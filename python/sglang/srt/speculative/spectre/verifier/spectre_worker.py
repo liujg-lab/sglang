@@ -35,6 +35,52 @@ _DEFAULT_DRAFT = {
 }
 
 
+def _req_committed_len(req) -> int:
+    committed = int(getattr(req, "kv_committed_len", 0) or 0)
+    if committed > 0:
+        return committed
+    return max(0, len(req.origin_input_ids) + len(req.output_ids))
+
+
+def _sync_kv_from_seq_lens(batch: ScheduleBatch) -> None:
+    """Keep req KV counters equal to EAGLE-compacted batch.seq_lens.
+
+    Verify grows seq_lens by accept_length+1 while kv_committed_len is only
+    bumped by num_accepted; after a reject/AR fallback those can diverge and
+    decode attention reads freed tree slots (CUDA illegal access).
+    """
+    seq_lens = batch.seq_lens.tolist()
+    for req, sl in zip(batch.reqs, seq_lens):
+        if _is_health_check(req):
+            continue
+        sl_i = int(sl)
+        req.kv_committed_len = sl_i
+        req.kv_allocated_len = sl_i
+
+
+def _align_seq_lens_to_committed(batch: ScheduleBatch) -> None:
+    """Rebuild batch.seq_lens from committed KV before a 1-token AR decode."""
+    device = batch.seq_lens.device
+    committed = [_req_committed_len(req) for req in batch.reqs]
+    new_lens = torch.tensor(committed, dtype=batch.seq_lens.dtype, device=device)
+    if batch.seq_lens.shape == new_lens.shape:
+        batch.seq_lens.copy_(new_lens)
+    else:
+        batch.seq_lens = new_lens
+    cpu_lens = torch.tensor(committed, dtype=torch.int64)
+    if batch.seq_lens_cpu is not None and batch.seq_lens_cpu.shape == cpu_lens.shape:
+        batch.seq_lens_cpu.copy_(cpu_lens)
+    else:
+        batch.seq_lens_cpu = cpu_lens
+    if batch.orig_seq_lens is not None:
+        orig = torch.tensor(committed, dtype=batch.orig_seq_lens.dtype, device=device)
+        if batch.orig_seq_lens.shape == orig.shape:
+            batch.orig_seq_lens.copy_(orig)
+        else:
+            batch.orig_seq_lens = orig
+    batch.seq_lens_sum = int(sum(committed))
+
+
 class SpectreWorker:
     def __init__(
         self,
@@ -101,9 +147,9 @@ class SpectreWorker:
                 can_run_cuda_graph=False,
             )
         else:
-            draft_num_tokens = getattr(
-                batch, "draft_num_tokens", self.speculative_num_draft_tokens
-            )
+            draft_num_tokens = getattr(batch, "draft_num_tokens", None)
+            if draft_num_tokens is None:
+                draft_num_tokens = self.speculative_num_draft_tokens
 
             if draft_num_tokens == 1 and not batch.forward_mode.is_idle():
                 batch_result = self._forward_normal_decode(batch)
@@ -337,6 +383,8 @@ class SpectreWorker:
             self.page_size,
             vocab_mask=None,
         )
+        if not batch.forward_mode.is_idle():
+            _sync_kv_from_seq_lens(batch)
 
         self._post_verify_update_drafts(
             batch,
@@ -448,6 +496,11 @@ class SpectreWorker:
         if batch.global_num_tokens_for_logprob is not None:
             batch.global_num_tokens_for_logprob = [bs]
 
+        # Tree verify can leave seq_lens ahead of real KV occupancy. Draft
+        # rebuilds seq_lens from kv_committed_len; Target must do the same
+        # before a 1-token AR fallback (draft_num_tokens==1).
+        _align_seq_lens_to_committed(batch)
+
         batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
 
         for req in batch.reqs:
@@ -483,6 +536,7 @@ class SpectreWorker:
                             f"\033[36m [NormalDecode] grammar.accept_token failed "
                             f"for req {req.rid} token {token} \033[0m"
                         )
+                req.check_finished()
             _apply_drafts_to_req(
                 req,
                 verified_token=token if token is not None else -1,

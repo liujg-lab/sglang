@@ -2112,9 +2112,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
-            return
+            # EAGLE / Target SPECTRE prepare decode inside the spec worker.
+            # SPECTRE draft uses ordinary TpModelWorker AR decode, so it must
+            # still collapse input_ids to the last token (otherwise q_len stays
+            # at the prefill length and flashinfer decode rejects it).
+            spectre_draft = (
+                self.spec_algorithm.is_spectre()
+                and get_global_server_args().spectre_role == "draft"
+            )
+            if not spectre_draft:
+                return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:

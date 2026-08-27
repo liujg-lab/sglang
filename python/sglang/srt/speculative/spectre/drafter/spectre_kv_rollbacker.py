@@ -52,12 +52,13 @@ class SpectreKVRollbacker:
         self, req: "Req", fork_point: int, current_kv_len: Optional[int] = None
     ) -> bool:
         if current_kv_len is None:
-            input_ids = getattr(req, "origin_input_ids", [])
-            output_ids = getattr(req, "output_ids", [])
-            input_len = len(input_ids) if input_ids is not None else 0
-            output_len = len(output_ids) if output_ids is not None else 0
-            total_len = input_len + output_len
-            current_kv_len = max(0, total_len - 1)
+            current_kv_len = int(getattr(req, "kv_allocated_len", 0) or 0)
+            if current_kv_len <= 0:
+                input_ids = getattr(req, "origin_input_ids", [])
+                output_ids = getattr(req, "output_ids", [])
+                input_len = len(input_ids) if input_ids is not None else 0
+                output_len = len(output_ids) if output_ids is not None else 0
+                current_kv_len = max(0, input_len + output_len - 1)
 
         if self.can_local_rollback(req, fork_point):
             return self.local_rollback(req, fork_point, current_kv_len)
@@ -81,7 +82,15 @@ class SpectreKVRollbacker:
         if req.req_pool_idx is None:
             return False
 
-        if fork_point >= current_kv_len:
+        allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+        # Only free slots the allocator actually handed out. Token-length
+        # (origin+output-1) can run ahead after Case 3.1 catch-up appends;
+        # freeing past kv_allocated_len double-counts the free list.
+        end = allocated if allocated > 0 else int(current_kv_len)
+
+        if fork_point >= end:
+            req.kv_committed_len = min(int(req.kv_committed_len or 0), fork_point, end)
+            req.kv_allocated_len = min(end, fork_point)
             return False
 
         prefix_len = self.get_prefix_len(req)
@@ -96,7 +105,7 @@ class SpectreKVRollbacker:
         try:
             max_len = self.req_to_token_pool.req_to_token.shape[1]
             start = min(fork_point, max_len)
-            end = min(current_kv_len, max_len)
+            end = min(end, max_len)
 
             if start >= end:
                 if self.tp_rank == 0:
@@ -120,7 +129,7 @@ class SpectreKVRollbacker:
             if self.tp_rank == 0:
                 logger.debug(
                     f"[SpectreKVRollbacker] Local rollback for {req.rid}: "
-                    f"freed [{fork_point}, {current_kv_len}), "
+                    f"freed [{fork_point}, {end}), "
                     f"kv_committed: {old_committed} -> {req.kv_committed_len}, "
                     f"kv_allocated: {old_allocated} -> {req.kv_allocated_len}, "
                     f"prefix_len={prefix_len}"
@@ -140,7 +149,9 @@ class SpectreKVRollbacker:
         kv_len = req.kv_committed_len
         req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
 
-        release_kv_cache(req, self.tree_cache)
+        # Draft KV is a speculative prefix; do not insert into radix (would
+        # leave evictable tokens after FINISH and inflate leak checks).
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
         if self.tp_rank == 0:
             logger.debug(
@@ -154,7 +165,7 @@ class SpectreKVRollbacker:
         kv_len = req.kv_committed_len
         req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
 
-        release_kv_cache(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
         if self.tp_rank == 0:
             logger.debug(

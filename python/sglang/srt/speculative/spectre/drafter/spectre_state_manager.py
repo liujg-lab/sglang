@@ -22,6 +22,8 @@ class SpectreDraftState:
     last_updated_time: float = field(default_factory=time.time)
     created_time: float = field(default_factory=time.time)
     timeout_threshold: float = 30.0  # seconds
+    # [SPECTRE-VL] 记录旁路 mm payload 的 rid，re-prefill / 超时清理时据此释放。
+    mm_ref: Optional[str] = None
 
 
 class SpectreDraftStateManager:

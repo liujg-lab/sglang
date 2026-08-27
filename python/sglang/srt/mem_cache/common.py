@@ -481,13 +481,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    # MambaRadixCache may alloc mamba state before alloc KV cache
+    # MambaRadixCache may alloc mamba state before alloc KV cache.
+    # SPECTRE draft re-prefill can also free the pool slot while a stale
+    # copy of the same Req is still in running_batch; skip instead of asserting.
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
-        # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
+        if tree_cache.supports_mamba() and req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_pool.free(
                 req.mamba_pool_idx.unsqueeze(-1)
             )

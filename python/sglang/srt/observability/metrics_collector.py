@@ -285,6 +285,45 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # SPECTRE VL multimodal sidecar (Target send / Draft recv + prewarm)
+        self.spectre_mm_payloads_sent_total = Counter(
+            name="sglang:spectre_mm_payloads_sent_total",
+            documentation="SPECTRE VL mm payloads successfully sent Target -> Draft.",
+            labelnames=labels.keys(),
+        )
+        self.spectre_mm_payloads_received_total = Counter(
+            name="sglang:spectre_mm_payloads_received_total",
+            documentation="SPECTRE VL mm payloads stored on Draft.",
+            labelnames=labels.keys(),
+        )
+        self.spectre_mm_payloads_dropped_total = Counter(
+            name="sglang:spectre_mm_payloads_dropped_total",
+            documentation=(
+                "SPECTRE VL mm payloads dropped "
+                "(reason=queue_full, send_error, finished_rid, recv_error)."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        self.spectre_mm_prewarm_total = Counter(
+            name="sglang:spectre_mm_prewarm_total",
+            documentation="SPECTRE VL ViT prewarm attempts by result (success or failure).",
+            labelnames=list(labels.keys()) + ["result"],
+        )
+        self.spectre_mm_degrades_total = Counter(
+            name="sglang:spectre_mm_degrades_total",
+            documentation=(
+                "SPECTRE VL draft requests degraded to autoregression "
+                "(reason=wait_timeout, padded_mismatch, oversized)."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        self.spectre_mm_pending_bytes = Gauge(
+            name="sglang:spectre_mm_pending_bytes",
+            documentation="Resident bytes of SPECTRE VL pending mm payloads (CPU+GPU).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         # Retract
         # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
@@ -817,6 +856,33 @@ class SchedulerMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
+
+    def increment_spectre_mm_payloads_sent(self, n: int = 1) -> None:
+        if n > 0:
+            self.spectre_mm_payloads_sent_total.labels(**self.labels).inc(n)
+
+    def increment_spectre_mm_payloads_received(self, n: int = 1) -> None:
+        if n > 0:
+            self.spectre_mm_payloads_received_total.labels(**self.labels).inc(n)
+
+    def increment_spectre_mm_payloads_dropped(
+        self, n: int = 1, reason: str = "send_error"
+    ) -> None:
+        if n > 0:
+            self.spectre_mm_payloads_dropped_total.labels(
+                **self.labels, reason=reason
+            ).inc(n)
+
+    def increment_spectre_mm_prewarm(self, n: int = 1, result: str = "success") -> None:
+        if n > 0:
+            self.spectre_mm_prewarm_total.labels(**self.labels, result=result).inc(n)
+
+    def increment_spectre_mm_degrades(self, n: int = 1, reason: str = "wait_timeout") -> None:
+        if n > 0:
+            self.spectre_mm_degrades_total.labels(**self.labels, reason=reason).inc(n)
+
+    def set_spectre_mm_pending_bytes(self, n: int) -> None:
+        self.spectre_mm_pending_bytes.labels(**self.labels).set(n)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)

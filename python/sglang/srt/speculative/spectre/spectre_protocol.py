@@ -85,6 +85,8 @@ class SpectreRequest:
     draft_logprobs: Optional[List[float]] = None
     draft_recv_time: float = -1.0
     draft_send_time: float = -1.0
+    # [SPECTRE-VL] C++ msgpack 只带关联 id；大 tensor 走旁路通道，Draft 用 mm_ref 去取。
+    mm_ref: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {}

@@ -3179,6 +3179,105 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "SPECTRE":
+            # [SPECTRE-VL] SPECTRE 默认关闭 overlap / mixed-chunk；VL 时再校验 vision 几何。
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for SPECTRE speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 5
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            logger.warning(
+                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "using SPECTRE speculative decoding."
+            )
+            self._validate_spectre_vl_config()
+
+    def _validate_spectre_vl_config(self) -> None:
+        """[SPECTRE-VL] Draft 自跑 ViT 时 embedding 条数必须等于占位符个数。
+
+        Target/Draft 是独立进程，这里只能校验本侧 vision 几何，并提醒两侧必须一致。
+        """
+        try:
+            model_config = self.get_model_config()
+        except Exception as e:
+            logger.warning("SPECTRE: skip VL config validation (%s)", e)
+            return
+
+        if not getattr(model_config, "is_multimodal", False):
+            return
+
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is None:
+            logger.warning(
+                "SPECTRE is running a multimodal model without vision_config; "
+                "Draft/Target vision geometry cannot be validated."
+            )
+            return
+
+        missing = [
+            name
+            for name in ("spatial_merge_size", "patch_size")
+            if getattr(vision_config, name, None) is None
+        ]
+        if missing:
+            raise ValueError(
+                "SPECTRE + VL requires vision_config fields "
+                f"{missing}. Draft and Target must use matching vision geometry "
+                "(spatial_merge_size, patch_size, temporal_patch_size) and the "
+                "same processor resize settings so ViT embedding length equals "
+                "the padded placeholder count."
+            )
+
+        temporal = getattr(vision_config, "temporal_patch_size", None)
+        processor_resize = {
+            key: getattr(vision_config, key, None)
+            for key in (
+                "min_pixels",
+                "max_pixels",
+                "spatial_merge_size",
+                "merge_size",
+                "patch_size",
+                "temporal_patch_size",
+            )
+            if getattr(vision_config, key, None) is not None
+        }
+        logger.info(
+            "SPECTRE VL vision geometry: spatial_merge_size=%s patch_size=%s "
+            "temporal_patch_size=%s processor/vision fields=%s. Draft and Target "
+            "must use the same values and the same processor image/video resize "
+            "config so ViT embedding length equals the padded placeholder count.",
+            vision_config.spatial_merge_size,
+            vision_config.patch_size,
+            temporal,
+            processor_resize,
+        )
+        if self.spectre_role == "draft":
+            if self.context_length is not None and self.context_length <= 0:
+                raise ValueError(
+                    "SPECTRE draft context_length must be positive and at least "
+                    "the Target padded maximum prompt length."
+                )
+            logger.info(
+                "SPECTRE draft context_length=%s. It must be greater than or "
+                "equal to the Target padded maximum prompt length.",
+                self.context_length,
+            )
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            # [SPECTRE-VL] 显式转发 pad_value，UUID hash 路径两侧也不会错位。
+            logger.info(
+                "SGLANG_MM_SKIP_COMPUTE_HASH is set; SPECTRE preserves Target "
+                "pad_value/hash on the mm payload so Draft will not rehash."
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"

@@ -551,11 +551,15 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        is_spectre_target = (
+            model_runner.spec_algorithm.is_spectre()
+            and model_runner.server_args.spectre_role != "draft"
+        )
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
-            or model_runner.spec_algorithm.is_spectre()
+            or is_spectre_target
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -568,7 +572,7 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
-        self.is_spectre = model_runner.spec_algorithm.is_spectre()
+        self.is_spectre = is_spectre_target
         if self.is_spectre:
             self.spectre_ntpb_options = sorted(
                 set([1, self.num_tokens_per_bs]), reverse=True
@@ -1375,7 +1379,7 @@ class CudaGraphRunner:
                     seq_lens_cpu=None,
                 )
 
-        elif self.model_runner.spec_algorithm.is_spectre():
+        elif self.is_spectre:
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:

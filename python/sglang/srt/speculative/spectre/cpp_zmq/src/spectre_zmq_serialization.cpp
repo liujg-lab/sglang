@@ -24,7 +24,9 @@ constexpr bool kNativeLittleEndian = false;
 constexpr bool kNativeLittleEndian = true;
 #endif
 
-constexpr uint32_t kSpectreRequestFieldCount = 15;
+constexpr uint32_t kSpectreRequestMinFieldCount = 15;
+// [SPECTRE-VL] 15 -> 16: trailing optional mm_ref. Keep min=15 so old peers unpack.
+constexpr uint32_t kSpectreRequestFieldCount = 16;
 
 template <typename T>
 inline void pack_optional_value(msgpack::packer<StringStream> &pk,
@@ -139,6 +141,8 @@ void pack_spectre_request(msgpack::packer<StringStream> &pk,
   pack_optional_float_vector_bin(pk, req.draft_logprobs);
   pk.pack(req.draft_recv_time);
   pk.pack(req.draft_send_time);
+  // [SPECTRE-VL] field 15, appended; same type as grammar (optional string).
+  pack_optional_value(pk, req.mm_ref);
 }
 
 template <typename T>
@@ -230,7 +234,7 @@ void unpack_optional_float_vector_bin(
 void unpack_spectre_request(const msgpack::object &obj,
                             spectre::SpectreRequest &req) {
   if (obj.type != msgpack::type::ARRAY ||
-      obj.via.array.size < kSpectreRequestFieldCount) {
+      obj.via.array.size < kSpectreRequestMinFieldCount) {
     throw std::runtime_error("invalid Spectre request payload");
   }
 
@@ -250,6 +254,10 @@ void unpack_spectre_request(const msgpack::object &obj,
   unpack_optional_float_vector_bin(fields[12], req.draft_logprobs);
   req.draft_recv_time = fields[13].as<double>();
   req.draft_send_time = fields[14].as<double>();
+  // [SPECTRE-VL] Skip if the peer still sends 15-field arrays.
+  if (obj.via.array.size >= kSpectreRequestFieldCount) {
+    unpack_optional_value(fields[15], req.mm_ref);
+  }
 }
 
 } // namespace

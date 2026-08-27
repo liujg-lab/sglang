@@ -120,11 +120,15 @@ struct SpectreRequest {
   std::optional<std::vector<float>> draft_logprobs;
   double draft_recv_time = -1.0;
   double draft_send_time = -1.0;
+  // [SPECTRE-VL] Optional correlation id for the Python MM sidecar. Appended
+  // so old 15-field messages still unpack. Do not put tensors here.
+  std::optional<std::string> mm_ref;
 
+  // [SPECTRE-VL] mm_ref must stay last so the array layout stays backward compatible.
   MSGPACK_DEFINE(request_id, spec_cnt, action, spec_type, draft_token_ids,
                  input_ids, output_ids, num_draft_tokens, sampling_params,
                  grammar, target_send_time, target_recv_time, draft_logprobs,
-                 draft_recv_time, draft_send_time);
+                 draft_recv_time, draft_send_time, mm_ref);
 };
 
 inline SamplingParams sampling_params_from_py_dict(const py::dict &d) {
@@ -203,6 +207,8 @@ inline SpectreRequest from_py_dict(const py::dict &d) {
     r.draft_recv_time = py::cast<double>(d["draft_recv_time"]);
   if (d.contains("draft_send_time") && !d["draft_send_time"].is_none())
     r.draft_send_time = py::cast<double>(d["draft_send_time"]);
+  // [SPECTRE-VL] Python dict <-> C++ optional string; omitted when null.
+  assign_optional_from_py_dict(d, "mm_ref", r.mm_ref);
 
   return r;
 }
@@ -268,6 +274,8 @@ inline py::dict to_py_dict(const SpectreRequest &r) {
   set_if_present("draft_logprobs", r.draft_logprobs);
   d["draft_recv_time"] = r.draft_recv_time;
   d["draft_send_time"] = r.draft_send_time;
+  // [SPECTRE-VL] Python dict <-> C++ optional string; omitted when null.
+  set_if_present("mm_ref", r.mm_ref);
 
   return d;
 }

@@ -375,13 +375,23 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         return input_ids, offsets, modality_list
 
     def compute_mrope_positions(self, input_ids, mm_items):
-        image_grid_thw = None
-        video_grid_thw = None
-        for item in mm_items:
-            if "image_grid_thw" in item.model_specific_data:
-                image_grid_thw = item.model_specific_data["image_grid_thw"]
-            if "video_grid_thw" in item.model_specific_data:
-                video_grid_thw = item.model_specific_data["video_grid_thw"]
+        def _cat_grid_thw(key: str):
+            grids = []
+            for item in mm_items:
+                grid = item.model_specific_data.get(key)
+                if grid is None:
+                    continue
+                if not isinstance(grid, torch.Tensor):
+                    grid = torch.as_tensor(grid)
+                if grid.ndim == 1:
+                    grid = grid.unsqueeze(0)
+                grids.append(grid)
+            if not grids:
+                return None
+            return torch.cat(grids, dim=0)
+
+        image_grid_thw = _cat_grid_thw("image_grid_thw")
+        video_grid_thw = _cat_grid_thw("video_grid_thw")
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(

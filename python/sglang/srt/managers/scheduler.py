@@ -476,13 +476,68 @@ class Scheduler(
             else:
                 self.zmq_communicator = None
 
+            # [SPECTRE-VL] Target 仅 rank0 PUB；Draft 所有 TP rank SUB 直收，不再 gloo 广播 pixel。
+            if spectre_config.is_target:
+                if self.tp_size == 1 or self.tp_rank == 0:
+                    self._init_spectre_mm_channel(spectre_config)
+                else:
+                    self.spectre_mm_sender = None
+                    self.spectre_mm_receiver = None
+            else:
+                self._init_spectre_mm_channel(spectre_config)
+
             if role == "draft":
                 self.paused_reqs: List[Req] = []
                 self.paused_reqs_lock = threading.RLock()
         elif role is not None:
             raise ValueError(f"Invalid Spectre role: {role}")
+        else:
+            # [SPECTRE-VL] 非 SPECTRE 进程也挂上属性，避免 handle_generate_request 取不到。
+            self.spectre_mm_sender = None
+            self.spectre_mm_receiver = None
 
         self.spec_forward_cycle = 0
+
+    def _validate_spectre_draft_multimodal(self) -> None:
+        """[SPECTRE-VL] Draft 自跑 ViT 就必须能自己算 M-RoPE。
+
+        _maybe_compute_mrope_positions 在 _mm_processor 为 None 时是静默 return 的，
+        那样 VL 请求会拿到纯文本位置编码：不报错，只表现为接受率莫名很低。
+        与其静默跑错，不如启动就失败。
+        """
+        if self.server_args.spectre_role != "draft":
+            return
+        if not self.model_config.is_multimodal:
+            return
+        if self._mm_processor is not None:
+            return
+        raise ValueError(
+            "SPECTRE draft is serving a multimodal model but failed to load a "
+            "multimodal processor, so M-RoPE positions cannot be computed and "
+            "vision requests would silently use text-only positions. Make sure "
+            "the draft is started without --skip-tokenizer-init and that its "
+            "processor files are available."
+        )
+
+    def _init_spectre_mm_channel(self, spectre_config) -> None:
+        # [SPECTRE-VL] Target bind / Draft connect。大 tensor 不能走 C++ msgpack。
+        from sglang.srt.speculative.spectre.spectre_mm_transport import (
+            SpectreMMReceiver,
+            SpectreMMSender,
+        )
+
+        mm_addr = spectre_config.get_mm_addr()
+        use_shm = spectre_config.mm_use_shm
+        if spectre_config.is_target:
+            self.spectre_mm_sender = SpectreMMSender(
+                mm_addr, use_shm=use_shm, bind=True
+            )
+            self.spectre_mm_receiver = None
+        else:
+            self.spectre_mm_receiver = SpectreMMReceiver(
+                mm_addr, use_shm=use_shm, bind=False
+            )
+            self.spectre_mm_sender = None
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -594,6 +649,8 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
+        self._validate_spectre_draft_multimodal()
+
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
@@ -652,6 +709,17 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # SPECTRE draft is a standalone AR server. SpectreWorker is the Target
+        # verifier only; wrapping draft with it leaves batch.draft_num_tokens
+        # unset (None) and crashes decode with `None - 1`.
+        if (
+            self.spec_algorithm.is_spectre()
+            and self.server_args.spectre_role == "draft"
+        ):
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -692,8 +760,9 @@ class Scheduler(
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        # Dispatch the model worker. SPECTRE draft has no spec worker and
+        # must use the ordinary TpModelWorker for prefill/decode.
+        if self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1779,9 +1848,15 @@ class Scheduler(
         if mm is None or mm.mrope_positions is not None:
             return
 
+        # pad_input_ids has already replaced vision slots with pad_value.
+        # get_rope_index looks for image_token_id, so restore placeholders first.
+        from sglang.srt.speculative.spectre.spectre_mm_transport import (
+            ids_for_mrope_compute,
+        )
+
         mrope_positions, mrope_position_delta = (
             self._mm_processor.compute_mrope_positions(
-                req.origin_input_ids, mm.mm_items
+                ids_for_mrope_compute(req.origin_input_ids, mm), mm.mm_items
             )
         )
         if mrope_positions is not None:
@@ -1973,6 +2048,10 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        # [SPECTRE-VL] 必须在所有 abort 检查之后、Target ViT 之前发：
+        # feature 此时还活着；已 abort 的请求不要把 payload 泄漏到 Draft。
+        self.maybe_send_spectre_mm(req)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -2744,8 +2823,16 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
+            if (
+                self.spec_algorithm.is_none()
+                or self.enable_overlap
+                or (
+                    self.spec_algorithm.is_spectre()
+                    and self.server_args.spectre_role == "draft"
+                )
+            ):
+                # TpModelWorker (including SPECTRE draft) needs ModelWorkerBatch.
+                # SpectreWorker on Target still consumes ScheduleBatch below.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.

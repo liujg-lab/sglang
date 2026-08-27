@@ -624,12 +624,20 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        # SPECTRE draft is ordinary AR (no verify). Accept-rate stats belong to Target;
+        # draft never calls update_spec_metrics, so spec_num_forward_ct stays 0.
+        skip_spec_stats = self.spec_algorithm.is_none() or (
+            self.spec_algorithm.is_spectre()
+            and self.server_args.spectre_role == "draft"
+        )
+        if skip_spec_stats:
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
             )
             total_draft_tokens = self.spec_num_draft_tokens
             spec_accept_rate = (

@@ -101,6 +101,20 @@ class SpectreConfig:
             return f"ipc://{self._get_ipc_base_path()}"
         raise ValueError(f"Unsupported zmq transport: {self.zmq_transport}")
 
+    def get_mm_addr(self) -> str:
+        # [SPECTRE-VL] 多模态旁路 socket：tcp 用 port+3，ipc 用独立路径，避免和大 token 通道抢同一地址。
+        """Address for the out-of-band multimodal payload channel."""
+        if self.zmq_transport == "tcp":
+            return f"tcp://{self.zmq_addr}:{int(self.zmq_port) + 3}"
+        if self.zmq_transport == "ipc":
+            return f"ipc://{self._get_ipc_base_path()}_mm"
+        raise ValueError(f"Unsupported zmq transport: {self.zmq_transport}")
+
+    @property
+    def mm_use_shm(self) -> bool:
+        # [SPECTRE-VL] 同机走 POSIX SHM，跨机（tcp）走 multipart raw buffer。
+        return self.zmq_transport == "ipc"
+
     def validate(self) -> None:
         if self.role not in ("target", "draft"):
             raise ValueError(f"Invalid role: {self.role}. Must be 'target' or 'draft'")

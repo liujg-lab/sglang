@@ -92,7 +92,7 @@ class DraftCircuitBreaker:
 class SchedulerSpectreTargetMixin:
     def _init_draft_recv_infra(self):
         self._recv_timeout_s = (
-            float(os.environ.get("SPECTRE_RECV_TIMEOUT_MS", "200")) / 1000.0
+            float(os.environ.get("SPECTRE_RECV_TIMEOUT_MS", "5000")) / 1000.0
         )
         self._msg_buffer: List[SpectreRequest] = []
         self._msg_lock = threading.Lock()
@@ -471,9 +471,21 @@ class SchedulerSpectreTargetMixin:
                                 req.sampling_params if needs_full_context else None
                             ),
                             grammar=None,
+                            # [SPECTRE-VL] 只在 full-context 时带 mm_ref；tensor 不进这条通道。
+                            mm_ref=(
+                                req.rid
+                                if needs_full_context
+                                and req.multimodal_inputs is not None
+                                else None
+                            ),
                         )
                     )
                 self._zmq_send(draft_reqs)
+                # [SPECTRE-VL] HALF_OPEN / 首步 full-context 时重发 payload。
+                # OPEN 期间准入被跳过的请求、以及 Draft 侧已超时回收的 payload，靠这次补上。
+                for req in reqs_to_send:
+                    if req.spec_cnt == 0 or is_half_open:
+                        self.maybe_send_spectre_mm(req)
 
     def _send_retry_requests(
         self, failed_reqs: List[Req], num_draft_tokens: int
@@ -547,6 +559,68 @@ class SchedulerSpectreTargetMixin:
             return True
         batch.is_high_overhead = False
         return False
+
+    def _mm_features_alive(self, req: Req) -> bool:
+        # [SPECTRE-VL] prefill 后 feature 只是搬到 CPU；finish 才 release_features。
+        mm = getattr(req, "multimodal_inputs", None)
+        if mm is None:
+            return False
+        for item in getattr(mm, "mm_items", None) or []:
+            if getattr(item, "feature", None) is not None:
+                return True
+            if getattr(item, "precomputed_embeddings", None) is not None:
+                return True
+        return False
+
+    def maybe_send_spectre_mm(self, req: Req) -> None:
+        # [SPECTRE-VL] 请求准入时快照 pixel_values。若等到 DRAFT_REQUEST，
+        # Target ViT 可能已跑完、feature 已被 buffer 回收。
+        if not getattr(self, "spec_algorithm", None) or not self.spec_algorithm.is_spectre():
+            return
+        if self.server_args.spectre_role != "target":
+            return
+        if req.multimodal_inputs is None:
+            return
+        if self.tp_size > 1 and self.tp_rank != 0:
+            return
+        # [SPECTRE-VL] 不要调 should_send()：OPEN 时它会累加 rounds_in_open。
+        breaker = getattr(self, "draft_circuit_breaker", None)
+        if breaker is not None and breaker.state == DraftCircuitBreaker.OPEN:
+            return
+        if not self._mm_features_alive(req):
+            return
+        sender = getattr(self, "spectre_mm_sender", None)
+        if sender is None:
+            return
+        try:
+            from sglang.srt.speculative.spectre.spectre_mm_transport import (
+                SpectreMMPayload,
+            )
+
+            status = sender.send(SpectreMMPayload.from_req(req))
+            metrics = self._spectre_mm_metrics()
+            if metrics is not None:
+                if status == "sent":
+                    metrics.increment_spectre_mm_payloads_sent()
+                elif status == "queue_full":
+                    metrics.increment_spectre_mm_payloads_dropped(reason="queue_full")
+                else:
+                    metrics.increment_spectre_mm_payloads_dropped(reason="send_error")
+        except Exception as e:
+            metrics = self._spectre_mm_metrics()
+            if metrics is not None:
+                metrics.increment_spectre_mm_payloads_dropped(reason="send_error")
+            if self.tp_rank == 0:
+                logger.warning(
+                    "[Target] Failed to send SPECTRE mm payload for %s: %s",
+                    req.rid,
+                    e,
+                )
+
+    def _spectre_mm_metrics(self):
+        if not getattr(self, "current_scheduler_metrics_enabled", False):
+            return None
+        return getattr(self, "metrics_collector", None)
 
     def _decide_speculative_num_draft_tokens(self, batch: ScheduleBatch) -> int:
         return self.server_args.speculative_num_steps + 1

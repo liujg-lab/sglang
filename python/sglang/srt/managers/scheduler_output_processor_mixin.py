@@ -106,6 +106,20 @@ class SchedulerOutputProcessorMixin:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def _is_spectre_draft_ar(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """SPECTRE draft runs ordinary TpModelWorker AR, not spec-v1 verify."""
+        return (
+            batch.spec_algorithm.is_spectre()
+            and self.server_args.spectre_role == "draft"
+        )
+
+    def _maybe_pause_spectre_draft_req(self: Scheduler, req: Req) -> None:
+        if self.server_args.spectre_role != "draft":
+            return
+        check_and_pause = getattr(self, "_check_and_pause_draft_req", None)
+        if check_and_pause is not None:
+            check_and_pause(req)
+
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
     ):
@@ -192,7 +206,11 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        insert_radix = not (
+                            self.spec_algorithm.is_spectre()
+                            and self.server_args.spectre_role == "draft"
+                        )
+                        release_kv_cache(req, self.tree_cache, is_insert=insert_radix)
                         req.time_stats.set_completion_time()
                         if (
                             self.spec_algorithm.is_spectre()
@@ -202,7 +220,12 @@ class SchedulerOutputProcessorMixin:
                                 req, SpectreAction.FINISH
                             )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                        # SPECTRE draft KV is speculative; keep it off the radix tree.
+                        if not (
+                            self.spec_algorithm.is_spectre()
+                            and self.server_args.spectre_role == "draft"
+                        ):
+                            self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -257,6 +280,10 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    # SPECTRE draft is ordinary AR: the first sampled token lives on
+                    # output_ids after prefill and must count toward draft_tokens_target.
+                    self._maybe_pause_spectre_draft_req(req)
 
                 else:
                     # being chunked reqs' prefill is not finished
@@ -397,7 +424,11 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+        # SPECTRE draft is a standalone AR server (TpModelWorker), not a spec-v1
+        # verifier. Token append + DRAFT_RESPONSE live in this post-process path.
+        spectre_draft = self._is_spectre_draft_ar(batch)
+
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2 or spectre_draft:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
@@ -422,7 +453,7 @@ class SchedulerOutputProcessorMixin:
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none() and not spectre_draft:
             self.update_spec_metrics(
                 batch.batch_size(),
                 result.num_accepted_tokens,
@@ -436,8 +467,12 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        # in the verify phase. Non-spec, V2, and SPECTRE draft handle them here.
+        is_spec_v1 = (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and not spectre_draft
+        )
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -459,10 +494,10 @@ class SchedulerOutputProcessorMixin:
                     req.grammar.finished = req.finished()
                 continue
 
-            # Non-spec and V2: full post-processing
+            # Non-spec, SPECTRE draft AR, and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if batch.spec_algorithm.is_none() or spectre_draft:
                 req.output_ids.append(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)
@@ -517,7 +552,7 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if batch.spec_algorithm.is_none() or spectre_draft:
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
@@ -533,10 +568,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-            if self.server_args.spectre_role == "draft" and hasattr(
-                self, "_check_and_pause_draft_req"
-            ):
-                self._check_and_pause_draft_req(req)
+            self._maybe_pause_spectre_draft_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -570,7 +602,11 @@ class SchedulerOutputProcessorMixin:
             else:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                insert_radix = not (
+                    self.spec_algorithm.is_spectre()
+                    and self.server_args.spectre_role == "draft"
+                )
+                release_kv_cache(req, self.tree_cache, is_insert=insert_radix)
 
             req.time_stats.set_completion_time()
             if (

@@ -123,6 +123,8 @@ class SpeculativeAlgorithm(Enum):
                 SpectreWorker,
             )
 
+            # Target-only verifier. SPECTRE draft skips create_worker in
+            # Scheduler.maybe_init_draft_worker and uses TpModelWorker.
             return SpectreWorker
 
         raise ValueError("Unreachable code path in create_worker.")
