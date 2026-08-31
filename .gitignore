@@ -273,3 +273,6 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+# liujg
+test_sglang_liujg/result/
