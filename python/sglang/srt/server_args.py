@@ -530,6 +530,13 @@ class ServerArgs:
     spectre_draft_priority: bool = False
     spectre_max_draft_priority_steps: int = 0
 
+    # STANDALONE_REMOTE speculative decoding (sync RPC, cross-server)
+    standalone_remote_role: Optional[Literal["target", "draft"]] = None
+    standalone_remote_addr: str = "127.0.0.1"
+    standalone_remote_port: str = "30019"
+    standalone_remote_rpc_timeout_ms: int = 5000
+    standalone_remote_max_batch_size: int = 32
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -1330,8 +1337,8 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
+                if self.speculative_algorithm in ("STANDALONE", "STANDALONE_REMOTE"):
+                    # standalone draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
@@ -3201,6 +3208,137 @@ class ServerArgs:
             )
             self._validate_spectre_vl_config()
 
+        if self.speculative_algorithm == "STANDALONE_REMOTE":
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for STANDALONE_REMOTE "
+                    "speculative decoding. You can override this by explicitly "
+                    "setting --max-running-requests."
+                )
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 3
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_eagle_topk == 1 and (
+                self.speculative_num_draft_tokens
+                != self.speculative_num_steps + 1
+            ):
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to "
+                    "speculative_num_steps + 1 when speculative_eagle_topk == 1"
+                )
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_eagle_topk > 1 and (self.page_size or 1) > 1:
+                raise ValueError(
+                    "STANDALONE_REMOTE tree speculation "
+                    "(speculative_eagle_topk > 1) requires --page-size 1."
+                )
+            if self.standalone_remote_role not in ("target", "draft"):
+                raise ValueError(
+                    "STANDALONE_REMOTE requires --standalone-remote-role "
+                    "{target|draft}."
+                )
+            logger.warning(
+                "The overlap scheduler and mixed chunked prefill are disabled "
+                "because of using STANDALONE_REMOTE speculative decoding."
+            )
+            self._validate_standalone_remote_vl_config()
+
+    def _validate_standalone_remote_vl_config(self) -> None:
+        """Draft 自跑 ViT 时 embedding 条数必须等于占位符个数。
+
+        Target/Draft 是独立进程，这里只能校验本侧 vision 几何，并提醒两侧必须一致。
+        """
+        try:
+            model_config = self.get_model_config()
+        except Exception as e:
+            logger.warning("STANDALONE_REMOTE: skip VL config validation (%s)", e)
+            return
+
+        if not getattr(model_config, "is_multimodal", False):
+            return
+
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is None:
+            logger.warning(
+                "STANDALONE_REMOTE is running a multimodal model without "
+                "vision_config; Draft/Target vision geometry cannot be validated."
+            )
+            return
+
+        missing = [
+            name
+            for name in ("spatial_merge_size", "patch_size")
+            if getattr(vision_config, name, None) is None
+        ]
+        if missing:
+            raise ValueError(
+                "STANDALONE_REMOTE + VL requires vision_config fields "
+                f"{missing}. Draft and Target must use matching vision geometry "
+                "(spatial_merge_size, patch_size, temporal_patch_size) and the "
+                "same processor resize settings so ViT embedding length equals "
+                "the padded placeholder count."
+            )
+
+        allowed_arch = {
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+        }
+        arch = None
+        try:
+            arch = model_config.hf_config.architectures[0]
+        except Exception:
+            pass
+        if arch is not None and arch not in allowed_arch:
+            logger.warning(
+                "STANDALONE_REMOTE VL is validated for Qwen3-VL "
+                "(Qwen3VLForConditionalGeneration / "
+                "Qwen3VLMoeForConditionalGeneration); got %s. "
+                "Other VLMs are not claimed to work out of the box.",
+                arch,
+            )
+
+        temporal = getattr(vision_config, "temporal_patch_size", None)
+        processor_resize = {
+            key: getattr(vision_config, key, None)
+            for key in (
+                "min_pixels",
+                "max_pixels",
+                "spatial_merge_size",
+                "merge_size",
+                "patch_size",
+                "temporal_patch_size",
+            )
+            if getattr(vision_config, key, None) is not None
+        }
+        logger.info(
+            "STANDALONE_REMOTE VL vision geometry: spatial_merge_size=%s "
+            "patch_size=%s temporal_patch_size=%s processor/vision fields=%s. "
+            "Draft and Target must use the same values and the same processor "
+            "image/video resize config so ViT embedding length equals the "
+            "padded placeholder count.",
+            vision_config.spatial_merge_size,
+            vision_config.patch_size,
+            temporal,
+            processor_resize,
+        )
+        if self.standalone_remote_role == "draft":
+            if self.context_length is not None and self.context_length <= 0:
+                raise ValueError(
+                    "STANDALONE_REMOTE draft context_length must be positive "
+                    "and at least the Target padded maximum prompt length."
+                )
+            logger.info(
+                "STANDALONE_REMOTE draft context_length=%s. It must be greater "
+                "than or equal to the Target padded maximum prompt length.",
+                self.context_length,
+            )
+
     def _validate_spectre_vl_config(self) -> None:
         """[SPECTRE-VL] Draft 自跑 ViT 时 embedding 条数必须等于占位符个数。
 
@@ -4907,7 +5045,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SPECTRE"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "SPECTRE",
+                "STANDALONE_REMOTE",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -5134,6 +5280,51 @@ class ServerArgs:
                 "all active draft requests. Positive values cap the steps to prevent Normal-"
                 "request starvation. Only effective when --spectre-draft-priority "
                 "is set."
+            ),
+        )
+
+        # STANDALONE_REMOTE speculative decoding
+        parser.add_argument(
+            "--standalone-remote-role",
+            type=str,
+            choices=["target", "draft"],
+            help=(
+                "Role of this process for STANDALONE_REMOTE: 'target' verifies, "
+                "'draft' generates draft tokens over a sync ZMQ RPC."
+            ),
+            default=ServerArgs.standalone_remote_role,
+        )
+        parser.add_argument(
+            "--standalone-remote-addr",
+            type=str,
+            default=ServerArgs.standalone_remote_addr,
+            help=(
+                "Draft RPC bind / Target connect address. 127.0.0.1 or 0.0.0.0 "
+                "use IPC; otherwise TCP."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-port",
+            type=str,
+            default=ServerArgs.standalone_remote_port,
+            help="ZMQ port for STANDALONE_REMOTE sync RPC.",
+        )
+        parser.add_argument(
+            "--standalone-remote-rpc-timeout-ms",
+            type=int,
+            default=ServerArgs.standalone_remote_rpc_timeout_ms,
+            help=(
+                "Target wait budget for one draft RPC. Timeout falls back to "
+                "1-token autoregression for that step."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-max-batch-size",
+            type=int,
+            default=ServerArgs.standalone_remote_max_batch_size,
+            help=(
+                "If the running batch is larger than this, STANDALONE_REMOTE "
+                "Target falls back to 1-token decode."
             ),
         )
 
@@ -6957,7 +7148,7 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
+    if self.speculative_algorithm in ("STANDALONE", "STANDALONE_REMOTE"):
         # The default value for standalone speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:

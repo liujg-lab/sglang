@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spectre.spectre_protocol import (
-    SpectreAction,
     SpecType,
 )
 
@@ -107,11 +106,8 @@ class SchedulerOutputProcessorMixin:
         )
 
     def _is_spectre_draft_ar(self: Scheduler, batch: ScheduleBatch) -> bool:
-        """SPECTRE draft runs ordinary TpModelWorker AR, not spec-v1 verify."""
-        return (
-            batch.spec_algorithm.is_spectre()
-            and self.server_args.spectre_role == "draft"
-        )
+        """Remote draft runs ordinary TpModelWorker AR, not spec-v1 verify."""
+        return self.is_remote_spec_draft
 
     def _maybe_pause_spectre_draft_req(self: Scheduler, req: Req) -> None:
         if self.server_args.spectre_role != "draft":
@@ -206,25 +202,13 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        insert_radix = not (
-                            self.spec_algorithm.is_spectre()
-                            and self.server_args.spectre_role == "draft"
-                        )
+                        insert_radix = not self.is_remote_spec_draft
                         release_kv_cache(req, self.tree_cache, is_insert=insert_radix)
                         req.time_stats.set_completion_time()
-                        if (
-                            self.spec_algorithm.is_spectre()
-                            and self.server_args.spectre_role == "target"
-                        ):
-                            self.notify_draft_request_finished_or_aborted(
-                                req, SpectreAction.FINISH
-                            )
+                        self.maybe_notify_remote_draft_finished(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # SPECTRE draft KV is speculative; keep it off the radix tree.
-                        if not (
-                            self.spec_algorithm.is_spectre()
-                            and self.server_args.spectre_role == "draft"
-                        ):
+                        if not self.is_remote_spec_draft:
                             self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -602,18 +586,11 @@ class SchedulerOutputProcessorMixin:
             else:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                insert_radix = not (
-                    self.spec_algorithm.is_spectre()
-                    and self.server_args.spectre_role == "draft"
-                )
+                insert_radix = not self.is_remote_spec_draft
                 release_kv_cache(req, self.tree_cache, is_insert=insert_radix)
 
             req.time_stats.set_completion_time()
-            if (
-                self.spec_algorithm.is_spectre()
-                and self.server_args.spectre_role == "target"
-            ):
-                self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
+            self.maybe_notify_remote_draft_finished(req)
 
         self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -1046,6 +1023,9 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+
+            if getattr(req, "is_sr_draft", False) is True:
                 continue
 
             if hasattr(req, "spec_type") and req.spec_type == SpecType.DRAFT_REQUEST:

@@ -1,0 +1,1201 @@
+import logging
+import time
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+from sglang.srt.layers.sampler import SamplingBatchInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+    SRDraftState,
+    SRDraftStateManager,
+    SRWindow,
+)
+from sglang.srt.speculative.standalone_remote.sr_align import (
+    DraftDecision,
+    classify_prefix_alignment,
+    committed_tail_not_in_kv,
+    decide_draft_action,
+    draft_needed_max_new_tokens,
+    find_fork_point,
+    ingest_active_indices,
+)
+from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+    slice_decode_batch_row,
+)
+from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import SRKVRollbacker
+from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
+    SRMMPayload,
+    release_mm_resources,
+    reset_mm_mrope,
+)
+from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    SRAction,
+    SRBatchReply,
+    SRBatchRequest,
+    SRDraftReply,
+    SRDraftRequest,
+    SRReplyStatus,
+)
+from sglang.srt.speculative.standalone_remote.sr_transport import (
+    SRDraftServer,
+    make_transport_from_server_args,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+    SRTreeDrafter,
+)
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
+
+logger = logging.getLogger(__name__)
+
+
+def _fix_sampling_params_stop_strs(sp) -> None:
+    if not hasattr(sp, "stop_strs") or sp.stop_strs is None:
+        sp.stop_strs = []
+    elif isinstance(sp.stop_strs, str):
+        sp.stop_strs = [sp.stop_strs]
+    if not hasattr(sp, "stop_regex_strs") or sp.stop_regex_strs is None:
+        sp.stop_regex_strs = []
+    elif isinstance(sp.stop_regex_strs, str):
+        sp.stop_regex_strs = [sp.stop_regex_strs]
+
+
+def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
+    if len(a) != len(b):
+        return 0
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return None
+
+
+class StandaloneRemoteDraftSchedulerMixin:
+    def _init_sr_draft(self) -> None:
+        self.sr_state = SRDraftStateManager()
+        self.sr_kv = SRKVRollbacker(
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
+            page_size=self.server_args.page_size or 1,
+            tp_rank=self.tp_rank,
+        )
+        self.sr_server: Optional[SRDraftServer] = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            server = make_transport_from_server_args(self.server_args)
+            assert isinstance(server, SRDraftServer)
+            self.sr_server = server
+        self.sr_waiting: List[Req] = []
+        self.draft_paused_reqs: List[Req] = []
+        self.paused_reqs = self.draft_paused_reqs
+        self.sr_tree_drafter: Optional[SRTreeDrafter] = None
+        topk = int(self.server_args.speculative_eagle_topk or 1)
+        if topk > 1:
+            self.sr_tree_drafter = SRTreeDrafter(self)
+        logger.info(
+            "[SR] Draft scheduler ready (tree=%s topk=%s)",
+            self.sr_tree_drafter is not None,
+            topk,
+        )
+
+    def _sr_tree_mode(self) -> bool:
+        return getattr(self, "sr_tree_drafter", None) is not None
+
+    def _sr_is_http_req(self, req: Req) -> bool:
+        """HTTP generate reqs are unmarked; Target RPC reqs set is_sr_draft."""
+        return getattr(req, "is_sr_draft", False) is not True
+
+    def _sr_http_alive(self) -> bool:
+        waiting = getattr(self, "waiting_queue", None) or []
+        paused = getattr(self, "draft_paused_reqs", None) or []
+        running = getattr(self, "running_batch", None)
+        running_reqs = (
+            list(running.reqs)
+            if running is not None and not running.is_empty()
+            else []
+        )
+        chunked = getattr(self, "chunked_req", None)
+        candidates = list(waiting) + list(paused) + running_reqs
+        if chunked is not None:
+            candidates.append(chunked)
+        return any(self._sr_is_http_req(r) for r in candidates if r is not None)
+
+    def _sr_wipe_all(self) -> None:
+        """Drop previous-session Draft RPC state. Target flush_cache never
+        reaches this process; a new session_id is the only signal.
+
+        HTTP generate reqs on this Draft process must survive. Full radix /
+        KV / embedding_cache reset only runs when no HTTP req is alive
+        (needed for VL leftover 128 vs 64 embeddings).
+        """
+        for state in self.sr_state.clear():
+            req = state.req_object
+            if req is None:
+                continue
+            self._sr_remove_req(req)
+            release_mm_resources(req.multimodal_inputs)
+            req.multimodal_inputs = None
+            req.req_pool_idx = None
+            if not req.finished():
+                req.to_abort = True
+                req.finished_reason = FINISH_ABORT("Target session reset")
+        self.sr_waiting = [
+            r for r in self.sr_waiting if self._sr_is_http_req(r)
+        ]
+        if getattr(self, "draft_paused_reqs", None) is not None:
+            self.draft_paused_reqs = [
+                r for r in self.draft_paused_reqs if self._sr_is_http_req(r)
+            ]
+        http_alive = self._sr_http_alive()
+        if http_alive:
+            self.cur_batch = None
+            self.last_batch = None
+        else:
+            self._sr_reset_scheduler_caches()
+        if self.sr_server is not None:
+            self.sr_server.last_rpc_seq = -1
+            drain = getattr(self.sr_server, "drain", None)
+            if callable(drain):
+                drain()
+        logger.info(
+            "[SR] Draft wiped RPC state for new session (http_alive=%s)",
+            http_alive,
+        )
+
+    def _sr_reset_scheduler_caches(self) -> None:
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is not None:
+            waiting.clear()
+        running = getattr(self, "running_batch", None)
+        if running is not None and not running.is_empty():
+            running.filter_batch(keep_indices=[])
+            running.batch_is_full = False
+        self.cur_batch = None
+        self.last_batch = None
+        if getattr(self, "chunked_req", None) is not None:
+            self.chunked_req = None
+        tree = getattr(self, "tree_cache", None)
+        if tree is not None and hasattr(tree, "reset"):
+            tree.reset()
+        pool = getattr(self, "req_to_token_pool", None)
+        if pool is not None and hasattr(pool, "clear"):
+            pool.clear()
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is not None and hasattr(alloc, "clear"):
+            alloc.clear()
+        gm = getattr(self, "grammar_manager", None)
+        if gm is not None and hasattr(gm, "clear"):
+            gm.clear()
+        try:
+            from sglang.srt.managers.mm_utils import embedding_cache
+
+            if embedding_cache is not None:
+                embedding_cache.clear()
+        except Exception:
+            pass
+
+    def _sr_remove_req(self, req: Req) -> None:
+        if req in self.sr_waiting:
+            self.sr_waiting.remove(req)
+        if req in self.draft_paused_reqs:
+            self.draft_paused_reqs.remove(req)
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is not None and req in waiting:
+            waiting.remove(req)
+        running = getattr(self, "running_batch", None)
+        if running is not None and not running.is_empty():
+            keep = [i for i, r in enumerate(running.reqs) if r is not req]
+            if len(keep) != len(running.reqs):
+                running.filter_batch(keep_indices=keep)
+
+    def _sr_pause_req(self, req: Req) -> None:
+        req.draft_is_paused = True
+        if req not in self.draft_paused_reqs:
+            self.draft_paused_reqs.append(req)
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is not None and req in waiting:
+            waiting.remove(req)
+        running = getattr(self, "running_batch", None)
+        if running is not None and not running.is_empty() and req in running.reqs:
+            keep = [i for i, r in enumerate(running.reqs) if r is not req]
+            running.filter_batch(keep_indices=keep)
+
+    def _sr_resume_req(self, req: Req) -> None:
+        req.draft_is_paused = False
+        if req in self.draft_paused_reqs:
+            self.draft_paused_reqs.remove(req)
+
+    def _sr_resume_http_reqs(self) -> None:
+        """Requeue HTTP reqs parked by isolate_need after an RPC tick."""
+        paused = getattr(self, "draft_paused_reqs", None)
+        if not paused:
+            return
+        to_resume = [r for r in list(paused) if self._sr_is_http_req(r)]
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is None:
+            waiting = []
+            self.waiting_queue = waiting
+        for req in to_resume:
+            self._sr_resume_req(req)
+            if req.req_pool_idx is None:
+                if req not in waiting:
+                    waiting.append(req)
+            else:
+                self._sr_park_in_running_many([req])
+
+    def _sr_park_sr_reqs(self) -> None:
+        """Keep Target RPC reqs out of the HTTP get_next_batch_to_run path."""
+        running = getattr(self, "running_batch", None)
+        if running is not None and not running.is_empty():
+            keep: List[int] = []
+            to_pause: List[Req] = []
+            for i, r in enumerate(running.reqs):
+                if getattr(r, "is_sr_draft", False) is True:
+                    to_pause.append(r)
+                else:
+                    keep.append(i)
+            if len(keep) != len(running.reqs):
+                running.filter_batch(keep_indices=keep)
+            for r in to_pause:
+                r.draft_is_paused = True
+                if r not in self.draft_paused_reqs:
+                    self.draft_paused_reqs.append(r)
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting:
+            stay = []
+            for r in list(waiting):
+                if getattr(r, "is_sr_draft", False) is True:
+                    r.draft_is_paused = True
+                    if r not in self.draft_paused_reqs:
+                        self.draft_paused_reqs.append(r)
+                else:
+                    stay.append(r)
+            waiting[:] = stay
+        last = getattr(self, "last_batch", None)
+        if last is not None and not getattr(last, "is_empty", lambda: True)():
+            if any(getattr(r, "is_sr_draft", False) is True for r in last.reqs):
+                self.last_batch = None
+
+    def _sr_run_http_batch(self) -> None:
+        """One ordinary generate tick for Draft HTTP reqs (no RPC this loop)."""
+        self._sr_park_sr_reqs()
+        batch = self.get_next_batch_to_run()
+        if batch is not None and batch.reqs:
+            keep = [
+                i for i, r in enumerate(batch.reqs) if self._sr_is_http_req(r)
+            ]
+            if keep:
+                if len(keep) != len(batch.reqs):
+                    batch.filter_batch(keep_indices=keep)
+                self.cur_batch = batch
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+                self.last_batch = batch
+                return
+        self.cur_batch = None
+        self.self_check_during_idle()
+
+    def _sr_isolate_need(self, need_rids: set) -> None:
+        """Park every scheduler req that is not in this RPC's need set.
+
+        `_sr_run_until_ready` uses the global get_next_batch_to_run; without
+        this, leftover waiting/running reqs mix into the GPU batch and blow up
+        VL M-RoPE / KV gather. Sibling rids of the **same** RPC belong in
+        ``need_rids`` so they share one fused forward.
+        """
+        running = getattr(self, "running_batch", None)
+        if running is not None and not running.is_empty():
+            keep: List[int] = []
+            to_pause: List[Req] = []
+            for i, r in enumerate(running.reqs):
+                if r.rid in need_rids:
+                    keep.append(i)
+                else:
+                    to_pause.append(r)
+            if len(keep) != len(running.reqs):
+                running.filter_batch(keep_indices=keep)
+            for r in to_pause:
+                r.draft_is_paused = True
+                if r not in self.draft_paused_reqs:
+                    self.draft_paused_reqs.append(r)
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting:
+            stay = []
+            for r in list(waiting):
+                if r.rid in need_rids:
+                    stay.append(r)
+                else:
+                    r.draft_is_paused = True
+                    if r not in self.draft_paused_reqs:
+                        self.draft_paused_reqs.append(r)
+            waiting[:] = stay
+        last = getattr(self, "last_batch", None)
+        if last is not None and not getattr(last, "is_empty", lambda: True)():
+            if any(getattr(r, "rid", None) not in need_rids for r in last.reqs):
+                self.last_batch = None
+
+    def _sr_make_decode_batch(self, reqs: List[Req]) -> ScheduleBatch:
+        device = getattr(self, "device", "cuda")
+
+        def _seq_len(r: Req) -> int:
+            committed = int(getattr(r, "kv_committed_len", 0) or 0)
+            if committed > 0:
+                return committed
+            return max(0, len(r.origin_input_ids) + len(r.output_ids or []) - 1)
+
+        seq_lens_list = [_seq_len(r) for r in reqs]
+        batch = ScheduleBatch(
+            reqs=list(reqs),
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            forward_mode=ForwardMode.DECODE,
+            device=device,
+        )
+        batch.req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        )
+        batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=device
+        )
+        batch.out_cache_loc = None
+        batch.seq_lens_sum = sum(seq_lens_list)
+        batch.output_ids = torch.tensor(
+            [
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in reqs
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        batch.return_logprob = any(r.return_logprob for r in reqs)
+        batch.top_logprobs_nums = [
+            r.top_logprobs_num if r.return_logprob else 0 for r in reqs
+        ]
+        batch.token_ids_logprobs = [
+            r.token_ids_logprob if r.return_logprob else None for r in reqs
+        ]
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        return batch
+
+    def _sr_park_in_running(self, req: Req) -> None:
+        self._sr_park_in_running_many([req])
+
+    def _sr_park_in_running_many(self, reqs: List[Req]) -> None:
+        running = getattr(self, "running_batch", None)
+        in_running = set()
+        if running is not None and not running.is_empty():
+            in_running = set(running.reqs)
+        fresh = [
+            r
+            for r in reqs
+            if r.req_pool_idx is not None and r not in in_running
+        ]
+        if not fresh:
+            return
+        decode_batch = self._sr_make_decode_batch(fresh)
+        if running is None or running.is_empty():
+            self.running_batch = decode_batch
+        else:
+            running.merge_batch(decode_batch)
+
+    def _sr_finish_rid(self, rid: str, release_mm: bool = True) -> None:
+        state = self.sr_state.delete(rid)
+        if state is None:
+            return
+        req = state.req_object
+        if req is None:
+            return
+        self._sr_remove_req(req)
+        if not req.finished():
+            req.to_abort = True
+            req.finished_reason = FINISH_ABORT("Target request finished")
+        if req.req_pool_idx is not None:
+            self.sr_kv.release_all_kv_for_finished_req(req)
+        if release_mm:
+            release_mm_resources(req.multimodal_inputs)
+        req.multimodal_inputs = None
+
+    def _sr_is_terminal_finished(self, req: Req) -> bool:
+        """Length cap is not a real end; Target FINISH/ABORT / EOS is."""
+        if not req.finished():
+            return False
+        return not isinstance(req.finished_reason, FINISH_LENGTH)
+
+    def _sr_ensure_window_budget(
+        self, req: Req, num_draft_tokens: Optional[int]
+    ) -> None:
+        """Raise max_new_tokens so this window cannot trip FINISH_LENGTH.
+
+        Isolate + pause stops extra GPU work. A lifetime cap of ~9 made STEP
+        return empty windows and Target fall back to AR.
+        """
+        sp = req.sampling_params
+        already = len(req.output_ids or [])
+        need = draft_needed_max_new_tokens(
+            already,
+            num_draft_tokens,
+            self.server_args.speculative_num_steps,
+            getattr(sp, "max_new_tokens", None),
+        )
+        if getattr(sp, "max_new_tokens", 0) < need:
+            sp.max_new_tokens = need
+        if isinstance(getattr(req, "finished_reason", None), FINISH_LENGTH):
+            req.finished_reason = None
+            req.to_abort = False
+
+    def _sr_create_req(
+        self,
+        dreq: SRDraftRequest,
+        mm: Optional[SRMMPayload],
+        session_id: str,
+    ) -> Optional[Req]:
+        rid = dreq.rid
+        if self.sr_state.exists(rid):
+            self._sr_finish_rid(rid, release_mm=False)
+
+        input_ids = list(dreq.padded_input_ids or [])
+        if mm is not None and mm.padded_input_ids:
+            mismatch = _padded_ids_mismatch(input_ids, list(mm.padded_input_ids))
+            if mismatch is not None:
+                logger.warning(
+                    "[SR] padded_input_ids mismatch for %s at %s; skip spec",
+                    rid,
+                    mismatch,
+                )
+                return None
+        if not input_ids:
+            logger.warning("[SR] PREFILL without padded_input_ids for %s", rid)
+            return None
+
+        sampling_params = dreq.sampling_params
+        if sampling_params is None:
+            from sglang.srt.sampling.sampling_params import SamplingParams
+
+            sampling_params = SamplingParams()
+        if hasattr(sampling_params, "normalize"):
+            try:
+                sampling_params.normalize(self.tokenizer)
+            except Exception:
+                _fix_sampling_params_stop_strs(sampling_params)
+        else:
+            _fix_sampling_params_stop_strs(sampling_params)
+
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=False,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            lora_id=None,
+            input_embeds=None,
+            custom_logit_processor=None,
+            return_hidden_states=False,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            bootstrap_host=None,
+            bootstrap_port=8998,
+            bootstrap_room=None,
+            vocab_size=self.model_config.vocab_size,
+        )
+        req.tokenizer = self.tokenizer
+        req.sr_padded_ids = list(input_ids)
+        committed = list(dreq.committed_ids or [])
+        req.origin_input_ids = list(input_ids) + committed
+        req.origin_input_ids_unpadded = list(req.origin_input_ids)
+        req.fill_ids = list(req.origin_input_ids)
+        req.extend_input_len = len(req.fill_ids)
+        req.output_ids = []
+        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.draft_tokens_target = dreq.num_draft_tokens
+        req.draft_generation_start_len = 0
+        req.sr_step_id = dreq.step_id
+        req.draft_is_paused = False
+        req.is_sr_draft = True
+        self._sr_ensure_window_budget(req, dreq.num_draft_tokens)
+
+        if mm is not None:
+            mm_inputs = mm.to_multimodal_inputs()
+            req.extend_image_inputs(mm_inputs)
+            mm.attached = True
+            self._maybe_compute_mrope_positions(req)
+
+        self.sr_waiting.append(req)
+        self.sr_state.set(
+            rid,
+            SRDraftState(
+                req_id=rid,
+                session_id=session_id,
+                last_step_id=dreq.step_id,
+                last_base_committed_len=dreq.base_committed_len,
+                req_object=req,
+            ),
+        )
+        return req
+
+    def _sr_align(
+        self, req: Req, dreq: SRDraftRequest, state: SRDraftState
+    ) -> None:
+        padded = list(getattr(req, "sr_padded_ids", None) or req.origin_input_ids)
+        local = list(req.origin_input_ids) + list(req.output_ids or [])
+        target = list(padded) + list(dreq.committed_ids or [])
+        if local == target:
+            req.draft_generation_start_len = len(req.output_ids or [])
+            req.draft_tokens_target = dreq.num_draft_tokens
+            return
+
+        prefix_len = self.sr_kv.get_prefix_len(req)
+        kind = classify_prefix_alignment(local, target, prefix_len)
+        current_kv = int(getattr(req, "kv_allocated_len", 0) or 0)
+        if current_kv <= 0:
+            current_kv = max(0, len(local) - 1)
+        _, fork = find_fork_point(local, target)
+
+        if kind == "replace_tail":
+            req.output_ids[-1] = target[-1]
+            req.draft_generation_start_len = len(req.output_ids)
+            req.draft_tokens_target = dreq.num_draft_tokens
+            return
+        if kind in ("append_one", "append_n"):
+            req.output_ids.extend(target[len(local) :])
+            req.draft_generation_start_len = len(req.output_ids)
+            req.draft_tokens_target = dreq.num_draft_tokens
+            return
+        if kind == "local_rollback" and fork == len(target) and self.sr_kv.rollback(
+            req, fork, current_kv
+        ):
+            extra = len(local) - fork
+            if extra > 0 and req.output_ids:
+                keep = max(0, len(req.output_ids) - extra)
+                req.output_ids = req.output_ids[:keep]
+            req.draft_generation_start_len = len(req.output_ids)
+            req.draft_tokens_target = dreq.num_draft_tokens
+            return
+        self._sr_reprefill(req, target, dreq, state)
+
+    def _sr_run_window(self, req: Req, dreq: SRDraftRequest) -> None:
+        self._sr_run_window_batch([(dreq, req)])
+
+    def _sr_run_window_batch(
+        self, pairs: List[Tuple[SRDraftRequest, Req]]
+    ) -> None:
+        reqs: List[Req] = []
+        for dreq, req in pairs:
+            self._sr_ensure_window_budget(req, dreq.num_draft_tokens)
+            req.draft_tokens_target = dreq.num_draft_tokens
+            reqs.append(req)
+        if reqs:
+            self._sr_run_until_ready(reqs)
+
+    def _sr_token_lens_for_seed(self, reqs: List[Req], batch) -> Optional[List[int]]:
+        if batch is None:
+            return None
+        lens = getattr(batch, "extend_lens", None)
+        if lens is not None and len(lens) == len(reqs):
+            return [int(x) for x in lens]
+        fallback = [int(getattr(r, "extend_input_len", 0) or 0) for r in reqs]
+        if fallback and all(x > 0 for x in fallback):
+            return fallback
+        return None
+
+    def _sr_cache_tree_seed(self, req: Req, result) -> None:
+        self._sr_cache_tree_seeds([req], result)
+
+    def _sr_cache_tree_seeds(
+        self, reqs: List[Req], result, batch=None
+    ) -> None:
+        """Cache one tree seed per req. ``reqs`` must match the GPU batch rows."""
+        logits_output = getattr(result, "logits_output", None)
+        if logits_output is None or logits_output.next_token_logits is None:
+            return
+        hidden = getattr(logits_output, "hidden_states", None)
+        if hidden is None:
+            return
+        logits = logits_output.next_token_logits
+        n = len(reqs)
+        token_lens = self._sr_token_lens_for_seed(reqs, batch)
+        try:
+            from sglang.srt.speculative.spec_utils import fast_topk
+
+            topk = max(1, int(self.server_args.speculative_eagle_topk or 1))
+            skipped: List[str] = []
+            for i, req in enumerate(reqs):
+                row_logits = slice_decode_batch_row(logits, i, n, token_lens)
+                row_hidden = slice_decode_batch_row(hidden, i, n, token_lens)
+                if row_logits is None or row_hidden is None:
+                    skipped.append(req.rid)
+                    continue
+                probs = torch.softmax(row_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+                token_id = (
+                    req.output_ids[-1]
+                    if req.output_ids
+                    else req.origin_input_ids[-1]
+                )
+                verified_id = torch.tensor(
+                    [token_id], dtype=torch.int64, device=row_logits.device
+                )
+                req.sr_tree_seed = (topk_p, topk_index, row_hidden, verified_id)
+            if skipped:
+                logger.warning(
+                    "[SR] skip tree seed for %s: logits/hidden %s/%s "
+                    "batch=%s extend_lens=%s",
+                    skipped,
+                    tuple(logits.shape),
+                    tuple(hidden.shape),
+                    n,
+                    token_lens,
+                )
+        except Exception as e:
+            logger.warning(
+                "[SR] cache tree seed failed for %s: %s",
+                [r.rid for r in reqs],
+                e,
+            )
+
+    def _sr_run_until_allocated(self, req: Req) -> None:
+        self._sr_materialize_prefix_batch([req])
+
+    def _sr_materialize_prefix(self, req: Req) -> None:
+        self._sr_materialize_prefix_batch([req])
+
+    def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
+        """Prefill until every req has a pool slot; drop any sampled extras."""
+        need = [r for r in reqs if r.req_pool_idx is None]
+        if not need:
+            return
+        need_rids = {r.rid for r in need}
+        self._sr_isolate_need(need_rids)
+        for req in need:
+            self._sr_resume_req(req)
+            if req not in self.sr_waiting:
+                self.sr_waiting.append(req)
+            if req not in self.waiting_queue:
+                self.waiting_queue.append(req)
+        for _ in range(8):
+            still = [r for r in need if r.req_pool_idx is None]
+            if not still:
+                break
+            still_rids = {r.rid for r in still}
+            self._sr_isolate_need(still_rids)
+            batch = self.get_next_batch_to_run()
+            if batch is None or not batch.reqs:
+                break
+            keep = [i for i, r in enumerate(batch.reqs) if r.rid in still_rids]
+            if not keep:
+                break
+            if len(keep) != len(batch.reqs):
+                batch.filter_batch(keep_indices=keep)
+            batch.return_hidden_states = True
+            self.cur_batch = batch
+            result = self.run_batch(batch)
+            self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
+            self.process_batch_result(batch, result)
+            self.last_batch = batch
+            is_extend = (
+                batch.forward_mode is not None and batch.forward_mode.is_extend()
+            ) or getattr(batch, "is_extend_in_batch", False)
+            if is_extend and len(keep) == len(still):
+                break
+        for req in need:
+            req.output_ids = []
+            req.draft_generation_start_len = 0
+            if not self._sr_is_terminal_finished(req):
+                self._sr_pause_req(req)
+        self.last_batch = None
+
+    def _sr_kv_len(self, req: Req) -> int:
+        committed = int(getattr(req, "kv_committed_len", 0) or 0)
+        if committed > 0:
+            return committed
+        allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+        if allocated > 0:
+            return allocated
+        return max(0, len(req.origin_input_ids))
+
+    def _sr_ingest_committed(self, req: Req) -> None:
+        self._sr_ingest_committed_batch([req])
+
+    def _sr_ingest_committed_batch(self, reqs: List[Req]) -> None:
+        """Teacher-force committed tails into linear KV via fused chain decode.
+
+        Align only appends Target ids onto ``output_ids``. Chain then forwards
+        that last token with ``prepare_for_decode``. Tree used to skip that and
+        expand on prompt KV, so only layer-0 matched (accept len stuck at 2).
+        Tails may differ in length: each step only runs reqs that still have a
+        token at that offset.
+        """
+        if not reqs:
+            return
+        snapshots = []
+        for req in reqs:
+            committed = list(req.output_ids or [])
+            tail = committed_tail_not_in_kv(
+                len(req.origin_input_ids), committed, self._sr_kv_len(req)
+            )
+            snapshots.append(
+                (req, committed, tail, len(committed) - len(tail))
+            )
+        for t, active_idx in enumerate(
+            ingest_active_indices(
+                [len(tail) for _, _, tail, _ in snapshots]
+            )
+        ):
+            active: List[Req] = []
+            for i in active_idx:
+                req, committed, _tail, already = snapshots[i]
+                req.output_ids = committed[: already + t + 1]
+                req.draft_generation_start_len = len(req.output_ids)
+                req.draft_tokens_target = 1
+                self._sr_ensure_window_budget(req, 1)
+                active.append(req)
+            if active:
+                self._sr_run_until_ready(active, capture_tree_seed=True)
+        for req, committed, _, _ in snapshots:
+            req.output_ids = committed
+            req.draft_generation_start_len = len(committed)
+
+    def _sr_tree_expand(self, req: Req) -> SRWindow:
+        return self._sr_tree_expand_batch([req])[0]
+
+    def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
+        empty: SRWindow = ([], None, None)
+        if not reqs:
+            return []
+        self._sr_materialize_prefix_batch(reqs)
+        self._sr_ingest_committed_batch(reqs)
+        windows: List[SRWindow] = [empty] * len(reqs)
+        ready: List[Req] = []
+        ready_idx: List[int] = []
+        for i, req in enumerate(reqs):
+            leftover = committed_tail_not_in_kv(
+                len(req.origin_input_ids),
+                req.output_ids,
+                self._sr_kv_len(req),
+            )
+            if leftover:
+                logger.warning(
+                    "[SR] tree ingest left %s token(s) out of KV for %s",
+                    len(leftover),
+                    req.rid,
+                )
+                continue
+            if req.req_pool_idx is None or self.sr_tree_drafter is None:
+                continue
+            if getattr(req, "sr_tree_seed", None) is None:
+                continue
+            ready.append(req)
+            ready_idx.append(i)
+        if not ready:
+            return windows
+        for req in ready:
+            self._sr_resume_req(req)
+        self._sr_park_in_running_many(ready)
+        try:
+            got = self.sr_tree_drafter.expand_batch(ready)
+        except Exception as e:
+            logger.warning(
+                "[SR] tree expand failed for %s: %s",
+                [r.rid for r in ready],
+                e,
+            )
+            got = [empty] * len(ready)
+        finally:
+            for req in ready:
+                if not self._sr_is_terminal_finished(req):
+                    self._sr_pause_req(req)
+            self.last_batch = None
+        for j, idx in enumerate(ready_idx):
+            windows[idx] = got[j]
+        return windows
+
+    def _sr_reprefill(
+        self,
+        req: Req,
+        target_fill_ids: List[int],
+        dreq: SRDraftRequest,
+        state: SRDraftState,
+    ) -> None:
+        self._sr_remove_req(req)
+        if req.req_pool_idx is not None:
+            self.sr_kv.release_all_kv_for_finished_req(req)
+        req.fill_ids = list(target_fill_ids)
+        req.origin_input_ids = list(target_fill_ids)
+        req.output_ids = []
+        req.prefix_indices = []
+        req.extend_input_len = len(req.fill_ids)
+        req.draft_tokens_target = dreq.num_draft_tokens
+        req.draft_generation_start_len = 0
+        req.last_node = None
+        req.kv_committed_len = 0
+        req.kv_committed_freed = False
+        req.kv_overallocated_freed = False
+        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.sr_tree_seed = None
+        if req.multimodal_inputs is not None:
+            reset_mm_mrope(req.multimodal_inputs)
+            self._maybe_compute_mrope_positions(req)
+        if req not in self.sr_waiting:
+            self.sr_waiting.append(req)
+
+    def _sr_run_until_ready(
+        self, reqs: List[Req], capture_tree_seed: bool = False
+    ) -> None:
+        need = {r.rid: r for r in reqs}
+        need_rids = set(need.keys())
+        self._sr_isolate_need(need_rids)
+        parked: List[Req] = []
+        for req in reqs:
+            self._sr_resume_req(req)
+            if req not in self.sr_waiting and req.req_pool_idx is None:
+                self.sr_waiting.append(req)
+            if req.req_pool_idx is None:
+                if req not in self.waiting_queue:
+                    self.waiting_queue.append(req)
+            else:
+                parked.append(req)
+        self._sr_park_in_running_many(parked)
+
+        guard = 0
+        max_steps = max(
+            int(self.server_args.speculative_num_steps or 1) + 4, 8
+        ) * max(1, len(reqs))
+        while need and guard < max_steps:
+            guard += 1
+            still = []
+            for rid, req in list(need.items()):
+                produced = len(req.output_ids) - int(
+                    getattr(req, "draft_generation_start_len", 0) or 0
+                )
+                target = int(getattr(req, "draft_tokens_target", 0) or 0)
+                if target <= 0:
+                    target = int(self.server_args.speculative_num_steps or 1)
+                if produced >= target or self._sr_is_terminal_finished(req):
+                    still.append(rid)
+            for rid in still:
+                need.pop(rid, None)
+            if not need:
+                break
+            self._sr_isolate_need(set(need.keys()))
+            batch = self.get_next_batch_to_run()
+            if batch is not None and batch.reqs:
+                keep = [i for i, r in enumerate(batch.reqs) if r.rid in need]
+                if not keep:
+                    break
+                if len(keep) != len(batch.reqs):
+                    batch.filter_batch(keep_indices=keep)
+            self.cur_batch = batch
+            if batch:
+                if capture_tree_seed:
+                    batch.return_hidden_states = True
+                result = self.run_batch(batch)
+                if capture_tree_seed:
+                    self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
+                self.process_batch_result(batch, result)
+                self.last_batch = batch
+            else:
+                break
+
+        for req in reqs:
+            if not self._sr_is_terminal_finished(req):
+                self._sr_pause_req(req)
+        self.last_batch = None
+
+    def _sr_extract_window(self, req: Req, dreq: SRDraftRequest) -> SRWindow:
+        start = int(getattr(req, "draft_generation_start_len", 0) or 0)
+        tokens = list(req.output_ids[start:])
+        n = dreq.num_draft_tokens or len(tokens)
+        return tokens[:n], None, None
+
+    def _sr_empty_reply(
+        self, dreq: SRDraftRequest, status: SRReplyStatus = SRReplyStatus.EMPTY
+    ) -> SRDraftReply:
+        return SRDraftReply(
+            rid=dreq.rid,
+            step_id=dreq.step_id,
+            base_committed_len=dreq.base_committed_len,
+            draft_tokens=[],
+            status=status,
+        )
+
+    def _sr_stamp_window(
+        self,
+        dreq: SRDraftRequest,
+        window: SRWindow,
+        rpc_seq: int,
+        session_id: str,
+        status: Optional[SRReplyStatus] = None,
+    ) -> SRDraftReply:
+        tokens, pl, ix = window
+        st = self.sr_state.get(dreq.rid)
+        if st is not None:
+            st.last_step_id = dreq.step_id
+            st.last_base_committed_len = dreq.base_committed_len
+            st.last_rpc_seq = rpc_seq
+            st.last_window = window
+            st.session_id = session_id
+            st.last_updated_time = time.time()
+        if status is None:
+            status = SRReplyStatus.OK if tokens else SRReplyStatus.EMPTY
+        return SRDraftReply(
+            rid=dreq.rid,
+            step_id=dreq.step_id,
+            base_committed_len=dreq.base_committed_len,
+            draft_tokens=list(tokens),
+            status=status,
+            parent_list=pl,
+            top_scores_index=ix,
+        )
+
+    def _sr_prepare_one(
+        self,
+        dreq: SRDraftRequest,
+        action: SRAction,
+        session_id: str,
+        rpc_seq: int,
+        mm: Optional[SRMMPayload],
+        last_session_id: Optional[str],
+        last_rpc_seq: int,
+    ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
+        """CPU decision + align. Returns (early_reply, None) or (None, live_req)."""
+        state = self.sr_state.get(dreq.rid)
+        req = state.req_object if state is not None else None
+        decision = decide_draft_action(
+            action=action,
+            session_id=session_id,
+            rpc_seq=rpc_seq,
+            last_session_id=last_session_id,
+            last_rpc_seq=last_rpc_seq,
+            last_step_id=state.last_step_id if state is not None else -1,
+            last_base_committed_len=(
+                state.last_base_committed_len if state is not None else -1
+            ),
+            step_id=dreq.step_id,
+            base_committed_len=dreq.base_committed_len,
+            has_state=state is not None and req is not None,
+        )
+        empty = self._sr_empty_reply(dreq)
+        if decision in (
+            DraftDecision.DROP_OLD_SESSION,
+            DraftDecision.DROP_STALE_SEQ,
+        ):
+            empty.status = SRReplyStatus.REJECT
+            return empty, None
+        if decision == DraftDecision.FINISH:
+            self._sr_finish_rid(dreq.rid)
+            empty.status = SRReplyStatus.OK
+            return empty, None
+        if decision == DraftDecision.IDEMPOTENT:
+            if state is not None and state.last_window is not None:
+                tokens, pl, ix = state.last_window
+                return (
+                    SRDraftReply(
+                        rid=dreq.rid,
+                        step_id=dreq.step_id,
+                        base_committed_len=dreq.base_committed_len,
+                        draft_tokens=list(tokens),
+                        status=SRReplyStatus.IDEMPOTENT,
+                        parent_list=pl,
+                        top_scores_index=ix,
+                    ),
+                    None,
+                )
+            return empty, None
+        if decision == DraftDecision.HARD_RESET:
+            req = self._sr_create_req(dreq, mm, session_id)
+            if req is None:
+                return empty, None
+        elif decision == DraftDecision.WIPE_NEW_SESSION:
+            # Batch-level wipe already ran for this session_id; do not wipe
+            # siblings created earlier in the same RPC.
+            if self.sr_state.session_id != session_id:
+                self._sr_wipe_all()
+                self.sr_state.session_id = session_id
+            if dreq.padded_input_ids:
+                req = self._sr_create_req(dreq, mm, session_id)
+                if req is None:
+                    return empty, None
+            else:
+                return empty, None
+        else:
+            if req is None:
+                if dreq.padded_input_ids:
+                    req = self._sr_create_req(dreq, mm, session_id)
+                    if req is None:
+                        return empty, None
+                else:
+                    return empty, None
+            else:
+                self._sr_align(req, dreq, state)
+
+        if req is None:
+            return empty, None
+        return None, req
+
+    def _sr_produce_windows(
+        self,
+        action: SRAction,
+        pairs: List[Tuple[SRDraftRequest, Req]],
+    ) -> List[SRWindow]:
+        if not pairs:
+            return []
+        reqs = [req for _, req in pairs]
+        if self._sr_tree_mode():
+            if action == SRAction.PREFILL:
+                self._sr_materialize_prefix_batch(reqs)
+                return [([], None, None)] * len(pairs)
+            return self._sr_tree_expand_batch(reqs)
+        # Chain: teacher-force newly appended committed tokens into KV before
+        # generating the next window. append_one used to fold that into the
+        # first draft decode; append_n cannot (KV would skip the middle ids).
+        self._sr_ingest_committed_batch(reqs)
+        self._sr_run_window_batch(pairs)
+        return [self._sr_extract_window(req, dreq) for dreq, req in pairs]
+
+    def _sr_handle_one(
+        self,
+        dreq: SRDraftRequest,
+        action: SRAction,
+        session_id: str,
+        rpc_seq: int,
+        mm: Optional[SRMMPayload],
+        last_session_id: Optional[str],
+        last_rpc_seq: int,
+    ) -> SRDraftReply:
+        reply, req = self._sr_prepare_one(
+            dreq,
+            action,
+            session_id,
+            rpc_seq,
+            mm,
+            last_session_id,
+            last_rpc_seq,
+        )
+        if reply is not None:
+            return reply
+        windows = self._sr_produce_windows(action, [(dreq, req)])
+        return self._sr_stamp_window(dreq, windows[0], rpc_seq, session_id)
+
+    def _sr_handle_batch(
+        self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]
+    ) -> SRBatchReply:
+        last_session = self.sr_state.session_id
+        last_rpc = self.sr_server.last_rpc_seq if self.sr_server is not None else -1
+        wiped_this_batch = (
+            last_session is not None and batch.session_id > last_session
+        )
+        if wiped_this_batch:
+            self._sr_wipe_all()
+            # New session resets Target rpc_seq to 0. Do not apply the previous
+            # session's last_rpc_seq to this batch or PREFILL is DROP_STALE_SEQ.
+            last_rpc = -1
+        self.sr_state.session_id = batch.session_id
+        n = len(batch.reqs)
+        replies: List[Optional[SRDraftReply]] = [None] * n
+        gpu_pairs: List[Tuple[int, SRDraftRequest, Req]] = []
+        # After a batch-level wipe, later rids must see the new session so
+        # decide_draft_action does not WIPE_NEW_SESSION again and drop siblings.
+        prepare_last_session = (
+            batch.session_id if wiped_this_batch else last_session
+        )
+        prepare_last_rpc = -1 if wiped_this_batch else last_rpc
+        for i, dreq in enumerate(batch.reqs):
+            reply, req = self._sr_prepare_one(
+                dreq,
+                batch.action,
+                batch.session_id,
+                batch.rpc_seq,
+                mm_by_rid.get(dreq.rid),
+                prepare_last_session,
+                prepare_last_rpc,
+            )
+            if reply is not None:
+                replies[i] = reply
+            else:
+                gpu_pairs.append((i, dreq, req))
+        if gpu_pairs:
+            windows = self._sr_produce_windows(
+                batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
+            )
+            for (i, dreq, _req), window in zip(gpu_pairs, windows):
+                replies[i] = self._sr_stamp_window(
+                    dreq, window, batch.rpc_seq, batch.session_id
+                )
+        if self.sr_server is not None:
+            self.sr_server.remember(batch)
+        return SRBatchReply(
+            session_id=batch.session_id,
+            rpc_seq=batch.rpc_seq,
+            reqs=[r if r is not None else self._sr_empty_reply(d) for r, d in zip(replies, batch.reqs)],
+        )
+
+    def _sr_recv_packet(self):
+        packet = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if self.sr_server is not None:
+                packet = self.sr_server.recv_batch(timeout_ms=50)
+                if packet is not None:
+                    batch, mm = packet
+                    mm_pickled = {
+                        rid: p.to_pickleable() for rid, p in mm.items()
+                    }
+                    packet = (batch.to_dict(), mm_pickled)
+        if self.tp_size > 1:
+            packet = broadcast_pyobj(
+                packet,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        if packet is None:
+            return None
+        batch_d, mm_d = packet
+        batch = SRBatchRequest.from_dict(batch_d)
+        mm = {
+            rid: SRMMPayload.from_pickleable(d) for rid, d in (mm_d or {}).items()
+        }
+        return batch, mm
+
+    @DynamicGradMode()
+    def event_loop_normal_standalone_remote_draft(self) -> None:
+        self._init_sr_draft()
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            packet = self._sr_recv_packet()
+            if packet is not None:
+                batch, mm = packet
+                if self.sr_server is not None and self.sr_server.is_stale(batch):
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "[SR] Draft drop stale session=%s rpc_seq=%s",
+                            batch.session_id,
+                            batch.rpc_seq,
+                        )
+                else:
+                    reply = self._sr_handle_batch(batch, mm)
+                    if (
+                        (self.tp_size == 1 or self.tp_rank == 0)
+                        and self.sr_server is not None
+                        and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                    ):
+                        self.sr_server.send_batch(reply)
+                self.last_batch = None
+                self._sr_resume_http_reqs()
+                continue
+            self._sr_run_http_batch()

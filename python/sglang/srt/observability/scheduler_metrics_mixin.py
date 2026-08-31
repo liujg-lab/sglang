@@ -626,10 +626,7 @@ class SchedulerMetricsMixin:
 
         # SPECTRE draft is ordinary AR (no verify). Accept-rate stats belong to Target;
         # draft never calls update_spec_metrics, so spec_num_forward_ct stays 0.
-        skip_spec_stats = self.spec_algorithm.is_none() or (
-            self.spec_algorithm.is_spectre()
-            and self.server_args.spectre_role == "draft"
-        )
+        skip_spec_stats = self.spec_algorithm.is_none() or self.is_remote_spec_draft
         if skip_spec_stats:
             spec_accept_length = 0
             spec_accept_rate = 0

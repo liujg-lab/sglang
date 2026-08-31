@@ -324,6 +324,15 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.sr_stale_replies_dropped_total = Counter(
+            name="sglang:sr_stale_replies_dropped_total",
+            documentation=(
+                "STANDALONE_REMOTE stale RPC replies dropped "
+                "(reason=session|rpc_seq|step|base_len)."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
         # Retract
         # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
@@ -883,6 +892,14 @@ class SchedulerMetricsCollector:
 
     def set_spectre_mm_pending_bytes(self, n: int) -> None:
         self.spectre_mm_pending_bytes.labels(**self.labels).set(n)
+
+    def increment_sr_stale_replies_dropped(
+        self, n: int = 1, reason: str = "rpc_seq"
+    ) -> None:
+        if n > 0:
+            self.sr_stale_replies_dropped_total.labels(
+                **self.labels, reason=reason
+            ).inc(n)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)

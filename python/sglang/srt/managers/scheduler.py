@@ -215,6 +215,12 @@ from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import
 from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
     SchedulerSpectreTargetMixin,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+    StandaloneRemoteDraftSchedulerMixin as SchedulerStandaloneRemoteDraftMixin,
+)
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+    SchedulerStandaloneRemoteTargetMixin,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -297,6 +303,8 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerSpectreDraftMixin,
     SchedulerSpectreTargetMixin,
+    SchedulerStandaloneRemoteDraftMixin,
+    SchedulerStandaloneRemoteTargetMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -439,6 +447,7 @@ class Scheduler(
         self.init_request_dispatcher()
 
         self.init_spectre_communication()
+        self.init_standalone_remote_communication()
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -498,6 +507,17 @@ class Scheduler(
 
         self.spec_forward_cycle = 0
 
+    def init_standalone_remote_communication(self):
+        if not self.spec_algorithm.is_standalone_remote():
+            return
+        role = self.server_args.standalone_remote_role
+        if role not in ("target", "draft"):
+            raise ValueError(f"Invalid STANDALONE_REMOTE role: {role}")
+        if role == "draft":
+            self.paused_reqs: List[Req] = []
+            self.paused_reqs_lock = threading.RLock()
+            self.draft_paused_reqs: List[Req] = []
+
     def _validate_spectre_draft_multimodal(self) -> None:
         """[SPECTRE-VL] Draft 自跑 ViT 就必须能自己算 M-RoPE。
 
@@ -505,7 +525,10 @@ class Scheduler(
         那样 VL 请求会拿到纯文本位置编码：不报错，只表现为接受率莫名很低。
         与其静默跑错，不如启动就失败。
         """
-        if self.server_args.spectre_role != "draft":
+        if self.server_args.spectre_role != "draft" and not (
+            self.spec_algorithm.is_standalone_remote()
+            and self.server_args.standalone_remote_role == "draft"
+        ):
             return
         if not self.model_config.is_multimodal:
             return
@@ -715,6 +738,14 @@ class Scheduler(
         if (
             self.spec_algorithm.is_spectre()
             and self.server_args.spectre_role == "draft"
+        ):
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
+        if (
+            self.spec_algorithm.is_standalone_remote()
+            and self.server_args.standalone_remote_role == "draft"
         ):
             self.draft_worker = None
             self.external_corpus_manager = None
@@ -2442,10 +2473,14 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         paused_count = 0
-        if self.server_args.spectre_role == "draft":
-            with self.paused_reqs_lock:
-                if hasattr(self, "paused_reqs"):
-                    paused_count = len(self.paused_reqs)
+        if self.is_remote_spec_draft:
+            lock = getattr(self, "paused_reqs_lock", None)
+            if lock is not None:
+                with lock:
+                    if hasattr(self, "paused_reqs"):
+                        paused_count = len(self.paused_reqs)
+            elif hasattr(self, "paused_reqs"):
+                paused_count = len(self.paused_reqs)
 
         # Total occupied slots = running + paused
         total_occupied = running_bs + paused_count
@@ -2826,10 +2861,7 @@ class Scheduler(
             if (
                 self.spec_algorithm.is_none()
                 or self.enable_overlap
-                or (
-                    self.spec_algorithm.is_spectre()
-                    and self.server_args.spectre_role == "draft"
-                )
+                or self.is_remote_spec_draft
             ):
                 # TpModelWorker (including SPECTRE draft) needs ModelWorkerBatch.
                 # SpectreWorker on Target still consumes ScheduleBatch below.
@@ -3143,6 +3175,19 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
 
+        # STANDALONE_REMOTE Draft: paused RPC/HTTP and sr_state hold KV that
+        # flush_cache must not reset.
+        if getattr(self, "is_remote_spec_draft", False):
+            sr_state = getattr(self, "sr_state", None)
+            if sr_state is not None and getattr(sr_state, "active", None):
+                idle &= len(sr_state.active) == 0
+            paused = getattr(self, "draft_paused_reqs", None)
+            if paused:
+                idle &= len(paused) == 0
+            sr_waiting = getattr(self, "sr_waiting", None)
+            if sr_waiting:
+                idle &= len(sr_waiting) == 0
+
         return idle
 
     def attach_hicache_storage_wrapped(
@@ -3260,6 +3305,8 @@ class Scheduler(
 
             if self.spec_algorithm.is_spectre():
                 self.reset_spectre_target_state()
+            if self.spec_algorithm.is_standalone_remote():
+                self.reset_standalone_remote_target_state()
 
             # TODO: allow optional empty cache
             torch.cuda.empty_cache()
@@ -3364,9 +3411,18 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        draft_http_abort = bool(getattr(self, "is_remote_spec_draft", False))
+        if (
+            recv_req.abort_all
+            and self.spec_algorithm.is_standalone_remote()
+            and not draft_http_abort
+        ):
+            self.reset_standalone_remote_target_state()
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
+            if draft_http_abort and getattr(req, "is_sr_draft", False) is True:
+                continue
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
@@ -3398,6 +3454,28 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if draft_http_abort:
+            paused = getattr(self, "draft_paused_reqs", None) or []
+            keep_paused = []
+            for req in list(paused):
+                if getattr(req, "is_sr_draft", False) is True:
+                    keep_paused.append(req)
+                    continue
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    if req.req_pool_idx is None:
+                        self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                    else:
+                        req.to_finish = FINISH_ABORT()
+                        resume = getattr(self, "_sr_resume_req", None)
+                        if callable(resume):
+                            resume(req)
+                        park = getattr(self, "_sr_park_in_running_many", None)
+                        if callable(park):
+                            park([req])
+                    continue
+                keep_paused.append(req)
+            self.draft_paused_reqs = keep_paused
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
@@ -3455,6 +3533,8 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
+            if draft_http_abort and getattr(req, "is_sr_draft", False) is True:
+                continue
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
@@ -3469,6 +3549,8 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
+        if self.spec_algorithm.is_standalone_remote():
+            self.reset_standalone_remote_target_state()
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
@@ -3518,6 +3600,8 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+        if self.spec_algorithm.is_standalone_remote():
+            self.reset_standalone_remote_target_state()
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
@@ -3700,6 +3784,16 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
+        elif (
+            scheduler.spec_algorithm.is_standalone_remote()
+            and server_args.standalone_remote_role == "draft"
+        ):
+            scheduler.event_loop_normal_standalone_remote_draft()
+        elif (
+            scheduler.spec_algorithm.is_standalone_remote()
+            and server_args.standalone_remote_role == "target"
+        ):
+            scheduler.event_loop_normal_standalone_remote_target()
         elif server_args.spectre_role == "draft":
             scheduler.event_loop_normal_spectre_draft()
         elif (

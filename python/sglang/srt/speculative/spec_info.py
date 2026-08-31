@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spectre.verifier.spectre_worker import (
         SpectreWorker,
     )
+    from sglang.srt.speculative.standalone_remote.verifier.sr_worker import (
+        StandaloneRemoteWorker,
+    )
 
 
 class SpeculativeAlgorithm(Enum):
@@ -23,6 +26,7 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     SPECTRE = auto()
+    STANDALONE_REMOTE = auto()
     NONE = auto()
 
     @classmethod
@@ -53,6 +57,9 @@ class SpeculativeAlgorithm(Enum):
     def is_spectre(self) -> bool:
         return self == SpeculativeAlgorithm.SPECTRE
 
+    def is_standalone_remote(self) -> bool:
+        return self == SpeculativeAlgorithm.STANDALONE_REMOTE
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
@@ -62,6 +69,7 @@ class SpeculativeAlgorithm(Enum):
             Type[TpModelWorker],
             Type[NGRAMWorker],
             Type[SpectreWorker],
+            Type[StandaloneRemoteWorker],
         ]
     ]:
         assert (
@@ -126,6 +134,19 @@ class SpeculativeAlgorithm(Enum):
             # Target-only verifier. SPECTRE draft skips create_worker in
             # Scheduler.maybe_init_draft_worker and uses TpModelWorker.
             return SpectreWorker
+        elif self.is_standalone_remote():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.standalone_remote.verifier.sr_worker import (
+                StandaloneRemoteWorker,
+            )
+
+            # Target-only verifier. STANDALONE_REMOTE draft skips create_worker
+            # in Scheduler.maybe_init_draft_worker and uses TpModelWorker.
+            return StandaloneRemoteWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

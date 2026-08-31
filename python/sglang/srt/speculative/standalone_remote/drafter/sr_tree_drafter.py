@@ -1,0 +1,305 @@
+"""STANDALONE-style top-k tree expansion on the remote Draft process.
+
+Uses the Draft server's existing TpModelWorker (no second weight load).
+Linear KV stays the Target committed prefix; tree KV is ephemeral.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
+
+from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import organize_draft_results
+from sglang.srt.speculative.spec_utils import (
+    assign_draft_cache_locs,
+    fast_topk,
+    maybe_detect_nan,
+    maybe_detect_oob,
+    select_top_k_tokens,
+)
+from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+    advance_tree_draft_positions,
+)
+from sglang.srt.utils import next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+logger = logging.getLogger(__name__)
+
+SRTreeWindow = Tuple[List[int], Optional[List[int]], Optional[List[int]]]
+
+
+class SRTreeDrafter:
+    def __init__(self, scheduler) -> None:
+        self.scheduler = scheduler
+        self.server_args = scheduler.server_args
+        self.draft_model_runner = scheduler.tp_worker.model_runner
+        self.device = getattr(scheduler, "device", None) or self.draft_model_runner.device
+        self.topk = max(1, int(self.server_args.speculative_eagle_topk or 1))
+        self.speculative_num_steps = max(
+            1, int(self.server_args.speculative_num_steps or 1)
+        )
+        self.speculative_num_draft_tokens = int(
+            self.server_args.speculative_num_draft_tokens
+            or (self.speculative_num_steps + 1)
+        )
+        self.page_size = int(self.server_args.page_size or 1)
+        self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
+        self.req_to_token_pool = scheduler.req_to_token_pool
+        self.model_config = scheduler.model_config
+        self.num_new_pages_per_topk = torch.empty(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self.draft_attn_backend = None
+        self._init_attention_backend()
+
+    def _init_attention_backend(self) -> None:
+        if self.speculative_num_steps <= 1:
+            return
+        try:
+            factory = DraftBackendFactory(
+                self.server_args,
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_attn_backend = factory.create_decode_backend()
+        except Exception as e:
+            logger.warning("[SR] tree draft attention backend unavailable: %s", e)
+            self.draft_attn_backend = None
+
+    def expand(self, req: "Req") -> SRTreeWindow:
+        """Expand a STANDALONE tree from a seed captured after chain ingest."""
+        return self.expand_batch([req])[0]
+
+    def expand_batch(self, reqs: List["Req"]) -> List[SRTreeWindow]:
+        """Fused tree expand for every req that has a pool slot and a seed."""
+        empty: SRTreeWindow = ([], None, None)
+        if not reqs:
+            return []
+        windows: List[SRTreeWindow] = [empty] * len(reqs)
+        keep: List["Req"] = []
+        keep_idx: List[int] = []
+        for i, req in enumerate(reqs):
+            if req.req_pool_idx is None:
+                continue
+            if getattr(req, "sr_tree_seed", None) is None:
+                continue
+            keep.append(req)
+            keep_idx.append(i)
+        if not keep:
+            return windows
+        try:
+            parent_list, top_scores_index, draft_tokens = self._expand_tree(
+                keep, *self._stack_seeds(keep)
+            )
+        except Exception as e:
+            logger.warning(
+                "[SR] tree expand_batch failed for %s: %s; falling back per-req",
+                [r.rid for r in keep],
+                e,
+            )
+            for j, req in enumerate(keep):
+                windows[keep_idx[j]] = self._expand_one(req)
+            return windows
+        for j, idx in enumerate(keep_idx):
+            windows[idx] = (
+                draft_tokens[j].detach().to("cpu").tolist(),
+                parent_list[j].detach().to("cpu").tolist(),
+                top_scores_index[j].detach().to("cpu").tolist(),
+            )
+        return windows
+
+    def _expand_one(self, req: "Req") -> SRTreeWindow:
+        empty: SRTreeWindow = ([], None, None)
+        seed = getattr(req, "sr_tree_seed", None)
+        if req.req_pool_idx is None or seed is None:
+            return empty
+        try:
+            parent_list, top_scores_index, draft_tokens = self._expand_tree(
+                [req], *self._stack_seeds([req])
+            )
+        except Exception as e:
+            logger.warning("[SR] tree expand failed for %s: %s", req.rid, e)
+            return empty
+        return (
+            draft_tokens[0].detach().to("cpu").tolist(),
+            parent_list[0].detach().to("cpu").tolist(),
+            top_scores_index[0].detach().to("cpu").tolist(),
+        )
+
+    def _stack_seeds(
+        self, reqs: List["Req"]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ps: List[torch.Tensor] = []
+        ixs: List[torch.Tensor] = []
+        hs: List[torch.Tensor] = []
+        vs: List[torch.Tensor] = []
+        for req in reqs:
+            topk_p, topk_index, hidden_states, verified_id = req.sr_tree_seed
+            if topk_p.dim() == 1:
+                topk_p = topk_p.unsqueeze(0)
+            if topk_index.dim() == 1:
+                topk_index = topk_index.unsqueeze(0)
+            if hidden_states.dim() == 1:
+                hidden_states = hidden_states.unsqueeze(0)
+            elif hidden_states.dim() == 3:
+                hidden_states = hidden_states[:, -1, :]
+            if verified_id.dim() == 0:
+                verified_id = verified_id.unsqueeze(0)
+            ps.append(topk_p[:1])
+            ixs.append(topk_index[:1])
+            hs.append(hidden_states[:1])
+            vs.append(verified_id.reshape(-1)[:1])
+        return (
+            torch.cat(ps, dim=0),
+            torch.cat(ixs, dim=0),
+            torch.cat(hs, dim=0),
+            torch.cat(vs, dim=0),
+        )
+
+    def _expand_tree(
+        self,
+        reqs: List["Req"],
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+        verified_id: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        scheduler = self.scheduler
+        batch = scheduler._sr_make_decode_batch(reqs)
+        spec_info = EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            verified_id=verified_id,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
+        batch.spec_info = spec_info
+        batch.return_hidden_states = False
+        token_to_kv_pool_state_backup = self._alloc_tree_kv(batch)
+        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch = batch.get_model_worker_batch()
+        prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
+        try:
+            if self.draft_attn_backend is not None:
+                self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            if (
+                self.draft_attn_backend is not None
+                and self.speculative_num_steps > 1
+                and not forward_batch.forward_mode.is_idle()
+            ):
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            parent_list, top_scores_index, draft_tokens = self._draft_forward(
+                forward_batch
+            )
+        finally:
+            self.draft_model_runner.draft_attn_backend = prev_draft_backend
+            self.token_to_kv_pool_allocator.restore_state(
+                token_to_kv_pool_state_backup
+            )
+        return parent_list, top_scores_index, draft_tokens
+
+    def _alloc_tree_kv(self, batch: "ScheduleBatch"):
+        if self.page_size != 1:
+            raise RuntimeError("SR tree draft requires page_size=1")
+        num_seqs = batch.batch_size()
+        alloc_len = self.speculative_num_steps * self.topk
+        out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
+            batch.tree_cache,
+            num_seqs * alloc_len,
+            backup_state=True,
+        )
+        assign_draft_cache_locs[(num_seqs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            self.extend_lens,
+            self.num_new_pages_per_topk,
+            out_cache_loc,
+            None,
+            None,
+            None,
+            0,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps + self.page_size),
+        )
+        batch.out_cache_loc = out_cache_loc
+        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+        return token_to_kv_pool_state_backup
+
+    def _draft_forward(self, forward_batch: ForwardBatch):
+        spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "SR draft_forward: NaN in seed topk_p")
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+        score_list: List[torch.Tensor] = []
+        token_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+        scores = None
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+            if i == self.speculative_num_steps - 1:
+                break
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            advance_tree_draft_positions(
+                forward_batch.positions,
+                getattr(forward_batch, "mrope_positions", None),
+            )
+            if self.draft_attn_backend is not None:
+                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
+            logits_output = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+            maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"SR draft_forward step {i}: topk_index OOB",
+            )
+            hidden_states = logits_output.hidden_states
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )

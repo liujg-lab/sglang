@@ -2120,7 +2120,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.spec_algorithm.is_spectre()
                 and get_global_server_args().spectre_role == "draft"
             )
-            if not spectre_draft:
+            standalone_remote_draft = (
+                self.spec_algorithm.is_standalone_remote()
+                and get_global_server_args().standalone_remote_role == "draft"
+            )
+            if not spectre_draft and not standalone_remote_draft:
                 return
 
         if self.sampling_info.penalizer_orchestrator.is_required:

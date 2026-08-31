@@ -1,0 +1,167 @@
+"""Alignment and identity decisions for STANDALONE_REMOTE Draft."""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import List, Optional, Sequence, Tuple
+
+from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
+
+class DraftDecision(Enum):
+    DROP_OLD_SESSION = "drop_old_session"
+    WIPE_NEW_SESSION = "wipe_new_session"
+    DROP_STALE_SEQ = "drop_stale_seq"
+    IDEMPOTENT = "idempotent"
+    FULL_REALIGN = "full_realign"
+    HARD_RESET = "hard_reset"
+    FINISH = "finish"
+
+
+def find_fork_point(draft_ids: Sequence[int], target_ids: Sequence[int]) -> Tuple[bool, int]:
+    min_len = min(len(draft_ids), len(target_ids))
+    for i in range(min_len):
+        if draft_ids[i] != target_ids[i]:
+            return False, i
+    return len(draft_ids) == len(target_ids), min_len
+
+
+def classify_prefix_alignment(
+    local: Sequence[int],
+    target: Sequence[int],
+    prefix_len: int,
+) -> str:
+    """Return one of: equal, replace_tail, append_one, append_n, local_rollback, reprefill."""
+    identical, fork = find_fork_point(local, target)
+    if identical:
+        return "equal"
+    if len(local) == len(target) and fork == len(local) - 1:
+        return "replace_tail"
+    extra = len(target) - len(local)
+    if extra >= 1 and fork == len(local):
+        # Target accepted one or more tokens on top of Draft's prefix.
+        # append_one is the n=1 case (common after AR fallback).
+        return "append_one" if extra == 1 else "append_n"
+    # Trim only when Target's sequence is a prefix of local. A mid-sequence
+    # fork still needs the rest of `target` (reprefill), not a blind trim.
+    if fork == len(target) and fork < len(local) and fork >= prefix_len:
+        return "local_rollback"
+    return "reprefill"
+
+
+def decide_draft_action(
+    action: SRAction,
+    session_id: str,
+    rpc_seq: int,
+    last_session_id: Optional[str],
+    last_rpc_seq: int,
+    last_step_id: int,
+    last_base_committed_len: int,
+    step_id: int,
+    base_committed_len: int,
+    has_state: bool,
+) -> DraftDecision:
+    if action in (SRAction.FINISH, SRAction.ABORT):
+        return DraftDecision.FINISH
+    if last_session_id is not None and session_id < last_session_id:
+        return DraftDecision.DROP_OLD_SESSION
+    if last_session_id is not None and session_id > last_session_id:
+        if action == SRAction.PREFILL:
+            return DraftDecision.HARD_RESET
+        return DraftDecision.WIPE_NEW_SESSION
+    if last_session_id is not None and rpc_seq <= last_rpc_seq:
+        return DraftDecision.DROP_STALE_SEQ
+    if action == SRAction.PREFILL:
+        return DraftDecision.HARD_RESET
+    if not has_state:
+        return DraftDecision.FULL_REALIGN
+    if (
+        step_id == last_step_id
+        and base_committed_len == last_base_committed_len
+    ):
+        return DraftDecision.IDEMPOTENT
+    return DraftDecision.FULL_REALIGN
+
+
+def draft_token_budget(num_draft_tokens: Optional[int], spec_steps: Optional[int]) -> int:
+    """Slack for one Draft window (not a lifetime cap). Pause stops the GPU."""
+    n = int(num_draft_tokens or 0)
+    if n <= 0:
+        n = int(spec_steps or 1) + 1
+    return max(n + 4, 8)
+
+
+def draft_needed_max_new_tokens(
+    already_generated: int,
+    num_draft_tokens: Optional[int],
+    spec_steps: Optional[int],
+    current_max: Optional[int] = None,
+) -> int:
+    """Lifetime max_new_tokens so the next window can finish without FINISH_LENGTH."""
+    need = int(already_generated) + draft_token_budget(num_draft_tokens, spec_steps)
+    return max(int(current_max or 0), need)
+
+
+def committed_tail_not_in_kv(
+    origin_len: int,
+    output_ids: Optional[Sequence[int]],
+    kv_len: int,
+) -> List[int]:
+    """Committed output tokens that are not yet in linear KV.
+
+    ``kv_len`` is ``kv_committed_len`` (prefix + ingested outputs). Align only
+    mutates ``output_ids``; tree ingest must decode this tail before expand.
+    """
+    already = max(0, int(kv_len) - int(origin_len))
+    return list(output_ids or [])[already:]
+
+
+def ingest_active_indices(tail_lens: Sequence[int]) -> List[List[int]]:
+    """For fused tree ingest: at offset t, which reqs still have a tail token."""
+    max_t = max(tail_lens) if tail_lens else 0
+    return [
+        [i for i, n in enumerate(tail_lens) if t < int(n)]
+        for t in range(max_t)
+    ]
+
+
+def shift_overlapped_prefill_drafts(
+    output_ids: Sequence[int],
+    draft_tokens: Sequence[int],
+) -> Optional[List[int]]:
+    """Drop PREFILL draft prefix that Target already sampled during overlapped extend.
+
+    PREFILL is sent before GPU, so Draft's window is the prompt continuation
+    ``[D0, D1, ...]``. After extend, Target has ``T0`` in ``output_ids``. Same-model
+    greedy means ``D0 == T0``; verify must use ``[D1, ...]`` with root ``T0``.
+
+    Returns remaining draft tokens. ``None`` means the window diverged (discard;
+    the next STEP realigns). Empty ``output_ids`` keeps the full window.
+    """
+    committed = list(output_ids or [])
+    drafts = list(draft_tokens or [])
+    if not drafts:
+        return []
+    n = 0
+    while n < len(committed) and n < len(drafts) and committed[n] == drafts[n]:
+        n += 1
+    if committed and n == 0:
+        return None
+    return drafts[n:]
+
+
+def drop_duplicate_root_draft(
+    last_committed: Optional[int], draft_tokens: Sequence[int]
+) -> List[int]:
+    """Drop a leading draft token that duplicates EAGLE's verify root.
+
+    Verify uses ``output_ids[-1]`` as ``verified_id``. If the window starts with
+    that same id, the first candidate is a repeat and greedy accept length
+    collapses to 1.
+    """
+    tokens = list(draft_tokens or [])
+    if last_committed is None or not tokens:
+        return tokens
+    if tokens[0] == last_committed:
+        return tokens[1:]
+    return tokens
