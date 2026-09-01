@@ -10,8 +10,9 @@ Draft 等下一段已提交前缀再生成。
 （通常 ``D0 == T0``），verify 从 ``D1`` 开始。若 ``topk>1``，PREFILL 只填 Draft KV，
 第一棵树在 ``T0`` 之后的 STEP 才到。Decode STEP 始终是阻塞 send+recv。
 
-本模式 **不是** SPECTRE：无流水线、无乱序 mm 旁路、无熔断、无 C++ ZMQ 扩展。
-传输用 pyzmq DEALER/ROUTER。
+本模式 **不是** SPECTRE：无流水线、无乱序 mm 旁路、无 C++ ZMQ 扩展。
+传输用 pyzmq DEALER/ROUTER。同步 RPC 上有 Draft 状态 TTL、连续超时熔断
+（跳过 STEP，退回 1-token AR），以及 Draft 忙时快速 REJECT。
 
 ## 启动
 
@@ -41,7 +42,7 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --speculative-num-draft-tokens 5 \
   --standalone-remote-addr 127.0.0.1 \
   --standalone-remote-port 30019 \
-  --page-size 1 --disable-cuda-graph --skip-server-warmup \
+  --page-size 1 --skip-server-warmup \
   --port 30000
 
 # Draft — RPC 服务 :30019（不要 --skip-tokenizer-init）
@@ -55,7 +56,7 @@ CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
   --context-length 32768 \
   --standalone-remote-addr 127.0.0.1 \
   --standalone-remote-port 30019 \
-  --page-size 1 --disable-cuda-graph
+  --page-size 1
 ```
 
 Draft 的 HTTP warmup 可以跑完（空闲循环会跑普通 generate）。
@@ -87,6 +88,23 @@ Target **connect**。跨机时，Target 的 `--standalone-remote-addr` 填 Draft
 评测：`POST http://<target-host>:30000/generate`。Draft HTTP 是可选双通道，
 GPU 时间与投机 RPC 共享。
 
+## 容错（同步 RPC）
+
+这些都是 SR 自己的同步路径，不是 SPECTRE 的异步缓冲。
+
+- **Draft TTL**（`--standalone-remote-draft-ttl-s`，默认 60s，`<=0` 关闭）：
+  Target abort / 崩溃且没发 FINISH 时，Draft 会丢掉空闲 RPC 的 KV。
+  当前 RPC 里的 rid 不会被清掉。
+- **连续超时熔断**（`--standalone-remote-breaker-failures` 默认 3，
+  `--standalone-remote-breaker-cooldown` 默认 32）：Target 连续 recv 超时后
+  跳过 STEP RPC，decode 走 1-token AR；冷却结束后试一次 STEP。
+  PREFILL 在 OPEN 时仍会发出（探活）。Draft **REJECT**（忙）不算超时。
+  `/flush_cache` 会 reset 熔断器。
+- **Draft 忙 REJECT**：running batch（或其中的 HTTP 请求数）超过
+  `--standalone-remote-max-batch-size` 时，Draft 立刻回 REJECT、不跑 GPU。
+  有任意 HTTP 存活就 REJECT 会把 warmup 期间的每一拍 RPC 都打掉，所以不用那种启发式。
+  Target 把非 OK 回复当成空窗，该步退回 AR。
+
 ## 约束
 
 - ``topk=1``（默认）是链：Draft AR 窗口，Target EAGLE 核验。
@@ -99,13 +117,22 @@ GPU 时间与投机 RPC 共享。
   （Target 一次接受超过 1 个 token 时走 ``append_n``），再从该前缀展开树。
   整段 re-prefill 只用于序列中段分叉，不用于更长的已接受后缀。
 - overlap scheduler 与 mixed chunked prefill 关闭。
+- Target verify 复用 EAGLE 树核验：structured output 走 `generate_token_bitmask`；
+  `return_logprob` 只写接受路径（含 bonus）。Hybrid Mamba/GDN/Lightning 走与 EAGLE 相同的
+  MTP scatter（`mamba_track_interval >= speculative_num_draft_tokens`，建议 extra_buffer）。
+  Draft 在 PREFILL 用同一份 json/regex/ebnf schema 编译 grammar，每窗生成前按 committed
+  前缀 replay；编译失败则 Draft 不约束，Target mask 仍保证正确性。
 - Draft GPU 按 RPC 融合，类似同进程 STANDALONE 的 `draft(batch)`：align 仍按 rid，
   然后链窗口 / 树 ingest / 树 expand 对本 RPC 里所有活 rid 各跑一次。
   `_sr_isolate_need` 只 pause **不在** 本 RPC 里的请求（调度器残留），不 pause 同 RPC 的兄弟 rid。
   Draft 上的 HTTP generate 在 RPC 拍内同样被 pause，拍后再 resume；
   HTTP 与 RPC 不会进入同一个 `ScheduleBatch`。
 - `page_size>1` 且 `topk>1` 不支持（树 KV 只支持 `page_size=1`）。
-- CUDA graph：Phase 1 请用 `--disable-cuda-graph`（树的 CUDA graph 是后续工作）。
+- CUDA graph 默认开启：Target 捕获 `TARGET_VERIFY`（`ntpb = speculative_num_draft_tokens`）
+  以及 SPECTRE 同款的 `ntpb=1` DECODE graph；`can_run` / replay 按 forward mode 分流。
+  Draft 链（`topk=1`）走普通 DECODE graph；Draft 树复用 v1 `EAGLEDraftCudaGraphRunner`
+  （不捕获 draft-extend graph，也不走 spec v2 / plan stream）。
+  树仍要求 `page_size=1`。Target 1-token AR fallback **强制 eager**，不 replay verify graph。
 - 视觉仅 Qwen3-VL：`Qwen3VLForConditionalGeneration` /
   `Qwen3VLMoeForConditionalGeneration`。
 - Draft **禁止** `--skip-tokenizer-init`（3D M-RoPE）。
@@ -139,7 +166,7 @@ accept rate 低可以接受。缺 token、重复 token、过早 EOS 才是 bug�
 | 现象 | 可能原因 |
 |---|---|
 | accept rate 接近 0，无报错 | `padded_input_ids` / 视觉几何不一致；或过期回复错位（看上面的 counter） |
-| Draft 卡住 | Target 没发 FINISH；abort 掉 Target 上的请求 |
+| Draft 卡住 | Target 没发 FINISH；abort 掉 Target 上的请求。超过 `--standalone-remote-draft-ttl-s` 后 Draft 会自己丢掉空闲 KV |
 | Draft 上 `q_len` flashinfer 报错 | `prepare_for_decode` 没有收成 last token（remote draft 路径） |
 | `/flush_cache` 之后 VL 崩 `128 vs 64` embeddings | Draft wipe 必须在 **没有** HTTP 请求存活时 reset radix / waiting_queue / last_batch / VLM embedding cache（HTTP flush 到不了 Draft） |
 | 并发 VL `gather kernel index out of bounds` | Draft `_sr_run_until_ready` 混进了调度器残留请求；isolate 必须 pause **本 RPC 之外** 的 rid |

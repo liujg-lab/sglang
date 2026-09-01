@@ -25,6 +25,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     draft_needed_max_new_tokens,
     find_fork_point,
     ingest_active_indices,
+    replay_grammar_from_committed,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     slice_decode_batch_row,
@@ -75,9 +76,27 @@ def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
     return None
 
 
+def _sr_is_cuda_context_error(exc: BaseException) -> bool:
+    """True when the GPU context is already poisoned (do not keep running)."""
+    name = type(exc).__name__
+    if name in ("AcceleratorError", "CUDAError"):
+        return True
+    accel = getattr(torch, "AcceleratorError", None)
+    if accel is not None and isinstance(exc, accel):
+        return True
+    msg = str(exc).lower()
+    return (
+        "illegal memory access" in msg
+        or "cudaerrorillegaladdress" in msg
+    )
+
+
 class StandaloneRemoteDraftSchedulerMixin:
     def _init_sr_draft(self) -> None:
-        self.sr_state = SRDraftStateManager()
+        ttl = float(
+            getattr(self.server_args, "standalone_remote_draft_ttl_s", 60.0) or 0.0
+        )
+        self.sr_state = SRDraftStateManager(timeout_threshold=ttl)
         self.sr_kv = SRKVRollbacker(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -124,6 +143,51 @@ class StandaloneRemoteDraftSchedulerMixin:
         if chunked is not None:
             candidates.append(chunked)
         return any(self._sr_is_http_req(r) for r in candidates if r is not None)
+
+    def _sr_draft_busy(self) -> bool:
+        """True when HTTP / leftover GPU work is too large to start a new RPC window.
+
+        Any alive HTTP req would REJECT every Target RPC during warmup, so this
+        only trips when the running batch (or its HTTP subset) exceeds the cap.
+        """
+        cap = int(
+            getattr(
+                getattr(self, "server_args", None),
+                "standalone_remote_max_batch_size",
+                32,
+            )
+            or 32
+        )
+        running = getattr(self, "running_batch", None)
+        if running is None:
+            return False
+        is_empty = getattr(running, "is_empty", None)
+        if callable(is_empty) and is_empty() is True:
+            return False
+        bsz = getattr(running, "batch_size", 0)
+        bsz = bsz() if callable(bsz) else bsz
+        try:
+            bsz = int(bsz or 0)
+        except (TypeError, ValueError):
+            bsz = 0
+        if bsz > cap:
+            return True
+        reqs = getattr(running, "reqs", None) or []
+        http_n = sum(1 for r in reqs if r is not None and self._sr_is_http_req(r))
+        return http_n > cap
+
+    def _sr_cleanup_stale_drafts(self, keep_rids=None) -> None:
+        manager = getattr(self, "sr_state", None)
+        if manager is None:
+            return
+        popped = manager.cleanup_stale_states(keep_rids=keep_rids)
+        for state in popped:
+            logger.info(
+                "[SR] Draft TTL expired rid=%s idle=%.1fs",
+                state.req_id,
+                time.time() - state.last_updated_time,
+            )
+            self._sr_finish_rid(state.req_id, state=state)
 
     def _sr_wipe_all(self) -> None:
         """Drop previous-session Draft RPC state. Target flush_cache never
@@ -391,9 +455,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
         return batch
 
-    def _sr_park_in_running(self, req: Req) -> None:
-        self._sr_park_in_running_many([req])
-
     def _sr_park_in_running_many(self, reqs: List[Req]) -> None:
         running = getattr(self, "running_batch", None)
         in_running = set()
@@ -412,8 +473,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         else:
             running.merge_batch(decode_batch)
 
-    def _sr_finish_rid(self, rid: str, release_mm: bool = True) -> None:
-        state = self.sr_state.delete(rid)
+    def _sr_finish_rid(
+        self,
+        rid: str,
+        release_mm: bool = True,
+        state: Optional[SRDraftState] = None,
+    ) -> None:
+        if state is None:
+            state = self.sr_state.delete(rid)
         if state is None:
             return
         req = state.req_object
@@ -535,6 +602,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             mm.attached = True
             self._maybe_compute_mrope_positions(req)
 
+        self._sr_attach_grammar(req)
+
         self.sr_waiting.append(req)
         self.sr_state.set(
             rid,
@@ -547,6 +616,71 @@ class StandaloneRemoteDraftSchedulerMixin:
             ),
         )
         return req
+
+    def _sr_attach_grammar(self, req: Req) -> None:
+        """Compile Target's schema on Draft. Failure leaves grammar unset."""
+        from concurrent.futures import Future
+
+        from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
+
+        gm = getattr(self, "grammar_manager", None)
+        if gm is None:
+            return
+        try:
+            added = gm.process_req_with_grammar(req)
+        except Exception as e:
+            logger.warning("[SR] Draft grammar compile failed for %s: %s", req.rid, e)
+            req.grammar = None
+            return
+        if added:
+            gm.grammar_queue = [r for r in gm.grammar_queue if r is not req]
+            grammar = req.grammar
+            if isinstance(grammar, Future):
+                try:
+                    grammar = grammar.result()
+                    req.grammar = grammar
+                    if (
+                        getattr(req, "grammar_key", None) is not None
+                        and gm.grammar_backend is not None
+                    ):
+                        gm.grammar_backend.set_cache(
+                            req.grammar_key, grammar.copy()
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[SR] Draft grammar future failed for %s: %s", req.rid, e
+                    )
+                    req.grammar = None
+                    return
+        if req.grammar is None or isinstance(req.grammar, InvalidGrammarObject):
+            if isinstance(req.grammar, InvalidGrammarObject):
+                logger.warning(
+                    "[SR] invalid grammar for %s: %s",
+                    req.rid,
+                    getattr(req.grammar, "error_message", ""),
+                )
+            req.grammar = None
+            return
+        try:
+            req.sr_grammar_template = req.grammar.copy()
+        except Exception as e:
+            logger.warning(
+                "[SR] Draft grammar copy failed for %s: %s", req.rid, e
+            )
+            req.grammar = None
+
+    def _sr_replay_grammars(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            template = getattr(req, "sr_grammar_template", None)
+            if template is None:
+                continue
+            try:
+                req.grammar = replay_grammar_from_committed(
+                    template, req.output_ids or []
+                )
+            except Exception as e:
+                logger.warning("[SR] grammar replay failed for %s: %s", req.rid, e)
+                req.grammar = None
 
     def _sr_align(
         self, req: Req, dreq: SRDraftRequest, state: SRDraftState
@@ -588,9 +722,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             return
         self._sr_reprefill(req, target, dreq, state)
 
-    def _sr_run_window(self, req: Req, dreq: SRDraftRequest) -> None:
-        self._sr_run_window_batch([(dreq, req)])
-
     def _sr_run_window_batch(
         self, pairs: List[Tuple[SRDraftRequest, Req]]
     ) -> None:
@@ -612,9 +743,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         if fallback and all(x > 0 for x in fallback):
             return fallback
         return None
-
-    def _sr_cache_tree_seed(self, req: Req, result) -> None:
-        self._sr_cache_tree_seeds([req], result)
 
     def _sr_cache_tree_seeds(
         self, reqs: List[Req], result, batch=None
@@ -662,23 +790,81 @@ class StandaloneRemoteDraftSchedulerMixin:
                     token_lens,
                 )
         except Exception as e:
+            if _sr_is_cuda_context_error(e):
+                logger.error(
+                    "[SR] cache tree seed CUDA context error for %s: %s",
+                    [r.rid for r in reqs],
+                    e,
+                )
+                raise
             logger.warning(
                 "[SR] cache tree seed failed for %s: %s",
                 [r.rid for r in reqs],
                 e,
             )
 
-    def _sr_run_until_allocated(self, req: Req) -> None:
-        self._sr_materialize_prefix_batch([req])
+    def _sr_intercept_retract_enqueue(self, req: Req) -> bool:
+        """Handle scheduler KV retract for Target-RPC drafts.
 
-    def _sr_materialize_prefix(self, req: Req) -> None:
-        self._sr_materialize_prefix_batch([req])
+        Generic retract requeues onto ``waiting_queue`` and re-prefills
+        ``origin + output`` with the prompt-length M-RoPE tensor. That path
+        illegal-memory-accesses Qwen-VL. Return True to skip enqueue.
+        """
+        if getattr(req, "is_sr_draft", False) is not True:
+            return False
+        self._sr_on_scheduler_retract(req)
+        return True
+
+    def _sr_on_scheduler_retract(self, req: Req) -> None:
+        fill_ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
+        if not fill_ids:
+            fill_ids = list(getattr(req, "sr_padded_ids", None) or [])
+        self._sr_reset_linear_kv_state(req, fill_ids)
+        self._sr_pause_req(req)
+
+    def _sr_reset_linear_kv_state(self, req: Req, fill_ids: List[int]) -> None:
+        """Drop linear KV bookkeeping and rebuild fill/origin for a full re-prefill."""
+        self._sr_remove_req(req)
+        if req.req_pool_idx is not None:
+            kv = getattr(self, "sr_kv", None)
+            if kv is not None:
+                kv.release_all_kv_for_finished_req(req)
+        req.fill_ids = list(fill_ids)
+        req.origin_input_ids = list(fill_ids)
+        req.output_ids = []
+        req.prefix_indices = []
+        req.extend_input_len = len(req.fill_ids)
+        req.draft_generation_start_len = 0
+        req.last_node = None
+        req.kv_committed_len = 0
+        req.kv_committed_freed = False
+        req.kv_overallocated_freed = False
+        req.logprob_start_len = max(0, len(req.origin_input_ids) - 1)
+        req.sr_tree_seed = None
+        if req.multimodal_inputs is not None:
+            reset_mm_mrope(req.multimodal_inputs)
+            maybe = getattr(self, "_maybe_compute_mrope_positions", None)
+            if callable(maybe):
+                maybe(req)
+
+    def _sr_prepare_retracted_for_materialize(self, req: Req) -> None:
+        if not (
+            getattr(req, "is_retracted", False)
+            or getattr(req, "retracted_stain", False)
+        ):
+            return
+        if not (req.output_ids or []):
+            return
+        fill_ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
+        self._sr_reset_linear_kv_state(req, fill_ids)
 
     def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
         """Prefill until every req has a pool slot; drop any sampled extras."""
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
             return
+        for req in need:
+            self._sr_prepare_retracted_for_materialize(req)
         need_rids = {r.rid for r in need}
         self._sr_isolate_need(need_rids)
         for req in need:
@@ -728,9 +914,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             return allocated
         return max(0, len(req.origin_input_ids))
 
-    def _sr_ingest_committed(self, req: Req) -> None:
-        self._sr_ingest_committed_batch([req])
-
     def _sr_ingest_committed_batch(self, reqs: List[Req]) -> None:
         """Teacher-force committed tails into linear KV via fused chain decode.
 
@@ -770,15 +953,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.output_ids = committed
             req.draft_generation_start_len = len(committed)
 
-    def _sr_tree_expand(self, req: Req) -> SRWindow:
-        return self._sr_tree_expand_batch([req])[0]
-
     def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
         empty: SRWindow = ([], None, None)
         if not reqs:
             return []
         self._sr_materialize_prefix_batch(reqs)
         self._sr_ingest_committed_batch(reqs)
+        self._sr_replay_grammars(reqs)
         windows: List[SRWindow] = [empty] * len(reqs)
         ready: List[Req] = []
         ready_idx: List[int] = []
@@ -831,25 +1012,8 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
     ) -> None:
-        self._sr_remove_req(req)
-        if req.req_pool_idx is not None:
-            self.sr_kv.release_all_kv_for_finished_req(req)
-        req.fill_ids = list(target_fill_ids)
-        req.origin_input_ids = list(target_fill_ids)
-        req.output_ids = []
-        req.prefix_indices = []
-        req.extend_input_len = len(req.fill_ids)
+        self._sr_reset_linear_kv_state(req, target_fill_ids)
         req.draft_tokens_target = dreq.num_draft_tokens
-        req.draft_generation_start_len = 0
-        req.last_node = None
-        req.kv_committed_len = 0
-        req.kv_committed_freed = False
-        req.kv_overallocated_freed = False
-        req.logprob_start_len = len(req.origin_input_ids) - 1
-        req.sr_tree_seed = None
-        if req.multimodal_inputs is not None:
-            reset_mm_mrope(req.multimodal_inputs)
-            self._maybe_compute_mrope_positions(req)
         if req not in self.sr_waiting:
             self.sr_waiting.append(req)
 
@@ -1064,32 +1228,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         # generating the next window. append_one used to fold that into the
         # first draft decode; append_n cannot (KV would skip the middle ids).
         self._sr_ingest_committed_batch(reqs)
+        self._sr_replay_grammars(reqs)
         self._sr_run_window_batch(pairs)
         return [self._sr_extract_window(req, dreq) for dreq, req in pairs]
-
-    def _sr_handle_one(
-        self,
-        dreq: SRDraftRequest,
-        action: SRAction,
-        session_id: str,
-        rpc_seq: int,
-        mm: Optional[SRMMPayload],
-        last_session_id: Optional[str],
-        last_rpc_seq: int,
-    ) -> SRDraftReply:
-        reply, req = self._sr_prepare_one(
-            dreq,
-            action,
-            session_id,
-            rpc_seq,
-            mm,
-            last_session_id,
-            last_rpc_seq,
-        )
-        if reply is not None:
-            return reply
-        windows = self._sr_produce_windows(action, [(dreq, req)])
-        return self._sr_stamp_window(dreq, windows[0], rpc_seq, session_id)
 
     def _sr_handle_batch(
         self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]
@@ -1105,6 +1246,24 @@ class StandaloneRemoteDraftSchedulerMixin:
             # session's last_rpc_seq to this batch or PREFILL is DROP_STALE_SEQ.
             last_rpc = -1
         self.sr_state.session_id = batch.session_id
+        self._sr_cleanup_stale_drafts(keep_rids={d.rid for d in batch.reqs})
+        if (
+            batch.action not in (SRAction.FINISH, SRAction.ABORT)
+            and self._sr_draft_busy()
+        ):
+            logger.info(
+                "[SR] Draft busy, REJECT rpc_seq=%s n=%s",
+                batch.rpc_seq,
+                len(batch.reqs),
+            )
+            return SRBatchReply(
+                session_id=batch.session_id,
+                rpc_seq=batch.rpc_seq,
+                reqs=[
+                    self._sr_empty_reply(d, status=SRReplyStatus.REJECT)
+                    for d in batch.reqs
+                ],
+            )
         n = len(batch.reqs)
         replies: List[Optional[SRDraftReply]] = [None] * n
         gpu_pairs: List[Tuple[int, SRDraftRequest, Req]] = []
@@ -1198,4 +1357,5 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self.last_batch = None
                 self._sr_resume_http_reqs()
                 continue
+            self._sr_cleanup_stale_drafts()
             self._sr_run_http_batch()

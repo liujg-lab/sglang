@@ -60,6 +60,74 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone_remote(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE_REMOTE
 
+    def uses_spec_topk_cuda_graph_layout(self) -> bool:
+        """Draft-tree CUDA graph pads tokens as ``bs * topk`` (EAGLE / STANDALONE / SR)."""
+        return self.is_eagle() or self.is_standalone() or self.is_standalone_remote()
+
+    def captures_target_verify_cuda_graph(
+        self, server_args: "ServerArgs", is_draft_worker: bool = False
+    ) -> bool:
+        """Whether CudaGraphRunner should capture TARGET_VERIFY (not DECODE).
+
+        STANDALONE_REMOTE Draft must stay on DECODE so chain ``run_batch`` can
+        replay ordinary decode graphs. Only the Target role captures verify.
+        """
+        if is_draft_worker:
+            return False
+        if self.is_eagle() or self.is_standalone() or self.is_ngram():
+            return True
+        if self.is_spectre() and getattr(server_args, "spectre_role", None) != "draft":
+            return True
+        if (
+            self.is_standalone_remote()
+            and getattr(server_args, "standalone_remote_role", None) == "target"
+        ):
+            return True
+        return False
+
+    def uses_dual_ntpb_cuda_graph(
+        self, server_args: "ServerArgs", is_draft_worker: bool = False
+    ) -> bool:
+        """Capture both TARGET_VERIFY and ntpb=1 DECODE graphs (SPECTRE / SR Target).
+
+        DECODE graphs cover 1-token AR. STANDALONE_REMOTE Draft stays on a
+        single ordinary DECODE capture.
+        """
+        if is_draft_worker:
+            return False
+        if self.is_spectre() and getattr(server_args, "spectre_role", None) != "draft":
+            return True
+        if (
+            self.is_standalone_remote()
+            and getattr(server_args, "standalone_remote_role", None) == "target"
+        ):
+            return True
+        return False
+
+    def dual_ntpb_cuda_graph_options(
+        self, server_args: "ServerArgs", is_draft_worker: bool = False
+    ) -> Optional[List[int]]:
+        if not self.uses_dual_ntpb_cuda_graph(server_args, is_draft_worker):
+            return None
+        ntpb = self.target_verify_cuda_graph_num_tokens_per_bs(
+            server_args, is_draft_worker
+        )
+        return sorted(set([1, ntpb]), reverse=True)
+
+    def target_verify_cuda_graph_num_tokens_per_bs(
+        self, server_args: "ServerArgs", is_draft_worker: bool = False
+    ) -> int:
+        """Tokens per sequence captured into the Target CUDA graph.
+
+        TARGET_VERIFY graphs use ``speculative_num_draft_tokens``. DECODE
+        (including STANDALONE_REMOTE Draft chain) stays at 1.
+        """
+        if self.captures_target_verify_cuda_graph(server_args, is_draft_worker):
+            return int(
+                getattr(server_args, "speculative_num_draft_tokens", 1) or 1
+            )
+        return 1
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 

@@ -150,6 +150,21 @@ def shift_overlapped_prefill_drafts(
     return drafts[n:]
 
 
+def replay_grammar_from_committed(template, committed_ids: Optional[Sequence[int]]):
+    """Copy ``template`` and accept Target's committed tokens in order.
+
+    Draft ingest/decode can desync grammar; replay from a pristine template
+    before each window so the constraint state matches the committed prefix.
+    Returns None when there is no template.
+    """
+    if template is None:
+        return None
+    grammar = template.copy()
+    for tok in committed_ids or []:
+        grammar.accept_token(int(tok))
+    return grammar
+
+
 def drop_duplicate_root_draft(
     last_committed: Optional[int], draft_tokens: Sequence[int]
 ) -> List[int]:

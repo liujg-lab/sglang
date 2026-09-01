@@ -10,6 +10,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     shift_overlapped_prefill_drafts,
     drop_duplicate_root_draft,
 )
+from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
@@ -115,6 +116,16 @@ class SchedulerStandaloneRemoteTargetMixin:
         self.sr_pending: Dict[str, SRPendingEntry] = {}
         self._sr_inflight: Optional[SRInflight] = None
         self.sr_client: Optional[SRTargetClient] = None
+        self.sr_breaker = SRRpcBreaker(
+            failure_threshold=int(
+                getattr(self.server_args, "standalone_remote_breaker_failures", 3)
+                or 3
+            ),
+            cooldown_steps=int(
+                getattr(self.server_args, "standalone_remote_breaker_cooldown", 32)
+                or 32
+            ),
+        )
         if self.tp_size == 1 or self.tp_rank == 0:
             client = make_transport_from_server_args(self.server_args)
             assert isinstance(client, SRTargetClient)
@@ -133,6 +144,9 @@ class SchedulerStandaloneRemoteTargetMixin:
         client = getattr(self, "sr_client", None)
         if client is not None:
             client._drain()
+        breaker = getattr(self, "sr_breaker", None)
+        if breaker is not None:
+            breaker.reset()
         logger.info("[SR] Target flushed, new session_id=%s", self.sr_session_id)
 
     def _sr_note_stale(self, reason: str) -> None:
@@ -292,13 +306,17 @@ class SchedulerStandaloneRemoteTargetMixin:
             reply = SRBatchReply.from_dict(payload) if payload is not None else None
 
         result: Dict[str, SRDraftReply] = {}
+        got_packet = reply is not None
         if reply is None:
+            self._sr_observe_rpc(inflight, got_packet=False)
             return result
         if reply.session_id != self.sr_session_id:
             self._sr_note_stale("session")
+            self._sr_observe_rpc(inflight, got_packet=True)
             return result
         if reply.rpc_seq != inflight.rpc_seq:
             self._sr_note_stale("rpc_seq")
+            self._sr_observe_rpc(inflight, got_packet=True)
             return result
         pending = inflight.pending
         for item in reply.reqs:
@@ -310,7 +328,19 @@ class SchedulerStandaloneRemoteTargetMixin:
                 self._sr_note_stale(reason or "step")
                 continue
             result[item.rid] = item
+        self._sr_observe_rpc(inflight, got_packet=got_packet)
         return result
+
+    def _sr_observe_rpc(self, inflight: SRInflight, *, got_packet: bool) -> None:
+        if not inflight.wait_reply:
+            return
+        breaker = getattr(self, "sr_breaker", None)
+        if breaker is None:
+            return
+        if inflight.send_ok and got_packet:
+            breaker.record_success()
+        else:
+            breaker.record_failure()
 
     def _sr_rpc(
         self,
@@ -322,6 +352,9 @@ class SchedulerStandaloneRemoteTargetMixin:
         return self._sr_recv(inflight)
 
     def rpc_next_draft(self, reqs: List[Req]) -> Dict[str, SRDraftReply]:
+        breaker = getattr(self, "sr_breaker", None)
+        if breaker is not None and not breaker.should_send():
+            return {}
         return self._sr_rpc(SRAction.STEP, reqs, include_full_context=False)
 
     def notify_sr_draft_finished(self, req: Req, action: SRAction = SRAction.FINISH) -> None:
@@ -396,6 +429,15 @@ class SchedulerStandaloneRemoteTargetMixin:
         current_bsz = max(batch.batch_size(), self.running_batch.batch_size())
         return current_bsz > self.server_args.standalone_remote_max_batch_size
 
+    def _sr_skip_draft_rpc(self, batch: ScheduleBatch) -> bool:
+        if self._sr_is_high_overhead(batch):
+            return True
+        breaker = getattr(self, "sr_breaker", None)
+        if breaker is not None and not breaker.should_send():
+            breaker.note_skipped_step()
+            return True
+        return False
+
     def _sr_chain_mode(self) -> bool:
         return int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1) <= 1
 
@@ -452,7 +494,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                                 still, replies, prefill=True
                             )
                             self._sr_attach_replies(still, replies)
-                elif self._sr_is_high_overhead(batch):
+                elif self._sr_skip_draft_rpc(batch):
                     batch.draft_num_tokens = 1
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)

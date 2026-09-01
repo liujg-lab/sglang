@@ -505,6 +505,11 @@ def _is_spectre(runner) -> bool:
     return getattr(runner, "is_spectre", False)
 
 
+def _uses_dual_ntpb(runner) -> bool:
+    """SPECTRE Target and STANDALONE_REMOTE Target capture verify + ntpb=1 DECODE."""
+    return getattr(runner, "dual_ntpb", False)
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -555,39 +560,49 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_spectre()
             and model_runner.server_args.spectre_role != "draft"
         )
-        if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
-            or is_spectre_target
+        if model_runner.spec_algorithm.captures_target_verify_cuda_graph(
+            model_runner.server_args,
+            is_draft_worker=bool(self.model_runner.is_draft_worker),
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
                 self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
+                    model_runner.spec_algorithm.target_verify_cuda_graph_num_tokens_per_bs(
+                        model_runner.server_args,
+                        is_draft_worker=bool(self.model_runner.is_draft_worker),
+                    )
                 )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
         self.is_spectre = is_spectre_target
-        if self.is_spectre:
-            self.spectre_ntpb_options = sorted(
-                set([1, self.num_tokens_per_bs]), reverse=True
+        self.dual_ntpb = model_runner.spec_algorithm.uses_dual_ntpb_cuda_graph(
+            model_runner.server_args,
+            is_draft_worker=bool(self.model_runner.is_draft_worker),
+        )
+        if self.dual_ntpb:
+            self.spectre_ntpb_options = (
+                model_runner.spec_algorithm.dual_ntpb_cuda_graph_options(
+                    model_runner.server_args,
+                    is_draft_worker=bool(self.model_runner.is_draft_worker),
+                )
+                or sorted(set([1, self.num_tokens_per_bs]), reverse=True)
             )
         else:
             self.spectre_ntpb_options = None
         self.actual_ntpb = self.num_tokens_per_bs
         self._captured_attn_tensors = {}
 
-        if self.is_spectre:
+        if self.dual_ntpb:
+            tag = "[Spectre CudaGraph]" if self.is_spectre else "[SR CudaGraph]"
             log_info_on_rank0(
                 logger,
-                f"[Spectre CudaGraph] is_spectre=True, "
+                f"{tag} dual_ntpb=True, "
                 f"num_tokens_per_bs={self.num_tokens_per_bs}, "
-                f"spectre_ntpb_options={self.spectre_ntpb_options}, "
+                f"ntpb_options={self.spectre_ntpb_options}, "
                 f"capture_forward_mode={self.capture_forward_mode}",
             )
 
@@ -699,7 +714,7 @@ class CudaGraphRunner:
         stream_idx: Optional[int] = None,
         ntpb: Optional[int] = None,
     ):
-        if _is_spectre(self) and ntpb is not None:
+        if _uses_dual_ntpb(self) and ntpb is not None:
             base_key = f"r{ntpb}_{bs}"
         else:
             base_key = bs
@@ -708,7 +723,7 @@ class CudaGraphRunner:
         return base_key
 
     def _get_actual_ntpb(self, forward_batch: ForwardBatch) -> int:
-        if _is_spectre(self):
+        if _uses_dual_ntpb(self):
             if forward_batch.spec_info is not None:
                 return getattr(
                     forward_batch.spec_info,
@@ -728,6 +743,7 @@ class CudaGraphRunner:
                 if (
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
+                    or self.model_runner.spec_algorithm.is_standalone_remote()
                     or _is_spectre(self)
                 )
                 else max(forward_batch.global_num_tokens_cpu)
@@ -739,7 +755,7 @@ class CudaGraphRunner:
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx,
-            actual_ntpb if _is_spectre(self) else None,
+            actual_ntpb if _uses_dual_ntpb(self) else None,
         )
 
         is_bs_supported = (
@@ -748,7 +764,7 @@ class CudaGraphRunner:
             else cuda_graph_bs <= self.max_bs
         )
 
-        if _is_spectre(self):
+        if _uses_dual_ntpb(self):
             expected_forward_mode = (
                 ForwardMode.DECODE
                 if actual_ntpb == 1 and forward_batch.spec_info is None
@@ -860,15 +876,20 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                is_spectre = _is_spectre(self)
+                is_dual = _uses_dual_ntpb(self)
                 ntpb_list = (
-                    getattr(self, "spectre_ntpb_options", None) if is_spectre else None
+                    getattr(self, "spectre_ntpb_options", None) if is_dual else None
                 ) or [self.num_tokens_per_bs]
                 for ntpb in ntpb_list:
-                    if is_spectre:
+                    if is_dual:
+                        tag = (
+                            "[Spectre CudaGraph]"
+                            if _is_spectre(self)
+                            else "[SR CudaGraph]"
+                        )
                         log_info_on_rank0(
                             logger,
-                            f"[Spectre CudaGraph] Capturing: bs={bs}, "
+                            f"{tag} Capturing: bs={bs}, "
                             f"ntpb={ntpb}, num_tokens={bs * ntpb}",
                         )
                     with patch_model(
@@ -877,7 +898,7 @@ class CudaGraphRunner:
                         num_tokens=bs * ntpb,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        if is_spectre:
+                        if is_dual:
                             graph, output_buffers = self.capture_one_batch_size(
                                 bs,
                                 forward,
@@ -912,18 +933,19 @@ class CudaGraphRunner:
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
 
-        if _is_spectre(self):
-            spectre_keys = [
+        if _uses_dual_ntpb(self):
+            dual_keys = [
                 k
                 for k in self.graphs.keys()
                 if isinstance(k, str) and k.startswith("r")
             ]
             captured_tensors = getattr(self, "_captured_attn_tensors", {})
+            tag = "[Spectre CudaGraph]" if _is_spectre(self) else "[SR CudaGraph]"
             log_info_on_rank0(
                 logger,
-                f"[Spectre CudaGraph] Capture complete. "
+                f"{tag} Capture complete. "
                 f"Total graphs={len(self.graphs)}, "
-                f"Spectre keys (sample)={spectre_keys[:10]}, "
+                f"dual-ntpb keys (sample)={dual_keys[:10]}, "
                 f"preserved_tensors={len(captured_tensors)}",
             )
 
@@ -1024,7 +1046,7 @@ class CudaGraphRunner:
 
         effective_forward_mode = (
             ForwardMode.DECODE
-            if _is_spectre(self) and spec_info is None and ntpb == 1
+            if _uses_dual_ntpb(self) and spec_info is None and ntpb == 1
             else self.capture_forward_mode
         )
 
@@ -1110,7 +1132,7 @@ class CudaGraphRunner:
             spec_info,
         )
 
-        if _is_spectre(self) and ntpb_override is not None:
+        if _uses_dual_ntpb(self) and ntpb_override is not None:
             capture_key = self._make_graph_key(bs, stream_idx, ntpb_override)
             fwd_meta = attn_backend.forward_metadata
             captured = getattr(self, "_captured_attn_tensors", None)
@@ -1232,6 +1254,7 @@ class CudaGraphRunner:
                 if (
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
+                    or self.model_runner.spec_algorithm.is_standalone_remote()
                     or _is_spectre(self)
                 )
                 else max_num_tokens
@@ -1273,7 +1296,7 @@ class CudaGraphRunner:
 
         effective_replay_mode = (
             ForwardMode.DECODE
-            if _is_spectre(self)
+            if _uses_dual_ntpb(self)
             and actual_ntpb == 1
             and forward_batch.spec_info is None
             else self.capture_forward_mode
@@ -1295,7 +1318,7 @@ class CudaGraphRunner:
         self.bs = bs
         self.actual_ntpb = actual_ntpb
 
-        if _is_spectre(self):
+        if _uses_dual_ntpb(self):
             graph_key_preview = self._make_graph_key(
                 bs,
                 get_current_stream_idx() if self.enable_pdmux else None,
@@ -1324,7 +1347,7 @@ class CudaGraphRunner:
         graph_key = self._make_graph_key(
             self.bs,
             stream_idx,
-            getattr(self, "actual_ntpb", None) if _is_spectre(self) else None,
+            getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
         )
 
         self.graphs[graph_key].replay()
@@ -1357,12 +1380,26 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or (
+                self.model_runner.spec_algorithm.is_standalone_remote()
+                and getattr(
+                    self.model_runner.server_args, "standalone_remote_role", None
+                )
+                == "target"
+            )
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+                draft_token_num = (
+                    ntpb_override
+                    if ntpb_override is not None
+                    else self.num_tokens_per_bs
+                )
+                if _uses_dual_ntpb(self) and draft_token_num == 1:
+                    return None
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,

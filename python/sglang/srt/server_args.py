@@ -536,6 +536,9 @@ class ServerArgs:
     standalone_remote_port: str = "30019"
     standalone_remote_rpc_timeout_ms: int = 5000
     standalone_remote_max_batch_size: int = 32
+    standalone_remote_draft_ttl_s: float = 60.0
+    standalone_remote_breaker_failures: int = 3
+    standalone_remote_breaker_cooldown: int = 32
 
     # Expert parallelism
     ep_size: int = 1
@@ -5324,7 +5327,35 @@ class ServerArgs:
             default=ServerArgs.standalone_remote_max_batch_size,
             help=(
                 "If the running batch is larger than this, STANDALONE_REMOTE "
-                "Target falls back to 1-token decode."
+                "Target falls back to 1-token decode. Draft also REJECTS RPC "
+                "when its running batch or HTTP req count exceeds this cap."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-draft-ttl-s",
+            type=float,
+            default=ServerArgs.standalone_remote_draft_ttl_s,
+            help=(
+                "Drop idle Draft RPC KV if Target never sends FINISH/ABORT. "
+                "<=0 disables."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-breaker-failures",
+            type=int,
+            default=ServerArgs.standalone_remote_breaker_failures,
+            help=(
+                "Consecutive Target RPC timeouts before skipping STEP RPCs. "
+                "Draft REJECT is not a timeout."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-breaker-cooldown",
+            type=int,
+            default=ServerArgs.standalone_remote_breaker_cooldown,
+            help=(
+                "Decode steps to skip while the Target RPC breaker is OPEN "
+                "before one STEP probe."
             ),
         )
 

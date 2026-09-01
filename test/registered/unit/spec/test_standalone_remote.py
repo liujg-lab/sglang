@@ -1,9 +1,11 @@
 """Unit tests for STANDALONE_REMOTE protocol, alignment, mm, and stale replies."""
 
+import inspect
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 try:
     import torch
@@ -21,6 +23,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     drop_duplicate_root_draft,
     find_fork_point,
     ingest_active_indices,
+    replay_grammar_from_committed,
     shift_overlapped_prefill_drafts,
 )
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
@@ -36,6 +39,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftState,
     SRDraftStateManager,
 )
+from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRDraftServer,
     SRTargetClient,
@@ -77,6 +81,115 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
             SpeculativeAlgorithm.from_string("STANDALONE_REMOTE"),
             SpeculativeAlgorithm.STANDALONE_REMOTE,
         )
+
+    def test_sr_target_captures_target_verify_cuda_graph(self):
+        sr = SpeculativeAlgorithm.STANDALONE_REMOTE
+        target = SimpleNamespace(
+            standalone_remote_role="target",
+            speculative_num_draft_tokens=5,
+            spectre_role=None,
+        )
+        self.assertTrue(sr.captures_target_verify_cuda_graph(target))
+        self.assertEqual(sr.target_verify_cuda_graph_num_tokens_per_bs(target), 5)
+        self.assertFalse(
+            sr.captures_target_verify_cuda_graph(target, is_draft_worker=True)
+        )
+        self.assertEqual(
+            sr.target_verify_cuda_graph_num_tokens_per_bs(
+                target, is_draft_worker=True
+            ),
+            1,
+        )
+        self.assertTrue(sr.uses_spec_topk_cuda_graph_layout())
+        self.assertTrue(sr.uses_dual_ntpb_cuda_graph(target))
+        self.assertEqual(sr.dual_ntpb_cuda_graph_options(target), [5, 1])
+        self.assertFalse(
+            sr.uses_dual_ntpb_cuda_graph(target, is_draft_worker=True)
+        )
+
+    def test_sr_draft_stays_on_decode_cuda_graph(self):
+        sr = SpeculativeAlgorithm.STANDALONE_REMOTE
+        draft = SimpleNamespace(
+            standalone_remote_role="draft",
+            speculative_num_draft_tokens=5,
+            spectre_role=None,
+        )
+        self.assertFalse(sr.captures_target_verify_cuda_graph(draft))
+        self.assertEqual(sr.target_verify_cuda_graph_num_tokens_per_bs(draft), 1)
+        self.assertTrue(sr.uses_spec_topk_cuda_graph_layout())
+        self.assertFalse(sr.uses_dual_ntpb_cuda_graph(draft))
+        self.assertIsNone(sr.dual_ntpb_cuda_graph_options(draft))
+
+    def test_existing_algorithms_keep_target_verify_capture(self):
+        args = SimpleNamespace(
+            standalone_remote_role=None,
+            speculative_num_draft_tokens=7,
+            spectre_role=None,
+        )
+        self.assertTrue(
+            SpeculativeAlgorithm.EAGLE.captures_target_verify_cuda_graph(args)
+        )
+        self.assertTrue(
+            SpeculativeAlgorithm.STANDALONE.captures_target_verify_cuda_graph(args)
+        )
+        self.assertTrue(
+            SpeculativeAlgorithm.NGRAM.captures_target_verify_cuda_graph(args)
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.EAGLE.target_verify_cuda_graph_num_tokens_per_bs(args),
+            7,
+        )
+        self.assertFalse(
+            SpeculativeAlgorithm.NONE.captures_target_verify_cuda_graph(args)
+        )
+        spectre_target = SimpleNamespace(
+            spectre_role="target",
+            standalone_remote_role=None,
+            speculative_num_draft_tokens=4,
+        )
+        spectre_draft = SimpleNamespace(
+            spectre_role="draft",
+            standalone_remote_role=None,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertTrue(
+            SpeculativeAlgorithm.SPECTRE.captures_target_verify_cuda_graph(
+                spectre_target
+            )
+        )
+        self.assertFalse(
+            SpeculativeAlgorithm.SPECTRE.captures_target_verify_cuda_graph(
+                spectre_draft
+            )
+        )
+        self.assertFalse(SpeculativeAlgorithm.EAGLE.uses_dual_ntpb_cuda_graph(args))
+        self.assertFalse(
+            SpeculativeAlgorithm.STANDALONE.uses_dual_ntpb_cuda_graph(args)
+        )
+        self.assertTrue(
+            SpeculativeAlgorithm.SPECTRE.uses_dual_ntpb_cuda_graph(spectre_target)
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.SPECTRE.dual_ntpb_cuda_graph_options(spectre_target),
+            [4, 1],
+        )
+        self.assertFalse(
+            SpeculativeAlgorithm.SPECTRE.uses_dual_ntpb_cuda_graph(spectre_draft)
+        )
+
+    def test_ar_fallback_source_forces_eager(self):
+        from pathlib import Path
+
+        worker_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        )
+        if not worker_path.is_file():
+            self.skipTest(f"missing {worker_path}")
+        src = worker_path.read_text()
+        self.assertIn("def _forward_target_eager", src)
+        self.assertIn("runner.graph_runner = None", src)
+        self.assertIn("can_run_cuda_graph=False", src)
 
 
 class TestSRProtocolRoundTrip(CustomTestCase):
@@ -1105,6 +1218,45 @@ class TestTargetPrefillOverlap(CustomTestCase):
         self.assertEqual(mixin.sr_pending, {})
         client._drain.assert_called_once()
 
+    def test_reset_resets_breaker(self):
+        mixin_cls = self._import_mixin()
+        mixin = mixin_cls()
+        mixin.sr_session_id = "old"
+        mixin.sr_rpc_seq = 1
+        mixin.sr_pending = {}
+        mixin._sr_inflight = None
+        mixin.sr_client = None
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        for _ in range(3):
+            mixin.sr_breaker.record_failure()
+        self.assertFalse(mixin.sr_breaker.should_send())
+        mixin.reset_standalone_remote_target_state()
+        self.assertTrue(mixin.sr_breaker.should_send())
+        self.assertEqual(mixin.sr_breaker.state, SRRpcBreaker.CLOSED)
+
+    def test_open_breaker_skips_step_rpc(self):
+        order = []
+        req = self._make_req()
+        mixin, _client = self._make_mixin(order, req, is_extend=False)
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=32)
+        mixin.sr_breaker.state = SRRpcBreaker.OPEN
+        with self.assertRaises(mixin.recv_requests.StopLoop):
+            mixin.event_loop_normal_standalone_remote_target()
+        self.assertEqual(order, ["gpu"])
+        self.assertEqual(mixin.sr_breaker.steps_in_open, 1)
+
+    def test_open_breaker_still_sends_prefill(self):
+        order = []
+        req = self._make_req()
+        mixin, _client = self._make_mixin(order, req, is_extend=True)
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=32)
+        mixin.sr_breaker.state = SRRpcBreaker.OPEN
+        with self.assertRaises(mixin.recv_requests.StopLoop):
+            mixin.event_loop_normal_standalone_remote_target()
+        self.assertEqual(order, ["send", "gpu", "recv"])
+        self.assertTrue(mixin.sr_breaker.should_send())
+        self.assertEqual(mixin.sr_breaker.state, SRRpcBreaker.CLOSED)
+
 
 class TestOverlappedPrefillShift(CustomTestCase):
     """PREFILL drafts start at the prompt; Target already sampled T0 during extend."""
@@ -1179,6 +1331,15 @@ class TestStandaloneRemoteTree(CustomTestCase):
     def test_no_fake_bush_helper(self):
         worker_cls = self._import_worker()
         self.assertFalse(hasattr(worker_cls, "_construct_tree_structure_general"))
+
+    def test_ar_fallback_forces_eager(self):
+        worker_cls = self._import_worker()
+        self.assertTrue(hasattr(worker_cls, "_forward_target_eager"))
+        src = inspect.getsource(worker_cls._forward_normal_decode)
+        self.assertIn("_forward_target_eager", src)
+        self.assertIn("can_run_cuda_graph=False", src)
+        eager_src = inspect.getsource(worker_cls._forward_target_eager)
+        self.assertIn("graph_runner = None", eager_src)
 
     def test_advance_tree_draft_positions_increments_mrope(self):
         if torch is None:
@@ -1273,6 +1434,45 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(windows[1][1], [-1, 1])
 
+    def test_tree_drafter_exposes_eagle_draft_graph_aliases(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        self.assertIsInstance(
+            inspect.getattr_static(SRTreeDrafter, "model_runner"), property
+        )
+        self.assertTrue(callable(getattr(SRTreeDrafter, "draft_forward")))
+        src = inspect.getsource(SRTreeDrafter._expand_tree)
+        self.assertIn("cuda_graph_runner", src)
+        self.assertIn("replay", src)
+        init_src = inspect.getsource(SRTreeDrafter._init_cuda_graphs)
+        self.assertIn("EAGLEDraftCudaGraphRunner", init_src)
+        self.assertNotIn("EAGLEDraftExtendCudaGraphRunner", init_src)
+
+    def test_tree_drafter_skips_cuda_graph_when_disabled(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        drafter = SRTreeDrafter.__new__(SRTreeDrafter)
+        drafter.server_args = SimpleNamespace(disable_cuda_graph=True)
+        drafter.speculative_num_steps = 4
+        drafter.draft_attn_backend = object()
+        drafter.cuda_graph_runner = "sentinel"
+        drafter._init_cuda_graphs()
+        self.assertIsNone(drafter.cuda_graph_runner)
+
+        drafter.server_args = SimpleNamespace(disable_cuda_graph=False)
+        drafter.draft_attn_backend = None
+        drafter.cuda_graph_runner = "sentinel"
+        drafter._init_cuda_graphs()
+        self.assertIsNone(drafter.cuda_graph_runner)
+
     def test_assemble_keeps_organized_token_width(self):
         if torch is None:
             self.skipTest("torch not available")
@@ -1362,7 +1562,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
 
         mixin._sr_ensure_window_budget = lambda *_a, **_k: None
         mixin._sr_run_until_ready = run_ready
-        mixin._sr_ingest_committed(req)
+        mixin._sr_ingest_committed_batch([req])
         self.assertEqual(calls, [([10], 1, True)])
         self.assertEqual(req.output_ids, [10])
         self.assertEqual(req.draft_generation_start_len, 1)
@@ -1555,6 +1755,392 @@ class TestStandaloneRemoteTree(CustomTestCase):
         mixin.server_args.speculative_eagle_topk = 1
         mixin._sr_maybe_align_chain_replies([], {}, prefill=True)
         self.assertEqual(called["n"], 2)
+
+
+class TestReplayGrammarFromCommitted(CustomTestCase):
+    def test_none_template(self):
+        self.assertIsNone(replay_grammar_from_committed(None, [1, 2]))
+
+    def test_replays_committed_ids_in_order(self):
+        accepted = []
+
+        class FakeGrammar:
+            def copy(self):
+                child = FakeGrammar()
+                child._accepted = accepted
+                return child
+
+            def accept_token(self, token):
+                self._accepted.append(int(token))
+
+        template = FakeGrammar()
+        out = replay_grammar_from_committed(template, [7, 8, 9])
+        self.assertIsNot(out, template)
+        self.assertEqual(accepted, [7, 8, 9])
+
+    def test_empty_committed(self):
+        class FakeGrammar:
+            def __init__(self):
+                self.accepted = []
+
+            def copy(self):
+                return FakeGrammar()
+
+            def accept_token(self, token):
+                self.accepted.append(token)
+
+        out = replay_grammar_from_committed(FakeGrammar(), [])
+        self.assertEqual(out.accepted, [])
+        out = replay_grammar_from_committed(FakeGrammar(), None)
+        self.assertEqual(out.accepted, [])
+
+
+class TestSRDraftStateTTL(CustomTestCase):
+    def test_cleanup_pops_idle_keeps_active_and_keep_rids(self):
+        mgr = SRDraftStateManager(timeout_threshold=10.0)
+        stale = SRDraftState(req_id="old", session_id="s")
+        mgr.set("old", stale)
+        stale.last_updated_time = 0.0
+        fresh = SRDraftState(req_id="keep", session_id="s")
+        mgr.set("keep", fresh)
+        protected = SRDraftState(req_id="live", session_id="s")
+        mgr.set("live", protected)
+        protected.last_updated_time = 0.0
+
+        popped = mgr.cleanup_stale_states(now=100.0, keep_rids={"live"})
+        self.assertEqual([s.req_id for s in popped], ["old"])
+        self.assertFalse(mgr.exists("old"))
+        self.assertTrue(mgr.exists("keep"))
+        self.assertTrue(mgr.exists("live"))
+
+    def test_set_refreshes_last_updated_time(self):
+        mgr = SRDraftStateManager(timeout_threshold=10.0)
+        state = SRDraftState(req_id="r", session_id="s")
+        state.last_updated_time = 0.0
+        mgr.set("r", state)
+        self.assertGreater(state.last_updated_time, 0.0)
+
+    def test_nonpositive_timeout_disables(self):
+        mgr = SRDraftStateManager(timeout_threshold=0.0)
+        state = SRDraftState(req_id="r", session_id="s")
+        mgr.set("r", state)
+        state.last_updated_time = 0.0
+        self.assertEqual(mgr.cleanup_stale_states(now=1e9), [])
+        self.assertTrue(mgr.exists("r"))
+
+
+class TestSRRpcBreaker(CustomTestCase):
+    def test_three_failures_open_then_cooldown_half_open_success_closes(self):
+        b = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        self.assertTrue(b.should_send())
+        b.record_failure()
+        b.record_failure()
+        self.assertTrue(b.should_send())
+        b.record_failure()
+        self.assertFalse(b.should_send())
+        self.assertEqual(b.state, SRRpcBreaker.OPEN)
+
+        for _ in range(3):
+            b.note_skipped_step()
+            self.assertFalse(b.should_send())
+        b.note_skipped_step()
+        self.assertTrue(b.should_send())
+        self.assertEqual(b.state, SRRpcBreaker.HALF_OPEN)
+
+        b.record_success()
+        self.assertTrue(b.should_send())
+        self.assertEqual(b.state, SRRpcBreaker.CLOSED)
+        self.assertEqual(b.consecutive_failures, 0)
+
+    def test_reject_must_not_record_failure(self):
+        """Draft REJECT is a live reply; only timeouts call record_failure."""
+        b = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        b.record_success()
+        self.assertTrue(b.should_send())
+        b.record_success()
+        b.record_success()
+        self.assertEqual(b.state, SRRpcBreaker.CLOSED)
+        self.assertEqual(b.consecutive_failures, 0)
+
+    def test_open_timeout_does_not_reset_cooldown(self):
+        b = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        for _ in range(3):
+            b.record_failure()
+        b.note_skipped_step()
+        b.note_skipped_step()
+        b.record_failure()
+        b.note_skipped_step()
+        b.note_skipped_step()
+        self.assertTrue(b.should_send())
+        self.assertEqual(b.state, SRRpcBreaker.HALF_OPEN)
+
+    def test_observe_reject_packet_is_success(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SRInflight,
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        for _ in range(3):
+            mixin.sr_breaker.record_failure()
+        self.assertFalse(mixin.sr_breaker.should_send())
+        inflight = SRInflight(
+            session_id="s",
+            rpc_seq=1,
+            pending={},
+            wait_reply=True,
+            send_ok=True,
+        )
+        mixin._sr_observe_rpc(inflight, got_packet=True)
+        self.assertTrue(mixin.sr_breaker.should_send())
+        self.assertEqual(mixin.sr_breaker.state, SRRpcBreaker.CLOSED)
+
+    def test_observe_timeout_is_failure(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SRInflight,
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
+        inflight = SRInflight(
+            session_id="s",
+            rpc_seq=1,
+            pending={},
+            wait_reply=True,
+            send_ok=True,
+        )
+        mixin._sr_observe_rpc(inflight, got_packet=False)
+        mixin._sr_observe_rpc(inflight, got_packet=False)
+        mixin._sr_observe_rpc(inflight, got_packet=False)
+        self.assertFalse(mixin.sr_breaker.should_send())
+
+
+class TestSRDraftBusyReject(CustomTestCase):
+    def test_busy_rejects_without_producing_windows(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        mixin.sr_state = SRDraftStateManager()
+        mixin.sr_server = MagicMock()
+        mixin.sr_server.last_rpc_seq = -1
+        mixin.sr_tree_drafter = None
+        mixin._sr_draft_busy = lambda: True
+        produce_calls = []
+        mixin._sr_produce_windows = lambda *_a, **_k: produce_calls.append(1) or []
+        mixin._sr_prepare_one = lambda *_a, **_k: (None, MagicMock())
+        batch = SRBatchRequest(
+            session_id="s",
+            rpc_seq=1,
+            action=SRAction.STEP,
+            reqs=[
+                SRDraftRequest(
+                    rid="a", step_id=1, base_committed_len=4, num_draft_tokens=5
+                )
+            ],
+        )
+        reply = mixin._sr_handle_batch(batch, {})
+        self.assertEqual(produce_calls, [])
+        self.assertEqual(len(reply.reqs), 1)
+        self.assertEqual(reply.reqs[0].status, SRReplyStatus.REJECT)
+        self.assertEqual(reply.reqs[0].draft_tokens, [])
+
+    def test_busy_still_handles_finish(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        mixin.sr_state = SRDraftStateManager()
+        mixin.sr_server = MagicMock()
+        mixin.sr_server.last_rpc_seq = -1
+        mixin._sr_draft_busy = lambda: True
+        prepare_calls = []
+
+        def fake_prepare(dreq, *_a, **_k):
+            prepare_calls.append(dreq.rid)
+            return mixin._sr_empty_reply(dreq), None
+
+        mixin._sr_prepare_one = fake_prepare
+        mixin._sr_produce_windows = lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("produce must not run")
+        )
+        batch = SRBatchRequest(
+            session_id="s",
+            rpc_seq=1,
+            action=SRAction.FINISH,
+            reqs=[SRDraftRequest(rid="a", step_id=1, base_committed_len=4)],
+        )
+        reply = mixin._sr_handle_batch(batch, {})
+        self.assertEqual(prepare_calls, ["a"])
+        self.assertEqual(reply.reqs[0].status, SRReplyStatus.EMPTY)
+
+    def _make_draft_mixin(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+            StandaloneRemoteDraftSchedulerMixin,
+        )
+
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        mixin.sr_waiting = []
+        mixin.draft_paused_reqs = []
+        mixin.waiting_queue = []
+        mixin.running_batch = MagicMock()
+        mixin.running_batch.is_empty.return_value = True
+        mixin.sr_kv = MagicMock()
+        mixin._maybe_compute_mrope_positions = MagicMock()
+        mixin.server_args = SimpleNamespace(speculative_eagle_topk=2)
+        return mixin
+
+    def test_sr_retract_skips_waiting_queue_and_resets_mm(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        req = SimpleNamespace(
+            rid="sr-1",
+            is_sr_draft=True,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4, 5],
+            req_pool_idx=None,
+            sr_tree_seed=object(),
+            sr_padded_ids=[1, 2, 3],
+            multimodal_inputs=MagicMock(),
+            is_retracted=True,
+            retracted_stain=True,
+            kv_committed_len=5,
+        )
+        handled = mixin._sr_intercept_retract_enqueue(req)
+        self.assertTrue(handled)
+        self.assertEqual(mixin.waiting_queue, [])
+        self.assertEqual(req.output_ids, [])
+        self.assertEqual(req.origin_input_ids, [1, 2, 3, 4, 5])
+        self.assertEqual(req.fill_ids, [1, 2, 3, 4, 5])
+        self.assertIsNone(req.sr_tree_seed)
+        self.assertEqual(req.kv_committed_len, 0)
+        self.assertIn(req, mixin.draft_paused_reqs)
+        mixin._maybe_compute_mrope_positions.assert_called_once_with(req)
+
+    def test_http_retract_is_not_intercepted(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        req = SimpleNamespace(is_sr_draft=False, rid="http")
+        self.assertFalse(mixin._sr_intercept_retract_enqueue(req))
+        self.assertEqual(mixin.draft_paused_reqs, [])
+
+    def test_materialize_repairs_retracted_output_tail(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        req = SimpleNamespace(
+            rid="sr-2",
+            is_sr_draft=True,
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            req_pool_idx=None,
+            sr_tree_seed=object(),
+            multimodal_inputs=MagicMock(),
+            is_retracted=True,
+            retracted_stain=True,
+            kv_committed_len=3,
+        )
+        mixin._sr_prepare_retracted_for_materialize(req)
+        self.assertEqual(req.origin_input_ids, [1, 2, 3])
+        self.assertEqual(req.output_ids, [])
+        self.assertIsNone(req.sr_tree_seed)
+        mixin._maybe_compute_mrope_positions.assert_called_once_with(req)
+
+    def test_cache_tree_seed_reraises_cuda_ima(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        if torch is None:
+            self.skipTest("torch is required")
+        mixin = self._make_draft_mixin()
+        req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
+        result = MagicMock()
+        result.logits_output.next_token_logits = MagicMock()
+        result.logits_output.hidden_states = MagicMock()
+        row = MagicMock()
+        row.device = "cpu"
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
+            return_value=row,
+        ), patch(
+            "torch.softmax",
+            side_effect=RuntimeError(
+                "CUDA error: an illegal memory access was encountered"
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                mixin._sr_cache_tree_seeds([req], result, None)
+        self.assertIn("illegal memory access", str(ctx.exception).lower())
+
+    def test_cache_tree_seed_shape_error_stays_warning(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
+        result = MagicMock()
+        result.logits_output.next_token_logits = MagicMock()
+        result.logits_output.hidden_states = MagicMock()
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
+            side_effect=ValueError("shape mismatch"),
+        ):
+            mixin._sr_cache_tree_seeds([req], result, None)
+
+    def test_cuda_context_error_helper(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                _sr_is_cuda_context_error,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        self.assertTrue(
+            _sr_is_cuda_context_error(
+                RuntimeError("CUDA error: an illegal memory access was encountered")
+            )
+        )
+        self.assertFalse(_sr_is_cuda_context_error(ValueError("shape mismatch")))
+        if torch is not None and hasattr(torch, "AcceleratorError"):
+            try:
+                err = torch.AcceleratorError("cuda boom")
+            except TypeError:
+                err = None
+            if err is not None:
+                self.assertTrue(_sr_is_cuda_context_error(err))
 
 
 if __name__ == "__main__":

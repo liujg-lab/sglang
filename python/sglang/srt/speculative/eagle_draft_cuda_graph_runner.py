@@ -174,8 +174,7 @@ class EAGLEDraftCudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if self.model_runner.spec_algorithm.uses_spec_topk_cuda_graph_layout()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -364,8 +363,7 @@ class EAGLEDraftCudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if self.model_runner.spec_algorithm.uses_spec_topk_cuda_graph_layout()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -377,6 +375,7 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            buffers.mrope_positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -386,6 +385,10 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.mrope_positions is not None:
+            buffers.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
@@ -402,6 +405,8 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            if forward_batch.mrope_positions is not None:
+                forward_batch.mrope_positions = buffers.mrope_positions[:, :num_tokens]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -424,6 +429,10 @@ class EAGLEDraftCudaGraphRunner:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
             forward_batch.batch_size = raw_bs
             forward_batch.positions = buffers.positions[:raw_num_token]
+            if forward_batch.mrope_positions is not None:
+                forward_batch.mrope_positions = buffers.mrope_positions[
+                    :, :raw_num_token
+                ]
             forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:

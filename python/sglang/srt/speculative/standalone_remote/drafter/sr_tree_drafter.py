@@ -62,7 +62,18 @@ class SRTreeDrafter:
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
         self.draft_attn_backend = None
+        self.cuda_graph_runner = None
         self._init_attention_backend()
+        self._init_cuda_graphs()
+
+    @property
+    def model_runner(self):
+        """Alias for EAGLEDraftCudaGraphRunner, which reads ``eagle_worker.model_runner``."""
+        return self.draft_model_runner
+
+    def draft_forward(self, forward_batch: ForwardBatch):
+        """Alias for CUDA-graph capture, which calls ``eagle_worker.draft_forward``."""
+        return self._draft_forward(forward_batch)
 
     def _init_attention_backend(self) -> None:
         if self.speculative_num_steps <= 1:
@@ -79,9 +90,28 @@ class SRTreeDrafter:
             logger.warning("[SR] tree draft attention backend unavailable: %s", e)
             self.draft_attn_backend = None
 
-    def expand(self, req: "Req") -> SRTreeWindow:
-        """Expand a STANDALONE tree from a seed captured after chain ingest."""
-        return self.expand_batch([req])[0]
+    def _init_cuda_graphs(self) -> None:
+        """Capture v1 EAGLE draft-tree graphs. Skip draft-extend graphs (not used by SR)."""
+        self.cuda_graph_runner = None
+        if getattr(self.server_args, "disable_cuda_graph", False):
+            return
+        if self.speculative_num_steps <= 1 or self.draft_attn_backend is None:
+            return
+        prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
+        try:
+            from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+                EAGLEDraftCudaGraphRunner,
+            )
+
+            self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            logger.info("[SR] Capture tree draft CUDA graph begin.")
+            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+            logger.info("[SR] Capture tree draft CUDA graph end.")
+        except Exception as e:
+            logger.warning("[SR] tree draft CUDA graph capture failed: %s", e)
+            self.cuda_graph_runner = None
+        finally:
+            self.draft_model_runner.draft_attn_backend = prev_draft_backend
 
     def expand_batch(self, reqs: List["Req"]) -> List[SRTreeWindow]:
         """Fused tree expand for every req that has a pool slot and a seed."""
@@ -200,15 +230,24 @@ class SRTreeDrafter:
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
-            if (
-                self.draft_attn_backend is not None
-                and self.speculative_num_steps > 1
-                and not forward_batch.forward_mode.is_idle()
-            ):
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self._draft_forward(
-                forward_batch
+            can_cuda_graph = (
+                self.cuda_graph_runner is not None
+                and self.cuda_graph_runner.can_run(forward_batch)
             )
+            if can_cuda_graph:
+                parent_list, top_scores_index, draft_tokens = (
+                    self.cuda_graph_runner.replay(forward_batch)
+                )
+            else:
+                if (
+                    self.draft_attn_backend is not None
+                    and self.speculative_num_steps > 1
+                    and not forward_batch.forward_mode.is_idle()
+                ):
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                parent_list, top_scores_index, draft_tokens = self._draft_forward(
+                    forward_batch
+                )
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
             self.token_to_kv_pool_allocator.restore_state(

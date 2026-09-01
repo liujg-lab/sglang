@@ -30,10 +30,11 @@ class SRDraftState:
 
 
 class SRDraftStateManager:
-    def __init__(self) -> None:
+    def __init__(self, timeout_threshold: float = 60.0) -> None:
         self.active: Dict[str, SRDraftState] = {}
         self._lock = threading.Lock()
         self.session_id: Optional[str] = None
+        self.timeout_threshold = float(timeout_threshold)
 
     def get(self, req_id: str) -> Optional[SRDraftState]:
         with self._lock:
@@ -41,7 +42,14 @@ class SRDraftStateManager:
 
     def set(self, req_id: str, state: SRDraftState) -> None:
         with self._lock:
+            state.last_updated_time = time.time()
             self.active[req_id] = state
+
+    def touch(self, req_id: str) -> None:
+        with self._lock:
+            state = self.active.get(req_id)
+            if state is not None:
+                state.last_updated_time = time.time()
 
     def delete(self, req_id: str) -> Optional[SRDraftState]:
         with self._lock:
@@ -50,6 +58,27 @@ class SRDraftStateManager:
     def exists(self, req_id: str) -> bool:
         with self._lock:
             return req_id in self.active
+
+    def cleanup_stale_states(
+        self,
+        timeout: Optional[float] = None,
+        keep_rids: Optional[set] = None,
+        now: Optional[float] = None,
+    ) -> List[SRDraftState]:
+        """Pop RPC states idle longer than ``timeout``. ``timeout<=0`` disables."""
+        limit = self.timeout_threshold if timeout is None else float(timeout)
+        if limit <= 0:
+            return []
+        ts = time.time() if now is None else float(now)
+        keep = keep_rids or set()
+        popped: List[SRDraftState] = []
+        with self._lock:
+            for rid, state in list(self.active.items()):
+                if rid in keep:
+                    continue
+                if ts - state.last_updated_time > limit:
+                    popped.append(self.active.pop(rid))
+        return popped
 
     def clear(self) -> List[SRDraftState]:
         with self._lock:
