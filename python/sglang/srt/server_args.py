@@ -1340,12 +1340,15 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm in ("STANDALONE", "STANDALONE_REMOTE"):
-                    # standalone draft model and cuda graphs
+                if self.speculative_algorithm == "STANDALONE":
+                    # Co-located standalone draft weights + CUDA graphs.
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
-                    # eagle draft models and cuda graphs
+                elif self.speculative_algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+                    # Co-located eagle/MTP draft weights + CUDA graphs.
+                    # NEXTN is rewritten to EAGLE later in _handle_speculative_decoding.
                     reserved_mem += 4 * 1024
+                # SPECTRE / STANDALONE_REMOTE: remote draft, no co-located draft weights.
+                # NGRAM: no draft model. CUDA graphs already covered by cuda_graph_max_bs.
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)

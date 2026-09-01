@@ -477,5 +477,36 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestSpeculativeMemFraction(CustomTestCase):
+    GPU_MEM_MB = 24576
+
+    def _mem_fraction(self, speculative_algorithm):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = speculative_algorithm
+        args.mem_fraction_static = None
+        args.disable_piecewise_cuda_graph = True
+        mock_config = MagicMock()
+        mock_config.is_multimodal = False
+        with patch.object(ServerArgs, "get_model_config", return_value=mock_config):
+            args._handle_gpu_memory_settings(self.GPU_MEM_MB)
+        return args.mem_fraction_static
+
+    def test_remote_draft_does_not_reserve_colocated_draft_weights(self):
+        none_frac = self._mem_fraction(None)
+        spectre_frac = self._mem_fraction("SPECTRE")
+        standalone_remote_frac = self._mem_fraction("STANDALONE_REMOTE")
+        ngram_frac = self._mem_fraction("NGRAM")
+        eagle_frac = self._mem_fraction("EAGLE")
+        nextn_frac = self._mem_fraction("NEXTN")
+        standalone_frac = self._mem_fraction("STANDALONE")
+
+        self.assertEqual(spectre_frac, none_frac)
+        self.assertEqual(standalone_remote_frac, none_frac)
+        self.assertEqual(ngram_frac, none_frac)
+        self.assertEqual(nextn_frac, eagle_frac)
+        self.assertLess(eagle_frac, none_frac)
+        self.assertLess(standalone_frac, eagle_frac)
+
+
 if __name__ == "__main__":
     unittest.main()
