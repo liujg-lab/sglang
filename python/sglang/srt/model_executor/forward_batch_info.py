@@ -800,7 +800,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                    if mrope_positions.numel() == 0:
+                    if mrope_positions.shape[1] != extend_seq_len:
                         mrope_positions = self._expand_mrope_from_input(
                             mm_input, self.seq_lens_cpu[batch_idx]
                         )
@@ -810,6 +810,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             [pos for pos in mrope_positions_list],
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        if self.input_ids is not None:
+            assert self.mrope_positions.shape[1] == self.input_ids.shape[0], (
+                f"M-RoPE width {self.mrope_positions.shape[1]} != "
+                f"{self.input_ids.shape[0]} tokens; the rope kernel would read OOB"
+            )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

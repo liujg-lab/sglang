@@ -7,7 +7,6 @@ import torch
 from sglang.srt.layers.sampler import SamplingBatchInfo
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    FINISH_LENGTH,
     Req,
     ScheduleBatch,
 )
@@ -498,22 +497,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             release_mm_resources(req.multimodal_inputs)
         req.multimodal_inputs = None
 
-    def _sr_is_terminal_finished(self, req: Req) -> bool:
-        """Length cap is not a real end; Target FINISH/ABORT / EOS is."""
-        if not req.finished():
-            return False
-        return not isinstance(req.finished_reason, FINISH_LENGTH)
-
-    def _sr_is_target_finished(self, req: Req) -> bool:
-        """Only Target FINISH/ABORT ends a Draft RPC request.
-
-        Draft-local stops (EOS, stop strings, length) are throwaway: the tokens
-        it samples during teacher forcing are discarded, so they must not end
-        the request or the remaining committed tail never reaches KV.
-        """
-        if not req.finished():
-            return False
-        return isinstance(req.finished_reason, FINISH_ABORT)
+    def _sr_is_finished(self, req: Req) -> bool:
+        """Target FINISH/ABORT is the only way a draft req finishes."""
+        return req.finished()
 
     def _sr_mm_embed_error(self, req: Req) -> Optional[str]:
         """Vision items must still carry features to survive a re-prefill."""
@@ -550,25 +536,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         state = self.sr_state.get(rid)
         return state is not None and state.degraded is True
 
-    def _sr_clear_local_finish(self, req: Req) -> bool:
-        """Drop a Draft-sampled terminal state. Returns True when one was cleared.
-
-        Target FINISH/ABORT (``FINISH_ABORT``) is preserved.
-        """
-        reason = getattr(req, "finished_reason", None)
-        if reason is None or isinstance(reason, FINISH_ABORT):
-            return False
-        req.finished_reason = None
-        req.to_abort = False
-        return True
-
     def _sr_ensure_window_budget(
         self, req: Req, num_draft_tokens: Optional[int]
     ) -> None:
-        """Raise max_new_tokens so this window cannot trip FINISH_LENGTH.
+        """Raise max_new_tokens so PrefillAdder can budget this window.
 
-        Isolate + pause stops extra GPU work. A lifetime cap of ~9 made STEP
-        return empty windows and Target fall back to AR.
+        Local FINISH_LENGTH is suppressed on draft reqs; this still lifts the
+        cap so the scheduler does not stall, and degrades if the next window
+        would exceed the context.
         """
         sp = req.sampling_params
         already = len(req.output_ids or [])
@@ -580,9 +555,11 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
         if getattr(sp, "max_new_tokens", 0) < need:
             sp.max_new_tokens = need
-        if isinstance(getattr(req, "finished_reason", None), FINISH_LENGTH):
-            req.finished_reason = None
-            req.to_abort = False
+        cap = int(getattr(self, "max_req_input_len", 0) or 0)
+        if cap > 0:
+            horizon = len(req.origin_input_ids or []) + need
+            if horizon >= cap:
+                self._sr_mark_degraded(req.rid, "context horizon exhausted")
 
     def _sr_create_req(
         self,
@@ -654,6 +631,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         req.sr_step_id = dreq.step_id
         req.draft_is_paused = False
         req.is_sr_draft = True
+        req.suppress_local_finish = True
         self._sr_ensure_window_budget(req, dreq.num_draft_tokens)
 
         if mm is not None:
@@ -920,32 +898,52 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_mark_degraded(req.rid, embed_err)
                 return
 
-    def _sr_prepare_retracted_for_materialize(self, req: Req) -> None:
-        if not (
-            getattr(req, "is_retracted", False)
-            or getattr(req, "retracted_stain", False)
-        ):
-            return
-        if not (req.output_ids or []):
-            return
-        fill_ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
+    def _sr_enqueue_for_reprefill(self, req: Req, fill_ids: List[int]) -> bool:
+        """The only way a draft req may re-enter waiting_queue.
+
+        Rebuilds all length-derived state (M-RoPE included) so EXTEND cannot
+        read past a stale prompt-width tensor.
+        """
         self._sr_reset_linear_kv_state(req, fill_ids)
+        if self._sr_is_degraded(req.rid):
+            return False
+        mm = req.multimodal_inputs
+        if mm is not None and getattr(mm, "mrope_positions", None) is not None:
+            if mm.mrope_positions.shape[1] != len(fill_ids):
+                self._sr_mark_degraded(req.rid, "mrope width != fill_ids")
+                return False
+        self._sr_resume_req(req)
+        if req not in self.sr_waiting:
+            self.sr_waiting.append(req)
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is not None and req not in waiting:
+            waiting.append(req)
+        return True
 
     def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
         """Prefill until every req has a pool slot; drop any sampled extras."""
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
             return
+        live: List[Req] = []
         for req in need:
-            self._sr_prepare_retracted_for_materialize(req)
+            if req.output_ids:
+                fill_ids = list(req.origin_input_ids or []) + list(req.output_ids)
+                if not self._sr_enqueue_for_reprefill(req, fill_ids):
+                    continue
+            else:
+                self._sr_resume_req(req)
+                if req not in self.sr_waiting:
+                    self.sr_waiting.append(req)
+                waiting = getattr(self, "waiting_queue", None)
+                if waiting is not None and req not in waiting:
+                    waiting.append(req)
+            live.append(req)
+        need = live
+        if not need:
+            return
         need_rids = {r.rid for r in need}
         self._sr_isolate_need(need_rids)
-        for req in need:
-            self._sr_resume_req(req)
-            if req not in self.sr_waiting:
-                self.sr_waiting.append(req)
-            if req not in self.waiting_queue:
-                self.waiting_queue.append(req)
         for _ in range(8):
             still = [r for r in need if r.req_pool_idx is None]
             if not still:
@@ -974,7 +972,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         for req in need:
             req.output_ids = []
             req.draft_generation_start_len = 0
-            if not self._sr_is_terminal_finished(req):
+            if not self._sr_is_finished(req):
                 self._sr_pause_req(req)
         self.last_batch = None
 
@@ -1010,8 +1008,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 req.rid,
                 len(fill_ids),
             )
-            self._sr_reset_linear_kv_state(req, fill_ids)
-            if self._sr_is_degraded(req.rid):
+            if not self._sr_enqueue_for_reprefill(req, fill_ids):
                 continue
             self._sr_ensure_window_budget(req, req.draft_tokens_target)
             rebuilt.append(req)
@@ -1064,9 +1061,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_ensure_window_budget(req, 1)
                 active.append(req)
             if active:
-                self._sr_run_until_ready(
-                    active, capture_tree_seed=True, teacher_forcing=True
-                )
+                self._sr_run_until_ready(active, capture_tree_seed=True)
         for req, committed, _, _ in snapshots:
             req.output_ids = committed
             req.draft_generation_start_len = len(committed)
@@ -1123,7 +1118,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             got = [empty] * len(ready)
         finally:
             for req in ready:
-                if not self._sr_is_terminal_finished(req):
+                if not self._sr_is_finished(req):
                     self._sr_pause_req(req)
             self.last_batch = None
         for j, idx in enumerate(ready_idx):
@@ -1137,37 +1132,40 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
     ) -> None:
-        self._sr_reset_linear_kv_state(req, target_fill_ids)
         req.draft_tokens_target = dreq.num_draft_tokens
-        if req not in self.sr_waiting:
-            self.sr_waiting.append(req)
+        self._sr_enqueue_for_reprefill(req, target_fill_ids)
 
     def _sr_run_until_ready(
         self,
         reqs: List[Req],
         capture_tree_seed: bool = False,
-        teacher_forcing: bool = False,
     ) -> None:
-        # Teacher forcing replays Target's committed ids; only Target FINISH ends it.
-        done = (
-            self._sr_is_target_finished
-            if teacher_forcing
-            else self._sr_is_terminal_finished
-        )
-        if teacher_forcing:
-            for req in reqs:
-                self._sr_clear_local_finish(req)
         need = {r.rid: r for r in reqs}
         need_rids = set(need.keys())
         self._sr_isolate_need(need_rids)
         parked: List[Req] = []
         for req in reqs:
             self._sr_resume_req(req)
-            if req not in self.sr_waiting and req.req_pool_idx is None:
-                self.sr_waiting.append(req)
             if req.req_pool_idx is None:
-                if req not in self.waiting_queue:
-                    self.waiting_queue.append(req)
+                if req.output_ids:
+                    logger.error(
+                        "[SR] req %s lost pool slot with %s output tokens; "
+                        "rebuilding prefix (suppress_local_finish invariant broken)",
+                        req.rid,
+                        len(req.output_ids),
+                    )
+                    if not self._sr_enqueue_for_reprefill(
+                        req,
+                        list(req.origin_input_ids or []) + list(req.output_ids),
+                    ):
+                        need.pop(req.rid, None)
+                        continue
+                else:
+                    if req not in self.sr_waiting:
+                        self.sr_waiting.append(req)
+                    waiting = getattr(self, "waiting_queue", None)
+                    if waiting is not None and req not in waiting:
+                        waiting.append(req)
             else:
                 parked.append(req)
         self._sr_park_in_running_many(parked)
@@ -1180,15 +1178,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             guard += 1
             still = []
             for rid, req in list(need.items()):
-                if teacher_forcing:
-                    self._sr_clear_local_finish(req)
                 produced = len(req.output_ids) - int(
                     getattr(req, "draft_generation_start_len", 0) or 0
                 )
                 target = int(getattr(req, "draft_tokens_target", 0) or 0)
                 if target <= 0:
                     target = int(self.server_args.speculative_num_steps or 1)
-                if produced >= target or done(req):
+                if produced >= target or self._sr_is_finished(req):
                     still.append(rid)
             for rid in still:
                 need.pop(rid, None)
@@ -1215,9 +1211,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 break
 
         for req in reqs:
-            if teacher_forcing:
-                self._sr_clear_local_finish(req)
-            if not done(req):
+            if not self._sr_is_finished(req):
                 self._sr_pause_req(req)
         self.last_batch = None
 

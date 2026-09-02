@@ -617,6 +617,10 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        # Speculative remote-draft reqs are shadows of a Target req: their KV
+        # lifetime belongs to the SR scheduler, so no local stop condition may
+        # end them (and free their pool slot) behind its back.
+        self.suppress_local_finish = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1183,6 +1187,9 @@ class Req(ReqDllmMixin):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            return
+
+        if self.suppress_local_finish:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:

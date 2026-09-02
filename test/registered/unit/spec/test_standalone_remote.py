@@ -1039,9 +1039,8 @@ class TestDraftSessionWipe(CustomTestCase):
         self.assertIs(mixin.last_batch, batch)
         mixin.self_check_during_idle.assert_not_called()
 
-    def test_ensure_window_budget_extends_length_finish(self):
+    def test_ensure_window_budget_extends_max_new_tokens(self):
         try:
-            from sglang.srt.managers.schedule_batch import FINISH_LENGTH
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
                 StandaloneRemoteDraftSchedulerMixin,
             )
@@ -1051,17 +1050,42 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.server_args = MagicMock()
         mixin.server_args.speculative_num_steps = 4
+        mixin.sr_state = SRDraftStateManager()
         req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1, 2, 3]
         req.output_ids = [1, 2, 3, 4, 5]
         sp = MagicMock()
         sp.max_new_tokens = 9
         req.sampling_params = sp
-        req.finished_reason = FINISH_LENGTH(9)
-        req.to_abort = False
         mixin._sr_ensure_window_budget(req, 5)
         self.assertEqual(sp.max_new_tokens, 14)
-        self.assertIsNone(req.finished_reason)
-        self.assertFalse(req.to_abort)
+        self.assertFalse(mixin._sr_is_degraded("a"))
+
+    def test_ensure_window_budget_degrades_on_horizon(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        mixin.server_args = MagicMock()
+        mixin.server_args.speculative_num_steps = 4
+        mixin.max_req_input_len = 10
+        mixin.sr_state = SRDraftStateManager()
+        req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1] * 8
+        req.output_ids = [1, 2, 3, 4, 5]
+        sp = MagicMock()
+        sp.max_new_tokens = 9
+        req.sampling_params = sp
+        mixin.sr_state.set("a", SRDraftState(req_id="a", session_id="s", req_object=req))
+        mixin._sr_ensure_window_budget(req, 5)
+        self.assertEqual(sp.max_new_tokens, 14)
+        self.assertTrue(mixin._sr_is_degraded("a"))
 
 
 class TestDraftWindowBudget(CustomTestCase):
@@ -2057,6 +2081,7 @@ class TestSRDraftBusyReject(CustomTestCase):
         except ImportError as e:
             self.skipTest(str(e))
         mixin = self._make_draft_mixin()
+        mixin.sr_state = SRDraftStateManager()
         req = SimpleNamespace(
             rid="sr-2",
             is_sr_draft=True,
@@ -2068,12 +2093,57 @@ class TestSRDraftBusyReject(CustomTestCase):
             is_retracted=True,
             retracted_stain=True,
             kv_committed_len=3,
+            draft_is_paused=False,
+            finished=lambda: False,
         )
-        mixin._sr_prepare_retracted_for_materialize(req)
+        mixin.get_next_batch_to_run = lambda: None
+        mixin._sr_isolate_need = lambda *_a, **_k: None
+        mixin._sr_materialize_prefix_batch([req])
         self.assertEqual(req.origin_input_ids, [1, 2, 3])
         self.assertEqual(req.output_ids, [])
         self.assertIsNone(req.sr_tree_seed)
         mixin._maybe_compute_mrope_positions.assert_called_once_with(req)
+
+    def test_materialize_rebuilds_mrope_when_pool_slot_lost(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        if torch is None:
+            self.skipTest("torch is required")
+        mixin = self._make_draft_mixin()
+        mixin.sr_state = SRDraftStateManager()
+        mm = SimpleNamespace(mrope_positions=torch.zeros(3, 2, dtype=torch.int64))
+        req = SimpleNamespace(
+            rid="sr-lost-slot",
+            is_sr_draft=True,
+            origin_input_ids=[1, 2],
+            output_ids=[3, 4, 5],
+            req_pool_idx=None,
+            sr_tree_seed=object(),
+            multimodal_inputs=mm,
+            is_retracted=False,
+            retracted_stain=False,
+            kv_committed_len=5,
+            draft_is_paused=False,
+            finished=lambda: False,
+        )
+
+        def recompute(r):
+            r.multimodal_inputs.mrope_positions = torch.zeros(
+                3, len(r.origin_input_ids), dtype=torch.int64
+            )
+
+        mixin._maybe_compute_mrope_positions = recompute
+        mixin.get_next_batch_to_run = lambda: None
+        mixin._sr_isolate_need = lambda *_a, **_k: None
+        mixin._sr_materialize_prefix_batch([req])
+        self.assertEqual(req.origin_input_ids, [1, 2, 3, 4, 5])
+        self.assertEqual(req.output_ids, [])
+        self.assertEqual(tuple(req.multimodal_inputs.mrope_positions.shape), (3, 5))
+        self.assertIn(req, mixin.draft_paused_reqs)
 
     def test_cache_tree_seed_reraises_cuda_ima(self):
         try:
@@ -2182,30 +2252,34 @@ class TestSRTeacherForcedIngest(CustomTestCase):
             self.skipTest(str(e))
         return StandaloneRemoteDraftSchedulerMixin()
 
-    def test_clear_local_finish_keeps_target_abort(self):
+    def test_suppress_local_finish_keeps_to_finish(self):
         try:
-            from sglang.srt.managers.schedule_batch import (
-                FINISH_ABORT,
-                FINISH_LENGTH,
-                FINISH_MATCHED_TOKEN,
-            )
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
         except ImportError as e:
             self.skipTest(str(e))
-        mixin = self._mixin()
-
-        req = SimpleNamespace(
-            finished_reason=FINISH_MATCHED_TOKEN(matched=151645), to_abort=False
+        req = Req.__new__(Req)
+        req.finished_reason = None
+        req.to_finish = None
+        req.output_ids = [151645]
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=1,
+            ignore_eos=False,
+            stop_token_ids=None,
+            stop_strs=[],
+            stop_regex_strs=[],
         )
-        self.assertTrue(mixin._sr_clear_local_finish(req))
-        self.assertIsNone(req.finished_reason)
-
-        req = SimpleNamespace(finished_reason=FINISH_LENGTH(length=8), to_abort=False)
-        self.assertTrue(mixin._sr_clear_local_finish(req))
+        req.eos_token_ids = {151645}
+        req.grammar = None
+        req.tokenizer = None
+        req.vocab_size = 200000
+        req.spec_type = None
+        req.suppress_local_finish = True
+        req.check_finished()
         self.assertIsNone(req.finished_reason)
 
         abort = FINISH_ABORT("Target request finished")
-        req = SimpleNamespace(finished_reason=abort, to_abort=True)
-        self.assertFalse(mixin._sr_clear_local_finish(req))
+        req.to_finish = abort
+        req.check_finished()
         self.assertIs(req.finished_reason, abort)
 
     def test_draft_eos_does_not_truncate_ingest(self):
@@ -2222,9 +2296,9 @@ class TestSRTeacherForcedIngest(CustomTestCase):
         req.finished_reason = None
         steps = []
 
-        def run_ready(reqs, capture_tree_seed=False, teacher_forcing=False):
+        def run_ready(reqs, capture_tree_seed=False):
             r = reqs[0]
-            steps.append((list(r.output_ids), bool(teacher_forcing)))
+            steps.append(list(r.output_ids))
             r.kv_committed_len = 3 + len(r.output_ids)
             # Draft samples EOS on the first ingest step.
             r.finished_reason = FINISH_MATCHED_TOKEN(matched=151645)
@@ -2233,10 +2307,7 @@ class TestSRTeacherForcedIngest(CustomTestCase):
         mixin._sr_run_until_ready = run_ready
         mixin._sr_ingest_committed_batch([req])
 
-        self.assertEqual(
-            [ids for ids, _ in steps], [[10], [10, 11], [10, 11, 12]]
-        )
-        self.assertTrue(all(tf for _, tf in steps))
+        self.assertEqual(steps, [[10], [10, 11], [10, 11, 12]])
         self.assertEqual(req.output_ids, [10, 11, 12])
         self.assertEqual(
             committed_tail_not_in_kv(3, req.output_ids, req.kv_committed_len), []
@@ -2257,7 +2328,9 @@ class TestSRTeacherForcedIngest(CustomTestCase):
         materialized = []
 
         mixin._sr_ensure_window_budget = lambda *_a, **_k: None
-        mixin._sr_reset_linear_kv_state = lambda r, ids: resets.append((r.rid, len(ids)))
+        mixin._sr_enqueue_for_reprefill = lambda r, ids: resets.append(
+            (r.rid, len(ids))
+        ) or True
         mixin._sr_materialize_prefix_batch = lambda reqs: materialized.append(
             [r.rid for r in reqs]
         )
@@ -2375,6 +2448,77 @@ class TestSchedulerSkipsDraftMmClear(CustomTestCase):
 
         self.assertIsNotNone(draft_req.multimodal_inputs)
         self.assertIsNone(normal_req.multimodal_inputs)
+
+
+class TestComputeMropeWidthFallback(CustomTestCase):
+    def test_extend_falls_back_when_cached_mrope_is_short(self):
+        if torch is None:
+            self.skipTest("torch is required")
+        try:
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                ForwardMode,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        fb = ForwardBatch.__new__(ForwardBatch)
+        fb.seq_lens_cpu = torch.tensor([10])
+        fb.forward_mode = ForwardMode.EXTEND
+        fb.input_ids = torch.arange(8, dtype=torch.int64)
+        mm = SimpleNamespace(
+            mrope_positions=torch.arange(5).unsqueeze(0).repeat(3, 1),
+            mrope_position_delta=torch.tensor([0]),
+            mrope_position_delta_repeated_cache=None,
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[mm],
+            extend_seq_lens=[8],
+            extend_prefix_lens=[0],
+        )
+        fallback = torch.arange(8).unsqueeze(0).repeat(3, 1)
+        fb._expand_mrope_from_input = MagicMock(return_value=fallback)
+        with patch(
+            "sglang.srt.model_executor.forward_batch_info.get_global_server_args",
+            return_value=SimpleNamespace(rl_on_policy_target=None),
+        ):
+            fb._compute_mrope_positions(SimpleNamespace(device="cpu"), batch)
+        fb._expand_mrope_from_input.assert_called_once()
+        self.assertEqual(tuple(fb.mrope_positions.shape), (3, 8))
+
+    def test_extend_keeps_cached_mrope_when_width_matches(self):
+        if torch is None:
+            self.skipTest("torch is required")
+        try:
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                ForwardMode,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        fb = ForwardBatch.__new__(ForwardBatch)
+        fb.seq_lens_cpu = torch.tensor([8])
+        fb.forward_mode = ForwardMode.EXTEND
+        fb.input_ids = torch.arange(5, dtype=torch.int64)
+        cached = torch.arange(8).unsqueeze(0).repeat(3, 1)
+        mm = SimpleNamespace(mrope_positions=cached)
+        batch = SimpleNamespace(
+            multimodal_inputs=[mm],
+            extend_seq_lens=[5],
+            extend_prefix_lens=[3],
+        )
+        fb._expand_mrope_from_input = MagicMock(
+            side_effect=AssertionError("must not fall back")
+        )
+        with patch(
+            "sglang.srt.model_executor.forward_batch_info.get_global_server_args",
+            return_value=SimpleNamespace(rl_on_policy_target=None),
+        ):
+            fb._compute_mrope_positions(SimpleNamespace(device="cpu"), batch)
+        fb._expand_mrope_from_input.assert_not_called()
+        self.assertEqual(tuple(fb.mrope_positions.shape), (3, 5))
+        self.assertTrue(torch.equal(fb.mrope_positions.cpu(), cached[:, 3:8].cpu()))
 
 
 if __name__ == "__main__":
