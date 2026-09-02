@@ -157,16 +157,18 @@ class TestSpectreMMPayload(CustomTestCase):
         mm = restored.to_multimodal_inputs()
         self.assertEqual(mm.mm_items[0].pad_value, 1_000_009)
         self.assertTrue(torch.equal(mm.mm_items[0].feature, item.feature))
+        self.assertTrue(
+            torch.equal(mm.mm_items[0].image_grid_thw, item.image_grid_thw)
+        )
         self.assertEqual(restored.padded_input_ids, [9, 8, 7])
 
         restored_bytes = SpectreMMPayload.from_multipart(
             meta, [bytes(b) for b in buffers]
         )
+        restored_mm = restored_bytes.to_multimodal_inputs()
+        self.assertTrue(torch.equal(restored_mm.mm_items[0].feature, item.feature))
         self.assertTrue(
-            torch.equal(
-                restored_bytes.to_multimodal_inputs().mm_items[0].feature,
-                item.feature,
-            )
+            torch.equal(restored_mm.mm_items[0].image_grid_thw, item.image_grid_thw)
         )
 
     def test_payload_resident_bytes(self):

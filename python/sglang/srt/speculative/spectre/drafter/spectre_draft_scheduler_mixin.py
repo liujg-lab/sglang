@@ -1687,7 +1687,15 @@ class SpectreDraftSchedulerMixin:
             mm = mm_payload.to_multimodal_inputs()
             req.extend_image_inputs(mm)
             mm_payload.attached = True
-            self._maybe_compute_mrope_positions(req)
+            try:
+                self._maybe_compute_mrope_positions(req)
+            except Exception as e:
+                # tcp multipart 反序列化失败时 grid_thw 会是 dict，不能让 scheduler 自杀。
+                self._degrade_draft_req(
+                    draft_req, f"compute_mrope_positions failed: {e}"
+                )
+                self._record_spectre_mm_degrade("mrope_failed")
+                return True
 
         self.draft_waiting_queue.append(req)
 

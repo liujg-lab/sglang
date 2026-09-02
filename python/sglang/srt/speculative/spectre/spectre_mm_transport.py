@@ -120,6 +120,10 @@ def _unlink_shm_pointers(pointers: List[ShmPointerMMData]) -> None:
 
 def _walk_and_transform(obj: Any, fn) -> Any:
     if isinstance(obj, dict):
+        # Placeholder dicts from to_multipart are leaves; recursing into
+        # shape/dtype would skip restore() and leave image_grid_thw as a dict.
+        if _TENSOR_PLACEHOLDER_PREFIX in obj:
+            return fn(obj)
         return {k: _walk_and_transform(v, fn) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_walk_and_transform(v, fn) for v in obj]
