@@ -108,6 +108,7 @@ class SchedulerSpectreTargetMixin:
             cooldown_rounds=cooldown_rounds,
             tp_rank=self.tp_rank,
         )
+        self._spectre_mm_sent_rids: Set[str] = set()
 
         if self.tp_size == 1 or self.tp_rank == 0:
             self._bg_recv_thread = threading.Thread(
@@ -163,6 +164,9 @@ class SchedulerSpectreTargetMixin:
             self.draft_circuit_breaker.state = DraftCircuitBreaker.CLOSED
             self.draft_circuit_breaker.consecutive_failures = 0
             self.draft_circuit_breaker.rounds_in_open = 0
+
+        if hasattr(self, "_spectre_mm_sent_rids"):
+            self._spectre_mm_sent_rids.clear()
 
         if hasattr(self, "is_rejected"):
             self.is_rejected = False
@@ -481,11 +485,11 @@ class SchedulerSpectreTargetMixin:
                         )
                     )
                 self._zmq_send(draft_reqs)
-                # [SPECTRE-VL] HALF_OPEN / 首步 full-context 时重发 payload。
-                # OPEN 期间准入被跳过的请求、以及 Draft 侧已超时回收的 payload，靠这次补上。
+                # [SPECTRE-VL] 准入时已发过 payload 的 spec_cnt==0 不再重发。
+                # HALF_OPEN 才强制再发：OPEN 期间漏发、以及 Draft 超时回收后的补包。
                 for req in reqs_to_send:
                     if req.spec_cnt == 0 or is_half_open:
-                        self.maybe_send_spectre_mm(req)
+                        self.maybe_send_spectre_mm(req, force=is_half_open)
 
     def _send_retry_requests(
         self, failed_reqs: List[Req], num_draft_tokens: int
@@ -551,6 +555,9 @@ class SchedulerSpectreTargetMixin:
                     f"\033[34m [Target][Notify] Failed to cleanup req_to_draft_token "
                     f"for {req.rid}: {e} \033[0m"
                 )
+        sent = getattr(self, "_spectre_mm_sent_rids", None)
+        if sent is not None:
+            sent.discard(req.rid)
 
     def _is_self_high_overhead_target(self, batch: ScheduleBatch) -> bool:
         current_bsz = max(batch.batch_size(), self.running_batch.batch_size())
@@ -572,7 +579,7 @@ class SchedulerSpectreTargetMixin:
                 return True
         return False
 
-    def maybe_send_spectre_mm(self, req: Req) -> None:
+    def maybe_send_spectre_mm(self, req: Req, force: bool = False) -> None:
         # [SPECTRE-VL] 请求准入时快照 pixel_values。若等到 DRAFT_REQUEST，
         # Target ViT 可能已跑完、feature 已被 buffer 回收。
         if not getattr(self, "spec_algorithm", None) or not self.spec_algorithm.is_spectre():
@@ -588,6 +595,12 @@ class SchedulerSpectreTargetMixin:
         if breaker is not None and breaker.state == DraftCircuitBreaker.OPEN:
             return
         if not self._mm_features_alive(req):
+            return
+        sent = getattr(self, "_spectre_mm_sent_rids", None)
+        if sent is None:
+            self._spectre_mm_sent_rids = set()
+            sent = self._spectre_mm_sent_rids
+        if not force and req.rid in sent:
             return
         sender = getattr(self, "spectre_mm_sender", None)
         if sender is None:
@@ -606,6 +619,8 @@ class SchedulerSpectreTargetMixin:
                     metrics.increment_spectre_mm_payloads_dropped(reason="queue_full")
                 else:
                     metrics.increment_spectre_mm_payloads_dropped(reason="send_error")
+            if status == "sent":
+                sent.add(req.rid)
         except Exception as e:
             metrics = self._spectre_mm_metrics()
             if metrics is not None:

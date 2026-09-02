@@ -251,6 +251,51 @@ class SpectreDraftSchedulerMixin:
             ]
             self.running_batch.filter_batch(keep_indices=keep)
 
+    def _draft_req_uses_precomputed_mm(self, req: Req) -> bool:
+        """[SPECTRE-VL] True if a VL prefill of this req would take the precomputed path.
+
+        mm_utils._get_precomputed_embedding cannot mix precomputed and raw-feature
+        requests in one batch (NotImplementedError). Text-only / not-yet-prewarmed
+        reqs return False so they can share a ViT fallback batch.
+        """
+        mm = getattr(req, "multimodal_inputs", None)
+        if mm is None:
+            return False
+        found = False
+        for item in getattr(mm, "mm_items", None) or []:
+            is_image = getattr(item, "is_image", None)
+            is_video = getattr(item, "is_video", None)
+            if not (
+                (callable(is_image) and is_image())
+                or (callable(is_video) and is_video())
+            ):
+                continue
+            if item.precomputed_embeddings is None:
+                return False
+            found = True
+        return found
+
+    def _partition_draft_prefill_queue(self, queue: List[Req]) -> List[List[Req]]:
+        """[SPECTRE-VL] Split waiting reqs so one extend batch is embedding-homogeneous.
+
+        Busy-loop ViT prewarm only does budget=1, so a later payload can attach
+        without precomputed_embeddings while an earlier one already has them.
+        """
+        if len(queue) <= 1:
+            return [list(queue)] if queue else []
+        precomputed: List[Req] = []
+        others: List[Req] = []
+        for req in queue:
+            if self._draft_req_uses_precomputed_mm(req):
+                precomputed.append(req)
+            else:
+                others.append(req)
+        if not precomputed or not others:
+            return [list(queue)]
+        if self._draft_req_uses_precomputed_mm(queue[0]):
+            return [precomputed, others]
+        return [others, precomputed]
+
     def _prefill_draft_reqs(self) -> None:
         if not self.draft_waiting_queue:
             return
@@ -258,8 +303,21 @@ class SpectreDraftSchedulerMixin:
         for req in self.draft_waiting_queue:
             req.init_next_round_input(self.tree_cache)
 
+        original = list(self.draft_waiting_queue)
+        admitted_ids = set()
+        for group in self._partition_draft_prefill_queue(original):
+            pending = [req for req in group if id(req) not in admitted_ids]
+            if not pending:
+                continue
+            for req in self._prefill_admitted_group(pending):
+                admitted_ids.add(id(req))
+        self.draft_waiting_queue = [
+            req for req in original if id(req) not in admitted_ids
+        ]
+
+    def _prefill_admitted_group(self, group: List[Req]) -> List[Req]:
         adder = self._build_prefill_adder_for_draft()
-        for req in self.draft_waiting_queue:
+        for req in group:
             res = adder.add_one_req(
                 req,
                 has_chunked_req=False,
@@ -269,12 +327,8 @@ class SpectreDraftSchedulerMixin:
                 break
 
         admitted: List[Req] = adder.can_run_list
-        admitted_set = set(id(r) for r in admitted)
-        self.draft_waiting_queue = [
-            r for r in self.draft_waiting_queue if id(r) not in admitted_set
-        ]
         if not admitted:
-            return
+            return []
 
         draft_prefill_batch = ScheduleBatch.init_new(
             admitted,
@@ -301,6 +355,7 @@ class SpectreDraftSchedulerMixin:
                 state = self._get_draft_state(req.rid)
                 if state:
                     state.location = DraftReqLocation.DRAFT_BATCH
+        return admitted
 
     def _process_draft_prefill_result(self, batch: ScheduleBatch, result) -> None:
         self.process_batch_result_prefill(batch, result)
@@ -416,6 +471,24 @@ class SpectreDraftSchedulerMixin:
         if metrics is not None:
             metrics.increment_spectre_mm_degrades(reason=reason)
 
+    def _mm_embed_error(self, req) -> Optional[str]:
+        mm = getattr(req, "multimodal_inputs", None)
+        if mm is None:
+            return None
+        for item in getattr(mm, "mm_items", None) or []:
+            is_image = getattr(item, "is_image", None)
+            is_video = getattr(item, "is_video", None)
+            if not (
+                (callable(is_image) and is_image())
+                or (callable(is_video) and is_video())
+            ):
+                continue
+            if item.precomputed_embeddings is None and item.feature is None:
+                return (
+                    "mm item has neither feature nor precomputed_embeddings"
+                )
+        return None
+
     def _recv_and_store_mm_payloads(self) -> None:
         # [SPECTRE-VL] 每个 Draft TP rank 从 PUB/SUB 直收；不再 broadcast 整包 pixel。
         receiver = getattr(self, "spectre_mm_receiver", None)
@@ -455,6 +528,15 @@ class SpectreDraftSchedulerMixin:
                 continue
             old = self._pending_mm.get(payload.rid)
             if old is not None and old is not payload:
+                if getattr(old, "attached", False):
+                    # [SPECTRE-VL] 活请求已经持有 old.mm_inputs。重发 payload
+                    # 若 release 旧对象，re-prefill 会变成 feature=None。
+                    release_mm_resources(payload.mm_inputs)
+                    if metrics is not None:
+                        metrics.increment_spectre_mm_payloads_dropped(
+                            reason="duplicate_attached"
+                        )
+                    continue
                 release_mm_resources(old.mm_inputs)
             self._pending_mm[payload.rid] = payload
             # [SPECTRE-VL] 重发把粘性空响应解开，后续 DRAFT_REQUEST 可以重新 attach。
@@ -1501,7 +1583,19 @@ class SpectreDraftSchedulerMixin:
         if req.multimodal_inputs is not None:
             # [SPECTRE-VL] origin_input_ids 被整体重写后长度变了，必须清空并重算 M-RoPE。
             reset_mm_mrope(req.multimodal_inputs)
-            self._maybe_compute_mrope_positions(req)
+            try:
+                self._maybe_compute_mrope_positions(req)
+            except Exception as e:
+                self._degrade_draft_req(
+                    draft_req, f"compute_mrope_positions failed: {e}"
+                )
+                self._record_spectre_mm_degrade("mrope_failed")
+                return
+            embed_err = self._mm_embed_error(req)
+            if embed_err:
+                self._degrade_draft_req(draft_req, embed_err)
+                self._record_spectre_mm_degrade("mm_tensors_missing")
+                return
 
         if req not in self.draft_waiting_queue:
             self.draft_waiting_queue.append(req)
@@ -1695,6 +1789,11 @@ class SpectreDraftSchedulerMixin:
                     draft_req, f"compute_mrope_positions failed: {e}"
                 )
                 self._record_spectre_mm_degrade("mrope_failed")
+                return True
+            embed_err = self._mm_embed_error(req)
+            if embed_err:
+                self._degrade_draft_req(draft_req, embed_err)
+                self._record_spectre_mm_degrade("mm_tensors_missing")
                 return True
 
         self.draft_waiting_queue.append(req)

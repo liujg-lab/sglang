@@ -654,6 +654,96 @@ class TestSpectreDraftMmLogic(CustomTestCase):
         self.assertIsNone(mm.mrope_position_delta_repeated_cache)
         self.assertEqual(req.origin_input_ids, [1, 2, 3, 4, 5])
 
+    def test_reprefill_degrades_when_mm_tensors_missing(self):
+        from sglang.srt.speculative.spectre.drafter.spectre_state_manager import (
+            SpectreDraftState,
+        )
+        from sglang.srt.speculative.spectre.spectre_protocol import SpectreRequest
+
+        mixin = self._make_mixin()
+        metrics = self._enable_mm_metrics(mixin)
+        item = _make_image_item()
+        item.feature = None
+        item.precomputed_embeddings = None
+        mm = MultimodalInputs(mm_items=[item])
+        req = MagicMock()
+        req.rid = "r3miss"
+        req.req_pool_idx = None
+        req.multimodal_inputs = mm
+        req.origin_input_ids = [1, 2]
+        req.output_ids = [3]
+        req.fill_ids = [1, 2, 3]
+        req.finished.return_value = True
+        state = SpectreDraftState(
+            req_id="r3miss", spec_cnt=0, req_object=req, mm_ref="r3miss"
+        )
+        mixin._set_draft_state("r3miss", state)
+        mixin._remove_draft_req = MagicMock()
+        mixin._reset_req_logprob_fields = MagicMock()
+        draft_req = SpectreRequest(
+            request_id="r3miss", spec_cnt=1, num_draft_tokens=4
+        )
+        mixin._prepare_for_reprefill(req, [1, 2, 3, 4, 5], draft_req, state)
+        self.assertIn("r3miss", mixin._mm_unavailable_rids)
+        self.assertNotIn(req, mixin.draft_waiting_queue)
+        metrics.increment_spectre_mm_degrades.assert_called_with(
+            reason="mm_tensors_missing"
+        )
+        self.assertEqual(len(self._sent_responses(mixin)), 1)
+
+    def test_create_degrades_when_mm_tensors_missing(self):
+        from sglang.srt.speculative.spectre.spectre_mm_transport import SpectreMMPayload
+        from sglang.srt.speculative.spectre.spectre_protocol import (
+            SpectreAction,
+            SpectreRequest,
+            SpecType,
+        )
+
+        mixin = self._make_mixin()
+        metrics = self._enable_mm_metrics(mixin)
+        item = _make_image_item()
+        item.feature = None
+        item.precomputed_embeddings = None
+        payload = SpectreMMPayload(
+            rid="cmiss",
+            padded_input_ids=[1_000_001, 1_000_001, 9],
+            mm_items=[serialize_mm_item(item)],
+        )
+        mixin._pending_mm["cmiss"] = payload
+        draft_req = SpectreRequest(
+            request_id="cmiss",
+            spec_cnt=0,
+            action=SpectreAction.DRAFT,
+            spec_type=SpecType.DRAFT_REQUEST,
+            input_ids=[1_000_001, 1_000_001, 9],
+            mm_ref="cmiss",
+        )
+
+        def fake_req(**kwargs):
+            obj = MagicMock()
+            obj.origin_input_ids = list(kwargs.get("origin_input_ids") or [])
+            obj.output_ids = []
+            obj.multimodal_inputs = None
+
+            def extend(mm):
+                obj.multimodal_inputs = mm
+
+            obj.extend_image_inputs.side_effect = extend
+            return obj
+
+        with patch(
+            "sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin.Req",
+            side_effect=fake_req,
+        ):
+            self.assertTrue(mixin._create_new_draft_req(draft_req))
+
+        self.assertIn("cmiss", mixin._mm_unavailable_rids)
+        self.assertEqual(mixin.draft_waiting_queue, [])
+        metrics.increment_spectre_mm_degrades.assert_called_with(
+            reason="mm_tensors_missing"
+        )
+        self.assertEqual(len(self._sent_responses(mixin)), 1)
+
     def test_finish_releases_pending_mm(self):
         from sglang.srt.speculative.spectre.drafter.spectre_state_manager import (
             SpectreDraftState,
@@ -721,6 +811,160 @@ class TestSpectreDraftMmLogic(CustomTestCase):
         self.assertNotIn("rs1", mixin._mm_unavailable_rids)
         self.assertIn("rs1", mixin._pending_mm)
         self.assertIs(mixin._pending_mm["rs1"], payload)
+
+    def test_duplicate_attached_payload_keeps_old_tensors(self):
+        from types import MethodType
+
+        from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import (
+            SpectreDraftSchedulerMixin,
+        )
+        from sglang.srt.speculative.spectre.spectre_mm_transport import SpectreMMPayload
+
+        mixin = self._make_mixin()
+        metrics = self._enable_mm_metrics(mixin)
+        mixin._recv_and_store_mm_payloads = MethodType(
+            SpectreDraftSchedulerMixin._recv_and_store_mm_payloads, mixin
+        )
+        old = SpectreMMPayload(
+            rid="dup1",
+            padded_input_ids=[1, 2, 3],
+            mm_items=[serialize_mm_item(_make_image_item())],
+        )
+        mm = old.to_multimodal_inputs()
+        old.attached = True
+        mixin._pending_mm["dup1"] = old
+        live_feature = mm.mm_items[0].feature
+        self.assertIsNotNone(live_feature)
+
+        new = SpectreMMPayload(
+            rid="dup1",
+            padded_input_ids=[1, 2, 3],
+            mm_items=[serialize_mm_item(_make_image_item())],
+        )
+        mixin.spectre_mm_receiver = MagicMock()
+        mixin.spectre_mm_receiver.use_shm = False
+        mixin.spectre_mm_receiver.recv_all.return_value = ([new], 0)
+        mixin._recv_and_store_mm_payloads()
+
+        self.assertIs(mixin._pending_mm["dup1"], old)
+        self.assertIs(mm.mm_items[0].feature, live_feature)
+        self.assertIsNotNone(mm.mm_items[0].feature)
+        metrics.increment_spectre_mm_payloads_dropped.assert_called_with(
+            reason="duplicate_attached"
+        )
+        metrics.increment_spectre_mm_payloads_received.assert_not_called()
+
+    def test_unattached_duplicate_replaces_old_payload(self):
+        from types import MethodType
+
+        from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import (
+            SpectreDraftSchedulerMixin,
+        )
+        from sglang.srt.speculative.spectre.spectre_mm_transport import SpectreMMPayload
+
+        mixin = self._make_mixin()
+        mixin._recv_and_store_mm_payloads = MethodType(
+            SpectreDraftSchedulerMixin._recv_and_store_mm_payloads, mixin
+        )
+        old = SpectreMMPayload(
+            rid="dup2",
+            padded_input_ids=[1, 2, 3],
+            mm_items=[serialize_mm_item(_make_image_item())],
+        )
+        old.to_multimodal_inputs()
+        mixin._pending_mm["dup2"] = old
+
+        new = SpectreMMPayload(
+            rid="dup2",
+            padded_input_ids=[1, 2, 3],
+            mm_items=[serialize_mm_item(_make_image_item())],
+        )
+        mixin.spectre_mm_receiver = MagicMock()
+        mixin.spectre_mm_receiver.use_shm = False
+        mixin.spectre_mm_receiver.recv_all.return_value = ([new], 0)
+        mixin._recv_and_store_mm_payloads()
+
+        self.assertIs(mixin._pending_mm["dup2"], new)
+        self.assertIsNone(old.mm_inputs.mm_items[0].feature)
+
+    def test_mm_embed_error_detects_missing_tensors(self):
+        mixin = self._make_mixin()
+        item = _make_image_item()
+        req = MagicMock()
+        req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+        self.assertIsNone(mixin._mm_embed_error(req))
+
+        item.feature = None
+        item.precomputed_embeddings = torch.randn(4, 8)
+        self.assertIsNone(mixin._mm_embed_error(req))
+
+        item.precomputed_embeddings = None
+        self.assertIsNotNone(mixin._mm_embed_error(req))
+
+        req.multimodal_inputs = None
+        self.assertIsNone(mixin._mm_embed_error(req))
+
+    def _vl_draft_req(self, rid, *, precomputed):
+        item = _make_image_item()
+        if precomputed:
+            item.feature = None
+            item.precomputed_embeddings = torch.randn(4, 8)
+        req = MagicMock()
+        req.rid = rid
+        req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+        return req
+
+    def test_draft_req_uses_precomputed_mm(self):
+        mixin = self._make_mixin()
+        self.assertTrue(
+            mixin._draft_req_uses_precomputed_mm(self._vl_draft_req("p", precomputed=True))
+        )
+        self.assertFalse(
+            mixin._draft_req_uses_precomputed_mm(
+                self._vl_draft_req("v", precomputed=False)
+            )
+        )
+        text = MagicMock()
+        text.rid = "t"
+        text.multimodal_inputs = None
+        self.assertFalse(mixin._draft_req_uses_precomputed_mm(text))
+
+    def test_partition_draft_prefill_queue_splits_mixed(self):
+        mixin = self._make_mixin()
+        pre_a = self._vl_draft_req("baba", precomputed=True)
+        vit_b = self._vl_draft_req("7ede", precomputed=False)
+        pre_c = self._vl_draft_req("af9a", precomputed=True)
+        groups = mixin._partition_draft_prefill_queue([pre_a, vit_b, pre_c])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual([r.rid for r in groups[0]], ["baba", "af9a"])
+        self.assertEqual([r.rid for r in groups[1]], ["7ede"])
+
+        vit_first = mixin._partition_draft_prefill_queue([vit_b, pre_a])
+        self.assertEqual([r.rid for r in vit_first[0]], ["7ede"])
+        self.assertEqual([r.rid for r in vit_first[1]], ["baba"])
+
+        only_pre = mixin._partition_draft_prefill_queue([pre_a, pre_c])
+        self.assertEqual(len(only_pre), 1)
+        self.assertEqual([r.rid for r in only_pre[0]], ["baba", "af9a"])
+
+    def test_prefill_splits_mixed_precomputed_batch(self):
+        mixin = self._make_mixin()
+        mixin.tree_cache = MagicMock()
+        pre = self._vl_draft_req("baba", precomputed=True)
+        vit = self._vl_draft_req("7ede", precomputed=False)
+        mixin.draft_waiting_queue = [pre, vit]
+        seen = []
+
+        def fake_group(group):
+            seen.append([r.rid for r in group])
+            return list(group)
+
+        mixin._prefill_admitted_group = fake_group
+        mixin._prefill_draft_reqs()
+        self.assertEqual(seen, [["baba"], ["7ede"]])
+        self.assertEqual(mixin.draft_waiting_queue, [])
+        pre.init_next_round_input.assert_called_once_with(mixin.tree_cache)
+        vit.init_next_round_input.assert_called_once_with(mixin.tree_cache)
 
     def test_finish_drops_late_payload(self):
         from types import MethodType
@@ -1337,7 +1581,70 @@ class TestSpectreTargetMmSend(CustomTestCase):
         batch = MagicMock()
         batch.reqs = [req]
         target.send_batch_draft_requests(batch, 5)
-        target.maybe_send_spectre_mm.assert_called_once_with(req)
+        target.maybe_send_spectre_mm.assert_called_once_with(req, force=True)
+
+    def test_send_batch_spec_cnt0_does_not_force(self):
+        from collections import defaultdict
+
+        from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
+            DraftCircuitBreaker,
+        )
+
+        target = self._make_target()
+        target.draft_circuit_breaker.state = DraftCircuitBreaker.CLOSED
+        target.req_to_draft_token = defaultdict(dict)
+        target.zmq_communicator = MagicMock()
+        target._zmq_send = MagicMock()
+        target.maybe_send_spectre_mm = MagicMock()
+        req = self._vl_req(spec_cnt=0, rid="first")
+        batch = MagicMock()
+        batch.reqs = [req]
+        target.send_batch_draft_requests(batch, 5)
+        target.maybe_send_spectre_mm.assert_called_once_with(req, force=False)
+
+    def test_second_send_skipped_without_force(self):
+        target = self._make_target()
+        req = self._vl_req(rid="once")
+        target.maybe_send_spectre_mm(req)
+        target.spectre_mm_sender.send.assert_called_once()
+        target.spectre_mm_sender.send.reset_mock()
+        target.maybe_send_spectre_mm(req)
+        target.spectre_mm_sender.send.assert_not_called()
+
+    def test_force_resend_even_if_already_sent(self):
+        target = self._make_target()
+        req = self._vl_req(rid="force1")
+        target.maybe_send_spectre_mm(req)
+        target.spectre_mm_sender.send.reset_mock()
+        target.maybe_send_spectre_mm(req, force=True)
+        target.spectre_mm_sender.send.assert_called_once()
+
+    def test_send_batch_spec_cnt0_skips_if_already_sent(self):
+        from collections import defaultdict
+
+        target = self._make_target()
+        target.req_to_draft_token = defaultdict(dict)
+        target.zmq_communicator = MagicMock()
+        target._zmq_send = MagicMock()
+        req = self._vl_req(spec_cnt=0, rid="once")
+        target.maybe_send_spectre_mm(req)
+        target.spectre_mm_sender.send.reset_mock()
+        batch = MagicMock()
+        batch.reqs = [req]
+        target.send_batch_draft_requests(batch, 5)
+        target.spectre_mm_sender.send.assert_not_called()
+
+    def test_notify_clears_sent_rid(self):
+        from sglang.srt.speculative.spectre.spectre_protocol import SpectreAction
+
+        target = self._make_target()
+        target.req_to_draft_token = {"t1": {}}
+        target.zmq_communicator = None
+        target._spectre_mm_sent_rids = {"t1"}
+        target.notify_draft_request_finished_or_aborted(
+            self._vl_req(rid="t1"), SpectreAction.FINISH
+        )
+        self.assertNotIn("t1", target._spectre_mm_sent_rids)
 
     def test_send_batch_skips_resend_when_not_full_context(self):
         from collections import defaultdict
