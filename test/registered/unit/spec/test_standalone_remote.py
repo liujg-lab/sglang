@@ -23,6 +23,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     drop_duplicate_root_draft,
     find_fork_point,
     ingest_active_indices,
+    plan_committed_ingest,
     replay_grammar_from_committed,
     shift_overlapped_prefill_drafts,
 )
@@ -1549,7 +1550,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         req.kv_allocated_len = 3
         calls = []
 
-        def run_ready(reqs, capture_tree_seed=False):
+        def run_ready(reqs, capture_tree_seed=False, teacher_forcing=False):
             calls.append(
                 (
                     list(reqs[0].output_ids),
@@ -1577,7 +1578,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         calls = []
 
-        def run_ready(reqs, capture_tree_seed=False):
+        def run_ready(reqs, capture_tree_seed=False, teacher_forcing=False):
             calls.append(([r.rid for r in reqs], bool(capture_tree_seed)))
             for r in reqs:
                 r.kv_committed_len = len(r.origin_input_ids) + len(r.output_ids)
@@ -1610,7 +1611,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         calls = []
 
-        def run_ready(reqs, capture_tree_seed=False):
+        def run_ready(reqs, capture_tree_seed=False, teacher_forcing=False):
             calls.append([r.rid for r in reqs])
             for r in reqs:
                 r.kv_committed_len = len(r.origin_input_ids) + len(r.output_ids)
@@ -2141,6 +2142,239 @@ class TestSRDraftBusyReject(CustomTestCase):
                 err = None
             if err is not None:
                 self.assertTrue(_sr_is_cuda_context_error(err))
+
+
+class TestPlanCommittedIngest(CustomTestCase):
+    def test_noop_when_tail_already_in_kv(self):
+        mode, tail = plan_committed_ingest(3, [10, 11], 5)
+        self.assertEqual(mode, "noop")
+        self.assertEqual(tail, [])
+
+    def test_decode_for_short_tail(self):
+        mode, tail = plan_committed_ingest(3, [10, 11, 12], 3)
+        self.assertEqual(mode, "decode")
+        self.assertEqual(tail, [10, 11, 12])
+
+    def test_reprefill_for_long_tail(self):
+        committed = list(range(100, 340))
+        mode, tail = plan_committed_ingest(3, committed, 3, max_decode_steps=16)
+        self.assertEqual(mode, "reprefill")
+        self.assertEqual(len(tail), 240)
+
+    def test_threshold_boundary(self):
+        committed = list(range(16))
+        self.assertEqual(
+            plan_committed_ingest(0, committed, 0, max_decode_steps=16)[0], "decode"
+        )
+        self.assertEqual(
+            plan_committed_ingest(0, committed + [99], 0, max_decode_steps=16)[0],
+            "reprefill",
+        )
+
+
+class TestSRTeacherForcedIngest(CustomTestCase):
+    def _mixin(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        return StandaloneRemoteDraftSchedulerMixin()
+
+    def test_clear_local_finish_keeps_target_abort(self):
+        try:
+            from sglang.srt.managers.schedule_batch import (
+                FINISH_ABORT,
+                FINISH_LENGTH,
+                FINISH_MATCHED_TOKEN,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._mixin()
+
+        req = SimpleNamespace(
+            finished_reason=FINISH_MATCHED_TOKEN(matched=151645), to_abort=False
+        )
+        self.assertTrue(mixin._sr_clear_local_finish(req))
+        self.assertIsNone(req.finished_reason)
+
+        req = SimpleNamespace(finished_reason=FINISH_LENGTH(length=8), to_abort=False)
+        self.assertTrue(mixin._sr_clear_local_finish(req))
+        self.assertIsNone(req.finished_reason)
+
+        abort = FINISH_ABORT("Target request finished")
+        req = SimpleNamespace(finished_reason=abort, to_abort=True)
+        self.assertFalse(mixin._sr_clear_local_finish(req))
+        self.assertIs(req.finished_reason, abort)
+
+    def test_draft_eos_does_not_truncate_ingest(self):
+        try:
+            from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._mixin()
+        req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [10, 11, 12]
+        req.kv_committed_len = 3
+        req.finished_reason = None
+        steps = []
+
+        def run_ready(reqs, capture_tree_seed=False, teacher_forcing=False):
+            r = reqs[0]
+            steps.append((list(r.output_ids), bool(teacher_forcing)))
+            r.kv_committed_len = 3 + len(r.output_ids)
+            # Draft samples EOS on the first ingest step.
+            r.finished_reason = FINISH_MATCHED_TOKEN(matched=151645)
+
+        mixin._sr_ensure_window_budget = lambda *_a, **_k: None
+        mixin._sr_run_until_ready = run_ready
+        mixin._sr_ingest_committed_batch([req])
+
+        self.assertEqual(
+            [ids for ids, _ in steps], [[10], [10, 11], [10, 11, 12]]
+        )
+        self.assertTrue(all(tf for _, tf in steps))
+        self.assertEqual(req.output_ids, [10, 11, 12])
+        self.assertEqual(
+            committed_tail_not_in_kv(3, req.output_ids, req.kv_committed_len), []
+        )
+
+    def test_long_tail_uses_single_reprefill(self):
+        mixin = self._mixin()
+        mixin.sr_state = SRDraftStateManager()
+        committed = list(range(100, 340))
+        req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = list(committed)
+        req.kv_committed_len = 3
+        req.sr_padded_ids = [1, 2, 3]
+        req.draft_tokens_target = 4
+        resets = []
+        materialized = []
+
+        mixin._sr_ensure_window_budget = lambda *_a, **_k: None
+        mixin._sr_reset_linear_kv_state = lambda r, ids: resets.append((r.rid, len(ids)))
+        mixin._sr_materialize_prefix_batch = lambda reqs: materialized.append(
+            [r.rid for r in reqs]
+        )
+        mixin._sr_run_until_ready = MagicMock()
+        mixin._sr_ingest_committed_batch([req])
+
+        self.assertEqual(resets, [("a", 243)])
+        self.assertEqual(materialized, [["a"]])
+        mixin._sr_run_until_ready.assert_not_called()
+
+
+class TestSRDegradedRequests(CustomTestCase):
+    def _mixin(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        return StandaloneRemoteDraftSchedulerMixin()
+
+    def test_leftover_marks_degraded(self):
+        mixin = self._mixin()
+        mixin.sr_state = SRDraftStateManager()
+        req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [10, 11]
+        req.kv_committed_len = 4
+        req.req_pool_idx = None
+        mixin.sr_state.set("a", SRDraftState(req_id="a", session_id="s", req_object=req))
+        mixin.sr_tree_drafter = None
+        mixin._sr_materialize_prefix_batch = lambda reqs: None
+        mixin._sr_ingest_committed_batch = lambda reqs: None
+        mixin._sr_replay_grammars = lambda reqs: None
+
+        windows = mixin._sr_tree_expand_batch([req])
+
+        self.assertEqual(windows, [([], None, None)])
+        self.assertTrue(mixin.sr_state.get("a").degraded)
+
+    def test_degraded_rid_replies_empty_without_align(self):
+        mixin = self._mixin()
+        mixin.sr_state = SRDraftStateManager()
+        req = MagicMock()
+        req.rid = "a"
+        state = SRDraftState(req_id="a", session_id="s", req_object=req)
+        state.degraded = True
+        state.last_rpc_seq = 1
+        state.last_step_id = 0
+        state.last_base_committed_len = 3
+        mixin.sr_state.set("a", state)
+        mixin._sr_align = MagicMock()
+
+        dreq = SRDraftRequest(
+            rid="a",
+            step_id=1,
+            base_committed_len=4,
+            committed_ids=[10],
+            num_draft_tokens=4,
+        )
+        reply, live = mixin._sr_prepare_one(
+            dreq,
+            SRAction.STEP,
+            session_id="s",
+            rpc_seq=2,
+            mm=None,
+            last_session_id="s",
+            last_rpc_seq=1,
+        )
+        self.assertIsNone(live)
+        self.assertEqual(reply.status, SRReplyStatus.EMPTY)
+        self.assertEqual(reply.draft_tokens, [])
+        mixin._sr_align.assert_not_called()
+
+    def test_mm_embed_error_detects_released_features(self):
+        mixin = self._mixin()
+        item = SimpleNamespace(
+            is_image=lambda: True,
+            is_video=lambda: False,
+            feature=None,
+            precomputed_embeddings=None,
+        )
+        req = SimpleNamespace(
+            rid="a", multimodal_inputs=SimpleNamespace(mm_items=[item])
+        )
+        self.assertIsNotNone(mixin._sr_mm_embed_error(req))
+        item.feature = object()
+        self.assertIsNone(mixin._sr_mm_embed_error(req))
+        self.assertIsNone(
+            mixin._sr_mm_embed_error(SimpleNamespace(multimodal_inputs=None))
+        )
+
+
+class TestSchedulerSkipsDraftMmClear(CustomTestCase):
+    def test_sr_draft_req_keeps_mm_inputs(self):
+        try:
+            from sglang.srt.managers.scheduler import Scheduler
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        def make_req(is_sr_draft):
+            req = MagicMock()
+            req.finished.return_value = True
+            req.session = None
+            req.is_sr_draft = is_sr_draft
+            req.multimodal_inputs = MagicMock()
+            return req
+
+        draft_req = make_req(True)
+        normal_req = make_req(False)
+        batch = SimpleNamespace(reqs=[draft_req, normal_req])
+
+        Scheduler._maybe_clear_mm_inputs(MagicMock(), batch)
+
+        self.assertIsNotNone(draft_req.multimodal_inputs)
+        self.assertIsNone(normal_req.multimodal_inputs)
 
 
 if __name__ == "__main__":

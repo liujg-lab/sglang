@@ -1901,6 +1901,11 @@ class Scheduler(
             # For session requests, keep mm_inputs for the next request
             if req.session:
                 continue
+            # A speculative Draft req can look finished mid-RPC (it samples its
+            # own EOS while teacher-forcing); its mm lifetime belongs to the SR
+            # scheduler, which frees it on Target FINISH or TTL.
+            if getattr(req, "is_sr_draft", False) is True:
+                continue
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None

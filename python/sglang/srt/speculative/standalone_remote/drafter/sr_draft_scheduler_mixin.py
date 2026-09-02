@@ -18,6 +18,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRWindow,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
+    DEFAULT_MAX_INGEST_DECODE_STEPS,
     DraftDecision,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
@@ -25,6 +26,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     draft_needed_max_new_tokens,
     find_fork_point,
     ingest_active_indices,
+    plan_committed_ingest,
     replay_grammar_from_committed,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -502,6 +504,64 @@ class StandaloneRemoteDraftSchedulerMixin:
             return False
         return not isinstance(req.finished_reason, FINISH_LENGTH)
 
+    def _sr_is_target_finished(self, req: Req) -> bool:
+        """Only Target FINISH/ABORT ends a Draft RPC request.
+
+        Draft-local stops (EOS, stop strings, length) are throwaway: the tokens
+        it samples during teacher forcing are discarded, so they must not end
+        the request or the remaining committed tail never reaches KV.
+        """
+        if not req.finished():
+            return False
+        return isinstance(req.finished_reason, FINISH_ABORT)
+
+    def _sr_mm_embed_error(self, req: Req) -> Optional[str]:
+        """Vision items must still carry features to survive a re-prefill."""
+        mm = getattr(req, "multimodal_inputs", None)
+        if mm is None:
+            return None
+        for item in getattr(mm, "mm_items", None) or []:
+            is_image = getattr(item, "is_image", None)
+            is_video = getattr(item, "is_video", None)
+            if not (
+                (callable(is_image) and is_image())
+                or (callable(is_video) and is_video())
+            ):
+                continue
+            if item.precomputed_embeddings is None and item.feature is None:
+                return "mm item has neither feature nor precomputed_embeddings"
+        return None
+
+    def _sr_mark_degraded(self, rid: str, reason: str) -> None:
+        """Give up speculation for this rid until Target FINISHes it.
+
+        Half-ingested KV / broken VL tensors cannot be repaired mid-flight, and
+        letting them reach the GPU is what triggers the gather OOB. Target
+        treats a non-OK reply as an empty window and falls back to 1-token AR.
+        """
+        state = self.sr_state.get(rid)
+        if state is not None:
+            if state.degraded:
+                return
+            state.degraded = True
+        logger.warning("[SR] degrading %s to AR (no speculation): %s", rid, reason)
+
+    def _sr_is_degraded(self, rid: str) -> bool:
+        state = self.sr_state.get(rid)
+        return state is not None and state.degraded is True
+
+    def _sr_clear_local_finish(self, req: Req) -> bool:
+        """Drop a Draft-sampled terminal state. Returns True when one was cleared.
+
+        Target FINISH/ABORT (``FINISH_ABORT``) is preserved.
+        """
+        reason = getattr(req, "finished_reason", None)
+        if reason is None or isinstance(reason, FINISH_ABORT):
+            return False
+        req.finished_reason = None
+        req.to_abort = False
+        return True
+
     def _sr_ensure_window_budget(
         self, req: Req, num_draft_tokens: Optional[int]
     ) -> None:
@@ -842,10 +902,23 @@ class StandaloneRemoteDraftSchedulerMixin:
         req.logprob_start_len = max(0, len(req.origin_input_ids) - 1)
         req.sr_tree_seed = None
         if req.multimodal_inputs is not None:
+            # origin_input_ids was rewritten, so M-RoPE must be recomputed. If
+            # that fails or the vision tensors are already gone, prefilling
+            # would index past the embedding table and take down the scheduler.
             reset_mm_mrope(req.multimodal_inputs)
             maybe = getattr(self, "_maybe_compute_mrope_positions", None)
             if callable(maybe):
-                maybe(req)
+                try:
+                    maybe(req)
+                except Exception as e:
+                    self._sr_mark_degraded(
+                        req.rid, f"compute_mrope_positions failed: {e}"
+                    )
+                    return
+            embed_err = self._sr_mm_embed_error(req)
+            if embed_err:
+                self._sr_mark_degraded(req.rid, embed_err)
+                return
 
     def _sr_prepare_retracted_for_materialize(self, req: Req) -> None:
         if not (
@@ -914,26 +987,69 @@ class StandaloneRemoteDraftSchedulerMixin:
             return allocated
         return max(0, len(req.origin_input_ids))
 
+    def _sr_max_ingest_decode_steps(self) -> int:
+        """Per-token teacher forcing budget before one extend is cheaper."""
+        server_args = getattr(self, "server_args", None)
+        n = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+        if n <= 0:
+            n = int(getattr(server_args, "speculative_num_steps", 0) or 0) + 1
+        return max(DEFAULT_MAX_INGEST_DECODE_STEPS, 2 * n)
+
+    def _sr_reprefill_committed(self, reqs: List[Req]) -> None:
+        """Fold a long committed tail into one extend instead of N decodes."""
+        rebuilt: List[Req] = []
+        for req in reqs:
+            padded = list(getattr(req, "sr_padded_ids", None) or [])
+            committed = list(req.output_ids or [])
+            fill_ids = (padded + committed) if padded else (
+                list(req.origin_input_ids) + committed
+            )
+            logger.info(
+                "[SR] ingest tail %s tokens for %s: one reprefill of %s ids",
+                len(committed),
+                req.rid,
+                len(fill_ids),
+            )
+            self._sr_reset_linear_kv_state(req, fill_ids)
+            if self._sr_is_degraded(req.rid):
+                continue
+            self._sr_ensure_window_budget(req, req.draft_tokens_target)
+            rebuilt.append(req)
+        if rebuilt:
+            self._sr_materialize_prefix_batch(rebuilt)
+
     def _sr_ingest_committed_batch(self, reqs: List[Req]) -> None:
-        """Teacher-force committed tails into linear KV via fused chain decode.
+        """Teacher-force committed tails into linear KV.
 
         Align only appends Target ids onto ``output_ids``. Chain then forwards
         that last token with ``prepare_for_decode``. Tree used to skip that and
         expand on prompt KV, so only layer-0 matched (accept len stuck at 2).
-        Tails may differ in length: each step only runs reqs that still have a
-        token at that offset.
+        Short tails go one decode per token (tails may differ in length: each
+        step only runs reqs that still have a token at that offset). A long
+        tail -- Target ran ahead autoregressively -- is folded into a single
+        reprefill so the RPC cannot blow its deadline.
         """
         if not reqs:
             return
+        max_decode_steps = self._sr_max_ingest_decode_steps()
         snapshots = []
+        long_tail: List[Req] = []
         for req in reqs:
             committed = list(req.output_ids or [])
-            tail = committed_tail_not_in_kv(
-                len(req.origin_input_ids), committed, self._sr_kv_len(req)
+            mode, tail = plan_committed_ingest(
+                len(req.origin_input_ids),
+                committed,
+                self._sr_kv_len(req),
+                max_decode_steps=max_decode_steps,
             )
+            if mode == "reprefill":
+                long_tail.append(req)
+                continue
             snapshots.append(
                 (req, committed, tail, len(committed) - len(tail))
             )
+        if long_tail:
+            self._sr_reprefill_committed(long_tail)
         for t, active_idx in enumerate(
             ingest_active_indices(
                 [len(tail) for _, _, tail, _ in snapshots]
@@ -948,7 +1064,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_ensure_window_budget(req, 1)
                 active.append(req)
             if active:
-                self._sr_run_until_ready(active, capture_tree_seed=True)
+                self._sr_run_until_ready(
+                    active, capture_tree_seed=True, teacher_forcing=True
+                )
         for req, committed, _, _ in snapshots:
             req.output_ids = committed
             req.draft_generation_start_len = len(committed)
@@ -971,10 +1089,17 @@ class StandaloneRemoteDraftSchedulerMixin:
             )
             if leftover:
                 logger.warning(
-                    "[SR] tree ingest left %s token(s) out of KV for %s",
+                    "[SR] tree ingest left %s token(s) out of KV for %s "
+                    "(finished_reason=%s kv_committed_len=%s prompt_len=%s "
+                    "output_len=%s)",
                     len(leftover),
                     req.rid,
+                    getattr(req, "finished_reason", None),
+                    getattr(req, "kv_committed_len", None),
+                    len(req.origin_input_ids),
+                    len(req.output_ids or []),
                 )
+                self._sr_mark_degraded(req.rid, "tree ingest left tokens out of KV")
                 continue
             if req.req_pool_idx is None or self.sr_tree_drafter is None:
                 continue
@@ -1018,8 +1143,20 @@ class StandaloneRemoteDraftSchedulerMixin:
             self.sr_waiting.append(req)
 
     def _sr_run_until_ready(
-        self, reqs: List[Req], capture_tree_seed: bool = False
+        self,
+        reqs: List[Req],
+        capture_tree_seed: bool = False,
+        teacher_forcing: bool = False,
     ) -> None:
+        # Teacher forcing replays Target's committed ids; only Target FINISH ends it.
+        done = (
+            self._sr_is_target_finished
+            if teacher_forcing
+            else self._sr_is_terminal_finished
+        )
+        if teacher_forcing:
+            for req in reqs:
+                self._sr_clear_local_finish(req)
         need = {r.rid: r for r in reqs}
         need_rids = set(need.keys())
         self._sr_isolate_need(need_rids)
@@ -1043,13 +1180,15 @@ class StandaloneRemoteDraftSchedulerMixin:
             guard += 1
             still = []
             for rid, req in list(need.items()):
+                if teacher_forcing:
+                    self._sr_clear_local_finish(req)
                 produced = len(req.output_ids) - int(
                     getattr(req, "draft_generation_start_len", 0) or 0
                 )
                 target = int(getattr(req, "draft_tokens_target", 0) or 0)
                 if target <= 0:
                     target = int(self.server_args.speculative_num_steps or 1)
-                if produced >= target or self._sr_is_terminal_finished(req):
+                if produced >= target or done(req):
                     still.append(rid)
             for rid in still:
                 need.pop(rid, None)
@@ -1076,7 +1215,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                 break
 
         for req in reqs:
-            if not self._sr_is_terminal_finished(req):
+            if teacher_forcing:
+                self._sr_clear_local_finish(req)
+            if not done(req):
                 self._sr_pause_req(req)
         self.last_batch = None
 
@@ -1181,6 +1322,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                 )
             return empty, None
         if decision == DraftDecision.HARD_RESET:
+            # A fresh req replaces the broken KV, so speculation can resume.
+            if state is not None:
+                state.degraded = False
             req = self._sr_create_req(dreq, mm, session_id)
             if req is None:
                 return empty, None
@@ -1204,6 +1348,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                         return empty, None
                 else:
                     return empty, None
+            elif state is not None and state.degraded:
+                # Broken Draft state: stay off the GPU, let Target autoregress.
+                return empty, None
             else:
                 self._sr_align(req, dreq, state)
 

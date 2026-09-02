@@ -116,6 +116,32 @@ def committed_tail_not_in_kv(
     return list(output_ids or [])[already:]
 
 
+DEFAULT_MAX_INGEST_DECODE_STEPS = 16
+
+
+def plan_committed_ingest(
+    origin_len: int,
+    output_ids: Optional[Sequence[int]],
+    kv_len: int,
+    max_decode_steps: int = DEFAULT_MAX_INGEST_DECODE_STEPS,
+) -> Tuple[str, List[int]]:
+    """Decide how to get the committed tail into linear KV.
+
+    Returns one of ``("noop", [])``, ``("decode", tail)``, ``("reprefill", tail)``.
+
+    Per-token teacher forcing costs one decode per missing token. After a
+    Target AR stretch the tail can be hundreds of tokens, which blows the RPC
+    timeout and keeps the tail growing. One extend over the whole sequence is
+    orders of magnitude cheaper, so switch to reprefill past the threshold.
+    """
+    tail = committed_tail_not_in_kv(origin_len, output_ids, kv_len)
+    if not tail:
+        return "noop", []
+    if len(tail) > max(1, int(max_decode_steps)):
+        return "reprefill", tail
+    return "decode", tail
+
+
 def ingest_active_indices(tail_lens: Sequence[int]) -> List[List[int]]:
     """For fused tree ingest: at offset t, which reqs still have a tail token."""
     max_t = max(tail_lens) if tail_lens else 0

@@ -25,6 +25,9 @@ class SRDraftState:
     last_rpc_seq: int = -1
     last_window: Optional[SRWindow] = None
     req_object: Optional["Req"] = None
+    # Sticky: this rid hit unrecoverable Draft state (half-ingested KV, broken
+    # VL tensors). Reply EMPTY without touching the GPU until Target FINISHes.
+    degraded: bool = False
     last_updated_time: float = field(default_factory=time.time)
     created_time: float = field(default_factory=time.time)
 
