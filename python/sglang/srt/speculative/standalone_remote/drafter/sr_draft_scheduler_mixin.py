@@ -19,6 +19,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DEFAULT_MAX_INGEST_DECODE_STEPS,
     DraftDecision,
+    broadcast_sr_obj,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
     decide_draft_action,
@@ -52,7 +53,7 @@ from sglang.srt.speculative.standalone_remote.sr_transport import (
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
     SRTreeDrafter,
 )
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
+from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
 
@@ -1461,11 +1462,12 @@ class StandaloneRemoteDraftSchedulerMixin:
                     }
                     packet = (batch.to_dict(), mm_pickled)
         if self.tp_size > 1:
-            packet = broadcast_pyobj(
+            packet = broadcast_sr_obj(
                 packet,
-                self.tp_group.rank,
+                self.tp_size,
+                self.tp_rank,
+                self.tp_group,
                 self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
             )
         if packet is None:
             return None

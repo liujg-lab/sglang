@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.speculative.standalone_remote.sr_align import (
+    broadcast_sr_obj,
     shift_overlapped_prefill_drafts,
     drop_duplicate_root_draft,
 )
@@ -110,8 +111,21 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _new_sr_session_id(self) -> str:
         return f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
 
+    def _sr_broadcast_obj(self, obj):
+        return broadcast_sr_obj(
+            obj, self.tp_size, self.tp_rank, self.tp_group, self.tp_cpu_group
+        )
+
+    def _sync_sr_session_id(self) -> None:
+        if self.tp_rank == 0:
+            self.sr_session_id = self._new_sr_session_id()
+        else:
+            self.sr_session_id = None
+        if self.tp_size > 1:
+            self.sr_session_id = self._sr_broadcast_obj(self.sr_session_id)
+
     def _init_sr_target(self) -> None:
-        self.sr_session_id = self._new_sr_session_id()
+        self._sync_sr_session_id()
         self.sr_rpc_seq = 0
         self.sr_pending: Dict[str, SRPendingEntry] = {}
         self._sr_inflight: Optional[SRInflight] = None
@@ -131,13 +145,14 @@ class SchedulerStandaloneRemoteTargetMixin:
             assert isinstance(client, SRTargetClient)
             client.drop_callback = self._sr_note_stale
             self.sr_client = client
-        logger.info(
-            "[SR] Target session_id=%s",
-            self.sr_session_id,
-        )
+        if self.tp_rank == 0:
+            logger.info(
+                "[SR] Target session_id=%s",
+                self.sr_session_id,
+            )
 
     def reset_standalone_remote_target_state(self) -> None:
-        self.sr_session_id = self._new_sr_session_id()
+        self._sync_sr_session_id()
         self.sr_rpc_seq = 0
         self.sr_pending = {}
         self._sr_inflight = None
@@ -147,7 +162,8 @@ class SchedulerStandaloneRemoteTargetMixin:
         breaker = getattr(self, "sr_breaker", None)
         if breaker is not None:
             breaker.reset()
-        logger.info("[SR] Target flushed, new session_id=%s", self.sr_session_id)
+        if self.tp_rank == 0:
+            logger.info("[SR] Target flushed, new session_id=%s", self.sr_session_id)
 
     def _sr_note_stale(self, reason: str) -> None:
         from sglang.srt.speculative.standalone_remote.sr_transport import (
@@ -256,14 +272,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                     send_ok = False
 
         if self.tp_size > 1:
-            from sglang.srt.utils import broadcast_pyobj
-
-            send_ok = broadcast_pyobj(
-                send_ok,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+            send_ok = self._sr_broadcast_obj(send_ok)
 
         inflight = SRInflight(
             session_id=self.sr_session_id,
@@ -294,15 +303,8 @@ class SchedulerStandaloneRemoteTargetMixin:
                         reply = None
 
         if self.tp_size > 1:
-            from sglang.srt.utils import broadcast_pyobj
-
             payload = reply.to_dict() if reply is not None else None
-            payload = broadcast_pyobj(
-                payload,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+            payload = self._sr_broadcast_obj(payload)
             reply = SRBatchReply.from_dict(payload) if payload is not None else None
 
         result: Dict[str, SRDraftReply] = {}

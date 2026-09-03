@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
@@ -206,3 +206,43 @@ def drop_duplicate_root_draft(
     if tokens[0] == last_committed:
         return tokens[1:]
     return tokens
+
+
+def wrap_tp_broadcast(obj: Any) -> List[Any]:
+    """Box an object for ``broadcast_pyobj`` (needs ``len``). ``[None]`` is valid."""
+    return [obj]
+
+
+def unwrap_tp_broadcast(wrapped: Sequence[Any]) -> Any:
+    """Inverse of ``wrap_tp_broadcast``."""
+    return wrapped[0]
+
+
+def _default_broadcast_pyobj(data, rank, dist_group, src=0):
+    from sglang.srt.utils import broadcast_pyobj
+
+    return broadcast_pyobj(data, rank, dist_group, src=src)
+
+
+def broadcast_sr_obj(
+    obj: Any,
+    tp_size: int,
+    tp_rank: int,
+    tp_group,
+    tp_cpu_group,
+):
+    """Broadcast a pickleable object from TP rank 0.
+
+    ``broadcast_pyobj`` requires a sequence. Wrap as ``[obj]`` so bool / None /
+    dict all work. Empty list is only the non-src dummy; never the None sentinel.
+    """
+    if tp_size <= 1:
+        return obj
+    wrapped = wrap_tp_broadcast(obj)
+    out = _default_broadcast_pyobj(
+        wrapped if tp_rank == 0 else [],
+        tp_group.rank,
+        tp_cpu_group,
+        src=tp_group.ranks[0],
+    )
+    return unwrap_tp_broadcast(out)

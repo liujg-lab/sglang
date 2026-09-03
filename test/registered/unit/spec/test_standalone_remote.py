@@ -21,6 +21,7 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DraftDecision,
+    broadcast_sr_obj,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
     decide_draft_action,
@@ -32,6 +33,8 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     plan_committed_ingest,
     replay_grammar_from_committed,
     shift_overlapped_prefill_drafts,
+    unwrap_tp_broadcast,
+    wrap_tp_broadcast,
 )
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
@@ -315,6 +318,97 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.LAST)
         batch.spec_info = None
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.NULL)
+
+
+class TestSRTpBroadcast(CustomTestCase):
+    def test_wrap_unwrap_bool_none_dict_tuple(self):
+        for obj in (True, False, None, {"k": 1}, (1, 2)):
+            wrapped = wrap_tp_broadcast(obj)
+            self.assertEqual(len(wrapped), 1)
+            self.assertIs(unwrap_tp_broadcast(wrapped), obj)
+        with self.assertRaises(TypeError):
+            len(True)
+        with self.assertRaises(TypeError):
+            len(None)
+
+    def test_broadcast_sr_obj_tp1_is_identity(self):
+        group = SimpleNamespace(rank=0, ranks=[0])
+        self.assertIs(
+            broadcast_sr_obj(True, 1, 0, group, None),
+            True,
+        )
+        self.assertIsNone(broadcast_sr_obj(None, 1, 0, group, None))
+
+    @patch(
+        "sglang.srt.speculative.standalone_remote.sr_align._default_broadcast_pyobj"
+    )
+    def test_rank0_sends_singleton_list(self, mock_bcast):
+        mock_bcast.side_effect = lambda data, rank, group, src=0: data
+        group = SimpleNamespace(rank=0, ranks=[0])
+        self.assertIs(
+            broadcast_sr_obj(True, 2, 0, group, "cpu"),
+            True,
+        )
+        self.assertEqual(mock_bcast.call_args[0][0], [True])
+        mock_bcast.reset_mock()
+        self.assertIsNone(broadcast_sr_obj(None, 2, 0, group, "cpu"))
+        self.assertEqual(mock_bcast.call_args[0][0], [None])
+
+    @patch(
+        "sglang.srt.speculative.standalone_remote.sr_align._default_broadcast_pyobj"
+    )
+    def test_nonsrc_dummy_is_empty_list(self, mock_bcast):
+        mock_bcast.side_effect = lambda data, rank, group, src=0: [True]
+        group = SimpleNamespace(rank=1, ranks=[0, 1])
+        self.assertIs(
+            broadcast_sr_obj(False, 2, 1, group, "cpu"),
+            True,
+        )
+        self.assertEqual(mock_bcast.call_args[0][0], [])
+
+    def test_init_syncs_session_id_to_rank1(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        shared = {}
+
+        def fake_bcast(obj, tp_size, tp_rank, tp_group, tp_cpu_group):
+            if tp_rank == 0:
+                shared["id"] = obj
+                return obj
+            return shared.get("id")
+
+        def _make(rank):
+            mixin = SchedulerStandaloneRemoteTargetMixin()
+            mixin.tp_size = 2
+            mixin.tp_rank = rank
+            mixin.tp_group = SimpleNamespace(rank=rank, ranks=[0, 1])
+            mixin.tp_cpu_group = None
+            mixin.server_args = SimpleNamespace(
+                standalone_remote_breaker_failures=3,
+                standalone_remote_breaker_cooldown=32,
+            )
+            return mixin
+
+        with patch(
+            "sglang.srt.speculative.standalone_remote.verifier."
+            "sr_target_scheduler_mixin.broadcast_sr_obj",
+            side_effect=fake_bcast,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.verifier."
+            "sr_target_scheduler_mixin.make_transport_from_server_args",
+        ):
+            rank0 = _make(0)
+            rank0._init_sr_target()
+            rank1 = _make(1)
+            rank1._init_sr_target()
+        self.assertIsNotNone(rank0.sr_session_id)
+        self.assertEqual(rank1.sr_session_id, rank0.sr_session_id)
+        self.assertIsNone(rank1.sr_client)
 
 
 class TestSRProtocolRoundTrip(CustomTestCase):

@@ -142,7 +142,7 @@ GPU 时间与投机 RPC 共享。
 - Re-prefill 会重算 M-RoPE，但保留 `precomputed_embeddings`（不再跑一遍 ViT）。
   Target 不发送 `mm_input_embeds`。
 - 纯文本请求不带 mm frame。
-- Draft TP>1：rank 0 收 RPC，再 `broadcast_pyobj` 给其它 rank。
+- Draft / Target TP>1：rank 0 收发 ZMQ，再 `broadcast_sr_obj`（`[obj]` 包装）给其它 rank。
 
 ## 协议身份（过期回复）
 
