@@ -1446,6 +1446,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Optional override for CUDA-graph / logits hidden capture (LAST, FULL).
+    # Resolved after return_hidden_states in get_model_worker_batch.
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None
+
     # Whether to return captured experts
     return_routed_experts: bool = False
 
@@ -2361,10 +2365,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        if other.capture_hidden_mode is not None:
+            if self.capture_hidden_mode is None:
+                self.capture_hidden_mode = other.capture_hidden_mode
+            else:
+                self.capture_hidden_mode = max(
+                    self.capture_hidden_mode, other.capture_hidden_mode
+                )
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+    def resolve_capture_hidden_mode(self) -> CaptureHiddenMode:
+        if self.return_hidden_states:
+            return CaptureHiddenMode.FULL
+        if self.capture_hidden_mode is not None:
+            return self.capture_hidden_mode
+        if self.spec_info is not None:
+            return getattr(
+                self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+            )
+        return CaptureHiddenMode.NULL
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
@@ -2422,17 +2444,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.return_hidden_states
-                else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-                    )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
+            capture_hidden_mode=self.resolve_capture_hidden_mode(),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,

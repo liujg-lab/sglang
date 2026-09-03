@@ -12,7 +12,13 @@ try:
 except ImportError:
     torch = None
 
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    cuda_graph_hidden_mode_can_run,
+    cuda_graph_hidden_mode_needs_recapture,
+    decode_cuda_graph_accepts_spec_info,
+    resolve_cuda_graph_capture_hidden_mode,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DraftDecision,
     classify_prefix_alignment,
@@ -120,6 +126,76 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
         self.assertTrue(sr.uses_spec_topk_cuda_graph_layout())
         self.assertFalse(sr.uses_dual_ntpb_cuda_graph(draft))
         self.assertIsNone(sr.dual_ntpb_cuda_graph_options(draft))
+        self.assertEqual(sr.decode_cuda_graph_hidden_mode(draft), 1)  # LAST
+        self.assertEqual(
+            sr.decode_cuda_graph_hidden_mode(draft, is_draft_worker=True),
+            0,
+        )
+
+    def test_cuda_graph_hidden_mode_can_run_table(self):
+        null, last, full = 0, 1, 2  # CaptureHiddenMode NULL / LAST / FULL
+        # Emulation: weaker request on a stronger graph.
+        self.assertTrue(cuda_graph_hidden_mode_can_run(null, last))
+        self.assertTrue(cuda_graph_hidden_mode_can_run(last, last))
+        self.assertTrue(cuda_graph_hidden_mode_can_run(last, full))
+        self.assertFalse(cuda_graph_hidden_mode_needs_recapture(null, last))
+        self.assertFalse(cuda_graph_hidden_mode_needs_recapture(last, last))
+        self.assertFalse(cuda_graph_hidden_mode_needs_recapture(last, full))
+        # Stronger request must not replay DECODE graphs (tree capture would
+        # hit unset raw_num_token). Recapture stays on the replay path only.
+        self.assertFalse(cuda_graph_hidden_mode_can_run(full, last))
+        self.assertFalse(cuda_graph_hidden_mode_can_run(last, null))
+        self.assertTrue(cuda_graph_hidden_mode_needs_recapture(full, last))
+        self.assertTrue(cuda_graph_hidden_mode_needs_recapture(last, null))
+
+    def test_decode_cuda_graph_rejects_tree_draft_spec(self):
+        self.assertTrue(decode_cuda_graph_accepts_spec_info(None))
+        self.assertTrue(
+            decode_cuda_graph_accepts_spec_info(
+                SimpleNamespace(capture_hidden_mode=1, num_tokens_per_req=1)
+            )
+        )
+        self.assertFalse(
+            decode_cuda_graph_accepts_spec_info(
+                SimpleNamespace(is_draft_input=lambda: True, num_tokens_per_req=2)
+            )
+        )
+        self.assertFalse(
+            decode_cuda_graph_accepts_spec_info(
+                SimpleNamespace(num_tokens_per_req=2)
+            )
+        )
+
+    def test_capture_keeps_last_when_draft_spec_info_is_none(self):
+        null, last, full = 0, 1, 2
+        # SR draft DECODE graphs have no verify spec_info; keep LAST.
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(last, None), last
+        )
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(null, None), null
+        )
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(full, None), full
+        )
+        # Target verify spec_info can raise NULL → FULL.
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(
+                null, SimpleNamespace(capture_hidden_mode=full)
+            ),
+            full,
+        )
+        # FULL is sticky even if spec_info is weaker.
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(
+                full, SimpleNamespace(capture_hidden_mode=null)
+            ),
+            full,
+        )
+        # Ingest LAST on LAST-captured graphs must still can_run.
+        captured = resolve_cuda_graph_capture_hidden_mode(last, None)
+        self.assertTrue(cuda_graph_hidden_mode_can_run(last, captured))
+        self.assertTrue(cuda_graph_hidden_mode_can_run(null, captured))
 
     def test_existing_algorithms_keep_target_verify_capture(self):
         args = SimpleNamespace(
@@ -177,6 +253,20 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
         self.assertFalse(
             SpeculativeAlgorithm.SPECTRE.uses_dual_ntpb_cuda_graph(spectre_draft)
         )
+        self.assertEqual(
+            SpeculativeAlgorithm.EAGLE.decode_cuda_graph_hidden_mode(args),
+            0,
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.NONE.decode_cuda_graph_hidden_mode(args),
+            0,
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.STANDALONE_REMOTE.decode_cuda_graph_hidden_mode(
+                SimpleNamespace(standalone_remote_role="target")
+            ),
+            0,
+        )
 
     def test_ar_fallback_source_forces_eager(self):
         from pathlib import Path
@@ -191,6 +281,40 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
         self.assertIn("def _forward_target_eager", src)
         self.assertIn("runner.graph_runner = None", src)
         self.assertIn("can_run_cuda_graph=False", src)
+
+
+class TestSRTreeSeedHiddenCapture(CustomTestCase):
+    def test_enable_tree_seed_hidden_requests_last_not_full(self):
+        try:
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        batch = SimpleNamespace(return_hidden_states=True, capture_hidden_mode=None)
+        StandaloneRemoteDraftSchedulerMixin._sr_enable_tree_seed_hidden(None, batch)
+        self.assertFalse(batch.return_hidden_states)
+        self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.LAST)
+
+    def test_schedule_batch_resolves_last_unless_http_full(self):
+        try:
+            from sglang.srt.managers.schedule_batch import ScheduleBatch
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        except ImportError as e:
+            self.skipTest(str(e))
+        batch = ScheduleBatch()
+        batch.return_hidden_states = False
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.LAST)
+        batch.return_hidden_states = True
+        self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.FULL)
+        batch.return_hidden_states = False
+        batch.capture_hidden_mode = None
+        batch.spec_info = SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.LAST)
+        self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.LAST)
+        batch.spec_info = None
+        self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.NULL)
 
 
 class TestSRProtocolRoundTrip(CustomTestCase):

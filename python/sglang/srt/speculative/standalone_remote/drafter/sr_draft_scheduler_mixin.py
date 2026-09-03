@@ -10,7 +10,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftState,
     SRDraftStateManager,
@@ -125,6 +125,11 @@ class StandaloneRemoteDraftSchedulerMixin:
 
     def _sr_tree_mode(self) -> bool:
         return getattr(self, "sr_tree_drafter", None) is not None
+
+    def _sr_enable_tree_seed_hidden(self, batch: ScheduleBatch) -> None:
+        """Request last-token hidden for tree seed without HTTP FULL capture."""
+        batch.return_hidden_states = False
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
     def _sr_is_http_req(self, req: Req) -> bool:
         """HTTP generate reqs are unmarked; Target RPC reqs set is_sr_draft."""
@@ -958,7 +963,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 break
             if len(keep) != len(batch.reqs):
                 batch.filter_batch(keep_indices=keep)
-            batch.return_hidden_states = True
+            self._sr_enable_tree_seed_hidden(batch)
             self.cur_batch = batch
             result = self.run_batch(batch)
             self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
@@ -1201,7 +1206,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             self.cur_batch = batch
             if batch:
                 if capture_tree_seed:
-                    batch.return_hidden_states = True
+                    self._sr_enable_tree_seed_hidden(batch)
                 result = self.run_batch(batch)
                 if capture_tree_seed:
                     self._sr_cache_tree_seeds(list(batch.reqs), result, batch)

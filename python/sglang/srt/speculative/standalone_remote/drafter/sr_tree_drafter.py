@@ -326,9 +326,16 @@ class SRTreeDrafter:
             if self.draft_attn_backend is not None:
                 forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # Tree steps are bs*topk, not 1-token AR. DECODE graphs must not replay
+            # here (capture would hit unset raw_num_token; runtime layout is wrong).
+            prev_graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
+            self.draft_model_runner.graph_runner = None
+            try:
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+            finally:
+                self.draft_model_runner.graph_runner = prev_graph_runner
             maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)

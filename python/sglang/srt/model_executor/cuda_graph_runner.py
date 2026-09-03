@@ -65,6 +65,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.spec_info import (
+    cuda_graph_hidden_mode_can_run,
+    decode_cuda_graph_accepts_spec_info,
+    resolve_cuda_graph_capture_hidden_mode,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -578,6 +583,16 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        self.capture_hidden_mode = max(
+            self.capture_hidden_mode,
+            CaptureHiddenMode(
+                model_runner.spec_algorithm.decode_cuda_graph_hidden_mode(
+                    model_runner.server_args,
+                    is_draft_worker=bool(self.model_runner.is_draft_worker),
+                )
+            ),
+        )
+
         self.is_spectre = is_spectre_target
         self.dual_ntpb = model_runner.spec_algorithm.uses_dual_ntpb_cuda_graph(
             model_runner.server_args,
@@ -797,10 +812,17 @@ class CudaGraphRunner:
                 else CaptureHiddenMode.NULL
             ),
         )
-        capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
+        capture_hidden_mode_matches = cuda_graph_hidden_mode_can_run(
+            requested_capture_hidden_mode, self.capture_hidden_mode
         )
+        is_decode_layout_supported = True
+        if (
+            self.capture_forward_mode == ForwardMode.DECODE
+            and not _uses_dual_ntpb(self)
+        ):
+            is_decode_layout_supported = decode_cuda_graph_accepts_spec_info(
+                forward_batch.spec_info
+            )
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
@@ -820,6 +842,7 @@ class CudaGraphRunner:
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_decode_layout_supported
         )
 
         return result
@@ -1039,10 +1062,11 @@ class CudaGraphRunner:
             global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens, ntpb_override=ntpb_override)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+        self.capture_hidden_mode = CaptureHiddenMode(
+            resolve_cuda_graph_capture_hidden_mode(
+                self.capture_hidden_mode, spec_info
             )
+        )
 
         effective_forward_mode = (
             ForwardMode.DECODE
@@ -1339,6 +1363,12 @@ class CudaGraphRunner:
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
+            if not hasattr(self, "raw_num_token"):
+                raise RuntimeError(
+                    "CUDA graph replay skipped replay_prepare but raw_num_token "
+                    "is unset. DECODE graphs cannot wrap tree-draft forwards; "
+                    "use EAGLEDraftCudaGraphRunner or eager draft_forward."
+                )
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)

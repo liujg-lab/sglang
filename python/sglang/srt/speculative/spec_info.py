@@ -128,6 +128,25 @@ class SpeculativeAlgorithm(Enum):
             )
         return 1
 
+    def decode_cuda_graph_hidden_mode(
+        self, server_args: "ServerArgs", is_draft_worker: bool = False
+    ) -> int:
+        """Hidden mode value for ordinary DECODE CUDA graphs.
+
+        Returns a ``CaptureHiddenMode`` integer (NULL=0, LAST=1). STANDALONE_REMOTE
+        Draft tree ingest needs last-token hidden for the tree seed. Capture LAST
+        at startup so ingest can replay without ``--enable-return-hidden-states``.
+        HTTP generate still requests NULL, which LAST graphs can emulate.
+        In-process EAGLE draft workers and other algorithms stay NULL.
+        """
+        if (
+            not is_draft_worker
+            and self.is_standalone_remote()
+            and getattr(server_args, "standalone_remote_role", None) == "draft"
+        ):
+            return 1  # CaptureHiddenMode.LAST
+        return 0  # CaptureHiddenMode.NULL
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
@@ -217,6 +236,59 @@ class SpeculativeAlgorithm(Enum):
             return StandaloneRemoteWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+def resolve_cuda_graph_capture_hidden_mode(current, spec_info):
+    """Hidden mode used while recording CUDA graphs.
+
+    FULL is sticky (``--enable-return-hidden-states``). Otherwise keep
+    ``current`` (LAST from ``decode_cuda_graph_hidden_mode`` for SR draft)
+    and raise to ``spec_info.capture_hidden_mode`` when present. A missing
+    spec_info must not reset LAST to NULL — that made SR draft ingest miss
+    DECODE graphs after capture.
+    """
+    full = 2  # CaptureHiddenMode.FULL
+    if current is not None and int(current) >= full:
+        return current
+    spec_mode = (
+        getattr(spec_info, "capture_hidden_mode", None)
+        if spec_info is not None
+        else None
+    )
+    if spec_mode is None:
+        return current
+    if current is None:
+        return spec_mode
+    return max(current, spec_mode)
+
+
+def cuda_graph_hidden_mode_can_run(requested, captured) -> bool:
+    """Whether ``CudaGraphRunner.can_run`` should accept this hidden-mode pair.
+
+    Captured graphs can emulate weaker modes (``requested <= captured``).
+    Stronger requests must not replay: ``recapture_if_needed`` is not reachable
+    from ``can_run``, and forcing True made tree-draft capture replay DECODE
+    graphs before ``raw_num_token`` existed.
+    """
+    return requested <= captured
+
+
+def cuda_graph_hidden_mode_needs_recapture(requested, captured) -> bool:
+    """True when replay must recapture because the request is stronger."""
+    return requested > captured
+
+
+def decode_cuda_graph_accepts_spec_info(spec_info) -> bool:
+    """Ordinary DECODE graphs are 1-token AR. Tree ``EagleDraftInput`` must not replay them."""
+    if spec_info is None:
+        return True
+    is_draft = getattr(spec_info, "is_draft_input", None)
+    if callable(is_draft) and is_draft():
+        return False
+    ntpb = getattr(spec_info, "num_tokens_per_req", None)
+    if ntpb is not None and int(ntpb) > 1:
+        return False
+    return True
 
 
 class SpecInputType(IntEnum):
