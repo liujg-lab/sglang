@@ -139,6 +139,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
+      "verify_tree_rpd(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor logits, Tensor z_star, Tensor target_predict, float gap_max, bool use_equality) -> ()");
+  m.impl("verify_tree_rpd", torch::kCUDA, &verify_tree_rpd);
+
+  m.def(
       "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "

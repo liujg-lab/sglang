@@ -50,6 +50,22 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
+_logged_verify_method = False
+
+
+def _log_verify_method_once(
+    resolved: str, *, verify_mode: str, tau: float | None = None
+) -> None:
+    global _logged_verify_method
+    if _logged_verify_method:
+        return
+    _logged_verify_method = True
+    if resolved == "rpd":
+        logger.info("Speculative verify method: rpd (tau=%s)", tau)
+    elif verify_mode == "auto":
+        logger.info("Speculative verify method: %s (mode=auto)", resolved)
+    else:
+        logger.info("Speculative verify method: %s", resolved)
 
 
 @dataclass
@@ -319,6 +335,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if verify_mode == "rpd":
+            resolved_verify = "rpd"
+        elif (
+            verify_mode == "greedy"
+            or (verify_mode == "auto" and is_all_greedy)
+            or not TREE_SPEC_KERNEL_AVAILABLE
+        ):
+            resolved_verify = "greedy"
+        else:
+            resolved_verify = "target_only"
+        rpd_tau = float(getattr(server_args, "speculative_rpd_tau", 0.2))
+        _log_verify_method_once(
+            resolved_verify, verify_mode=verify_mode, tau=rpd_tau
+        )
+
+        if resolved_verify == "rpd":
             predict, accept_index, accept_length = verify_tree_rpd(
                 predicts=predict,
                 accept_index=accept_index,
@@ -328,13 +359,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 logits=logits_output.next_token_logits,
-                tau=float(getattr(server_args, "speculative_rpd_tau", 0.2)),
+                tau=rpd_tau,
             )
-        elif (
-            verify_mode == "greedy"
-            or (verify_mode == "auto" and is_all_greedy)
-            or not TREE_SPEC_KERNEL_AVAILABLE
-        ):
+        elif resolved_verify == "greedy":
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(

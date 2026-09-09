@@ -11,10 +11,14 @@ Torch-only so CPU unit tests can import it without the rest of sglang.srt.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+_logged_rpd_cpu_fallback = False
 
 
 def rpd_gap_max(tau: float) -> float:
@@ -97,7 +101,13 @@ def _longest_path(
     return path
 
 
-def verify_tree_rpd(
+def _prepare_logits(logits: torch.Tensor) -> torch.Tensor:
+    if logits.dim() == 3:
+        return logits.reshape(-1, logits.shape[-1])
+    return logits
+
+
+def _verify_tree_rpd_cuda(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
@@ -106,27 +116,51 @@ def verify_tree_rpd(
     retrive_next_token: torch.Tensor,
     retrive_next_sibling: torch.Tensor,
     logits: torch.Tensor,
-    tau: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fill greedy-compatible verify buffers using RPD longest-path.
+    gap_max: float,
+    use_equality: bool,
+) -> None:
+    from sgl_kernel import verify_tree_rpd as verify_tree_rpd_cuda
 
-    Args:
-        predicts: mutable ``[tot]`` (or flattened logits rows + 1 in EAGLE).
-            Written at parent retrieve indices and the last-slot bonus.
-        accept_index: mutable ``[bs, spec_steps+1]``, pre-filled with -1.
-        accept_token_num: mutable ``[bs]``.
-        candidates: ``[bs, num_draft_tokens]`` draft token ids (slot 0 = root).
-        retrive_index / retrive_next_token / retrive_next_sibling: ``[bs, n]``.
-        logits: ``[tot, vocab]`` target logits, rows indexed by retrive_index.
-        tau: RPD threshold in ``[0, 1)``.
-    """
-    gap_max = rpd_gap_max(tau)
-    use_equality = float(tau) == 0.0
+    logits = _prepare_logits(logits)
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    candidates = candidates.contiguous()
+    retrive_index = retrive_index.contiguous()
+    retrive_next_token = retrive_next_token.contiguous()
+    retrive_next_sibling = retrive_next_sibling.contiguous()
+    z_star = logits.amax(dim=-1).contiguous()
+    target_predict = logits.argmax(dim=-1).to(torch.int64).contiguous()
+    accept_index.fill_(-1)
+    verify_tree_rpd_cuda(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        logits,
+        z_star,
+        target_predict,
+        float(gap_max),
+        bool(use_equality),
+    )
 
+
+def _verify_tree_rpd_cpu(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    logits: torch.Tensor,
+    gap_max: float,
+    use_equality: bool,
+) -> None:
     bs, n = candidates.shape
-    logits_f32 = logits.float()
-    if logits_f32.dim() == 3:
-        logits_f32 = logits_f32.reshape(-1, logits_f32.shape[-1])
+    logits_f32 = _prepare_logits(logits).float()
     target_predict = torch.argmax(logits_f32, dim=-1)
     z_star = logits_f32.max(dim=-1).values
 
@@ -182,4 +216,56 @@ def verify_tree_rpd(
         last_flat = int(retr_cpu[b, path[-1]].item())
         predicts[last_flat] = int(argmax_cpu[last_flat].item())
 
+
+def verify_tree_rpd(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    logits: torch.Tensor,
+    tau: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fill greedy-compatible verify buffers using RPD longest-path.
+
+    Args:
+        predicts: mutable ``[tot]`` (or flattened logits rows + 1 in EAGLE).
+            Written at parent retrieve indices and the last-slot bonus.
+        accept_index: mutable ``[bs, spec_steps+1]``, pre-filled with -1.
+        accept_token_num: mutable ``[bs]``.
+        candidates: ``[bs, num_draft_tokens]`` draft token ids (slot 0 = root).
+        retrive_index / retrive_next_token / retrive_next_sibling: ``[bs, n]``.
+        logits: ``[tot, vocab]`` target logits, rows indexed by retrive_index.
+        tau: RPD threshold in ``[0, 1)``.
+    """
+    gap_max = rpd_gap_max(tau)
+    use_equality = float(tau) == 0.0
+    kwargs = dict(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        logits=logits,
+        gap_max=gap_max,
+        use_equality=use_equality,
+    )
+    if logits.is_cuda:
+        try:
+            _verify_tree_rpd_cuda(**kwargs)
+            return predicts, accept_index, accept_token_num
+        except (ImportError, AttributeError) as e:
+            global _logged_rpd_cpu_fallback
+            if not _logged_rpd_cpu_fallback:
+                _logged_rpd_cpu_fallback = True
+                logger.warning(
+                    "RPD CUDA kernel unavailable (%s); falling back to CPU. "
+                    "Rebuild sgl-kernel so sgl_kernel.verify_tree_rpd is installed.",
+                    e,
+                )
+    _verify_tree_rpd_cpu(**kwargs)
     return predicts, accept_index, accept_token_num
