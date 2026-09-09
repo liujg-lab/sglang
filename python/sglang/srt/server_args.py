@@ -500,6 +500,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_verify_mode: Literal["auto", "greedy", "target_only", "rpd"] = "auto"
+    speculative_rpd_tau: float = 0.2
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -2998,6 +3000,18 @@ class ServerArgs:
         return False
 
     def _handle_speculative_decoding(self):
+        verify_modes = ("auto", "greedy", "target_only", "rpd")
+        if self.speculative_verify_mode not in verify_modes:
+            raise ValueError(
+                "--speculative-verify-mode must be one of "
+                f"{list(verify_modes)}, got {self.speculative_verify_mode!r}."
+            )
+        if not (0.0 <= float(self.speculative_rpd_tau) < 1.0):
+            raise ValueError(
+                "--speculative-rpd-tau must be in [0, 1), "
+                f"got {self.speculative_rpd_tau}."
+            )
+
         if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
@@ -5114,6 +5128,27 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-verify-mode",
+            type=str,
+            choices=["auto", "greedy", "target_only", "rpd"],
+            help=(
+                "Target verify accept policy. 'auto' keeps the current rule "
+                "(greedy when top_k<=1, else target-only sampling). "
+                "'rpd' uses Relative Probability Drop longest-path verification."
+            ),
+            default=ServerArgs.speculative_verify_mode,
+        )
+        parser.add_argument(
+            "--speculative-rpd-tau",
+            type=float,
+            help=(
+                "RPD relative probability-drop threshold in [0, 1). "
+                "A draft edge is valid if 1 - p(c)/p(c*) <= tau, i.e. "
+                "logit gap <= -ln(1-tau). Used when --speculative-verify-mode=rpd."
+            ),
+            default=ServerArgs.speculative_rpd_tau,
         )
         parser.add_argument(
             "--speculative-token-map",

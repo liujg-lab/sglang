@@ -40,6 +40,8 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --speculative-num-steps 4 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 5 \
+  --speculative-verify-mode rpd \
+  --speculative-rpd-tau 0.2 \
   --standalone-remote-addr 127.0.0.1 \
   --standalone-remote-port 30019 \
   --page-size 1 --skip-server-warmup \
@@ -62,7 +64,8 @@ CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
 Draft 的 HTTP warmup 可以跑完（空闲循环会跑普通 generate）。
 Draft 上 `--skip-server-warmup` 可选。
 
-`topk=1` 会强制 `num-draft-tokens = steps + 1`。同模型 greedy 时
+`topk=1` 会强制 `num-draft-tokens = steps + 1`。同模型、且核验为 greedy
+（默认 `auto` 且 `temperature=0`，或 `rpd` 且 `tau=0`）时
 `accept len` 应接近 5，`accept rate` 接近 1.0。
 
 ### 树（`topk>1`）
@@ -78,6 +81,22 @@ Draft 上 `--skip-server-warmup` 可选。
 
 Draft 日志：`[SR] Draft scheduler ready (tree=True topk=2)`。
 `page_size>1` 且 `topk>1` 会在启动时失败。
+
+树超参（`num-steps` / `topk` / `num-draft-tokens` / `page-size`）两侧必须一致。
+**`--speculative-verify-mode` 与 `--speculative-rpd-tau` 只需 Target**。
+
+### RPD 柔性核验
+
+Target 接受草稿时默认走 EAGLE 规则（`--speculative-verify-mode auto`：请求 `top_k<=1` 时 greedy，否则 target-only sampling）。可改成 **Relative Probability Drop（RPD）**：按父槽 logit gap 标边，在草稿链/树上提交从根出发的**最长合格路径**。RPC 仍只传 token 与树拓扑，Draft 不用改。
+
+| 参数 | 含义 |
+|---|---|
+| `--speculative-verify-mode` | `auto`（默认）/ `greedy` / `target_only` / `rpd`。`rpd` 覆盖请求侧 greedy 推断。 |
+| `--speculative-rpd-tau` | 相对概率下降阈值，默认 `0.2`，范围 `[0, 1)`。边合格当且仅当 \(g=z(c^*)-z(c)\le -\ln(1-\tau)\)。`tau=0` 退回 token 与 argmax 相等。 |
+
+同一父节点下所有合格孩子都参与比较。A 即使是 target top-1，若 A→C 只接受 2 个、B→E→F 接受 3 个，则提交后者。
+
+上面 Target 示例已带 `rpd` / `tau=0.2`。若只要 greedy 核验，删掉这两行（默认 `auto`）。
 
 ### 网络
 
@@ -117,7 +136,9 @@ GPU 时间与投机 RPC 共享。
   （Target 一次接受超过 1 个 token 时走 ``append_n``），再从该前缀展开树。
   整段 re-prefill 只用于序列中段分叉，不用于更长的已接受后缀。
 - overlap scheduler 与 mixed chunked prefill 关闭。
-- Target verify 复用 EAGLE 树核验：structured output 走 `generate_token_bitmask`；
+- Target verify 复用 EAGLE 树核验（默认 `auto`：greedy 或 target-only sampling）。
+  `--speculative-verify-mode rpd` 时按 logit gap 做最长路柔性接受（见上文）。
+  structured output 走 `generate_token_bitmask`；
   `return_logprob` 只写接受路径（含 bonus）。Hybrid Mamba/GDN/Lightning 走与 EAGLE 相同的
   MTP scatter（`mamba_track_interval >= speculative_num_draft_tokens`，建议 extra_buffer）。
   Draft 在 PREFILL 用同一份 json/regex/ebnf schema 编译 grammar，每窗生成前按 committed
@@ -158,7 +179,9 @@ GPU 时间与投机 RPC 共享。
 
 ## 正确性检查
 
-`temperature=0` 时，输出必须与 **仅 Target 的 greedy** 一致，而不是 Draft。
+`temperature=0` 时，输出必须与 **仅 Target 的 greedy** 一致，而不是 Draft
+（`auto` / `greedy`，或 `rpd` 且 `--speculative-rpd-tau 0`）。
+`rpd` 且 `tau>0` 时不再要求等于纯 Target greedy。
 accept rate 低可以接受。缺 token、重复 token、过早 EOS 才是 bug。
 
 ## 排查

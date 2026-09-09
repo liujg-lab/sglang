@@ -26,6 +26,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleVerifyInputV2Mixin,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.speculative.rpd_verify import verify_tree_rpd
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -303,13 +304,37 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            server_args = None
+        verify_mode = getattr(server_args, "speculative_verify_mode", "auto") or "auto"
+        want_sampling = verify_mode == "target_only" or (
+            verify_mode == "auto" and not is_all_greedy
+        )
+        if want_sampling and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+        if verify_mode == "rpd":
+            predict, accept_index, accept_length = verify_tree_rpd(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                logits=logits_output.next_token_logits,
+                tau=float(getattr(server_args, "speculative_rpd_tau", 0.2)),
+            )
+        elif (
+            verify_mode == "greedy"
+            or (verify_mode == "auto" and is_all_greedy)
+            or not TREE_SPEC_KERNEL_AVAILABLE
+        ):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(

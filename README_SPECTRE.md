@@ -115,6 +115,19 @@ ldd python/sglang/srt/speculative/spectre/cpp_zmq/spectre_zmq*.so
 
 HTTP `meta_info` 里：`alen` 上限约等于 `num-draft-tokens`；`accept` 的分母是每次 `num-draft-tokens - 1` 个 draft 猜测（bonus 不算猜中）。
 
+### RPD 柔性核验
+
+Target 接受草稿时默认走 EAGLE 规则（`--speculative-verify-mode auto`：请求 `top_k<=1` 时 greedy，否则 target-only sampling）。可改成 **Relative Probability Drop（RPD）**：按父槽 logit gap 标边，在草稿树上提交从根出发的**最长合格路径**（链和树都适用）。Draft 协议不变，**只需在 Target 上加 flag**。
+
+| 参数 | 含义 |
+| --- | --- |
+| `--speculative-verify-mode` | `auto`（默认）/ `greedy` / `target_only` / `rpd`。`rpd` 覆盖请求侧 greedy 推断。 |
+| `--speculative-rpd-tau` | 相对概率下降阈值，默认 `0.2`，范围 `[0, 1)`。边合格当且仅当 \(g=z(c^*)-z(c)\le -\ln(1-\tau)\)。`tau=0` 退回 token 与 argmax 相等（与 greedy 相同）。 |
+
+同一父节点下所有合格孩子都参与比较，不在一层就锁死 top-1。例如 A 是 target top-1 但路径更短、B→E→F 更长时，提交后者。
+
+`temperature=0` 时输出对齐 **Target 单独 greedy**，仅适用于 `auto` / `greedy`，或 `rpd` 且 `tau=0`。`rpd` 且 `tau>0` 会接受近邻 token，不再保证逐 token 与 greedy 一致。
+
 ### 时序：先发后验、一窗即停、回滚后再开一窗
 
 两端是独立进程。Target **先** ZMQ 要下一窗 draft，**再**对本窗做 GPU verify；Draft 用这段 GPU 时间 AR 往前猜。Draft 产满 **`num_steps + 1`** 个 token（示例为 4，不是 3）就回包并 pause，不会无限 lookahead。
@@ -251,6 +264,13 @@ python -m sglang.launch_server \
   --log-level debug
 ```
 
+开 RPD 时，在 **Target** 命令上追加（Draft 不用改）：
+
+```bash
+  --speculative-verify-mode rpd \
+  --speculative-rpd-tau 0.2
+```
+
 终端 2 — Draft（GPU 0；等 Target 起来后再启）：
 
 ```bash
@@ -287,7 +307,7 @@ curl -s http://127.0.0.1:30000/generate \
   }'
 ```
 
-`temperature=0` 时，SPECTRE 输出应对齐 **Target 单独 greedy**，不是 Draft。接受率可以低；缺 token、重复、提前结束才是 bug。先做短请求正确性，再考虑吞吐。
+`temperature=0` 时，SPECTRE 输出应对齐 **Target 单独 greedy**，不是 Draft（`auto` / `greedy`，或 `rpd` 且 `--speculative-rpd-tau 0`）。`rpd` 且 `tau>0` 时不再做这条对齐。接受率可以低；缺 token、重复、提前结束才是 bug。先做短请求正确性，再考虑吞吐。
 
 IPC 地址占用时，两个进程都停掉后清理（C++ 通道三条 socket，本树 VL 旁路多一条）：
 
@@ -415,7 +435,7 @@ python -m sglang.launch_server \
 | `Missing /usr/include/zmq.hpp` | 系统只有 C libzmq，没有 cppzmq header。确认 `ls /usr/include/zmq.hpp`。 |
 | Target 一直 `No draft available` | Draft 未起、先起了 Draft、两端 `spectre-zmq-addr` / `spectre-zmq-port` 不一致、或 IPC 文件残留。 |
 | 输出乱码 / 严重不一致 | Draft 与 Target tokenizer / vocab 不一致。协议直接传 token ID。 |
-| greedy 与 baseline 对不齐 | 应对齐 **Target 单独 greedy**，不是 Draft。接受率可以低；缺 token、重复、提前结束才是问题。 |
+| greedy 与 baseline 对不齐 | 应对齐 **Target 单独 greedy**，不是 Draft（`auto` / `greedy`，或 `rpd` 且 `tau=0`）。`rpd` 且 `tau>0` 时预期会偏离 greedy。接受率可以低；缺 token、重复、提前结束才是问题。 |
 | `TypeError: ... NoneType ... draft_num_tokens - 1` | Draft 误走了 Target 的 `SpectreWorker`。确认 `--spectre-role draft`，且本树不会给 Draft 包 verify worker。 |
 | `ScheduleBatch` has no attribute `lora_ids` | Draft 的 `run_batch` 把 `ScheduleBatch` 直接交给了 `TpModelWorker`。本树应在 Draft 路径先 `get_model_worker_batch()`。 |
 | `q.shape[0] (N) does not match batch_size * q_len_per_req (1)` | Draft 的 `prepare_for_decode` 因 `spec_algorithm!=NONE` 提前 return，prefill 的整段 `input_ids` 进了 decode。本树对 SPECTRE draft 会走普通 AR decode 准备。 |
