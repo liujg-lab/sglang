@@ -3227,6 +3227,7 @@ class ServerArgs:
                 "using SPECTRE speculative decoding."
             )
             self._validate_spectre_vl_config()
+            self._log_remote_spec_backend_checks("SPECTRE")
 
         if self.speculative_algorithm == "STANDALONE_REMOTE":
             self.disable_overlap_schedule = True
@@ -3253,11 +3254,6 @@ class ServerArgs:
                     "speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
-            if self.speculative_eagle_topk > 1 and (self.page_size or 1) > 1:
-                raise ValueError(
-                    "STANDALONE_REMOTE tree speculation "
-                    "(speculative_eagle_topk > 1) requires --page-size 1."
-                )
             if self.standalone_remote_role not in ("target", "draft"):
                 raise ValueError(
                     "STANDALONE_REMOTE requires --standalone-remote-role "
@@ -3268,6 +3264,46 @@ class ServerArgs:
                 "because of using STANDALONE_REMOTE speculative decoding."
             )
             self._validate_standalone_remote_vl_config()
+            self._log_remote_spec_backend_checks("STANDALONE_REMOTE")
+
+    def _log_remote_spec_backend_checks(self, algo: str) -> None:
+        """Log backend/role/verify/page/graph capability for SPECTRE and SR."""
+        from sglang.srt.speculative.spec_utils import (
+            device_backend_key,
+            is_remote_spec_algorithm,
+            tree_verify_method_available,
+        )
+
+        backend = device_backend_key(getattr(self, "device", None))
+        role = (
+            getattr(self, "spectre_role", None)
+            if algo == "SPECTRE"
+            else getattr(self, "standalone_remote_role", None)
+        )
+        verify_mode = getattr(self, "speculative_verify_mode", "auto") or "auto"
+        page_size = self.page_size or 1
+        graphs = not bool(getattr(self, "disable_cuda_graph", False))
+        logger.info(
+            "%s startup: backend=%s role=%s verify_mode=%s page_size=%s "
+            "cuda_graph(also NPU graph)=%s topk=%s steps=%s draft_tokens=%s",
+            algo,
+            backend,
+            role,
+            verify_mode,
+            page_size,
+            graphs,
+            self.speculative_eagle_topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+        )
+        if verify_mode in ("target_only", "auto") and is_remote_spec_algorithm(self):
+            if verify_mode == "target_only" and not tree_verify_method_available(
+                "target_only", backend
+            ):
+                raise ValueError(
+                    f"{algo} speculative_verify_mode=target_only is not available "
+                    f"on backend={backend}."
+                )
 
     def _validate_standalone_remote_vl_config(self) -> None:
         """Draft 自跑 ViT 时 embedding 条数必须等于占位符个数。
@@ -5853,7 +5889,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-cuda-graph",
             action="store_true",
-            help="Disable cuda graph.",
+            help="Disable CUDA graph (and NPU graph on Ascend). The flag name is kept for compatibility.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",

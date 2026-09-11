@@ -172,6 +172,29 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 slot_indices=loc,
             )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Copy KV by token slot on the NPU page-physical layout.
+
+        CUDA tiled copy kernels assume token-major ``(size, head, dim)`` strides
+        and must not be used here.
+        """
+        if tgt_loc is None or src_loc is None:
+            return
+        n = int(tgt_loc.numel())
+        if n == 0:
+            return
+        src = src_loc.reshape(-1).to(dtype=torch.int32)
+        tgt = tgt_loc.reshape(-1).to(dtype=torch.int32)
+        page_size = int(self.page_size)
+        src_page = torch.div(src, page_size, rounding_mode="floor")
+        src_off = src % page_size
+        tgt_page = torch.div(tgt, page_size, rounding_mode="floor")
+        tgt_off = tgt % page_size
+        # kv_buffer: [2, layer, num_pages, page_size, head, dim]
+        self.kv_buffer[:, :, tgt_page, tgt_off, :, :] = self.kv_buffer[
+            :, :, src_page, src_off, :, :
+        ]
+
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
 

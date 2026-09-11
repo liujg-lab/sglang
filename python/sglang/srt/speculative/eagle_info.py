@@ -30,7 +30,6 @@ from sglang.srt.speculative.rpd_verify import verify_tree_rpd
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
-    TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
     create_accept_length_filter,
@@ -39,6 +38,9 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    is_remote_spec_algorithm,
+    tree_verify_backend,
+    tree_verify_method_available,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
 
@@ -48,6 +50,10 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+else:
+    top_k_renorm_prob = None
+    top_p_renorm_prob = None
+    tree_speculative_sampling_target_only = None
 
 logger = logging.getLogger(__name__)
 _logged_verify_method = False
@@ -95,19 +101,29 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+        device=None,
+    ):
+        if device is None:
+            from sglang.srt.utils import get_device
+
+            device = get_device()
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -318,7 +334,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens. Force greedy sampling on AMD
+        # Sample tokens. SPECTRE/SR must not silently fall back to greedy.
         is_all_greedy = sampling_info.is_all_greedy
         try:
             server_args = get_global_server_args()
@@ -328,22 +344,30 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         want_sampling = verify_mode == "target_only" or (
             verify_mode == "auto" and not is_all_greedy
         )
-        if want_sampling and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
-            )
+        backend = tree_verify_backend()
+        remote_spec = is_remote_spec_algorithm(server_args)
 
         if verify_mode == "rpd":
             resolved_verify = "rpd"
-        elif (
-            verify_mode == "greedy"
-            or (verify_mode == "auto" and is_all_greedy)
-            or not TREE_SPEC_KERNEL_AVAILABLE
-        ):
+        elif verify_mode == "greedy" or (verify_mode == "auto" and is_all_greedy):
             resolved_verify = "greedy"
-        else:
+        elif want_sampling:
             resolved_verify = "target_only"
+            if not tree_verify_method_available("target_only", backend):
+                if remote_spec:
+                    raise RuntimeError(
+                        "speculative_verify_mode="
+                        f"{verify_mode!r} requires target_only verification on "
+                        f"backend={backend!r}, but that method is not available. "
+                        "Refusing to fall back to greedy."
+                    )
+                logger.warning(
+                    "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                    "Falling back to greedy verification."
+                )
+                resolved_verify = "greedy"
+        else:
+            resolved_verify = "greedy"
         rpd_tau = float(getattr(server_args, "speculative_rpd_tau", 0.2))
         _log_verify_method_once(
             resolved_verify, verify_mode=verify_mode, tau=rpd_tau
@@ -385,14 +409,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
+            from sglang.srt.speculative.tree_verify import (
+                torch_top_k_renorm_prob,
+                torch_top_p_renorm_prob,
+                tree_speculative_sampling_target_only_ref,
+            )
+
+            renorm_k = top_k_renorm_prob or torch_top_k_renorm_prob
+            renorm_p = top_p_renorm_prob or torch_top_p_renorm_prob
+            target_probs = renorm_k(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
             if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
+                target_probs = renorm_p(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
@@ -412,7 +444,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
+            sampling_fn = (
+                tree_speculative_sampling_target_only
+                if tree_speculative_sampling_target_only is not None
+                else tree_speculative_sampling_target_only_ref
+            )
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable

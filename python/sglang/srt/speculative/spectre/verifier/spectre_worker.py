@@ -238,7 +238,7 @@ class SpectreWorker:
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
-                self.topk, spec_steps, num_draft_tokens
+                self.topk, spec_steps, num_draft_tokens, device=batch.device
             )
 
         bs = batch.batch_size()
@@ -267,7 +267,8 @@ class SpectreWorker:
                 if dt is not None:
                     if isinstance(dt, torch.Tensor):
                         n = min(dt.numel(), spec_steps)
-                        draft_tokens_buf[i, :n] = dt[:n].cpu() if dt.is_cuda else dt[:n]
+                        host = dt[:n].cpu() if dt.device.type != "cpu" else dt[:n]
+                        draft_tokens_buf[i, :n] = host
                     else:
                         n = min(len(dt), spec_steps)
                         draft_tokens_buf[i, :n] = torch.tensor(
@@ -369,7 +370,7 @@ class SpectreWorker:
                 "SpectreWorker verify logits",
             )
 
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         new_drafts_per_req: dict = {}
         if recv_draft_fn is not None and not batch.forward_mode.is_idle():
             new_drafts_per_req = recv_draft_fn(batch)

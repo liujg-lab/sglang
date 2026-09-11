@@ -46,7 +46,76 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+# Backward-compatible alias used by ngram / HIP EAGLE fallback.
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda
+
+_REMOTE_SPEC_ALGOS = {"SPECTRE", "STANDALONE_REMOTE"}
+
+
+def tree_verify_backend() -> str:
+    if _is_cuda:
+        return "cuda"
+    if _is_npu:
+        return "npu"
+    if _is_hip:
+        return "hip"
+    return "cpu"
+
+
+def device_backend_key(device) -> str:
+    """Map a torch device / device string to a backend key (cuda/npu/cpu/...)."""
+    if device is None:
+        return tree_verify_backend()
+    if isinstance(device, torch.device):
+        return device.type
+    text = str(device).split(":", 1)[0].lower()
+    if text.startswith("npu"):
+        return "npu"
+    if text.startswith("cuda"):
+        return "cuda"
+    if text.startswith("hip"):
+        return "hip"
+    return text or tree_verify_backend()
+
+
+def is_remote_spec_algorithm(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        try:
+            server_args = get_global_server_args()
+        except Exception:
+            return False
+    algo = getattr(server_args, "speculative_algorithm", None) or ""
+    return str(algo).upper() in _REMOTE_SPEC_ALGOS
+
+
+def tree_verify_method_available(
+    method: str, backend: Optional[str] = None
+) -> bool:
+    """Capability table: backend × verify method.
+
+    greedy: CUDA/HIP kernels; NPU uses the portable sibling-walk implementation.
+    target_only: CUDA kernel or portable NPU/CPU reference. Not HIP.
+    rpd: CUDA kernel or CPU fallback on every backend.
+    """
+    backend = backend or tree_verify_backend()
+    method = (method or "").lower()
+    if method == "greedy":
+        return backend in ("cuda", "hip", "npu", "cpu")
+    if method == "target_only":
+        return backend in ("cuda", "npu", "cpu")
+    if method == "rpd":
+        return True
+    return False
+
+
+def tensor_on_accelerator(value) -> bool:
+    return isinstance(value, torch.Tensor) and value.device.type != "cpu"
+
+
+def check_tree_verify_tensors(**kwargs):
+    from sglang.srt.speculative.tree_verify import check_tree_verify_tensors as impl
+
+    return impl(**kwargs)
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -556,7 +625,7 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device

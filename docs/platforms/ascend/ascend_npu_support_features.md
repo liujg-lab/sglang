@@ -212,7 +212,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                                         | Defaults  | Options                  | Server supported |
 |------------------------------------------------------------------|-----------|--------------------------|:----------------:|
-| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`   |      A2, A3      |
+| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`,<br/> `SPECTRE`,<br/> `STANDALONE_REMOTE`   |      A2, A3      |
 | `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                |      A2, A3      |
 | `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                |      A2, A3      |
 | `--speculative-draft-load-format`                                | `None`    | `auto`                   |      A2, A3      |
@@ -227,6 +227,15 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`          |      A2, A3      |
 | `--speculative-draft-attention-backend`                          | `None`    | `ascend`                 |      A2, A3      |
 | `--speculative-draft-model-quantization`                         | `None`    | `unquant`                |      A2, A3      |
+
+SPECTRE / STANDALONE_REMOTE on Ascend:
+
+- Device pairs: NPU→NPU (CI), CUDA↔NPU (manual multi-host). Heterogeneous runs exchange tokens, tree structure, and CPU multimodal payloads only — not KV.
+- Text: Qwen3. Vision: Qwen3-VL. SPECTRE stays chain (`topk=1`); SR keeps real trees (`topk>1`).
+- Tree verify: sibling-walk greedy and portable `target_only`. `auto` + non-greedy must not fall back to greedy.
+- Default `page_size=128` is supported for SR trees (last-page fork copy). Mid-page rollback still re-prefills.
+- `--disable-cuda-graph` also disables NPU graphs. Tree mode is not considered compatible if it only runs with `topk=1` and graphs off.
+- Greedy accuracy is vs the same Target backend AR baseline, not CUDA vs NPU token identity.
 
 ## Ngram speculative decoding
 

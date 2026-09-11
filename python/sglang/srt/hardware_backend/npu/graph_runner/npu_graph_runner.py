@@ -28,7 +28,8 @@ import torch
 import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, _uses_dual_ntpb
+from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -122,11 +123,12 @@ class NPUGraphRunner(CudaGraphRunner):
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
 
-    def _update_inputs(self, seq_lens):
+    def _update_inputs(self, seq_lens, graph_key=None):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 
-        self.graphs[self.bs].update(
+        key = self.bs if graph_key is None else graph_key
+        self.graphs[key].update(
             cpu_update_input=[{self.update_attr_name: seq_lens}]
         )
 
@@ -176,23 +178,40 @@ class NPUGraphRunner(CudaGraphRunner):
 
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
+        stream_idx = (
+            get_current_stream_idx() if getattr(self, "enable_pdmux", False) else None
+        )
+        graph_key = self._make_graph_key(
+            self.bs,
+            stream_idx,
+            getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
+        )
+        if graph_key not in self.graphs:
+            raise RuntimeError(
+                f"NPU graph miss: key={graph_key!r} not among captured "
+                f"{list(self.graphs)}. In-range shapes must hit a captured graph; "
+                "eager fallback after capture failure is not a pass."
+            )
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
+                ntpb = getattr(self, "actual_ntpb", None) or self.num_tokens_per_bs
+                seq_lens_cpu = forward_batch.seq_lens.cpu() + ntpb
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+            thread = threading.Thread(
+                target=self._update_inputs, args=(seq_lens, graph_key)
+            )
             thread.start()
-            self.graphs[self.bs].replay()
+            self.graphs[graph_key].replay()
             thread.join()
         else:
-            self.graphs[self.bs].replay()
+            self.graphs[graph_key].replay()
 
-        output = self.output_buffers[self.bs]
+        output = self.output_buffers[graph_key]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

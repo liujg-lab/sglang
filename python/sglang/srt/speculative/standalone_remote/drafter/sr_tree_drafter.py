@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend, alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -21,7 +21,9 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    device_backend_key,
     fast_topk,
+    get_last_loc_large_page_size_large_top_k,
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
@@ -103,12 +105,22 @@ class SRTreeDrafter:
                 EAGLEDraftCudaGraphRunner,
             )
 
+            backend = device_backend_key(self.device)
+            # Import the NPU runner only on NPU so CUDA hosts never need torch_npu.
+            if backend == "npu":
+                from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
+                    EAGLEDraftNpuGraphRunner,
+                )
+
+                runner_cls = EAGLEDraftNpuGraphRunner
+            else:
+                runner_cls = EAGLEDraftCudaGraphRunner
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-            logger.info("[SR] Capture tree draft CUDA graph begin.")
-            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
-            logger.info("[SR] Capture tree draft CUDA graph end.")
+            logger.info("[SR] Capture tree draft graph begin (backend=%s).", backend)
+            self.cuda_graph_runner = runner_cls(self)
+            logger.info("[SR] Capture tree draft graph end.")
         except Exception as e:
-            logger.warning("[SR] tree draft CUDA graph capture failed: %s", e)
+            logger.warning("[SR] tree draft graph capture failed: %s", e)
             self.cuda_graph_runner = None
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
@@ -256,15 +268,87 @@ class SRTreeDrafter:
         return parent_list, top_scores_index, draft_tokens
 
     def _alloc_tree_kv(self, batch: "ScheduleBatch"):
-        if self.page_size != 1:
-            raise RuntimeError("SR tree draft requires page_size=1")
-        num_seqs = batch.batch_size()
-        alloc_len = self.speculative_num_steps * self.topk
-        out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
-            batch.tree_cache,
-            num_seqs * alloc_len,
-            backup_state=True,
+        from sglang.srt.speculative.eagle_worker import (
+            get_last_loc_large_page_size_top_k_1,
         )
+
+        num_seqs = batch.batch_size()
+        if self.page_size == 1:
+            alloc_len = self.speculative_num_steps * self.topk
+            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
+                batch.tree_cache,
+                num_seqs * alloc_len,
+                backup_state=True,
+            )
+            duplicate_cache_len = 0
+            source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
+        else:
+            if self.topk == 1:
+                prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.speculative_num_steps,
+                )
+                prefix_lens_cpu = batch.seq_lens_cpu
+                seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
+                extend_num_tokens = num_seqs * self.speculative_num_steps
+                last_page_lens = None
+            else:
+                (
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    self.num_new_pages_per_topk,
+                    self.extend_lens,
+                    last_page_lens,
+                ) = get_last_loc_large_page_size_large_top_k(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.speculative_num_steps,
+                    self.topk,
+                    self.page_size,
+                )
+                prefix_lens_cpu = batch.seq_lens_cpu
+                last_page_lens_cpu = prefix_lens_cpu % self.page_size
+                num_new_pages_per_topk = (
+                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
+                ) // self.page_size
+                seq_lens_cpu = (
+                    prefix_lens_cpu // self.page_size * self.page_size
+                    + num_new_pages_per_topk * (self.page_size * self.topk)
+                )
+                extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
+
+            out_cache_loc, token_to_kv_pool_state_backup = (
+                alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    extend_num_tokens,
+                    backup_state=True,
+                )
+            )
+            if self.page_size > 1 and self.topk > 1:
+                last_page_lens_cpu = batch.seq_lens_cpu % self.page_size
+                last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+                duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (
+                    self.topk - 1
+                )
+                target_cache_loc = torch.zeros(
+                    duplicate_cache_len, dtype=torch.int32, device=self.device
+                )
+                source_cache_loc = torch.zeros(
+                    duplicate_cache_len, dtype=torch.int32, device=self.device
+                )
+            else:
+                duplicate_cache_len = 0
+                source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
+
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -272,10 +356,10 @@ class SRTreeDrafter:
             self.extend_lens,
             self.num_new_pages_per_topk,
             out_cache_loc,
-            None,
-            None,
-            None,
-            0,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
@@ -283,6 +367,13 @@ class SRTreeDrafter:
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps + self.page_size),
         )
+        if self.page_size > 1 and self.topk > 1 and duplicate_cache_len > 0:
+            self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                target_cache_loc, source_cache_loc
+            )
+            out_cache_loc = out_cache_loc[
+                : num_seqs * self.topk * self.speculative_num_steps
+            ]
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)

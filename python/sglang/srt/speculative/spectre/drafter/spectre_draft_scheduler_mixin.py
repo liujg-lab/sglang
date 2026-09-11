@@ -384,7 +384,14 @@ class SpectreDraftSchedulerMixin:
         try:
             device = self.tp_group.device
         except Exception:
-            device = "cuda"
+            device = getattr(self, "device", None)
+            if device is None:
+                try:
+                    device = self.tp_worker.model_runner.device
+                except Exception:
+                    from sglang.srt.utils import get_device
+
+                    device = get_device()
 
         def _seq_len(r: Req) -> int:
             # prepare_for_decode writes the next slot at seq_lens then increments.
@@ -726,7 +733,9 @@ class SpectreDraftSchedulerMixin:
         try:
             return self.tp_worker.model_runner.device
         except Exception:
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            from sglang.srt.utils import get_device
+
+            return getattr(self, "device", None) or get_device()
 
     def _prewarm_item_to_device(self, item, device) -> None:
         # [SPECTRE-VL] 只搬 feature，与正常 prefill 路径的 _move_items_to_device 保持一致。
@@ -742,7 +751,7 @@ class SpectreDraftSchedulerMixin:
         if mm is None:
             return
         for item in mm.mm_items:
-            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+            if isinstance(item.feature, torch.Tensor) and item.feature.device.type != "cpu":
                 item.feature = item.feature.cpu()
 
     def _mm_item_token_count(self, item) -> Optional[int]:

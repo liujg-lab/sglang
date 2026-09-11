@@ -60,10 +60,16 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     libgl1-mesa-glx \
     libgl1-mesa-dri \
     ca-certificates \
+    libzmq3-dev \
+    libmsgpack-dev \
     && rm -rf /var/cache/apt/* \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates \
     && locale-gen en_US.UTF-8
+
+# cppzmq header required by SPECTRE C++ ZMQ (plain C++ build, not CANN).
+RUN wget -q -O /usr/include/zmq.hpp \
+    https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq.hpp
 
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en

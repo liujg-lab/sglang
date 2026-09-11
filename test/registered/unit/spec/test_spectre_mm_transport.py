@@ -185,6 +185,31 @@ class TestSpectreMMPayload(CustomTestCase):
         expected = int(item.feature.numel() * item.feature.element_size())
         self.assertEqual(payload_resident_bytes(payload), expected)
 
+    def test_gpu_bytes_counts_fake_npu_and_cuda_not_cpu(self):
+        from sglang.srt.speculative.spectre.spectre_mm_transport import (
+            _tensor_gpu_bytes,
+            _to_cpu_contiguous_tensor,
+        )
+
+        cpu = torch.ones(4)
+        self.assertEqual(_tensor_gpu_bytes(cpu), 0)
+        out = _to_cpu_contiguous_tensor(cpu)
+        self.assertEqual(out.device.type, "cpu")
+
+        fake_npu = MagicMock(spec=torch.Tensor)
+        fake_npu.device = SimpleNamespace(type="npu")
+        fake_npu.numel.return_value = 16
+        fake_npu.element_size.return_value = 2
+        self.assertEqual(_tensor_gpu_bytes(fake_npu), 32)
+
+        real = torch.arange(3, dtype=torch.float32)
+        fake_dev = MagicMock(spec=torch.Tensor)
+        fake_dev.device = SimpleNamespace(type="npu")
+        fake_dev.detach.return_value = fake_dev
+        fake_dev.cpu.return_value = real
+        moved = _to_cpu_contiguous_tensor(fake_dev)
+        self.assertTrue(torch.equal(moved, real))
+
     def test_ipc_sender_receiver_roundtrip(self):
         try:
             import zmq  # noqa: F401

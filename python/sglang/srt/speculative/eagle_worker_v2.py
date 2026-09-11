@@ -350,6 +350,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                device=self.device,
             )
 
         # Build tree mask

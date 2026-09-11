@@ -763,6 +763,23 @@ class TestMMPayloadMultipart(CustomTestCase):
         self.assertIsInstance(grid, torch.Tensor)
         self.assertTrue(torch.equal(grid, torch.tensor([[1, 2, 2]])))
 
+    def test_sr_mm_moves_fake_npu_tensor_to_cpu(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
+                _to_cpu_contiguous_tensor,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        real = torch.arange(4, dtype=torch.float32)
+        fake = MagicMock(spec=torch.Tensor)
+        fake.device = SimpleNamespace(type="npu")
+        fake.detach.return_value = fake
+        fake.cpu.return_value = real
+        out = _to_cpu_contiguous_tensor(fake)
+        self.assertTrue(torch.equal(out, real))
+
     def test_pack_request_with_mm_frames(self):
         if torch is None:
             self.skipTest("torch not available")
@@ -1693,6 +1710,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertIn("replay", src)
         init_src = inspect.getsource(SRTreeDrafter._init_cuda_graphs)
         self.assertIn("EAGLEDraftCudaGraphRunner", init_src)
+        self.assertIn("EAGLEDraftNpuGraphRunner", init_src)
         self.assertNotIn("EAGLEDraftExtendCudaGraphRunner", init_src)
 
     def test_tree_drafter_skips_cuda_graph_when_disabled(self):

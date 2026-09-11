@@ -23,6 +23,12 @@ SPECTRE 使用**两个独立的 SGLang 进程**：Target 做 verify，Draft 产 
 | Qwen3-VL-MoE 图 / 视频 | 支持。架构 `Qwen3VLMoeForConditionalGeneration`。 |
 | 任意其他 VLM | **不宣称开箱即用。** 需要模型提供 `get_image_feature` / `get_video_feature` 以及 M-RoPE processor。 |
 | 音频 | payload 里有字段，**预热路径未接**。 |
+| CUDA / Ascend NPU | 支持同构（CUDA→CUDA、NPU→NPU）与异构（CUDA→NPU、NPU→CUDA）。两端只交换 token、树结构和 CPU 多模态数据，不传 KV。 |
+| `--disable-cuda-graph` | 名称保留，NPU 上同样关闭图执行。 |
+
+greedy 对照**同一 Target 后端**的 AR 基线；不要要求 CUDA 与 NPU 逐 token 相同。
+NPU 树验证使用兄弟遍历 greedy 与可移植 `target_only`；`auto` 且非 greedy 时不会悄悄改 greedy。
+NPU 镜像需 `libzmq3-dev` / `libmsgpack-dev` / `zmq.hpp` 才能按普通 C++ 构建 SPECTRE ZMQ 扩展。
 
 VL 走 **Route A：Draft 自跑 ViT**。Target 的 processor 已经把 vision 占位符 pad 进 `input_ids`；Draft **复用** 这份序列和 `pad_value`，**不再**调用 `pad_input_ids`。再 pad 一次会对不齐 embedding，接受率会 silently 崩。
 
@@ -92,7 +98,7 @@ ldd python/sglang/srt/speculative/spectre/cpp_zmq/spectre_zmq*.so
 
 **先起 Target，等就绪，再起 Draft。** HTTP 只打 Target 端口，不要打 Draft。
 
-第一次建议：单机、双 GPU、`tp=1`、`topk=1`、`--page-size 1`、`--disable-cuda-graph`。不要一上来跨机 TCP、`TP>1` 或 CUDA Graph。日志用 `--log-level debug`。
+第一次建议：单机、两端各一块加速器、`tp=1`、`topk=1`、`--disable-cuda-graph`。CUDA 上可先 `--page-size 1`；NPU 可使用默认页大小。不要一上来跨机 TCP、`TP>1` 或图执行。日志用 `--log-level debug`。`--disable-cuda-graph` 在 NPU 上同样关闭图。
 
 ### 投机窗口
 
@@ -308,6 +314,30 @@ curl -s http://127.0.0.1:30000/generate \
 ```
 
 `temperature=0` 时，SPECTRE 输出应对齐 **Target 单独 greedy**，不是 Draft（`auto` / `greedy`，或 `rpd` 且 `--speculative-rpd-tau 0`）。`rpd` 且 `tau>0` 时不再做这条对齐。接受率可以低；缺 token、重复、提前结束才是 bug。先做短请求正确性，再考虑吞吐。
+
+### 文本冒烟（Ascend NPU）
+
+NPU 默认 `page_size=128`，不要为 SPECTRE 强制改成 1。`--disable-cuda-graph` 同样关闭 NPU 图；正确性过后再去掉它。异构时两端只换 token / 树 / CPU 多模态数据。
+
+```bash
+# Target
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-1.7B \
+  --device npu --attention-backend ascend \
+  --speculative-algorithm SPECTRE --spectre-role target \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --spectre-zmq-addr 127.0.0.1 --spectre-zmq-port 30009 \
+  --skip-server-warmup --port 30000
+
+# Draft
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-0.6B \
+  --device npu --attention-backend ascend \
+  --speculative-algorithm SPECTRE --spectre-role draft \
+  --spectre-zmq-addr 127.0.0.1 --spectre-zmq-port 30009 \
+  --skip-server-warmup --port 30008
+```
 
 IPC 地址占用时，两个进程都停掉后清理（C++ 通道三条 socket，本树 VL 旁路多一条）：
 

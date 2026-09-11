@@ -183,10 +183,10 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
 
-    elif _is_npu:
-        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+    else:
+        from sglang.srt.speculative.tree_verify import verify_tree_greedy_ref
 
-        verify_tree_greedy(
+        verify_tree_greedy_ref(
             predicts=predicts,
             accept_index=accept_index,
             accept_token_num=accept_token_num,
@@ -195,5 +195,6 @@ def verify_tree_greedy_func(
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
+            topk=topk,
         )
     return predicts, accept_index, accept_token_num

@@ -70,17 +70,16 @@ Draft 上 `--skip-server-warmup` 可选。
 
 ### 树（`topk>1`）
 
-启动命令相同，但 **两侧** 的树超参和 `page-size 1` 必须一致：
+启动命令相同，但 **两侧** 的树超参必须一致。CUDA 上可用 `--page-size 1`；
+NPU 可用默认页大小（通常 128）。`page_size>1` 时 Draft 会为各分支复制共享前缀尾页。
 
 ```bash
   --speculative-num-steps 4 \
   --speculative-eagle-topk 2 \
-  --speculative-num-draft-tokens 8 \
-  --page-size 1
+  --speculative-num-draft-tokens 8
 ```
 
 Draft 日志：`[SR] Draft scheduler ready (tree=True topk=2)`。
-`page_size>1` 且 `topk>1` 会在启动时失败。
 
 树超参（`num-steps` / `topk` / `num-draft-tokens` / `page-size`）两侧必须一致。
 **`--speculative-verify-mode` 与 `--speculative-rpd-tau` 只需 Target**。
@@ -148,12 +147,17 @@ GPU 时间与投机 RPC 共享。
   `_sr_isolate_need` 只 pause **不在** 本 RPC 里的请求（调度器残留），不 pause 同 RPC 的兄弟 rid。
   Draft 上的 HTTP generate 在 RPC 拍内同样被 pause，拍后再 resume；
   HTTP 与 RPC 不会进入同一个 `ScheduleBatch`。
-- `page_size>1` 且 `topk>1` 不支持（树 KV 只支持 `page_size=1`）。
+- `page_size>1` 且 `topk>1` 时，Draft 为各分支复制共享前缀尾页，避免兄弟互相覆盖。
+  中页 fork 的 KV 回滚仍走 re-prefill。
+- `--disable-cuda-graph` 同时控制 CUDA Graph 和 NPU Graph。
 - CUDA graph 默认开启：Target 捕获 `TARGET_VERIFY`（`ntpb = speculative_num_draft_tokens`）
   以及 SPECTRE 同款的 `ntpb=1` DECODE graph；`can_run` / replay 按 forward mode 分流。
-  Draft 链（`topk=1`）走普通 DECODE graph；Draft 树复用 v1 `EAGLEDraftCudaGraphRunner`
+  Draft 链（`topk=1`）走普通 DECODE graph；Draft 树按 device 选择
+  `EAGLEDraftCudaGraphRunner` 或 `EAGLEDraftNpuGraphRunner`
   （不捕获 draft-extend graph，也不走 spec v2 / plan stream）。
-  树仍要求 `page_size=1`。Target 1-token AR fallback **强制 eager**，不 replay verify graph。
+  Target 1-token AR fallback **强制 eager**，不 replay verify graph。
+- CUDA↔NPU 异构：两端只交换 token、树结构、CPU 多模态数据。TP 通信限定在各自服务内部。
+- greedy 对照同一 Target 后端的 AR 基线。`auto` 且非 greedy 走 `target_only`，能力缺失时报错而不是改 greedy。
 - 视觉仅 Qwen3-VL：`Qwen3VLForConditionalGeneration` /
   `Qwen3VLMoeForConditionalGeneration`。
 - Draft **禁止** `--skip-tokenizer-init`（3D M-RoPE）。

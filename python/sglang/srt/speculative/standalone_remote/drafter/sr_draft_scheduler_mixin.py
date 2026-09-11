@@ -78,10 +78,10 @@ def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
     return None
 
 
-def _sr_is_cuda_context_error(exc: BaseException) -> bool:
-    """True when the GPU context is already poisoned (do not keep running)."""
+def _sr_is_device_context_error(exc: BaseException) -> bool:
+    """True when the accelerator context is already poisoned (do not keep running)."""
     name = type(exc).__name__
-    if name in ("AcceleratorError", "CUDAError"):
+    if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
         return True
     accel = getattr(torch, "AcceleratorError", None)
     if accel is not None and isinstance(exc, accel):
@@ -90,7 +90,13 @@ def _sr_is_cuda_context_error(exc: BaseException) -> bool:
     return (
         "illegal memory access" in msg
         or "cudaerrorillegaladdress" in msg
+        or "npu error" in msg
+        or ("ascend" in msg and "illegal" in msg)
     )
+
+
+# Backward-compatible alias.
+_sr_is_cuda_context_error = _sr_is_device_context_error
 
 
 class StandaloneRemoteDraftSchedulerMixin:
@@ -411,7 +417,14 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self.last_batch = None
 
     def _sr_make_decode_batch(self, reqs: List[Req]) -> ScheduleBatch:
-        device = getattr(self, "device", "cuda")
+        device = getattr(self, "device", None)
+        if device is None:
+            try:
+                device = self.tp_worker.model_runner.device
+            except Exception:
+                from sglang.srt.utils import get_device
+
+                device = get_device()
 
         def _seq_len(r: Req) -> int:
             committed = int(getattr(r, "kv_committed_len", 0) or 0)
@@ -834,9 +847,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                     token_lens,
                 )
         except Exception as e:
-            if _sr_is_cuda_context_error(e):
+            if _sr_is_device_context_error(e):
                 logger.error(
-                    "[SR] cache tree seed CUDA context error for %s: %s",
+                    "[SR] cache tree seed device context error for %s: %s",
                     [r.rid for r in reqs],
                     e,
                 )
@@ -1116,6 +1129,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         try:
             got = self.sr_tree_drafter.expand_batch(ready)
         except Exception as e:
+            if _sr_is_device_context_error(e):
+                logger.error(
+                    "[SR] tree expand device context error for %s: %s",
+                    [r.rid for r in ready],
+                    e,
+                )
+                raise
             logger.warning(
                 "[SR] tree expand failed for %s: %s",
                 [r.rid for r in ready],

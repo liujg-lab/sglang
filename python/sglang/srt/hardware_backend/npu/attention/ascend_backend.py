@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.tree_attn_mask import custom_mask_to_ascend_masked
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -67,6 +68,10 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # TARGET_VERIFY tree attention (True = masked, Ascend polarity)
+    tree_attn_mask: Optional[torch.Tensor] = None
+    tree_kv_lens: Optional[List[int]] = None
 
 
 class AscendAttnMaskBuilder:
@@ -250,6 +255,9 @@ class AscendAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        self.cuda_graph_custom_mask = None
+        self.cuda_graph_tree_attn_mask = None
+        self.cuda_graph_verify_positions = None
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -287,17 +295,66 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
     def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
+        """Tree mask and position buffers filled after draft for TARGET_VERIFY."""
+        return [self.cuda_graph_custom_mask, self.cuda_graph_verify_positions]
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        pass
+        custom_mask = getattr(spec_info, "custom_mask", None)
+        if custom_mask is None or self.cuda_graph_custom_mask is None:
+            return
+        n = custom_mask.numel()
+        if n > self.cuda_graph_custom_mask.numel():
+            raise RuntimeError(
+                f"Ascend tree custom_mask ({n}) exceeds graph buffer "
+                f"({self.cuda_graph_custom_mask.numel()})"
+            )
+        self.cuda_graph_custom_mask[:n].copy_(custom_mask.reshape(-1))
+        spec_info.custom_mask = self.cuda_graph_custom_mask[:n]
+        positions = getattr(spec_info, "positions", None)
+        if positions is not None and self.cuda_graph_verify_positions is not None:
+            pn = positions.numel()
+            self.cuda_graph_verify_positions[:pn].copy_(positions.reshape(-1))
+            spec_info.positions = self.cuda_graph_verify_positions[:pn]
+
+    def _fill_tree_verify_mask(self, forward_batch: ForwardBatch) -> None:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        custom_mask = getattr(spec_info, "custom_mask", None)
+        if spec_info is None or custom_mask is None or custom_mask.numel() == 0:
+            return
+        num_draft = int(
+            getattr(spec_info, "draft_token_num", None)
+            or self.speculative_num_draft_tokens
+            or 1
+        )
+        seq_lens = forward_batch.seq_lens
+        if seq_lens is None:
+            return
+        tree_mask = custom_mask_to_ascend_masked(
+            custom_mask,
+            seq_lens,
+            num_draft,
+            device=self.device,
+        )
+        if (
+            self.graph_mode
+            and self.cuda_graph_tree_attn_mask is not None
+            and tree_mask.shape[0] <= self.cuda_graph_tree_attn_mask.shape[0]
+            and tree_mask.shape[1] <= self.cuda_graph_tree_attn_mask.shape[1]
+        ):
+            self.cuda_graph_tree_attn_mask.zero_()
+            self.cuda_graph_tree_attn_mask.fill_(True)
+            self.cuda_graph_tree_attn_mask[
+                : tree_mask.shape[0], : tree_mask.shape[1]
+            ].copy_(tree_mask)
+            tree_mask = self.cuda_graph_tree_attn_mask[
+                : tree_mask.shape[0], : tree_mask.shape[1]
+            ]
+        self.forward_metadata.tree_attn_mask = tree_mask
+        self.forward_metadata.tree_kv_lens = [
+            int(s) + num_draft for s in seq_lens.tolist()
+        ]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -352,6 +409,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+            self._fill_tree_verify_mask(forward_batch)
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -396,6 +454,18 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        draft = max(int(self.speculative_num_draft_tokens or 1), 1)
+        max_q = max_bs * draft
+        max_kv = int(self.max_context_len) + draft
+        self.cuda_graph_custom_mask = torch.empty(
+            (max_q * max_kv,), dtype=torch.bool, device=self.device
+        )
+        self.cuda_graph_tree_attn_mask = torch.ones(
+            (max_q, max_kv), dtype=torch.bool, device=self.device
+        )
+        self.cuda_graph_verify_positions = torch.empty(
+            (max_q,), dtype=torch.int64, device=self.device
+        )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
@@ -535,6 +605,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        orig_seq_lens = seq_lens[:bs]
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
@@ -544,6 +615,11 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+        if forward_mode.is_target_verify() and spec_info is not None:
+            dummy_batch = type("ForwardBatchLite", (), {})()
+            dummy_batch.spec_info = spec_info
+            dummy_batch.seq_lens = orig_seq_lens
+            self._fill_tree_verify_mask(dummy_batch)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
@@ -1445,6 +1521,10 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens,
                 )
 
+            tree_mask = getattr(self.forward_metadata, "tree_attn_mask", None)
+            use_tree = (
+                forward_batch.forward_mode.is_target_verify() and tree_mask is not None
+            )
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 query,
                 k_cache,
@@ -1454,11 +1534,11 @@ class AscendAttnBackend(AttentionBackend):
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
-                atten_mask=self.mtp_mask,
+                atten_mask=tree_mask if use_tree else self.mtp_mask,
                 scale=layer.scaling,
                 actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=3,
+                sparse_mode=0 if use_tree else 3,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
@@ -1516,6 +1596,13 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens,
                 )
 
+            tree_mask = getattr(self.forward_metadata, "tree_attn_mask", None)
+            use_tree = (
+                forward_batch.forward_mode.is_target_verify() and tree_mask is not None
+            )
+            sparse_mode = 0 if use_tree else 3
+            atten_mask = tree_mask if use_tree else self.mtp_mask
+
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 q_nope,
                 c_kv_cache,
@@ -1530,8 +1617,8 @@ class AscendAttnBackend(AttentionBackend):
                 antiquant_scale=None,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
+                sparse_mode=sparse_mode,
+                atten_mask=atten_mask,
                 actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
             )
@@ -1551,8 +1638,8 @@ class AscendAttnBackend(AttentionBackend):
                 antiquant_scale=None,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
+                sparse_mode=sparse_mode,
+                atten_mask=atten_mask,
                 actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
                 workspace=workspace,

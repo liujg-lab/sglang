@@ -49,7 +49,7 @@ def _to_cpu_contiguous_tensor(value: Any) -> Optional[torch.Tensor]:
     if not isinstance(value, torch.Tensor):
         return None
     tensor = value.detach()
-    if tensor.is_cuda:
+    if tensor.device.type != "cpu":
         tensor = tensor.cpu()
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
@@ -587,7 +587,7 @@ def spectre_mm_stale_s() -> float:
 
 
 def _tensor_gpu_bytes(value: Any) -> int:
-    if isinstance(value, torch.Tensor) and value.is_cuda:
+    if isinstance(value, torch.Tensor) and value.device.type != "cpu":
         return int(value.numel() * value.element_size())
     return 0
 

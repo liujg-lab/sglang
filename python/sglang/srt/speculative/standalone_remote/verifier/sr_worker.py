@@ -185,7 +185,7 @@ class StandaloneRemoteWorker:
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
-                self.topk, spec_steps, num_draft_tokens
+                self.topk, spec_steps, num_draft_tokens, device=batch.device
             )
 
         bs = batch.batch_size()

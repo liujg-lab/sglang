@@ -37,7 +37,7 @@ def _to_cpu_contiguous_tensor(value: Any) -> Optional[torch.Tensor]:
     if not isinstance(value, torch.Tensor):
         return None
     tensor = value.detach()
-    if tensor.is_cuda:
+    if tensor.device.type != "cpu":
         tensor = tensor.cpu()
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()

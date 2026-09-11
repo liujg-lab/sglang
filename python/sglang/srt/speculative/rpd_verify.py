@@ -19,6 +19,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 _logged_rpd_cpu_fallback = False
+_logged_rpd_path = False
 
 
 def rpd_gap_max(tau: float) -> float:
@@ -257,6 +258,10 @@ def verify_tree_rpd(
     if logits.is_cuda:
         try:
             _verify_tree_rpd_cuda(**kwargs)
+            global _logged_rpd_path
+            if not _logged_rpd_path:
+                _logged_rpd_path = True
+                logger.info("Speculative RPD verify path: cuda_kernel")
             return predicts, accept_index, accept_token_num
         except (ImportError, AttributeError) as e:
             global _logged_rpd_cpu_fallback
@@ -267,5 +272,9 @@ def verify_tree_rpd(
                     "Rebuild sgl-kernel so sgl_kernel.verify_tree_rpd is installed.",
                     e,
                 )
+    global _logged_rpd_path
+    if not _logged_rpd_path:
+        _logged_rpd_path = True
+        logger.info("Speculative RPD verify path: cpu_reference device=%s", logits.device)
     _verify_tree_rpd_cpu(**kwargs)
     return predicts, accept_index, accept_token_num
