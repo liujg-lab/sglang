@@ -20,6 +20,7 @@ from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
     assign_draft_cache_locs,
     device_backend_key,
@@ -147,14 +148,8 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 keep, *self._stack_seeds(keep)
             )
-        except NpuGraphReplaySubmittedError as e:
-            logger.warning(
-                "[SR] tree expand_batch graph already submitted for %s: %s; "
-                "skipping per-req retry",
-                [r.rid for r in keep],
-                e,
-            )
-            return windows
+        except NpuGraphReplaySubmittedError:
+            raise
         except Exception as e:
             logger.warning(
                 "[SR] tree expand_batch failed for %s: %s; falling back per-req",
@@ -181,6 +176,8 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 [req], *self._stack_seeds([req])
             )
+        except NpuGraphReplaySubmittedError:
+            raise
         except Exception as e:
             logger.warning("[SR] tree expand failed for %s: %s", req.rid, e)
             return empty
@@ -245,6 +242,7 @@ class SRTreeDrafter:
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
+        graph_submitted = False
         try:
             if self.draft_attn_backend is not None:
                 self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -262,8 +260,9 @@ class SRTreeDrafter:
                     )
                 except NpuGraphReplaySubmittedError:
                     self.cuda_graph_runner = None
+                    graph_submitted = True
                     raise
-                except Exception as e:
+                except NpuGraphPreparationError as e:
                     logger.warning(
                         "[SR] tree draft graph replay prep failed: %s; "
                         "falling back to eager",
@@ -283,9 +282,10 @@ class SRTreeDrafter:
                 )
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
-            self.token_to_kv_pool_allocator.restore_state(
-                token_to_kv_pool_state_backup
-            )
+            if not graph_submitted:
+                self.token_to_kv_pool_allocator.restore_state(
+                    token_to_kv_pool_state_backup
+                )
         return parent_list, top_scores_index, draft_tokens
 
     def _alloc_tree_kv(self, batch: "ScheduleBatch"):

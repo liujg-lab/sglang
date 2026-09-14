@@ -27,10 +27,12 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
     build_draft_graph_step_kv_lens,
     expand_fia_cpu_update_inputs,
-    resolve_fia_update_count,
+    validate_draft_graph_step_kv_lens,
+    validate_tree_draft_fia_records,
 )
 
 if TYPE_CHECKING:
@@ -57,35 +59,12 @@ def _iter_graph_dispatch_records(graph):
     return records
 
 
-def count_fia_kv_len_records(graph, attr_name):
-    """Count captured graph records that take ``actual_seq_lengths_kv``.
-
-    Returns None when the torch_npu dispatch-record API is missing.
-    """
-    records = _iter_graph_dispatch_records(graph)
-    if records is None:
-        return None
-    n = 0
-    for rec in records:
-        update_info = getattr(rec, "update_info", None)
-        if isinstance(update_info, dict) and attr_name in update_info:
-            n += 1
-            continue
-        attrs = getattr(rec, "attrs", None)
-        if isinstance(attrs, dict) and attr_name in attrs:
-            n += 1
-            continue
-        if attr_name in str(rec):
-            n += 1
-    return n
-
-
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EAGLEWorker):
         super().__init__(eagle_worker)
         self.update_attr_name = None
         self.update_attr_type = None
-        self._logged_tree_fia_update = False
+        self._logged_tree_fia_update_bs = set()
         self._init_arch_map()
 
     def _init_arch_map(self):
@@ -131,7 +110,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             if end is None:
                 end = getattr(inner, "end_layer", None)
         if end is None:
-            raise RuntimeError(
+            raise NpuGraphPreparationError(
                 "model end_layer is unavailable for NPU tree graph update"
             )
         return int(end) - int(start or 0)
@@ -150,43 +129,59 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             return
 
         if forward_batch.seq_lens_cpu is None:
-            raise RuntimeError("tree draft graph replay requires seq_lens_cpu")
+            raise NpuGraphPreparationError(
+                "tree draft graph replay requires seq_lens_cpu"
+            )
 
         prefix_lens = forward_batch.seq_lens_cpu[: self.raw_bs]
-        num_tokens = self.bs * self.num_tokens_per_bs
         step_lens_list = []
-        for speculative_step_id in range(self.speculative_num_steps - 1):
-            seq_lens = build_draft_graph_step_kv_lens(
-                prefix_lens, self.bs, self.topk, speculative_step_id
-            )
-            if len(seq_lens) != num_tokens:
-                raise RuntimeError(
-                    f"tree draft step KV lengths length {len(seq_lens)} "
-                    f"!= bs*tokens_per_bs={num_tokens}"
+        try:
+            for speculative_step_id in range(self.speculative_num_steps - 1):
+                seq_lens = build_draft_graph_step_kv_lens(
+                    prefix_lens, self.bs, self.topk, speculative_step_id
                 )
-            step_lens_list.append(seq_lens)
+                validate_draft_graph_step_kv_lens(
+                    seq_lens,
+                    self.bs,
+                    self.topk,
+                    self.raw_bs,
+                    prefix_lens,
+                    speculative_step_id,
+                )
+                step_lens_list.append(seq_lens)
+        except NpuGraphPreparationError:
+            raise
+        except (TypeError, ValueError) as e:
+            raise NpuGraphPreparationError(
+                f"tree draft step KV lengths invalid: {e}"
+            ) from e
 
         graph = self.graphs[self.bs]
         n_steps = len(step_lens_list)
         num_layers = self._num_model_layers()
-        n_records = count_fia_kv_len_records(graph, self.update_attr_name)
-        n_updates = resolve_fia_update_count(n_records, n_steps, num_layers)
+        records = _iter_graph_dispatch_records(graph)
+        n_records = validate_tree_draft_fia_records(
+            records, n_steps, num_layers, self.update_attr_name
+        )
         cpu_update_input = expand_fia_cpu_update_inputs(
             step_lens_list, num_layers, self.update_attr_name
         )
-        if len(cpu_update_input) != n_updates:
-            raise RuntimeError(
-                f"cpu_update_input length {len(cpu_update_input)} != resolved {n_updates}"
+        if len(cpu_update_input) != n_records:
+            raise NpuGraphPreparationError(
+                f"cpu_update_input length {len(cpu_update_input)} != records {n_records}"
             )
-        if not self._logged_tree_fia_update:
+        if self.bs not in self._logged_tree_fia_update_bs:
             logger.info(
-                "NPU tree draft graph FIA updates: records=%s steps=%s layers=%s updates=%s",
+                "NPU tree draft graph FIA updates: bs=%s raw_bs=%s records=%s "
+                "steps=%s layers=%s updates=%s",
+                self.bs,
+                self.raw_bs,
                 n_records,
                 n_steps,
                 num_layers,
-                n_updates,
+                len(cpu_update_input),
             )
-            self._logged_tree_fia_update = True
+            self._logged_tree_fia_update_bs.add(self.bs)
 
         errors = []
         thread = threading.Thread(

@@ -119,8 +119,20 @@ def normalize_tree_draft_kv_lens(seq_lens, num_q: int, topk: int):
     )
 
 
+class NpuGraphPreparationError(RuntimeError):
+    """Raised before NPU graph.replay(); callers may disable the graph and fall back to eager."""
+
+
 class NpuGraphReplaySubmittedError(RuntimeError):
     """Raised after NPU graph.replay() has been invoked; do not retry the same graph."""
+
+
+TREE_DRAFT_FIA_OP_NAMES = frozenset(
+    {
+        "npu_fused_infer_attention_score",
+        "npu_fused_infer_attention_score.out",
+    }
+)
 
 
 def build_draft_graph_step_kv_lens(prefix_lens, capture_bs, topk, step_id):
@@ -164,22 +176,140 @@ def expand_fia_cpu_update_inputs(step_lens_list, num_layers, attr_name):
     ]
 
 
-def resolve_fia_update_count(n_records, n_steps, num_layers):
-    """Return how many cpu_update_input dicts the captured graph needs.
+def _structured_op_name(obj):
+    if obj is None:
+        return None
+    for key in ("op_name", "name", "op"):
+        val = getattr(obj, key, None)
+        if isinstance(val, str) and val:
+            return val
+        if isinstance(obj, dict):
+            val = obj.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return None
 
-    Expected ``n_steps * num_layers``. If ``n_records`` is None (API missing),
-    use expected. Mismatch raises; never silently guess a 2x workspace factor.
+
+def _structured_kwargs(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    kwargs = getattr(obj, "kwargs", None)
+    if isinstance(kwargs, dict):
+        return kwargs
+    update_info = getattr(obj, "update_info", None)
+    if isinstance(update_info, dict):
+        return update_info
+    return None
+
+
+def inspect_dispatch_record(rec, kv_attr):
+    """Return ``(op_name, has_kv_attr)`` from structured record fields only.
+
+    Never uses ``str(rec)``. Unreadable records raise
+    ``NpuGraphPreparationError`` so the tree graph can be disabled.
     """
+    if rec is None:
+        raise NpuGraphPreparationError(
+            "NPU graph dispatch record is None; disable tree graph"
+        )
+    entry = getattr(rec, "op_cache_entry", None)
+    op_name = _structured_op_name(entry) or _structured_op_name(rec)
+    kwargs = _structured_kwargs(entry) or _structured_kwargs(rec)
+    if op_name is None or kwargs is None:
+        raise NpuGraphPreparationError(
+            "NPU graph dispatch record lacks structured op/kwargs; disable tree graph"
+        )
+    return op_name, kv_attr in kwargs
+
+
+def validate_tree_draft_fia_records(records, n_steps, num_layers, kv_attr):
+    """Require every captured record to be expected FIA with ``kv_attr``.
+
+    Mixed ops or a missing record API refuse replay; do not filter a subset.
+    """
+    if records is None:
+        raise NpuGraphPreparationError(
+            "NPU graph dispatch records unavailable; disable tree graph"
+        )
     n_steps = int(n_steps)
     num_layers = int(num_layers)
     expected = n_steps * num_layers
+    n_records = len(records)
+    if n_records != expected:
+        raise NpuGraphPreparationError(
+            f"FIA records={n_records} != steps*num_layers="
+            f"{n_steps}*{num_layers}={expected}; disable tree graph"
+        )
+    for i, rec in enumerate(records):
+        op_name, has_kv = inspect_dispatch_record(rec, kv_attr)
+        if op_name not in TREE_DRAFT_FIA_OP_NAMES:
+            raise NpuGraphPreparationError(
+                f"dispatch record[{i}] op={op_name!r} is not expected FIA; "
+                "disable tree graph"
+            )
+        if not has_kv:
+            raise NpuGraphPreparationError(
+                f"dispatch record[{i}] op={op_name!r} missing {kv_attr}; "
+                "disable tree graph"
+            )
+    return n_records
+
+
+def validate_draft_graph_step_kv_lens(
+    seq_lens, capture_bs, topk, raw_bs, prefix_lens, step_id
+):
+    """Check one step's branch KV lengths: real rows prefix+step+1, padding 0."""
+    capture_bs = int(capture_bs)
+    topk = max(int(topk), 1)
+    raw_bs = int(raw_bs)
+    step_id = int(step_id)
+    values = list(seq_lens)
+    expected_len = capture_bs * topk
+    if len(values) != expected_len:
+        raise NpuGraphPreparationError(
+            f"step KV lengths length {len(values)} != capture_bs*topk={expected_len}"
+        )
+    if prefix_lens is None:
+        raise NpuGraphPreparationError("draft graph prefix_lens must not be None")
+    prefixes = [int(s) for s in list(prefix_lens)]
+    if len(prefixes) != raw_bs:
+        raise NpuGraphPreparationError(
+            f"prefix_lens length {len(prefixes)} != raw_bs={raw_bs}"
+        )
+    for b, prefix in enumerate(prefixes):
+        want = prefix + step_id + 1
+        start = b * topk
+        row = values[start : start + topk]
+        if any(int(x) != want for x in row):
+            raise NpuGraphPreparationError(
+                f"branch KV lengths {row} != prefix+step_id+1={want} at seq {b}"
+            )
+    pad = values[raw_bs * topk :]
+    if any(int(x) != 0 for x in pad):
+        raise NpuGraphPreparationError(f"padding KV lengths {pad} must be 0")
+    return values
+
+
+def resolve_fia_update_count(n_records, n_steps, num_layers):
+    """Return how many cpu_update_input dicts the captured graph needs.
+
+    Expected ``n_steps * num_layers``. Missing record counts refuse replay;
+    never guess ``steps * layers``.
+    """
     if n_records is None:
-        return expected
+        raise NpuGraphPreparationError(
+            "FIA record count unavailable; disable tree graph"
+        )
+    n_steps = int(n_steps)
+    num_layers = int(num_layers)
+    expected = n_steps * num_layers
     n_records = int(n_records)
     if n_records != expected:
-        raise RuntimeError(
+        raise NpuGraphPreparationError(
             f"FIA records={n_records} != steps*num_layers="
-            f"{n_steps}*{num_layers}={expected}"
+            f"{n_steps}*{num_layers}={expected}; disable tree graph"
         )
     return expected
 

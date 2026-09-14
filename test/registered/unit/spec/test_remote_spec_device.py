@@ -106,17 +106,28 @@ def _load_tree_draft_helpers():
         "build_draft_graph_step_kv_lens",
         "expand_fia_cpu_update_inputs",
         "resolve_fia_update_count",
+        "_structured_op_name",
+        "_structured_kwargs",
+        "inspect_dispatch_record",
+        "validate_tree_draft_fia_records",
+        "validate_draft_graph_step_kv_lens",
     }
-    class_names = {"NpuGraphReplaySubmittedError"}
+    class_names = {"NpuGraphReplaySubmittedError", "NpuGraphPreparationError"}
+    assign_names = {"TREE_DRAFT_FIA_OP_NAMES"}
     try:
         from sglang.srt.speculative.spec_utils import (
+            NpuGraphPreparationError,
             NpuGraphReplaySubmittedError,
+            TREE_DRAFT_FIA_OP_NAMES,
             build_draft_graph_step_kv_lens,
             build_tree_draft_block_tables,
             expand_fia_cpu_update_inputs,
             expand_seq_lens_for_spec_topk,
+            inspect_dispatch_record,
             normalize_tree_draft_kv_lens,
             resolve_fia_update_count,
+            validate_draft_graph_step_kv_lens,
+            validate_tree_draft_fia_records,
         )
 
         return SimpleNamespace(
@@ -126,18 +137,28 @@ def _load_tree_draft_helpers():
             build_draft_graph_step_kv_lens=build_draft_graph_step_kv_lens,
             expand_fia_cpu_update_inputs=expand_fia_cpu_update_inputs,
             resolve_fia_update_count=resolve_fia_update_count,
+            inspect_dispatch_record=inspect_dispatch_record,
+            validate_tree_draft_fia_records=validate_tree_draft_fia_records,
+            validate_draft_graph_step_kv_lens=validate_draft_graph_step_kv_lens,
             NpuGraphReplaySubmittedError=NpuGraphReplaySubmittedError,
+            NpuGraphPreparationError=NpuGraphPreparationError,
+            TREE_DRAFT_FIA_OP_NAMES=TREE_DRAFT_FIA_OP_NAMES,
         )
     except Exception:
         pass
     src_path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
     tree = ast.parse(src_path.read_text())
-    keep = [
-        node
-        for node in tree.body
-        if (isinstance(node, ast.FunctionDef) and node.name in helper_names)
-        or (isinstance(node, ast.ClassDef) and node.name in class_names)
-    ]
+    keep = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in helper_names:
+            keep.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in class_names:
+            keep.append(node)
+        elif isinstance(node, ast.Assign):
+            if any(
+                isinstance(t, ast.Name) and t.id in assign_names for t in node.targets
+            ):
+                keep.append(node)
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
     ns = {"torch": torch, "Optional": Optional}
@@ -149,7 +170,12 @@ def _load_tree_draft_helpers():
         build_draft_graph_step_kv_lens=ns["build_draft_graph_step_kv_lens"],
         expand_fia_cpu_update_inputs=ns["expand_fia_cpu_update_inputs"],
         resolve_fia_update_count=ns["resolve_fia_update_count"],
+        inspect_dispatch_record=ns["inspect_dispatch_record"],
+        validate_tree_draft_fia_records=ns["validate_tree_draft_fia_records"],
+        validate_draft_graph_step_kv_lens=ns["validate_draft_graph_step_kv_lens"],
         NpuGraphReplaySubmittedError=ns["NpuGraphReplaySubmittedError"],
+        NpuGraphPreparationError=ns["NpuGraphPreparationError"],
+        TREE_DRAFT_FIA_OP_NAMES=ns["TREE_DRAFT_FIA_OP_NAMES"],
     )
 
 
@@ -405,47 +431,94 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertNotEqual(keys, ([s0, s1] * 3))
 
     def test_resolve_fia_update_count(self):
-        resolve = _load_tree_draft_helpers().resolve_fia_update_count
-        self.assertEqual(resolve(None, 4, 28), 112)
+        helpers = _load_tree_draft_helpers()
+        resolve = helpers.resolve_fia_update_count
+        Prep = helpers.NpuGraphPreparationError
         self.assertEqual(resolve(112, 4, 28), 112)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(Prep):
+            resolve(None, 4, 28)
+        with self.assertRaises(Prep):
             resolve(8, 4, 28)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(Prep):
             resolve(224, 4, 28)
 
-    def test_count_fia_kv_len_records(self):
-        src_path = (
-            _REPO
-            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
+    def _fia_rec(self, op="npu_fused_infer_attention_score"):
+        return SimpleNamespace(
+            op_name=op,
+            kwargs={"actual_seq_lengths_kv": [1]},
         )
-        tree = ast.parse(src_path.read_text())
-        names = {"_iter_graph_dispatch_records", "count_fia_kv_len_records"}
-        keep = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name in names
-        ]
-        mod = ast.Module(body=keep, type_ignores=[])
-        ast.fix_missing_locations(mod)
-        ns = {}
-        exec(compile(mod, str(src_path), "exec"), ns)
-        count = ns["count_fia_kv_len_records"]
-        attr = "actual_seq_lengths_kv"
-        self.assertIsNone(count(SimpleNamespace(), attr))
-        graph = SimpleNamespace(
-            graph_dispatch_mode=SimpleNamespace(
-                graph_dispatch_records=[
-                    SimpleNamespace(update_info={attr: [1]}),
-                    SimpleNamespace(update_info={"other": [1]}),
-                    SimpleNamespace(update_info={attr: [2]}),
-                ]
-            )
-        )
-        self.assertEqual(count(graph, attr), 2)
-        empty = SimpleNamespace(graph_dispatch_records=[])
-        self.assertEqual(count(empty, attr), 0)
 
-    def test_expand_batch_skips_expand_one_after_graph_submitted(self):
+    def test_validate_tree_draft_fia_records_all_fia(self):
+        helpers = _load_tree_draft_helpers()
+        validate = helpers.validate_tree_draft_fia_records
+        n_steps, num_layers = 4, 3
+        records = [self._fia_rec() for _ in range(n_steps * num_layers)]
+        self.assertEqual(
+            validate(records, n_steps, num_layers, "actual_seq_lengths_kv"),
+            n_steps * num_layers,
+        )
+        expanded = helpers.expand_fia_cpu_update_inputs(
+            [[129] * 3, [130] * 3, [131] * 3, [132] * 3],
+            num_layers,
+            "actual_seq_lengths_kv",
+        )
+        self.assertEqual(len(expanded), n_steps * num_layers)
+        keys = [d["actual_seq_lengths_kv"] for d in expanded]
+        self.assertEqual(
+            keys,
+            [[129] * 3] * 3
+            + [[130] * 3] * 3
+            + [[131] * 3] * 3
+            + [[132] * 3] * 3,
+        )
+
+    def test_validate_tree_draft_fia_records_rejects_mixed_ops(self):
+        helpers = _load_tree_draft_helpers()
+        validate = helpers.validate_tree_draft_fia_records
+        Prep = helpers.NpuGraphPreparationError
+        records = [self._fia_rec() for _ in range(11)]
+        records.insert(3, self._fia_rec(op="npu_rms_norm"))
+        with self.assertRaises(Prep):
+            validate(records, 4, 3, "actual_seq_lengths_kv")
+
+    def test_validate_tree_draft_fia_records_missing_api(self):
+        helpers = _load_tree_draft_helpers()
+        validate = helpers.validate_tree_draft_fia_records
+        Prep = helpers.NpuGraphPreparationError
+        with self.assertRaises(Prep):
+            validate(None, 4, 28, "actual_seq_lengths_kv")
+        with self.assertRaises(Prep):
+            inspect = helpers.inspect_dispatch_record
+            inspect(SimpleNamespace(value="actual_seq_lengths_kv"), "actual_seq_lengths_kv")
+
+    def test_validate_draft_graph_step_kv_lens_padding(self):
+        helpers = _load_tree_draft_helpers()
+        build = helpers.build_draft_graph_step_kv_lens
+        validate = helpers.validate_draft_graph_step_kv_lens
+        Prep = helpers.NpuGraphPreparationError
+        seq_lens = build([128], capture_bs=4, topk=3, step_id=0)
+        got = validate(
+            seq_lens,
+            capture_bs=4,
+            topk=3,
+            raw_bs=1,
+            prefix_lens=[128],
+            step_id=0,
+        )
+        self.assertEqual(len(got), 12)
+        self.assertEqual(got[:3], [129, 129, 129])
+        self.assertEqual(got[3:], [0] * 9)
+        with self.assertRaises(Prep):
+            validate(
+                [129, 129, 129] + [1] * 9,
+                capture_bs=4,
+                topk=3,
+                raw_bs=1,
+                prefix_lens=[128],
+                step_id=0,
+            )
+
+    def test_expand_batch_reraises_graph_submitted(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
                 SRTreeDrafter,
@@ -467,9 +540,48 @@ class TestRemoteSpecDevice(CustomTestCase):
         drafter._expand_one = expand_one
         drafter._stack_seeds = lambda _reqs: (None, None, None, None)
         req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
-        windows = SRTreeDrafter.expand_batch(drafter, [req])
-        self.assertEqual(windows, [([], None, None)])
+        with self.assertRaises(Submitted):
+            SRTreeDrafter.expand_batch(drafter, [req])
         self.assertEqual(called["expand_one"], 0)
+
+    def test_scheduler_reraises_graph_submitted(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+        Submitted = _load_tree_draft_helpers().NpuGraphReplaySubmittedError
+
+        class FakeDrafter:
+            def expand_batch(self, _reqs):
+                raise Submitted("already submitted")
+
+        mixin = object.__new__(StandaloneRemoteDraftSchedulerMixin)
+        mixin.sr_tree_drafter = FakeDrafter()
+        mixin._sr_materialize_prefix_batch = lambda _reqs: None
+        mixin._sr_ingest_committed_batch = lambda _reqs: None
+        mixin._sr_replay_grammars = lambda _reqs: None
+        mixin._sr_resume_req = lambda _req: None
+        mixin._sr_park_in_running_many = lambda _reqs: None
+        mixin._sr_pause_req = lambda _req: None
+        mixin._sr_is_finished = lambda _req: False
+        mixin._sr_kv_len = lambda req: len(req.origin_input_ids) + len(
+            req.output_ids or []
+        )
+        mixin._sr_mark_degraded = lambda *_a, **_k: None
+        mixin.last_batch = object()
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            sr_tree_seed=object(),
+            rid="r0",
+            origin_input_ids=[1],
+            output_ids=[],
+            finished_reason=None,
+            kv_committed_len=1,
+        )
+        with self.assertRaises(Submitted):
+            mixin._sr_tree_expand_batch([req])
 
     def test_build_tree_draft_block_tables_matrix(self):
         build_tree_draft_block_tables = (
@@ -656,19 +768,32 @@ class TestRemoteSpecDevice(CustomTestCase):
         ).read_text()
         self.assertIn("build_draft_graph_step_kv_lens", graph_src)
         self.assertIn("expand_fia_cpu_update_inputs", graph_src)
-        self.assertIn("resolve_fia_update_count", graph_src)
-        self.assertIn("count_fia_kv_len_records", graph_src)
+        self.assertIn("validate_tree_draft_fia_records", graph_src)
+        self.assertIn("validate_draft_graph_step_kv_lens", graph_src)
         self.assertIn("graph_dispatch_records", graph_src)
         self.assertIn("NpuGraphReplaySubmittedError", graph_src)
+        self.assertIn("NpuGraphPreparationError", graph_src)
         self.assertIn("seq_lens_cpu[: self.raw_bs]", graph_src)
+        self.assertIn("_logged_tree_fia_update_bs", graph_src)
         self.assertNotIn("normalize_tree_draft_kv_lens", graph_src)
+        self.assertNotIn("count_fia_kv_len_records", graph_src)
+        self.assertNotIn("if attr_name in str(rec)", graph_src)
         drafter_src = (
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
         ).read_text()
         self.assertIn("NpuGraphReplaySubmittedError", drafter_src)
-        self.assertIn("skipping per-req retry", drafter_src)
+        self.assertIn("NpuGraphPreparationError", drafter_src)
+        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", drafter_src)
+        self.assertNotIn("skipping per-req retry", drafter_src)
         self.assertIn("falling back to eager", drafter_src)
+        self.assertIn("graph_submitted", drafter_src)
+        self.assertIn("except NpuGraphPreparationError as e:", drafter_src)
+        mixin_src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
+        ).read_text()
+        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", mixin_src)
 
     def test_npu_tree_draft_fia_alignment_source_guards(self):
         src = (

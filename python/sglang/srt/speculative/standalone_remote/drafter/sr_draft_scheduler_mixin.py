@@ -50,6 +50,7 @@ from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRDraftServer,
     make_transport_from_server_args,
 )
+from sglang.srt.speculative.spec_utils import NpuGraphReplaySubmittedError
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
     SRTreeDrafter,
 )
@@ -1128,6 +1129,8 @@ class StandaloneRemoteDraftSchedulerMixin:
         self._sr_park_in_running_many(ready)
         try:
             got = self.sr_tree_drafter.expand_batch(ready)
+        except NpuGraphReplaySubmittedError:
+            raise
         except Exception as e:
             if _sr_is_device_context_error(e):
                 logger.error(
