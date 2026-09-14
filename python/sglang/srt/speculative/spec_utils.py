@@ -92,6 +92,33 @@ def expand_seq_lens_for_spec_topk(seq_lens, num_tokens: int):
     return values
 
 
+def normalize_tree_draft_kv_lens(seq_lens, num_q: int, topk: int):
+    """Normalize prefix/step KV lengths to one FIA batch row per tree branch.
+
+    Tree draft Q is ``bs * topk``. Each branch of a sequence shares
+    ``kv_len = prefix + step_id + 1``.
+
+    - ``len(seq_lens) == num_q``: already per-branch, return as-is.
+    - ``num_q == len(seq_lens) * topk``: repeat each length ``topk`` times.
+    - otherwise: raise. Never silently truncate or broadcast a singleton.
+    """
+    if seq_lens is None:
+        raise ValueError("tree draft KV lengths must not be None")
+    values = list(seq_lens)
+    n = len(values)
+    num_q = int(num_q)
+    topk = max(int(topk), 1)
+    if num_q < 0:
+        raise ValueError(f"tree draft num_q must be >= 0, got {num_q}")
+    if n == num_q:
+        return values
+    if topk > 1 and n * topk == num_q:
+        return [s for s in values for _ in range(topk)]
+    raise ValueError(
+        f"tree draft KV lengths length {n} incompatible with num_q={num_q} topk={topk}"
+    )
+
+
 def build_tree_draft_block_tables(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -180,8 +207,16 @@ def build_tree_draft_block_tables(
     if ctx_len <= 0:
         pages = torch.zeros(gather_idx.shape, dtype=torch.int32, device=device)
     else:
-        token_pos_clamped = token_pos.clamp(min=0, max=ctx_len - 1)
-        token_ids = req_to_token[gather_idx, token_pos_clamped]
+        valid = valid.expand_as(token_pos)
+        overflow = valid & ((token_pos < 0) | (token_pos >= ctx_len))
+        if bool(overflow.any().item()):
+            max_pos = int(token_pos[overflow].max().item())
+            raise RuntimeError(
+                "tree draft block table token_pos out of req_to_token range: "
+                f"max_valid_pos={max_pos} ctx_len={ctx_len}"
+            )
+        token_pos_safe = torch.where(valid, token_pos, torch.zeros_like(token_pos))
+        token_ids = req_to_token[gather_idx, token_pos_safe]
         if index_mapping is not None:
             token_ids = index_mapping.to(device=device)[token_ids]
         pages = (token_ids // page_size).to(torch.int32)
@@ -360,40 +395,45 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):
-        # Part 2: Copy indices into source_cache_loc and target_cache_loc
-        # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
+    if (page_size != 1) and (topk != 1):
         prefix_len = tl.load(seq_lens + pid)
         last_page_len = prefix_len % page_size
-        offsets = tl.arange(0, page_size)
-        mask = offsets < last_page_len
         num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
         prefix_base = token_pool + prefix_len - last_page_len
-        src_indices = tl.load(prefix_base + offsets, mask=mask)
-        last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
-        # Skip the first one since no copy is needed
-        for topk_id in range(1, topk):
-            tl.store(
-                source_cache_loc
-                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-                + (topk_id - 1) * last_page_len
-                + offsets,
-                src_indices,
-                mask=mask,
-            )
-            tgt_indices = tl.load(
-                prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
-                mask=mask,
-            )
-            tl.store(
-                target_cache_loc
-                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-                + (topk_id - 1) * last_page_len
-                + offsets,
-                tgt_indices,
-                mask=mask,
-            )
-        # Part 3: Copy and remove the used indices for duplication
+        if duplicate_cache_len > 0:
+            # Part 2: Copy indices into source_cache_loc and target_cache_loc
+            # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
+            offsets = tl.arange(0, page_size)
+            mask = offsets < last_page_len
+            src_indices = tl.load(prefix_base + offsets, mask=mask)
+            last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+            # Skip the first one since no copy is needed
+            for topk_id in range(1, topk):
+                tl.store(
+                    source_cache_loc
+                    + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                    + (topk_id - 1) * last_page_len
+                    + offsets,
+                    src_indices,
+                    mask=mask,
+                )
+                tgt_indices = tl.load(
+                    prefix_base
+                    + topk_id * num_new_pages_per_topk_ * page_size
+                    + offsets,
+                    mask=mask,
+                )
+                tl.store(
+                    target_cache_loc
+                    + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                    + (topk_id - 1) * last_page_len
+                    + offsets,
+                    tgt_indices,
+                    mask=mask,
+                )
+        # Part 3: Copy and remove the used indices for duplication.
+        # Always run for paged tree draft so page-aligned prefixes
+        # (last_page_len == 0) still compact per-branch slots.
         # speculative_num_steps=5, page_size=4, num_new_pages_per_topk_=2, last_page_len=1
         #  - xxxxx .. | - xxxxx .. |
         #   topk=0        topk=1

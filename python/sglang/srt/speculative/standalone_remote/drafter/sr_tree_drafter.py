@@ -369,10 +369,12 @@ class SRTreeDrafter:
                 next_power_of_2(num_seqs),
                 next_power_of_2(self.speculative_num_steps + self.page_size),
             )
-            if self.page_size > 1 and self.topk > 1 and duplicate_cache_len > 0:
-                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
-                    target_cache_loc, source_cache_loc
-                )
+            if self.page_size > 1 and self.topk > 1:
+                if duplicate_cache_len > 0:
+                    self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                        target_cache_loc, source_cache_loc
+                    )
+                # Remove padded slots (including last_page_len == 0).
                 out_cache_loc = out_cache_loc[
                     : num_seqs * self.topk * self.speculative_num_steps
                 ]

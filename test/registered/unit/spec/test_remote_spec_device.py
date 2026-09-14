@@ -1,8 +1,10 @@
 """Device-agnostic helpers for SPECTRE / STANDALONE_REMOTE dual-backend."""
 
+import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -17,6 +19,121 @@ except Exception:
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
 _REPO = Path(__file__).resolve().parents[4]
+
+
+def _noncontiguous_req_to_token(page_ids, page_size: int) -> torch.Tensor:
+    """Fill req_to_token so physical page numbers are the given ids (not 0,1,2...)."""
+    bs = len(page_ids)
+    n_pages = max(len(p) for p in page_ids)
+    ctx = n_pages * page_size
+    req = torch.zeros((bs, ctx), dtype=torch.int32)
+    for b, pages in enumerate(page_ids):
+        for p, pid in enumerate(pages):
+            start = p * page_size
+            req[b, start : start + page_size] = int(pid) * page_size + torch.arange(
+                page_size, dtype=torch.int32
+            )
+    return req
+
+
+def _reference_tree_draft_block_tables(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    topk: int,
+    step_id: int,
+    num_steps: int,
+) -> torch.Tensor:
+    bs = int(req_pool_indices.shape[0])
+    kv_extra = int(step_id) + 1
+    rows = []
+    for b in range(bs):
+        pool = int(req_pool_indices[b])
+        seq = int(seq_lens[b])
+        kv_len = seq + kv_extra
+        n_pages = (kv_len + page_size - 1) // page_size
+        if topk == 1:
+            token_pos = [p * page_size for p in range(n_pages)]
+            pages = [
+                int(req_to_token[pool, pos]) // page_size if pos < kv_len else 0
+                for pos in token_pos
+            ]
+            rows.append(pages)
+            continue
+        if page_size == 1:
+            for k in range(topk):
+                pages = []
+                for p in range(n_pages):
+                    if p < seq:
+                        pos = p
+                    else:
+                        pos = seq + k * num_steps + (p - seq)
+                    pages.append(
+                        int(req_to_token[pool, pos]) if p < kv_len else 0
+                    )
+                rows.append(pages)
+            continue
+        last_page_len = seq % page_size
+        prefix_base = seq - last_page_len
+        num_new_pages = (last_page_len + num_steps + page_size - 1) // page_size
+        n_shared = prefix_base // page_size
+        for k in range(topk):
+            pages = []
+            for p in range(n_pages):
+                if p < n_shared:
+                    pos = p * page_size
+                else:
+                    pos = prefix_base + k * num_new_pages * page_size + (
+                        p - n_shared
+                    ) * page_size
+                pages.append(
+                    int(req_to_token[pool, pos]) // page_size if p < n_pages else 0
+                )
+            rows.append(pages)
+    n_cols = max((len(r) for r in rows), default=0)
+    out = torch.zeros((bs * topk, n_cols), dtype=torch.int32)
+    for i, r in enumerate(rows):
+        out[i, : len(r)] = torch.tensor(r, dtype=torch.int32)
+    return out
+
+
+def _load_tree_draft_helpers():
+    try:
+        from sglang.srt.speculative.spec_utils import (
+            build_tree_draft_block_tables,
+            expand_seq_lens_for_spec_topk,
+            normalize_tree_draft_kv_lens,
+        )
+
+        return (
+            build_tree_draft_block_tables,
+            expand_seq_lens_for_spec_topk,
+            normalize_tree_draft_kv_lens,
+        )
+    except Exception:
+        pass
+    src_path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
+    tree = ast.parse(src_path.read_text())
+    names = {
+        "expand_seq_lens_for_spec_topk",
+        "normalize_tree_draft_kv_lens",
+        "build_tree_draft_block_tables",
+    }
+    keep = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    mod = ast.Module(body=keep, type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns = {"torch": torch, "Optional": Optional}
+    exec(compile(mod, str(src_path), "exec"), ns)
+    return (
+        ns["build_tree_draft_block_tables"],
+        ns["expand_seq_lens_for_spec_topk"],
+        ns["normalize_tree_draft_kv_lens"],
+    )
 
 
 class TestRemoteSpecDevice(CustomTestCase):
@@ -185,13 +302,11 @@ class TestRemoteSpecDevice(CustomTestCase):
             _REPO / "python/sglang/srt/speculative/spec_utils.py"
         ).read_text()
         self.assertNotIn(
-            "if page_size != 1 and topk != 1 and duplicate_cache_len > 0:",
-            spec_src,
-        )
-        self.assertIn(
             "if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):",
             spec_src,
         )
+        self.assertIn("if (page_size != 1) and (topk != 1):", spec_src)
+        self.assertIn("Always run for paged tree draft", spec_src)
         drafter_src = (
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
@@ -199,14 +314,33 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("def _alloc_tree_kv", drafter_src)
         self.assertIn("if token_to_kv_pool_state_backup is not None:", drafter_src)
         self.assertIn("except Exception:", drafter_src)
+        self.assertNotIn(
+            "if self.page_size > 1 and self.topk > 1 and duplicate_cache_len > 0:",
+            drafter_src,
+        )
+        self.assertIn("if self.page_size > 1 and self.topk > 1:", drafter_src)
+        self.assertIn("if duplicate_cache_len > 0:", drafter_src)
+
+    def test_normalize_tree_draft_kv_lens(self):
+        _, _, normalize_tree_draft_kv_lens = _load_tree_draft_helpers()
+
+        self.assertEqual(normalize_tree_draft_kv_lens([7], 3, topk=3), [7, 7, 7])
+        self.assertEqual(
+            normalize_tree_draft_kv_lens([10, 20], 6, topk=3),
+            [10, 10, 10, 20, 20, 20],
+        )
+        self.assertEqual(
+            normalize_tree_draft_kv_lens([7, 7, 7], 3, topk=3),
+            [7, 7, 7],
+        )
+        self.assertEqual(normalize_tree_draft_kv_lens([7], 1, topk=1), [7])
+        with self.assertRaises(ValueError):
+            normalize_tree_draft_kv_lens([7, 8], 3, topk=3)
+        with self.assertRaises(ValueError):
+            normalize_tree_draft_kv_lens(None, 3, topk=3)
 
     def test_expand_seq_lens_for_spec_topk(self):
-        try:
-            from sglang.srt.speculative.spec_utils import (
-                expand_seq_lens_for_spec_topk,
-            )
-        except Exception as e:
-            self.skipTest(f"sglang runtime deps missing: {e}")
+        _, expand_seq_lens_for_spec_topk, _ = _load_tree_draft_helpers()
 
         self.assertEqual(
             expand_seq_lens_for_spec_topk([10, 20], 6),
@@ -215,13 +349,103 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(expand_seq_lens_for_spec_topk([10, 20], 2), [10, 20])
         self.assertEqual(expand_seq_lens_for_spec_topk([7], 4), [7])
 
-    def test_build_tree_draft_block_tables_aligned(self):
-        try:
-            from sglang.srt.speculative.spec_utils import (
-                build_tree_draft_block_tables,
+    def test_build_tree_draft_block_tables_matrix(self):
+        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+
+        cases = []
+        for page_size in (1, 4, 128):
+            for topk in (1, 3):
+                for step_id in (0, 1, 4):
+                    num_steps = 5
+                    prefixes = {
+                        1: (1, 2, 3),
+                        4: (3, 4, 5, 7, 8, 9),
+                        128: (127, 128, 129),
+                    }[page_size]
+                    for seq in prefixes:
+                        cases.append((page_size, topk, step_id, num_steps, [seq]))
+                    if page_size != 1:
+                        cases.append(
+                            (page_size, topk, step_id, num_steps, [prefixes[0], prefixes[-1]])
+                        )
+
+        for page_size, topk, step_id, num_steps, seqs in cases:
+            with self.subTest(
+                page_size=page_size, topk=topk, step_id=step_id, seqs=seqs
+            ):
+                last_page_len = [s % page_size for s in seqs]
+                num_new = [
+                    (lp + num_steps + page_size - 1) // page_size for lp in last_page_len
+                ]
+                n_logical = []
+                for s, nnp in zip(seqs, num_new):
+                    if topk == 1:
+                        n_logical.append(s + step_id + 1 + page_size)
+                    elif page_size == 1:
+                        n_logical.append(s + topk * num_steps + 8)
+                    else:
+                        n_logical.append(
+                            (s - s % page_size) + topk * nnp * page_size + page_size
+                        )
+                n_pages = [(n + page_size - 1) // page_size for n in n_logical]
+                page_ids = [
+                    [1000 + b * 50 + p * 7 for p in range(np)]
+                    for b, np in enumerate(n_pages)
+                ]
+                req = _noncontiguous_req_to_token(page_ids, page_size)
+                pool = torch.arange(len(seqs), dtype=torch.int64)
+                seq_t = torch.tensor(seqs, dtype=torch.int64)
+                got = build_tree_draft_block_tables(
+                    req,
+                    pool,
+                    seq_t,
+                    page_size=page_size,
+                    topk=topk,
+                    step_id=step_id,
+                    num_steps=num_steps,
+                )
+                ref = _reference_tree_draft_block_tables(
+                    req,
+                    pool,
+                    seq_t,
+                    page_size=page_size,
+                    topk=topk,
+                    step_id=step_id,
+                    num_steps=num_steps,
+                )
+                self.assertEqual(tuple(got.shape), tuple(ref.shape))
+                self.assertTrue(torch.equal(got, ref), msg=f"got={got} ref={ref}")
+                if topk > 1 and page_size > 1:
+                    kv_len0 = seqs[0] + step_id + 1
+                    n_pages0 = (kv_len0 + page_size - 1) // page_size
+                    last = n_pages0 - 1
+                    self.assertGreaterEqual(last, 0)
+                    row0 = got[0]
+                    row1 = got[1]
+                    last_len = seqs[0] % page_size
+                    n_shared = (seqs[0] - last_len) // page_size
+                    if n_shared > 0:
+                        self.assertEqual(int(row0[0]), int(row1[0]))
+                    self.assertNotEqual(int(row0[last]), int(row1[last]))
+
+    def test_build_tree_draft_block_tables_overflow_raises(self):
+        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+
+        page_size = 4
+        req = torch.arange(8, dtype=torch.int32).view(1, 8)
+        with self.assertRaises(RuntimeError):
+            build_tree_draft_block_tables(
+                req,
+                torch.tensor([0]),
+                torch.tensor([8]),
+                page_size=page_size,
+                topk=2,
+                step_id=0,
+                num_steps=5,
             )
-        except Exception as e:
-            self.skipTest(f"sglang runtime deps missing: {e}")
+
+    def test_build_tree_draft_block_tables_aligned(self):
+        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
 
         page_size = 4
         req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
@@ -240,12 +464,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(int(tables[1, -1]), 16 // page_size)
 
     def test_build_tree_draft_block_tables_unaligned(self):
-        try:
-            from sglang.srt.speculative.spec_utils import (
-                build_tree_draft_block_tables,
-            )
-        except Exception as e:
-            self.skipTest(f"sglang runtime deps missing: {e}")
+        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
 
         page_size = 4
         req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
@@ -264,12 +483,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(int(tables[1, 1]), 12 // page_size)
 
     def test_build_tree_draft_block_tables_topk1(self):
-        try:
-            from sglang.srt.speculative.spec_utils import (
-                build_tree_draft_block_tables,
-            )
-        except Exception as e:
-            self.skipTest(f"sglang runtime deps missing: {e}")
+        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
 
         page_size = 4
         seq_len = 8
@@ -295,10 +509,29 @@ class TestRemoteSpecDevice(CustomTestCase):
             / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
         ).read_text()
         self.assertIn("build_tree_draft_block_tables", src)
+        self.assertIn("normalize_tree_draft_kv_lens", src)
         self.assertIn("max(int(max_bs), int(max_num_tokens))", src)
         self.assertIn("_tree_draft_table_rows(bs, num_tokens)", src)
         self.assertIn("draft_topk=topk", src)
         self.assertIn("draft_num_steps=speculative_num_steps", src)
+        self.assertIn("metadata.block_tables.fill_(0)", src)
+        self.assertIn("tables.shape[0] > dest.shape[0]", src)
+        self.assertNotIn("n_rows = min(tables.shape[0], dest.shape[0])", src)
+        self.assertIn("is_tree_draft = self._is_tree_draft(forward_batch)", src)
+        graph_src = (
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
+        ).read_text()
+        self.assertIn("normalize_tree_draft_kv_lens", graph_src)
+
+    def test_npu_tree_draft_fia_alignment_source_guards(self):
+        src = (
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+        ).read_text()
+        self.assertIn("query = q.reshape(", src)
+        self.assertIn("-1, 1, layer.tp_q_head_num, layer.qk_head_dim", src)
+        self.assertIn("context_lens=context_lens", src)
 
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
         eagle_src = (

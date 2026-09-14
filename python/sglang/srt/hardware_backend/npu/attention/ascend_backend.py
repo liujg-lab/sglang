@@ -28,6 +28,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     build_tree_draft_block_tables,
     expand_seq_lens_for_spec_topk,
+    normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_mask import custom_mask_to_ascend_masked
 from sglang.srt.utils import get_bool_env_var
@@ -368,6 +369,18 @@ class AscendAttnBackend(AttentionBackend):
             int(s) + num_draft for s in seq_lens.tolist()
         ]
 
+    def _is_tree_draft(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.draft_topk > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        )
+
+    def _tree_draft_kv_lens(self, seq_lens, num_q: int):
+        if self.draft_topk > 1:
+            return normalize_tree_draft_kv_lens(seq_lens, num_q, self.draft_topk)
+        return expand_seq_lens_for_spec_topk(seq_lens, num_q)
+
     def _tree_draft_table_rows(self, num_seqs: int, num_tokens: Optional[int] = None) -> int:
         if self.draft_topk > 1:
             if num_tokens is not None:
@@ -407,8 +420,13 @@ class AscendAttnBackend(AttentionBackend):
             max_pages=dest.shape[1],
             index_mapping=index_mapping,
         )
-        n_rows = min(tables.shape[0], dest.shape[0])
-        dest[:n_rows].copy_(tables[:n_rows])
+        if tables.shape[0] > dest.shape[0]:
+            raise RuntimeError(
+                "tree draft block_tables need "
+                f"{tables.shape[0]} rows, graph buffer has {dest.shape[0]}"
+            )
+        n_rows = tables.shape[0]
+        dest[:n_rows].copy_(tables)
         dest[n_rows:].fill_(0)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -575,6 +593,8 @@ class AscendAttnBackend(AttentionBackend):
 
         table_rows = self._tree_draft_table_rows(bs, num_tokens)
         metadata.block_tables = self.graph_metadata["block_tables"][:table_rows, :]
+        if self.draft_topk > 1:
+            metadata.block_tables.fill_(0)
         if self.is_dllm_model:
             max_len = int(seq_lens[:bs].max().item())
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
@@ -593,9 +613,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][
                 :table_rows, :
             ]
+            if self.draft_topk > 1:
+                metadata.block_tables_swa.fill_(0)
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         if num_tokens > bs:
-            metadata.seq_lens_cpu_list = expand_seq_lens_for_spec_topk(
+            metadata.seq_lens_cpu_list = self._tree_draft_kv_lens(
                 metadata.seq_lens_cpu_list, num_tokens
             )
         metadata.seq_lens = seq_lens
@@ -1834,9 +1856,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             num_tokens = query.shape[0]
-            actual_seq_len_kv = expand_seq_lens_for_spec_topk(
-                actual_seq_len_kv, num_tokens
-            )
+            actual_seq_len_kv = self._tree_draft_kv_lens(actual_seq_len_kv, num_tokens)
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
@@ -2043,13 +2063,23 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q.view(
+                is_tree_draft = self._is_tree_draft(forward_batch)
+                if is_tree_draft:
+                    query = q.reshape(
+                        -1, 1, layer.tp_q_head_num, layer.qk_head_dim
+                    )
+                    actual_seq_len_kv = normalize_tree_draft_kv_lens(
+                        actual_seq_len_kv, query.shape[0], self.draft_topk
+                    )
+                else:
+                    query = q.view(
                         forward_batch.batch_size,
                         -1,
                         layer.tp_q_head_num,
                         layer.qk_head_dim,
-                    ),
+                    )
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    query,
                     k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
                     ),
@@ -2077,6 +2107,18 @@ class AscendAttnBackend(AttentionBackend):
                         device=query.device,
                     )
 
+                    context_lens = self.forward_metadata.seq_lens_cpu_int
+                    if self._is_tree_draft(forward_batch):
+                        kv_lens = normalize_tree_draft_kv_lens(
+                            context_lens.cpu().int().tolist(),
+                            num_tokens,
+                            self.draft_topk,
+                        )
+                        context_lens = torch.tensor(
+                            kv_lens,
+                            dtype=torch.int32,
+                            device=context_lens.device,
+                        )
                     torch_npu._npu_paged_attention(
                         query=query,
                         key_cache=k_cache,
@@ -2085,7 +2127,7 @@ class AscendAttnBackend(AttentionBackend):
                         num_kv_heads=layer.tp_k_head_num,
                         scale_value=layer.scaling,
                         block_table=self.forward_metadata.block_tables,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        context_lens=context_lens,
                         out=attn_output,
                     )
                 else:
