@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
@@ -120,7 +121,15 @@ def normalize_tree_draft_kv_lens(seq_lens, num_q: int, topk: int):
 
 
 class NpuGraphPreparationError(RuntimeError):
-    """Raised before NPU graph.replay(); callers may disable the graph and fall back to eager."""
+    """Raised before NPU graph.replay(); callers may disable the graph and fall back to eager.
+
+    ``scope="format"``: dispatch-record API/fields unreadable (disable all tree graphs).
+    ``scope="graph"``: this captured graph or this request's KV lengths are invalid.
+    """
+
+    def __init__(self, message, scope="graph"):
+        super().__init__(message)
+        self.scope = scope
 
 
 class NpuGraphReplaySubmittedError(RuntimeError):
@@ -133,6 +142,8 @@ TREE_DRAFT_FIA_OP_NAMES = frozenset(
         "npu_fused_infer_attention_score.out",
     }
 )
+
+_dumped_unreadable_dispatch_record = False
 
 
 def build_draft_graph_step_kv_lens(prefix_lens, capture_bs, topk, step_id):
@@ -176,9 +187,26 @@ def expand_fia_cpu_update_inputs(step_lens_list, num_layers, attr_name):
     ]
 
 
+def normalize_fia_op_name(name):
+    """Strip ``npu::`` and ``.default``; keep ``.out``."""
+    if name is None:
+        return None
+    text = str(name).strip()
+    if not text:
+        return None
+    if "::" in text:
+        text = text.split("::", 1)[1]
+    if text.endswith(".default"):
+        text = text[: -len(".default")]
+    return text
+
+
 def _structured_op_name(obj):
     if obj is None:
         return None
+    dunder = getattr(obj, "__name__", None)
+    if isinstance(dunder, str) and dunder:
+        return dunder
     for key in ("op_name", "name", "op"):
         val = getattr(obj, key, None)
         if isinstance(val, str) and val:
@@ -193,45 +221,104 @@ def _structured_op_name(obj):
 def _structured_kwargs(obj):
     if obj is None:
         return None
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return obj
     kwargs = getattr(obj, "kwargs", None)
-    if isinstance(kwargs, dict):
+    if isinstance(kwargs, Mapping):
         return kwargs
     update_info = getattr(obj, "update_info", None)
-    if isinstance(update_info, dict):
+    if isinstance(update_info, Mapping):
         return update_info
     return None
 
 
+def _schema_has_kv_attr(obj, kv_attr):
+    if obj is None:
+        return False
+    schema = getattr(obj, "_schema", None)
+    if schema is None:
+        return False
+    if isinstance(schema, str):
+        return kv_attr in schema
+    if isinstance(schema, (list, tuple)):
+        return kv_attr in {str(x) for x in schema}
+    arguments = getattr(schema, "arguments", None)
+    if arguments is not None:
+        names = []
+        for arg in arguments:
+            name = getattr(arg, "name", None)
+            names.append(str(name if name is not None else arg))
+        return kv_attr in names
+    return False
+
+
+def _dump_unreadable_dispatch_record(rec):
+    global _dumped_unreadable_dispatch_record
+    if _dumped_unreadable_dispatch_record:
+        return
+    _dumped_unreadable_dispatch_record = True
+    entry = getattr(rec, "op_cache_entry", None)
+    logger.warning(
+        "Unreadable NPU graph dispatch record: type=%s dir=%s "
+        "entry_type=%s entry.__name__=%s",
+        type(rec),
+        dir(rec),
+        type(entry),
+        getattr(entry, "__name__", None) if entry is not None else None,
+    )
+
+
 def inspect_dispatch_record(rec, kv_attr):
-    """Return ``(op_name, has_kv_attr)`` from structured record fields only.
+    """Return ``(normalized_op_name, has_kv_attr)`` from structured fields only.
 
     Never uses ``str(rec)``. Unreadable records raise
-    ``NpuGraphPreparationError`` so the tree graph can be disabled.
+    ``NpuGraphPreparationError(scope="format")``.
     """
     if rec is None:
         raise NpuGraphPreparationError(
-            "NPU graph dispatch record is None; disable tree graph"
+            "NPU graph dispatch record is None; disable tree graph",
+            scope="format",
         )
     entry = getattr(rec, "op_cache_entry", None)
-    op_name = _structured_op_name(entry) or _structured_op_name(rec)
+    raw_name = _structured_op_name(entry) or _structured_op_name(rec)
     kwargs = _structured_kwargs(entry) or _structured_kwargs(rec)
-    if op_name is None or kwargs is None:
+    if raw_name is None:
+        _dump_unreadable_dispatch_record(rec)
         raise NpuGraphPreparationError(
-            "NPU graph dispatch record lacks structured op/kwargs; disable tree graph"
+            "NPU graph dispatch record missing structured op name "
+            "(__name__/op_name); disable tree graph",
+            scope="format",
         )
-    return op_name, kv_attr in kwargs
+    if kwargs is None and not (
+        _schema_has_kv_attr(entry, kv_attr) or _schema_has_kv_attr(rec, kv_attr)
+    ):
+        _dump_unreadable_dispatch_record(rec)
+        raise NpuGraphPreparationError(
+            "NPU graph dispatch record missing structured kwargs/_schema; "
+            "disable tree graph",
+            scope="format",
+        )
+    op_name = normalize_fia_op_name(raw_name)
+    has_kv = False
+    if kwargs is not None:
+        has_kv = kv_attr in kwargs
+    if not has_kv:
+        has_kv = _schema_has_kv_attr(entry, kv_attr) or _schema_has_kv_attr(
+            rec, kv_attr
+        )
+    return op_name, has_kv
 
 
 def validate_tree_draft_fia_records(records, n_steps, num_layers, kv_attr):
     """Require every captured record to be expected FIA with ``kv_attr``.
 
     Mixed ops or a missing record API refuse replay; do not filter a subset.
+    Returns ``(n_records, step_ids)`` with step-major ``step_ids[i] = i // L``.
     """
     if records is None:
         raise NpuGraphPreparationError(
-            "NPU graph dispatch records unavailable; disable tree graph"
+            "NPU graph dispatch records unavailable; disable tree graph",
+            scope="format",
         )
     n_steps = int(n_steps)
     num_layers = int(num_layers)
@@ -240,21 +327,25 @@ def validate_tree_draft_fia_records(records, n_steps, num_layers, kv_attr):
     if n_records != expected:
         raise NpuGraphPreparationError(
             f"FIA records={n_records} != steps*num_layers="
-            f"{n_steps}*{num_layers}={expected}; disable tree graph"
+            f"{n_steps}*{num_layers}={expected}; disable tree graph",
+            scope="graph",
         )
     for i, rec in enumerate(records):
         op_name, has_kv = inspect_dispatch_record(rec, kv_attr)
         if op_name not in TREE_DRAFT_FIA_OP_NAMES:
             raise NpuGraphPreparationError(
                 f"dispatch record[{i}] op={op_name!r} is not expected FIA; "
-                "disable tree graph"
+                "disable tree graph",
+                scope="graph",
             )
         if not has_kv:
             raise NpuGraphPreparationError(
                 f"dispatch record[{i}] op={op_name!r} missing {kv_attr}; "
-                "disable tree graph"
+                "disable tree graph",
+                scope="graph",
             )
-    return n_records
+    step_ids = [i // num_layers for i in range(n_records)] if num_layers else []
+    return n_records, step_ids
 
 
 def validate_draft_graph_step_kv_lens(
@@ -300,7 +391,8 @@ def resolve_fia_update_count(n_records, n_steps, num_layers):
     """
     if n_records is None:
         raise NpuGraphPreparationError(
-            "FIA record count unavailable; disable tree graph"
+            "FIA record count unavailable; disable tree graph",
+            scope="format",
         )
     n_steps = int(n_steps)
     num_layers = int(num_layers)

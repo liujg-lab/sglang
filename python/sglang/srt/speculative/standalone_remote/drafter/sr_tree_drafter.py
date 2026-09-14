@@ -120,6 +120,19 @@ class SRTreeDrafter:
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
             logger.info("[SR] Capture tree draft graph begin (backend=%s).", backend)
             self.cuda_graph_runner = runner_cls(self)
+            reason = getattr(
+                self.cuda_graph_runner, "tree_graph_disabled_reason", None
+            )
+            graphs = getattr(self.cuda_graph_runner, "graphs", None)
+            if reason or not graphs:
+                logger.warning(
+                    "[SR] tree draft graphs disabled after capture: %s "
+                    "(tree_graph_replay_count=%s tree_eager_fallback_count=%s)",
+                    reason or "no graphs",
+                    getattr(self.cuda_graph_runner, "tree_graph_replay_count", 0),
+                    getattr(self.cuda_graph_runner, "tree_eager_fallback_count", 0),
+                )
+                self.cuda_graph_runner = None
             logger.info("[SR] Capture tree draft graph end.")
         except Exception as e:
             logger.warning("[SR] tree draft graph capture failed: %s", e)
@@ -268,7 +281,14 @@ class SRTreeDrafter:
                         "falling back to eager",
                         e,
                     )
-                    self.cuda_graph_runner = None
+                    if getattr(e, "scope", "graph") == "format":
+                        self.cuda_graph_runner = None
+                    else:
+                        runner = self.cuda_graph_runner
+                        if runner is not None:
+                            runner.tree_eager_fallback_count = (
+                                getattr(runner, "tree_eager_fallback_count", 0) + 1
+                            )
                     can_cuda_graph = False
             if not can_cuda_graph:
                 if (

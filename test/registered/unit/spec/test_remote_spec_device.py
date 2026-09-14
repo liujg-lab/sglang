@@ -2,6 +2,7 @@
 
 import ast
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -111,9 +112,12 @@ def _load_tree_draft_helpers():
         "inspect_dispatch_record",
         "validate_tree_draft_fia_records",
         "validate_draft_graph_step_kv_lens",
+        "normalize_fia_op_name",
+        "_schema_has_kv_attr",
+        "_dump_unreadable_dispatch_record",
     }
     class_names = {"NpuGraphReplaySubmittedError", "NpuGraphPreparationError"}
-    assign_names = {"TREE_DRAFT_FIA_OP_NAMES"}
+    assign_names = {"TREE_DRAFT_FIA_OP_NAMES", "_dumped_unreadable_dispatch_record"}
     try:
         from sglang.srt.speculative.spec_utils import (
             NpuGraphPreparationError,
@@ -124,6 +128,7 @@ def _load_tree_draft_helpers():
             expand_fia_cpu_update_inputs,
             expand_seq_lens_for_spec_topk,
             inspect_dispatch_record,
+            normalize_fia_op_name,
             normalize_tree_draft_kv_lens,
             resolve_fia_update_count,
             validate_draft_graph_step_kv_lens,
@@ -140,6 +145,7 @@ def _load_tree_draft_helpers():
             inspect_dispatch_record=inspect_dispatch_record,
             validate_tree_draft_fia_records=validate_tree_draft_fia_records,
             validate_draft_graph_step_kv_lens=validate_draft_graph_step_kv_lens,
+            normalize_fia_op_name=normalize_fia_op_name,
             NpuGraphReplaySubmittedError=NpuGraphReplaySubmittedError,
             NpuGraphPreparationError=NpuGraphPreparationError,
             TREE_DRAFT_FIA_OP_NAMES=TREE_DRAFT_FIA_OP_NAMES,
@@ -161,7 +167,7 @@ def _load_tree_draft_helpers():
                 keep.append(node)
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
-    ns = {"torch": torch, "Optional": Optional}
+    ns = {"torch": torch, "Optional": Optional, "Mapping": __import__("collections.abc", fromlist=["Mapping"]).Mapping, "logging": __import__("logging"), "logger": __import__("logging").getLogger("tree_draft_helpers")}
     exec(compile(mod, str(src_path), "exec"), ns)
     return SimpleNamespace(
         build_tree_draft_block_tables=ns["build_tree_draft_block_tables"],
@@ -173,6 +179,7 @@ def _load_tree_draft_helpers():
         inspect_dispatch_record=ns["inspect_dispatch_record"],
         validate_tree_draft_fia_records=ns["validate_tree_draft_fia_records"],
         validate_draft_graph_step_kv_lens=ns["validate_draft_graph_step_kv_lens"],
+        normalize_fia_op_name=ns["normalize_fia_op_name"],
         NpuGraphReplaySubmittedError=ns["NpuGraphReplaySubmittedError"],
         NpuGraphPreparationError=ns["NpuGraphPreparationError"],
         TREE_DRAFT_FIA_OP_NAMES=ns["TREE_DRAFT_FIA_OP_NAMES"],
@@ -453,10 +460,11 @@ class TestRemoteSpecDevice(CustomTestCase):
         validate = helpers.validate_tree_draft_fia_records
         n_steps, num_layers = 4, 3
         records = [self._fia_rec() for _ in range(n_steps * num_layers)]
-        self.assertEqual(
-            validate(records, n_steps, num_layers, "actual_seq_lengths_kv"),
-            n_steps * num_layers,
+        n_records, step_ids = validate(
+            records, n_steps, num_layers, "actual_seq_lengths_kv"
         )
+        self.assertEqual(n_records, n_steps * num_layers)
+        self.assertEqual(step_ids, [i // num_layers for i in range(n_records)])
         expanded = helpers.expand_fia_cpu_update_inputs(
             [[129] * 3, [130] * 3, [131] * 3, [132] * 3],
             num_layers,
@@ -478,18 +486,93 @@ class TestRemoteSpecDevice(CustomTestCase):
         Prep = helpers.NpuGraphPreparationError
         records = [self._fia_rec() for _ in range(11)]
         records.insert(3, self._fia_rec(op="npu_rms_norm"))
-        with self.assertRaises(Prep):
+        with self.assertRaises(Prep) as ctx:
             validate(records, 4, 3, "actual_seq_lengths_kv")
+        self.assertEqual(ctx.exception.scope, "graph")
+
+    def test_normalize_fia_op_name(self):
+        normalize = _load_tree_draft_helpers().normalize_fia_op_name
+        self.assertEqual(
+            normalize("npu::npu_fused_infer_attention_score.default"),
+            "npu_fused_infer_attention_score",
+        )
+        self.assertEqual(
+            normalize("npu::npu_fused_infer_attention_score.out"),
+            "npu_fused_infer_attention_score.out",
+        )
+        self.assertEqual(
+            normalize("npu_fused_infer_attention_score"),
+            "npu_fused_infer_attention_score",
+        )
+
+    def test_validate_tree_draft_fia_records_torchnpu_name(self):
+        helpers = _load_tree_draft_helpers()
+        validate = helpers.validate_tree_draft_fia_records
+        n_steps, num_layers = 2, 2
+
+        class KwargsMap(Mapping):
+            def __init__(self, data):
+                self._data = data
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        entry = SimpleNamespace(
+            **{
+                "__name__": "npu::npu_fused_infer_attention_score.default",
+            }
+        )
+        rec = SimpleNamespace(
+            op_cache_entry=entry,
+            kwargs=KwargsMap({"actual_seq_lengths_kv": [1]}),
+        )
+        n_records, step_ids = validate(
+            [rec, rec, rec, rec], n_steps, num_layers, "actual_seq_lengths_kv"
+        )
+        self.assertEqual(n_records, 4)
+        self.assertEqual(step_ids, [0, 0, 1, 1])
+
+        out_entry = SimpleNamespace(
+            **{"__name__": "npu::npu_fused_infer_attention_score.out"}
+        )
+        out_rec = SimpleNamespace(
+            op_cache_entry=out_entry,
+            kwargs={"actual_seq_lengths_kv": [1]},
+        )
+        n_records, _ = validate(
+            [out_rec] * 4, n_steps, num_layers, "actual_seq_lengths_kv"
+        )
+        self.assertEqual(n_records, 4)
+
+        schema_entry = SimpleNamespace(
+            **{
+                "__name__": "npu::npu_fused_infer_attention_score.default",
+                "_schema": "actual_seq_lengths_kv: List[int]",
+            }
+        )
+        schema_rec = SimpleNamespace(op_cache_entry=schema_entry)
+        n_records, _ = validate(
+            [schema_rec] * 4, n_steps, num_layers, "actual_seq_lengths_kv"
+        )
+        self.assertEqual(n_records, 4)
 
     def test_validate_tree_draft_fia_records_missing_api(self):
         helpers = _load_tree_draft_helpers()
         validate = helpers.validate_tree_draft_fia_records
         Prep = helpers.NpuGraphPreparationError
-        with self.assertRaises(Prep):
+        with self.assertRaises(Prep) as ctx:
             validate(None, 4, 28, "actual_seq_lengths_kv")
-        with self.assertRaises(Prep):
+        self.assertEqual(ctx.exception.scope, "format")
+        with self.assertRaises(Prep) as ctx:
             inspect = helpers.inspect_dispatch_record
             inspect(SimpleNamespace(value="actual_seq_lengths_kv"), "actual_seq_lengths_kv")
+        self.assertEqual(ctx.exception.scope, "format")
 
     def test_validate_draft_graph_step_kv_lens_padding(self):
         helpers = _load_tree_draft_helpers()
@@ -774,8 +857,14 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("NpuGraphReplaySubmittedError", graph_src)
         self.assertIn("NpuGraphPreparationError", graph_src)
         self.assertIn("seq_lens_cpu[: self.raw_bs]", graph_src)
-        self.assertIn("_logged_tree_fia_update_bs", graph_src)
+        self.assertIn("_tree_fia_maps", graph_src)
+        self.assertIn("tree_graph_disabled_reason", graph_src)
+        self.assertIn("tree_graph_replay_count", graph_src)
         self.assertNotIn("normalize_tree_draft_kv_lens", graph_src)
+        spec_src = (_REPO / "python/sglang/srt/speculative/spec_utils.py").read_text()
+        self.assertIn("normalize_fia_op_name", spec_src)
+        self.assertIn('getattr(obj, "__name__", None)', spec_src)
+        self.assertIn("scope=\"format\"", spec_src)
         self.assertNotIn("count_fia_kv_len_records", graph_src)
         self.assertNotIn("if attr_name in str(rec)", graph_src)
         drafter_src = (
@@ -789,6 +878,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("falling back to eager", drafter_src)
         self.assertIn("graph_submitted", drafter_src)
         self.assertIn("except NpuGraphPreparationError as e:", drafter_src)
+        self.assertIn('getattr(e, "scope", "graph") == "format"', drafter_src)
+        self.assertIn("tree_eager_fallback_count", drafter_src)
+        self.assertIn("tree draft graphs disabled after capture", drafter_src)
         mixin_src = (
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
