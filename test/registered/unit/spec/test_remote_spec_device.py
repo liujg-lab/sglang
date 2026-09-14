@@ -215,6 +215,91 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(expand_seq_lens_for_spec_topk([10, 20], 2), [10, 20])
         self.assertEqual(expand_seq_lens_for_spec_topk([7], 4), [7])
 
+    def test_build_tree_draft_block_tables_aligned(self):
+        try:
+            from sglang.srt.speculative.spec_utils import (
+                build_tree_draft_block_tables,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+
+        page_size = 4
+        req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
+        tables = build_tree_draft_block_tables(
+            req_to_token,
+            torch.tensor([0]),
+            torch.tensor([8]),
+            page_size=page_size,
+            topk=2,
+            step_id=0,
+            num_steps=5,
+        )
+        self.assertEqual(tables.shape[0], 2)
+        self.assertTrue(torch.equal(tables[0, :-1], tables[1, :-1]))
+        self.assertEqual(int(tables[0, -1]), 8 // page_size)
+        self.assertEqual(int(tables[1, -1]), 16 // page_size)
+
+    def test_build_tree_draft_block_tables_unaligned(self):
+        try:
+            from sglang.srt.speculative.spec_utils import (
+                build_tree_draft_block_tables,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+
+        page_size = 4
+        req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
+        tables = build_tree_draft_block_tables(
+            req_to_token,
+            torch.tensor([0]),
+            torch.tensor([5]),
+            page_size=page_size,
+            topk=2,
+            step_id=0,
+            num_steps=5,
+        )
+        self.assertEqual(tables.shape[0], 2)
+        self.assertEqual(int(tables[0, 0]), int(tables[1, 0]))
+        self.assertEqual(int(tables[0, 1]), 4 // page_size)
+        self.assertEqual(int(tables[1, 1]), 12 // page_size)
+
+    def test_build_tree_draft_block_tables_topk1(self):
+        try:
+            from sglang.srt.speculative.spec_utils import (
+                build_tree_draft_block_tables,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+
+        page_size = 4
+        seq_len = 8
+        step_id = 0
+        kv_len = seq_len + step_id + 1
+        req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
+        naive = req_to_token[:, :kv_len:page_size] // page_size
+        tables = build_tree_draft_block_tables(
+            req_to_token,
+            torch.tensor([0]),
+            torch.tensor([seq_len]),
+            page_size=page_size,
+            topk=1,
+            step_id=step_id,
+            num_steps=5,
+        )
+        self.assertEqual(tuple(tables.shape), (1, int(naive.shape[1])))
+        self.assertTrue(torch.equal(tables, naive.to(torch.int32)))
+
+    def test_npu_tree_draft_block_tables_source_guards(self):
+        src = (
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+        ).read_text()
+        self.assertIn("build_tree_draft_block_tables", src)
+        self.assertIn("max(int(max_bs), int(max_num_tokens))", src)
+        self.assertIn("_tree_draft_table_rows(bs, num_tokens)", src)
+        self.assertIn("draft_topk=topk", src)
+        self.assertIn("draft_num_steps=speculative_num_steps", src)
+
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
         eagle_src = (
             _REPO / "python/sglang/srt/speculative/eagle_info.py"

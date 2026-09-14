@@ -25,7 +25,10 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.speculative.spec_utils import expand_seq_lens_for_spec_topk
+from sglang.srt.speculative.spec_utils import (
+    build_tree_draft_block_tables,
+    expand_seq_lens_for_spec_topk,
+)
 from sglang.srt.speculative.tree_attn_mask import custom_mask_to_ascend_masked
 from sglang.srt.utils import get_bool_env_var
 
@@ -215,11 +218,19 @@ class AscendAttnMaskBuilder:
 
 class AscendAttnBackend(AttentionBackend):
 
-    def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        speculative_step_id: int = 0,
+        draft_topk: int = 1,
+        draft_num_steps: int = 0,
+    ):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
+        self.draft_topk = max(int(draft_topk), 1)
+        self.draft_num_steps = max(int(draft_num_steps), 0)
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
         )
@@ -357,6 +368,49 @@ class AscendAttnBackend(AttentionBackend):
             int(s) + num_draft for s in seq_lens.tolist()
         ]
 
+    def _tree_draft_table_rows(self, num_seqs: int, num_tokens: Optional[int] = None) -> int:
+        if self.draft_topk > 1:
+            if num_tokens is not None:
+                return max(int(num_seqs), int(num_tokens))
+            return int(num_seqs) * self.draft_topk
+        return int(num_seqs)
+
+    def _build_tree_draft_block_tables(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_pages: Optional[int] = None,
+        index_mapping: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return build_tree_draft_block_tables(
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_size=self.page_size,
+            topk=self.draft_topk,
+            step_id=self.speculative_step_id,
+            num_steps=self.draft_num_steps,
+            max_pages=max_pages,
+            index_mapping=index_mapping,
+        )
+
+    def _copy_tree_draft_block_tables(
+        self,
+        dest: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        index_mapping: Optional[torch.Tensor] = None,
+    ) -> None:
+        tables = self._build_tree_draft_block_tables(
+            req_pool_indices,
+            seq_lens,
+            max_pages=dest.shape[1],
+            index_mapping=index_mapping,
+        )
+        n_rows = min(tables.shape[0], dest.shape[0])
+        dest[:n_rows].copy_(tables[:n_rows])
+        dest[n_rows:].fill_(0)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -368,25 +422,47 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             seq_lens_max += self.speculative_step_id + 1
-        self.forward_metadata.block_tables = (
-            forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
+        use_tree_draft_tables = (
+            self.draft_topk > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
         )
-        if self.is_hybrid_swa:
-            self.forward_metadata.block_tables_swa = (
-                (
-                    self.full_to_swa_index_mapping[
-                        forward_batch.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
-                    // self.page_size
-                )
-                .to(torch.int32)
-                .contiguous()
+        if use_tree_draft_tables:
+            self.forward_metadata.block_tables = self._build_tree_draft_block_tables(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
             )
+        else:
+            self.forward_metadata.block_tables = (
+                forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
+            )
+        if self.is_hybrid_swa:
+            if use_tree_draft_tables:
+                self.forward_metadata.block_tables_swa = (
+                    self._build_tree_draft_block_tables(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        index_mapping=self.full_to_swa_index_mapping,
+                    )
+                    .to(torch.int32)
+                    .contiguous()
+                )
+            else:
+                self.forward_metadata.block_tables_swa = (
+                    (
+                        self.full_to_swa_index_mapping[
+                            forward_batch.req_to_token_pool.req_to_token[
+                                forward_batch.req_pool_indices, :seq_lens_max
+                            ]
+                        ][:, :: self.page_size]
+                        // self.page_size
+                    )
+                    .to(torch.int32)
+                    .contiguous()
+                )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -448,9 +524,17 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        table_bs = (
+            max(int(max_bs), int(max_num_tokens))
+            if self.draft_topk > 1
+            else int(max_bs)
+        )
         self.graph_metadata = {
             "block_tables": torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (
+                    table_bs,
+                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                ),
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -469,7 +553,10 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (
+                    table_bs,
+                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -486,7 +573,8 @@ class AscendAttnBackend(AttentionBackend):
     ):
         metadata = ForwardMetadata()
 
-        metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        table_rows = self._tree_draft_table_rows(bs, num_tokens)
+        metadata.block_tables = self.graph_metadata["block_tables"][:table_rows, :]
         if self.is_dllm_model:
             max_len = int(seq_lens[:bs].max().item())
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
@@ -502,7 +590,9 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[bs:, :].fill_(0)
 
         if self.is_hybrid_swa:
-            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][
+                :table_rows, :
+            ]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         if num_tokens > bs:
             metadata.seq_lens_cpu_list = expand_seq_lens_for_spec_topk(
@@ -592,23 +682,38 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        replay_seq_lens = seq_lens_cpu[:bs] if seq_lens_cpu is not None else seq_lens[:bs]
 
-        if self.is_hybrid_swa:
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
-                self.full_to_swa_index_mapping[
-                    self.req_to_token[req_pool_indices[:bs], :max_len]
-                ][:, :: self.page_size]
+        if self.draft_topk > 1 and forward_mode.is_decode_or_idle() and spec_info is not None:
+            if self.is_hybrid_swa:
+                self._copy_tree_draft_block_tables(
+                    metadata.block_tables_swa,
+                    req_pool_indices[:bs],
+                    replay_seq_lens,
+                    index_mapping=self.full_to_swa_index_mapping,
+                )
+            self._copy_tree_draft_block_tables(
+                metadata.block_tables,
+                req_pool_indices[:bs],
+                replay_seq_lens,
+            )
+        else:
+            if self.is_hybrid_swa:
+                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
+                    self.full_to_swa_index_mapping[
+                        self.req_to_token[req_pool_indices[:bs], :max_len]
+                    ][:, :: self.page_size]
+                    // self.page_size
+                )
+                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+                metadata.block_tables_swa[bs:, :].fill_(0)
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
                 // self.page_size
             )
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
-            // self.page_size
-        )
 
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
 
         orig_seq_lens = seq_lens[:bs]
         if forward_mode.is_target_verify():
@@ -2184,7 +2289,12 @@ class AscendAttnMultiStepDraftBackend:
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                AscendAttnBackend(
+                    model_runner,
+                    speculative_step_id=step_id,
+                    draft_topk=topk,
+                    draft_num_steps=speculative_num_steps,
+                )
             )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):

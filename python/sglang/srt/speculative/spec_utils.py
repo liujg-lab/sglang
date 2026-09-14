@@ -92,6 +92,106 @@ def expand_seq_lens_for_spec_topk(seq_lens, num_tokens: int):
     return values
 
 
+def build_tree_draft_block_tables(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    topk: int,
+    step_id: int,
+    num_steps: int,
+    max_pages: Optional[int] = None,
+    index_mapping: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build FIA block tables with one row per (seq, topk) draft branch.
+
+    Tree draft Q is ``bs * topk``. Each branch shares prefix pages, then has
+    its own last/new pages in ``req_to_token`` (see ``assign_draft_cache_locs``
+    and ``generate_draft_decode_kv_indices``). KV length per row is
+    ``seq_len + step_id + 1``.
+
+    ``index_mapping``, if set, is applied to gathered token ids before
+    converting them to page ids (hybrid SWA).
+    """
+    device = req_to_token.device
+    bs = int(req_pool_indices.shape[0])
+    page_size = int(page_size)
+    topk = max(int(topk), 1)
+    step_id = int(step_id)
+    num_steps = max(int(num_steps), 0)
+    kv_extra = step_id + 1
+    ctx_len = int(req_to_token.shape[1]) if req_to_token.ndim >= 2 else 0
+
+    if bs == 0:
+        n_cols = 0 if max_pages is None else int(max_pages)
+        return torch.zeros((0, n_cols), dtype=torch.int32, device=device)
+
+    pool_idx = req_pool_indices[:bs].to(device=device, dtype=torch.int64)
+    seq = seq_lens[:bs].to(device=device, dtype=torch.int64)
+    kv_len = seq + kv_extra
+    n_pages = (kv_len + page_size - 1) // page_size
+    n_cols = int(n_pages.max().item()) if kv_len.numel() else 0
+    if max_pages is not None:
+        n_cols = int(max_pages)
+    if n_cols <= 0:
+        return torch.zeros((bs * topk, 0), dtype=torch.int32, device=device)
+
+    page_idx = torch.arange(n_cols, device=device, dtype=torch.int64)
+
+    if topk == 1:
+        token_pos = page_idx.view(1, n_cols) * page_size
+        valid = token_pos < kv_len.view(bs, 1)
+        token_pos = token_pos.expand(bs, n_cols)
+        gather_idx = pool_idx.view(bs, 1).expand(bs, n_cols)
+    elif page_size == 1:
+        page_idx_3d = page_idx.view(1, 1, n_cols)
+        seq_3d = seq.view(bs, 1, 1)
+        k_ids = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk, 1)
+        token_pos = torch.where(
+            page_idx_3d < seq_3d,
+            page_idx_3d,
+            seq_3d + k_ids * num_steps + (page_idx_3d - seq_3d),
+        )
+        valid = page_idx_3d < kv_len.view(bs, 1, 1)
+        gather_idx = pool_idx.view(bs, 1, 1).expand(bs, topk, n_cols)
+        token_pos = token_pos.expand(bs, topk, n_cols)
+    else:
+        last_page_len = seq % page_size
+        prefix_base = seq - last_page_len
+        num_new_pages = (last_page_len + num_steps + page_size - 1) // page_size
+        n_shared = prefix_base // page_size
+        page_idx_3d = page_idx.view(1, 1, n_cols)
+        k_ids = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk, 1)
+        token_pos_shared = page_idx_3d * page_size
+        branch_page = page_idx_3d - n_shared.view(bs, 1, 1)
+        token_pos_branch = (
+            prefix_base.view(bs, 1, 1)
+            + k_ids * num_new_pages.view(bs, 1, 1) * page_size
+            + branch_page * page_size
+        )
+        token_pos = torch.where(
+            page_idx_3d < n_shared.view(bs, 1, 1),
+            token_pos_shared,
+            token_pos_branch,
+        )
+        valid = page_idx_3d < n_pages.view(bs, 1, 1)
+        gather_idx = pool_idx.view(bs, 1, 1).expand(bs, topk, n_cols)
+
+    if ctx_len <= 0:
+        pages = torch.zeros(gather_idx.shape, dtype=torch.int32, device=device)
+    else:
+        token_pos_clamped = token_pos.clamp(min=0, max=ctx_len - 1)
+        token_ids = req_to_token[gather_idx, token_pos_clamped]
+        if index_mapping is not None:
+            token_ids = index_mapping.to(device=device)[token_ids]
+        pages = (token_ids // page_size).to(torch.int32)
+        pages = torch.where(valid, pages, torch.zeros_like(pages))
+
+    if pages.ndim == 2:
+        return pages
+    return pages.reshape(bs * topk, n_cols)
+
+
 def is_remote_spec_algorithm(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         try:
