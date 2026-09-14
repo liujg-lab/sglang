@@ -33,6 +33,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         enable_kv_cache_copy: bool = False,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        # Keep enable_kv_cache_copy in the signature (mixin still passes True
+        # for speculative decoding). NPU page-physical KV cannot use CUDA
+        # Triton tiled copy; tree last-page fork uses move_kv_cache() instead.
+        _ = enable_kv_cache_copy
         super().__init__(
             size=size,
             page_size=page_size,
@@ -45,8 +49,13 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
-            enable_kv_cache_copy=enable_kv_cache_copy,
+            enable_kv_cache_copy=False,
         )
+
+    def _init_kv_copy_and_warmup(self):
+        # Parent CUDA warmup reads data_strides from the token-major layout.
+        # NPU _create_buffers() never sets that field.
+        self._kv_copy_config = None
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):

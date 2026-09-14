@@ -176,6 +176,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("def move_kv_cache", npu_src)
         self.assertIn("tgt_page", npu_src)
         self.assertNotIn("copy_all_layer_kv_cache_tiled", npu_src)
+        self.assertIn("enable_kv_cache_copy=False", npu_src)
+        self.assertNotIn("enable_kv_cache_copy=enable_kv_cache_copy", npu_src)
+        self.assertIn("def _init_kv_copy_and_warmup", npu_src)
 
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
         eagle_src = (
