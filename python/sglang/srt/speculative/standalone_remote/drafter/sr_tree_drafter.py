@@ -273,6 +273,7 @@ class SRTreeDrafter:
         )
 
         num_seqs = batch.batch_size()
+        token_to_kv_pool_state_backup = None
         if self.page_size == 1:
             alloc_len = self.speculative_num_steps * self.topk
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
@@ -349,35 +350,44 @@ class SRTreeDrafter:
                 duplicate_cache_len = 0
                 source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
 
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
-            out_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
-        )
-        if self.page_size > 1 and self.topk > 1 and duplicate_cache_len > 0:
-            self.draft_model_runner.token_to_kv_pool.move_kv_cache(
-                target_cache_loc, source_cache_loc
+        try:
+            assign_draft_cache_locs[(num_seqs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                self.extend_lens,
+                self.num_new_pages_per_topk,
+                out_cache_loc,
+                source_cache_loc,
+                target_cache_loc,
+                last_page_lens_cumsum,
+                duplicate_cache_len,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+                next_power_of_2(num_seqs),
+                next_power_of_2(self.speculative_num_steps + self.page_size),
             )
-            out_cache_loc = out_cache_loc[
-                : num_seqs * self.topk * self.speculative_num_steps
-            ]
-        batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
-        batch.spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        return token_to_kv_pool_state_backup
+            if self.page_size > 1 and self.topk > 1 and duplicate_cache_len > 0:
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                    target_cache_loc, source_cache_loc
+                )
+                out_cache_loc = out_cache_loc[
+                    : num_seqs * self.topk * self.speculative_num_steps
+                ]
+            batch.out_cache_loc = out_cache_loc
+            batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+            batch.spec_info.positions = batch.seq_lens.repeat_interleave(
+                self.topk, dim=0
+            )
+            return token_to_kv_pool_state_backup
+        except Exception:
+            if token_to_kv_pool_state_backup is not None:
+                self.token_to_kv_pool_allocator.restore_state(
+                    token_to_kv_pool_state_backup
+                )
+            raise
 
     def _draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info

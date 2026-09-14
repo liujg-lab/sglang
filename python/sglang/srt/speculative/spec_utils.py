@@ -78,6 +78,20 @@ def device_backend_key(device) -> str:
     return text or tree_verify_backend()
 
 
+def expand_seq_lens_for_spec_topk(seq_lens, num_tokens: int):
+    """Repeat per-seq KV lengths so FIA batch dim matches Q tokens (bs * topk)."""
+    if seq_lens is None:
+        return seq_lens
+    values = list(seq_lens)
+    n = len(values)
+    if n == 0 or n == num_tokens or n == 1:
+        return values
+    if num_tokens > 0 and num_tokens % n == 0:
+        rpt = num_tokens // n
+        return [s for s in values for _ in range(rpt)]
+    return values
+
+
 def is_remote_spec_algorithm(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         try:
@@ -246,7 +260,7 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)

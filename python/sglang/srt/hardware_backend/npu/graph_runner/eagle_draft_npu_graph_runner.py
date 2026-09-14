@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
+from sglang.srt.speculative.spec_utils import expand_seq_lens_for_spec_topk
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -98,9 +99,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.update_attr_type = self._get_update_attr_type()
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             seq_lens_for_each_draft_step = []
+            num_tokens = self.bs * self.num_tokens_per_bs
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                seq_lens = expand_seq_lens_for_spec_topk(seq_lens, num_tokens)
                 seq_lens_for_each_draft_step.append(seq_lens)
             thread = threading.Thread(
                 target=self._replay_update, args=(seq_lens_for_each_draft_step,)

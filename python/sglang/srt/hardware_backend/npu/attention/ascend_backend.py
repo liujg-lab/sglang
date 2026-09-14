@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_utils import expand_seq_lens_for_spec_topk
 from sglang.srt.speculative.tree_attn_mask import custom_mask_to_ascend_masked
 from sglang.srt.utils import get_bool_env_var
 
@@ -503,6 +504,10 @@ class AscendAttnBackend(AttentionBackend):
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        if num_tokens > bs:
+            metadata.seq_lens_cpu_list = expand_seq_lens_for_spec_topk(
+                metadata.seq_lens_cpu_list, num_tokens
+            )
         metadata.seq_lens = seq_lens
         if (
             forward_mode.is_target_verify()
@@ -1724,6 +1729,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             num_tokens = query.shape[0]
+            actual_seq_len_kv = expand_seq_lens_for_spec_topk(
+                actual_seq_len_kv, num_tokens
+            )
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,

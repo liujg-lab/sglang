@@ -180,6 +180,41 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertNotIn("enable_kv_cache_copy=enable_kv_cache_copy", npu_src)
         self.assertIn("def _init_kv_copy_and_warmup", npu_src)
 
+    def test_npu_tree_draft_triton_and_kv_restore_source_guards(self):
+        spec_src = (
+            _REPO / "python/sglang/srt/speculative/spec_utils.py"
+        ).read_text()
+        self.assertNotIn(
+            "if page_size != 1 and topk != 1 and duplicate_cache_len > 0:",
+            spec_src,
+        )
+        self.assertIn(
+            "if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):",
+            spec_src,
+        )
+        drafter_src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        ).read_text()
+        self.assertIn("def _alloc_tree_kv", drafter_src)
+        self.assertIn("if token_to_kv_pool_state_backup is not None:", drafter_src)
+        self.assertIn("except Exception:", drafter_src)
+
+    def test_expand_seq_lens_for_spec_topk(self):
+        try:
+            from sglang.srt.speculative.spec_utils import (
+                expand_seq_lens_for_spec_topk,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+
+        self.assertEqual(
+            expand_seq_lens_for_spec_topk([10, 20], 6),
+            [10, 10, 10, 20, 20, 20],
+        )
+        self.assertEqual(expand_seq_lens_for_spec_topk([10, 20], 2), [10, 20])
+        self.assertEqual(expand_seq_lens_for_spec_topk([7], 4), [7])
+
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
         eagle_src = (
             _REPO / "python/sglang/srt/speculative/eagle_info.py"
