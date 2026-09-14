@@ -99,40 +99,57 @@ def _reference_tree_draft_block_tables(
 
 
 def _load_tree_draft_helpers():
+    helper_names = {
+        "expand_seq_lens_for_spec_topk",
+        "normalize_tree_draft_kv_lens",
+        "build_tree_draft_block_tables",
+        "build_draft_graph_step_kv_lens",
+        "expand_fia_cpu_update_inputs",
+        "resolve_fia_update_count",
+    }
+    class_names = {"NpuGraphReplaySubmittedError"}
     try:
         from sglang.srt.speculative.spec_utils import (
+            NpuGraphReplaySubmittedError,
+            build_draft_graph_step_kv_lens,
             build_tree_draft_block_tables,
+            expand_fia_cpu_update_inputs,
             expand_seq_lens_for_spec_topk,
             normalize_tree_draft_kv_lens,
+            resolve_fia_update_count,
         )
 
-        return (
-            build_tree_draft_block_tables,
-            expand_seq_lens_for_spec_topk,
-            normalize_tree_draft_kv_lens,
+        return SimpleNamespace(
+            build_tree_draft_block_tables=build_tree_draft_block_tables,
+            expand_seq_lens_for_spec_topk=expand_seq_lens_for_spec_topk,
+            normalize_tree_draft_kv_lens=normalize_tree_draft_kv_lens,
+            build_draft_graph_step_kv_lens=build_draft_graph_step_kv_lens,
+            expand_fia_cpu_update_inputs=expand_fia_cpu_update_inputs,
+            resolve_fia_update_count=resolve_fia_update_count,
+            NpuGraphReplaySubmittedError=NpuGraphReplaySubmittedError,
         )
     except Exception:
         pass
     src_path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
     tree = ast.parse(src_path.read_text())
-    names = {
-        "expand_seq_lens_for_spec_topk",
-        "normalize_tree_draft_kv_lens",
-        "build_tree_draft_block_tables",
-    }
     keep = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if (isinstance(node, ast.FunctionDef) and node.name in helper_names)
+        or (isinstance(node, ast.ClassDef) and node.name in class_names)
     ]
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
     ns = {"torch": torch, "Optional": Optional}
     exec(compile(mod, str(src_path), "exec"), ns)
-    return (
-        ns["build_tree_draft_block_tables"],
-        ns["expand_seq_lens_for_spec_topk"],
-        ns["normalize_tree_draft_kv_lens"],
+    return SimpleNamespace(
+        build_tree_draft_block_tables=ns["build_tree_draft_block_tables"],
+        expand_seq_lens_for_spec_topk=ns["expand_seq_lens_for_spec_topk"],
+        normalize_tree_draft_kv_lens=ns["normalize_tree_draft_kv_lens"],
+        build_draft_graph_step_kv_lens=ns["build_draft_graph_step_kv_lens"],
+        expand_fia_cpu_update_inputs=ns["expand_fia_cpu_update_inputs"],
+        resolve_fia_update_count=ns["resolve_fia_update_count"],
+        NpuGraphReplaySubmittedError=ns["NpuGraphReplaySubmittedError"],
     )
 
 
@@ -322,7 +339,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("if duplicate_cache_len > 0:", drafter_src)
 
     def test_normalize_tree_draft_kv_lens(self):
-        _, _, normalize_tree_draft_kv_lens = _load_tree_draft_helpers()
+        normalize_tree_draft_kv_lens = (
+            _load_tree_draft_helpers().normalize_tree_draft_kv_lens
+        )
 
         self.assertEqual(normalize_tree_draft_kv_lens([7], 3, topk=3), [7, 7, 7])
         self.assertEqual(
@@ -340,7 +359,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             normalize_tree_draft_kv_lens(None, 3, topk=3)
 
     def test_expand_seq_lens_for_spec_topk(self):
-        _, expand_seq_lens_for_spec_topk, _ = _load_tree_draft_helpers()
+        expand_seq_lens_for_spec_topk = (
+            _load_tree_draft_helpers().expand_seq_lens_for_spec_topk
+        )
 
         self.assertEqual(
             expand_seq_lens_for_spec_topk([10, 20], 6),
@@ -349,8 +370,111 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(expand_seq_lens_for_spec_topk([10, 20], 2), [10, 20])
         self.assertEqual(expand_seq_lens_for_spec_topk([7], 4), [7])
 
+    def test_build_draft_graph_step_kv_lens(self):
+        helpers = _load_tree_draft_helpers()
+        build = helpers.build_draft_graph_step_kv_lens
+
+        self.assertEqual(
+            build([128], capture_bs=1, topk=3, step_id=0),
+            [129, 129, 129],
+        )
+        padded = build([128], capture_bs=4, topk=3, step_id=0)
+        self.assertEqual(len(padded), 12)
+        self.assertEqual(padded[:3], [129, 129, 129])
+        self.assertEqual(padded[3:], [0] * 9)
+        self.assertEqual(
+            build([10, 20], capture_bs=2, topk=3, step_id=1),
+            [12, 12, 12, 22, 22, 22],
+        )
+        self.assertEqual(build([128], capture_bs=1, topk=1, step_id=0), [129])
+        with self.assertRaises(ValueError):
+            build(None, capture_bs=1, topk=3, step_id=0)
+        with self.assertRaises(ValueError):
+            build([128, 64], capture_bs=1, topk=3, step_id=0)
+
+    def test_expand_fia_cpu_update_inputs_is_step_major(self):
+        helpers = _load_tree_draft_helpers()
+        expand = helpers.expand_fia_cpu_update_inputs
+        s0 = [129, 129, 129]
+        s1 = [130, 130, 130]
+        got = expand([s0, s1], num_layers=3, attr_name="actual_seq_lengths_kv")
+        keys = [d["actual_seq_lengths_kv"] for d in got]
+        self.assertEqual(keys, [s0, s0, s0, s1, s1, s1])
+        self.assertNotEqual(keys, [s0, s1, s0, s1, s0, s1])
+        # list * num_layers would produce the interleaved / repeated-block wrong order
+        self.assertNotEqual(keys, ([s0, s1] * 3))
+
+    def test_resolve_fia_update_count(self):
+        resolve = _load_tree_draft_helpers().resolve_fia_update_count
+        self.assertEqual(resolve(None, 4, 28), 112)
+        self.assertEqual(resolve(112, 4, 28), 112)
+        with self.assertRaises(RuntimeError):
+            resolve(8, 4, 28)
+        with self.assertRaises(RuntimeError):
+            resolve(224, 4, 28)
+
+    def test_count_fia_kv_len_records(self):
+        src_path = (
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
+        )
+        tree = ast.parse(src_path.read_text())
+        names = {"_iter_graph_dispatch_records", "count_fia_kv_len_records"}
+        keep = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        mod = ast.Module(body=keep, type_ignores=[])
+        ast.fix_missing_locations(mod)
+        ns = {}
+        exec(compile(mod, str(src_path), "exec"), ns)
+        count = ns["count_fia_kv_len_records"]
+        attr = "actual_seq_lengths_kv"
+        self.assertIsNone(count(SimpleNamespace(), attr))
+        graph = SimpleNamespace(
+            graph_dispatch_mode=SimpleNamespace(
+                graph_dispatch_records=[
+                    SimpleNamespace(update_info={attr: [1]}),
+                    SimpleNamespace(update_info={"other": [1]}),
+                    SimpleNamespace(update_info={attr: [2]}),
+                ]
+            )
+        )
+        self.assertEqual(count(graph, attr), 2)
+        empty = SimpleNamespace(graph_dispatch_records=[])
+        self.assertEqual(count(empty, attr), 0)
+
+    def test_expand_batch_skips_expand_one_after_graph_submitted(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except Exception as e:
+            self.skipTest(f"sglang runtime deps missing: {e}")
+        Submitted = _load_tree_draft_helpers().NpuGraphReplaySubmittedError
+        drafter = object.__new__(SRTreeDrafter)
+        called = {"expand_one": 0}
+
+        def boom(*_args, **_kwargs):
+            raise Submitted("already submitted")
+
+        def expand_one(_req):
+            called["expand_one"] += 1
+            return ([], None, None)
+
+        drafter._expand_tree = boom
+        drafter._expand_one = expand_one
+        drafter._stack_seeds = lambda _reqs: (None, None, None, None)
+        req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
+        windows = SRTreeDrafter.expand_batch(drafter, [req])
+        self.assertEqual(windows, [([], None, None)])
+        self.assertEqual(called["expand_one"], 0)
+
     def test_build_tree_draft_block_tables_matrix(self):
-        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+        build_tree_draft_block_tables = (
+            _load_tree_draft_helpers().build_tree_draft_block_tables
+        )
 
         cases = []
         for page_size in (1, 4, 128):
@@ -429,7 +553,9 @@ class TestRemoteSpecDevice(CustomTestCase):
                     self.assertNotEqual(int(row0[last]), int(row1[last]))
 
     def test_build_tree_draft_block_tables_overflow_raises(self):
-        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+        build_tree_draft_block_tables = (
+            _load_tree_draft_helpers().build_tree_draft_block_tables
+        )
 
         page_size = 4
         req = torch.arange(8, dtype=torch.int32).view(1, 8)
@@ -445,7 +571,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             )
 
     def test_build_tree_draft_block_tables_aligned(self):
-        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+        build_tree_draft_block_tables = (
+            _load_tree_draft_helpers().build_tree_draft_block_tables
+        )
 
         page_size = 4
         req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
@@ -464,7 +592,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(int(tables[1, -1]), 16 // page_size)
 
     def test_build_tree_draft_block_tables_unaligned(self):
-        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+        build_tree_draft_block_tables = (
+            _load_tree_draft_helpers().build_tree_draft_block_tables
+        )
 
         page_size = 4
         req_to_token = torch.arange(32, dtype=torch.int32).view(1, 32)
@@ -483,7 +613,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(int(tables[1, 1]), 12 // page_size)
 
     def test_build_tree_draft_block_tables_topk1(self):
-        build_tree_draft_block_tables, _, _ = _load_tree_draft_helpers()
+        build_tree_draft_block_tables = (
+            _load_tree_draft_helpers().build_tree_draft_block_tables
+        )
 
         page_size = 4
         seq_len = 8
@@ -522,7 +654,21 @@ class TestRemoteSpecDevice(CustomTestCase):
             _REPO
             / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
         ).read_text()
-        self.assertIn("normalize_tree_draft_kv_lens", graph_src)
+        self.assertIn("build_draft_graph_step_kv_lens", graph_src)
+        self.assertIn("expand_fia_cpu_update_inputs", graph_src)
+        self.assertIn("resolve_fia_update_count", graph_src)
+        self.assertIn("count_fia_kv_len_records", graph_src)
+        self.assertIn("graph_dispatch_records", graph_src)
+        self.assertIn("NpuGraphReplaySubmittedError", graph_src)
+        self.assertIn("seq_lens_cpu[: self.raw_bs]", graph_src)
+        self.assertNotIn("normalize_tree_draft_kv_lens", graph_src)
+        drafter_src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        ).read_text()
+        self.assertIn("NpuGraphReplaySubmittedError", drafter_src)
+        self.assertIn("skipping per-req retry", drafter_src)
+        self.assertIn("falling back to eager", drafter_src)
 
     def test_npu_tree_draft_fia_alignment_source_guards(self):
         src = (

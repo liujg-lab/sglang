@@ -119,6 +119,71 @@ def normalize_tree_draft_kv_lens(seq_lens, num_q: int, topk: int):
     )
 
 
+class NpuGraphReplaySubmittedError(RuntimeError):
+    """Raised after NPU graph.replay() has been invoked; do not retry the same graph."""
+
+
+def build_draft_graph_step_kv_lens(prefix_lens, capture_bs, topk, step_id):
+    """Build per-branch KV lengths for one captured tree-draft graph step.
+
+    ``prefix_lens`` is the unpadded raw batch. Pads with 0 to ``capture_bs``,
+    then expands to ``capture_bs * topk`` branch rows. Parent replay already
+    copies ``seq_lens_cpu`` to capture ``bs``, so callers must pass ``[:raw_bs]``.
+    """
+    if prefix_lens is None:
+        raise ValueError("draft graph prefix_lens must not be None")
+    values = [int(s) for s in list(prefix_lens)]
+    raw_bs = len(values)
+    capture_bs = int(capture_bs)
+    topk = max(int(topk), 1)
+    step_id = int(step_id)
+    if capture_bs < raw_bs:
+        raise ValueError(f"capture_bs={capture_bs} smaller than raw_bs={raw_bs}")
+    seq_lens = [s + step_id + 1 for s in values] + [0] * (capture_bs - raw_bs)
+    num_tokens = capture_bs * topk
+    if topk > 1:
+        return normalize_tree_draft_kv_lens(seq_lens, num_tokens, topk)
+    return expand_seq_lens_for_spec_topk(seq_lens, num_tokens)
+
+
+def expand_fia_cpu_update_inputs(step_lens_list, num_layers, attr_name):
+    """Expand per-step KV lengths to one FIA cpu_update_input per captured layer.
+
+    Capture order is step-major: step0 x L, step1 x L, ...
+    Do not use ``list * num_layers`` (that repeats the whole step list).
+    """
+    num_layers = int(num_layers)
+    if num_layers < 0:
+        raise ValueError(f"num_layers must be >= 0, got {num_layers}")
+    if not attr_name:
+        raise ValueError("FIA update attr_name must not be empty")
+    return [
+        {attr_name: list(step_lens)}
+        for step_lens in step_lens_list
+        for _ in range(num_layers)
+    ]
+
+
+def resolve_fia_update_count(n_records, n_steps, num_layers):
+    """Return how many cpu_update_input dicts the captured graph needs.
+
+    Expected ``n_steps * num_layers``. If ``n_records`` is None (API missing),
+    use expected. Mismatch raises; never silently guess a 2x workspace factor.
+    """
+    n_steps = int(n_steps)
+    num_layers = int(num_layers)
+    expected = n_steps * num_layers
+    if n_records is None:
+        return expected
+    n_records = int(n_records)
+    if n_records != expected:
+        raise RuntimeError(
+            f"FIA records={n_records} != steps*num_layers="
+            f"{n_steps}*{num_layers}={expected}"
+        )
+    return expected
+
+
 def build_tree_draft_block_tables(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

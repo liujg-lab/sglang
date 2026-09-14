@@ -20,6 +20,7 @@ from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.spec_utils import (
+    NpuGraphReplaySubmittedError,
     assign_draft_cache_locs,
     device_backend_key,
     fast_topk,
@@ -146,6 +147,14 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 keep, *self._stack_seeds(keep)
             )
+        except NpuGraphReplaySubmittedError as e:
+            logger.warning(
+                "[SR] tree expand_batch graph already submitted for %s: %s; "
+                "skipping per-req retry",
+                [r.rid for r in keep],
+                e,
+            )
+            return windows
         except Exception as e:
             logger.warning(
                 "[SR] tree expand_batch failed for %s: %s; falling back per-req",
@@ -247,10 +256,22 @@ class SRTreeDrafter:
                 and self.cuda_graph_runner.can_run(forward_batch)
             )
             if can_cuda_graph:
-                parent_list, top_scores_index, draft_tokens = (
-                    self.cuda_graph_runner.replay(forward_batch)
-                )
-            else:
+                try:
+                    parent_list, top_scores_index, draft_tokens = (
+                        self.cuda_graph_runner.replay(forward_batch)
+                    )
+                except NpuGraphReplaySubmittedError:
+                    self.cuda_graph_runner = None
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "[SR] tree draft graph replay prep failed: %s; "
+                        "falling back to eager",
+                        e,
+                    )
+                    self.cuda_graph_runner = None
+                    can_cuda_graph = False
+            if not can_cuda_graph:
                 if (
                     self.draft_attn_backend is not None
                     and self.speculative_num_steps > 1
