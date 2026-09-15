@@ -2,6 +2,10 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.speculative.standalone_remote.sr_align import (
+    kv_release_len,
+    rollback_free_range,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -82,11 +86,9 @@ class SRKVRollbacker:
             return False
 
         try:
+            old_allocated = allocated if allocated > 0 else int(current_kv_len)
             max_len = self.req_to_token_pool.req_to_token.shape[1]
-            start = min(fork_point, max_len)
-            end = min(end, max_len)
-            if self.page_size > 1:
-                end = (end // self.page_size) * self.page_size
+            start, end = rollback_free_range(fork_point, old_allocated, max_len)
             if start < end:
                 kv_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, start:end
@@ -103,6 +105,10 @@ class SRKVRollbacker:
     def release_all_kv_for_finished_req(self, req: "Req") -> None:
         if req.req_pool_idx is None:
             return
-        kv_len = req.kv_committed_len
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
+        committed = int(getattr(req, "kv_committed_len", 0) or 0)
+        allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+        kv_len = kv_release_len(committed, allocated)
+        req.kv_allocated_len = kv_len
+        ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
+        req.fill_ids = ids[:kv_len]
         release_kv_cache(req, self.tree_cache, is_insert=False)

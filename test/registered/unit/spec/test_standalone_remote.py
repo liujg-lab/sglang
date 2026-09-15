@@ -21,6 +21,7 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DraftDecision,
+    apply_tree_seed_topk,
     broadcast_sr_obj,
     capture_tree_seed_topk,
     classify_prefix_alignment,
@@ -31,11 +32,14 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     drop_duplicate_root_draft,
     find_fork_point,
     ingest_active_indices,
+    kv_release_len,
     last_token_in_kv,
     plan_committed_ingest,
     plan_tree_seed_recovery,
     replay_grammar_from_committed,
+    rollback_free_range,
     shift_overlapped_prefill_drafts,
+    snapshot_reprefill_fill_ids,
     unwrap_tp_broadcast,
     wrap_tp_broadcast,
 )
@@ -583,13 +587,51 @@ class TestForkPointAlign(CustomTestCase):
             ),
             "recapture_last",
         )
-        # Rollback to 128 can be legal on page_size=128; dropping 127 is not.
+        # Origin last token: P=K=L even when the last slot is page-aligned.
         self.assertEqual(
             plan_tree_seed_recovery(
-                128, [], 128, seed_ok=False, can_rollback_last_slot=False
+                128, [], 128, seed_ok=False, can_rollback_last_slot=True
             ),
             "reprefill",
         )
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                257, [], 256, seed_ok=False, can_rollback_last_slot=True
+            ),
+            "reprefill",
+        )
+        # page_size=128 cannot drop 127.
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                10, [7], 11, seed_ok=False, can_rollback_last_slot=False
+            ),
+            "reprefill",
+        )
+
+    def test_apply_tree_seed_topk_writes_live_sampling_info(self):
+        info = SimpleNamespace(tree_seed_topk=0)
+        batch = SimpleNamespace(tree_seed_topk=0, sampling_info=info)
+        self.assertEqual(apply_tree_seed_topk(batch, 3), 3)
+        self.assertEqual(batch.tree_seed_topk, 3)
+        self.assertEqual(info.tree_seed_topk, 3)
+        bare = SimpleNamespace()
+        apply_tree_seed_topk(bare, 0)
+        self.assertEqual(bare.tree_seed_topk, 1)
+
+    def test_snapshot_reprefill_does_not_shrink_to_padded(self):
+        origin = list(range(78))
+        first = snapshot_reprefill_fill_ids(origin, [99])
+        self.assertEqual(len(first), 79)
+        second = snapshot_reprefill_fill_ids(first, [])
+        self.assertEqual(second, first)
+        padded = list(range(78))
+        self.assertNotEqual(second, padded)
+
+    def test_rollback_free_range_does_not_page_floor(self):
+        self.assertEqual(rollback_free_range(256, 384, 4096), (256, 384))
+        self.assertEqual(rollback_free_range(256, 257, 4096), (256, 257))
+        self.assertEqual(kv_release_len(257, 384), 384)
+        self.assertEqual(kv_release_len(128, 0), 128)
 
 
 class TestSRTreeSeedSourceGuard(CustomTestCase):
@@ -625,6 +667,44 @@ class TestSRTreeSeedSourceGuard(CustomTestCase):
         body = src[start : nxt if nxt > start else None]
         self.assertIn("tree_seed_topk_p", body)
         self.assertNotIn("softmax", body)
+
+    def test_enable_and_reprefill_use_sr_align_helpers(self):
+        from pathlib import Path
+
+        mixin_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/"
+            "sr_draft_scheduler_mixin.py"
+        )
+        if not mixin_path.is_file():
+            self.skipTest(f"missing {mixin_path}")
+        src = mixin_path.read_text()
+        enable = src[src.find("def _sr_enable_tree_seed_hidden") :]
+        enable = enable[: enable.find("\n    def ")]
+        self.assertIn("apply_tree_seed_topk", enable)
+        reprefill = src[src.find("def _sr_reprefill_committed") :]
+        reprefill = reprefill[: reprefill.find("\n    def ")]
+        self.assertIn("snapshot_reprefill_fill_ids", reprefill)
+        ensure = src[src.find("def _sr_ensure_tree_seeds") :]
+        ensure = ensure[: ensure.find("\n    def ")]
+        self.assertIn('action == "ingest"', ensure)
+        self.assertIn("tree seed recovery failed", ensure)
+
+    def test_local_rollback_does_not_page_floor_end(self):
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/sr_kv_rollbacker.py"
+        )
+        if not path.is_file():
+            self.skipTest(f"missing {path}")
+        src = path.read_text()
+        start = src.find("def local_rollback")
+        body = src[start : src.find("\n    def ", start + 1)]
+        self.assertIn("rollback_free_range", body)
+        self.assertNotIn("end // self.page_size", body)
+        self.assertIn("kv_release_len", src)
 
 
 class TestDraftDecision(CustomTestCase):

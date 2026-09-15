@@ -123,6 +123,38 @@ def last_token_in_kv(fork: int, kv_committed_len: int) -> bool:
     return int(kv_committed_len) > int(fork)
 
 
+def apply_tree_seed_topk(batch, topk: int) -> int:
+    """Write top-k onto the batch and a live sampling_info, if present."""
+    k = max(1, int(topk or 1))
+    batch.tree_seed_topk = k
+    info = getattr(batch, "sampling_info", None)
+    if info is not None:
+        info.tree_seed_topk = k
+    return k
+
+
+def snapshot_reprefill_fill_ids(
+    origin_ids: Optional[Sequence[int]],
+    output_ids: Optional[Sequence[int]],
+) -> List[int]:
+    """Committed prefix for one reprefill: current origin plus output tail."""
+    return list(origin_ids or []) + list(output_ids or [])
+
+
+def rollback_free_range(
+    fork_point: int, allocated_len: int, max_len: int
+) -> Tuple[int, int]:
+    """Slots to free on rollback. Do not page-floor ``allocated_len``."""
+    start = min(max(0, int(fork_point)), int(max_len))
+    end = min(max(0, int(allocated_len)), int(max_len))
+    return start, end
+
+
+def kv_release_len(committed_len: int, allocated_len: int) -> int:
+    """FINISH must cover allocated pages, not only written tokens."""
+    return max(int(committed_len or 0), int(allocated_len or 0))
+
+
 def capture_tree_seed_topk(logits: torch.Tensor, topk: int):
     """Softmax + top-k; caller must not keep the full vocab tensor."""
     probs = torch.softmax(logits.float(), dim=-1)
@@ -162,14 +194,21 @@ def plan_tree_seed_recovery(
 ) -> str:
     """How to get a tree seed after align/ingest.
 
+    ``P`` is origin length, ``L = P + len(output)``, ``K`` is committed KV.
     Returns ``ok``, ``ingest``, ``recapture_last``, or ``reprefill``.
     """
-    leftover = committed_tail_not_in_kv(origin_len, output_ids, kv_committed_len)
+    outputs = list(output_ids or [])
+    prefix_len = int(origin_len)
+    committed = int(kv_committed_len)
+    if committed < prefix_len:
+        return "reprefill"
+    leftover = committed_tail_not_in_kv(prefix_len, outputs, committed)
     if leftover:
         return "ingest"
     if seed_ok:
         return "ok"
-    if can_rollback_last_slot:
+    last_in_output = bool(outputs)
+    if last_in_output and can_rollback_last_slot:
         return "recapture_last"
     return "reprefill"
 

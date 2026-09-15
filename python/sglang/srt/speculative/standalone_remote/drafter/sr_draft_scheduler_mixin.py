@@ -19,6 +19,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DEFAULT_MAX_INGEST_DECODE_STEPS,
     DraftDecision,
+    apply_tree_seed_topk,
     broadcast_sr_obj,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
@@ -31,6 +32,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     plan_committed_ingest,
     plan_tree_seed_recovery,
     replay_grammar_from_committed,
+    snapshot_reprefill_fill_ids,
     tree_seed_matches_prefix,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -129,8 +131,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Request last-token hidden for tree seed without HTTP FULL capture."""
         batch.return_hidden_states = False
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.tree_seed_topk = max(
-            1, int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
+        apply_tree_seed_topk(
+            batch,
+            getattr(self.server_args, "speculative_eagle_topk", 1),
         )
 
     def _sr_is_http_req(self, req: Req) -> bool:
@@ -1023,14 +1026,12 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Fold a long committed tail into one extend instead of N decodes."""
         rebuilt: List[Req] = []
         for req in reqs:
-            padded = list(getattr(req, "sr_padded_ids", None) or [])
-            committed = list(req.output_ids or [])
-            fill_ids = (padded + committed) if padded else (
-                list(req.origin_input_ids) + committed
+            fill_ids = snapshot_reprefill_fill_ids(
+                req.origin_input_ids, req.output_ids
             )
             logger.info(
                 "[SR] ingest tail %s tokens for %s: one reprefill of %s ids",
-                len(committed),
+                len(req.output_ids or []),
                 req.rid,
                 len(fill_ids),
             )
@@ -1094,6 +1095,7 @@ class StandaloneRemoteDraftSchedulerMixin:
 
     def _sr_ensure_tree_seeds(self, reqs: List[Req]) -> None:
         """Rebuild seed when prefix KV is complete but last-token logits are gone."""
+        need_ingest: List[Req] = []
         recapture: List[Req] = []
         reprefill: List[Req] = []
         for req in reqs:
@@ -1114,10 +1116,14 @@ class StandaloneRemoteDraftSchedulerMixin:
                 seed_ok,
                 can_last,
             )
-            if action == "recapture_last":
+            if action == "ingest":
+                need_ingest.append(req)
+            elif action == "recapture_last":
                 recapture.append(req)
             elif action == "reprefill":
                 reprefill.append(req)
+        if need_ingest:
+            self._sr_ingest_committed_batch(need_ingest)
         failed_recapture: List[Req] = []
         for req in recapture:
             committed = int(getattr(req, "kv_committed_len", 0) or 0)
@@ -1131,6 +1137,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         need_reprefill = reprefill + failed_recapture
         if need_reprefill:
             self._sr_reprefill_committed(need_reprefill)
+        for req in reqs:
+            if tree_seed_matches_prefix(
+                getattr(req, "sr_tree_seed", None),
+                req.origin_input_ids or [],
+                req.output_ids or [],
+            ):
+                continue
+            self._sr_mark_degraded(req.rid, "tree seed recovery failed")
 
     def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
         empty: SRWindow = ([], None, None)
