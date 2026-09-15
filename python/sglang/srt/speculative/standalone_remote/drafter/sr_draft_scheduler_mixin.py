@@ -26,6 +26,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     draft_needed_max_new_tokens,
     find_fork_point,
     ingest_active_indices,
+    is_device_context_error,
     plan_committed_ingest,
     replay_grammar_from_committed,
 )
@@ -80,20 +81,7 @@ def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
 
 
 def _sr_is_device_context_error(exc: BaseException) -> bool:
-    """True when the accelerator context is already poisoned (do not keep running)."""
-    name = type(exc).__name__
-    if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
-        return True
-    accel = getattr(torch, "AcceleratorError", None)
-    if accel is not None and isinstance(exc, accel):
-        return True
-    msg = str(exc).lower()
-    return (
-        "illegal memory access" in msg
-        or "cudaerrorillegaladdress" in msg
-        or "npu error" in msg
-        or ("ascend" in msg and "illegal" in msg)
-    )
+    return is_device_context_error(exc)
 
 
 # Backward-compatible alias.

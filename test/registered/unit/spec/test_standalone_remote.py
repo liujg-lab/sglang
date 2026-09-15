@@ -1547,9 +1547,20 @@ class TestOverlappedPrefillShift(CustomTestCase):
         self.assertEqual(shift_overlapped_prefill_drafts([10], []), [])
 
     def test_drop_duplicate_verify_root(self):
-        self.assertEqual(drop_duplicate_root_draft(10, [10, 11, 12, 13, 14]), [11, 12, 13, 14])
+        self.assertEqual(
+            drop_duplicate_root_draft(10, [10, 11, 12, 13, 14]),
+            [10, 11, 12, 13, 14],
+        )
         self.assertEqual(drop_duplicate_root_draft(10, [11, 12, 13]), [11, 12, 13])
         self.assertEqual(drop_duplicate_root_draft(None, [10, 11]), [10, 11])
+        self.assertEqual(
+            drop_duplicate_root_draft(10, [10, 11, 12, 13, 14], include_root=True),
+            [11, 12, 13, 14],
+        )
+        self.assertEqual(
+            drop_duplicate_root_draft(10, [11, 12, 13], include_root=True),
+            [11, 12, 13],
+        )
 
 
 class TestPrefillHardResetRidReuse(CustomTestCase):

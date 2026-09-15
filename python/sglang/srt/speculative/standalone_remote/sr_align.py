@@ -192,16 +192,18 @@ def replay_grammar_from_committed(template, committed_ids: Optional[Sequence[int
 
 
 def drop_duplicate_root_draft(
-    last_committed: Optional[int], draft_tokens: Sequence[int]
+    last_committed: Optional[int],
+    draft_tokens: Sequence[int],
+    include_root: bool = False,
 ) -> List[int]:
     """Drop a leading draft token that duplicates EAGLE's verify root.
 
-    Verify uses ``output_ids[-1]`` as ``verified_id``. If the window starts with
-    that same id, the first candidate is a repeat and greedy accept length
-    collapses to 1.
+    STANDALONE_REMOTE windows do not prepend ``verified_id``. A repeated token
+    id (``\\n\\n``, stacked words) is a valid next token unless the caller
+    marks the window as ``include_root=True``.
     """
     tokens = list(draft_tokens or [])
-    if last_committed is None or not tokens:
+    if not include_root or last_committed is None or not tokens:
         return tokens
     if tokens[0] == last_committed:
         return tokens[1:]
@@ -216,6 +218,28 @@ def wrap_tp_broadcast(obj: Any) -> List[Any]:
 def unwrap_tp_broadcast(wrapped: Sequence[Any]) -> Any:
     """Inverse of ``wrap_tp_broadcast``."""
     return wrapped[0]
+
+
+def is_device_context_error(exc: BaseException) -> bool:
+    """True when the accelerator context is already poisoned (do not keep running)."""
+    name = type(exc).__name__
+    if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
+        return True
+    try:
+        import torch
+
+        accel = getattr(torch, "AcceleratorError", None)
+    except Exception:
+        accel = None
+    if accel is not None and isinstance(exc, accel):
+        return True
+    msg = str(exc).lower()
+    return (
+        "illegal memory access" in msg
+        or "cudaerrorillegaladdress" in msg
+        or "npu error" in msg
+        or ("ascend" in msg and "illegal" in msg)
+    )
 
 
 def _default_broadcast_pyobj(data, rank, dist_group, src=0):

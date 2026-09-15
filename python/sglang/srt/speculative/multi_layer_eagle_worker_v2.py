@@ -298,7 +298,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
-        _, hidden_states, scores, tree_info = select_top_k_tokens(
+        _, hidden_states, scores, tree_info, _ = select_top_k_tokens(
             0, topk_p, topk_index, hidden_states, scores, self.topk
         )
         if self.speculative_num_steps == 1:

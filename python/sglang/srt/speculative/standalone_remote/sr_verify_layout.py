@@ -28,6 +28,52 @@ def advance_tree_draft_positions(
         mrope_positions.add_(1)
 
 
+def advance_tree_draft_positions_for_step(
+    step_i: int,
+    positions: Optional[torch.Tensor],
+    mrope_positions: Optional[torch.Tensor] = None,
+) -> None:
+    """Advance RoPE only after the first tree forward.
+
+    STANDALONE initializes ``positions`` / M-RoPE at ``seq_lens``, which is
+    already the correct id for the first draft tokens. EAGLE CUDA still
+    ``add_(1)`` on every step including ``i==0``; SR full models must not.
+    """
+    if int(step_i) <= 0:
+        return
+    advance_tree_draft_positions(positions, mrope_positions)
+
+
+def copy_paged_kv_buffer_by_slot(
+    kv_buffer: torch.Tensor,
+    src_loc: torch.Tensor,
+    tgt_loc: torch.Tensor,
+) -> None:
+    """Copy token slots in a paged KV buffer without 6D advanced indexing.
+
+    ``kv_buffer`` is ``[2, layer, num_pages, page_size, head, dim]``. ``src_loc``
+    / ``tgt_loc`` are token-slot indices (``page * page_size + offset``).
+    """
+    if tgt_loc is None or src_loc is None:
+        return
+    n = int(tgt_loc.numel())
+    if n == 0:
+        return
+    kv2, layer, _pages, _page_size, head, dim = kv_buffer.shape
+    flat = kv_buffer.view(kv2, layer, -1, head, dim)
+    src_list = src_loc.reshape(-1).tolist()
+    tgt_list = tgt_loc.reshape(-1).tolist()
+    staged = torch.empty(
+        (kv2, layer, n, head, dim),
+        dtype=kv_buffer.dtype,
+        device=kv_buffer.device,
+    )
+    for i, s in enumerate(src_list):
+        staged[:, :, i].copy_(flat[:, :, int(s)])
+    for i, t in enumerate(tgt_list):
+        flat[:, :, int(t)].copy_(staged[:, :, i])
+
+
 def chain_tree_structure(
     num_draft_tokens: int, spec_steps: int, device=None
 ) -> Tuple[torch.Tensor, torch.Tensor]:

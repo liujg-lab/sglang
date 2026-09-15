@@ -397,7 +397,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+        input_ids, hidden_states, scores, tree_info, _ = select_top_k_tokens(
             0, topk_p, topk_index, hidden_states, scores, self.topk
         )
         if self.speculative_num_steps == 1:

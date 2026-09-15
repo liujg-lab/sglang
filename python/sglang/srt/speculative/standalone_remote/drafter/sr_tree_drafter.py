@@ -30,8 +30,10 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    advance_tree_draft_positions,
+    advance_tree_draft_positions_for_step,
+    copy_paged_kv_buffer_by_slot,
 )
 from sglang.srt.utils import next_power_of_2
 
@@ -164,6 +166,8 @@ class SRTreeDrafter:
         except NpuGraphReplaySubmittedError:
             raise
         except Exception as e:
+            if is_device_context_error(e):
+                raise
             logger.warning(
                 "[SR] tree expand_batch failed for %s: %s; falling back per-req",
                 [r.rid for r in keep],
@@ -192,6 +196,8 @@ class SRTreeDrafter:
         except NpuGraphReplaySubmittedError:
             raise
         except Exception as e:
+            if is_device_context_error(e):
+                raise
             logger.warning("[SR] tree expand failed for %s: %s", req.rid, e)
             return empty
         return (
@@ -453,17 +459,22 @@ class SRTreeDrafter:
         parents_list: List[torch.Tensor] = []
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+            input_ids, hidden_states, scores, tree_info, parent_rows = (
+                select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
             if i == self.speculative_num_steps - 1:
                 break
+            if i > 0 and self.topk > 1 and parent_rows is not None:
+                self._remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
-            advance_tree_draft_positions(
+            advance_tree_draft_positions_for_step(
+                i,
                 forward_batch.positions,
                 getattr(forward_batch, "mrope_positions", None),
             )
@@ -493,3 +504,18 @@ class SRTreeDrafter:
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
+
+    def _remap_tree_kv_to_parents(
+        self,
+        out_cache_loc: torch.Tensor,
+        parent_rows: torch.Tensor,
+        n_prev_steps: int,
+    ) -> None:
+        kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        kv_buffer = getattr(kv_pool, "kv_buffer", None) if kv_pool is not None else None
+        if kv_buffer is None:
+            return
+        for s in range(n_prev_steps):
+            copy_paged_kv_buffer_by_slot(
+                kv_buffer, out_cache_loc[s][parent_rows], out_cache_loc[s]
+            )

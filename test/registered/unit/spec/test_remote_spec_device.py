@@ -115,6 +115,7 @@ def _load_tree_draft_helpers():
         "normalize_fia_op_name",
         "_schema_has_kv_attr",
         "_dump_unreadable_dispatch_record",
+        "tree_reselect_parent_rows",
     }
     class_names = {"NpuGraphReplaySubmittedError", "NpuGraphPreparationError"}
     assign_names = {"TREE_DRAFT_FIA_OP_NAMES", "_dumped_unreadable_dispatch_record"}
@@ -131,6 +132,7 @@ def _load_tree_draft_helpers():
             normalize_fia_op_name,
             normalize_tree_draft_kv_lens,
             resolve_fia_update_count,
+            tree_reselect_parent_rows,
             validate_draft_graph_step_kv_lens,
             validate_tree_draft_fia_records,
         )
@@ -149,6 +151,7 @@ def _load_tree_draft_helpers():
             NpuGraphReplaySubmittedError=NpuGraphReplaySubmittedError,
             NpuGraphPreparationError=NpuGraphPreparationError,
             TREE_DRAFT_FIA_OP_NAMES=TREE_DRAFT_FIA_OP_NAMES,
+            tree_reselect_parent_rows=tree_reselect_parent_rows,
         )
     except Exception:
         pass
@@ -183,6 +186,46 @@ def _load_tree_draft_helpers():
         NpuGraphReplaySubmittedError=ns["NpuGraphReplaySubmittedError"],
         NpuGraphPreparationError=ns["NpuGraphPreparationError"],
         TREE_DRAFT_FIA_OP_NAMES=ns["TREE_DRAFT_FIA_OP_NAMES"],
+        tree_reselect_parent_rows=ns["tree_reselect_parent_rows"],
+    )
+
+
+def _load_sr_tree_expand_methods():
+    """CPU-safe expand_batch/_expand_one without importing SRTreeDrafter."""
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    helpers = _load_tree_draft_helpers()
+    src_path = (
+        _REPO
+        / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+    )
+    tree = ast.parse(src_path.read_text())
+    methods = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name in {
+                    "expand_batch",
+                    "_expand_one",
+                }:
+                    methods[item.name] = item
+    future = ast.parse("from __future__ import annotations").body
+    mod = ast.Module(body=future + list(methods.values()), type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns = {
+        "NpuGraphReplaySubmittedError": helpers.NpuGraphReplaySubmittedError,
+        "is_device_context_error": is_device_context_error,
+        "logger": __import__("logging").getLogger("sr_tree_expand"),
+        "List": list,
+        "SRTreeWindow": tuple,
+    }
+    exec(compile(mod, str(src_path), "exec"), ns)
+    return SimpleNamespace(
+        expand_batch=ns["expand_batch"],
+        expand_one=ns["_expand_one"],
+        NpuGraphReplaySubmittedError=helpers.NpuGraphReplaySubmittedError,
     )
 
 
@@ -324,21 +367,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertNotIn("self.graphs[self.bs].replay()", src)
 
     def test_page_physical_kv_copy_matches_slot_to_page_offset(self):
-        def _copy_by_slot(kv_buffer, src_loc, tgt_loc):
-            n = int(tgt_loc.numel())
-            kv2, layer, _pages, _page_size, head, dim = kv_buffer.shape
-            flat = kv_buffer.view(kv2, layer, -1, head, dim)
-            src_list = src_loc.reshape(-1).tolist()
-            tgt_list = tgt_loc.reshape(-1).tolist()
-            staged = torch.empty(
-                (kv2, layer, n, head, dim),
-                dtype=kv_buffer.dtype,
-                device=kv_buffer.device,
-            )
-            for i, s in enumerate(src_list):
-                staged[:, :, i].copy_(flat[:, :, int(s)])
-            for i, t in enumerate(tgt_list):
-                flat[:, :, int(t)].copy_(staged[:, :, i])
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_paged_kv_buffer_by_slot,
+        )
 
         def _gold_6d(buf, src, tgt, page_size):
             src_page = torch.div(src, page_size, rounding_mode="floor")
@@ -356,7 +387,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         disjoint_src = torch.tensor([5, 6], dtype=torch.int32)
         disjoint_tgt = torch.tensor([9, 10], dtype=torch.int32)
         got = buf.clone()
-        _copy_by_slot(got, disjoint_src, disjoint_tgt)
+        copy_paged_kv_buffer_by_slot(got, disjoint_src, disjoint_tgt)
         torch.testing.assert_close(
             got, _gold_6d(buf, disjoint_src, disjoint_tgt, page_size)
         )
@@ -364,23 +395,29 @@ class TestRemoteSpecDevice(CustomTestCase):
         overlap_src = torch.tensor([5, 6], dtype=torch.int32)
         overlap_tgt = torch.tensor([4, 5], dtype=torch.int32)
         got_overlap = buf.clone()
-        _copy_by_slot(got_overlap, overlap_src, overlap_tgt)
+        copy_paged_kv_buffer_by_slot(got_overlap, overlap_src, overlap_tgt)
         torch.testing.assert_close(
             got_overlap, _gold_6d(buf, overlap_src, overlap_tgt, page_size)
         )
+
+        layout_src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/sr_verify_layout.py"
+        ).read_text()
+        self.assertIn("def copy_paged_kv_buffer_by_slot", layout_src)
+        self.assertIn("kv_buffer.view(kv2, layer, -1, head, dim)", layout_src)
+        self.assertIn(".copy_(", layout_src)
+        self.assertNotIn("[:, :, tgt_page, tgt_off", layout_src)
 
         npu_src = (
             _REPO / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
         ).read_text()
         self.assertIn("def move_kv_cache", npu_src)
-        self.assertIn("def copy_paged_kv_buffer_by_slot", npu_src)
         self.assertIn(
             "copy_paged_kv_buffer_by_slot(self.kv_buffer, src_loc, tgt_loc)",
             npu_src,
         )
-        self.assertIn("kv_buffer.view(kv2, layer, -1, head, dim)", npu_src)
-        self.assertIn(".copy_(", npu_src)
-        self.assertNotIn("[:, :, tgt_page, tgt_off", npu_src)
+        self.assertNotIn("def copy_paged_kv_buffer_by_slot", npu_src)
         self.assertNotIn("copy_all_layer_kv_cache_tiled", npu_src)
         self.assertIn("enable_kv_cache_copy=False", npu_src)
         self.assertNotIn("enable_kv_cache_copy=enable_kv_cache_copy", npu_src)
@@ -666,6 +703,45 @@ class TestRemoteSpecDevice(CustomTestCase):
             SRTreeDrafter.expand_batch(drafter, [req])
         self.assertEqual(called["expand_one"], 0)
 
+    def test_expand_batch_reraises_device_context_error(self):
+        methods = _load_sr_tree_expand_methods()
+
+        class NPUError(Exception):
+            pass
+
+        drafter = SimpleNamespace()
+        called = {"expand_one": 0}
+
+        def boom(*_args, **_kwargs):
+            raise NPUError("illegal memory access")
+
+        def expand_one(_req):
+            called["expand_one"] += 1
+            return ([], None, None)
+
+        drafter._expand_tree = boom
+        drafter._expand_one = expand_one
+        drafter._stack_seeds = lambda _reqs: (None, None, None, None)
+        req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
+        with self.assertRaises(NPUError):
+            methods.expand_batch(drafter, [req])
+        self.assertEqual(called["expand_one"], 0)
+
+        def boom_msg(*_args, **_kwargs):
+            raise RuntimeError("NPU error: illegal memory access")
+
+        drafter._expand_tree = boom_msg
+        with self.assertRaises(RuntimeError):
+            methods.expand_batch(drafter, [req])
+        self.assertEqual(called["expand_one"], 0)
+
+        def boom_one(*_args, **_kwargs):
+            raise NPUError("illegal memory access")
+
+        drafter._expand_tree = boom_one
+        with self.assertRaises(NPUError):
+            methods.expand_one(drafter, req)
+
     def test_scheduler_reraises_graph_submitted(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
@@ -934,6 +1010,73 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("query = q.reshape(", src)
         self.assertIn("-1, 1, layer.tp_q_head_num, layer.qk_head_dim", src)
         self.assertIn("context_lens=context_lens", src)
+
+    def test_advance_tree_draft_positions_for_step(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            advance_tree_draft_positions_for_step,
+        )
+
+        positions = torch.tensor([4, 5, 6], dtype=torch.int64)
+        mrope = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.int64)
+        advance_tree_draft_positions_for_step(0, positions, mrope)
+        self.assertEqual(positions.tolist(), [4, 5, 6])
+        self.assertEqual(mrope.tolist(), [[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+
+        advance_tree_draft_positions_for_step(1, positions, mrope)
+        self.assertEqual(positions.tolist(), [5, 6, 7])
+        self.assertEqual(mrope.tolist(), [[2, 3, 4], [5, 6, 7], [8, 9, 10]])
+
+        advance_tree_draft_positions_for_step(-1, positions, mrope)
+        self.assertEqual(positions.tolist(), [5, 6, 7])
+
+    def test_tree_reselect_parent_rows_and_kv_remap(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_paged_kv_buffer_by_slot,
+        )
+
+        tree_reselect_parent_rows = (
+            _load_tree_draft_helpers().tree_reselect_parent_rows
+        )
+        topk = 2
+        topk_cs_index = torch.tensor([[3, 1]], dtype=torch.int64)
+        parent_rows = tree_reselect_parent_rows(topk_cs_index, num_hidden_rows=2, topk=topk)
+        self.assertEqual(parent_rows.tolist(), [1, 0])
+
+        page_size = 4
+        buf = torch.arange(2 * 1 * 3 * 4 * 1 * 2, dtype=torch.float32).reshape(
+            2, 1, 3, 4, 1, 2
+        )
+        out_cache_loc = torch.tensor([5, 6], dtype=torch.int64)
+        src = out_cache_loc[parent_rows]
+        tgt = out_cache_loc
+        gold = buf.clone()
+        src_page = torch.div(src, page_size, rounding_mode="floor")
+        src_off = src % page_size
+        tgt_page = torch.div(tgt, page_size, rounding_mode="floor")
+        tgt_off = tgt % page_size
+        gold[:, :, tgt_page, tgt_off, :, :] = buf[:, :, src_page, src_off, :, :]
+        got = buf.clone()
+        copy_paged_kv_buffer_by_slot(got, src, tgt)
+        torch.testing.assert_close(got, gold)
+
+    def test_tree_draft_forward_rope_and_kv_remap_source_guards(self):
+        drafter_src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        ).read_text()
+        self.assertIn("advance_tree_draft_positions_for_step", drafter_src)
+        self.assertIn("copy_paged_kv_buffer_by_slot", drafter_src)
+        self.assertIn("def _remap_tree_kv_to_parents", drafter_src)
+        self.assertIn("parent_rows", drafter_src)
+        self.assertNotIn("advance_tree_draft_positions(", drafter_src)
+        self.assertIn("if is_device_context_error(e):", drafter_src)
+
+        spec_src = (_REPO / "python/sglang/srt/speculative/spec_utils.py").read_text()
+        self.assertIn("def tree_reselect_parent_rows", spec_src)
+        self.assertIn(
+            "return input_ids, hidden_states, scores, tree_info, parent_rows",
+            spec_src,
+        )
 
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
         eagle_src = (

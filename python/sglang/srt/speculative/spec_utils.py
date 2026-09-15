@@ -972,6 +972,20 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
+def tree_reselect_parent_rows(
+    topk_cs_index: torch.Tensor, num_hidden_rows: int, topk: int
+) -> torch.Tensor:
+    """Map reselected tree rows to the parent hidden/KV row.
+
+    Same index math as ``select_top_k_tokens`` for ``i > 0``.
+    """
+    topk = max(int(topk), 1)
+    device = topk_cs_index.device
+    return topk_cs_index.flatten() // topk + torch.arange(
+        0, num_hidden_rows, step=topk, device=device
+    ).repeat_interleave(topk)
+
+
 @torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens(
     i: int,
@@ -981,6 +995,7 @@ def select_top_k_tokens(
     scores: torch.Tensor,
     topk: int,
 ):
+    parent_rows = None
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
@@ -1009,10 +1024,10 @@ def select_top_k_tokens(
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
         if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device=topk_index.device
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
+            parent_rows = tree_reselect_parent_rows(
+                topk_cs_index, hidden_states.shape[0], topk
+            )
+            hidden_states = hidden_states[parent_rows, :]
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
@@ -1020,7 +1035,7 @@ def select_top_k_tokens(
             topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
         )
 
-    return input_ids, hidden_states, scores, tree_info
+    return input_ids, hidden_states, scores, tree_info, parent_rows
 
 
 def generate_simulated_accept_index(
