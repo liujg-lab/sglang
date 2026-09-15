@@ -33,6 +33,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     advance_tree_draft_positions_for_step,
+    copy_mha_kv_by_slot,
     copy_paged_kv_buffer_by_slot,
 )
 from sglang.srt.utils import next_power_of_2
@@ -512,10 +513,32 @@ class SRTreeDrafter:
         n_prev_steps: int,
     ) -> None:
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
-        kv_buffer = getattr(kv_pool, "kv_buffer", None) if kv_pool is not None else None
-        if kv_buffer is None:
+        if kv_pool is None:
             return
         for s in range(n_prev_steps):
-            copy_paged_kv_buffer_by_slot(
-                kv_buffer, out_cache_loc[s][parent_rows], out_cache_loc[s]
+            src = out_cache_loc[s][parent_rows]
+            tgt = out_cache_loc[s]
+            self._copy_tree_kv_slots(kv_pool, src, tgt)
+
+    def _copy_tree_kv_slots(self, kv_pool, src: torch.Tensor, tgt: torch.Tensor) -> None:
+        kv_buffer = getattr(kv_pool, "kv_buffer", None)
+        if torch.is_tensor(kv_buffer) and kv_buffer.dim() == 6:
+            copy_paged_kv_buffer_by_slot(kv_buffer, src, tgt)
+            return
+        mover = getattr(kv_pool, "move_kv_cache", None)
+        if callable(mover) and getattr(kv_pool, "_kv_copy_config", None) is not None:
+            mover(tgt, src)
+            return
+        k_buffer = getattr(kv_pool, "k_buffer", None)
+        v_buffer = getattr(kv_pool, "v_buffer", None)
+        if k_buffer is not None:
+            copy_mha_kv_by_slot(
+                k_buffer,
+                v_buffer,
+                src,
+                tgt,
+                getattr(kv_pool, "index_k_buffer", None),
             )
+            return
+        if isinstance(kv_buffer, (list, tuple)):
+            copy_mha_kv_by_slot(kv_buffer, None, src, tgt)

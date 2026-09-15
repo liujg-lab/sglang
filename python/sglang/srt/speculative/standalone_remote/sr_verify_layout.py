@@ -5,7 +5,7 @@ Kept free of sglang.srt.utils so unit tests can import it without torchvision.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -53,25 +53,70 @@ def copy_paged_kv_buffer_by_slot(
 
     ``kv_buffer`` is ``[2, layer, num_pages, page_size, head, dim]``. ``src_loc``
     / ``tgt_loc`` are token-slot indices (``page * page_size + offset``).
+
+    Uses device ``index_select`` / ``index_copy_`` so NPU/CUDA graph replay
+    re-reads live indices instead of frozen Python ints from ``.tolist()``.
+    Staging keeps overlapping src/tgt memmove-safe. Do not 6D-index pages.
     """
     if tgt_loc is None or src_loc is None:
         return
-    n = int(tgt_loc.numel())
-    if n == 0:
+    if int(tgt_loc.numel()) == 0:
         return
     kv2, layer, _pages, _page_size, head, dim = kv_buffer.shape
     flat = kv_buffer.view(kv2, layer, -1, head, dim)
-    src_list = src_loc.reshape(-1).tolist()
-    tgt_list = tgt_loc.reshape(-1).tolist()
-    staged = torch.empty(
-        (kv2, layer, n, head, dim),
-        dtype=kv_buffer.dtype,
-        device=kv_buffer.device,
-    )
-    for i, s in enumerate(src_list):
-        staged[:, :, i].copy_(flat[:, :, int(s)])
-    for i, t in enumerate(tgt_list):
-        flat[:, :, int(t)].copy_(staged[:, :, i])
+    src = src_loc.reshape(-1).to(dtype=torch.int64, device=kv_buffer.device)
+    tgt = tgt_loc.reshape(-1).to(dtype=torch.int64, device=kv_buffer.device)
+    staged = flat.index_select(2, src)
+    flat.index_copy_(2, tgt, staged)
+
+
+def _copy_token_slots(buf: torch.Tensor, src: torch.Tensor, tgt: torch.Tensor) -> None:
+    """Copy slots along the token axis of one KV tensor."""
+    src = src.to(device=buf.device, dtype=torch.int64)
+    tgt = tgt.to(device=buf.device, dtype=torch.int64)
+    if buf.dim() >= 5:
+        # NPU MLA-style [layer, pages, page_size, ...]
+        layer = int(buf.shape[0])
+        rest = buf.shape[3:]
+        flat = buf.view(layer, -1, *rest)
+        staged = flat.index_select(1, src)
+        flat.index_copy_(1, tgt, staged)
+        return
+    staged = buf.index_select(0, src)
+    buf.index_copy_(0, tgt, staged)
+
+
+def copy_mha_kv_by_slot(
+    k_buffer: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
+    v_buffer: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
+    src_loc: Optional[torch.Tensor],
+    tgt_loc: Optional[torch.Tensor],
+    index_k_buffer: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]] = None,
+) -> None:
+    """Copy token slots in per-layer or stacked K/V buffers.
+
+    CUDA MHA/MLA store a list of ``[tokens, ...]`` tensors (index dim 0).
+    NPU MLA stores ``[layer, pages, page_size, 1, dim]`` (flatten pages).
+    """
+    if src_loc is None or tgt_loc is None:
+        return
+    if int(tgt_loc.numel()) == 0:
+        return
+    src = src_loc.reshape(-1).to(dtype=torch.int64)
+    tgt = tgt_loc.reshape(-1).to(dtype=torch.int64)
+
+    def _copy_one(buf):
+        if buf is None:
+            return
+        if isinstance(buf, torch.Tensor):
+            _copy_token_slots(buf, src, tgt)
+            return
+        for layer_buf in buf:
+            _copy_token_slots(layer_buf, src, tgt)
+
+    _copy_one(k_buffer)
+    _copy_one(v_buffer)
+    _copy_one(index_k_buffer)
 
 
 def chain_tree_structure(

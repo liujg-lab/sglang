@@ -406,7 +406,10 @@ class TestRemoteSpecDevice(CustomTestCase):
         ).read_text()
         self.assertIn("def copy_paged_kv_buffer_by_slot", layout_src)
         self.assertIn("kv_buffer.view(kv2, layer, -1, head, dim)", layout_src)
-        self.assertIn(".copy_(", layout_src)
+        self.assertIn("flat.index_select(2, src)", layout_src)
+        self.assertIn("flat.index_copy_(2, tgt, staged)", layout_src)
+        self.assertNotIn("src_loc.reshape(-1).tolist()", layout_src)
+        self.assertNotIn("for i, s in enumerate", layout_src)
         self.assertNotIn("[:, :, tgt_page, tgt_off", layout_src)
 
         npu_src = (
@@ -1059,6 +1062,52 @@ class TestRemoteSpecDevice(CustomTestCase):
         copy_paged_kv_buffer_by_slot(got, src, tgt)
         torch.testing.assert_close(got, gold)
 
+    def test_copy_mha_kv_by_slot_matches_index_gold(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_mha_kv_by_slot,
+        )
+
+        parent_rows = torch.tensor([1, 0], dtype=torch.int64)
+        out_cache_loc = torch.tensor([5, 6], dtype=torch.int64)
+        src = out_cache_loc[parent_rows]
+        tgt = out_cache_loc
+
+        k_buf = [
+            torch.arange(12 * 1 * 2, dtype=torch.float32).reshape(12, 1, 2),
+            torch.arange(12 * 1 * 2, dtype=torch.float32).reshape(12, 1, 2) + 100,
+        ]
+        v_buf = [b.clone() + 50 for b in k_buf]
+        k_gold = []
+        v_gold = []
+        for kb, vb in zip(k_buf, v_buf):
+            kg = kb.clone()
+            vg = vb.clone()
+            kg.index_copy_(0, tgt, kb.index_select(0, src))
+            vg.index_copy_(0, tgt, vb.index_select(0, src))
+            k_gold.append(kg)
+            v_gold.append(vg)
+        k_got = [b.clone() for b in k_buf]
+        v_got = [b.clone() for b in v_buf]
+        copy_mha_kv_by_slot(k_got, v_got, src, tgt)
+        for got, gold in zip(k_got, k_gold):
+            torch.testing.assert_close(got, gold)
+        for got, gold in zip(v_got, v_gold):
+            torch.testing.assert_close(got, gold)
+
+        k5 = torch.arange(1 * 3 * 4 * 1 * 2, dtype=torch.float32).reshape(1, 3, 4, 1, 2)
+        v5 = k5.clone() + 7
+        k5_got = k5.clone()
+        v5_got = v5.clone()
+        copy_mha_kv_by_slot(k5_got, v5_got, src, tgt)
+        k5_gold = k5.clone()
+        v5_gold = v5.clone()
+        k_flat = k5_gold.view(1, -1, 1, 2)
+        v_flat = v5_gold.view(1, -1, 1, 2)
+        k_flat.index_copy_(1, tgt, k5.view(1, -1, 1, 2).index_select(1, src))
+        v_flat.index_copy_(1, tgt, v5.view(1, -1, 1, 2).index_select(1, src))
+        torch.testing.assert_close(k5_got, k5_gold)
+        torch.testing.assert_close(v5_got, v5_gold)
+
     def test_tree_draft_forward_rope_and_kv_remap_source_guards(self):
         drafter_src = (
             _REPO
@@ -1066,10 +1115,13 @@ class TestRemoteSpecDevice(CustomTestCase):
         ).read_text()
         self.assertIn("advance_tree_draft_positions_for_step", drafter_src)
         self.assertIn("copy_paged_kv_buffer_by_slot", drafter_src)
+        self.assertIn("copy_mha_kv_by_slot", drafter_src)
         self.assertIn("def _remap_tree_kv_to_parents", drafter_src)
+        self.assertIn("move_kv_cache", drafter_src)
         self.assertIn("parent_rows", drafter_src)
         self.assertNotIn("advance_tree_draft_positions(", drafter_src)
         self.assertIn("if is_device_context_error(e):", drafter_src)
+        self.assertNotIn("if kv_buffer is None:", drafter_src)
 
         spec_src = (_REPO / "python/sglang/srt/speculative/spec_utils.py").read_text()
         self.assertIn("def tree_reselect_parent_rows", spec_src)
