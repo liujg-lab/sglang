@@ -324,24 +324,63 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertNotIn("self.graphs[self.bs].replay()", src)
 
     def test_page_physical_kv_copy_matches_slot_to_page_offset(self):
+        def _copy_by_slot(kv_buffer, src_loc, tgt_loc):
+            n = int(tgt_loc.numel())
+            kv2, layer, _pages, _page_size, head, dim = kv_buffer.shape
+            flat = kv_buffer.view(kv2, layer, -1, head, dim)
+            src_list = src_loc.reshape(-1).tolist()
+            tgt_list = tgt_loc.reshape(-1).tolist()
+            staged = torch.empty(
+                (kv2, layer, n, head, dim),
+                dtype=kv_buffer.dtype,
+                device=kv_buffer.device,
+            )
+            for i, s in enumerate(src_list):
+                staged[:, :, i].copy_(flat[:, :, int(s)])
+            for i, t in enumerate(tgt_list):
+                flat[:, :, int(t)].copy_(staged[:, :, i])
+
+        def _gold_6d(buf, src, tgt, page_size):
+            src_page = torch.div(src, page_size, rounding_mode="floor")
+            src_off = src % page_size
+            tgt_page = torch.div(tgt, page_size, rounding_mode="floor")
+            tgt_off = tgt % page_size
+            out = buf.clone()
+            out[:, :, tgt_page, tgt_off, :, :] = buf[:, :, src_page, src_off, :, :]
+            return out
+
         page_size = 4
         buf = torch.arange(2 * 1 * 3 * 4 * 1 * 2, dtype=torch.float32).reshape(
             2, 1, 3, 4, 1, 2
         )
-        src = torch.tensor([5, 6], dtype=torch.int32)
-        tgt = torch.tensor([9, 10], dtype=torch.int32)
-        src_page = torch.div(src, page_size, rounding_mode="floor")
-        src_off = src % page_size
-        tgt_page = torch.div(tgt, page_size, rounding_mode="floor")
-        tgt_off = tgt % page_size
-        expected = buf[:, :, src_page, src_off, :, :].clone()
-        buf[:, :, tgt_page, tgt_off, :, :] = buf[:, :, src_page, src_off, :, :]
-        torch.testing.assert_close(buf[:, :, tgt_page, tgt_off, :, :], expected)
+        disjoint_src = torch.tensor([5, 6], dtype=torch.int32)
+        disjoint_tgt = torch.tensor([9, 10], dtype=torch.int32)
+        got = buf.clone()
+        _copy_by_slot(got, disjoint_src, disjoint_tgt)
+        torch.testing.assert_close(
+            got, _gold_6d(buf, disjoint_src, disjoint_tgt, page_size)
+        )
+
+        overlap_src = torch.tensor([5, 6], dtype=torch.int32)
+        overlap_tgt = torch.tensor([4, 5], dtype=torch.int32)
+        got_overlap = buf.clone()
+        _copy_by_slot(got_overlap, overlap_src, overlap_tgt)
+        torch.testing.assert_close(
+            got_overlap, _gold_6d(buf, overlap_src, overlap_tgt, page_size)
+        )
+
         npu_src = (
             _REPO / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
         ).read_text()
         self.assertIn("def move_kv_cache", npu_src)
-        self.assertIn("tgt_page", npu_src)
+        self.assertIn("def copy_paged_kv_buffer_by_slot", npu_src)
+        self.assertIn(
+            "copy_paged_kv_buffer_by_slot(self.kv_buffer, src_loc, tgt_loc)",
+            npu_src,
+        )
+        self.assertIn("kv_buffer.view(kv2, layer, -1, head, dim)", npu_src)
+        self.assertIn(".copy_(", npu_src)
+        self.assertNotIn("[:, :, tgt_page, tgt_off", npu_src)
         self.assertNotIn("copy_all_layer_kv_cache_tiled", npu_src)
         self.assertIn("enable_kv_cache_copy=False", npu_src)
         self.assertNotIn("enable_kv_cache_copy=enable_kv_cache_copy", npu_src)

@@ -15,6 +15,41 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 
+def copy_paged_kv_buffer_by_slot(
+    kv_buffer: torch.Tensor,
+    src_loc: torch.Tensor,
+    tgt_loc: torch.Tensor,
+) -> None:
+    """Copy token slots in a paged KV buffer without 6D advanced indexing.
+
+    ``kv_buffer`` is ``[2, layer, num_pages, page_size, head, dim]``. ``src_loc``
+    / ``tgt_loc`` are token-slot indices (``page * page_size + offset``).
+
+    torch_npu 6D gather/scatter of the full pool allocates a second copy of the
+    KV cache. Flatten to slots and copy with scalar slices + a small staging
+    buffer so overlapping src/tgt (tree compact) is memmove-safe.
+    """
+    if tgt_loc is None or src_loc is None:
+        return
+    n = int(tgt_loc.numel())
+    if n == 0:
+        return
+    # [2, layer, num_pages, page_size, head, dim] -> [2, layer, slots, head, dim]
+    kv2, layer, _pages, _page_size, head, dim = kv_buffer.shape
+    flat = kv_buffer.view(kv2, layer, -1, head, dim)
+    src_list = src_loc.reshape(-1).tolist()
+    tgt_list = tgt_loc.reshape(-1).tolist()
+    staged = torch.empty(
+        (kv2, layer, n, head, dim),
+        dtype=kv_buffer.dtype,
+        device=kv_buffer.device,
+    )
+    for i, s in enumerate(src_list):
+        staged[:, :, i].copy_(flat[:, :, int(s)])
+    for i, t in enumerate(tgt_list):
+        flat[:, :, int(t)].copy_(staged[:, :, i])
+
+
 class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def __init__(
@@ -185,24 +220,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         """Copy KV by token slot on the NPU page-physical layout.
 
         CUDA tiled copy kernels assume token-major ``(size, head, dim)`` strides
-        and must not be used here.
+        and must not be used here. Do not 6D-index ``kv_buffer``: torch_npu
+        materializes a temporary the size of the whole pool.
         """
-        if tgt_loc is None or src_loc is None:
-            return
-        n = int(tgt_loc.numel())
-        if n == 0:
-            return
-        src = src_loc.reshape(-1).to(dtype=torch.int32)
-        tgt = tgt_loc.reshape(-1).to(dtype=torch.int32)
-        page_size = int(self.page_size)
-        src_page = torch.div(src, page_size, rounding_mode="floor")
-        src_off = src % page_size
-        tgt_page = torch.div(tgt, page_size, rounding_mode="floor")
-        tgt_off = tgt % page_size
-        # kv_buffer: [2, layer, num_pages, page_size, head, dim]
-        self.kv_buffer[:, :, tgt_page, tgt_off, :, :] = self.kv_buffer[
-            :, :, src_page, src_off, :, :
-        ]
+        copy_paged_kv_buffer_by_slot(self.kv_buffer, src_loc, tgt_loc)
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
