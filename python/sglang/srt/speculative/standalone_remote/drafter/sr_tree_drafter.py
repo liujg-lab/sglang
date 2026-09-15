@@ -28,7 +28,9 @@ from sglang.srt.speculative.spec_utils import (
     get_last_loc_large_page_size_large_top_k,
     maybe_detect_nan,
     maybe_detect_oob,
+    paged_tree_mapping_fits,
     select_top_k_tokens,
+    split_draft_cache_locs,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -322,6 +324,19 @@ class SRTreeDrafter:
 
         num_seqs = batch.batch_size()
         token_to_kv_pool_state_backup = None
+        pool_len = batch.req_to_token_pool.req_to_token.shape[1]
+        if not paged_tree_mapping_fits(
+            batch.seq_lens,
+            self.page_size,
+            self.topk,
+            self.speculative_num_steps,
+            pool_len,
+        ):
+            raise RuntimeError(
+                "tree draft mapping exceeds req_to_token width: "
+                f"pool_len={pool_len} page_size={self.page_size} "
+                f"topk={self.topk} steps={self.speculative_num_steps}"
+            )
         if self.page_size == 1:
             alloc_len = self.speculative_num_steps * self.topk
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
@@ -399,13 +414,21 @@ class SRTreeDrafter:
                 source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
 
         try:
+            raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
+                out_cache_loc,
+                num_seqs,
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+            )
             assign_draft_cache_locs[(num_seqs,)](
                 batch.req_pool_indices,
                 batch.req_to_token_pool.req_to_token,
                 batch.seq_lens,
                 self.extend_lens,
                 self.num_new_pages_per_topk,
-                out_cache_loc,
+                raw_cache_loc,
+                draft_cache_loc,
                 source_cache_loc,
                 target_cache_loc,
                 last_page_lens_cumsum,
@@ -422,11 +445,7 @@ class SRTreeDrafter:
                     self.draft_model_runner.token_to_kv_pool.move_kv_cache(
                         target_cache_loc, source_cache_loc
                     )
-                # Remove padded slots (including last_page_len == 0).
-                out_cache_loc = out_cache_loc[
-                    : num_seqs * self.topk * self.speculative_num_steps
-                ]
-            batch.out_cache_loc = out_cache_loc
+            batch.out_cache_loc = draft_cache_loc
             batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
             batch.spec_info.positions = batch.seq_lens.repeat_interleave(
                 self.topk, dim=0

@@ -391,9 +391,14 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
-            extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+            from sglang.srt.speculative.spec_utils import req_to_token_extra_context_len
+
+            extra_max_context_len = req_to_token_extra_context_len(
+                self.server_args.speculative_num_draft_tokens,
+                page_size=self.server_args.page_size or 1,
+                topk=self.server_args.speculative_eagle_topk or 1,
+                num_steps=self.server_args.speculative_num_steps or 1,
+            )
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (

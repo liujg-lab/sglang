@@ -642,6 +642,69 @@ def assign_req_to_token_pool_func(
     )
 
 
+def paged_tree_mapping_end(
+    seq_len: int, page_size: int, topk: int, num_steps: int
+) -> int:
+    """Exclusive end column written into ``req_to_token`` for one paged tree."""
+    page = max(int(page_size), 1)
+    k = max(int(topk), 1)
+    steps = max(int(num_steps), 0)
+    length = max(int(seq_len), 0)
+    remainder = length % page
+    branch_pages = (remainder + steps + page - 1) // page
+    return length - remainder + k * branch_pages * page
+
+
+def paged_tree_mapping_extra(page_size: int, topk: int, num_steps: int) -> int:
+    """Conservative extra columns beyond context_len for branch expansion."""
+    page = int(page_size or 1)
+    k = int(topk or 1)
+    steps = int(num_steps or 0)
+    if page <= 1 or k <= 1:
+        return 0
+    branch_pages = (page - 1 + steps + page - 1) // page
+    return k * branch_pages * page
+
+
+def req_to_token_extra_context_len(
+    draft_tokens, page_size: int = 1, topk: int = 1, num_steps: int = 1
+) -> int:
+    base = 4 + int(draft_tokens or 0)
+    return max(base, paged_tree_mapping_extra(page_size, topk, num_steps))
+
+
+def paged_tree_mapping_fits(
+    seq_lens, page_size: int, topk: int, num_steps: int, pool_len: int
+) -> bool:
+    """True when every seq's branch mapping stays inside ``req_to_token``."""
+    if int(page_size) <= 1 or int(topk) <= 1:
+        return True
+    if hasattr(seq_lens, "tolist"):
+        lens = seq_lens.tolist()
+    else:
+        lens = list(seq_lens or [])
+    pool = int(pool_len)
+    return all(
+        paged_tree_mapping_end(int(length), page_size, topk, num_steps) <= pool
+        for length in lens
+    )
+
+
+def split_draft_cache_locs(raw, num_seqs, topk, num_steps, page_size):
+    """Separate paged expand slots from compact draft slots.
+
+    ``topk==1`` or ``page_size==1`` keep a single buffer.
+    """
+    if int(page_size) > 1 and int(topk) > 1:
+        draft = torch.empty(
+            int(num_seqs) * int(topk) * int(num_steps),
+            dtype=raw.dtype,
+            device=raw.device,
+        )
+        return raw, draft
+    return raw, raw
+
+
 @triton.jit
 def assign_draft_cache_locs(
     req_pool_indices,
@@ -649,7 +712,8 @@ def assign_draft_cache_locs(
     seq_lens,
     extend_lens,
     num_new_pages_per_topk,
-    out_cache_loc,
+    raw_cache_loc,
+    draft_cache_loc,
     source_cache_loc,
     target_cache_loc,
     last_page_lens_cumsum,
@@ -666,12 +730,14 @@ def assign_draft_cache_locs(
 
     if page_size == 1 or topk == 1:
         copy_len = topk * speculative_num_steps
-        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
+        out_cache_ptr = raw_cache_loc + pid * topk * speculative_num_steps
     else:
         bs_offset = tl.arange(0, bs_upper)
         copy_len = tl.load(extend_lens + pid)
-        cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
-        out_cache_ptr = out_cache_loc + cum_copy_len
+        cum_copy_len = tl.sum(
+            tl.load(extend_lens + bs_offset, mask=bs_offset < pid, other=0)
+        )
+        out_cache_ptr = raw_cache_loc + cum_copy_len
 
     # Part 1: Copy from out_cache_loc to req_to_token
     kv_start = tl.load(seq_lens + pid)
@@ -746,7 +812,7 @@ def assign_draft_cache_locs(
             # For example, token pool is (1, 2, 3, 4 ,5) and last page is 1,
             # we write 2, 3, 4 to the front of out_cache_loc.
             tl.store(
-                out_cache_loc
+                draft_cache_loc
                 + ptr_offset
                 + topk_id * speculative_num_steps
                 - last_page_len
@@ -878,7 +944,7 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid, other=0)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
     copy_len = tl.load(accept_length + bid) + 1
     out_cache_loc_row = tl.load(
@@ -891,7 +957,9 @@ def get_target_cache_loc(
     )
 
     # write the second part to to_free_num_pages
-    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
+    to_free_num_slots_all = tl.load(
+        to_free_num_slots + bs_offset, mask=bs_offset < bid, other=0
+    )
     to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
     out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
     to_free_slots_start = tl.sum(to_free_num_slots_all)
@@ -940,11 +1008,11 @@ def filter_finished_cache_loc_kernel(
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid, other=0)
     old_start = tl.sum(accept_length_all) + bid
 
     accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+        accept_length_filter + bs_offset, mask=bs_offset < bid, other=0
     )
     new_start = tl.sum(accept_length_filter_all)
 
