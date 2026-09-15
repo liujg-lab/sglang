@@ -70,6 +70,9 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # STANDALONE_REMOTE: capture tree-seed top-k before sampler mutates logits.
+    tree_seed_topk: int = 0
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -184,6 +187,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            tree_seed_topk=int(getattr(batch, "tree_seed_topk", 0) or 0),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret

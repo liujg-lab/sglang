@@ -102,6 +102,23 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
 
+        tree_seed_topk = int(getattr(sampling_info, "tree_seed_topk", 0) or 0)
+        if tree_seed_topk > 0 and logits is not None:
+            from sglang.srt.speculative.standalone_remote.sr_align import (
+                capture_tree_seed_topk,
+            )
+
+            if sampling_info.is_all_greedy:
+                seed_src = logits
+            else:
+                seed_src = logits / sampling_info.temperatures
+            (
+                logits_output.tree_seed_topk_p,
+                logits_output.tree_seed_topk_index,
+            ) = capture_tree_seed_topk(seed_src, tree_seed_topk)
+            if seed_src is not logits:
+                del seed_src
+
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)

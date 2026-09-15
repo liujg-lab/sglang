@@ -27,8 +27,11 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     find_fork_point,
     ingest_active_indices,
     is_device_context_error,
+    last_token_in_kv,
     plan_committed_ingest,
+    plan_tree_seed_recovery,
     replay_grammar_from_committed,
+    tree_seed_matches_prefix,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     slice_decode_batch_row,
@@ -126,6 +129,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Request last-token hidden for tree seed without HTTP FULL capture."""
         batch.return_hidden_states = False
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.tree_seed_topk = max(
+            1, int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
+        )
 
     def _sr_is_http_req(self, req: Req) -> bool:
         """HTTP generate reqs are unmarked; Target RPC reqs set is_sr_draft."""
@@ -741,15 +747,20 @@ class StandaloneRemoteDraftSchedulerMixin:
 
         prefix_len = self.sr_kv.get_prefix_len(req)
         kind = classify_prefix_alignment(local, target, prefix_len)
-        current_kv = int(getattr(req, "kv_allocated_len", 0) or 0)
-        if current_kv <= 0:
-            current_kv = max(0, len(local) - 1)
+        allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+        if allocated <= 0:
+            allocated = max(0, len(local) - 1)
+        committed = int(getattr(req, "kv_committed_len", 0) or 0)
         _, fork = find_fork_point(local, target)
 
         if kind == "replace_tail":
             req.output_ids[-1] = target[-1]
+            req.sr_tree_seed = None
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
+            if last_token_in_kv(fork, committed):
+                if not self.sr_kv.rollback(req, fork, allocated):
+                    self._sr_reprefill(req, target, dreq, state)
             return
         if kind in ("append_one", "append_n"):
             req.output_ids.extend(target[len(local) :])
@@ -757,12 +768,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.draft_tokens_target = dreq.num_draft_tokens
             return
         if kind == "local_rollback" and fork == len(target) and self.sr_kv.rollback(
-            req, fork, current_kv
+            req, fork, allocated
         ):
             extra = len(local) - fork
             if extra > 0 and req.output_ids:
                 keep = max(0, len(req.output_ids) - extra)
                 req.output_ids = req.output_ids[:keep]
+            req.sr_tree_seed = None
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
@@ -795,42 +807,48 @@ class StandaloneRemoteDraftSchedulerMixin:
     ) -> None:
         """Cache one tree seed per req. ``reqs`` must match the GPU batch rows."""
         logits_output = getattr(result, "logits_output", None)
-        if logits_output is None or logits_output.next_token_logits is None:
+        if logits_output is None:
             return
         hidden = getattr(logits_output, "hidden_states", None)
-        if hidden is None:
+        topk_p_all = getattr(logits_output, "tree_seed_topk_p", None)
+        topk_index_all = getattr(logits_output, "tree_seed_topk_index", None)
+        if hidden is None or topk_p_all is None or topk_index_all is None:
+            if hidden is not None:
+                logger.warning(
+                    "[SR] skip tree seed for %s: missing pre-sample top-k "
+                    "(hidden=%s topk_p=%s)",
+                    [r.rid for r in reqs],
+                    None if hidden is None else tuple(hidden.shape),
+                    None if topk_p_all is None else tuple(topk_p_all.shape),
+                )
             return
-        logits = logits_output.next_token_logits
         n = len(reqs)
         token_lens = self._sr_token_lens_for_seed(reqs, batch)
         try:
-            from sglang.srt.speculative.spec_utils import fast_topk
-
-            topk = max(1, int(self.server_args.speculative_eagle_topk or 1))
             skipped: List[str] = []
             for i, req in enumerate(reqs):
-                row_logits = slice_decode_batch_row(logits, i, n, token_lens)
+                row_p = slice_decode_batch_row(topk_p_all, i, n, None)
+                row_ix = slice_decode_batch_row(topk_index_all, i, n, None)
                 row_hidden = slice_decode_batch_row(hidden, i, n, token_lens)
-                if row_logits is None or row_hidden is None:
+                if row_p is None or row_ix is None or row_hidden is None:
                     skipped.append(req.rid)
                     continue
-                probs = torch.softmax(row_logits, dim=-1)
-                topk_p, topk_index = fast_topk(probs, topk, dim=-1)
                 token_id = (
                     req.output_ids[-1]
                     if req.output_ids
                     else req.origin_input_ids[-1]
                 )
                 verified_id = torch.tensor(
-                    [token_id], dtype=torch.int64, device=row_logits.device
+                    [token_id], dtype=torch.int64, device=row_hidden.device
                 )
-                req.sr_tree_seed = (topk_p, topk_index, row_hidden, verified_id)
+                req.sr_tree_seed = (row_p, row_ix, row_hidden, verified_id)
             if skipped:
                 logger.warning(
-                    "[SR] skip tree seed for %s: logits/hidden %s/%s "
+                    "[SR] skip tree seed for %s: topk/hidden %s/%s/%s "
                     "batch=%s extend_lens=%s",
                     skipped,
-                    tuple(logits.shape),
+                    tuple(topk_p_all.shape),
+                    tuple(topk_index_all.shape),
                     tuple(hidden.shape),
                     n,
                     token_lens,
@@ -1074,12 +1092,53 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.output_ids = committed
             req.draft_generation_start_len = len(committed)
 
+    def _sr_ensure_tree_seeds(self, reqs: List[Req]) -> None:
+        """Rebuild seed when prefix KV is complete but last-token logits are gone."""
+        recapture: List[Req] = []
+        reprefill: List[Req] = []
+        for req in reqs:
+            committed = int(getattr(req, "kv_committed_len", 0) or 0)
+            seed_ok = tree_seed_matches_prefix(
+                getattr(req, "sr_tree_seed", None),
+                req.origin_input_ids or [],
+                req.output_ids or [],
+            )
+            can_last = False
+            kv = getattr(self, "sr_kv", None)
+            if kv is not None and committed > 0:
+                can_last = bool(kv.can_local_rollback(req, committed - 1))
+            action = plan_tree_seed_recovery(
+                len(req.origin_input_ids or []),
+                req.output_ids,
+                committed,
+                seed_ok,
+                can_last,
+            )
+            if action == "recapture_last":
+                recapture.append(req)
+            elif action == "reprefill":
+                reprefill.append(req)
+        failed_recapture: List[Req] = []
+        for req in recapture:
+            committed = int(getattr(req, "kv_committed_len", 0) or 0)
+            allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+            if committed <= 0 or not self.sr_kv.rollback(
+                req, committed - 1, allocated
+            ):
+                failed_recapture.append(req)
+                continue
+            self._sr_ingest_committed_batch([req])
+        need_reprefill = reprefill + failed_recapture
+        if need_reprefill:
+            self._sr_reprefill_committed(need_reprefill)
+
     def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
         empty: SRWindow = ([], None, None)
         if not reqs:
             return []
         self._sr_materialize_prefix_batch(reqs)
         self._sr_ingest_committed_batch(reqs)
+        self._sr_ensure_tree_seeds(reqs)
         self._sr_replay_grammars(reqs)
         windows: List[SRWindow] = [empty] * len(reqs)
         ready: List[Req] = []

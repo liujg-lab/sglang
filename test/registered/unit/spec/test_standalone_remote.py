@@ -22,6 +22,7 @@ from sglang.srt.speculative.spec_info import (
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DraftDecision,
     broadcast_sr_obj,
+    capture_tree_seed_topk,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
     decide_draft_action,
@@ -30,7 +31,9 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     drop_duplicate_root_draft,
     find_fork_point,
     ingest_active_indices,
+    last_token_in_kv,
     plan_committed_ingest,
+    plan_tree_seed_recovery,
     replay_grammar_from_committed,
     shift_overlapped_prefill_drafts,
     unwrap_tp_broadcast,
@@ -295,10 +298,14 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
             )
         except ImportError as e:
             self.skipTest(str(e))
+        mixin = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_eagle_topk=4)
+        )
         batch = SimpleNamespace(return_hidden_states=True, capture_hidden_mode=None)
-        StandaloneRemoteDraftSchedulerMixin._sr_enable_tree_seed_hidden(None, batch)
+        StandaloneRemoteDraftSchedulerMixin._sr_enable_tree_seed_hidden(mixin, batch)
         self.assertFalse(batch.return_hidden_states)
         self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.LAST)
+        self.assertEqual(batch.tree_seed_topk, 4)
 
     def test_schedule_batch_resolves_last_unless_http_full(self):
         try:
@@ -537,6 +544,87 @@ class TestForkPointAlign(CustomTestCase):
         self.assertEqual(
             classify_prefix_alignment([1, 2, 3], [9, 8, 7], 2), "reprefill"
         )
+
+    def test_last_token_in_kv_uses_committed_not_allocated(self):
+        self.assertTrue(last_token_in_kv(127, 128))
+        self.assertFalse(last_token_in_kv(127, 127))
+        self.assertFalse(last_token_in_kv(127, 126))
+
+    def test_capture_tree_seed_topk_matches_softmax_topk(self):
+        if torch is None:
+            self.skipTest("torch is required")
+        logits = torch.tensor(
+            [[1.0, 2.0, 0.5, -1.0], [0.1, 0.2, 3.0, 0.0]],
+            dtype=torch.float32,
+        )
+        vals, idx = capture_tree_seed_topk(logits, 2)
+        expect_vals, expect_idx = torch.topk(
+            torch.softmax(logits.float(), dim=-1), 2, dim=-1
+        )
+        self.assertTrue(torch.allclose(vals, expect_vals))
+        self.assertTrue(torch.equal(idx, expect_idx))
+
+    def test_plan_tree_seed_recovery(self):
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                10, [7, 8], 10, seed_ok=True, can_rollback_last_slot=True
+            ),
+            "ingest",
+        )
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                10, [7, 8], 12, seed_ok=True, can_rollback_last_slot=False
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                10, [7], 11, seed_ok=False, can_rollback_last_slot=True
+            ),
+            "recapture_last",
+        )
+        # Rollback to 128 can be legal on page_size=128; dropping 127 is not.
+        self.assertEqual(
+            plan_tree_seed_recovery(
+                128, [], 128, seed_ok=False, can_rollback_last_slot=False
+            ),
+            "reprefill",
+        )
+
+
+class TestSRTreeSeedSourceGuard(CustomTestCase):
+    def test_sampler_captures_topk_before_inplace_softmax(self):
+        from pathlib import Path
+
+        sampler_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/layers/sampler.py"
+        )
+        if not sampler_path.is_file():
+            self.skipTest(f"missing {sampler_path}")
+        src = sampler_path.read_text()
+        capture = src.find("capture_tree_seed_topk")
+        softmax_assign = src.find("logits[:] = torch.softmax")
+        self.assertGreater(capture, 0)
+        self.assertGreater(softmax_assign, capture)
+
+    def test_cache_tree_seeds_uses_precomputed_topk(self):
+        from pathlib import Path
+
+        mixin_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/"
+            "sr_draft_scheduler_mixin.py"
+        )
+        if not mixin_path.is_file():
+            self.skipTest(f"missing {mixin_path}")
+        src = mixin_path.read_text()
+        start = src.find("def _sr_cache_tree_seeds")
+        self.assertGreater(start, 0)
+        nxt = src.find("\n    def ", start + 1)
+        body = src[start : nxt if nxt > start else None]
+        self.assertIn("tree_seed_topk_p", body)
+        self.assertNotIn("softmax", body)
 
 
 class TestDraftDecision(CustomTestCase):
@@ -2399,20 +2487,14 @@ class TestSRDraftBusyReject(CustomTestCase):
             )
         except ImportError as e:
             self.skipTest(str(e))
-        if torch is None:
-            self.skipTest("torch is required")
         mixin = self._make_draft_mixin()
         req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
         result = MagicMock()
-        result.logits_output.next_token_logits = MagicMock()
         result.logits_output.hidden_states = MagicMock()
-        row = MagicMock()
-        row.device = "cpu"
+        result.logits_output.tree_seed_topk_p = MagicMock()
+        result.logits_output.tree_seed_topk_index = MagicMock()
         with patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
-            return_value=row,
-        ), patch(
-            "torch.softmax",
             side_effect=RuntimeError(
                 "CUDA error: an illegal memory access was encountered"
             ),
@@ -2431,13 +2513,69 @@ class TestSRDraftBusyReject(CustomTestCase):
         mixin = self._make_draft_mixin()
         req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
         result = MagicMock()
-        result.logits_output.next_token_logits = MagicMock()
         result.logits_output.hidden_states = MagicMock()
+        result.logits_output.tree_seed_topk_p = MagicMock()
+        result.logits_output.tree_seed_topk_index = MagicMock()
         with patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
             side_effect=ValueError("shape mismatch"),
         ):
             mixin._sr_cache_tree_seeds([req], result, None)
+
+    def test_align_replace_tail_written_last_token_rollbacks_allocated(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        mixin._sr_reprefill = MagicMock()
+        mixin.sr_kv.get_prefix_len.return_value = 2
+        mixin.sr_kv.rollback.return_value = True
+        req = SimpleNamespace(
+            origin_input_ids=[1, 2],
+            output_ids=[9],
+            sr_padded_ids=[1, 2],
+            sr_tree_seed=object(),
+            kv_committed_len=3,
+            kv_allocated_len=5,
+            draft_generation_start_len=0,
+            draft_tokens_target=0,
+        )
+        dreq = SimpleNamespace(committed_ids=[8], num_draft_tokens=4)
+        mixin._sr_align(req, dreq, SimpleNamespace())
+        self.assertEqual(req.output_ids, [8])
+        self.assertIsNone(req.sr_tree_seed)
+        mixin.sr_kv.rollback.assert_called_once_with(req, 2, 5)
+        mixin._sr_reprefill.assert_not_called()
+
+    def test_align_replace_tail_unwritten_does_not_rollback(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        mixin._sr_reprefill = MagicMock()
+        mixin.sr_kv.get_prefix_len.return_value = 2
+        req = SimpleNamespace(
+            origin_input_ids=[1, 2],
+            output_ids=[9],
+            sr_padded_ids=[1, 2],
+            sr_tree_seed=object(),
+            kv_committed_len=2,
+            kv_allocated_len=5,
+            draft_generation_start_len=0,
+            draft_tokens_target=0,
+        )
+        dreq = SimpleNamespace(committed_ids=[8], num_draft_tokens=4)
+        mixin._sr_align(req, dreq, SimpleNamespace())
+        self.assertEqual(req.output_ids, [8])
+        self.assertIsNone(req.sr_tree_seed)
+        mixin.sr_kv.rollback.assert_not_called()
+        mixin._sr_reprefill.assert_not_called()
 
     def test_cuda_context_error_helper(self):
         try:

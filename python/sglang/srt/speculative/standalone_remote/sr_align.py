@@ -5,6 +5,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple
 
+import torch
+
 from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
 
@@ -114,6 +116,62 @@ def committed_tail_not_in_kv(
     """
     already = max(0, int(kv_len) - int(origin_len))
     return list(output_ids or [])[already:]
+
+
+def last_token_in_kv(fork: int, kv_committed_len: int) -> bool:
+    """True when the token at ``fork`` already has valid written KV."""
+    return int(kv_committed_len) > int(fork)
+
+
+def capture_tree_seed_topk(logits: torch.Tensor, topk: int):
+    """Softmax + top-k; caller must not keep the full vocab tensor."""
+    probs = torch.softmax(logits.float(), dim=-1)
+    k = min(max(int(topk), 1), int(probs.shape[-1]))
+    return torch.topk(probs, k, dim=-1)
+
+
+def tree_seed_matches_prefix(seed, origin_ids: Sequence[int], output_ids: Sequence[int]) -> bool:
+    """True when cached ``verified_id`` is the current last committed token."""
+    if seed is None or not isinstance(seed, (tuple, list)) or len(seed) < 4:
+        return False
+    verified = seed[3]
+    if verified is None:
+        return False
+    try:
+        if isinstance(verified, torch.Tensor):
+            token = int(verified.reshape(-1)[0].item())
+        else:
+            token = int(verified)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if output_ids:
+        last = int(output_ids[-1])
+    elif origin_ids:
+        last = int(origin_ids[-1])
+    else:
+        return False
+    return token == last
+
+
+def plan_tree_seed_recovery(
+    origin_len: int,
+    output_ids: Optional[Sequence[int]],
+    kv_committed_len: int,
+    seed_ok: bool,
+    can_rollback_last_slot: bool,
+) -> str:
+    """How to get a tree seed after align/ingest.
+
+    Returns ``ok``, ``ingest``, ``recapture_last``, or ``reprefill``.
+    """
+    leftover = committed_tail_not_in_kv(origin_len, output_ids, kv_committed_len)
+    if leftover:
+        return "ingest"
+    if seed_ok:
+        return "ok"
+    if can_rollback_last_slot:
+        return "recapture_last"
+    return "reprefill"
 
 
 DEFAULT_MAX_INGEST_DECODE_STEPS = 16
