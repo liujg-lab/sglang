@@ -94,3 +94,25 @@ def locs_to_page_ids(locs: torch.Tensor, page_size: int) -> torch.Tensor:
     if locs.numel() == 0:
         return locs.to(dtype=torch.int32)
     return (locs.to(dtype=torch.int64) // page_size).to(dtype=torch.int32)
+
+
+def inplace_update_graph_tree_attn_mask(
+    buf: torch.Tensor, converted: torch.Tensor
+) -> torch.Tensor:
+    """Copy a converted tree mask into the captured graph buffer in place.
+
+    Padding stays True (masked). Returns ``buf`` itself so FIA keeps the
+    capture-time storage, shape, and stride.
+    """
+    if converted.dim() != 2:
+        raise ValueError(
+            f"converted tree mask must be 2D, got shape {tuple(converted.shape)}"
+        )
+    if converted.shape[0] > buf.shape[0] or converted.shape[1] > buf.shape[1]:
+        raise RuntimeError(
+            f"Ascend tree mask {tuple(converted.shape)} exceeds graph buffer "
+            f"{tuple(buf.shape)}"
+        )
+    buf.fill_(True)
+    buf[: converted.shape[0], : converted.shape[1]].copy_(converted)
+    return buf

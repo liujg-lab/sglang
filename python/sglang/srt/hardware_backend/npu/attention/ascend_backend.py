@@ -30,7 +30,10 @@ from sglang.srt.speculative.spec_utils import (
     expand_seq_lens_for_spec_topk,
     normalize_tree_draft_kv_lens,
 )
-from sglang.srt.speculative.tree_attn_mask import custom_mask_to_ascend_masked
+from sglang.srt.speculative.tree_attn_mask import (
+    custom_mask_to_ascend_masked,
+    inplace_update_graph_tree_attn_mask,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -350,20 +353,10 @@ class AscendAttnBackend(AttentionBackend):
             num_draft,
             device=self.device,
         )
-        if (
-            self.graph_mode
-            and self.cuda_graph_tree_attn_mask is not None
-            and tree_mask.shape[0] <= self.cuda_graph_tree_attn_mask.shape[0]
-            and tree_mask.shape[1] <= self.cuda_graph_tree_attn_mask.shape[1]
-        ):
-            self.cuda_graph_tree_attn_mask.zero_()
-            self.cuda_graph_tree_attn_mask.fill_(True)
-            self.cuda_graph_tree_attn_mask[
-                : tree_mask.shape[0], : tree_mask.shape[1]
-            ].copy_(tree_mask)
-            tree_mask = self.cuda_graph_tree_attn_mask[
-                : tree_mask.shape[0], : tree_mask.shape[1]
-            ]
+        if self.graph_mode and self.cuda_graph_tree_attn_mask is not None:
+            tree_mask = inplace_update_graph_tree_attn_mask(
+                self.cuda_graph_tree_attn_mask, tree_mask
+            )
         self.forward_metadata.tree_attn_mask = tree_mask
         self.forward_metadata.tree_kv_lens = [
             int(s) + num_draft for s in seq_lens.tolist()
@@ -680,6 +673,12 @@ class AscendAttnBackend(AttentionBackend):
                 ),
                 device=seq_lens.device,
             )
+
+        if (
+            forward_mode.is_target_verify()
+            and self.cuda_graph_tree_attn_mask is not None
+        ):
+            metadata.tree_attn_mask = self.cuda_graph_tree_attn_mask
 
         self.graph_metadata[bs] = metadata
         self.forward_metadata = metadata
