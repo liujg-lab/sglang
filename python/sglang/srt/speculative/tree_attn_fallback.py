@@ -11,6 +11,7 @@ without torchvision.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Sequence, Union
 
 import torch
@@ -24,21 +25,61 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 
 DEFAULT_ATTN_CHUNK_SIZE = 256
 
+logger = logging.getLogger(__name__)
+_LOGGED_TREE_VERIFY_FALLBACK = False
+
+
+def verify_tree_topk_from_server_args(server_args) -> int:
+    """Target verify tree width from launch args, not Draft ``draft_topk``."""
+    return max(int(getattr(server_args, "speculative_eagle_topk", 1) or 1), 1)
+
+
+def resolve_backend_topks(ctor_draft_topk, server_args):
+    """Mirror AscendAttnBackend construction: Draft layout vs Target verify width.
+
+    Target factory leaves ``ctor_draft_topk=1``. Verify fallback must use
+    ``speculative_eagle_topk`` from ``server_args``.
+    """
+    draft_topk = max(int(ctor_draft_topk), 1)
+    verify_tree_topk = verify_tree_topk_from_server_args(server_args)
+    return draft_topk, verify_tree_topk
+
 
 def use_tree_verify_fallback(
-    is_target_verify: bool, draft_topk: int, custom_mask
+    is_target_verify: bool, verify_tree_topk: int, custom_mask
 ) -> bool:
-    """True when TARGET_VERIFY must skip FIA and gather by slot."""
+    """True when TARGET_VERIFY must skip FIA and gather by slot.
+
+    Missing ``custom_mask`` on a tree verify must not silently use linear FIA.
+    """
     if not is_target_verify:
         return False
-    if int(draft_topk) <= 1:
+    if int(verify_tree_topk) <= 1:
         return False
     if custom_mask is None:
-        return False
+        raise RuntimeError(
+            "TARGET_VERIFY tree attention requires custom_mask; "
+            "refusing to fall back to linear FIA"
+        )
     numel = getattr(custom_mask, "numel", None)
     if callable(numel) and int(numel()) == 0:
-        return False
+        raise RuntimeError(
+            "TARGET_VERIFY tree attention requires a non-empty custom_mask; "
+            "refusing to fall back to linear FIA"
+        )
     return True
+
+
+def log_tree_verify_fallback_once(verify_tree_topk: int) -> None:
+    """Log once when slot-gather tree verify actually runs."""
+    global _LOGGED_TREE_VERIFY_FALLBACK
+    if _LOGGED_TREE_VERIFY_FALLBACK:
+        return
+    _LOGGED_TREE_VERIFY_FALLBACK = True
+    logger.info(
+        "tree verify slot-gather fallback enabled topk=%s",
+        int(verify_tree_topk),
+    )
 
 
 def should_skip_npu_target_verify_graph(device, draft_topk: int) -> bool:

@@ -7,6 +7,7 @@ from ``tree_attn_fallback``; wiring is source-guarded via AST.
 import ast
 import math
 import pathlib
+import types
 import unittest
 
 import torch
@@ -15,9 +16,11 @@ from sglang.srt.speculative.tree_attn_fallback import (
     chunked_attend,
     flatten_paged_kv,
     gather_kv_by_slots,
+    resolve_backend_topks,
     should_skip_npu_target_verify_graph,
     tree_verify_attention,
     use_tree_verify_fallback,
+    verify_tree_topk_from_server_args,
 )
 from sglang.srt.speculative.tree_attn_mask import visible_token_indices
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,6 +55,17 @@ def _function_source(path: pathlib.Path, name: str) -> str:
     raise AssertionError(f"{name} not found in {path}")
 
 
+def _class_method_source(path: pathlib.Path, class_name: str, method_name: str) -> str:
+    text = path.read_text()
+    tree = ast.parse(text)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == method_name:
+                    return ast.get_source_segment(text, child) or ast.unparse(child)
+    raise AssertionError(f"{class_name}.{method_name} not found in {path}")
+
+
 def _dense_attend(q, k, v, scale, q_rope=None, k_rope=None):
     q = q.reshape(-1, q.shape[-1]).float()
     n_q = q.shape[0]
@@ -76,8 +90,27 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertTrue(use_tree_verify_fallback(True, 3, mask))
         self.assertFalse(use_tree_verify_fallback(True, 1, mask))
         self.assertFalse(use_tree_verify_fallback(False, 3, mask))
-        self.assertFalse(use_tree_verify_fallback(True, 3, None))
-        self.assertFalse(use_tree_verify_fallback(True, 3, torch.empty(0)))
+        self.assertFalse(use_tree_verify_fallback(True, 1, None))
+        with self.assertRaises(RuntimeError) as ctx:
+            use_tree_verify_fallback(True, 3, None)
+        self.assertIn("custom_mask", str(ctx.exception))
+        self.assertIn("linear FIA", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            use_tree_verify_fallback(True, 3, torch.empty(0))
+
+    def test_target_factory_wiring_keeps_draft_topk_one(self):
+        args = types.SimpleNamespace(speculative_eagle_topk=3)
+        self.assertEqual(verify_tree_topk_from_server_args(args), 3)
+        self.assertEqual(verify_tree_topk_from_server_args(types.SimpleNamespace()), 1)
+        draft_topk, verify_topk = resolve_backend_topks(1, args)
+        self.assertEqual(draft_topk, 1)
+        self.assertEqual(verify_topk, 3)
+        mask = torch.ones(4, dtype=torch.bool)
+        self.assertTrue(use_tree_verify_fallback(True, verify_topk, mask))
+        self.assertFalse(use_tree_verify_fallback(True, draft_topk, mask))
+        draft_topk, verify_topk = resolve_backend_topks(3, args)
+        self.assertEqual(draft_topk, 3)
+        self.assertEqual(verify_topk, 3)
 
     def test_skip_verify_graph_npu_tree_only(self):
         self.assertTrue(should_skip_npu_target_verify_graph("npu", 3))
@@ -261,15 +294,24 @@ class TestTreeAttnFallback(CustomTestCase):
         src = _function_source(_ASCEND_BACKEND, "forward_mtp")
         self.assertIn("use_tree_verify_fallback", src)
         self.assertIn("tree_verify_attention", src)
+        self.assertIn("self.verify_tree_topk", src)
+        self.assertIn("log_tree_verify_fallback_once", src)
         self.assertIn("atten_mask=self.mtp_mask", src)
         self.assertIn("sparse_mode=3", src)
         self.assertNotIn("sparse_mode=0", src)
         self.assertNotIn("tree_mask if use_tree", src)
         self.assertNotIn("locs_to_page_ids", src)
+        self.assertEqual(src.count("self.draft_topk"), 0)
+        self.assertGreaterEqual(src.count("self.verify_tree_topk"), 2)
 
         fallback_src = _FALLBACK.read_text()
         self.assertNotIn("locs_to_page_ids", fallback_src)
         self.assertNotIn("// page_size", fallback_src)
+        self.assertIn("refusing to fall back to linear FIA", fallback_src)
+
+        init_src = _class_method_source(_ASCEND_BACKEND, "AscendAttnBackend", "__init__")
+        self.assertIn("self.verify_tree_topk = verify_tree_topk_from_server_args", init_src)
+        self.assertIn("self.draft_topk = max(int(draft_topk), 1)", init_src)
 
     def test_capture_does_not_bind_tree_mask_to_fia(self):
         capture_src = _function_source(

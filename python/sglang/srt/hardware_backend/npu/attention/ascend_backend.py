@@ -31,8 +31,10 @@ from sglang.srt.speculative.spec_utils import (
     normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
+    log_tree_verify_fallback_once,
     tree_verify_attention,
     use_tree_verify_fallback,
+    verify_tree_topk_from_server_args,
 )
 from sglang.srt.speculative.tree_attn_mask import (
     custom_mask_to_ascend_masked,
@@ -238,6 +240,9 @@ class AscendAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
         self.draft_topk = max(int(draft_topk), 1)
+        self.verify_tree_topk = verify_tree_topk_from_server_args(
+            model_runner.server_args
+        )
         self.draft_num_steps = max(int(draft_num_steps), 0)
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -1655,7 +1660,7 @@ class AscendAttnBackend(AttentionBackend):
             )
             if use_tree_verify_fallback(
                 forward_batch.forward_mode.is_target_verify(),
-                self.draft_topk,
+                self.verify_tree_topk,
                 custom_mask,
             ):
                 num_draft = int(
@@ -1663,6 +1668,7 @@ class AscendAttnBackend(AttentionBackend):
                     or self.speculative_num_draft_tokens
                     or 1
                 )
+                log_tree_verify_fallback_once(self.verify_tree_topk)
                 attn_output = tree_verify_attention(
                     query,
                     k_cache,
@@ -1758,7 +1764,7 @@ class AscendAttnBackend(AttentionBackend):
             )
             if use_tree_verify_fallback(
                 forward_batch.forward_mode.is_target_verify(),
-                self.draft_topk,
+                self.verify_tree_topk,
                 custom_mask,
             ):
                 num_draft = int(
@@ -1766,6 +1772,7 @@ class AscendAttnBackend(AttentionBackend):
                     or self.speculative_num_draft_tokens
                     or 1
                 )
+                log_tree_verify_fallback_once(self.verify_tree_topk)
                 attn_output = tree_verify_attention(
                     q_nope,
                     c_kv,
