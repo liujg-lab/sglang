@@ -70,6 +70,9 @@ from sglang.srt.speculative.spec_info import (
     decode_cuda_graph_accepts_spec_info,
     resolve_cuda_graph_capture_hidden_mode,
 )
+from sglang.srt.speculative.tree_attn_fallback import (
+    should_skip_npu_target_verify_graph,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -608,6 +611,18 @@ class CudaGraphRunner:
             )
         else:
             self.spectre_ntpb_options = None
+        if self.dual_ntpb and should_skip_npu_target_verify_graph(
+            self.device,
+            int(getattr(model_runner.server_args, "speculative_eagle_topk", 1) or 1),
+        ):
+            self.spectre_ntpb_options = [1]
+            tag = "[Spectre CudaGraph]" if self.is_spectre else "[SR CudaGraph]"
+            log_info_on_rank0(
+                logger,
+                f"{tag} skip TARGET_VERIFY NPU graph (topk>1); "
+                "tree verify uses eager slot-gather fallback; "
+                "capturing ntpb=1 AR only",
+            )
         self.actual_ntpb = self.num_tokens_per_bs
         self._captured_attn_tensors = {}
 

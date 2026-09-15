@@ -40,13 +40,6 @@ def _function_source(path: pathlib.Path, name: str) -> str:
     raise AssertionError(f"{name} not found in {path}")
 
 
-def _select_verify_atten_mask(tree_attn_mask, mtp_mask, is_target_verify):
-    use_tree = is_target_verify and tree_attn_mask is not None
-    atten_mask = tree_attn_mask if use_tree else mtp_mask
-    sparse_mode = 0 if use_tree else 3
-    return atten_mask, sparse_mode, use_tree
-
-
 class TestTreeAttnMask(CustomTestCase):
     def test_cuda_true_attend_becomes_ascend_masked_false(self):
         # One request, seq_len=2, num_draft=2. Flattened FULL_MASK rows of length 4.
@@ -82,6 +75,7 @@ class TestTreeAttnMask(CustomTestCase):
     def test_fia_contract_and_padding_is_masked(self):
         self.assertEqual(FIA_TREE_MASK_CONTRACT["ascend_true"], "masked")
         self.assertEqual(FIA_TREE_MASK_CONTRACT["sparse_mode"], 0)
+        self.assertFalse(FIA_TREE_MASK_CONTRACT["fia_consumes_mask"])
         custom = torch.tensor([True, True, True], dtype=torch.bool)
         seq_lens = torch.tensor([1], dtype=torch.int32)
         masked = custom_mask_to_ascend_masked(
@@ -114,33 +108,11 @@ class TestTreeAttnMask(CustomTestCase):
         self.assertTrue(out[:, converted.shape[1] :].all())
         self.assertTrue(out[converted.shape[0] :, :].all())
 
-    def test_forward_mtp_uses_bound_graph_buffer_not_mtp_mask(self):
-        mtp_mask = torch.ones((4, 4), dtype=torch.bool)
-        buf = torch.ones((8, 8), dtype=torch.bool)
-        atten, sparse, use_tree = _select_verify_atten_mask(None, mtp_mask, True)
-        self.assertFalse(use_tree)
-        self.assertIs(atten, mtp_mask)
-        self.assertEqual(sparse, 3)
-
-        atten, sparse, use_tree = _select_verify_atten_mask(buf, mtp_mask, True)
-        self.assertTrue(use_tree)
-        self.assertIs(atten, buf)
-        self.assertEqual(sparse, 0)
-
-        converted = torch.zeros((3, 4), dtype=torch.bool)
-        converted[1, 3] = True
-        inplace_update_graph_tree_attn_mask(buf, converted)
-        atten, sparse, use_tree = _select_verify_atten_mask(buf, mtp_mask, True)
-        self.assertTrue(use_tree)
-        self.assertIs(atten, buf)
-        self.assertEqual(sparse, 0)
-        self.assertEqual(tuple(atten.shape), (8, 8))
-
-    def test_capture_and_fill_bind_full_graph_buffer(self):
+    def test_capture_does_not_bind_tree_mask_for_fia(self):
         capture_src = _function_source(
             _ASCEND_BACKEND, "init_forward_metadata_capture_cuda_graph"
         )
-        self.assertIn(
+        self.assertNotIn(
             "metadata.tree_attn_mask = self.cuda_graph_tree_attn_mask",
             capture_src,
         )

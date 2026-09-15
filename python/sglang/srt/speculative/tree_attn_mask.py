@@ -3,10 +3,11 @@
 CUDA ``custom_mask`` is flattened FULL_MASK with True = can attend.
 Ascend ``atten_mask`` uses True = masked (see ``generate_mask_flag``).
 
-FIA tree-verify contract used by TARGET_VERIFY (sparse_mode=0, TND):
-``atten_mask`` shape ``[T, S] = [bs * num_draft, max_kv]``, True = masked.
-Hardware polarity must be confirmed by the NPU FIA probe test; do not invert
-this conversion without a failing probe.
+FIA currently cannot consume a tree mask: CheckFAIMask requires
+``sparse_mode=3`` whenever ``atten_mask`` is set, and mode 3 is linear
+causal only. TARGET_VERIFY with ``topk>1`` uses slot-gather fallback in
+``tree_attn_fallback`` instead of passing this mask to FIA. The conversion
+helpers remain for polarity tests and a future FIA tree path.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ FIA_TREE_MASK_CONTRACT = {
     "ascend_true": "masked",
     "layout": "TND",
     "sparse_mode": 0,
+    "fia_consumes_mask": False,
     "shape": "[T, S] = [bs * num_draft, max_kv]",
 }
 
