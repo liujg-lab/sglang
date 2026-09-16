@@ -7,7 +7,7 @@ bonus sampling match the CUDA kernels given the same tensors and coins.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -362,3 +362,151 @@ def tree_speculative_sampling_target_only_ref(
     )
     draft_probs.copy_(dp.to(device=draft_probs.device, dtype=draft_probs.dtype))
     return predicts, accept_index, accept_token_num
+
+
+TREE_MASK_FULL = 0
+TREE_MASK_QLEN_ONLY = 1
+
+
+def build_tree_kernel_efficient_ref(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: int = TREE_MASK_FULL,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CPU/torch replica of CUDA ``build_tree_efficient`` FULL_MASK writes.
+
+    Matches ``sgl-kernel/csrc/speculative/eagle_utils.cu``: the mask is filled
+    True (prefix columns stay True because the kernel never writes them), then
+    each row's trailing ``draft_token_num`` columns are rewritten from the
+    ancestor chain. Returns
+    ``(tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)``.
+    """
+    if int(tree_mask_mode) != TREE_MASK_FULL:
+        raise NotImplementedError(
+            f"build_tree_kernel_efficient_ref only implements FULL_MASK, "
+            f"got tree_mask_mode={tree_mask_mode}"
+        )
+    topk = int(topk)
+    depth = int(depth)
+    draft = int(draft_token_num)
+    seq_lens = [int(x) for x in verified_seq_len.detach().reshape(-1).tolist()]
+    bs = len(seq_lens)
+    expected_parent_cols = topk * (depth - 1) + 1
+    if parent_list.dim() == 2 and int(parent_list.shape[1]) != expected_parent_cols:
+        raise ValueError(
+            f"parent_list width {tuple(parent_list.shape)} != "
+            f"[bs, topk*(depth-1)+1]={expected_parent_cols}"
+        )
+    device = parent_list.device
+    parents = _to_long_list2(parent_list)
+    selected = _to_long_list2(selected_index)
+
+    mask_numel = sum(seq_lens) * draft + bs * draft * draft
+    mask = [True] * mask_numel
+    positions = [0] * (bs * draft)
+    retrive_index = [[-1] * draft for _ in range(bs)]
+    retrive_next_token = [[-1] * draft for _ in range(bs)]
+    retrive_next_sibling = [[-1] * draft for _ in range(bs)]
+
+    for bid in range(bs):
+        seq_tree_idx = draft * draft * bid
+        for i in range(bid):
+            seq_tree_idx += seq_lens[i] * draft
+        seq_len = seq_lens[bid]
+        parent_row = parents[bid] if bid < len(parents) else []
+        selected_row = selected[bid] if bid < len(selected) else []
+
+        retrive_index[bid][0] = bid * draft
+        for i in range(draft - 1, 0, -1):
+            retrive_index[bid][i] = bid * draft + i
+            parent_tb_idx = int(selected_row[i - 1]) // topk
+            parent_position = 0
+            if parent_tb_idx > 0:
+                parent_token_idx = int(parent_row[parent_tb_idx])
+                parent_position = 0
+                while parent_position < draft:
+                    if (
+                        parent_position < len(selected_row)
+                        and int(selected_row[parent_position]) == parent_token_idx
+                    ):
+                        parent_position += 1
+                        break
+                    parent_position += 1
+            if parent_position == draft:
+                continue
+            if retrive_next_token[bid][parent_position] == -1:
+                retrive_next_token[bid][parent_position] = i
+            else:
+                origin = retrive_next_token[bid][parent_position]
+                retrive_next_token[bid][parent_position] = i
+                retrive_next_sibling[bid][i] = origin
+
+        positions[bid * draft] = seq_len
+        for tid in range(draft):
+            token_tree_idx = seq_tree_idx + (seq_len + draft) * tid + seq_len + 1
+            mask[token_tree_idx - 1] = True
+            for i in range(draft - 1):
+                mask[token_tree_idx + i] = False
+            if tid == 0:
+                continue
+            cur_position = tid - 1
+            position = 0
+            while True:
+                position += 1
+                mask[token_tree_idx + cur_position] = True
+                parent_tb_idx = int(selected_row[cur_position]) // topk
+                if parent_tb_idx == 0:
+                    break
+                token_idx = int(parent_row[parent_tb_idx])
+                cur_position = 0
+                while cur_position < draft:
+                    if (
+                        cur_position < len(selected_row)
+                        and int(selected_row[cur_position]) == token_idx
+                    ):
+                        break
+                    cur_position += 1
+            positions[bid * draft + tid] = position + seq_len
+
+    tree_mask = torch.tensor(mask, dtype=torch.bool, device=device)
+    pos = torch.tensor(positions, dtype=torch.long, device=device)
+    ridx = torch.tensor(retrive_index, dtype=torch.long, device=device)
+    rnxt = torch.tensor(retrive_next_token, dtype=torch.long, device=device)
+    rsib = torch.tensor(retrive_next_sibling, dtype=torch.long, device=device)
+    return tree_mask, pos, ridx, rnxt, rsib
+
+
+def first_full_mask_mismatch(
+    got: torch.Tensor,
+    ref: torch.Tensor,
+    seq_lens: Sequence[int],
+    num_draft: int,
+):
+    """Return ``(batch, row, col, got, ref, got_row, ref_row)`` or None."""
+    got_list = got.detach().to("cpu").reshape(-1).bool().tolist()
+    ref_list = ref.detach().to("cpu").reshape(-1).bool().tolist()
+    offset = 0
+    for b, seq_len in enumerate(seq_lens):
+        row_len = int(seq_len) + int(num_draft)
+        for t in range(int(num_draft)):
+            got_row = got_list[offset : offset + row_len]
+            ref_row = ref_list[offset : offset + row_len]
+            for c, (g, r) in enumerate(zip(got_row, ref_row)):
+                if bool(g) != bool(r):
+                    return (b, t, c, bool(g), bool(r), got_row, ref_row)
+            offset += row_len
+    if len(got_list) != len(ref_list):
+        return (
+            -1,
+            -1,
+            -1,
+            len(got_list),
+            len(ref_list),
+            got_list[:8],
+            ref_list[:8],
+        )
+    return None
