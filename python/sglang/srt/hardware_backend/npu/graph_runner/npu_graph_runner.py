@@ -193,7 +193,19 @@ class NPUGraphRunner(CudaGraphRunner):
                 "eager fallback after capture failure is not a pass."
             )
         # Replay
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        skip_fia_update = is_deepseek_nsa(
+            self.model_runner.model_config.hf_config
+        ) or (
+            forward_batch.forward_mode.is_target_verify()
+            and int(
+                getattr(
+                    self.model_runner.server_args, "speculative_eagle_topk", 1
+                )
+                or 1
+            )
+            > 1
+        )
+        if not skip_fia_update:
             if forward_batch.forward_mode.is_target_verify():
                 ntpb = getattr(self, "actual_ntpb", None) or self.num_tokens_per_bs
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + ntpb

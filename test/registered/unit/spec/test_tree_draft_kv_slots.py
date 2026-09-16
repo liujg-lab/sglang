@@ -328,6 +328,43 @@ class TestTreeDraftAttention(CustomTestCase):
                 f"row {i} mismatch",
             )
 
+    def test_gpu_kv_lens_matches_list(self):
+        torch.manual_seed(0)
+        n_q, n_kv, d = 4, 2, 8
+        rows = 3
+        lens = [4, 6, 2]
+        k_cache = torch.randn(2, 8, n_kv * d)
+        v_cache = torch.randn(2, 8, n_kv * d)
+        query = torch.randn(rows, n_q, d)
+        kv_slots = torch.tensor(
+            [
+                [0, 1, 2, 3, 0, 0],
+                [1, 2, 3, 4, 5, 6],
+                [7, 8, 0, 0, 0, 0],
+            ],
+            dtype=torch.int64,
+        )
+        scale = 1.0 / math.sqrt(d)
+        kwargs = dict(
+            kv_slots=kv_slots,
+            scale=scale,
+            n_q_heads=n_q,
+            n_kv_heads=n_kv,
+            qk_head_dim=d,
+            v_head_dim=d,
+        )
+        out_list = tree_draft_attention(query, k_cache, v_cache, kv_lens=lens, **kwargs)
+        out_t = tree_draft_attention(
+            query,
+            k_cache,
+            v_cache,
+            kv_lens=torch.tensor(lens, dtype=torch.int32),
+            **kwargs,
+        )
+        self.assertTrue(
+            torch.allclose(out_list.float(), out_t.float(), atol=1e-5, rtol=1e-5)
+        )
+
     def test_equal_kv_lens_no_padding(self):
         torch.manual_seed(3)
         n_q, n_kv, d = 2, 2, 4
@@ -374,12 +411,24 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         src = _function_source(_ASCEND_BACKEND, "init_forward_metadata")
         self.assertIn("_fill_tree_draft_kv_slots", src)
 
-    def test_npu_graph_disabled_for_paged_tree(self):
+    def test_npu_graph_slot_gather_for_paged_tree(self):
         src = _function_source(_NPU_GRAPH, "__init__")
         self.assertIn("token-level slot gather", src)
         self.assertIn("page_size > 1 and topk > 1", src)
+        self.assertIn("_slot_gather_graph", src)
+        self.assertNotIn("npu tree draft uses token-level slot gather (eager)", src)
         capture_src = _function_source(_NPU_GRAPH, "capture")
         self.assertIn("tree_graph_disabled_reason", capture_src)
+        self.assertIn("_slot_gather_graph", capture_src)
+        replay_src = _function_source(_NPU_GRAPH, "_replay")
+        self.assertIn("_slot_gather_graph", replay_src)
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("cuda_graph_kv_slots", state_src)
+        replay_meta = _function_source(
+            _ASCEND_BACKEND, "init_forward_metadata_replay_cuda_graph"
+        )
+        self.assertIn("_fill_tree_draft_kv_slots", replay_meta)
+        self.assertIn("_copy_into_graph_slot_buffers", _ASCEND_BACKEND.read_text())
 
     def test_sr_tree_drafter_skips_last_page_copy(self):
         src = _function_source(_SR_TREE, "_alloc_tree_kv")

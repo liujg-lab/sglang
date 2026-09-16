@@ -71,13 +71,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._init_arch_map()
         page_size = int(getattr(eagle_worker, "page_size", 1) or 1)
         topk = int(getattr(eagle_worker, "topk", 1) or 1)
-        if page_size > 1 and topk > 1:
-            self.tree_graph_disabled_reason = (
-                "npu tree draft uses token-level slot gather (eager)"
-            )
+        self._slot_gather_graph = page_size > 1 and topk > 1
+        if self._slot_gather_graph:
             logger.info(
-                "%s page_size=%s topk=%s",
-                self.tree_graph_disabled_reason,
+                "NPU tree draft graphs use token-level slot gather "
+                "page_size=%s topk=%s",
                 page_size,
                 topk,
             )
@@ -136,7 +134,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
         graph, out = super().capture_one_batch_size(num_seqs, forward, stream_idx)
-        if self.tree_graph_disabled_reason:
+        if self.tree_graph_disabled_reason or self._slot_gather_graph:
             return graph, out
         self.update_attr_name = self._get_update_attr_name()
         n_steps = max(int(self.speculative_num_steps) - 1, 0)
@@ -176,6 +174,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
             return
         super().capture()
+        if self._slot_gather_graph:
+            logger.info(
+                "NPU tree draft slot-gather graphs ready: graphs=%s "
+                "tree_graph_replay_count=%s tree_eager_fallback_count=%s",
+                sorted(self.graphs),
+                self.tree_graph_replay_count,
+                self.tree_eager_fallback_count,
+            )
+            return
         self._finalize_tree_fia_maps()
 
     def _finalize_tree_fia_maps(self):
@@ -220,8 +227,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
-        if is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if is_deepseek_nsa(self.model_runner.model_config.hf_config) or getattr(
+            self, "_slot_gather_graph", False
+        ):
             self.graphs[self.bs].replay()
+            if getattr(self, "_slot_gather_graph", False):
+                self.tree_graph_replay_count += 1
             return
 
         if forward_batch.seq_lens_cpu is None:

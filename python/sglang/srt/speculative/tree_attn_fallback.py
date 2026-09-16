@@ -97,8 +97,8 @@ def log_tree_draft_slot_gather_once(draft_topk: int, page_size: int) -> None:
 
 
 def should_skip_npu_target_verify_graph(device, draft_topk: int) -> bool:
-    """NPU tree verify is eager-only; keep ntpb=1 AR graphs."""
-    return str(device).startswith("npu") and int(draft_topk) > 1
+    """Tree TARGET_VERIFY now captures NPU graphs over batched slot-gather."""
+    return False
 
 
 def flatten_paged_kv(
@@ -199,6 +199,68 @@ def _as_seq_list(seq_lens: SeqLens) -> list:
     return [int(x) for x in seq_lens]
 
 
+def _kv_lens_tensor(kv_lens: SeqLens, rows: int, device) -> torch.Tensor:
+    if isinstance(kv_lens, torch.Tensor):
+        kv_len_t = kv_lens.reshape(-1).to(dtype=torch.int64, device=device)
+    else:
+        kv_len_t = torch.as_tensor(list(kv_lens), dtype=torch.int64, device=device)
+    if int(kv_len_t.numel()) != rows:
+        raise ValueError(
+            f"tree draft kv_lens length {int(kv_len_t.numel())} != num query rows {rows}"
+        )
+    return kv_len_t
+
+
+def build_tree_verify_kv_slots(
+    custom_mask: torch.Tensor,
+    seq_lens: SeqLens,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    num_draft: int,
+    max_kv: Optional[int] = None,
+):
+    """Visible token slots per TARGET_VERIFY query.
+
+    Host-side (before graph replay). Returns
+    ``(kv_slots[T, max_kv], kv_lens[T])`` with ``T = bs * num_draft``.
+    Padding columns are ignored via ``kv_lens``.
+    """
+    seq_list = _as_seq_list(seq_lens)
+    bs = len(seq_list)
+    num_draft = int(num_draft)
+    rows = bs * num_draft
+    if max_kv is None:
+        max_kv = max((int(s) + num_draft for s in seq_list), default=num_draft)
+    max_kv = int(max_kv)
+    device = req_to_token.device
+    slots_out = torch.zeros((rows, max_kv), dtype=torch.int64, device=device)
+    lens_out = torch.zeros((rows,), dtype=torch.int32, device=device)
+    if rows == 0 or max_kv == 0:
+        return slots_out, lens_out
+
+    req_pool = req_pool_indices.reshape(-1).to(dtype=torch.int64)
+    draft_locs_all = out_cache_loc.reshape(-1)
+    for b, t, attend_row in iter_full_mask_rows(custom_mask, seq_list, num_draft):
+        q_idx = b * num_draft + t
+        if q_idx >= rows:
+            break
+        seq_len = seq_list[b]
+        req = int(req_pool[b].item())
+        prefix_locs = req_to_token[req, :seq_len]
+        draft_locs = draft_locs_all[b * num_draft : (b + 1) * num_draft]
+        vis = visible_token_indices(attend_row, prefix_locs, draft_locs)
+        n = int(vis.numel())
+        if n > max_kv:
+            raise RuntimeError(
+                f"tree verify visible slots {n} exceed max_kv={max_kv}"
+            )
+        if n:
+            slots_out[q_idx, :n] = vis[:n].to(dtype=torch.int64, device=device)
+        lens_out[q_idx] = n
+    return slots_out, lens_out
+
+
 def tree_verify_attention(
     query: torch.Tensor,
     k_cache: torch.Tensor,
@@ -219,62 +281,38 @@ def tree_verify_attention(
     q_rope: Optional[torch.Tensor] = None,
     k_rope_cache: Optional[torch.Tensor] = None,
     rope_head_dim: Optional[int] = None,
+    kv_slots: Optional[torch.Tensor] = None,
+    kv_lens: Optional[SeqLens] = None,
 ) -> torch.Tensor:
-    """Per-query slot-gather tree attention. Returns ``[T, n_q_heads * v_head_dim]``."""
-    query = query.reshape(-1, n_q_heads, qk_head_dim)
-    if q_rope is not None:
-        q_rope = q_rope.reshape(-1, n_q_heads, int(rope_head_dim))
-    flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)
-    flat_v = flatten_paged_kv(v_cache, n_kv_heads, v_head_dim)
-    flat_k_rope = None
-    if k_rope_cache is not None:
-        flat_k_rope = flatten_paged_kv(k_rope_cache, n_kv_heads, int(rope_head_dim))
+    """Batched slot-gather tree attention. Returns ``[T, n_q_heads * v_head_dim]``.
 
-    seq_list = _as_seq_list(seq_lens)
-    req_pool = req_pool_indices.reshape(-1).to(dtype=torch.int64)
-    draft_locs_all = out_cache_loc.reshape(-1)
-    num_draft = int(num_draft)
-    outputs = []
-    for b, t, attend_row in iter_full_mask_rows(custom_mask, seq_list, num_draft):
-        q_idx = b * num_draft + t
-        if q_idx >= query.shape[0]:
-            break
-        seq_len = seq_list[b]
-        req = int(req_pool[b].item())
-        prefix_locs = req_to_token[req, :seq_len]
-        draft_locs = draft_locs_all[b * num_draft : (b + 1) * num_draft]
-        slots = visible_token_indices(attend_row, prefix_locs, draft_locs)
-        k_vis, v_vis = gather_kv_by_slots(flat_k, flat_v, slots)
-        k_rope_vis = None
-        q_rope_t = None
-        if flat_k_rope is not None:
-            k_rope_vis, _ = gather_kv_by_slots(flat_k_rope, flat_k_rope, slots)
-            q_rope_t = q_rope[q_idx]
-        out = chunked_attend(
-            query[q_idx],
-            k_vis,
-            v_vis,
-            scale,
-            chunk_size=chunk_size,
-            q_rope=q_rope_t,
-            k_rope=k_rope_vis,
+    ``chunk_size`` is unused; kept so callers and tests do not need a split API.
+    """
+    del chunk_size
+    if kv_slots is None or kv_lens is None:
+        kv_slots, kv_lens = build_tree_verify_kv_slots(
+            custom_mask,
+            seq_lens,
+            req_to_token,
+            req_pool_indices,
+            out_cache_loc,
+            num_draft,
         )
-        outputs.append(out)
-
-    if not outputs:
-        return query.new_zeros(query.shape[0], n_q_heads * v_head_dim)
-    stacked = torch.stack(outputs, dim=0)
-    if stacked.shape[0] < query.shape[0]:
-        stacked = torch.cat(
-            [
-                stacked,
-                stacked.new_zeros(
-                    query.shape[0] - stacked.shape[0], n_q_heads, v_head_dim
-                ),
-            ],
-            dim=0,
-        )
-    return stacked.reshape(stacked.shape[0], n_q_heads * v_head_dim)
+    return tree_draft_attention(
+        query,
+        k_cache,
+        v_cache,
+        kv_slots=kv_slots,
+        kv_lens=kv_lens,
+        scale=scale,
+        n_q_heads=n_q_heads,
+        n_kv_heads=n_kv_heads,
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
+        q_rope=q_rope,
+        k_rope_cache=k_rope_cache,
+        rope_head_dim=rope_head_dim,
+    )
 
 
 def tree_draft_attention(
@@ -305,13 +343,8 @@ def tree_draft_attention(
 
     kv_slots = kv_slots.reshape(rows, -1).to(dtype=torch.int64, device=query.device)
     max_kv = int(kv_slots.shape[1])
-    lens_list = _as_seq_list(kv_lens)
-    if len(lens_list) != rows:
-        raise ValueError(
-            f"tree draft kv_lens length {len(lens_list)} != num query rows {rows}"
-        )
-    kv_len_t = torch.tensor(lens_list, dtype=torch.int64, device=query.device)
-    if max_kv == 0 or int(kv_len_t.max().item()) <= 0:
+    kv_len_t = _kv_lens_tensor(kv_lens, rows, query.device)
+    if max_kv == 0:
         return query.new_zeros(rows, n_q_heads * v_head_dim)
 
     flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)

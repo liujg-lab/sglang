@@ -13,6 +13,7 @@ import unittest
 import torch
 
 from sglang.srt.speculative.tree_attn_fallback import (
+    build_tree_verify_kv_slots,
     chunked_attend,
     flatten_paged_kv,
     gather_kv_by_slots,
@@ -22,7 +23,10 @@ from sglang.srt.speculative.tree_attn_fallback import (
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
 )
-from sglang.srt.speculative.tree_attn_mask import visible_token_indices
+from sglang.srt.speculative.tree_attn_mask import (
+    iter_full_mask_rows,
+    visible_token_indices,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 try:
@@ -38,6 +42,10 @@ _ASCEND_BACKEND = (
 )
 _CUDA_GRAPH_RUNNER = (
     _REPO_ROOT / "python/sglang/srt/model_executor/cuda_graph_runner.py"
+)
+_NPU_GRAPH_RUNNER = (
+    _REPO_ROOT
+    / "python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py"
 )
 _FALLBACK = _REPO_ROOT / "python/sglang/srt/speculative/tree_attn_fallback.py"
 
@@ -84,6 +92,49 @@ def _dense_attend(q, k, v, scale, q_rope=None, k_rope=None):
     return torch.einsum("hs,shd->hd", probs, v.float())
 
 
+def _tree_verify_attention_per_query(
+    query,
+    k_cache,
+    v_cache,
+    *,
+    custom_mask,
+    seq_lens,
+    req_to_token,
+    req_pool_indices,
+    out_cache_loc,
+    num_draft,
+    scale,
+    n_q_heads,
+    n_kv_heads,
+    qk_head_dim,
+    v_head_dim,
+):
+    query = query.reshape(-1, n_q_heads, qk_head_dim)
+    flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)
+    flat_v = flatten_paged_kv(v_cache, n_kv_heads, v_head_dim)
+    seq_list = [int(x) for x in seq_lens]
+    req_pool = req_pool_indices.reshape(-1).to(dtype=torch.int64)
+    draft_locs_all = out_cache_loc.reshape(-1)
+    outputs = []
+    for b, t, attend_row in iter_full_mask_rows(custom_mask, seq_list, num_draft):
+        q_idx = b * num_draft + t
+        if q_idx >= query.shape[0]:
+            break
+        seq_len = seq_list[b]
+        req = int(req_pool[b].item())
+        prefix_locs = req_to_token[req, :seq_len]
+        draft_locs = draft_locs_all[b * num_draft : (b + 1) * num_draft]
+        slots = visible_token_indices(attend_row, prefix_locs, draft_locs)
+        k_vis, v_vis = gather_kv_by_slots(flat_k, flat_v, slots)
+        outputs.append(
+            chunked_attend(query[q_idx], k_vis, v_vis, scale, chunk_size=2)
+        )
+    if not outputs:
+        return query.new_zeros(query.shape[0], n_q_heads * v_head_dim)
+    stacked = torch.stack(outputs, dim=0)
+    return stacked.reshape(stacked.shape[0], n_q_heads * v_head_dim)
+
+
 class TestTreeAttnFallback(CustomTestCase):
     def test_dispatch_topk_and_mask(self):
         mask = torch.ones(4, dtype=torch.bool)
@@ -113,8 +164,8 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertEqual(verify_topk, 3)
 
     def test_skip_verify_graph_npu_tree_only(self):
-        self.assertTrue(should_skip_npu_target_verify_graph("npu", 3))
-        self.assertTrue(should_skip_npu_target_verify_graph("npu:0", 3))
+        self.assertFalse(should_skip_npu_target_verify_graph("npu", 3))
+        self.assertFalse(should_skip_npu_target_verify_graph("npu:0", 3))
         self.assertFalse(should_skip_npu_target_verify_graph("npu", 1))
         self.assertFalse(should_skip_npu_target_verify_graph("cuda", 3))
 
@@ -293,9 +344,8 @@ class TestTreeAttnFallback(CustomTestCase):
     def test_forward_mtp_source_uses_fallback_not_fia_tree_mask(self):
         src = _function_source(_ASCEND_BACKEND, "forward_mtp")
         self.assertIn("use_tree_verify_fallback", src)
-        self.assertIn("tree_verify_attention", src)
+        self.assertIn("_run_tree_verify_slot_gather", src)
         self.assertIn("self.verify_tree_topk", src)
-        self.assertIn("log_tree_verify_fallback_once", src)
         self.assertIn("atten_mask=self.mtp_mask", src)
         self.assertIn("sparse_mode=3", src)
         self.assertNotIn("sparse_mode=0", src)
@@ -303,6 +353,13 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertNotIn("locs_to_page_ids", src)
         self.assertEqual(src.count("self.draft_topk"), 0)
         self.assertGreaterEqual(src.count("self.verify_tree_topk"), 2)
+
+        helper_src = _class_method_source(
+            _ASCEND_BACKEND, "AscendAttnBackend", "_run_tree_verify_slot_gather"
+        )
+        self.assertIn("tree_verify_attention", helper_src)
+        self.assertIn("log_tree_verify_fallback_once", helper_src)
+        self.assertIn("kv_slots=self.forward_metadata.tree_verify_kv_slots", helper_src)
 
         fallback_src = _FALLBACK.read_text()
         self.assertNotIn("locs_to_page_ids", fallback_src)
@@ -321,12 +378,105 @@ class TestTreeAttnFallback(CustomTestCase):
             "metadata.tree_attn_mask = self.cuda_graph_tree_attn_mask",
             capture_src,
         )
+        self.assertIn("_bind_graph_verify_slot_views", capture_src)
+        self.assertIn("_bind_graph_draft_slot_views", capture_src)
 
-    def test_cuda_graph_runner_skips_npu_tree_verify_ntpb(self):
+    def test_verify_graph_slot_buffers_wired(self):
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("cuda_graph_kv_slots", state_src)
+        self.assertIn("cuda_graph_kv_lens", state_src)
+        init_src = _function_source(_ASCEND_BACKEND, "init_forward_metadata")
+        self.assertIn("_fill_tree_verify_kv_slots", init_src)
+        replay_src = _function_source(
+            _ASCEND_BACKEND, "init_forward_metadata_replay_cuda_graph"
+        )
+        self.assertIn("_fill_tree_verify_kv_slots", replay_src)
+        self.assertIn("_restore_graph_verify_slot_views", replay_src)
+
+    def test_cuda_graph_runner_captures_npu_tree_verify_ntpb(self):
         init_src = _function_source(_CUDA_GRAPH_RUNNER, "__init__")
-        self.assertIn("should_skip_npu_target_verify_graph", init_src)
-        self.assertIn("self.spectre_ntpb_options = [1]", init_src)
-        self.assertIn("eager slot-gather fallback", init_src)
+        self.assertNotIn("should_skip_npu_target_verify_graph", init_src)
+        self.assertNotIn("eager slot-gather fallback", init_src)
+        self.assertIn("self.spectre_ntpb_options", init_src)
+
+    def test_npu_graph_runner_skips_fia_update_for_tree_verify(self):
+        replay_src = _function_source(_NPU_GRAPH_RUNNER, "replay")
+        self.assertIn("skip_fia_update", replay_src)
+        self.assertIn("speculative_eagle_topk", replay_src)
+
+    def test_build_tree_verify_kv_slots_matches_visible(self):
+        custom = torch.tensor(
+            [
+                True, True, False, False,
+                True, True, True, False,
+                True, True, False, True,
+            ],
+            dtype=torch.bool,
+        )
+        req_to_token = torch.zeros((1, 8), dtype=torch.int64)
+        req_to_token[0, 0] = 0
+        out_cache_loc = torch.tensor([4, 5, 6], dtype=torch.int64)
+        slots, lens = build_tree_verify_kv_slots(
+            custom,
+            [1],
+            req_to_token,
+            torch.tensor([0], dtype=torch.int64),
+            out_cache_loc,
+            num_draft=3,
+        )
+        prefix = torch.tensor([0], dtype=torch.int64)
+        expected = [
+            visible_token_indices(
+                torch.tensor([True, True, False, False]), prefix, out_cache_loc
+            ),
+            visible_token_indices(
+                torch.tensor([True, True, True, False]), prefix, out_cache_loc
+            ),
+            visible_token_indices(
+                torch.tensor([True, True, False, True]), prefix, out_cache_loc
+            ),
+        ]
+        self.assertEqual(tuple(slots.shape), (3, 4))
+        for i, vis in enumerate(expected):
+            n = int(vis.numel())
+            self.assertEqual(int(lens[i]), n)
+            self.assertEqual(slots[i, :n].tolist(), vis.tolist())
+
+    def test_batched_verify_matches_per_query_oracle(self):
+        n_q, n_kv, d = 4, 2, 4
+        page_size = 4
+        k_cache = torch.randn(2, page_size, n_kv * d)
+        v_cache = torch.randn(2, page_size, n_kv * d)
+        query = torch.randn(3, n_q, d)
+        custom = torch.tensor(
+            [
+                True, True, False, False,
+                True, True, True, False,
+                True, True, False, True,
+            ],
+            dtype=torch.bool,
+        )
+        req_to_token = torch.zeros((1, 8), dtype=torch.int64)
+        req_to_token[0, 0] = 0
+        out_cache_loc = torch.tensor([4, 5, 6], dtype=torch.int64)
+        kwargs = dict(
+            custom_mask=custom,
+            seq_lens=[1],
+            req_to_token=req_to_token,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc=out_cache_loc,
+            num_draft=3,
+            scale=1.0 / math.sqrt(d),
+            n_q_heads=n_q,
+            n_kv_heads=n_kv,
+            qk_head_dim=d,
+            v_head_dim=d,
+        )
+        batched = tree_verify_attention(query, k_cache, v_cache, **kwargs)
+        oracle = _tree_verify_attention_per_query(query, k_cache, v_cache, **kwargs)
+        self.assertTrue(
+            torch.allclose(batched.float(), oracle.float(), atol=1e-4, rtol=1e-4)
+        )
 
 
 if __name__ == "__main__":
