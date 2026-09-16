@@ -392,6 +392,10 @@ class TestTreeAttnFallback(CustomTestCase):
         )
         self.assertIn("_fill_tree_verify_kv_slots", replay_src)
         self.assertIn("_restore_graph_verify_slot_views", replay_src)
+        max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
+        self.assertIn("req_to_token.shape[1]", max_kv_src)
+        self.assertIn("min(cap, pool)", max_kv_src)
+        self.assertNotIn("return int(self.max_context_len) + extra", max_kv_src)
 
     def test_cuda_graph_runner_captures_npu_tree_verify_ntpb(self):
         init_src = _function_source(_CUDA_GRAPH_RUNNER, "__init__")

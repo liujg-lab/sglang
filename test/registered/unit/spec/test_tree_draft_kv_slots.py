@@ -429,6 +429,10 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         )
         self.assertIn("_fill_tree_draft_kv_slots", replay_meta)
         self.assertIn("_copy_into_graph_slot_buffers", _ASCEND_BACKEND.read_text())
+        max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
+        self.assertIn("req_to_token.shape[1]", max_kv_src)
+        self.assertIn("min(cap, pool)", max_kv_src)
+        self.assertNotIn("return int(self.max_context_len) + extra", max_kv_src)
 
     def test_sr_tree_drafter_skips_last_page_copy(self):
         src = _function_source(_SR_TREE, "_alloc_tree_kv")

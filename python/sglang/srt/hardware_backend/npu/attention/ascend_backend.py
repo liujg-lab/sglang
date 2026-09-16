@@ -455,7 +455,13 @@ class AscendAttnBackend(AttentionBackend):
             int(self.speculative_num_draft_tokens or 1),
             1,
         )
-        return int(self.max_context_len) + extra
+        pool = 0
+        if self.req_to_token is not None and self.req_to_token.ndim >= 2:
+            pool = int(self.req_to_token.shape[1])
+        cap = int(self.max_context_len)
+        if pool > 0:
+            cap = min(cap, pool)
+        return max(cap, 1) + extra
 
     def _copy_into_graph_slot_buffers(
         self,
