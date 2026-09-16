@@ -36,6 +36,7 @@ from sglang.srt.speculative.tree_attn_fallback import (
     build_tree_verify_kv_slots,
     log_tree_draft_slot_gather_once,
     log_tree_verify_fallback_once,
+    log_tree_verify_kv_slot_layout_once,
     tree_attn_chunk_width,
     tree_draft_attention,
     tree_verify_attention,
@@ -44,7 +45,9 @@ from sglang.srt.speculative.tree_attn_fallback import (
 )
 from sglang.srt.speculative.tree_attn_mask import (
     custom_mask_to_ascend_masked,
+    full_mask_numel,
     inplace_update_graph_tree_attn_mask,
+    resolve_tree_verify_mask_seq_lens,
 )
 from sglang.srt.utils import get_bool_env_var
 
@@ -374,6 +377,25 @@ class AscendAttnBackend(AttentionBackend):
             int(self.draft_topk) > 1 and int(self.page_size) > 1
         )
 
+    def _tree_verify_mask_layout(self, spec_info, fallback_seq_lens):
+        """Producer-side seq_lens / raw_bs that laid out ``custom_mask``.
+
+        Prefers ``spec_info.seq_lens_cpu`` (recorded when the mask was built)
+        over graph-padded ``buffers.seq_lens[:bs]``.
+        """
+        seq_list, raw_bs, _source = resolve_tree_verify_mask_seq_lens(
+            spec_info, fallback_seq_lens
+        )
+        if isinstance(fallback_seq_lens, torch.Tensor):
+            seq_t = torch.as_tensor(
+                seq_list,
+                dtype=fallback_seq_lens.dtype,
+                device=fallback_seq_lens.device,
+            )
+        else:
+            seq_t = torch.tensor(seq_list, dtype=torch.int32)
+        return seq_t, int(raw_bs)
+
     def _fill_tree_verify_mask(self, forward_batch: ForwardBatch) -> None:
         if self._slot_gather_tree_attn():
             # Slot-gather carries visibility in tree_verify_kv_slots/_lens, so
@@ -388,8 +410,10 @@ class AscendAttnBackend(AttentionBackend):
             or self.speculative_num_draft_tokens
             or 1
         )
-        seq_lens = forward_batch.seq_lens
-        if seq_lens is None:
+        seq_lens, _raw_bs = self._tree_verify_mask_layout(
+            spec_info, forward_batch.seq_lens
+        )
+        if seq_lens is None or int(seq_lens.numel()) == 0:
             return
         tree_mask = custom_mask_to_ascend_masked(
             custom_mask,
@@ -598,22 +622,51 @@ class AscendAttnBackend(AttentionBackend):
             or self.speculative_num_draft_tokens
             or 1
         )
+        seq_lens, raw_bs = self._tree_verify_mask_layout(
+            spec_info, forward_batch.seq_lens
+        )
         max_kv = None
         dest = getattr(self.forward_metadata, "tree_verify_kv_slots", None)
         dest_lens = getattr(self.forward_metadata, "tree_verify_kv_lens_t", None)
         if dest is not None and dest_lens is not None:
             max_kv = int(dest.shape[1])
+        expected = full_mask_numel(seq_lens, num_draft)
+        graph_rows = int(dest.shape[0]) if dest is not None else raw_bs * num_draft
+        padded_bs = 0
+        fb_seq = getattr(forward_batch, "seq_lens", None)
+        if isinstance(fb_seq, torch.Tensor):
+            padded_bs = int(fb_seq.numel())
+        elif fb_seq is not None:
+            padded_bs = len(fb_seq)
+        log_tree_verify_kv_slot_layout_once(
+            mask_numel=int(custom_mask.numel()),
+            expected_numel=int(expected),
+            bs=padded_bs,
+            raw_bs=raw_bs,
+            num_draft=num_draft,
+            seq_lens_sum=int(sum(int(x) for x in seq_lens.tolist())),
+            graph_rows=graph_rows,
+            max_kv=int(max_kv) if max_kv is not None else 0,
+        )
+        loc = forward_batch.out_cache_loc
+        need_loc = int(raw_bs) * num_draft
+        if loc is not None and int(loc.numel()) > need_loc:
+            loc = loc[:need_loc]
+        req_pool = forward_batch.req_pool_indices
+        if req_pool is not None and int(req_pool.numel()) > raw_bs:
+            req_pool = req_pool[:raw_bs]
         try:
             slots, lens = build_tree_verify_kv_slots(
                 custom_mask,
-                forward_batch.seq_lens,
+                seq_lens,
                 forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.out_cache_loc,
+                req_pool,
+                loc,
                 num_draft,
                 max_kv=max_kv,
+                rows_limit=need_loc,
             )
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             if dest is not None:
                 raise NpuGraphPreparationError(str(e), scope="graph") from e
             raise
@@ -1141,17 +1194,22 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify() and spec_info is not None:
             dummy_batch = type("ForwardBatchLite", (), {})()
             dummy_batch.spec_info = spec_info
-            dummy_batch.seq_lens = orig_seq_lens
             dummy_batch.forward_mode = forward_mode
-            dummy_batch.req_pool_indices = req_pool_indices[:bs]
-            dummy_batch.req_to_token_pool = type("PoolLite", (), {})()
-            dummy_batch.req_to_token_pool.req_to_token = self.req_to_token
             num_draft = int(
                 getattr(spec_info, "draft_token_num", None)
                 or self.speculative_num_draft_tokens
                 or 1
             )
-            dummy_batch.out_cache_loc = self._graph_out_cache_loc(int(bs) * num_draft)
+            seq_for_mask, raw_bs = self._tree_verify_mask_layout(
+                spec_info, orig_seq_lens
+            )
+            dummy_batch.seq_lens = seq_for_mask
+            dummy_batch.req_pool_indices = req_pool_indices[:raw_bs]
+            dummy_batch.req_to_token_pool = type("PoolLite", (), {})()
+            dummy_batch.req_to_token_pool.req_to_token = self.req_to_token
+            dummy_batch.out_cache_loc = self._graph_out_cache_loc(
+                int(raw_bs) * num_draft
+            )
             self._fill_tree_verify_mask(dummy_batch)
             if self.verify_tree_topk > 1:
                 self._restore_graph_verify_slot_views(metadata, bs)

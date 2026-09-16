@@ -29,7 +29,9 @@ from sglang.srt.speculative.tree_attn_fallback import (
     verify_tree_topk_from_server_args,
 )
 from sglang.srt.speculative.tree_attn_mask import (
+    full_mask_numel,
     iter_full_mask_rows,
+    resolve_tree_verify_mask_seq_lens,
     visible_token_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -397,6 +399,17 @@ class TestTreeAttnFallback(CustomTestCase):
         )
         self.assertIn("_fill_tree_verify_kv_slots", replay_src)
         self.assertIn("_restore_graph_verify_slot_views", replay_src)
+        self.assertIn("_tree_verify_mask_layout", replay_src)
+        self.assertIn("raw_bs", replay_src)
+        self.assertIn("int(raw_bs) * num_draft", replay_src)
+        fill_slots_src = _function_source(_ASCEND_BACKEND, "_fill_tree_verify_kv_slots")
+        self.assertIn("_tree_verify_mask_layout", fill_slots_src)
+        self.assertIn("log_tree_verify_kv_slot_layout_once", fill_slots_src)
+        self.assertIn("rows_limit", fill_slots_src)
+        self.assertIn("ValueError", fill_slots_src)
+        layout_src = _function_source(_ASCEND_BACKEND, "_tree_verify_mask_layout")
+        self.assertIn("resolve_tree_verify_mask_seq_lens", layout_src)
+        self.assertIn("seq_lens_cpu", layout_src)
         max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
         self.assertIn("_slot_gather_kv_pool_size", max_kv_src)
         self.assertIn("min(cap, pool)", max_kv_src)
@@ -416,6 +429,7 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertIn("cuda_graph_custom_mask", state_src)
         fill_src = _function_source(_ASCEND_BACKEND, "_fill_tree_verify_mask")
         self.assertIn("_slot_gather_tree_attn", fill_src)
+        self.assertIn("_tree_verify_mask_layout", fill_src)
 
     def test_chunked_attention_matches_dense_slot_gather(self):
         torch.manual_seed(3)
@@ -620,6 +634,158 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertTrue(
             torch.allclose(batched.float(), oracle.float(), atol=1e-4, rtol=1e-4)
         )
+
+    def test_log_config_all_true_mask_kv_lens(self):
+        seq_len, num_draft = 128, 15
+        custom = torch.ones(
+            full_mask_numel([seq_len], num_draft), dtype=torch.bool
+        )
+        req_to_token = torch.arange(seq_len + num_draft, dtype=torch.int64).unsqueeze(0)
+        out_cache_loc = torch.arange(seq_len, seq_len + num_draft, dtype=torch.int64)
+        slots, lens = build_tree_verify_kv_slots(
+            custom,
+            [seq_len],
+            req_to_token,
+            torch.tensor([0], dtype=torch.int64),
+            out_cache_loc,
+            num_draft,
+        )
+        self.assertEqual(tuple(slots.shape), (num_draft, seq_len + num_draft))
+        self.assertTrue(torch.equal(lens, torch.full((num_draft,), seq_len + num_draft)))
+        self.assertEqual(slots[0, :seq_len].tolist(), list(range(seq_len)))
+        self.assertEqual(
+            slots[0, seq_len:].tolist(), list(range(seq_len, seq_len + num_draft))
+        )
+
+    def test_short_mask_raises_value_error_not_index_error(self):
+        seq_len, num_draft = 128, 15
+        expected = full_mask_numel([seq_len], num_draft)
+        custom = torch.ones(expected - 9, dtype=torch.bool)
+        req_to_token = torch.arange(seq_len + num_draft, dtype=torch.int64).unsqueeze(0)
+        out_cache_loc = torch.arange(num_draft, dtype=torch.int64)
+        with self.assertRaises(ValueError) as ctx:
+            build_tree_verify_kv_slots(
+                custom,
+                [seq_len],
+                req_to_token,
+                torch.tensor([0], dtype=torch.int64),
+                out_cache_loc,
+                num_draft,
+            )
+        msg = str(ctx.exception)
+        self.assertIn("FULL_MASK layout mismatch", msg)
+        self.assertIn(str(expected), msg)
+        self.assertIn(str(expected - 9), msg)
+        self.assertIn("num_draft=15", msg)
+        self.assertIn("seq_lens_sum=128", msg)
+
+    def test_long_mask_raises_value_error(self):
+        seq_len, num_draft = 128, 15
+        expected = full_mask_numel([seq_len], num_draft)
+        custom = torch.ones(expected + 10, dtype=torch.bool)
+        req_to_token = torch.arange(seq_len + num_draft, dtype=torch.int64).unsqueeze(0)
+        out_cache_loc = torch.arange(num_draft, dtype=torch.int64)
+        with self.assertRaises(ValueError) as ctx:
+            build_tree_verify_kv_slots(
+                custom,
+                [seq_len],
+                req_to_token,
+                torch.tensor([0], dtype=torch.int64),
+                out_cache_loc,
+                num_draft,
+            )
+        msg = str(ctx.exception)
+        self.assertIn("FULL_MASK layout mismatch", msg)
+        self.assertIn(str(expected), msg)
+        self.assertIn(str(expected + 10), msg)
+
+    def test_padded_replay_walks_only_raw_bs_rows(self):
+        raw_bs, padded_bs, seq_len, num_draft = 1, 2, 128, 15
+        custom = torch.ones(full_mask_numel([seq_len], num_draft), dtype=torch.bool)
+        req_to_token = torch.arange(
+            seq_len + num_draft, dtype=torch.int64
+        ).unsqueeze(0).expand(padded_bs, -1).contiguous()
+        out_cache_loc = torch.arange(padded_bs * num_draft, dtype=torch.int64)
+        padded_seq = torch.tensor([seq_len, 0], dtype=torch.int32)
+        with self.assertRaises(ValueError):
+            build_tree_verify_kv_slots(
+                custom,
+                padded_seq,
+                req_to_token,
+                torch.arange(padded_bs, dtype=torch.int64),
+                out_cache_loc,
+                num_draft,
+            )
+        eager_slots, eager_lens = build_tree_verify_kv_slots(
+            custom,
+            [seq_len],
+            req_to_token[:raw_bs],
+            torch.tensor([0], dtype=torch.int64),
+            out_cache_loc[: raw_bs * num_draft],
+            num_draft,
+        )
+        slots, lens = build_tree_verify_kv_slots(
+            custom,
+            padded_seq,
+            req_to_token,
+            torch.arange(padded_bs, dtype=torch.int64),
+            out_cache_loc,
+            num_draft,
+            rows_limit=raw_bs * num_draft,
+        )
+        self.assertEqual(tuple(slots.shape), (raw_bs * num_draft, seq_len + num_draft))
+        self.assertTrue(torch.equal(slots, eager_slots))
+        self.assertTrue(torch.equal(lens, eager_lens))
+        dest_slots = torch.zeros(
+            (padded_bs * num_draft, seq_len + num_draft), dtype=torch.int64
+        )
+        dest_lens = torch.zeros((padded_bs * num_draft,), dtype=torch.int32)
+        dest_slots[: slots.shape[0]].copy_(slots)
+        dest_lens[: lens.shape[0]].copy_(lens)
+        self.assertTrue(torch.equal(dest_lens[: raw_bs * num_draft], eager_lens))
+        self.assertTrue((dest_lens[raw_bs * num_draft :] == 0).all())
+
+    def test_spec_info_seq_lens_preferred_over_padded_fallback(self):
+        spec = types.SimpleNamespace(
+            seq_lens_cpu=torch.tensor([128], dtype=torch.int32),
+            seq_lens_sum=128,
+        )
+        seq_list, raw_bs, source = resolve_tree_verify_mask_seq_lens(
+            spec, torch.tensor([128, 0], dtype=torch.int32)
+        )
+        self.assertEqual(source, "spec_info")
+        self.assertEqual(raw_bs, 1)
+        self.assertEqual(seq_list, [128])
+
+        mismatch = types.SimpleNamespace(
+            seq_lens_cpu=torch.tensor([128], dtype=torch.int32),
+            seq_lens_sum=999,
+        )
+        seq_list, raw_bs, source = resolve_tree_verify_mask_seq_lens(
+            mismatch, torch.tensor([50], dtype=torch.int32)
+        )
+        self.assertEqual(source, "fallback")
+        self.assertEqual(raw_bs, 1)
+        self.assertEqual(seq_list, [50])
+
+        missing = types.SimpleNamespace(seq_lens_cpu=None, seq_lens_sum=None)
+        seq_list, raw_bs, source = resolve_tree_verify_mask_seq_lens(
+            missing, torch.tensor([128, 0], dtype=torch.int32)
+        )
+        self.assertEqual(source, "fallback")
+        self.assertEqual(raw_bs, 2)
+        self.assertEqual(seq_list, [128, 0])
+
+    def test_visible_token_indices_rejects_short_row(self):
+        prefix = torch.arange(128, dtype=torch.int64)
+        draft = torch.arange(15, dtype=torch.int64)
+        short = torch.ones(128 + 6, dtype=torch.bool)
+        with self.assertRaises(ValueError) as ctx:
+            visible_token_indices(short, prefix, draft)
+        msg = str(ctx.exception)
+        self.assertIn("attend_row=134", msg)
+        self.assertIn("prefix=128", msg)
+        self.assertIn("draft=15", msg)
 
 
 if __name__ == "__main__":

@@ -76,7 +76,10 @@ class TestTreeAttnMask(CustomTestCase):
         self.assertEqual(FIA_TREE_MASK_CONTRACT["ascend_true"], "masked")
         self.assertEqual(FIA_TREE_MASK_CONTRACT["sparse_mode"], 0)
         self.assertFalse(FIA_TREE_MASK_CONTRACT["fia_consumes_mask"])
-        custom = torch.tensor([True, True, True], dtype=torch.bool)
+        # seq_len=1, num_draft=2 → two rows of length 3.
+        custom = torch.tensor(
+            [True, True, True, True, True, True], dtype=torch.bool
+        )
         seq_lens = torch.tensor([1], dtype=torch.int32)
         masked = custom_mask_to_ascend_masked(
             custom, seq_lens, num_draft=2, max_kv=5

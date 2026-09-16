@@ -17,6 +17,7 @@ from typing import Optional, Sequence, Union
 import torch
 
 from sglang.srt.speculative.tree_attn_mask import (
+    assert_full_mask_layout,
     iter_full_mask_rows,
     visible_token_indices,
 )
@@ -37,6 +38,7 @@ MAX_ATTN_CHUNK_WIDTH = 512
 logger = logging.getLogger(__name__)
 _LOGGED_TREE_VERIFY_FALLBACK = False
 _LOGGED_TREE_DRAFT_SLOT_GATHER = False
+_LOGGED_TREE_VERIFY_LAYOUT = False
 
 
 def verify_tree_topk_from_server_args(server_args) -> int:
@@ -89,6 +91,36 @@ def log_tree_verify_fallback_once(verify_tree_topk: int) -> None:
     logger.info(
         "tree verify slot-gather fallback enabled topk=%s",
         int(verify_tree_topk),
+    )
+
+
+def log_tree_verify_kv_slot_layout_once(
+    *,
+    mask_numel: int,
+    expected_numel: int,
+    bs: int,
+    raw_bs: int,
+    num_draft: int,
+    seq_lens_sum: int,
+    graph_rows: int,
+    max_kv: int,
+) -> None:
+    """Log once when tree-verify slot-gather fills the KV slot table."""
+    global _LOGGED_TREE_VERIFY_LAYOUT
+    if _LOGGED_TREE_VERIFY_LAYOUT:
+        return
+    _LOGGED_TREE_VERIFY_LAYOUT = True
+    logger.info(
+        "tree verify slot-gather layout: mask_numel=%s expected_numel=%s "
+        "bs=%s raw_bs=%s num_draft=%s seq_lens_sum=%s graph_rows=%s max_kv=%s",
+        int(mask_numel),
+        int(expected_numel),
+        int(bs),
+        int(raw_bs),
+        int(num_draft),
+        int(seq_lens_sum),
+        int(graph_rows),
+        int(max_kv),
     )
 
 
@@ -244,17 +276,32 @@ def build_tree_verify_kv_slots(
     out_cache_loc: torch.Tensor,
     num_draft: int,
     max_kv: Optional[int] = None,
+    rows_limit: Optional[int] = None,
 ):
     """Visible token slots per TARGET_VERIFY query.
 
     Host-side (before graph replay). Returns
     ``(kv_slots[T, max_kv], kv_lens[T])`` with ``T = bs * num_draft``.
-    Padding columns are ignored via ``kv_lens``.
+    Padding columns are ignored via ``kv_lens``. ``rows_limit`` walks only the
+    first N query rows (graph padding); default is ``bs * num_draft``.
     """
     seq_list = _as_seq_list(seq_lens)
     bs = len(seq_list)
     num_draft = int(num_draft)
     rows = bs * num_draft
+    if rows_limit is not None:
+        rows_limit = int(rows_limit)
+        if num_draft > 0:
+            n_seq = min(bs, max(rows_limit, 0) // num_draft)
+        else:
+            n_seq = 0
+        if n_seq < bs:
+            seq_list = seq_list[:n_seq]
+            bs = n_seq
+            rows = bs * num_draft
+    assert_full_mask_layout(
+        custom_mask, seq_list, num_draft, where="build_tree_verify_kv_slots"
+    )
     if max_kv is None:
         max_kv = max((int(s) + num_draft for s in seq_list), default=num_draft)
     max_kv = int(max_kv)
@@ -266,6 +313,18 @@ def build_tree_verify_kv_slots(
 
     req_pool = req_pool_indices.reshape(-1).to(dtype=torch.int64)
     draft_locs_all = out_cache_loc.reshape(-1)
+    need_loc = bs * num_draft
+    if int(draft_locs_all.numel()) < need_loc:
+        raise ValueError(
+            "build_tree_verify_kv_slots: out_cache_loc too short: "
+            f"numel={int(draft_locs_all.numel())} need={need_loc} "
+            f"bs={bs} num_draft={num_draft}"
+        )
+    if int(req_pool.numel()) < bs:
+        raise ValueError(
+            "build_tree_verify_kv_slots: req_pool_indices too short: "
+            f"numel={int(req_pool.numel())} need={bs}"
+        )
     for b, t, attend_row in iter_full_mask_rows(custom_mask, seq_list, num_draft):
         q_idx = b * num_draft + t
         if q_idx >= rows:
