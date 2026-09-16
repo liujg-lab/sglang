@@ -25,6 +25,15 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 
 DEFAULT_ATTN_CHUNK_SIZE = 256
 
+# A device graph unrolls the Python chunk loop, so the node count must not grow
+# with the slot-table width. Bound the number of chunks and derive the width
+# from it, aligned to a page so a chunk covers whole pages.
+MAX_ATTN_CHUNKS = 8
+ATTN_CHUNK_ALIGN = 128
+# The chunk width is what a gather actually materializes, so cap it too: an
+# oversized slot table then costs extra chunks rather than extra memory.
+MAX_ATTN_CHUNK_WIDTH = 512
+
 logger = logging.getLogger(__name__)
 _LOGGED_TREE_VERIFY_FALLBACK = False
 _LOGGED_TREE_DRAFT_SLOT_GATHER = False
@@ -116,6 +125,22 @@ def flatten_paged_kv(
         if cache.shape[1] == n_heads and cache.shape[-1] == head_dim:
             return cache.permute(0, 2, 1, 3).contiguous().reshape(-1, n_heads, head_dim)
     return cache.reshape(-1, n_heads, head_dim)
+
+
+def tree_attn_chunk_width(max_kv: int, align: int = ATTN_CHUNK_ALIGN) -> int:
+    """KV columns per gather chunk.
+
+    Aims for ``ceil(max_kv / width) <= MAX_ATTN_CHUNKS`` so a captured graph
+    holds a bounded number of nodes, while never exceeding
+    ``MAX_ATTN_CHUNK_WIDTH`` so one gather stays small.
+    """
+    max_kv = int(max_kv)
+    align = max(int(align), 1)
+    if max_kv <= 0:
+        return align
+    width = -(-max_kv // MAX_ATTN_CHUNKS)
+    width = -(-width // align) * align
+    return max(min(width, MAX_ATTN_CHUNK_WIDTH), align)
 
 
 def gather_kv_by_slots(
@@ -283,6 +308,7 @@ def tree_verify_attention(
     rope_head_dim: Optional[int] = None,
     kv_slots: Optional[torch.Tensor] = None,
     kv_lens: Optional[SeqLens] = None,
+    kv_bound: Optional[int] = None,
 ) -> torch.Tensor:
     """Batched slot-gather tree attention. Returns ``[T, n_q_heads * v_head_dim]``.
 
@@ -312,6 +338,7 @@ def tree_verify_attention(
         q_rope=q_rope,
         k_rope_cache=k_rope_cache,
         rope_head_dim=rope_head_dim,
+        kv_bound=kv_bound,
     )
 
 
@@ -330,11 +357,21 @@ def tree_draft_attention(
     q_rope: Optional[torch.Tensor] = None,
     k_rope_cache: Optional[torch.Tensor] = None,
     rope_head_dim: Optional[int] = None,
+    kv_bound: Optional[int] = None,
 ) -> torch.Tensor:
     """Batched token-level attention for tree-draft decode.
 
-    ``kv_slots`` is ``[R, max_kv]`` with one row per ``(seq, topk)`` branch.
-    Padding columns are ignored via ``kv_lens``. GQA repeats KV heads.
+    ``kv_slots`` is ``[R, S_pad]`` with one row per ``(seq, topk)`` branch.
+    Padding columns are ignored via ``kv_lens``.
+
+    KV is gathered one static chunk at a time and combined with online
+    softmax, so peak memory follows the chunk width instead of ``S_pad``.
+    A dense ``[R, S_pad, H, D]`` gather would be ``S_pad``-sized even when
+    every ``kv_lens`` entry is zero, which is what graph capture feeds in.
+
+    ``kv_bound`` caps the columns actually visited. Callers outside a device
+    graph may pass ``max(kv_lens)`` to skip all-padding tail chunks; inside a
+    graph it must stay ``None`` so the trip count is capture-time constant.
     """
     query = query.reshape(-1, n_q_heads, qk_head_dim)
     rows = int(query.shape[0])
@@ -344,45 +381,70 @@ def tree_draft_attention(
     kv_slots = kv_slots.reshape(rows, -1).to(dtype=torch.int64, device=query.device)
     max_kv = int(kv_slots.shape[1])
     kv_len_t = _kv_lens_tensor(kv_lens, rows, query.device)
+    if kv_bound is not None:
+        max_kv = min(max_kv, max(int(kv_bound), 0))
     if max_kv == 0:
         return query.new_zeros(rows, n_q_heads * v_head_dim)
 
+    n_kv_heads = max(int(n_kv_heads), 1)
+    n_rep = n_q_heads // n_kv_heads
+    if n_rep < 1 or n_kv_heads * n_rep != n_q_heads:
+        raise ValueError(
+            f"tree attention needs n_q_heads ({n_q_heads}) to be a multiple of "
+            f"n_kv_heads ({n_kv_heads})"
+        )
+
     flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)
     flat_v = flatten_paged_kv(v_cache, n_kv_heads, v_head_dim)
-    safe_slots = kv_slots.clamp(min=0)
-    k_g = flat_k.index_select(0, safe_slots.reshape(-1)).view(
-        rows, max_kv, n_kv_heads, qk_head_dim
-    )
-    v_g = flat_v.index_select(0, safe_slots.reshape(-1)).view(
-        rows, max_kv, n_kv_heads, v_head_dim
-    )
-    n_rep = n_q_heads // max(int(n_kv_heads), 1)
-    if n_rep > 1:
-        k_g = k_g.repeat_interleave(n_rep, dim=2)
-        v_g = v_g.repeat_interleave(n_rep, dim=2)
-
-    q_f = query.float()
-    # [R, H, D] x [R, S, H, D] -> [R, H, S]
-    k_f = k_g.permute(0, 2, 3, 1).contiguous().float()
-    scores = torch.matmul(q_f.unsqueeze(2), k_f).squeeze(2) * float(scale)
+    flat_k_rope = None
+    rd = 0
     if q_rope is not None and k_rope_cache is not None:
         rd = int(rope_head_dim)
-        q_rope = q_rope.reshape(-1, n_q_heads, rd)
         flat_k_rope = flatten_paged_kv(k_rope_cache, n_kv_heads, rd)
-        k_rope_g = flat_k_rope.index_select(0, safe_slots.reshape(-1)).view(
-            rows, max_kv, n_kv_heads, rd
-        )
-        if n_rep > 1:
-            k_rope_g = k_rope_g.repeat_interleave(n_rep, dim=2)
-        k_rope_f = k_rope_g.permute(0, 2, 3, 1).contiguous().float()
-        scores = scores + torch.matmul(q_rope.float().unsqueeze(2), k_rope_f).squeeze(
-            2
-        ) * float(scale)
+        # Grouped like q below: q head h attends kv head h // n_rep.
+        q_rope = q_rope.reshape(rows, n_kv_heads, n_rep, rd).float()
 
-    col = torch.arange(max_kv, device=query.device, dtype=torch.int64)
-    pad = col.view(1, 1, max_kv) >= kv_len_t.view(rows, 1, 1)
-    scores = scores.masked_fill(pad, torch.finfo(torch.float32).min)
-    probs = torch.softmax(scores, dim=-1)
-    probs = probs.masked_fill(pad, 0.0)
-    out = torch.matmul(probs.unsqueeze(2), v_g.permute(0, 2, 1, 3).float()).squeeze(2)
+    # [R, n_kv, n_rep, D]: q head h pairs with kv head h // n_rep, matching a
+    # repeat_interleave of the KV heads, but without materializing the copies.
+    q_g = query.view(rows, n_kv_heads, n_rep, qk_head_dim).float()
+    scale = float(scale)
+    neg_inf = torch.finfo(torch.float32).min
+    running_max = q_g.new_full((rows, n_kv_heads, n_rep), neg_inf)
+    running_sum = q_g.new_zeros(rows, n_kv_heads, n_rep)
+    acc = q_g.new_zeros(rows, n_kv_heads, n_rep, v_head_dim)
+
+    col_all = torch.arange(max_kv, device=query.device, dtype=torch.int64)
+    chunk = tree_attn_chunk_width(max_kv)
+    for start in range(0, max_kv, chunk):
+        width = min(chunk, max_kv - start)
+        slots_c = kv_slots[:, start : start + width].clamp(min=0)
+        idx = slots_c.reshape(-1)
+        k_c = flat_k.index_select(0, idx).view(rows, width, n_kv_heads, qk_head_dim)
+        v_c = flat_v.index_select(0, idx).view(rows, width, n_kv_heads, v_head_dim)
+
+        scores = torch.einsum("rkgd,rckd->rkgc", q_g, k_c.float()) * scale
+        if flat_k_rope is not None:
+            k_rope_c = flat_k_rope.index_select(0, idx).view(
+                rows, width, n_kv_heads, rd
+            )
+            scores = scores + (
+                torch.einsum("rkgd,rckd->rkgc", q_rope, k_rope_c.float()) * scale
+            )
+
+        pad = col_all[start : start + width].view(1, 1, 1, width) >= kv_len_t.view(
+            rows, 1, 1, 1
+        )
+        scores = scores.masked_fill(pad, neg_inf)
+
+        chunk_max = scores.amax(dim=-1)
+        new_max = torch.maximum(running_max, chunk_max)
+        alpha = torch.exp(running_max - new_max)
+        probs = torch.exp(scores - new_max.unsqueeze(-1)).masked_fill(pad, 0.0)
+        acc = acc * alpha.unsqueeze(-1) + torch.einsum(
+            "rkgc,rckd->rkgd", probs, v_c.float()
+        )
+        running_sum = running_sum * alpha + probs.sum(dim=-1)
+        running_max = new_max
+
+    out = acc / running_sum.clamp_min(1e-20).unsqueeze(-1)
     return out.to(dtype=query.dtype).reshape(rows, n_q_heads * v_head_dim)

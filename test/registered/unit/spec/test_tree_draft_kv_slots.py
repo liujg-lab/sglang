@@ -430,9 +430,20 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("_fill_tree_draft_kv_slots", replay_meta)
         self.assertIn("_copy_into_graph_slot_buffers", _ASCEND_BACKEND.read_text())
         max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
-        self.assertIn("req_to_token.shape[1]", max_kv_src)
+        self.assertIn("_slot_gather_kv_pool_size", max_kv_src)
         self.assertIn("min(cap, pool)", max_kv_src)
         self.assertNotIn("return int(self.max_context_len) + extra", max_kv_src)
+        pool_src = _function_source(_ASCEND_BACKEND, "_slot_gather_kv_pool_size")
+        self.assertIn("token_to_kv_pool", pool_src)
+        self.assertNotIn("self.req_to_token", pool_src)
+
+    def test_draft_slot_gather_passes_eager_kv_bound(self):
+        src = _function_source(_ASCEND_BACKEND, "_run_tree_draft_slot_gather")
+        self.assertIn("kv_bound=self._slot_gather_kv_bound", src)
+        bound_src = _function_source(_ASCEND_BACKEND, "_slot_gather_kv_bound")
+        # Skipping padding chunks needs a host read, so graph mode must opt out.
+        self.assertIn("self.graph_mode", bound_src)
+        self.assertIn("return None", bound_src)
 
     def test_sr_tree_drafter_skips_last_page_copy(self):
         src = _function_source(_SR_TREE, "_alloc_tree_kv")

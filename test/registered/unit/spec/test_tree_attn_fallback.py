@@ -13,12 +13,17 @@ import unittest
 import torch
 
 from sglang.srt.speculative.tree_attn_fallback import (
+    ATTN_CHUNK_ALIGN,
+    MAX_ATTN_CHUNK_WIDTH,
+    MAX_ATTN_CHUNKS,
     build_tree_verify_kv_slots,
     chunked_attend,
     flatten_paged_kv,
     gather_kv_by_slots,
     resolve_backend_topks,
     should_skip_npu_target_verify_graph,
+    tree_attn_chunk_width,
+    tree_draft_attention,
     tree_verify_attention,
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
@@ -393,9 +398,143 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertIn("_fill_tree_verify_kv_slots", replay_src)
         self.assertIn("_restore_graph_verify_slot_views", replay_src)
         max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
-        self.assertIn("req_to_token.shape[1]", max_kv_src)
+        self.assertIn("_slot_gather_kv_pool_size", max_kv_src)
         self.assertIn("min(cap, pool)", max_kv_src)
         self.assertNotIn("return int(self.max_context_len) + extra", max_kv_src)
+        # The slot table must be sized by the KV pool. req_to_token is
+        # context_len wide, so it caps nothing.
+        pool_src = _function_source(_ASCEND_BACKEND, "_slot_gather_kv_pool_size")
+        self.assertIn("token_to_kv_pool", pool_src)
+        self.assertIn("max_total_num_tokens", pool_src)
+        self.assertNotIn("self.req_to_token", pool_src)
+
+    def test_graph_state_drops_dead_tree_mask_for_slot_gather(self):
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("_slot_gather_tree_attn", state_src)
+        self.assertIn("self.cuda_graph_tree_attn_mask = None", state_src)
+        # custom_mask is still consumed when building the slot table.
+        self.assertIn("cuda_graph_custom_mask", state_src)
+        fill_src = _function_source(_ASCEND_BACKEND, "_fill_tree_verify_mask")
+        self.assertIn("_slot_gather_tree_attn", fill_src)
+
+    def test_chunked_attention_matches_dense_slot_gather(self):
+        torch.manual_seed(3)
+        page_size, num_pages = 128, 8
+        for n_q, n_kv in ((4, 4), (8, 2), (8, 1)):
+            rows, s_pad, d = 5, 600, 16
+            q = torch.randn(rows, n_q, d)
+            k_cache = torch.randn(num_pages, page_size, n_kv, d)
+            v_cache = torch.randn(num_pages, page_size, n_kv, d)
+            kv_slots = torch.randint(0, num_pages * page_size, (rows, s_pad))
+            kv_lens = torch.randint(1, s_pad + 1, (rows,), dtype=torch.int32)
+            scale = 1.0 / math.sqrt(d)
+            out = tree_draft_attention(
+                q,
+                k_cache,
+                v_cache,
+                kv_slots=kv_slots,
+                kv_lens=kv_lens,
+                scale=scale,
+                n_q_heads=n_q,
+                n_kv_heads=n_kv,
+                qk_head_dim=d,
+                v_head_dim=d,
+            )
+            self.assertEqual(tuple(out.shape), (rows, n_q * d))
+            flat_k = flatten_paged_kv(k_cache, n_kv, d)
+            flat_v = flatten_paged_kv(v_cache, n_kv, d)
+            for r in range(rows):
+                n = int(kv_lens[r])
+                k_vis, v_vis = gather_kv_by_slots(flat_k, flat_v, kv_slots[r, :n])
+                ref = _dense_attend(q[r], k_vis, v_vis, scale)
+                self.assertTrue(
+                    torch.allclose(
+                        out[r].view(n_q, d).float(), ref, atol=1e-4, rtol=1e-4
+                    ),
+                    msg=f"n_q={n_q} n_kv={n_kv} row={r}",
+                )
+
+    def test_chunked_attention_ignores_padding_columns(self):
+        torch.manual_seed(4)
+        rows, n_q, n_kv, d = 3, 4, 2, 8
+        page_size, num_pages = 128, 4
+        q = torch.randn(rows, n_q, d)
+        k_cache = torch.randn(num_pages, page_size, n_kv, d)
+        v_cache = torch.randn(num_pages, page_size, n_kv, d)
+        kv_lens = torch.tensor([0, 7, 300], dtype=torch.int32)
+        base = torch.randint(0, num_pages * page_size, (rows, 300))
+
+        def run(s_pad):
+            slots = torch.zeros(rows, s_pad, dtype=torch.int64)
+            slots[:, :300] = base
+            if s_pad > 300:
+                # Junk in the padding columns must not reach the output.
+                slots[:, 300:] = torch.randint(
+                    0, num_pages * page_size, (rows, s_pad - 300)
+                )
+            return tree_draft_attention(
+                q,
+                k_cache,
+                v_cache,
+                kv_slots=slots,
+                kv_lens=kv_lens,
+                scale=0.25,
+                n_q_heads=n_q,
+                n_kv_heads=n_kv,
+                qk_head_dim=d,
+                v_head_dim=d,
+            )
+
+        tight = run(300)
+        padded = run(4096)
+        self.assertTrue(torch.allclose(tight, padded, atol=1e-5, rtol=1e-5))
+        # kv_lens == 0 contributes nothing.
+        self.assertTrue(torch.equal(padded[0], torch.zeros_like(padded[0])))
+
+    def test_chunked_attention_kv_bound_matches_full_width(self):
+        torch.manual_seed(5)
+        rows, n_q, n_kv, d = 4, 4, 4, 8
+        page_size, num_pages = 128, 4
+        q = torch.randn(rows, n_q, d)
+        k_cache = torch.randn(num_pages, page_size, n_kv, d)
+        v_cache = torch.randn(num_pages, page_size, n_kv, d)
+        slots = torch.randint(0, num_pages * page_size, (rows, 2048))
+        kv_lens = torch.full((rows,), 130, dtype=torch.int32)
+        kwargs = dict(
+            kv_slots=slots,
+            kv_lens=kv_lens,
+            scale=0.25,
+            n_q_heads=n_q,
+            n_kv_heads=n_kv,
+            qk_head_dim=d,
+            v_head_dim=d,
+        )
+        full = tree_draft_attention(q, k_cache, v_cache, **kwargs)
+        bounded = tree_draft_attention(q, k_cache, v_cache, kv_bound=130, **kwargs)
+        self.assertTrue(torch.allclose(full, bounded, atol=1e-6, rtol=1e-6))
+
+    def test_chunk_width_bounds_graph_node_count(self):
+        for s_pad in (1, 17, 128, 384, 2063, 4096, 65536, 262151):
+            width = tree_attn_chunk_width(s_pad)
+            self.assertEqual(width % ATTN_CHUNK_ALIGN, 0)
+            self.assertLessEqual(width, MAX_ATTN_CHUNK_WIDTH)
+            chunks = -(-s_pad // width)
+            if width < MAX_ATTN_CHUNK_WIDTH:
+                self.assertLessEqual(chunks, MAX_ATTN_CHUNKS, msg=f"s_pad={s_pad}")
+        # A pool-sized table stays within the node budget.
+        self.assertLessEqual(-(-2063 // tree_attn_chunk_width(2063)), MAX_ATTN_CHUNKS)
+
+    def test_attention_never_gathers_the_whole_slot_table(self):
+        src = _function_source(_FALLBACK, "tree_draft_attention")
+        # A dense gather is S_pad-sized even when every kv_len is zero, which
+        # is exactly what graph capture feeds in.
+        self.assertNotIn("safe_slots.reshape(-1)", src)
+        self.assertNotIn(".repeat_interleave(", src)
+        self.assertIn("tree_attn_chunk_width", src)
+        self.assertIn("for start in range(0, max_kv, chunk)", src)
+        self.assertIn("kv_slots[:, start : start + width]", src)
+        # Trip count must be capture-time constant: no host sync inside.
+        self.assertNotIn(".item()", src)
 
     def test_cuda_graph_runner_captures_npu_tree_verify_ntpb(self):
         init_src = _function_source(_CUDA_GRAPH_RUNNER, "__init__")

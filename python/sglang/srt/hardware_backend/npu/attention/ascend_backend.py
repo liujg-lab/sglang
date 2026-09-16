@@ -36,6 +36,7 @@ from sglang.srt.speculative.tree_attn_fallback import (
     build_tree_verify_kv_slots,
     log_tree_draft_slot_gather_once,
     log_tree_verify_fallback_once,
+    tree_attn_chunk_width,
     tree_draft_attention,
     tree_verify_attention,
     use_tree_verify_fallback,
@@ -363,7 +364,21 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_verify_positions[:pn].copy_(positions.reshape(-1))
             spec_info.positions = self.cuda_graph_verify_positions[:pn]
 
+    def _slot_gather_tree_attn(self) -> bool:
+        """True when tree attention reads token slots instead of an FIA mask.
+
+        Target verify keys off ``speculative_eagle_topk``; tree draft needs a
+        paged KV cache on top of its own topk.
+        """
+        return int(self.verify_tree_topk) > 1 or (
+            int(self.draft_topk) > 1 and int(self.page_size) > 1
+        )
+
     def _fill_tree_verify_mask(self, forward_batch: ForwardBatch) -> None:
+        if self._slot_gather_tree_attn():
+            # Slot-gather carries visibility in tree_verify_kv_slots/_lens, so
+            # the dense mask has no reader and would be context_len wide.
+            return
         spec_info = getattr(forward_batch, "spec_info", None)
         custom_mask = getattr(spec_info, "custom_mask", None)
         if spec_info is None or custom_mask is None or custom_mask.numel() == 0:
@@ -449,19 +464,42 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 self.forward_metadata.tree_draft_kv_slots_swa = swa_slots
 
+    def _slot_gather_kv_pool_size(self) -> int:
+        """Token slots the KV pool physically holds.
+
+        ``req_to_token.shape[1]`` is ``context_len`` wide, so it is a mapping
+        table bound, not a capacity bound, and must not be used here.
+        """
+        pool = getattr(self.model_runner, "token_to_kv_pool", None)
+        size = int(getattr(pool, "size", 0) or 0) if pool is not None else 0
+        if size <= 0:
+            size = int(getattr(self.model_runner, "max_total_num_tokens", 0) or 0)
+        return max(size, 0)
+
     def _slot_gather_graph_max_kv(self) -> int:
         extra = max(
             int(self.draft_num_steps),
             int(self.speculative_num_draft_tokens or 1),
             1,
         )
-        pool = 0
-        if self.req_to_token is not None and self.req_to_token.ndim >= 2:
-            pool = int(self.req_to_token.shape[1])
+        pool = self._slot_gather_kv_pool_size()
         cap = int(self.max_context_len)
         if pool > 0:
             cap = min(cap, pool)
         return max(cap, 1) + extra
+
+    def _slot_gather_kv_bound(self, kv_lens) -> Optional[int]:
+        """Columns worth visiting in the slot-gather loop, or None for all of them.
+
+        Outside a device graph the all-padding tail chunks can be skipped.
+        Inside one the trip count must stay capture-time constant, so the full
+        slot-table width has to drive the loop.
+        """
+        if self.graph_mode or not isinstance(kv_lens, torch.Tensor):
+            return None
+        if kv_lens.numel() == 0:
+            return None
+        return int(kv_lens.max().item())
 
     def _copy_into_graph_slot_buffers(
         self,
@@ -626,6 +664,9 @@ class AscendAttnBackend(AttentionBackend):
             rope_head_dim=rope_head_dim,
             kv_slots=self.forward_metadata.tree_verify_kv_slots,
             kv_lens=self.forward_metadata.tree_verify_kv_lens_t,
+            kv_bound=self._slot_gather_kv_bound(
+                self.forward_metadata.tree_verify_kv_lens_t
+            ),
         )
 
     def _run_tree_draft_slot_gather(
@@ -673,6 +714,9 @@ class AscendAttnBackend(AttentionBackend):
             q_rope=q_rope,
             k_rope_cache=k_rope_cache,
             rope_head_dim=rope_head_dim,
+            kv_bound=self._slot_gather_kv_bound(
+                self.forward_metadata.tree_draft_kv_lens_t
+            ),
         )
 
     def _tree_draft_kv_lens(self, seq_lens, num_q: int):
@@ -871,9 +915,12 @@ class AscendAttnBackend(AttentionBackend):
         self.cuda_graph_custom_mask = torch.empty(
             (max_q * max_kv,), dtype=torch.bool, device=self.device
         )
-        self.cuda_graph_tree_attn_mask = torch.ones(
-            (max_q, max_kv), dtype=torch.bool, device=self.device
-        )
+        if self._slot_gather_tree_attn():
+            self.cuda_graph_tree_attn_mask = None
+        else:
+            self.cuda_graph_tree_attn_mask = torch.ones(
+                (max_q, max_kv), dtype=torch.bool, device=self.device
+            )
         self.cuda_graph_verify_positions = torch.empty(
             (max_q,), dtype=torch.int64, device=self.device
         )
@@ -882,6 +929,16 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.cuda_graph_kv_lens = torch.zeros(
             (max_q,), dtype=torch.int32, device=self.device
+        )
+        logger.info(
+            "tree slot-gather graph buffers: max_q=%s max_kv=%s kv_pool=%s "
+            "context_len=%s slots=%.1f MiB chunk_width=%s",
+            max_q,
+            max_kv,
+            self._slot_gather_kv_pool_size(),
+            int(self.max_context_len),
+            max_q * max_kv * 8 / (1024**2),
+            tree_attn_chunk_width(max_kv),
         )
         if self.is_hybrid_swa:
             self.cuda_graph_kv_slots_swa = torch.zeros(
