@@ -17,16 +17,24 @@ from sglang.srt.speculative.tree_attn_fallback import (
     MAX_ATTN_CHUNK_WIDTH,
     MAX_ATTN_CHUNKS,
     build_tree_verify_kv_slots,
+    build_tree_verify_kv_slots_ref,
     chunked_attend,
     flatten_paged_kv,
     gather_kv_by_slots,
+    gather_kv_into,
+    parse_tree_draft_capture_bs,
+    parse_tree_graph_kv_buckets,
     resolve_backend_topks,
+    select_tree_kv_bucket,
     should_skip_npu_target_verify_graph,
     tree_attn_chunk_width,
+    tree_compact_fia_layout_supported,
     tree_draft_attention,
+    tree_fia_actual_seq_lengths_kv,
     tree_verify_attention,
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
+    zero_gathered_kv_padding,
 )
 from sglang.srt.speculative.tree_attn_mask import (
     full_mask_numel,
@@ -562,15 +570,21 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertNotIn("eager slot-gather fallback", init_src)
         self.assertIn("self.spectre_ntpb_options", init_src)
 
-    def test_npu_graph_runner_skips_fia_update_for_tree_verify(self):
+    def test_npu_graph_runner_updates_fia_for_tree_verify(self):
         replay_src = _function_source(_NPU_GRAPH_RUNNER, "replay")
         self.assertIn("skip_fia_update", replay_src)
-        self.assertIn("speculative_eagle_topk", replay_src)
+        self.assertIn("is_deepseek_nsa", replay_src)
+        self.assertIn("compact_fia", replay_src)
+        self.assertIn("tree_fia_kv_lens_cpu", replay_src)
+        self.assertIn("tree_fia_actual_seq_lengths_kv", replay_src)
+        self.assertIn("_replay_tree_s_cap", replay_src)
 
     def test_npu_graph_runner_can_run_defers_to_slot_width(self):
         can_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "can_run")
         self.assertIn("super().can_run", can_src)
         self.assertIn("tree_slot_graph_can_run", can_src)
+        self.assertIn("_s", can_src)
+        self.assertIn("tree_verify_eager_fallback_count", can_src)
 
     def test_build_tree_verify_kv_slots_matches_visible(self):
         custom = torch.tensor(
@@ -927,6 +941,25 @@ class TestTreeGraphSlotCap(CustomTestCase):
             )
         )
 
+    def test_buckets_admit_smallest_fit(self):
+        info, fallback = self._verify_info([200])
+        self.assertTrue(
+            self._admit(
+                spec_info=info,
+                fallback_seq_lens=fallback,
+                slot_width=1,
+                buckets=[256, 512, 1024],
+            )
+        )
+        self.assertFalse(
+            self._admit(
+                spec_info=info,
+                fallback_seq_lens=fallback,
+                slot_width=1,
+                buckets=[64, 128],
+            )
+        )
+
     def test_parent_can_run_false_stays_false(self):
         self.assertTrue(self._admit(slot_gather_enabled=False, slot_width=1))
 
@@ -990,7 +1023,157 @@ class TestTreeGraphSlotCap(CustomTestCase):
         self.assertIn("max_q * mask_max_kv", state_src)
         self.assertIn("cuda_graph_kv_slots", state_src)
         self.assertIn("(max_q, slot_max_kv)", state_src)
+        self.assertIn("parse_tree_graph_kv_buckets", state_src)
+        self.assertIn("tree_kv_buckets", state_src)
         self.assertIn("parse_tree_graph_max_kv", _ASCEND_BACKEND.read_text())
+
+
+class TestTreeCompactFillAndBuckets(CustomTestCase):
+    def test_vectorized_slots_match_ref(self):
+        torch.manual_seed(0)
+        for seq_lens, num_draft in (([1], 3), ([2, 1], 2), ([4, 8, 3], 4)):
+            bs = len(seq_lens)
+            rows = []
+            for seq in seq_lens:
+                width = seq + num_draft
+                for _t in range(num_draft):
+                    rows.append(torch.randint(0, 2, (width,), dtype=torch.bool))
+            custom = torch.cat(rows)
+            req = torch.arange(bs * 32).view(bs, 32)
+            pool = torch.arange(bs)
+            draft = torch.arange(100, 100 + bs * num_draft)
+            a, la = build_tree_verify_kv_slots(
+                custom, seq_lens, req, pool, draft, num_draft
+            )
+            b, lb = build_tree_verify_kv_slots_ref(
+                custom, seq_lens, req, pool, draft, num_draft
+            )
+            self.assertTrue(torch.equal(a, b), msg=str(seq_lens))
+            self.assertTrue(torch.equal(la, lb), msg=str(seq_lens))
+
+    def test_hot_path_has_no_per_query_python_filter(self):
+        src = _function_source(_FALLBACK, "build_tree_verify_kv_slots")
+        self.assertNotIn("visible_token_indices", src)
+        self.assertNotIn("iter_full_mask_rows", src)
+        self.assertNotIn(".item()", src)
+        self.assertIn("cumsum", src)
+        self.assertIn("scatter_", src)
+
+    def test_invalid_columns_do_not_clobber_compact_slots(self):
+        custom = torch.tensor(
+            [
+                True, False, True, False,
+                False, False, False, False,
+            ],
+            dtype=torch.bool,
+        )
+        req = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
+        draft = torch.tensor([20, 21], dtype=torch.int64)
+        slots, lens = build_tree_verify_kv_slots(
+            custom, [2], req, torch.tensor([0]), draft, 2
+        )
+        self.assertEqual(int(lens[0]), 2)
+        self.assertEqual(slots[0, :2].tolist(), [10, 20])
+        self.assertEqual(slots[0, 2:].tolist(), [0, 0])
+
+    def test_overflow_width_raises_before_truncating(self):
+        custom = torch.ones(full_mask_numel([8], 2), dtype=torch.bool)
+        req = torch.arange(16).view(1, 16)
+        draft = torch.tensor([100, 101])
+        with self.assertRaises(RuntimeError):
+            build_tree_verify_kv_slots(
+                custom, [8], req, torch.tensor([0]), draft, 2, max_kv=4
+            )
+
+    def test_gather_kv_into_matches_index_select(self):
+        torch.manual_seed(1)
+        k = torch.randn(16, 2, 4)
+        v = torch.randn(16, 2, 4)
+        slots = torch.randint(0, 16, (3, 5))
+        k_out = torch.zeros(3, 5, 2, 4)
+        v_out = torch.zeros(3, 5, 2, 4)
+        gather_kv_into(k, v, slots, k_out, v_out)
+        ref_k, ref_v = gather_kv_by_slots(k, v, slots)
+        self.assertTrue(torch.equal(k_out.reshape_as(ref_k), ref_k))
+        self.assertTrue(torch.equal(v_out.reshape_as(ref_v), ref_v))
+        src = _function_source(_FALLBACK, "gather_kv_into")
+        self.assertIn("out=k_view", src)
+        self.assertIn("out=v_view", src)
+        self.assertNotIn("scratch.copy_", src)
+
+    def test_zero_padding_clears_empty_rows(self):
+        k_out = torch.ones(2, 3, 1, 2)
+        v_out = torch.ones(2, 3, 1, 2)
+        zero_gathered_kv_padding(k_out, v_out, torch.tensor([2, 0]))
+        self.assertEqual(float(k_out[1].abs().sum()), 0.0)
+        self.assertEqual(float(k_out[0, 2].abs().sum()), 0.0)
+        self.assertGreater(float(k_out[0, :2].abs().sum()), 0.0)
+
+    def test_buckets_clip_select_and_fia_lens(self):
+        self.assertEqual(
+            parse_tree_graph_kv_buckets(None, orig_max_kv=1024),
+            [256, 512, 1024],
+        )
+        self.assertEqual(
+            parse_tree_graph_kv_buckets("256,512,1024,2048", orig_max_kv=300),
+            [256, 300],
+        )
+        with self.assertRaises(ValueError):
+            parse_tree_graph_kv_buckets("0,256", orig_max_kv=1024)
+        self.assertEqual(select_tree_kv_bucket(200, [256, 512, 1024]), 256)
+        self.assertIsNone(select_tree_kv_bucket(2048, [256, 512]))
+        self.assertEqual(
+            tree_fia_actual_seq_lengths_kv(torch.tensor([0, 3]), capture_rows=4),
+            [1, 3, 1, 1],
+        )
+        self.assertEqual(parse_tree_draft_capture_bs(None), [1, 2])
+        self.assertTrue(tree_compact_fia_layout_supported(use_mla=False, has_rope_split=False))
+        self.assertFalse(tree_compact_fia_layout_supported(use_mla=True, has_rope_split=False))
+
+    def test_fia_update_list_matches_full_records(self):
+        spec_utils = _REPO_ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        src = _function_source(spec_utils, "expand_fia_cpu_update_inputs")
+        ns = {}
+        exec(src, ns)
+        updates = ns["expand_fia_cpu_update_inputs"](
+            [[2, 2, 2], [3, 3, 3]], 4, "actual_seq_lengths_kv"
+        )
+        self.assertEqual(len(updates), 8)
+        self.assertEqual(updates[0]["actual_seq_lengths_kv"], [2, 2, 2])
+        self.assertEqual(updates[4]["actual_seq_lengths_kv"], [3, 3, 3])
+        replay_src = _function_source(
+            _REPO_ROOT
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py",
+            "_replay",
+        )
+        self.assertIn("len(cpu_update_input) != n_records", replay_src)
+
+    def test_cuda_graph_capture_has_optional_extra_dim(self):
+        extra_src = _function_source(_CUDA_GRAPH_RUNNER, "_capture_extra_keys")
+        self.assertIn("return [None]", extra_src)
+        key_src = _function_source(_CUDA_GRAPH_RUNNER, "_make_graph_key")
+        self.assertIn("extra", key_src)
+        captured_src = _function_source(_CUDA_GRAPH_RUNNER, "_graph_key_captured")
+        self.assertIn("_s", captured_src)
+        can_src = _function_source(_CUDA_GRAPH_RUNNER, "can_run")
+        self.assertIn("_graph_key_captured", can_src)
+        capture_src = _function_source(_CUDA_GRAPH_RUNNER, "capture")
+        self.assertIn("_capture_extra_keys", capture_src)
+        self.assertIn("_active_capture_extra", capture_src)
+
+    def test_compact_fia_backend_wiring(self):
+        compact_src = _function_source(_ASCEND_BACKEND, "_run_tree_compact_fia")
+        self.assertIn("gather_kv_into", compact_src)
+        self.assertIn('input_layout="BSND"', compact_src)
+        self.assertIn("sparse_mode=0", compact_src)
+        self.assertIn("get_max_workspace", compact_src)
+        self.assertIn("npu_fused_infer_attention_score.out", compact_src)
+        self.assertNotIn("block_table", compact_src)
+        verify_src = _function_source(_ASCEND_BACKEND, "_run_tree_verify_slot_gather")
+        self.assertIn("_run_tree_compact_fia", verify_src)
+        self.assertIn("tree_verify_attention", verify_src)
+        draft_src = _function_source(_ASCEND_BACKEND, "_run_tree_draft_slot_gather")
+        self.assertIn("_run_tree_compact_fia", draft_src)
 
 
 if __name__ == "__main__":

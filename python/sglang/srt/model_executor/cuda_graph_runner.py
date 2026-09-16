@@ -723,19 +723,33 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _capture_extra_keys(self):
+        """Optional extra graph-key dimension. CUDA default is a single None."""
+        return [None]
+
     def _make_graph_key(
         self,
         bs: int,
         stream_idx: Optional[int] = None,
         ntpb: Optional[int] = None,
+        extra=None,
     ):
         if _uses_dual_ntpb(self) and ntpb is not None:
             base_key = f"r{ntpb}_{bs}"
         else:
             base_key = bs
         if stream_idx is not None:
-            return f"{stream_idx}_{base_key}"
+            base_key = f"{stream_idx}_{base_key}"
+        if extra is not None:
+            return f"{base_key}_s{int(extra)}"
         return base_key
+
+    def _graph_key_captured(self, graph_key) -> bool:
+        """True if this key exists, including bucketed ``{key}_s*`` variants."""
+        if graph_key in self.graphs:
+            return True
+        prefix = f"{graph_key}_s"
+        return any(isinstance(k, str) and str(k).startswith(prefix) for k in self.graphs)
 
     def _get_actual_ntpb(self, forward_batch: ForwardBatch) -> int:
         if _uses_dual_ntpb(self):
@@ -774,7 +788,7 @@ class CudaGraphRunner:
         )
 
         is_bs_supported = (
-            graph_key in self.graphs
+            self._graph_key_captured(graph_key)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -915,29 +929,39 @@ class CudaGraphRunner:
                             f"{tag} Capturing: bs={bs}, "
                             f"ntpb={ntpb}, num_tokens={bs * ntpb}",
                         )
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * ntpb,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if is_dual:
-                            graph, output_buffers = self.capture_one_batch_size(
-                                bs,
-                                forward,
-                                stream_idx,
-                                ntpb_override=ntpb,
-                            )
-                            key = self._make_graph_key(bs, stream_idx, ntpb)
-                        else:
-                            graph, output_buffers = self.capture_one_batch_size(
-                                bs,
-                                forward,
-                                stream_idx,
-                            )
-                            key = f"{stream_idx}_{bs}" if stream_idx is not None else bs
-                        self.graphs[key] = graph
-                        self.output_buffers[key] = output_buffers
+                    extra_keys = list(self._capture_extra_keys())
+                    if not extra_keys:
+                        extra_keys = [None]
+                    for extra in extra_keys:
+                        self._active_capture_extra = extra
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * ntpb,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if is_dual:
+                                graph, output_buffers = self.capture_one_batch_size(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    ntpb_override=ntpb,
+                                )
+                                key = self._make_graph_key(
+                                    bs, stream_idx, ntpb, extra=extra
+                                )
+                            else:
+                                graph, output_buffers = self.capture_one_batch_size(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                )
+                                key = self._make_graph_key(
+                                    bs, stream_idx, extra=extra
+                                )
+                            self.graphs[key] = graph
+                            self.output_buffers[key] = output_buffers
+                    self._active_capture_extra = None
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1157,7 +1181,12 @@ class CudaGraphRunner:
         )
 
         if _uses_dual_ntpb(self) and ntpb_override is not None:
-            capture_key = self._make_graph_key(bs, stream_idx, ntpb_override)
+            capture_key = self._make_graph_key(
+                bs,
+                stream_idx,
+                ntpb_override,
+                extra=getattr(self, "_active_capture_extra", None),
+            )
             fwd_meta = attn_backend.forward_metadata
             captured = getattr(self, "_captured_attn_tensors", None)
             if captured is None:

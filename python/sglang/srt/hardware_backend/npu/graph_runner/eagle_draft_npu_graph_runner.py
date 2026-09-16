@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, Union
 
@@ -33,6 +34,12 @@ from sglang.srt.speculative.spec_utils import (
     expand_fia_cpu_update_inputs,
     validate_draft_graph_step_kv_lens,
     validate_tree_draft_fia_records,
+)
+from sglang.srt.speculative.tree_attn_fallback import (
+    TREE_DRAFT_CAPTURE_BS_ENV,
+    parse_tree_draft_capture_bs,
+    tree_compact_fia_layout_supported,
+    tree_fia_actual_seq_lengths_kv,
 )
 
 if TYPE_CHECKING:
@@ -72,17 +79,74 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         page_size = int(getattr(eagle_worker, "page_size", 1) or 1)
         topk = int(getattr(eagle_worker, "topk", 1) or 1)
         self._slot_gather_graph = page_size > 1 and topk > 1
+        model = getattr(eagle_worker, "model_runner", None) or getattr(
+            eagle_worker, "draft_runner", None
+        )
+        use_mla = False
+        if model is not None:
+            cfg = getattr(model, "model_config", None)
+            use_mla = getattr(cfg, "attention_arch", None) == AttentionArch.MLA
+        self._tree_compact_fia = self._slot_gather_graph and tree_compact_fia_layout_supported(
+            use_mla=use_mla, has_rope_split=False
+        )
         if self._slot_gather_graph:
             logger.info(
                 "NPU tree draft graphs use token-level slot gather "
-                "page_size=%s topk=%s",
+                "page_size=%s topk=%s compact_fia=%s",
                 page_size,
                 topk,
+                self._tree_compact_fia,
             )
         super().__init__(eagle_worker)
 
+    def _capture_extra_keys(self):
+        if not getattr(self, "_slot_gather_graph", False):
+            return [None]
+        backend = None
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            backend = getattr(runner, "draft_attn_backend", None) or getattr(
+                runner, "attn_backend", None
+            )
+            inner = getattr(backend, "attn_backends", None)
+            if inner:
+                backend = inner[0]
+        buckets = getattr(backend, "tree_kv_buckets", None) if backend is not None else None
+        if buckets:
+            return list(reversed(list(buckets)))
+        return [None]
+
+    def _make_graph_key(
+        self,
+        bs: int,
+        stream_idx=None,
+        ntpb=None,
+        extra=None,
+    ):
+        base_key = bs
+        if stream_idx is not None:
+            base_key = f"{stream_idx}_{base_key}"
+        if extra is not None:
+            return f"{base_key}_s{int(extra)}"
+        return base_key
+
     def can_run(self, forward_batch: ForwardBatch):
-        if not super().can_run(forward_batch):
+        if self.require_mlp_tp_gather:
+            cuda_graph_bs = (
+                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.uses_spec_topk_cuda_graph_layout()
+                else max(forward_batch.global_num_tokens_cpu)
+            )
+        else:
+            cuda_graph_bs = forward_batch.batch_size
+        is_bs_supported = (
+            cuda_graph_bs in self.capture_bs
+            if self.disable_padding
+            else cuda_graph_bs <= self.max_bs
+        )
+        if self.require_mlp_sync:
+            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+        if not is_bs_supported:
             return False
         if not getattr(self, "_slot_gather_graph", False):
             return True
@@ -98,7 +162,19 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         fn = getattr(backend, "tree_slot_graph_can_run", None)
         if fn is None:
             return True
-        return bool(fn(forward_batch))
+        ok = bool(fn(forward_batch))
+        if not ok:
+            self.tree_eager_fallback_count += 1
+            return False
+        extra = getattr(backend, "_replay_tree_s_cap", None)
+        if extra is not None:
+            suffix = f"_s{int(extra)}"
+            if not any(
+                isinstance(k, str) and str(k).endswith(suffix) for k in self.graphs
+            ):
+                self.tree_eager_fallback_count += 1
+                return False
+        return True
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -153,21 +229,28 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
         graph, out = super().capture_one_batch_size(num_seqs, forward, stream_idx)
-        if self.tree_graph_disabled_reason or self._slot_gather_graph:
+        skip_fia = self.tree_graph_disabled_reason or (
+            self._slot_gather_graph and not self._tree_compact_fia
+        )
+        if skip_fia:
             return graph, out
         self.update_attr_name = self._get_update_attr_name()
         n_steps = max(int(self.speculative_num_steps) - 1, 0)
+        extra = getattr(self, "_active_capture_extra", None)
+        map_key = self._make_graph_key(int(num_seqs), extra=extra)
         try:
             num_layers = self._num_model_layers()
             records = _iter_graph_dispatch_records(graph)
             n_records, step_ids = validate_tree_draft_fia_records(
                 records, n_steps, num_layers, self.update_attr_name
             )
-            self._tree_fia_maps[num_seqs] = {
+            self._tree_fia_maps[map_key] = {
                 "n_records": n_records,
                 "n_steps": n_steps,
                 "num_layers": num_layers,
                 "step_ids": step_ids,
+                "bs": int(num_seqs),
+                "extra": extra,
             }
         except NpuGraphPreparationError as e:
             if getattr(e, "scope", "graph") == "format":
@@ -176,10 +259,20 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                     "NPU tree graph record format unsupported: %s", e
                 )
             else:
-                logger.warning("NPU tree graph bs=%s rejected: %s", num_seqs, e)
+                logger.warning("NPU tree graph bs=%s extra=%s rejected: %s", num_seqs, extra, e)
         return graph, out
 
     def capture(self):
+        if self._slot_gather_graph:
+            allow = set(
+                parse_tree_draft_capture_bs(os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV))
+            )
+            self.capture_bs = [b for b in self.capture_bs if b in allow]
+            self.compile_bs = [b for b in self.compile_bs if b in self.capture_bs]
+            self.max_bs = max(self.capture_bs) if self.capture_bs else 0
+            logger.info(
+                "NPU tree draft capture_bs restricted to %s", self.capture_bs
+            )
         if self.tree_graph_disabled_reason:
             self.graphs.clear()
             self.capture_bs = []
@@ -193,16 +286,17 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
             return
         super().capture()
-        if self._slot_gather_graph:
+        if self._slot_gather_graph and not self._tree_compact_fia:
             logger.info(
                 "NPU tree draft slot-gather graphs ready: graphs=%s "
                 "tree_graph_replay_count=%s tree_eager_fallback_count=%s",
-                sorted(self.graphs),
+                sorted(map(str, self.graphs)),
                 self.tree_graph_replay_count,
                 self.tree_eager_fallback_count,
             )
             return
-        self._finalize_tree_fia_maps()
+        if self._tree_compact_fia:
+            self._finalize_tree_fia_maps()
 
     def _finalize_tree_fia_maps(self):
         if self.tree_graph_disabled_reason or not self._tree_fia_maps:
@@ -221,17 +315,24 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 self.tree_eager_fallback_count,
             )
             return
-        for bs in list(self.graphs):
-            if bs not in self._tree_fia_maps:
-                del self.graphs[bs]
-                self.output_buffers.pop(bs, None)
-        self.capture_bs = [b for b in self.capture_bs if b in self.graphs]
+        for key in list(self.graphs):
+            if key not in self._tree_fia_maps:
+                del self.graphs[key]
+                self.output_buffers.pop(key, None)
+        kept_bs = sorted(
+            {
+                int(self._tree_fia_maps[k]["bs"])
+                for k in self.graphs
+                if k in self._tree_fia_maps
+            }
+        )
+        self.capture_bs = [b for b in self.capture_bs if b in kept_bs]
         self.max_bs = max(self.capture_bs) if self.capture_bs else 0
         logger.info(
             "NPU tree draft FIA maps ready: graphs=%s "
             "tree_graph_replay_count=%s tree_eager_fallback_count=%s "
             "tree_graph_disabled_reason=%s",
-            sorted(self._tree_fia_maps),
+            sorted(map(str, self._tree_fia_maps)),
             self.tree_graph_replay_count,
             self.tree_eager_fallback_count,
             self.tree_graph_disabled_reason,
@@ -246,12 +347,27 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
-        if is_deepseek_nsa(self.model_runner.model_config.hf_config) or getattr(
-            self, "_slot_gather_graph", False
-        ):
-            self.graphs[self.bs].replay()
-            if getattr(self, "_slot_gather_graph", False):
-                self.tree_graph_replay_count += 1
+        backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
+            self.model_runner, "attn_backend", None
+        )
+        inner = getattr(backend, "attn_backends", None)
+        if inner:
+            backend = inner[0]
+        extra = getattr(backend, "_replay_tree_s_cap", None)
+        graph_key = self._make_graph_key(self.bs, extra=extra)
+        if graph_key not in self.graphs:
+            raise NpuGraphPreparationError(
+                f"tree draft graph miss key={graph_key!r}",
+                scope="graph",
+            )
+        graph = self.graphs[graph_key]
+        self.output_buffers[self.bs] = self.output_buffers[graph_key]
+        skip_fia = is_deepseek_nsa(
+            self.model_runner.model_config.hf_config
+        ) or (self._slot_gather_graph and not self._tree_compact_fia)
+        if skip_fia:
+            graph.replay()
+            self.tree_graph_replay_count += 1
             return
 
         if forward_batch.seq_lens_cpu is None:
@@ -260,29 +376,44 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 scope="graph",
             )
 
-        fia_map = self._tree_fia_maps.get(self.bs)
+        fia_map = self._tree_fia_maps.get(graph_key)
         if fia_map is None:
             raise NpuGraphPreparationError(
-                f"tree draft graph bs={self.bs} has no FIA map",
+                f"tree draft graph key={graph_key!r} has no FIA map",
                 scope="graph",
             )
 
         prefix_lens = forward_batch.seq_lens_cpu[: self.raw_bs]
         step_lens_list = []
         n_steps = int(fia_map["n_steps"])
+        step_backends = inner if inner else None
         try:
             for speculative_step_id in range(n_steps):
-                seq_lens = build_draft_graph_step_kv_lens(
-                    prefix_lens, self.bs, self.topk, speculative_step_id
-                )
-                validate_draft_graph_step_kv_lens(
-                    seq_lens,
-                    self.bs,
-                    self.topk,
-                    self.raw_bs,
-                    prefix_lens,
-                    speculative_step_id,
-                )
+                seq_lens = None
+                if self._tree_compact_fia and step_backends is not None:
+                    if speculative_step_id < len(step_backends):
+                        seq_lens = getattr(
+                            step_backends[speculative_step_id],
+                            "tree_fia_kv_lens_cpu",
+                            None,
+                        )
+                if seq_lens is None:
+                    seq_lens = build_draft_graph_step_kv_lens(
+                        prefix_lens, self.bs, self.topk, speculative_step_id
+                    )
+                    validate_draft_graph_step_kv_lens(
+                        seq_lens,
+                        self.bs,
+                        self.topk,
+                        self.raw_bs,
+                        prefix_lens,
+                        speculative_step_id,
+                    )
+                    if self._tree_compact_fia:
+                        seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens)
+                else:
+                    capture_rows = int(self.bs) * max(int(self.topk), 1)
+                    seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens, capture_rows)
                 step_lens_list.append(seq_lens)
         except NpuGraphPreparationError:
             raise
@@ -292,7 +423,6 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 scope="graph",
             ) from e
 
-        graph = self.graphs[self.bs]
         n_records = int(fia_map["n_records"])
         num_layers = int(fia_map["num_layers"])
         cpu_update_input = expand_fia_cpu_update_inputs(
@@ -303,18 +433,21 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 f"cpu_update_input length {len(cpu_update_input)} != records {n_records}",
                 scope="graph",
             )
-        if self.bs not in self._logged_tree_fia_update_bs:
+        log_key = graph_key
+        if log_key not in self._logged_tree_fia_update_bs:
             logger.info(
-                "NPU tree draft graph FIA updates: bs=%s raw_bs=%s records=%s "
-                "steps=%s layers=%s updates=%s",
+                "NPU tree draft graph FIA updates: key=%s bs=%s raw_bs=%s "
+                "records=%s steps=%s layers=%s updates=%s bucket=%s",
+                graph_key,
                 self.bs,
                 self.raw_bs,
                 n_records,
                 n_steps,
                 num_layers,
                 len(cpu_update_input),
+                extra,
             )
-            self._logged_tree_fia_update_bs.add(self.bs)
+            self._logged_tree_fia_update_bs.add(log_key)
 
         errors = []
         thread = threading.Thread(
@@ -334,6 +467,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 "NPU tree draft graph update failed"
             ) from errors[0]
         self.tree_graph_replay_count += 1
+        if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
+            logger.info(
+                "NPU tree draft graph replay count=%s key=%s bucket=%s "
+                "eager_fallback=%s",
+                self.tree_graph_replay_count,
+                graph_key,
+                extra,
+                self.tree_eager_fallback_count,
+            )
 
     def _cache_loc_dtype(self):
         return torch.int32

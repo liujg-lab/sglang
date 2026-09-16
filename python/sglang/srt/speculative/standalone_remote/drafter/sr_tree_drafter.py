@@ -7,6 +7,7 @@ Linear KV stays the Target committed prefix; tree KV is ephemeral.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -266,16 +267,19 @@ class SRTreeDrafter:
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         graph_submitted = False
+        t_prep = time.perf_counter()
         try:
             if self.draft_attn_backend is not None:
                 self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
+            prep_s = time.perf_counter() - t_prep
             can_cuda_graph = (
                 self.cuda_graph_runner is not None
                 and self.cuda_graph_runner.can_run(forward_batch)
             )
+            t_exec = time.perf_counter()
             if can_cuda_graph:
                 try:
                     parent_list, top_scores_index, draft_tokens = (
@@ -316,6 +320,19 @@ class SRTreeDrafter:
                 self.token_to_kv_pool_allocator.restore_state(
                     token_to_kv_pool_state_backup
                 )
+        exec_s = time.perf_counter() - t_exec
+        runner = self.cuda_graph_runner
+        replay_n = getattr(runner, "tree_graph_replay_count", 0) if runner else 0
+        if replay_n <= 1 or replay_n % 8 == 0:
+            logger.info(
+                "[SR] tree draft timings: prep=%.3fs exec=%.3fs graph=%s "
+                "replay=%s eager_fallback=%s",
+                prep_s,
+                exec_s,
+                can_cuda_graph,
+                replay_n,
+                getattr(runner, "tree_eager_fallback_count", 0) if runner else 0,
+            )
         return parent_list, top_scores_index, draft_tokens
 
     def _alloc_tree_kv(self, batch: "ScheduleBatch"):

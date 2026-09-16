@@ -34,19 +34,28 @@ from sglang.srt.speculative.spec_utils import (
     normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
+    TREE_GRAPH_KV_BUCKETS_ENV,
     TREE_GRAPH_MAX_KV_ENV,
     build_tree_verify_kv_slots,
+    flatten_paged_kv,
+    gather_kv_into,
     log_tree_draft_slot_gather_once,
     log_tree_verify_fallback_once,
     log_tree_verify_kv_slot_layout_once,
+    parse_tree_graph_kv_buckets,
     parse_tree_graph_max_kv,
+    select_tree_kv_bucket,
     tree_attn_chunk_width,
+    tree_compact_fia_layout_supported,
     tree_draft_attention,
+    tree_fia_actual_seq_lengths_kv,
     tree_graph_slot_max_kv,
     tree_slot_graph_can_run_batch,
+    tree_slot_graph_needed_kv,
     tree_verify_attention,
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
+    zero_gathered_kv_padding,
 )
 from sglang.srt.speculative.tree_attn_mask import (
     custom_mask_to_ascend_masked,
@@ -109,6 +118,9 @@ class ForwardMetadata:
     # TARGET_VERIFY token-level slots (one row per draft query)
     tree_verify_kv_slots: Optional[torch.Tensor] = None
     tree_verify_kv_lens_t: Optional[torch.Tensor] = None
+
+    # CPU FIA KV lengths for compact tree attention (zeros already mapped to 1)
+    tree_fia_kv_lens_cpu: Optional[List[int]] = None
 
 
 class AscendAttnMaskBuilder:
@@ -315,6 +327,18 @@ class AscendAttnBackend(AttentionBackend):
         self.tree_graph_max_kv = parse_tree_graph_max_kv(
             os.environ.get(TREE_GRAPH_MAX_KV_ENV)
         )
+        self.tree_kv_buckets = []
+        self._active_tree_s_cap = None
+        self._replay_tree_s_cap = None
+        self._tree_kv_scratch = {}
+        self._tree_scratch_max_rows = 0
+        self._tree_scratch_max_cols = 0
+        self.tree_fia_kv_lens_cpu = None
+        self.tree_target_replay_count = 0
+        self.tree_draft_replay_count = 0
+        self.tree_capacity_fallback_count = 0
+        self.tree_layout_fallback_count = 0
+        self._logged_tree_fallback = set()
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -470,9 +494,11 @@ class AscendAttnBackend(AttentionBackend):
         dest_lens = getattr(self.forward_metadata, "tree_draft_kv_lens_t", None)
         if dest is not None and dest_lens is not None:
             self._copy_into_graph_slot_buffers(dest, dest_lens, slots, lens)
+            self._store_tree_fia_kv_lens_cpu(dest_lens, int(dest_lens.shape[0]))
         else:
             self.forward_metadata.tree_draft_kv_slots = slots
             self.forward_metadata.tree_draft_kv_lens_t = lens
+            self._store_tree_fia_kv_lens_cpu(lens, int(lens.shape[0]))
         if self.is_hybrid_swa:
             swa_max_kv = max_kv
             swa_dest = getattr(self.forward_metadata, "tree_draft_kv_slots_swa", None)
@@ -531,14 +557,38 @@ class AscendAttnBackend(AttentionBackend):
         slots = self.cuda_graph_kv_slots
         if slots is None:
             return None
+        s_cap = self._active_tree_s_cap or self._replay_tree_s_cap
+        if s_cap is not None:
+            return min(int(s_cap), int(slots.shape[1]))
         return int(slots.shape[1])
 
-    def tree_slot_graph_can_run(self, forward_batch: ForwardBatch) -> bool:
-        """True when this tree batch's needed KV fits the captured slot table.
+    def _tree_slot_bind_cols(self) -> int:
+        slots = self.cuda_graph_kv_slots
+        if slots is None:
+            return 0
+        width = self.tree_slot_graph_width()
+        if width is None:
+            return int(slots.shape[1])
+        return int(width)
 
-        Uses the captured buffer width, not the config constant. Verify reads
-        mask-producer seq_lens; draft uses seq+num_steps as a conservative
-        bound. Per-batch: overflow does not disable later graph hits.
+    def _log_tree_fallback_once(self, kind: str, reason: str) -> None:
+        key = f"{kind}:{reason}"
+        if key in self._logged_tree_fallback:
+            return
+        self._logged_tree_fallback.add(key)
+        logger.info("tree attention %s fallback: %s", kind, reason)
+
+    def _use_tree_compact_fia(self, q_rope: Optional[torch.Tensor] = None) -> bool:
+        return tree_compact_fia_layout_supported(
+            use_mla=self.use_mla, has_rope_split=q_rope is not None
+        )
+
+    def tree_slot_graph_can_run(self, forward_batch: ForwardBatch) -> bool:
+        """True when this tree batch's needed KV fits a captured bucket.
+
+        Uses captured buckets when they exist, otherwise the slot-table width.
+        Verify reads mask-producer seq_lens; draft uses seq+num_steps as a
+        conservative bound. Per-batch: overflow does not disable later graph hits.
         """
         fm = getattr(forward_batch, "forward_mode", None)
         is_verify = bool(fm is not None and fm.is_target_verify())
@@ -555,7 +605,8 @@ class AscendAttnBackend(AttentionBackend):
         fallback = seq
         if is_verify and spec_info is not None:
             fallback = getattr(spec_info, "seq_lens_cpu", None) or seq
-        return tree_slot_graph_can_run_batch(
+        buckets = list(self.tree_kv_buckets) if self.tree_kv_buckets else None
+        ok = tree_slot_graph_can_run_batch(
             slot_width=self.tree_slot_graph_width(),
             slot_gather_enabled=self._slot_gather_tree_attn(),
             is_target_verify=is_verify,
@@ -565,7 +616,43 @@ class AscendAttnBackend(AttentionBackend):
             draft_token_num_fallback=int(self.speculative_num_draft_tokens or 1),
             draft_num_steps=self.draft_num_steps,
             seq_lens=seq if seq is not None else [],
+            buckets=buckets,
         )
+        if not ok:
+            self.tree_capacity_fallback_count += 1
+            needed = tree_slot_graph_needed_kv(
+                is_target_verify=is_verify,
+                is_tree_draft=is_draft,
+                spec_info=spec_info,
+                fallback_seq_lens=fallback if fallback is not None else [],
+                draft_token_num_fallback=int(self.speculative_num_draft_tokens or 1),
+                draft_num_steps=self.draft_num_steps,
+                seq_lens=seq if seq is not None else [],
+            )
+            self._log_tree_fallback_once(
+                "capacity",
+                f"needed_kv={needed} buckets={buckets}",
+            )
+            self._replay_tree_s_cap = None
+            return False
+        if buckets and (is_verify or is_draft):
+            needed = tree_slot_graph_needed_kv(
+                is_target_verify=is_verify,
+                is_tree_draft=is_draft,
+                spec_info=spec_info,
+                fallback_seq_lens=fallback if fallback is not None else [],
+                draft_token_num_fallback=int(self.speculative_num_draft_tokens or 1),
+                draft_num_steps=self.draft_num_steps,
+                seq_lens=seq if seq is not None else [],
+            )
+            self._replay_tree_s_cap = select_tree_kv_bucket(needed or 0, buckets)
+            logger.debug(
+                "tree attention bucket hit kind=%s bucket=%s needed=%s",
+                "verify" if is_verify else "draft",
+                self._replay_tree_s_cap,
+                needed,
+            )
+        return True
 
     def _slot_gather_kv_bound(self, kv_lens) -> Optional[int]:
         """Columns worth visiting in the slot-gather loop, or None for all of them.
@@ -613,13 +700,14 @@ class AscendAttnBackend(AttentionBackend):
         if self.cuda_graph_kv_slots is None:
             return
         rows = min(int(rows), int(self.cuda_graph_kv_slots.shape[0]))
-        slots = self.cuda_graph_kv_slots[:rows]
+        cols = self._tree_slot_bind_cols()
+        slots = self.cuda_graph_kv_slots[:rows, :cols]
         lens = self.cuda_graph_kv_lens[:rows]
         slots.fill_(0)
         lens.fill_(0)
         swa = None
         if self.is_hybrid_swa and self.cuda_graph_kv_slots_swa is not None:
-            swa = self.cuda_graph_kv_slots_swa[:rows]
+            swa = self.cuda_graph_kv_slots_swa[:rows, :cols]
             swa.fill_(0)
         metadata.tree_draft_kv_slots = slots
         metadata.tree_draft_kv_lens_t = lens
@@ -630,7 +718,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.cuda_graph_kv_slots is None:
             return
         rows = min(int(rows), int(self.cuda_graph_kv_slots.shape[0]))
-        slots = self.cuda_graph_kv_slots[:rows]
+        cols = self._tree_slot_bind_cols()
+        slots = self.cuda_graph_kv_slots[:rows, :cols]
         lens = self.cuda_graph_kv_lens[:rows]
         slots.fill_(0)
         lens.fill_(0)
@@ -640,20 +729,153 @@ class AscendAttnBackend(AttentionBackend):
 
     def _restore_graph_draft_slot_views(self, metadata: ForwardMetadata, bs: int) -> None:
         views = self._cuda_graph_draft_slot_views.get(int(bs))
-        if views is None:
+        if views is None or self.cuda_graph_kv_slots is None:
             return
-        slots, lens, swa = views
+        rows = int(views[0].shape[0])
+        cols = self._tree_slot_bind_cols()
+        slots = self.cuda_graph_kv_slots[:rows, :cols]
+        lens = self.cuda_graph_kv_lens[:rows]
+        swa = None
+        if self.is_hybrid_swa and self.cuda_graph_kv_slots_swa is not None:
+            swa = self.cuda_graph_kv_slots_swa[:rows, :cols]
         metadata.tree_draft_kv_slots = slots
         metadata.tree_draft_kv_lens_t = lens
         metadata.tree_draft_kv_slots_swa = swa
 
     def _restore_graph_verify_slot_views(self, metadata: ForwardMetadata, bs: int) -> None:
         views = self._cuda_graph_verify_slot_views.get(int(bs))
-        if views is None:
+        if views is None or self.cuda_graph_kv_slots is None:
             return
-        slots, lens = views
+        rows = int(views[0].shape[0])
+        cols = self._tree_slot_bind_cols()
+        slots = self.cuda_graph_kv_slots[:rows, :cols]
+        lens = self.cuda_graph_kv_lens[:rows]
         metadata.tree_verify_kv_slots = slots
         metadata.tree_verify_kv_lens_t = lens
+
+    def _sync_active_tree_s_cap(self) -> None:
+        runner = getattr(self.model_runner, "graph_runner", None)
+        extra = getattr(runner, "_active_capture_extra", None)
+        if extra is None:
+            extra = getattr(self, "_replay_tree_s_cap", None)
+        self._active_tree_s_cap = extra
+
+    def _store_tree_fia_kv_lens_cpu(self, lens, capture_rows: int) -> None:
+        self.tree_fia_kv_lens_cpu = tree_fia_actual_seq_lengths_kv(lens, capture_rows)
+        if self.forward_metadata is not None:
+            self.forward_metadata.tree_fia_kv_lens_cpu = self.tree_fia_kv_lens_cpu
+
+    def _ensure_tree_kv_scratch(
+        self,
+        rows: int,
+        s_cap: int,
+        n_kv: int,
+        dk: int,
+        dv: int,
+        dtype,
+        device,
+    ):
+        alloc_r = max(int(rows), int(self._tree_scratch_max_rows or 0), 1)
+        key = (int(n_kv), int(dk), int(dv), dtype, str(device), int(s_cap))
+        pair = self._tree_kv_scratch.get(key)
+        if pair is None or pair[0].shape[0] < alloc_r:
+            if self.graph_mode and pair is not None:
+                raise NpuGraphPreparationError(
+                    "tree compact FIA scratch grew after graph capture",
+                    scope="graph",
+                )
+            k_buf = torch.zeros(
+                (alloc_r, int(s_cap), int(n_kv), int(dk)),
+                dtype=dtype,
+                device=device,
+            )
+            v_buf = torch.zeros(
+                (alloc_r, int(s_cap), int(n_kv), int(dv)),
+                dtype=dtype,
+                device=device,
+            )
+            self._tree_kv_scratch[key] = (k_buf, v_buf)
+            pair = (k_buf, v_buf)
+        return pair[0][:rows], pair[1][:rows]
+
+    def _run_tree_compact_fia(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        kv_slots: torch.Tensor,
+        kv_lens,
+        scale: float,
+        n_q_heads: int,
+        n_kv_heads: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        query = q.reshape(-1, n_q_heads, qk_head_dim)
+        rows = int(query.shape[0])
+        if rows == 0:
+            return query.new_zeros(0, n_q_heads * v_head_dim)
+        kv_slots = kv_slots.reshape(rows, -1).to(dtype=torch.int64, device=query.device)
+        s_cap = int(kv_slots.shape[1])
+        n_kv_heads = max(int(n_kv_heads), 1)
+        flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)
+        flat_v = flatten_paged_kv(v_cache, n_kv_heads, v_head_dim)
+        k_s, v_s = self._ensure_tree_kv_scratch(
+            rows,
+            s_cap,
+            n_kv_heads,
+            qk_head_dim,
+            v_head_dim,
+            query.dtype,
+            query.device,
+        )
+        gather_kv_into(flat_k, flat_v, kv_slots.clamp(min=0), k_s, v_s)
+        kv_len_t = kv_lens if isinstance(kv_lens, torch.Tensor) else torch.as_tensor(
+            list(kv_lens), dtype=torch.int32, device=query.device
+        )
+        zero_gathered_kv_padding(k_s, v_s, kv_len_t)
+        q_fia = query.reshape(rows, 1, n_q_heads, qk_head_dim)
+        if not q_fia.is_contiguous():
+            q_fia = q_fia.contiguous()
+        actual = getattr(self.forward_metadata, "tree_fia_kv_lens_cpu", None)
+        if actual is None:
+            actual = self.tree_fia_kv_lens_cpu
+        if actual is None or len(actual) != rows:
+            actual = tree_fia_actual_seq_lengths_kv(kv_len_t, rows)
+        fia_kwargs = dict(
+            num_heads=n_q_heads,
+            num_key_value_heads=n_kv_heads,
+            input_layout="BSND",
+            atten_mask=None,
+            sparse_mode=0,
+            actual_seq_lengths_kv=actual,
+            scale=float(scale),
+        )
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_fia,
+            k_s,
+            v_s,
+            **fia_kwargs,
+        )
+        attn_output = torch.empty(
+            (rows, 1, n_q_heads, v_head_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_fia,
+            k_s,
+            v_s,
+            **fia_kwargs,
+            workspace=workspace,
+            out=[attn_output, softmax_lse],
+        )
+        empty = kv_len_t.reshape(-1).to(device=attn_output.device) <= 0
+        if int(empty.numel()) == rows:
+            attn_output = attn_output.masked_fill(empty.view(rows, 1, 1, 1), 0)
+        return attn_output.reshape(rows, n_q_heads * v_head_dim)
 
     def _graph_out_cache_loc(self, num_tokens: int):
         runner = getattr(self.model_runner, "graph_runner", None)
@@ -727,9 +949,11 @@ class AscendAttnBackend(AttentionBackend):
             raise
         if dest is not None and dest_lens is not None:
             self._copy_into_graph_slot_buffers(dest, dest_lens, slots, lens)
+            self._store_tree_fia_kv_lens_cpu(dest_lens, int(dest_lens.shape[0]))
             return
         self.forward_metadata.tree_verify_kv_slots = slots
         self.forward_metadata.tree_verify_kv_lens_t = lens
+        self._store_tree_fia_kv_lens_cpu(lens, int(lens.shape[0]))
 
     def _run_tree_verify_slot_gather(
         self,
@@ -751,6 +975,24 @@ class AscendAttnBackend(AttentionBackend):
             getattr(forward_batch.spec_info, "draft_token_num", None)
             or self.speculative_num_draft_tokens
             or 1
+        )
+        if self._use_tree_compact_fia(q_rope):
+            return self._run_tree_compact_fia(
+                q,
+                k_cache,
+                v_cache,
+                kv_slots=self.forward_metadata.tree_verify_kv_slots,
+                kv_lens=self.forward_metadata.tree_verify_kv_lens_t,
+                scale=layer.scaling,
+                n_q_heads=layer.tp_q_head_num,
+                n_kv_heads=layer.tp_k_head_num,
+                qk_head_dim=qk_head_dim,
+                v_head_dim=v_head_dim,
+            )
+        self.tree_layout_fallback_count += 1
+        self._log_tree_fallback_once(
+            "layout",
+            f"verify use_mla={self.use_mla} has_rope={q_rope is not None}",
         )
         return tree_verify_attention(
             q,
@@ -808,6 +1050,24 @@ class AscendAttnBackend(AttentionBackend):
                 )
             slots = swa
         log_tree_draft_slot_gather_once(self.draft_topk, self.page_size)
+        if self._use_tree_compact_fia(q_rope):
+            return self._run_tree_compact_fia(
+                q,
+                k_cache,
+                v_cache,
+                kv_slots=slots,
+                kv_lens=self.forward_metadata.tree_draft_kv_lens_t,
+                scale=layer.scaling,
+                n_q_heads=layer.tp_q_head_num,
+                n_kv_heads=layer.tp_k_head_num,
+                qk_head_dim=qk_head_dim,
+                v_head_dim=v_head_dim,
+            )
+        self.tree_layout_fallback_count += 1
+        self._log_tree_fallback_once(
+            "layout",
+            f"draft use_mla={self.use_mla} has_rope={q_rope is not None}",
+        )
         return tree_draft_attention(
             q,
             k_cache,
@@ -1021,6 +1281,14 @@ class AscendAttnBackend(AttentionBackend):
         )
         mask_max_kv = self._slot_gather_graph_max_kv()
         slot_max_kv = self._slot_gather_graph_slot_max_kv()
+        self.tree_kv_buckets = parse_tree_graph_kv_buckets(
+            os.environ.get(TREE_GRAPH_KV_BUCKETS_ENV),
+            orig_max_kv=slot_max_kv,
+        )
+        if self.tree_kv_buckets:
+            slot_max_kv = max(self.tree_kv_buckets)
+        self._tree_scratch_max_rows = max_q
+        self._tree_scratch_max_cols = slot_max_kv
         self.cuda_graph_custom_mask = torch.empty(
             (max_q * mask_max_kv,), dtype=torch.bool, device=self.device
         )
@@ -1041,7 +1309,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         logger.info(
             "tree slot-gather graph buffers: max_q=%s slot_max_kv=%s "
-            "mask_max_kv=%s kv_pool=%s context_len=%s s_cap=%s "
+            "mask_max_kv=%s kv_pool=%s context_len=%s s_cap=%s buckets=%s "
             "slots=%.1f MiB chunk_width=%s",
             max_q,
             slot_max_kv,
@@ -1049,6 +1317,7 @@ class AscendAttnBackend(AttentionBackend):
             self._slot_gather_kv_pool_size(),
             int(self.max_context_len),
             int(self.tree_graph_max_kv),
+            self.tree_kv_buckets,
             max_q * slot_max_kv * 8 / (1024**2),
             tree_attn_chunk_width(slot_max_kv),
         )
@@ -1075,6 +1344,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        self._sync_active_tree_s_cap()
         metadata = ForwardMetadata()
 
         table_rows = self._tree_draft_table_rows(bs, num_tokens)
@@ -1190,6 +1460,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        self._sync_active_tree_s_cap()
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify():
@@ -2938,7 +3209,11 @@ class AscendAttnMultiStepDraftBackend:
         """
         if not self.attn_backends:
             return True
-        return self.attn_backends[0].tree_slot_graph_can_run(forward_batch)
+        ok = self.attn_backends[0].tree_slot_graph_can_run(forward_batch)
+        s_cap = self.attn_backends[0]._replay_tree_s_cap
+        for inner in self.attn_backends[1:]:
+            inner._replay_tree_s_cap = s_cap
+        return ok
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None
