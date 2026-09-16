@@ -19,6 +19,7 @@ import torch
 from sglang.srt.speculative.tree_attn_mask import (
     assert_full_mask_layout,
     iter_full_mask_rows,
+    resolve_tree_verify_mask_seq_lens,
     visible_token_indices,
 )
 
@@ -34,6 +35,11 @@ ATTN_CHUNK_ALIGN = 128
 # The chunk width is what a gather actually materializes, so cap it too: an
 # oversized slot table then costs extra chunks rather than extra memory.
 MAX_ATTN_CHUNK_WIDTH = 512
+
+# Graph slot-table width cap. Attention walks kv_slots.shape[1]; this does not
+# size custom_mask. Default 1024 → tree_attn_chunk_width 128 → 8 chunks.
+TREE_GRAPH_MAX_KV = 1024
+TREE_GRAPH_MAX_KV_ENV = "SGLANG_NPU_TREE_GRAPH_MAX_KV"
 
 logger = logging.getLogger(__name__)
 _LOGGED_TREE_VERIFY_FALLBACK = False
@@ -157,6 +163,96 @@ def flatten_paged_kv(
         if cache.shape[1] == n_heads and cache.shape[-1] == head_dim:
             return cache.permute(0, 2, 1, 3).contiguous().reshape(-1, n_heads, head_dim)
     return cache.reshape(-1, n_heads, head_dim)
+
+
+def parse_tree_graph_max_kv(
+    raw: Optional[str] = None,
+    *,
+    default: int = TREE_GRAPH_MAX_KV,
+    env_name: str = TREE_GRAPH_MAX_KV_ENV,
+) -> int:
+    """Parse a frozen positive slot-table cap.
+
+    ``raw is None`` (env unset) returns ``default``. Empty, zero, negative,
+    and non-integer values raise ``ValueError``.
+    """
+    if raw is None:
+        return int(default)
+    text = str(raw).strip()
+    if not text:
+        raise ValueError(f"{env_name} is empty; expected a positive integer")
+    try:
+        value = int(text, 10)
+    except ValueError as e:
+        raise ValueError(f"{env_name}={raw!r} is not an integer") from e
+    if value <= 0:
+        raise ValueError(f"{env_name}={value} must be a positive integer")
+    return value
+
+
+def tree_graph_slot_max_kv(orig_max_kv: int, s_cap: int) -> int:
+    """Slot-table width: min(original graph bound, configured S_cap)."""
+    return min(int(orig_max_kv), int(s_cap))
+
+
+def tree_verify_needed_kv(seq_lens: SeqLens, num_draft: int) -> int:
+    """Visible prefix+draft columns for one tree-verify query."""
+    seq_list = _as_seq_list(seq_lens)
+    if not seq_list:
+        return 0
+    return max(seq_list) + int(num_draft)
+
+
+def tree_draft_needed_kv(seq_lens: SeqLens, num_steps: int) -> int:
+    """Conservative in-graph draft bound: max(seq) + num_steps."""
+    seq_list = _as_seq_list(seq_lens)
+    if not seq_list:
+        return 0
+    return max(seq_list) + max(int(num_steps), 0)
+
+
+def tree_slot_graph_fits(needed_kv: int, slot_width: Optional[int]) -> bool:
+    """True when needed KV columns fit the captured slot table."""
+    if slot_width is None:
+        return True
+    return int(needed_kv) <= int(slot_width)
+
+
+def tree_slot_graph_can_run_batch(
+    *,
+    slot_width: Optional[int],
+    slot_gather_enabled: bool,
+    is_target_verify: bool,
+    is_tree_draft: bool,
+    spec_info,
+    fallback_seq_lens: SeqLens,
+    draft_token_num_fallback: int,
+    draft_num_steps: int,
+    seq_lens: SeqLens,
+) -> bool:
+    """Admit tree graph replay when needed KV fits the captured slot width.
+
+    Verify uses mask-producer seq_lens and actual ``draft_token_num``.
+    Draft uses ``max(seq)+num_steps`` as a conservative bound for every
+    in-graph step. Padding rows must not be in the producer seq_lens.
+    """
+    if not slot_gather_enabled or slot_width is None:
+        return True
+    if is_target_verify:
+        seq_list, _raw_bs, _source = resolve_tree_verify_mask_seq_lens(
+            spec_info, fallback_seq_lens
+        )
+        num_draft = int(
+            getattr(spec_info, "draft_token_num", None) or draft_token_num_fallback or 1
+        )
+        return tree_slot_graph_fits(
+            tree_verify_needed_kv(seq_list, num_draft), slot_width
+        )
+    if is_tree_draft:
+        return tree_slot_graph_fits(
+            tree_draft_needed_kv(seq_lens, draft_num_steps), slot_width
+        )
+    return True
 
 
 def tree_attn_chunk_width(max_kv: int, align: int = ATTN_CHUNK_ALIGN) -> int:

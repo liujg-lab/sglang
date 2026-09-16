@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -33,12 +34,16 @@ from sglang.srt.speculative.spec_utils import (
     normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
+    TREE_GRAPH_MAX_KV_ENV,
     build_tree_verify_kv_slots,
     log_tree_draft_slot_gather_once,
     log_tree_verify_fallback_once,
     log_tree_verify_kv_slot_layout_once,
+    parse_tree_graph_max_kv,
     tree_attn_chunk_width,
     tree_draft_attention,
+    tree_graph_slot_max_kv,
+    tree_slot_graph_can_run_batch,
     tree_verify_attention,
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
@@ -307,6 +312,9 @@ class AscendAttnBackend(AttentionBackend):
         self.cuda_graph_kv_slots_swa = None
         self._cuda_graph_draft_slot_views = {}
         self._cuda_graph_verify_slot_views = {}
+        self.tree_graph_max_kv = parse_tree_graph_max_kv(
+            os.environ.get(TREE_GRAPH_MAX_KV_ENV)
+        )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -511,6 +519,53 @@ class AscendAttnBackend(AttentionBackend):
         if pool > 0:
             cap = min(cap, pool)
         return max(cap, 1) + extra
+
+    def _slot_gather_graph_slot_max_kv(self) -> int:
+        """kv_slots width: original graph bound capped by the frozen S_cap."""
+        return tree_graph_slot_max_kv(
+            self._slot_gather_graph_max_kv(), self.tree_graph_max_kv
+        )
+
+    def tree_slot_graph_width(self) -> Optional[int]:
+        """Captured slot-table columns, or None before graph buffers exist."""
+        slots = self.cuda_graph_kv_slots
+        if slots is None:
+            return None
+        return int(slots.shape[1])
+
+    def tree_slot_graph_can_run(self, forward_batch: ForwardBatch) -> bool:
+        """True when this tree batch's needed KV fits the captured slot table.
+
+        Uses the captured buffer width, not the config constant. Verify reads
+        mask-producer seq_lens; draft uses seq+num_steps as a conservative
+        bound. Per-batch: overflow does not disable later graph hits.
+        """
+        fm = getattr(forward_batch, "forward_mode", None)
+        is_verify = bool(fm is not None and fm.is_target_verify())
+        is_draft = bool(
+            fm is not None
+            and fm.is_decode_or_idle()
+            and int(self.draft_topk) > 1
+            and int(self.page_size) > 1
+        )
+        seq = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq is None:
+            seq = getattr(forward_batch, "seq_lens", None)
+        spec_info = getattr(forward_batch, "spec_info", None)
+        fallback = seq
+        if is_verify and spec_info is not None:
+            fallback = getattr(spec_info, "seq_lens_cpu", None) or seq
+        return tree_slot_graph_can_run_batch(
+            slot_width=self.tree_slot_graph_width(),
+            slot_gather_enabled=self._slot_gather_tree_attn(),
+            is_target_verify=is_verify,
+            is_tree_draft=is_draft,
+            spec_info=spec_info,
+            fallback_seq_lens=fallback if fallback is not None else [],
+            draft_token_num_fallback=int(self.speculative_num_draft_tokens or 1),
+            draft_num_steps=self.draft_num_steps,
+            seq_lens=seq if seq is not None else [],
+        )
 
     def _slot_gather_kv_bound(self, kv_lens) -> Optional[int]:
         """Columns worth visiting in the slot-gather loop, or None for all of them.
@@ -964,38 +1019,42 @@ class AscendAttnBackend(AttentionBackend):
             int(max_num_tokens),
             int(max_bs) * max(draft, int(self.draft_topk), 1),
         )
-        max_kv = self._slot_gather_graph_max_kv()
+        mask_max_kv = self._slot_gather_graph_max_kv()
+        slot_max_kv = self._slot_gather_graph_slot_max_kv()
         self.cuda_graph_custom_mask = torch.empty(
-            (max_q * max_kv,), dtype=torch.bool, device=self.device
+            (max_q * mask_max_kv,), dtype=torch.bool, device=self.device
         )
         if self._slot_gather_tree_attn():
             self.cuda_graph_tree_attn_mask = None
         else:
             self.cuda_graph_tree_attn_mask = torch.ones(
-                (max_q, max_kv), dtype=torch.bool, device=self.device
+                (max_q, mask_max_kv), dtype=torch.bool, device=self.device
             )
         self.cuda_graph_verify_positions = torch.empty(
             (max_q,), dtype=torch.int64, device=self.device
         )
         self.cuda_graph_kv_slots = torch.zeros(
-            (max_q, max_kv), dtype=torch.int64, device=self.device
+            (max_q, slot_max_kv), dtype=torch.int64, device=self.device
         )
         self.cuda_graph_kv_lens = torch.zeros(
             (max_q,), dtype=torch.int32, device=self.device
         )
         logger.info(
-            "tree slot-gather graph buffers: max_q=%s max_kv=%s kv_pool=%s "
-            "context_len=%s slots=%.1f MiB chunk_width=%s",
+            "tree slot-gather graph buffers: max_q=%s slot_max_kv=%s "
+            "mask_max_kv=%s kv_pool=%s context_len=%s s_cap=%s "
+            "slots=%.1f MiB chunk_width=%s",
             max_q,
-            max_kv,
+            slot_max_kv,
+            mask_max_kv,
             self._slot_gather_kv_pool_size(),
             int(self.max_context_len),
-            max_q * max_kv * 8 / (1024**2),
-            tree_attn_chunk_width(max_kv),
+            int(self.tree_graph_max_kv),
+            max_q * slot_max_kv * 8 / (1024**2),
+            tree_attn_chunk_width(slot_max_kv),
         )
         if self.is_hybrid_swa:
             self.cuda_graph_kv_slots_swa = torch.zeros(
-                (max_q, max_kv), dtype=torch.int64, device=self.device
+                (max_q, slot_max_kv), dtype=torch.int64, device=self.device
             )
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (
@@ -2870,6 +2929,16 @@ class AscendAttnMultiStepDraftBackend:
                     draft_num_steps=speculative_num_steps,
                 )
             )
+
+    def tree_slot_graph_can_run(self, forward_batch: ForwardBatch) -> bool:
+        """Admit draft graph using the captured slot width of step 0.
+
+        Every in-graph step shares the same S_cap. Needed KV is the
+        conservative ``max(seq)+num_steps`` bound on the inner backend.
+        """
+        if not self.attn_backends:
+            return True
+        return self.attn_backends[0].tree_slot_graph_can_run(forward_batch)
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None

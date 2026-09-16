@@ -81,6 +81,25 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
         super().__init__(eagle_worker)
 
+    def can_run(self, forward_batch: ForwardBatch):
+        if not super().can_run(forward_batch):
+            return False
+        if not getattr(self, "_slot_gather_graph", False):
+            return True
+        runner = getattr(self, "model_runner", None)
+        backend = None
+        if runner is not None:
+            backend = getattr(runner, "draft_attn_backend", None) or getattr(
+                runner, "attn_backend", None
+            )
+            inner = getattr(backend, "attn_backends", None)
+            if inner:
+                backend = inner[0]
+        fn = getattr(backend, "tree_slot_graph_can_run", None)
+        if fn is None:
+            return True
+        return bool(fn(forward_batch))
+
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
             AttentionArch.MLA: "actual_seq_lengths_kv",

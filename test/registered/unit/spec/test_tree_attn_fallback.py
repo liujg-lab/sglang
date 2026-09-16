@@ -420,6 +420,12 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertIn("token_to_kv_pool", pool_src)
         self.assertIn("max_total_num_tokens", pool_src)
         self.assertNotIn("self.req_to_token", pool_src)
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("mask_max_kv", state_src)
+        self.assertIn("slot_max_kv", state_src)
+        self.assertIn("_slot_gather_graph_slot_max_kv", state_src)
+        self.assertIn("max_q * mask_max_kv", state_src)
+        self.assertIn("(max_q, slot_max_kv)", state_src)
 
     def test_graph_state_drops_dead_tree_mask_for_slot_gather(self):
         state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
@@ -560,6 +566,11 @@ class TestTreeAttnFallback(CustomTestCase):
         replay_src = _function_source(_NPU_GRAPH_RUNNER, "replay")
         self.assertIn("skip_fia_update", replay_src)
         self.assertIn("speculative_eagle_topk", replay_src)
+
+    def test_npu_graph_runner_can_run_defers_to_slot_width(self):
+        can_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "can_run")
+        self.assertIn("super().can_run", can_src)
+        self.assertIn("tree_slot_graph_can_run", can_src)
 
     def test_build_tree_verify_kv_slots_matches_visible(self):
         custom = torch.tensor(
@@ -786,6 +797,200 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertIn("attend_row=134", msg)
         self.assertIn("prefix=128", msg)
         self.assertIn("draft=15", msg)
+
+
+class TestTreeGraphSlotCap(CustomTestCase):
+    """Single S_cap + overflow eager: mask stays orig-sized, slots are capped."""
+
+    def test_parse_tree_graph_max_kv(self):
+        from sglang.srt.speculative.tree_attn_fallback import parse_tree_graph_max_kv
+
+        self.assertEqual(parse_tree_graph_max_kv(None), 1024)
+        self.assertEqual(parse_tree_graph_max_kv("2048"), 2048)
+        for bad in ("0", "-1", "abc", "", "  ", "1.5"):
+            with self.assertRaises(ValueError):
+                parse_tree_graph_max_kv(bad)
+
+    def test_slot_cap_mins_orig_bound(self):
+        from sglang.srt.speculative.tree_attn_fallback import tree_graph_slot_max_kv
+
+        self.assertEqual(tree_graph_slot_max_kv(8207, 1024), 1024)
+        self.assertEqual(tree_graph_slot_max_kv(256, 1024), 256)
+
+    def test_chunk_width_1024_is_eight_trips(self):
+        width = tree_attn_chunk_width(1024)
+        self.assertEqual(width, 128)
+        self.assertEqual(-(-1024 // width), 8)
+
+    def _admit(self, **kwargs):
+        from sglang.srt.speculative.tree_attn_fallback import (
+            tree_slot_graph_can_run_batch,
+        )
+
+        defaults = dict(
+            slot_width=1024,
+            slot_gather_enabled=True,
+            is_target_verify=True,
+            is_tree_draft=False,
+            spec_info=None,
+            fallback_seq_lens=[1],
+            draft_token_num_fallback=15,
+            draft_num_steps=5,
+            seq_lens=[1],
+        )
+        defaults.update(kwargs)
+        return tree_slot_graph_can_run_batch(**defaults)
+
+    def _verify_info(self, seq_lens, num_draft=15, pad=None):
+        info = types.SimpleNamespace(
+            seq_lens_cpu=list(seq_lens),
+            seq_lens_sum=sum(seq_lens),
+            draft_token_num=num_draft,
+        )
+        fallback = list(seq_lens) if pad is None else list(seq_lens) + list(pad)
+        return info, fallback
+
+    def test_needed_equal_to_cap_admits(self):
+        from sglang.srt.speculative.tree_attn_fallback import tree_verify_needed_kv
+
+        info, fallback = self._verify_info([1009])
+        needed = tree_verify_needed_kv([1009], 15)
+        self.assertEqual(needed, 1024)
+        self.assertTrue(
+            self._admit(spec_info=info, fallback_seq_lens=fallback, slot_width=1024)
+        )
+
+    def test_needed_cap_plus_one_rejects_before_replay(self):
+        from sglang.srt.speculative.tree_attn_fallback import (
+            tree_slot_graph_fits,
+            tree_verify_needed_kv,
+        )
+
+        needed = tree_verify_needed_kv([1010], 15)
+        self.assertEqual(needed, 1025)
+        self.assertFalse(tree_slot_graph_fits(needed, 1024))
+        info, fallback = self._verify_info([1010])
+        self.assertFalse(
+            self._admit(spec_info=info, fallback_seq_lens=fallback, slot_width=1024)
+        )
+        dest_cols = 1024
+        self.assertGreater(needed, dest_cols)
+
+    def test_short_long_short_rehits_graph(self):
+        path = []
+        for seq in (100, 2000, 100):
+            info, fallback = self._verify_info([seq])
+            path.append(
+                self._admit(
+                    spec_info=info, fallback_seq_lens=fallback, slot_width=1024
+                )
+            )
+        self.assertEqual(path, [True, False, True])
+
+    def test_padded_batch_uses_producer_seq_lens(self):
+        from sglang.srt.speculative.tree_attn_fallback import tree_verify_needed_kv
+
+        info, fallback = self._verify_info([10, 20], pad=[9999])
+        needed = tree_verify_needed_kv(
+            resolve_tree_verify_mask_seq_lens(info, fallback)[0], 15
+        )
+        self.assertEqual(needed, 35)
+        self.assertTrue(
+            self._admit(spec_info=info, fallback_seq_lens=fallback, slot_width=1024)
+        )
+        self.assertFalse(
+            self._admit(
+                spec_info=info, fallback_seq_lens=fallback, slot_width=34
+            )
+        )
+
+    def test_draft_bound_is_seq_plus_steps(self):
+        from sglang.srt.speculative.tree_attn_fallback import tree_draft_needed_kv
+
+        self.assertEqual(tree_draft_needed_kv([100], 5), 105)
+        self.assertTrue(
+            self._admit(
+                is_target_verify=False,
+                is_tree_draft=True,
+                seq_lens=[100],
+                draft_num_steps=5,
+                slot_width=105,
+            )
+        )
+        self.assertFalse(
+            self._admit(
+                is_target_verify=False,
+                is_tree_draft=True,
+                seq_lens=[100],
+                draft_num_steps=5,
+                slot_width=104,
+            )
+        )
+
+    def test_parent_can_run_false_stays_false(self):
+        self.assertTrue(self._admit(slot_gather_enabled=False, slot_width=1))
+
+        class _Runner:
+            def __init__(self, parent_ok):
+                self.parent_ok = parent_ok
+
+            def can_run(self, info):
+                if not self.parent_ok:
+                    return False
+                return TestTreeGraphSlotCap()._admit(
+                    spec_info=info,
+                    fallback_seq_lens=info.seq_lens_cpu,
+                    slot_width=1024,
+                )
+
+        info, _ = self._verify_info([8])
+        self.assertFalse(_Runner(False).can_run(info))
+        self.assertTrue(_Runner(True).can_run(info))
+
+    def test_equal_cap_attention_matches_eager_reference(self):
+        torch.manual_seed(6)
+        rows, n_q, n_kv, d = 2, 4, 2, 8
+        cap, page_size, num_pages = 64, 8, 16
+        q = torch.randn(rows, n_q, d)
+        k_cache = torch.randn(num_pages, page_size, n_kv, d)
+        v_cache = torch.randn(num_pages, page_size, n_kv, d)
+        slots = torch.randint(0, num_pages * page_size, (rows, cap))
+        kv_lens = torch.full((rows,), cap, dtype=torch.int32)
+        kwargs = dict(
+            kv_slots=slots,
+            kv_lens=kv_lens,
+            scale=0.25,
+            n_q_heads=n_q,
+            n_kv_heads=n_kv,
+            qk_head_dim=d,
+            v_head_dim=d,
+        )
+        graph_shaped = tree_draft_attention(q, k_cache, v_cache, **kwargs)
+        eager = tree_draft_attention(q, k_cache, v_cache, kv_bound=cap, **kwargs)
+        self.assertTrue(torch.allclose(graph_shaped, eager, atol=1e-6, rtol=1e-6))
+
+    def test_overlap_verify_mask_keeps_orig_capacity(self):
+        max_q, orig, s_cap = 15, 8207, 1024
+        from sglang.srt.speculative.tree_attn_fallback import tree_graph_slot_max_kv
+
+        slot_cols = tree_graph_slot_max_kv(orig, s_cap)
+        self.assertEqual(slot_cols, 1024)
+        mask_numel = max_q * orig
+        long_mask = full_mask_numel([2000], 15)
+        self.assertLessEqual(long_mask, mask_numel)
+        self.assertGreater(long_mask, max_q * slot_cols)
+
+    def test_init_cuda_graph_state_splits_mask_and_slots(self):
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("mask_max_kv = self._slot_gather_graph_max_kv()", state_src)
+        self.assertIn(
+            "slot_max_kv = self._slot_gather_graph_slot_max_kv()", state_src
+        )
+        self.assertIn("cuda_graph_custom_mask", state_src)
+        self.assertIn("max_q * mask_max_kv", state_src)
+        self.assertIn("cuda_graph_kv_slots", state_src)
+        self.assertIn("(max_q, slot_max_kv)", state_src)
+        self.assertIn("parse_tree_graph_max_kv", _ASCEND_BACKEND.read_text())
 
 
 if __name__ == "__main__":

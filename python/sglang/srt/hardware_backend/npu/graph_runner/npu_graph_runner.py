@@ -83,6 +83,15 @@ class NPUGraphRunner(CudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
+    def can_run(self, forward_batch: ForwardBatch):
+        if not super().can_run(forward_batch):
+            return False
+        backend = getattr(self.model_runner, "attn_backend", None)
+        fn = getattr(backend, "tree_slot_graph_can_run", None)
+        if fn is None:
+            return True
+        return bool(fn(forward_batch))
+
     def _init_arch_map(self):
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
