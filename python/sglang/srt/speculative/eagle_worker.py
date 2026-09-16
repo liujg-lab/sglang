@@ -49,6 +49,8 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    build_last_page_dup_locs,
+    build_paged_draft_cache_locs,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -459,7 +461,7 @@ class EAGLEWorker(TpModelWorker):
                     last_loc,
                     self.num_new_pages_per_topk,
                     self.extend_lens,
-                    last_page_lens,
+                    _last_page_lens,
                 ) = get_last_loc_large_page_size_large_top_k(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -492,20 +494,6 @@ class EAGLEWorker(TpModelWorker):
                 )
             )
 
-        if self.page_size > 1 and self.topk > 1:
-            last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-            duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)
-            target_cache_loc = torch.zeros(
-                duplicate_cache_len, dtype=torch.int32, device=self.device
-            )
-            source_cache_loc = torch.zeros(
-                duplicate_cache_len, dtype=torch.int32, device=self.device
-            )
-        else:
-            # When source_cache_loc is not needed, simply skip
-            duplicate_cache_len = 0
-            source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
-
         raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
             out_cache_loc,
             num_seqs,
@@ -518,23 +506,33 @@ class EAGLEWorker(TpModelWorker):
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
             self.extend_lens,
-            self.num_new_pages_per_topk,
             raw_cache_loc,
-            draft_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
         )
 
         if self.page_size > 1 and self.topk > 1:
-            if duplicate_cache_len > 0:
+            draft_cache_loc = build_paged_draft_cache_locs(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+                self.num_new_pages_per_topk,
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+            )
+            source_cache_loc, target_cache_loc = build_last_page_dup_locs(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+                self.num_new_pages_per_topk,
+                self.topk,
+                self.page_size,
+            )
+            if source_cache_loc.numel() > 0:
                 self.draft_model_runner.token_to_kv_pool.move_kv_cache(
                     target_cache_loc, source_cache_loc
                 )

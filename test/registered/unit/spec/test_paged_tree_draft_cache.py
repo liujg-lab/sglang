@@ -77,8 +77,9 @@ class TestPagedTreeDraftCache(CustomTestCase):
     def test_prefix_sum_loads_use_other_zero(self):
         assign_src = _function_source(_SPEC_UTILS, "assign_draft_cache_locs")
         self.assertIn("raw_cache_loc", assign_src)
-        self.assertIn("draft_cache_loc", assign_src)
+        self.assertNotIn("duplicate_cache_len: tl.constexpr", assign_src)
         self.assertIn("mask=bs_offset < pid, other=0", assign_src)
+        self.assertNotIn("source_cache_loc", assign_src)
 
         target_src = _function_source(_SPEC_UTILS, "get_target_cache_loc")
         self.assertIn("mask=bs_offset < bid, other=0", target_src)

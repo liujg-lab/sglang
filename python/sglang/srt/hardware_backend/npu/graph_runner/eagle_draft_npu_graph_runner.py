@@ -69,6 +69,18 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.tree_eager_fallback_count = 0
         self.tree_graph_disabled_reason = None
         self._init_arch_map()
+        page_size = int(getattr(eagle_worker, "page_size", 1) or 1)
+        topk = int(getattr(eagle_worker, "topk", 1) or 1)
+        if page_size > 1 and topk > 1:
+            self.tree_graph_disabled_reason = (
+                "npu tree draft uses token-level slot gather (eager)"
+            )
+            logger.info(
+                "%s page_size=%s topk=%s",
+                self.tree_graph_disabled_reason,
+                page_size,
+                topk,
+            )
         super().__init__(eagle_worker)
 
     def _init_arch_map(self):
@@ -151,6 +163,18 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return graph, out
 
     def capture(self):
+        if self.tree_graph_disabled_reason:
+            self.graphs.clear()
+            self.capture_bs = []
+            self.max_bs = 0
+            logger.warning(
+                "NPU tree draft graphs disabled: reason=%s "
+                "tree_graph_replay_count=%s tree_eager_fallback_count=%s",
+                self.tree_graph_disabled_reason,
+                self.tree_graph_replay_count,
+                self.tree_eager_fallback_count,
+            )
+            return
         super().capture()
         self._finalize_tree_fia_maps()
 

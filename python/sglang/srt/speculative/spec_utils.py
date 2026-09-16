@@ -514,6 +514,107 @@ def build_tree_draft_block_tables(
     return pages.reshape(bs * topk, n_cols)
 
 
+def _raise_tree_draft_pos_overflow(token_pos, overflow, ctx_len: int, what: str) -> None:
+    max_pos = int(token_pos[overflow].max().item())
+    raise RuntimeError(
+        f"{what} token_pos out of req_to_token range: "
+        f"max_valid_pos={max_pos} ctx_len={ctx_len}"
+    )
+
+
+def build_tree_draft_kv_slots(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    topk: int,
+    step_id: int,
+    num_steps: int,
+    index_mapping: Optional[torch.Tensor] = None,
+    max_kv: Optional[int] = None,
+):
+    """Token-level KV slots per tree-draft branch, matching CUDA decode indices.
+
+    Returns ``(kv_slots[bs * topk, max_kv], kv_lens[bs * topk])``.
+
+    Row ``i = b * topk + k`` attends ``kv_len = seq_b + step_id + 1`` slots:
+
+    - ``j < seq_b``: ``req_to_token[pool_b, j]`` (true prefix, not a duplicated page)
+    - otherwise the compact draft slot of branch ``k`` at offset ``j - seq_b``,
+      using the same three-way layout as ``generate_draft_decode_kv_indices``.
+    """
+    device = req_to_token.device
+    bs = int(req_pool_indices.shape[0])
+    page_size = int(page_size)
+    topk = max(int(topk), 1)
+    step_id = int(step_id)
+    num_steps = max(int(num_steps), 0)
+    kv_extra = step_id + 1
+    ctx_len = int(req_to_token.shape[1]) if req_to_token.ndim >= 2 else 0
+
+    if bs == 0:
+        n_cols = 0 if max_kv is None else int(max_kv)
+        return (
+            torch.zeros((0, n_cols), dtype=torch.int64, device=device),
+            torch.zeros((0,), dtype=torch.int32, device=device),
+        )
+
+    pool_idx = req_pool_indices[:bs].to(device=device, dtype=torch.int64)
+    seq = seq_lens[:bs].to(device=device, dtype=torch.int64)
+    kv_len = seq + kv_extra
+    n_cols = int(kv_len.max().item()) if kv_len.numel() else 0
+    if max_kv is not None:
+        n_cols = int(max_kv)
+    kv_lens = kv_len.repeat_interleave(topk).to(torch.int32)
+    if n_cols <= 0:
+        return (
+            torch.zeros((bs * topk, 0), dtype=torch.int64, device=device),
+            kv_lens,
+        )
+
+    col = torch.arange(n_cols, device=device, dtype=torch.int64)
+    seq_3d = seq.view(bs, 1, 1)
+    col_3d = col.view(1, 1, n_cols)
+    k_ids = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk, 1)
+    draft_i = col_3d - seq_3d
+    valid = col_3d < kv_len.view(bs, 1, 1)
+
+    if topk == 1 or page_size == 1:
+        draft_pos = seq_3d + k_ids * num_steps + draft_i
+    else:
+        last_page_len = (seq % page_size).view(bs, 1, 1)
+        prefix_base = seq_3d - last_page_len
+        num_new_pages = (seq % page_size + num_steps + page_size - 1) // page_size
+        draft_pos = (
+            prefix_base
+            + k_ids * num_new_pages.view(bs, 1, 1) * page_size
+            + last_page_len
+            + draft_i
+        )
+
+    token_pos = torch.where(col_3d < seq_3d, col_3d.expand_as(draft_pos), draft_pos)
+    gather_idx = pool_idx.view(bs, 1, 1).expand(bs, topk, n_cols)
+    valid = valid.expand_as(token_pos)
+
+    if ctx_len <= 0:
+        slots = torch.zeros(gather_idx.shape, dtype=torch.int64, device=device)
+    else:
+        overflow = valid & ((token_pos < 0) | (token_pos >= ctx_len))
+        if bool(overflow.any().item()):
+            _raise_tree_draft_pos_overflow(
+                token_pos, overflow, ctx_len, "tree draft kv slots"
+            )
+        token_pos_safe = torch.where(valid, token_pos, torch.zeros_like(token_pos))
+        token_ids = req_to_token[gather_idx, token_pos_safe]
+        if index_mapping is not None:
+            token_ids = index_mapping.to(device=device)[token_ids]
+        slots = torch.where(
+            valid, token_ids.to(torch.int64), torch.zeros_like(token_ids, dtype=torch.int64)
+        )
+
+    return slots.reshape(bs * topk, n_cols), kv_lens
+
+
 def is_remote_spec_algorithm(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         try:
@@ -694,15 +795,132 @@ def split_draft_cache_locs(raw, num_seqs, topk, num_steps, page_size):
     """Separate paged expand slots from compact draft slots.
 
     ``topk==1`` or ``page_size==1`` keep a single buffer.
+    The compact buffer is filled with ``-1`` so a skipped compact write
+    cannot silently reuse uninitialized slots.
     """
     if int(page_size) > 1 and int(topk) > 1:
-        draft = torch.empty(
-            int(num_seqs) * int(topk) * int(num_steps),
+        draft = torch.full(
+            (int(num_seqs) * int(topk) * int(num_steps),),
+            -1,
             dtype=raw.dtype,
             device=raw.device,
         )
         return raw, draft
     return raw, raw
+
+
+def build_paged_draft_cache_locs(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    topk: int,
+    num_steps: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Compact per-branch draft slots from paged ``req_to_token`` (Triton Part 3).
+
+    After Part 1 copies the expanded pages into ``req_to_token`` starting at
+    ``seq_len``, each branch's draft tokens live at
+
+    ``prefix_base + k * num_new_pages_per_topk * page_size + last_page_len + i``
+
+    for ``i in [0, num_steps)``. That is the same set Part 3 used to gather
+    with ``iter_offset in [L, L + num_steps)`` then subtract ``L``.
+    """
+    device = req_to_token.device
+    dtype = req_to_token.dtype
+    num_seqs = int(req_pool_indices.shape[0])
+    topk = int(topk)
+    num_steps = int(num_steps)
+    page_size = int(page_size)
+    pool_len = int(req_to_token.shape[1]) if req_to_token.ndim >= 2 else 0
+
+    if num_seqs == 0 or topk <= 0 or num_steps <= 0:
+        return torch.empty(0, dtype=dtype, device=device)
+
+    pool = req_pool_indices[:num_seqs].to(device=device, dtype=torch.int64)
+    seq = seq_lens[:num_seqs].to(device=device, dtype=torch.int64)
+    nnp = num_new_pages_per_topk[:num_seqs].to(device=device, dtype=torch.int64)
+    last_page_len = seq % page_size
+    prefix_base = seq - last_page_len
+
+    k_ids = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk, 1)
+    step_ids = torch.arange(num_steps, device=device, dtype=torch.int64).view(
+        1, 1, num_steps
+    )
+    pos = (
+        prefix_base.view(num_seqs, 1, 1)
+        + k_ids * nnp.view(num_seqs, 1, 1) * page_size
+        + last_page_len.view(num_seqs, 1, 1)
+        + step_ids
+    )
+    overflow = (pos < 0) | (pos >= pool_len)
+    if bool(overflow.any().item()):
+        _raise_tree_draft_pos_overflow(
+            pos, overflow, pool_len, "paged draft cache loc"
+        )
+    gather_idx = pool.view(num_seqs, 1, 1).expand(num_seqs, topk, num_steps)
+    draft = req_to_token[gather_idx, pos]
+    if bool((draft < 0).any().item()):
+        raise RuntimeError(
+            "paged draft cache loc contains unfilled (-1) slots; "
+            "req_to_token Part 1 copy may have failed"
+        )
+    return draft.reshape(num_seqs * topk * num_steps)
+
+
+def build_last_page_dup_locs(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    topk: int,
+    page_size: int,
+):
+    """Source/target slots for last-page KV duplication (former Triton Part 2).
+
+    Page-level attention needs the prefix tail copied onto each extra branch
+    page. Token-level slot gather reads the original prefix slots and must
+    not depend on this copy.
+    """
+    device = req_to_token.device
+    dtype = req_to_token.dtype
+    num_seqs = int(req_pool_indices.shape[0])
+    topk = int(topk)
+    page_size = int(page_size)
+    extra = max(topk - 1, 0)
+    empty = torch.empty(0, dtype=dtype, device=device)
+    if num_seqs == 0 or extra == 0 or page_size <= 1:
+        return empty, empty
+
+    pool = req_pool_indices[:num_seqs].to(device=device, dtype=torch.int64)
+    seq = seq_lens[:num_seqs].to(device=device, dtype=torch.int64)
+    nnp = num_new_pages_per_topk[:num_seqs].to(device=device, dtype=torch.int64)
+    last_page_len = seq % page_size
+    prefix_base = seq - last_page_len
+    n_copy = int(last_page_len.sum().item()) * extra
+    if n_copy <= 0:
+        return empty, empty
+
+    src_parts = []
+    tgt_parts = []
+    offsets = torch.arange(page_size, device=device, dtype=torch.int64)
+    for b in range(num_seqs):
+        length = int(last_page_len[b].item())
+        if length <= 0:
+            continue
+        mask = offsets < length
+        src = req_to_token[pool[b], prefix_base[b] + offsets]
+        src = src[mask]
+        for topk_id in range(1, topk):
+            src_parts.append(src)
+            tgt = req_to_token[
+                pool[b],
+                prefix_base[b] + topk_id * nnp[b] * page_size + offsets,
+            ]
+            tgt_parts.append(tgt[mask])
+    return torch.cat(src_parts), torch.cat(tgt_parts)
 
 
 @triton.jit
@@ -711,20 +929,19 @@ def assign_draft_cache_locs(
     req_to_token,
     seq_lens,
     extend_lens,
-    num_new_pages_per_topk,
     raw_cache_loc,
-    draft_cache_loc,
-    source_cache_loc,
-    target_cache_loc,
-    last_page_lens_cumsum,
-    duplicate_cache_len: tl.constexpr,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
     page_size: tl.constexpr,
     bs_upper: tl.constexpr,
-    iter_upper: tl.constexpr,
 ):
+    """Part 1 only: copy expanded paged slots into ``req_to_token``.
+
+    Compact draft slots and last-page duplication indices are built in
+    PyTorch so ``page_size>1 && topk>1`` does not JIT-specialize on a
+    batch-varying duplication length.
+    """
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
@@ -739,7 +956,6 @@ def assign_draft_cache_locs(
         )
         out_cache_ptr = raw_cache_loc + cum_copy_len
 
-    # Part 1: Copy from out_cache_loc to req_to_token
     kv_start = tl.load(seq_lens + pid)
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
     num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
@@ -748,78 +964,6 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if (page_size != 1) and (topk != 1):
-        prefix_len = tl.load(seq_lens + pid)
-        last_page_len = prefix_len % page_size
-        num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
-        prefix_base = token_pool + prefix_len - last_page_len
-        if duplicate_cache_len > 0:
-            # Part 2: Copy indices into source_cache_loc and target_cache_loc
-            # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
-            offsets = tl.arange(0, page_size)
-            mask = offsets < last_page_len
-            src_indices = tl.load(prefix_base + offsets, mask=mask)
-            last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
-            # Skip the first one since no copy is needed
-            for topk_id in range(1, topk):
-                tl.store(
-                    source_cache_loc
-                    + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-                    + (topk_id - 1) * last_page_len
-                    + offsets,
-                    src_indices,
-                    mask=mask,
-                )
-                tgt_indices = tl.load(
-                    prefix_base
-                    + topk_id * num_new_pages_per_topk_ * page_size
-                    + offsets,
-                    mask=mask,
-                )
-                tl.store(
-                    target_cache_loc
-                    + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-                    + (topk_id - 1) * last_page_len
-                    + offsets,
-                    tgt_indices,
-                    mask=mask,
-                )
-        # Part 3: Copy and remove the used indices for duplication.
-        # Always run for paged tree draft so page-aligned prefixes
-        # (last_page_len == 0) still compact per-branch slots.
-        # speculative_num_steps=5, page_size=4, num_new_pages_per_topk_=2, last_page_len=1
-        #  - xxxxx .. | - xxxxx .. |
-        #   topk=0        topk=1
-        #  "-" means prefix tokens
-        #  "x" means speculative draft tokens
-        #  "." means padded tokens
-        # we only want to copy the "x" part.
-        iter_offset = tl.arange(0, iter_upper)
-        for topk_id in range(topk):
-            mask_upper = iter_offset < (speculative_num_steps + last_page_len)
-            mask_lower = iter_offset >= last_page_len
-            combined_mask = mask_upper & mask_lower
-            indices = tl.load(
-                prefix_base
-                + topk_id * num_new_pages_per_topk_ * page_size
-                + iter_offset,
-                mask=combined_mask,
-                other=0,
-            )
-            # Shift from previous batches
-            ptr_offset = pid * speculative_num_steps * topk
-            # Subtract last_page_len to fill the gap of duplicated last page tokens.
-            # For example, token pool is (1, 2, 3, 4 ,5) and last page is 1,
-            # we write 2, 3, 4 to the front of out_cache_loc.
-            tl.store(
-                draft_cache_loc
-                + ptr_offset
-                + topk_id * speculative_num_steps
-                - last_page_len
-                + iter_offset,
-                indices,
-                mask=combined_mask,
-            )
 
 
 @triton.jit

@@ -434,8 +434,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             "if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):",
             spec_src,
         )
-        self.assertIn("if (page_size != 1) and (topk != 1):", spec_src)
-        self.assertIn("Always run for paged tree draft", spec_src)
+        self.assertIn("def build_paged_draft_cache_locs", spec_src)
+        self.assertIn("def build_tree_draft_kv_slots", spec_src)
+        self.assertNotIn("duplicate_cache_len: tl.constexpr", spec_src)
         drafter_src = (
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
@@ -448,7 +449,8 @@ class TestRemoteSpecDevice(CustomTestCase):
             drafter_src,
         )
         self.assertIn("if self.page_size > 1 and self.topk > 1:", drafter_src)
-        self.assertIn("if duplicate_cache_len > 0:", drafter_src)
+        self.assertIn("build_paged_draft_cache_locs", drafter_src)
+        self.assertNotIn("if duplicate_cache_len > 0:", drafter_src)
 
     def test_normalize_tree_draft_kv_lens(self):
         normalize_tree_draft_kv_lens = (

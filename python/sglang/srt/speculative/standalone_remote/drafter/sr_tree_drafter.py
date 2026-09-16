@@ -23,6 +23,7 @@ from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
     assign_draft_cache_locs,
+    build_paged_draft_cache_locs,
     device_backend_key,
     fast_topk,
     get_last_loc_large_page_size_large_top_k,
@@ -344,8 +345,6 @@ class SRTreeDrafter:
                 num_seqs * alloc_len,
                 backup_state=True,
             )
-            duplicate_cache_len = 0
-            source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
         else:
             if self.topk == 1:
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
@@ -357,7 +356,6 @@ class SRTreeDrafter:
                 prefix_lens_cpu = batch.seq_lens_cpu
                 seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
-                last_page_lens = None
             else:
                 (
                     prefix_lens,
@@ -365,7 +363,7 @@ class SRTreeDrafter:
                     last_loc,
                     self.num_new_pages_per_topk,
                     self.extend_lens,
-                    last_page_lens,
+                    _last_page_lens,
                 ) = get_last_loc_large_page_size_large_top_k(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -397,22 +395,6 @@ class SRTreeDrafter:
                     backup_state=True,
                 )
             )
-            if self.page_size > 1 and self.topk > 1:
-                last_page_lens_cpu = batch.seq_lens_cpu % self.page_size
-                last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-                duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (
-                    self.topk - 1
-                )
-                target_cache_loc = torch.zeros(
-                    duplicate_cache_len, dtype=torch.int32, device=self.device
-                )
-                source_cache_loc = torch.zeros(
-                    duplicate_cache_len, dtype=torch.int32, device=self.device
-                )
-            else:
-                duplicate_cache_len = 0
-                source_cache_loc = target_cache_loc = last_page_lens_cumsum = None
-
         try:
             raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
                 out_cache_loc,
@@ -426,25 +408,27 @@ class SRTreeDrafter:
                 batch.req_to_token_pool.req_to_token,
                 batch.seq_lens,
                 self.extend_lens,
-                self.num_new_pages_per_topk,
                 raw_cache_loc,
-                draft_cache_loc,
-                source_cache_loc,
-                target_cache_loc,
-                last_page_lens_cumsum,
-                duplicate_cache_len,
                 batch.req_to_token_pool.req_to_token.shape[1],
                 self.topk,
                 self.speculative_num_steps,
                 self.page_size,
                 next_power_of_2(num_seqs),
-                next_power_of_2(self.speculative_num_steps + self.page_size),
             )
             if self.page_size > 1 and self.topk > 1:
-                if duplicate_cache_len > 0:
-                    self.draft_model_runner.token_to_kv_pool.move_kv_cache(
-                        target_cache_loc, source_cache_loc
-                    )
+                # Compact draft slots in PyTorch (former Triton Part 3).
+                # Last-page KV duplication (former Part 2 / move_kv_cache) is
+                # only required for page-level attention. Token-level slot
+                # gather reads the original prefix slots, so skip the copy.
+                draft_cache_loc = build_paged_draft_cache_locs(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.num_new_pages_per_topk,
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.page_size,
+                )
             batch.out_cache_loc = draft_cache_loc
             batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
             batch.spec_info.positions = batch.seq_lens.repeat_interleave(

@@ -27,6 +27,7 @@ DEFAULT_ATTN_CHUNK_SIZE = 256
 
 logger = logging.getLogger(__name__)
 _LOGGED_TREE_VERIFY_FALLBACK = False
+_LOGGED_TREE_DRAFT_SLOT_GATHER = False
 
 
 def verify_tree_topk_from_server_args(server_args) -> int:
@@ -79,6 +80,19 @@ def log_tree_verify_fallback_once(verify_tree_topk: int) -> None:
     logger.info(
         "tree verify slot-gather fallback enabled topk=%s",
         int(verify_tree_topk),
+    )
+
+
+def log_tree_draft_slot_gather_once(draft_topk: int, page_size: int) -> None:
+    """Log once when token-level tree-draft attention actually runs."""
+    global _LOGGED_TREE_DRAFT_SLOT_GATHER
+    if _LOGGED_TREE_DRAFT_SLOT_GATHER:
+        return
+    _LOGGED_TREE_DRAFT_SLOT_GATHER = True
+    logger.info(
+        "tree draft token-level slot-gather enabled topk=%s page_size=%s",
+        int(draft_topk),
+        int(page_size),
     )
 
 
@@ -261,3 +275,81 @@ def tree_verify_attention(
             dim=0,
         )
     return stacked.reshape(stacked.shape[0], n_q_heads * v_head_dim)
+
+
+def tree_draft_attention(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    kv_slots: torch.Tensor,
+    kv_lens: SeqLens,
+    scale: float,
+    n_q_heads: int,
+    n_kv_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope_cache: Optional[torch.Tensor] = None,
+    rope_head_dim: Optional[int] = None,
+) -> torch.Tensor:
+    """Batched token-level attention for tree-draft decode.
+
+    ``kv_slots`` is ``[R, max_kv]`` with one row per ``(seq, topk)`` branch.
+    Padding columns are ignored via ``kv_lens``. GQA repeats KV heads.
+    """
+    query = query.reshape(-1, n_q_heads, qk_head_dim)
+    rows = int(query.shape[0])
+    if rows == 0:
+        return query.new_zeros(0, n_q_heads * v_head_dim)
+
+    kv_slots = kv_slots.reshape(rows, -1).to(dtype=torch.int64, device=query.device)
+    max_kv = int(kv_slots.shape[1])
+    lens_list = _as_seq_list(kv_lens)
+    if len(lens_list) != rows:
+        raise ValueError(
+            f"tree draft kv_lens length {len(lens_list)} != num query rows {rows}"
+        )
+    kv_len_t = torch.tensor(lens_list, dtype=torch.int64, device=query.device)
+    if max_kv == 0 or int(kv_len_t.max().item()) <= 0:
+        return query.new_zeros(rows, n_q_heads * v_head_dim)
+
+    flat_k = flatten_paged_kv(k_cache, n_kv_heads, qk_head_dim)
+    flat_v = flatten_paged_kv(v_cache, n_kv_heads, v_head_dim)
+    safe_slots = kv_slots.clamp(min=0)
+    k_g = flat_k.index_select(0, safe_slots.reshape(-1)).view(
+        rows, max_kv, n_kv_heads, qk_head_dim
+    )
+    v_g = flat_v.index_select(0, safe_slots.reshape(-1)).view(
+        rows, max_kv, n_kv_heads, v_head_dim
+    )
+    n_rep = n_q_heads // max(int(n_kv_heads), 1)
+    if n_rep > 1:
+        k_g = k_g.repeat_interleave(n_rep, dim=2)
+        v_g = v_g.repeat_interleave(n_rep, dim=2)
+
+    q_f = query.float()
+    # [R, H, D] x [R, S, H, D] -> [R, H, S]
+    k_f = k_g.permute(0, 2, 3, 1).contiguous().float()
+    scores = torch.matmul(q_f.unsqueeze(2), k_f).squeeze(2) * float(scale)
+    if q_rope is not None and k_rope_cache is not None:
+        rd = int(rope_head_dim)
+        q_rope = q_rope.reshape(-1, n_q_heads, rd)
+        flat_k_rope = flatten_paged_kv(k_rope_cache, n_kv_heads, rd)
+        k_rope_g = flat_k_rope.index_select(0, safe_slots.reshape(-1)).view(
+            rows, max_kv, n_kv_heads, rd
+        )
+        if n_rep > 1:
+            k_rope_g = k_rope_g.repeat_interleave(n_rep, dim=2)
+        k_rope_f = k_rope_g.permute(0, 2, 3, 1).contiguous().float()
+        scores = scores + torch.matmul(q_rope.float().unsqueeze(2), k_rope_f).squeeze(
+            2
+        ) * float(scale)
+
+    col = torch.arange(max_kv, device=query.device, dtype=torch.int64)
+    pad = col.view(1, 1, max_kv) >= kv_len_t.view(rows, 1, 1)
+    scores = scores.masked_fill(pad, torch.finfo(torch.float32).min)
+    probs = torch.softmax(scores, dim=-1)
+    probs = probs.masked_fill(pad, 0.0)
+    out = torch.matmul(probs.unsqueeze(2), v_g.permute(0, 2, 1, 3).float()).squeeze(2)
+    return out.to(dtype=query.dtype).reshape(rows, n_q_heads * v_head_dim)

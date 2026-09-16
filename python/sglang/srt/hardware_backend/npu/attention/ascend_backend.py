@@ -27,11 +27,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     build_tree_draft_block_tables,
+    build_tree_draft_kv_slots,
     expand_seq_lens_for_spec_topk,
     normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
+    log_tree_draft_slot_gather_once,
     log_tree_verify_fallback_once,
+    tree_draft_attention,
     tree_verify_attention,
     use_tree_verify_fallback,
     verify_tree_topk_from_server_args,
@@ -86,6 +89,11 @@ class ForwardMetadata:
     # TARGET_VERIFY tree attention (True = masked, Ascend polarity)
     tree_attn_mask: Optional[torch.Tensor] = None
     tree_kv_lens: Optional[List[int]] = None
+
+    # Tree-draft token-level slots (one row per branch)
+    tree_draft_kv_slots: Optional[torch.Tensor] = None
+    tree_draft_kv_lens_t: Optional[torch.Tensor] = None
+    tree_draft_kv_slots_swa: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -378,6 +386,85 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         )
 
+    def _use_tree_draft_slot_gather(self, forward_batch: ForwardBatch) -> bool:
+        return self._is_tree_draft(forward_batch) and self.page_size > 1
+
+    def _fill_tree_draft_kv_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        slots, lens = build_tree_draft_kv_slots(
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_size=self.page_size,
+            topk=self.draft_topk,
+            step_id=self.speculative_step_id,
+            num_steps=self.draft_num_steps,
+        )
+        self.forward_metadata.tree_draft_kv_slots = slots
+        self.forward_metadata.tree_draft_kv_lens_t = lens
+        if self.is_hybrid_swa:
+            swa_slots, _ = build_tree_draft_kv_slots(
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                page_size=self.page_size,
+                topk=self.draft_topk,
+                step_id=self.speculative_step_id,
+                num_steps=self.draft_num_steps,
+                index_mapping=self.full_to_swa_index_mapping,
+            )
+            self.forward_metadata.tree_draft_kv_slots_swa = swa_slots
+
+    def _run_tree_draft_slot_gather(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        *,
+        qk_head_dim: int,
+        v_head_dim: int,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope_cache: Optional[torch.Tensor] = None,
+        rope_head_dim: Optional[int] = None,
+    ) -> torch.Tensor:
+        slots = self.forward_metadata.tree_draft_kv_slots
+        if slots is None:
+            raise RuntimeError(
+                "tree draft slot-gather requires tree_draft_kv_slots; "
+                "init_forward_metadata did not fill them"
+            )
+        if (
+            self.is_hybrid_swa
+            and getattr(layer, "sliding_window_size", -1) not in (-1, None)
+            and int(layer.sliding_window_size) != -1
+        ):
+            swa = self.forward_metadata.tree_draft_kv_slots_swa
+            if swa is None:
+                raise RuntimeError(
+                    "tree draft SWA slot-gather requires tree_draft_kv_slots_swa"
+                )
+            slots = swa
+        log_tree_draft_slot_gather_once(self.draft_topk, self.page_size)
+        return tree_draft_attention(
+            q,
+            k_cache,
+            v_cache,
+            kv_slots=slots,
+            kv_lens=self.forward_metadata.tree_draft_kv_lens_t,
+            scale=layer.scaling,
+            n_q_heads=layer.tp_q_head_num,
+            n_kv_heads=layer.tp_k_head_num,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+            q_rope=q_rope,
+            k_rope_cache=k_rope_cache,
+            rope_head_dim=rope_head_dim,
+        )
+
     def _tree_draft_kv_lens(self, seq_lens, num_q: int):
         if self.draft_topk > 1:
             return normalize_tree_draft_kv_lens(seq_lens, num_q, self.draft_topk)
@@ -483,6 +570,11 @@ class AscendAttnBackend(AttentionBackend):
                     .to(torch.int32)
                     .contiguous()
                 )
+        if self._use_tree_draft_slot_gather(forward_batch):
+            self._fill_tree_draft_kv_slots(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+            )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -2070,17 +2162,18 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if self.graph_mode and (not self.enable_torch_compile):
-            return self.forward_decode_graph(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache,
-                q_rope=q_rope,
-                k_rope=k_rope,
-                sinks=sinks,
-            )
+            if not self._use_tree_draft_slot_gather(forward_batch):
+                return self.forward_decode_graph(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                    sinks=sinks,
+                )
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
@@ -2095,6 +2188,19 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self._use_tree_draft_slot_gather(forward_batch):
+                attn_output = self._run_tree_draft_slot_gather(
+                    q,
+                    k_cache,
+                    v_cache,
+                    layer,
+                    qk_head_dim=layer.qk_head_dim,
+                    v_head_dim=layer.v_head_dim,
+                )
+                return attn_output.view(
+                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
+                )
 
             if sinks is not None:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -2241,6 +2347,22 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self._use_tree_draft_slot_gather(forward_batch):
+                attn_output = self._run_tree_draft_slot_gather(
+                    q,
+                    kv_c,
+                    kv_c,
+                    layer,
+                    qk_head_dim=self.kv_lora_rank,
+                    v_head_dim=self.kv_lora_rank,
+                    q_rope=q_rope,
+                    k_rope_cache=k_pe,
+                    rope_head_dim=self.qk_rope_head_dim,
+                )
+                return attn_output.view(
+                    num_tokens, layer.tp_q_head_num * self.kv_lora_rank
+                )
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""

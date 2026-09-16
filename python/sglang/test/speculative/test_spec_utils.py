@@ -6,6 +6,8 @@ import torch
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    build_last_page_dup_locs,
+    build_paged_draft_cache_locs,
     split_draft_cache_locs,
 )
 from sglang.srt.utils import next_power_of_2
@@ -46,6 +48,55 @@ class TestSpecUtils(unittest.TestCase):
             dtype=torch.int64,
         )
 
+    def _assign_and_compact(
+        self,
+        num_seqs,
+        page_size,
+        speculative_num_steps,
+        topk,
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        extend_lens,
+        num_new_pages_per_topk,
+        out_cache_loc,
+    ):
+        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
+            out_cache_loc, num_seqs, topk, speculative_num_steps, page_size
+        )
+        assign_draft_cache_locs[(num_seqs,)](
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            extend_lens,
+            raw_cache_loc,
+            req_to_token.shape[1],
+            topk,
+            speculative_num_steps,
+            page_size,
+            next_power_of_2(num_seqs),
+        )
+        source_cache_loc = target_cache_loc = None
+        if page_size > 1 and topk > 1:
+            draft_cache_loc = build_paged_draft_cache_locs(
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                num_new_pages_per_topk,
+                topk,
+                speculative_num_steps,
+                page_size,
+            )
+            source_cache_loc, target_cache_loc = build_last_page_dup_locs(
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                num_new_pages_per_topk,
+                topk,
+                page_size,
+            )
+        return draft_cache_loc, source_cache_loc, target_cache_loc
+
     def test_assign_draft_cache_locs_single_seq(self):
         # Testing Setup: req_to_token starting from 4
         # 4,5,6,7,{8,9,10}, 8,9,10 is the last partial page, 3 tokens < page_size=4
@@ -66,39 +117,19 @@ class TestSpecUtils(unittest.TestCase):
         extend_lens = torch.tensor([extend_lens_num], dtype=torch.int32, device=device)
         num_new_pages_per_topk = torch.tensor([2], dtype=torch.int32, device=device)
         out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
-        last_page_lens = torch.tensor([3], dtype=torch.int32, device=device)
-        last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
-        target_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        source_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
-            out_cache_loc, num_seqs, topk, speculative_num_steps, page_size
-        )
-        assign_draft_cache_locs[(num_seqs,)](
+        out_cache_loc, source_cache_loc, target_cache_loc = self._assign_and_compact(
+            num_seqs,
+            page_size,
+            speculative_num_steps,
+            topk,
             req_pool_indices,
             req_to_token,
             seq_lens,
             extend_lens,
             num_new_pages_per_topk,
-            raw_cache_loc,
-            draft_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            req_to_token.shape[1],
-            topk,
-            speculative_num_steps,
-            page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps + page_size),
+            out_cache_loc,
         )
 
-        out_cache_loc = draft_cache_loc
         expected_source_cache_loc = torch.tensor(
             [8, 9, 10] * (topk - 1), device=device, dtype=torch.int32
         )
@@ -148,40 +179,21 @@ class TestSpecUtils(unittest.TestCase):
         req_to_token[1, :7] = torch.tensor([4, 5, 6, 7, 8, 9, 10], device=device)
         req_to_token[2, :5] = torch.tensor([4, 5, 6, 7, 8], device=device)
         last_page_lens = torch.tensor([0, 3, 1], dtype=torch.int32, device=device)
-        last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
         out_cache_loc = torch.arange(
             12, 12 + torch.sum(extend_lens), dtype=torch.int32, device=device
         )
-        target_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        source_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
-            out_cache_loc, num_seqs, topk, speculative_num_steps, page_size
-        )
-        assign_draft_cache_locs[(num_seqs,)](
+        out_cache_loc, source_cache_loc, target_cache_loc = self._assign_and_compact(
+            num_seqs,
+            page_size,
+            speculative_num_steps,
+            topk,
             req_pool_indices,
             req_to_token,
             seq_lens,
             extend_lens,
             num_new_pages_per_topk,
-            raw_cache_loc,
-            draft_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            req_to_token.shape[1],
-            topk,
-            speculative_num_steps,
-            page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps + page_size),
+            out_cache_loc,
         )
-        out_cache_loc = draft_cache_loc
         # fmt: off
         expected_out_cache_loc = torch.tensor([
             12,  13,  14,  15,  16,
@@ -262,34 +274,18 @@ class TestSpecUtils(unittest.TestCase):
         extend_lens = torch.tensor([extend_lens_num], dtype=torch.int32, device=device)
         num_new_pages_per_topk = torch.tensor([2], dtype=torch.int32, device=device)
         out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
-        last_page_lens = torch.tensor([3], dtype=torch.int32, device=device)
-        duplicate_cache_len = 0
-        target_cache_loc = None
-        source_cache_loc = None
-        last_page_lens_cumsum = None
-        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
-            out_cache_loc, num_seqs, topk, speculative_num_steps, page_size
-        )
-        assign_draft_cache_locs[(num_seqs,)](
+        out_cache_loc, _, _ = self._assign_and_compact(
+            num_seqs,
+            page_size,
+            speculative_num_steps,
+            topk,
             req_pool_indices,
             req_to_token,
             seq_lens,
             extend_lens,
             num_new_pages_per_topk,
-            raw_cache_loc,
-            draft_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            req_to_token.shape[1],
-            topk,
-            speculative_num_steps,
-            page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps + page_size),
+            out_cache_loc,
         )
-        out_cache_loc = draft_cache_loc
         expected_out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
         assert torch.allclose(out_cache_loc, expected_out_cache_loc)
 
@@ -310,8 +306,6 @@ class TestSpecUtils(unittest.TestCase):
         )
         seq_lens = torch.tensor([seq_lens_num], dtype=torch.int32, device=device)
         last_page_len = seq_lens_num % page_size
-        last_page_lens = torch.tensor([last_page_len], dtype=torch.int32, device=device)
-        last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
         num_new_pages_per_topk_val = (
             last_page_len + speculative_num_steps + page_size - 1
         ) // page_size
@@ -323,36 +317,18 @@ class TestSpecUtils(unittest.TestCase):
         out_cache_loc = torch.arange(
             2000, 2000 + extend_lens_num, dtype=torch.int32, device=device
         )
-        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
-        target_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        source_cache_loc = torch.zeros(
-            duplicate_cache_len, dtype=torch.int32, device=device
-        )
-        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
-            out_cache_loc, num_seqs, topk, speculative_num_steps, page_size
-        )
-        assign_draft_cache_locs[(num_seqs,)](
+        trimmed, _, _ = self._assign_and_compact(
+            num_seqs,
+            page_size,
+            speculative_num_steps,
+            topk,
             req_pool_indices,
             req_to_token,
             seq_lens,
             extend_lens,
             num_new_pages_per_topk,
-            raw_cache_loc,
-            draft_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            req_to_token.shape[1],
-            topk,
-            speculative_num_steps,
-            page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps + page_size),
+            out_cache_loc,
         )
-        trimmed = draft_cache_loc
         expected = []
         for topk_id in range(topk):
             start = seq_lens_num + topk_id * num_new_pages_per_topk_val * page_size
