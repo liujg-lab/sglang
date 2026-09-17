@@ -448,6 +448,7 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        seed_only: bool = False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -477,6 +478,10 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+            if seed_only:
+                self.model_runner.capture_tree_seed_only(logits_output, forward_batch)
+                return batch_result
 
             if is_verify:
                 # Skip sampling and return logits for target forward

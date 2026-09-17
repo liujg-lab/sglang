@@ -74,6 +74,27 @@ class Sampler(nn.Module):
 
         return logits
 
+    def _capture_tree_seed(self, logits_output, logits, sampling_info) -> None:
+        tree_seed_topk = int(getattr(sampling_info, "tree_seed_topk", 0) or 0)
+        if tree_seed_topk > 0 and logits is not None:
+            from sglang.srt.speculative.standalone_remote.sr_align import (
+                capture_tree_seed_topk,
+            )
+
+            seed_src = (
+                logits
+                if sampling_info.is_all_greedy
+                else logits / sampling_info.temperatures
+            )
+            (
+                logits_output.tree_seed_topk_p,
+                logits_output.tree_seed_topk_index,
+            ) = capture_tree_seed_topk(seed_src, tree_seed_topk)
+
+    def capture_tree_seed_only(self, logits_output, sampling_info) -> None:
+        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
+        self._capture_tree_seed(logits_output, logits, sampling_info)
+
     def forward(
         self,
         logits_output: LogitsProcessorOutput,
@@ -102,22 +123,7 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
 
-        tree_seed_topk = int(getattr(sampling_info, "tree_seed_topk", 0) or 0)
-        if tree_seed_topk > 0 and logits is not None:
-            from sglang.srt.speculative.standalone_remote.sr_align import (
-                capture_tree_seed_topk,
-            )
-
-            if sampling_info.is_all_greedy:
-                seed_src = logits
-            else:
-                seed_src = logits / sampling_info.temperatures
-            (
-                logits_output.tree_seed_topk_p,
-                logits_output.tree_seed_topk_index,
-            ) = capture_tree_seed_topk(seed_src, tree_seed_topk)
-            if seed_src is not logits:
-                del seed_src
+        self._capture_tree_seed(logits_output, logits, sampling_info)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling

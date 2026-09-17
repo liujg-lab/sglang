@@ -1449,6 +1449,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Optional override for CUDA-graph / logits hidden capture (LAST, FULL).
     # Resolved after return_hidden_states in get_model_worker_batch.
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
+    is_sr_tail_extend: bool = False
 
     # Whether to return captured experts
     return_routed_experts: bool = False
@@ -2445,6 +2446,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=self.resolve_capture_hidden_mode(),
+            is_sr_tail_extend=self.is_sr_tail_extend,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
@@ -2618,6 +2620,7 @@ class ModelWorkerBatch:
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    is_sr_tail_extend: bool = False
     hicache_consumer_index: int = -1
 
     # For matryoshka embeddings

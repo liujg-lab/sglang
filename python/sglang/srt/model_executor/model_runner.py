@@ -2676,7 +2676,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
 
         can_run_graph = (
-            self.piecewise_cuda_graph_runner is not None
+            not forward_batch.is_sr_tail_extend
+            and self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
 
@@ -2812,7 +2813,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            not forward_batch.is_sr_tail_extend
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
@@ -2897,6 +2899,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch_record_buf until the next iteration, causing a steady VRAM leak
         # when structured output (grammar) is used.
         sampling_info.vocab_mask = None
+
+    def capture_tree_seed_only(self, logits_output, forward_batch) -> None:
+        """Apply normal seed transforms without sampling or updating token state."""
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        self.sampler.capture_tree_seed_only(
+            logits_output, forward_batch.sampling_info
+        )
 
     def sample(
         self,

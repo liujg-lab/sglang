@@ -398,6 +398,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
+    is_sr_tail_extend: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
@@ -472,6 +473,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
+            is_sr_tail_extend=batch.is_sr_tail_extend,
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
@@ -578,6 +580,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
+
+        if ret.is_sr_tail_extend:
+            from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
+                validate_tail_forward_batch,
+            )
+
+            validate_tail_forward_batch(ret)
 
         # Precompute SWA cache location once for all SWA layers
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
@@ -796,6 +805,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         * 3
                     )
                 else:
+                    if self.is_sr_tail_extend:
+                        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+                            tail_mrope_positions,
+                        )
+
+                        mrope_positions_list[batch_idx] = tail_mrope_positions(
+                            mm_input, extend_prefix_len, extend_seq_len
+                        )
+                        continue
                     mrope_positions = mm_input.mrope_positions[
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,

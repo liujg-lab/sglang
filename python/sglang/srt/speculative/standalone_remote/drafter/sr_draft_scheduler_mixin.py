@@ -1,8 +1,11 @@
 import logging
 import time
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import get_sr_round_metrics
 
 from sglang.srt.layers.sampler import SamplingBatchInfo
 from sglang.srt.managers.schedule_batch import (
@@ -15,6 +18,15 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftState,
     SRDraftStateManager,
     SRWindow,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+    SRTailExtendTransaction,
+    TailExtendRecoveryRequired,
+    invalidate_tree_seed,
+    make_tail_extend_batch,
+    plan_tail_extend,
+    stamp_tree_seed,
+    tree_seed_is_current,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DEFAULT_MAX_INGEST_DECODE_STEPS,
@@ -724,16 +736,26 @@ class StandaloneRemoteDraftSchedulerMixin:
             )
             req.grammar = None
 
-    def _sr_replay_grammars(self, reqs: List[Req]) -> None:
+    def _sr_replay_grammars(self, reqs: List[Req], *, strict: bool = False) -> None:
         for req in reqs:
             template = getattr(req, "sr_grammar_template", None)
             if template is None:
                 continue
             try:
+                committed_ids = req.output_ids or []
+                if self._sr_tree_mode():
+                    # Recovery may have folded committed output into origin.
+                    # Grammar history starts after the original padded prompt.
+                    prompt = getattr(req, "sr_padded_ids", req.origin_input_ids)
+                    committed_ids = (
+                        list(req.origin_input_ids or []) + list(req.output_ids or [])
+                    )[len(prompt) :]
                 req.grammar = replay_grammar_from_committed(
-                    template, req.output_ids or []
+                    template, committed_ids
                 )
             except Exception as e:
+                if strict:
+                    raise RuntimeError(f"grammar replay failed for {req.rid}") from e
                 logger.warning("[SR] grammar replay failed for %s: %s", req.rid, e)
                 req.grammar = None
 
@@ -747,6 +769,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.draft_generation_start_len = len(req.output_ids or [])
             req.draft_tokens_target = dreq.num_draft_tokens
             return
+
+        invalidate_tree_seed(req)
 
         prefix_len = self.sr_kv.get_prefix_len(req)
         kind = classify_prefix_alignment(local, target, prefix_len)
@@ -844,7 +868,15 @@ class StandaloneRemoteDraftSchedulerMixin:
                 verified_id = torch.tensor(
                     [token_id], dtype=torch.int64, device=row_hidden.device
                 )
-                req.sr_tree_seed = (row_p, row_ix, row_hidden, verified_id)
+                req.sr_tree_seed = (
+                    row_p.detach().clone(),
+                    row_ix.detach().clone(),
+                    row_hidden.detach().clone(),
+                    verified_id,
+                )
+                stamp_tree_seed(
+                    req, len(req.origin_input_ids or []) + len(req.output_ids or [])
+                )
             if skipped:
                 logger.warning(
                     "[SR] skip tree seed for %s: topk/hidden %s/%s/%s "
@@ -891,6 +923,7 @@ class StandaloneRemoteDraftSchedulerMixin:
 
     def _sr_reset_linear_kv_state(self, req: Req, fill_ids: List[int]) -> None:
         """Drop linear KV bookkeeping and rebuild fill/origin for a full re-prefill."""
+        invalidate_tree_seed(req)
         self._sr_remove_req(req)
         if req.req_pool_idx is not None:
             kv = getattr(self, "sr_kv", None)
@@ -987,6 +1020,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                 break
             if len(keep) != len(batch.reqs):
                 batch.filter_batch(keep_indices=keep)
+            if self._sr_tree_mode():
+                self._sr_replay_grammars(list(batch.reqs), strict=True)
             self._sr_enable_tree_seed_hidden(batch)
             self.cur_batch = batch
             result = self.run_batch(batch)
@@ -1042,7 +1077,126 @@ class StandaloneRemoteDraftSchedulerMixin:
         if rebuilt:
             self._sr_materialize_prefix_batch(rebuilt)
 
+    def _sr_make_tail_extend_batch(self, plans) -> ScheduleBatch:
+        return make_tail_extend_batch(self, plans)
+
+    def _sr_ingest_tree_tails(self, reqs: List[Req]) -> None:
+        """Materialize all missing tree-prefix tokens in one eager EXTEND."""
+        metrics = get_sr_round_metrics(self, "Draft")
+        plan_start = time.perf_counter()
+        runner = self.tp_worker.model_runner
+        plans = []
+        recover = []
+        for req in reqs:
+            self._sr_ensure_window_budget(req, req.draft_tokens_target)
+            if self._sr_is_degraded(req.rid):
+                continue
+            try:
+                plan = plan_tail_extend(
+                    req,
+                    vocab_size=self.model_config.vocab_size,
+                    model_is_mrope=runner.model_is_mrope,
+                )
+            except TailExtendRecoveryRequired as e:
+                logger.info("[SR] tail prefix recovery for %s: %s", req.rid, e)
+                recover.append(req)
+                continue
+            if plan is not None:
+                plans.append(plan)
+            else:
+                metrics.counts["seed_reused"] += 1
+
+        # Recovery may use the scheduler/allocator, so finish it before opening
+        # the tail allocation transaction. It is not the normal ingest path.
+        if recover:
+            with metrics.phase("prefix_recovery", device=True):
+                self._sr_reprefill_committed(recover)
+            metrics.counts["prefix_recovered"] += len(recover)
+            for req in recover:
+                if not tree_seed_is_current(req):
+                    self._sr_mark_degraded(req.rid, "tail prefix recovery failed")
+            # Prefix recovery runs the scheduler and can retract other requests.
+            # Never allocate from a plan made before that scheduler work.
+            refreshed = []
+            for old_plan in plans:
+                req = old_plan.req
+                if self._sr_is_degraded(req.rid):
+                    continue
+                try:
+                    plan = plan_tail_extend(
+                        req,
+                        vocab_size=self.model_config.vocab_size,
+                        model_is_mrope=runner.model_is_mrope,
+                    )
+                except TailExtendRecoveryRequired:
+                    self._sr_mark_degraded(req.rid, "prefix changed during recovery")
+                    continue
+                if plan is not None:
+                    refreshed.append(plan)
+            plans = refreshed
+        if metrics.active:
+            metrics.host["tail_plan_including_recovery"] += time.perf_counter() - plan_start
+        if not plans:
+            return
+
+        transaction = SRTailExtendTransaction(self, plans)
+        active = [p.req for p in plans]
+        worker_failed = False
+        try:
+            with metrics.phase("tail_prepare_allocate"):
+                self._sr_replay_grammars(active, strict=True)
+                batch = self._sr_make_tail_extend_batch(plans)
+                transaction.allocate(batch)
+                worker_batch = batch.get_model_worker_batch()
+            metrics.counts["tail_requests"] += len(plans)
+            metrics.counts["tail_tokens"] += sum(p.length for p in plans)
+            metrics.counts["seed_recaptured"] += sum(p.recapture for p in plans)
+            for p in plans:
+                metrics.counts[f"tail_len_{p.length if p.length <= 16 else 'gt16'}"] += 1
+            with metrics.phase("tail_forward_seed_commit", device=True):
+                transaction.submitted = True
+                result = self.tp_worker.forward_batch_generation(
+                    worker_batch, seed_only=True
+                )
+                transaction.commit(result.logits_output)
+            paths = getattr(runner.attn_backend, "sr_tail_attention_paths", None)
+            for path in paths or ("ordinary_extend",):
+                metrics.paths[path] += 1
+        except Exception as e:
+            if _sr_is_device_context_error(e) or (
+                self.tp_size > 1 and transaction.submitted
+            ):
+                # Device execution may still own the slots. Do not recycle them.
+                # A TP peer may be inside a collective; do not block here on a
+                # local synchronize or let ranks continue with different state.
+                worker_failed = True
+                raise
+            try:
+                transaction.rollback()
+            except Exception:
+                worker_failed = True
+                raise
+            if self.tp_size > 1:
+                worker_failed = True
+                raise
+            metrics.counts["tail_failed_requests"] += len(active)
+            for req in active:
+                self._sr_mark_degraded(req.rid, f"tail extend failed: {e}")
+        finally:
+            if not worker_failed:
+                for req in active:
+                    self._sr_pause_req(req)
+            # Discard old decode metadata; the next tree/window builds it from
+            # the committed request lengths, never from this EXTEND batch.
+            self.last_batch = None
+
     def _sr_ingest_committed_batch(self, reqs: List[Req]) -> None:
+        if self._sr_tree_mode():
+            self._sr_ingest_tree_tails(reqs)
+            return
+        self._sr_ingest_committed_chain_batch(reqs)
+
+    def _sr_ingest_committed_chain_batch(self, reqs: List[Req]) -> None:
         """Teacher-force committed tails into linear KV.
 
         Align only appends Target ids onto ``output_ids``. Chain then forwards
@@ -1095,6 +1249,13 @@ class StandaloneRemoteDraftSchedulerMixin:
 
     def _sr_ensure_tree_seeds(self, reqs: List[Req]) -> None:
         """Rebuild seed when prefix KV is complete but last-token logits are gone."""
+        if self._sr_tree_mode():
+            # Ingest already planned both missing tails and seed recapture.
+            # Do not retry a failed transaction or run per-request decodes here.
+            for req in reqs:
+                if not self._sr_is_degraded(req.rid) and not tree_seed_is_current(req):
+                    self._sr_mark_degraded(req.rid, "tree seed recovery failed")
+            return
         need_ingest: List[Req] = []
         recapture: List[Req] = []
         reprefill: List[Req] = []
@@ -1150,7 +1311,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         empty: SRWindow = ([], None, None)
         if not reqs:
             return []
-        self._sr_materialize_prefix_batch(reqs)
+        metrics = get_sr_round_metrics(self, "Draft")
+        with metrics.phase("prefix_materialize", device=True):
+            self._sr_materialize_prefix_batch(reqs)
         self._sr_ingest_committed_batch(reqs)
         self._sr_ensure_tree_seeds(reqs)
         self._sr_replay_grammars(reqs)
@@ -1158,6 +1321,8 @@ class StandaloneRemoteDraftSchedulerMixin:
         ready: List[Req] = []
         ready_idx: List[int] = []
         for i, req in enumerate(reqs):
+            if self._sr_is_degraded(req.rid):
+                continue
             leftover = committed_tail_not_in_kv(
                 len(req.origin_input_ids),
                 req.output_ids,
@@ -1189,7 +1354,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_resume_req(req)
         self._sr_park_in_running_many(ready)
         try:
-            got = self.sr_tree_drafter.expand_batch(ready)
+            with metrics.phase("tree_expand_pack", device=True):
+                got = self.sr_tree_drafter.expand_batch(ready)
         except NpuGraphReplaySubmittedError:
             raise
         except Exception as e:
@@ -1466,6 +1632,19 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_handle_batch(
         self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]
     ) -> SRBatchReply:
+        if (
+            self._sr_tree_mode() and batch.action == SRAction.STEP
+            and not get_sr_round_metrics(self, "Draft").active
+        ):
+            with get_sr_round_metrics(self, "Draft").round():
+                return self._sr_handle_batch_impl(batch, mm_by_rid)
+        return self._sr_handle_batch_impl(batch, mm_by_rid)
+
+    def _sr_handle_batch_impl(
+        self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]
+    ) -> SRBatchReply:
+        metrics = get_sr_round_metrics(self, "Draft")
+        prepare_start = time.perf_counter()
         last_session = self.sr_state.session_id
         last_rpc = self.sr_server.last_rpc_seq if self.sr_server is not None else -1
         wiped_this_batch = (
@@ -1518,14 +1697,19 @@ class StandaloneRemoteDraftSchedulerMixin:
                 replies[i] = reply
             else:
                 gpu_pairs.append((i, dreq, req))
+        if metrics.active:
+            metrics.host["align_prepare"] += time.perf_counter() - prepare_start
         if gpu_pairs:
             windows = self._sr_produce_windows(
                 batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
             )
+            reply_start = time.perf_counter()
             for (i, dreq, _req), window in zip(gpu_pairs, windows):
                 replies[i] = self._sr_stamp_window(
                     dreq, window, batch.rpc_seq, batch.session_id
                 )
+            if metrics.active:
+                metrics.host["reply_prepare"] += time.perf_counter() - reply_start
         if self.sr_server is not None:
             self.sr_server.remember(batch)
         return SRBatchReply(
@@ -1579,13 +1763,17 @@ class StandaloneRemoteDraftSchedulerMixin:
                             batch.rpc_seq,
                         )
                 else:
-                    reply = self._sr_handle_batch(batch, mm)
-                    if (
-                        (self.tp_size == 1 or self.tp_rank == 0)
-                        and self.sr_server is not None
-                        and batch.action not in (SRAction.FINISH, SRAction.ABORT)
-                    ):
-                        self.sr_server.send_batch(reply)
+                    metrics = get_sr_round_metrics(self, "Draft")
+                    measure = self._sr_tree_mode() and batch.action == SRAction.STEP
+                    with metrics.round() if measure else nullcontext():
+                        reply = self._sr_handle_batch(batch, mm)
+                        if (
+                            (self.tp_size == 1 or self.tp_rank == 0)
+                            and self.sr_server is not None
+                            and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                        ):
+                            with metrics.phase("reply_send"):
+                                self.sr_server.send_batch(reply)
                 self.last_batch = None
                 self._sr_resume_http_reqs()
                 continue

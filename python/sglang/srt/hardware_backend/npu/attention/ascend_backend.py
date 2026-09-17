@@ -26,6 +26,10 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
+    SRTailAttentionMetadata,
+    build_tail_attention_metadata,
+)
 from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     build_tree_draft_block_tables,
@@ -94,6 +98,8 @@ class AttnGraphRole:
 
 @dataclass
 class ForwardMetadata:
+
+    sr_tail: Optional[SRTailAttentionMetadata] = None
 
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
@@ -1205,7 +1211,13 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
+        is_sr_tail = getattr(forward_batch, "is_sr_tail_extend", False)
+        self.sr_tail_attention_paths = set()
+        seq_lens_max = (
+            max(forward_batch.seq_lens_cpu.tolist(), default=0)
+            if is_sr_tail
+            else forward_batch.seq_lens.max()
+        )
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
         elif (
@@ -1222,6 +1234,17 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.block_tables = self._build_tree_draft_block_tables(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
+            )
+        elif is_sr_tail:
+            self.forward_metadata.block_tables = (
+                forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max:self.page_size
+                ] // self.page_size
+            ).to(torch.int32).contiguous()
+            self.forward_metadata.sr_tail = build_tail_attention_metadata(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.forward_metadata.block_tables,
             )
         else:
             self.forward_metadata.block_tables = (
@@ -1262,7 +1285,8 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
+                torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32)
+                if is_sr_tail else forward_batch.extend_seq_lens.cpu().int()
             )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
@@ -1927,6 +1951,63 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _can_run_sr_tail_paged(self, layer, forward_batch, sinks, slopes):
+        return (
+            getattr(forward_batch, "is_sr_tail_extend", False)
+            and not self.use_mla
+            and not self.use_alibi
+            and not layer.is_cross_attention
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+            and forward_batch.encoder_lens is None
+            and layer.sliding_window_size == -1
+            and layer.logit_cap == 0
+            and sinks is None
+            and slopes is None
+        )
+
+    def _run_sr_tail_paged(self, q, k_cache, v_cache, layer):
+        """All tail queries in one paged call; KV has already been written.
+
+        Only attention sees one row per token. The model and logits processor
+        retain the original EXTEND batch and its per-request last positions.
+        """
+        metadata = self.forward_metadata.sr_tail
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if metadata is None or query.shape[0] != len(metadata.context_lens_list):
+            raise ValueError("SR tail attention query/metadata row mismatch")
+        if self.use_fia:
+            self.sr_tail_attention_paths.add("paged_fia")
+            output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                query.unsqueeze(1),
+                k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=None,
+                block_size=self.page_size,
+                block_table=metadata.block_tables,
+                actual_seq_lengths_kv=metadata.context_lens_list,
+                scale=layer.scaling,
+            )
+        else:
+            self.sr_tail_attention_paths.add("paged_atb")
+            output = query.new_empty(
+                (query.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+            )
+            torch_npu._npu_paged_attention(
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                num_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                scale_value=layer.scaling,
+                block_table=metadata.block_tables,
+                context_lens=metadata.context_lens_cpu,
+                out=output,
+            )
+        return output.reshape(query.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -2018,6 +2099,11 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_k_head_num,
                 )
                 return attn_out
+
+            if self._can_run_sr_tail_paged(layer, forward_batch, sinks, slopes):
+                return self._run_sr_tail_paged(q, k_cache, v_cache, layer)
+            if getattr(forward_batch, "is_sr_tail_extend", False):
+                self.sr_tail_attention_paths.add("ordinary_extend_specialized")
 
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""

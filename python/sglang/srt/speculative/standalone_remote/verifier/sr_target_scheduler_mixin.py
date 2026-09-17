@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import get_sr_round_metrics
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.speculative.standalone_remote.sr_align import (
     broadcast_sr_obj,
@@ -501,32 +502,38 @@ class SchedulerStandaloneRemoteTargetMixin:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
                 else:
-                    live = self._sr_select_reqs(batch)
-                    n_ok = sum(1 for r in live if getattr(r, "cur_drafts", None))
-                    if n_ok == 0:
-                        replies = self.rpc_next_draft(live)
-                        self._sr_maybe_align_chain_replies(
-                            live, replies, prefill=False
-                        )
-                        n_ok = self._sr_attach_replies(live, replies)
-                    if n_ok == 0:
-                        batch.draft_num_tokens = 1
-                    else:
-                        batch.draft_num_tokens = (
-                            self.server_args.speculative_num_draft_tokens
-                        )
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-                    still = [r for r in live if not r.finished()]
-                    if still:
-                        replies = self.rpc_next_draft(still)
-                        self._sr_maybe_align_chain_replies(
-                            still, replies, prefill=False
-                        )
-                        self._sr_attach_replies(still, replies)
+                    self._sr_run_verify_round(batch)
             else:
                 self.self_check_during_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    def _sr_run_verify_round(self, batch):
+        metrics = get_sr_round_metrics(self, "Target")
+        with metrics.round():
+            batch.sr_round_metrics = metrics
+            try:
+                live = self._sr_select_reqs(batch)
+                n_ok = sum(1 for r in live if getattr(r, "cur_drafts", None))
+                if n_ok == 0:
+                    with metrics.phase("rpc_wait"):
+                        replies = self.rpc_next_draft(live)
+                    self._sr_maybe_align_chain_replies(live, replies, prefill=False)
+                    n_ok = self._sr_attach_replies(live, replies)
+                batch.draft_num_tokens = (
+                    self.server_args.speculative_num_draft_tokens if n_ok else 1
+                )
+                with metrics.phase("run_batch_including_verify"):
+                    result = self.run_batch(batch)
+                with metrics.phase("process_result"):
+                    self.process_batch_result(batch, result)
+                still = [r for r in live if not r.finished()]
+                if still:
+                    with metrics.phase("rpc_wait"):
+                        replies = self.rpc_next_draft(still)
+                    self._sr_maybe_align_chain_replies(still, replies, prefill=False)
+                    self._sr_attach_replies(still, replies)
+            finally:
+                batch.sr_round_metrics = None

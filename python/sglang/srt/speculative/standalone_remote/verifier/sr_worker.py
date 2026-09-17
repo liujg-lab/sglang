@@ -1,4 +1,6 @@
 import logging
+import time
+from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import torch
@@ -144,7 +146,9 @@ class StandaloneRemoteWorker:
             return self._forward_normal_decode(batch)
 
         spec_steps = self.speculative_num_steps
-        spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
+        metrics = getattr(batch, "sr_round_metrics", None)
+        with metrics.phase("construct_tree") if metrics else nullcontext():
+            spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
         logits_output, verify_output, _, can_run_cuda_graph = self.verify(
             batch, spec_info
         )
@@ -247,6 +251,8 @@ class StandaloneRemoteWorker:
         )
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        metrics = getattr(batch, "sr_round_metrics", None)
+        prepare_start = time.perf_counter()
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = spec_info.draft_token_num
@@ -270,9 +276,13 @@ class StandaloneRemoteWorker:
                 spec_info.retrive_next_token.shape
             ).cpu()
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
+        if metrics:
+            metrics.host["verify_prepare"] += time.perf_counter() - prepare_start
+        with metrics.phase("verify_forward", device=True) if metrics else nullcontext():
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+        accept_start = time.perf_counter()
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -338,6 +348,14 @@ class StandaloneRemoteWorker:
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
+        if metrics:
+            metrics.host["accept_commit"] += time.perf_counter() - accept_start
+            lengths = res.accept_length_per_req_cpu
+            metrics.counts["verify_requests"] += len(lengths)
+            metrics.counts["accepted_draft_tokens"] += sum(lengths)
+            metrics.counts["accepted_tokens_including_bonus"] += sum(lengths) + len(lengths)
+            metrics.counts["first_level_hits"] += sum(n > 0 for n in lengths)
+            metrics.counts["verify_graph_batches"] += int(can_run_cuda_graph)
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def _mamba_verify_update(

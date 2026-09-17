@@ -190,6 +190,27 @@ accept rate 低可以接受。缺 token、重复 token、过早 EOS 才是 bug�
 
 ## 排查
 
+树模式 Draft 使用一次 packed EXTEND 补齐 committed tail，成功后统一提交 KV 边界和 seed。
+NPU 普通 causal MHA/GQA 在每层将 tail 展开为逐 token 的 paged attention 查询，
+查询 `j` 只读取 `prefix_len + j + 1` 个 KV；模型仍保持 EXTEND batch，末位置才生成 seed。
+`ASCEND_USE_FIA` 未设置或为 `0` 时走 paged ATB，为 `1` 时走 paged FIA；
+CUDA 和其它 attention 类型保留各自原有 EXTEND 路径。tail 不进入 decode graph。
+
+`[SR Draft round]` / `[SR Target round]` 每 32 轮输出汇总：
+
+- `host_mean_ms` 是主机墙钟平均耗时，包含该阶段已有的设备等待；名字含 `including`
+  的阶段及 `total` 包含子阶段，不能将所有字段相加。Draft total 从处理 RPC 到回复发送完成，
+  不含 socket 等待收包；Target total 包含本轮 verify、结果处理及获取下一窗的 RPC。
+- `device_sample_mean_ms` 每 32 轮采样一次，事件完成后异步读取，可能延迟到下一个窗口；
+  `device_samples` 和 `device_pending` 给出样本数。计时不调用设备 synchronize。
+- `tail_attention` 记录实际 attention 分支；计数包含 tail 长度分布、seed 复用/重算、
+  恢复与失败请求。Target 的 `first_level_hits` 是接受至少一个草稿 token 的请求数，
+  `accept_len_mean` 包含每次验证的 bonus token。图 replay 成功不代表数值正确。
+
+CPU 回归：`python test/registered/unit/spec/test_sr_tail_extend.py`，覆盖数值等价、
+ATB/FIA 调用契约、分页事务、M-RoPE、seed-only 和计时。测试以 CPU 算子替身调用真实分派，
+不证明部署版本 ATB/FIA 的数值或 NPU 接受率已恢复。
+
 | 现象 | 可能原因 |
 |---|---|
 | accept rate 接近 0，无报错 | `padded_input_ids` / 视觉几何不一致；或过期回复错位（看上面的 counter） |

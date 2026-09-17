@@ -1018,6 +1018,9 @@ def general_mm_embed_routine(
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
+            # SR tail ingestion has already materialized all visual tokens.
+            # Keep mm_inputs for M-RoPE, but do not invoke the encoder again.
+            and not forward_batch.is_sr_tail_extend
             and forward_batch.contains_mm_inputs()
         ):
             mm_inputs_list = [
