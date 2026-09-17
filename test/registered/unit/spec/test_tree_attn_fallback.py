@@ -592,9 +592,10 @@ class TestTreeAttnFallback(CustomTestCase):
         can_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "can_run")
         self.assertIn("super().can_run", can_src)
         self.assertIn("tree_slot_graph_can_run", can_src)
-        self.assertIn("_s", can_src)
-        self.assertIn("is_target_verify", can_src)
+        self.assertIn("TreeReplayPlan", can_src)
+        self.assertIn("graph_key not in self.graphs", can_src)
         self.assertIn("tree_verify_eager_fallback_count", can_src)
+        self.assertNotIn("endswith(suffix)", can_src)
 
     def test_build_tree_verify_kv_slots_matches_visible(self):
         custom = torch.tensor(

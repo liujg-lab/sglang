@@ -362,9 +362,11 @@ class TestRemoteSpecDevice(CustomTestCase):
             / "python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py"
         ).read_text()
         self.assertIn("self._make_graph_key", src)
-        self.assertIn("NPU graph miss", src)
+        self.assertIn("TreeReplayPlan", src)
+        self.assertIn("NpuGraphReplaySubmittedError", src)
         self.assertIn("actual_ntpb", src)
         self.assertNotIn("self.graphs[self.bs].replay()", src)
+        self.assertNotIn("NPU graph miss", src)
 
     def test_page_physical_kv_copy_matches_slot_to_page_offset(self):
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (

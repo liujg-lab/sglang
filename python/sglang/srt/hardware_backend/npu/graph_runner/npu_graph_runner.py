@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import threading
@@ -28,9 +29,20 @@ import torch
 import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, _uses_dual_ntpb
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CudaGraphRunner,
+    _is_spectre,
+    _uses_dual_ntpb,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
-from sglang.srt.speculative.tree_attn_fallback import tree_fia_actual_seq_lengths_kv
+from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
+    NpuGraphReplaySubmittedError,
+)
+from sglang.srt.speculative.tree_attn_fallback import (
+    TreeReplayPlan,
+    tree_fia_actual_seq_lengths_kv,
+)
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -85,6 +97,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.tree_verify_replay_count = 0
         self.tree_verify_eager_fallback_count = 0
+        self._clear_tree_replay_plan()
 
     def _capture_extra_keys(self, ntpb=None):
         """S_cap buckets only for tree TARGET_VERIFY. DECODE keeps integer / r1 keys."""
@@ -107,29 +120,102 @@ class NPUGraphRunner(CudaGraphRunner):
             return list(reversed(list(buckets)))
         return [None]
 
+    def _clear_tree_replay_plan(self):
+        self._tree_replay_plan = None
+        self._tree_replay_batch_id = None
+        self._tree_replay_stream_idx = None
+        self._tree_replay_graphs_id = None
+        self._tree_replay_graph_keys = None
+
+    def _save_tree_replay_plan(
+        self,
+        plan: TreeReplayPlan,
+        forward_batch: ForwardBatch,
+        stream_idx,
+    ):
+        self._tree_replay_plan = plan
+        self._tree_replay_batch_id = id(forward_batch)
+        self._tree_replay_stream_idx = stream_idx
+        self._tree_replay_graphs_id = id(self.graphs)
+        self._tree_replay_graph_keys = frozenset(self.graphs)
+
+    def _padded_capture_bs(self, forward_batch: ForwardBatch, actual_ntpb: int):
+        """Same conversion as ``CudaGraphRunner.replay_prepare``."""
+        raw_bs = forward_batch.batch_size
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / actual_ntpb
+                if (
+                    self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_standalone()
+                    or self.model_runner.spec_algorithm.is_standalone_remote()
+                    or _is_spectre(self)
+                )
+                else max_num_tokens
+            )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+        return raw_bs, self.capture_bs[index]
+
+    def _is_tree_verify_batch(self, forward_batch: ForwardBatch) -> bool:
+        fm = getattr(forward_batch, "forward_mode", None)
+        return bool(
+            fm is not None
+            and fm.is_target_verify()
+            and int(
+                getattr(
+                    self.model_runner.server_args, "speculative_eagle_topk", 1
+                )
+                or 1
+            )
+            > 1
+        )
+
     def can_run(self, forward_batch: ForwardBatch):
+        self._clear_tree_replay_plan()
         if not super().can_run(forward_batch):
             return False
-        backend = getattr(self.model_runner, "attn_backend", None)
-        fn = getattr(backend, "tree_slot_graph_can_run", None)
-        if fn is None:
-            return True
-        ok = bool(fn(forward_batch))
-        if not ok:
-            self.tree_verify_eager_fallback_count += 1
+        if not self.capture_bs:
             return False
-        is_verify = bool(
-            getattr(forward_batch, "forward_mode", None) is not None
-            and forward_batch.forward_mode.is_target_verify()
-        )
-        extra = getattr(backend, "_replay_tree_s_cap", None) if backend is not None else None
-        if is_verify and extra is not None:
-            suffix = f"_s{int(extra)}"
-            if not any(
-                isinstance(k, str) and str(k).endswith(suffix) for k in self.graphs
-            ):
+        backend = getattr(self.model_runner, "attn_backend", None)
+        is_tree_verify = self._is_tree_verify_batch(forward_batch)
+        kv_bucket = None
+        fn = getattr(backend, "tree_slot_graph_can_run", None)
+        if fn is not None:
+            ok = bool(fn(forward_batch))
+            if not ok:
                 self.tree_verify_eager_fallback_count += 1
                 return False
+            if is_tree_verify:
+                kv_bucket = getattr(backend, "_replay_tree_s_cap", None)
+        tokens_per_req = self._get_actual_ntpb(forward_batch)
+        raw_bs, capture_bs = self._padded_capture_bs(forward_batch, tokens_per_req)
+        stream_idx = (
+            get_current_stream_idx() if getattr(self, "enable_pdmux", False) else None
+        )
+        graph_key = self._make_graph_key(
+            capture_bs,
+            stream_idx,
+            tokens_per_req if _uses_dual_ntpb(self) else None,
+            extra=kv_bucket,
+        )
+        if graph_key not in self.graphs:
+            if is_tree_verify:
+                self.tree_verify_eager_fallback_count += 1
+            return False
+        self._save_tree_replay_plan(
+            TreeReplayPlan(
+                graph_key=graph_key,
+                raw_bs=int(raw_bs),
+                capture_bs=int(capture_bs),
+                tokens_per_req=int(tokens_per_req),
+                kv_bucket=kv_bucket if kv_bucket is None else int(kv_bucket),
+            ),
+            forward_batch,
+            stream_idx,
+        )
         return True
 
     def _init_arch_map(self):
@@ -181,6 +267,12 @@ class NPUGraphRunner(CudaGraphRunner):
             cpu_update_input=[{self.update_attr_name: seq_lens}]
         )
 
+    def _replay_update(self, seq_lens, graph_key, errors):
+        try:
+            self._update_inputs(seq_lens, graph_key)
+        except Exception as e:
+            errors.append(e)
+
     def _cache_loc_dtype(self):
         return torch.int32
 
@@ -218,121 +310,179 @@ class NPUGraphRunner(CudaGraphRunner):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-
-        self.update_attr_name = self._get_update_attr_name()
-        self.update_attr_type = self._get_update_attr_type()
-        stream_idx = (
-            get_current_stream_idx() if getattr(self, "enable_pdmux", False) else None
-        )
-        backend = getattr(self.model_runner, "attn_backend", None)
-        is_tree_verify = (
-            forward_batch.forward_mode.is_target_verify()
-            and int(
-                getattr(
-                    self.model_runner.server_args, "speculative_eagle_topk", 1
+        plan = self._tree_replay_plan
+        batch_id = self._tree_replay_batch_id
+        stream_idx_saved = self._tree_replay_stream_idx
+        graphs_id = self._tree_replay_graphs_id
+        graph_keys = self._tree_replay_graph_keys
+        try:
+            if plan is None or batch_id != id(forward_batch):
+                raise NpuGraphPreparationError(
+                    "NPU graph replay has no TreeReplayPlan for this batch",
+                    scope="graph",
                 )
-                or 1
+            stream_idx = (
+                get_current_stream_idx()
+                if getattr(self, "enable_pdmux", False)
+                else None
             )
-            > 1
-        )
-        extra = (
-            getattr(backend, "_replay_tree_s_cap", None)
-            if is_tree_verify and backend is not None
-            else None
-        )
-        graph_key = self._make_graph_key(
-            self.bs,
-            stream_idx,
-            getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
-            extra=extra,
-        )
-        if graph_key not in self.graphs:
-            raise RuntimeError(
-                f"NPU graph miss: key={graph_key!r} not among captured "
-                f"{list(self.graphs)}. In-range shapes must hit a captured graph; "
-                "eager fallback after capture failure is not a pass."
-            )
-        compact_fia = bool(
-            backend is not None and getattr(backend, "_use_tree_compact_fia", lambda: False)()
-        )
-        skip_fia_update = is_deepseek_nsa(
-            self.model_runner.model_config.hf_config
-        ) or (is_tree_verify and not compact_fia)
-        if not skip_fia_update:
-            if is_tree_verify and compact_fia:
-                ntpb = getattr(self, "actual_ntpb", None) or self.num_tokens_per_bs
-                capture_rows = int(self.bs) * int(ntpb)
-                kv_lens = getattr(backend, "tree_fia_kv_lens_cpu", None)
-                if kv_lens is None:
-                    dest_lens = getattr(
-                        getattr(backend, "forward_metadata", None),
-                        "tree_verify_kv_lens_t",
-                        None,
-                    )
-                    kv_lens = tree_fia_actual_seq_lengths_kv(
-                        dest_lens if dest_lens is not None else [],
-                        capture_rows,
-                    )
-                elif len(kv_lens) != capture_rows:
-                    kv_lens = tree_fia_actual_seq_lengths_kv(kv_lens, capture_rows)
-                seq_lens = kv_lens
-            elif forward_batch.forward_mode.is_target_verify():
-                ntpb = getattr(self, "actual_ntpb", None) or self.num_tokens_per_bs
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + ntpb
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            if stream_idx != stream_idx_saved:
+                raise NpuGraphPreparationError(
+                    f"NPU graph stream_idx {stream_idx!r} != plan {stream_idx_saved!r}",
+                    scope="graph",
+                )
+            if not skip_attn_backend_init:
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
+                # In speculative decoding, these two fields are still needed.
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
                 )
-            thread = threading.Thread(
-                target=self._update_inputs, args=(seq_lens, graph_key)
-            )
-            thread.start()
-            self.graphs[graph_key].replay()
-            thread.join()
-        else:
-            self.graphs[graph_key].replay()
-        if is_tree_verify:
-            self.tree_verify_replay_count += 1
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
+
             if (
-                self.tree_verify_replay_count == 1
-                or self.tree_verify_replay_count % 32 == 0
+                id(self.graphs) != graphs_id
+                or frozenset(self.graphs) != graph_keys
+                or plan.graph_key not in self.graphs
             ):
-                logger.info(
-                    "NPU tree verify graph replay count=%s bucket=%s key=%s "
-                    "needed_len_max=%s eager_fallback=%s",
-                    self.tree_verify_replay_count,
-                    getattr(backend, "_replay_tree_s_cap", None)
-                    if backend is not None
-                    else None,
-                    graph_key,
-                    (max(seq_lens) if not skip_fia_update and is_tree_verify and compact_fia else None),
-                    self.tree_verify_eager_fallback_count,
+                raise NpuGraphPreparationError(
+                    f"NPU graph recapture invalidated plan key={plan.graph_key!r}",
+                    scope="graph",
                 )
 
-        output = self.output_buffers[graph_key]
-        if isinstance(output, LogitsProcessorOutput):
-            if self.is_dllm:
-                next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
-            else:
-                full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
-            return LogitsProcessorOutput(
-                next_token_logits=next_token_logits,
-                full_logits=full_logits,
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
+            backend = getattr(self.model_runner, "attn_backend", None)
+            is_tree_verify = self._is_tree_verify_batch(forward_batch)
+            actual_ntpb = getattr(self, "actual_ntpb", None) or self.num_tokens_per_bs
+            kv_bucket = (
+                getattr(backend, "_replay_tree_s_cap", None)
+                if is_tree_verify and backend is not None
+                else None
             )
-        else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            if (
+                int(self.bs) != plan.capture_bs
+                or int(self.raw_bs) != plan.raw_bs
+                or int(actual_ntpb) != plan.tokens_per_req
+                or kv_bucket != plan.kv_bucket
+            ):
+                raise NpuGraphPreparationError(
+                    f"NPU graph replay shape != plan: bs={self.bs}/{plan.capture_bs} "
+                    f"raw_bs={self.raw_bs}/{plan.raw_bs} ntpb={actual_ntpb}/"
+                    f"{plan.tokens_per_req} bucket={kv_bucket}/{plan.kv_bucket}",
+                    scope="graph",
+                )
+            graph_key = plan.graph_key
+
+            self.update_attr_name = self._get_update_attr_name()
+            self.update_attr_type = self._get_update_attr_type()
+            compact_fia = bool(
+                backend is not None
+                and getattr(backend, "_use_tree_compact_fia", lambda: False)()
+            )
+            skip_fia_update = is_deepseek_nsa(
+                self.model_runner.model_config.hf_config
+            ) or (is_tree_verify and not compact_fia)
+            seq_lens = None
+            if not skip_fia_update:
+                if is_tree_verify and compact_fia:
+                    ntpb = actual_ntpb
+                    capture_rows = int(self.bs) * int(ntpb)
+                    kv_lens = getattr(backend, "tree_fia_kv_lens_cpu", None)
+                    if kv_lens is None:
+                        dest_lens = getattr(
+                            getattr(backend, "forward_metadata", None),
+                            "tree_verify_kv_lens_t",
+                            None,
+                        )
+                        kv_lens = tree_fia_actual_seq_lengths_kv(
+                            dest_lens if dest_lens is not None else [],
+                            capture_rows,
+                        )
+                    elif len(kv_lens) != capture_rows:
+                        kv_lens = tree_fia_actual_seq_lengths_kv(
+                            kv_lens, capture_rows
+                        )
+                    seq_lens = kv_lens
+                elif forward_batch.forward_mode.is_target_verify():
+                    ntpb = actual_ntpb
+                    seq_lens_cpu = forward_batch.seq_lens.cpu() + ntpb
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                else:
+                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                        self.bs - self.raw_bs
+                    )
+                errors = []
+                replay_error = None
+                thread = threading.Thread(
+                    target=self._replay_update,
+                    args=(seq_lens, graph_key, errors),
+                )
+                thread.start()
+                try:
+                    self.graphs[graph_key].replay()
+                except Exception as exc:
+                    replay_error = exc
+                finally:
+                    thread.join()
+                if replay_error is not None or errors:
+                    cause = replay_error if replay_error is not None else errors[0]
+                    raise NpuGraphReplaySubmittedError(
+                        "NPU graph update/replay failed"
+                    ) from cause
+            else:
+                replay_error = None
+                try:
+                    self.graphs[graph_key].replay()
+                except Exception as exc:
+                    replay_error = exc
+                if replay_error is not None:
+                    raise NpuGraphReplaySubmittedError(
+                        "NPU graph update/replay failed"
+                    ) from replay_error
+            if is_tree_verify:
+                self.tree_verify_replay_count += 1
+                if (
+                    self.tree_verify_replay_count == 1
+                    or self.tree_verify_replay_count % 32 == 0
+                ):
+                    logger.info(
+                        "NPU tree verify graph replay count=%s bucket=%s key=%s "
+                        "needed_len_max=%s eager_fallback=%s",
+                        self.tree_verify_replay_count,
+                        kv_bucket,
+                        graph_key,
+                        (
+                            max(seq_lens)
+                            if not skip_fia_update
+                            and is_tree_verify
+                            and compact_fia
+                            else None
+                        ),
+                        self.tree_verify_eager_fallback_count,
+                    )
+
+            output = self.output_buffers[graph_key]
+            if isinstance(output, LogitsProcessorOutput):
+                if self.is_dllm:
+                    next_token_logits = None
+                    full_logits = output.full_logits[: self.raw_num_token]
+                else:
+                    full_logits = None
+                    next_token_logits = output.next_token_logits[: self.raw_num_token]
+                return LogitsProcessorOutput(
+                    next_token_logits=next_token_logits,
+                    full_logits=full_logits,
+                    hidden_states=(
+                        output.hidden_states[: self.raw_num_token]
+                        if output.hidden_states is not None
+                        else None
+                    ),
+                )
+            else:
+                assert isinstance(output, PPProxyTensors)
+                return PPProxyTensors(
+                    {k: v[: self.bs] for k, v in output.tensors.items()}
+                )
+        finally:
+            self._clear_tree_replay_plan()

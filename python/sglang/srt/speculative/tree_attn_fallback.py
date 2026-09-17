@@ -12,6 +12,7 @@ without torchvision.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
 import torch
@@ -44,6 +45,18 @@ TREE_GRAPH_KV_BUCKETS = (256, 512, 1024, 2048)
 TREE_GRAPH_KV_BUCKETS_ENV = "SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"
 TREE_DRAFT_CAPTURE_BS = (1, 2)
 TREE_DRAFT_CAPTURE_BS_ENV = "SGLANG_NPU_TREE_DRAFT_CAPTURE_BS"
+
+
+@dataclass(frozen=True)
+class TreeReplayPlan:
+    """Admission and replay share this key. ``graph_key`` is ``_make_graph_key`` as-is."""
+
+    graph_key: int | str
+    raw_bs: int
+    capture_bs: int
+    tokens_per_req: int
+    kv_bucket: int | None
+
 
 logger = logging.getLogger(__name__)
 _LOGGED_TREE_VERIFY_FALLBACK = False

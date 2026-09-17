@@ -604,7 +604,8 @@ class AscendAttnBackend(AttentionBackend):
         spec_info = getattr(forward_batch, "spec_info", None)
         fallback = seq
         if is_verify and spec_info is not None:
-            fallback = getattr(spec_info, "seq_lens_cpu", None) or seq
+            producer_seq_lens = getattr(spec_info, "seq_lens_cpu", None)
+            fallback = seq if producer_seq_lens is None else producer_seq_lens
         buckets = list(self.tree_kv_buckets) if self.tree_kv_buckets else None
         ok = tree_slot_graph_can_run_batch(
             slot_width=self.tree_slot_graph_width(),

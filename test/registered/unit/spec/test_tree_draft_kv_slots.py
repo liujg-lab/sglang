@@ -428,8 +428,11 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         can_src = _function_source(_NPU_GRAPH, "can_run")
         self.assertIn("tree_slot_graph_can_run", can_src)
         self.assertIn("capture_bs", can_src)
+        self.assertIn("TreeReplayPlan", can_src)
+        self.assertIn("graph_key not in self.graphs", can_src)
         self.assertIn("tree_fia_actual_seq_lengths_kv", replay_src)
         self.assertIn("_replay_tree_s_cap", replay_src)
+        self.assertIn("NpuGraphReplaySubmittedError", replay_src)
         state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
         self.assertIn("cuda_graph_kv_slots", state_src)
         replay_meta = _function_source(
