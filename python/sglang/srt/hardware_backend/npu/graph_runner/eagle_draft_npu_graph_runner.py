@@ -99,7 +99,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
         super().__init__(eagle_worker)
 
-    def _capture_extra_keys(self):
+    def _capture_extra_keys(self, ntpb=None):
+        del ntpb
         if not getattr(self, "_slot_gather_graph", False):
             return [None]
         backend = None

@@ -86,8 +86,22 @@ class NPUGraphRunner(CudaGraphRunner):
         self.tree_verify_replay_count = 0
         self.tree_verify_eager_fallback_count = 0
 
-    def _capture_extra_keys(self):
+    def _capture_extra_keys(self, ntpb=None):
+        """S_cap buckets only for tree TARGET_VERIFY. DECODE keeps integer / r1 keys."""
+        fm = getattr(self, "capture_forward_mode", None)
+        is_target_verify = bool(fm is not None and fm.is_target_verify())
+        if not is_target_verify:
+            return [None]
+        if _uses_dual_ntpb(self) and ntpb is not None and int(ntpb) == 1:
+            return [None]
         backend = getattr(self.model_runner, "attn_backend", None)
+        verify_topk = (
+            int(getattr(backend, "verify_tree_topk", 1) or 1)
+            if backend is not None
+            else 1
+        )
+        if verify_topk <= 1:
+            return [None]
         buckets = getattr(backend, "tree_kv_buckets", None) if backend is not None else None
         if buckets:
             return list(reversed(list(buckets)))
@@ -104,8 +118,12 @@ class NPUGraphRunner(CudaGraphRunner):
         if not ok:
             self.tree_verify_eager_fallback_count += 1
             return False
-        extra = getattr(backend, "_replay_tree_s_cap", None)
-        if extra is not None:
+        is_verify = bool(
+            getattr(forward_batch, "forward_mode", None) is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        extra = getattr(backend, "_replay_tree_s_cap", None) if backend is not None else None
+        if is_verify and extra is not None:
             suffix = f"_s{int(extra)}"
             if not any(
                 isinstance(k, str) and str(k).endswith(suffix) for k in self.graphs
@@ -212,21 +230,7 @@ class NPUGraphRunner(CudaGraphRunner):
         stream_idx = (
             get_current_stream_idx() if getattr(self, "enable_pdmux", False) else None
         )
-        graph_key = self._make_graph_key(
-            self.bs,
-            stream_idx,
-            getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
-            extra=getattr(backend, "_replay_tree_s_cap", None)
-            if (backend := getattr(self.model_runner, "attn_backend", None)) is not None
-            else None,
-        )
-        if graph_key not in self.graphs:
-            raise RuntimeError(
-                f"NPU graph miss: key={graph_key!r} not among captured "
-                f"{list(self.graphs)}. In-range shapes must hit a captured graph; "
-                "eager fallback after capture failure is not a pass."
-            )
-        # Replay
+        backend = getattr(self.model_runner, "attn_backend", None)
         is_tree_verify = (
             forward_batch.forward_mode.is_target_verify()
             and int(
@@ -237,6 +241,23 @@ class NPUGraphRunner(CudaGraphRunner):
             )
             > 1
         )
+        extra = (
+            getattr(backend, "_replay_tree_s_cap", None)
+            if is_tree_verify and backend is not None
+            else None
+        )
+        graph_key = self._make_graph_key(
+            self.bs,
+            stream_idx,
+            getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
+            extra=extra,
+        )
+        if graph_key not in self.graphs:
+            raise RuntimeError(
+                f"NPU graph miss: key={graph_key!r} not among captured "
+                f"{list(self.graphs)}. In-range shapes must hit a captured graph; "
+                "eager fallback after capture failure is not a pass."
+            )
         compact_fia = bool(
             backend is not None and getattr(backend, "_use_tree_compact_fia", lambda: False)()
         )

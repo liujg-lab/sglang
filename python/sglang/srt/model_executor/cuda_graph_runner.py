@@ -723,8 +723,9 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _capture_extra_keys(self):
+    def _capture_extra_keys(self, ntpb=None):
         """Optional extra graph-key dimension. CUDA default is a single None."""
+        del ntpb
         return [None]
 
     def _make_graph_key(
@@ -929,7 +930,7 @@ class CudaGraphRunner:
                             f"{tag} Capturing: bs={bs}, "
                             f"ntpb={ntpb}, num_tokens={bs * ntpb}",
                         )
-                    extra_keys = list(self._capture_extra_keys())
+                    extra_keys = list(self._capture_extra_keys(ntpb))
                     if not extra_keys:
                         extra_keys = [None]
                     for extra in extra_keys:

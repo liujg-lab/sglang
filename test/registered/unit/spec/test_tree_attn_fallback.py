@@ -578,12 +578,22 @@ class TestTreeAttnFallback(CustomTestCase):
         self.assertIn("tree_fia_kv_lens_cpu", replay_src)
         self.assertIn("tree_fia_actual_seq_lengths_kv", replay_src)
         self.assertIn("_replay_tree_s_cap", replay_src)
+        self.assertIn("if is_tree_verify and backend is not None", replay_src)
+        extra_src = _function_source(_NPU_GRAPH_RUNNER, "_capture_extra_keys")
+        self.assertIn("is_target_verify", extra_src)
+        self.assertIn("ntpb", extra_src)
+        self.assertIn("== 1", extra_src)
+        capture_init = _function_source(
+            _ASCEND_BACKEND, "init_forward_metadata_capture_cuda_graph"
+        )
+        self.assertIn("_store_tree_fia_kv_lens_cpu", capture_init)
 
     def test_npu_graph_runner_can_run_defers_to_slot_width(self):
         can_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "can_run")
         self.assertIn("super().can_run", can_src)
         self.assertIn("tree_slot_graph_can_run", can_src)
         self.assertIn("_s", can_src)
+        self.assertIn("is_target_verify", can_src)
         self.assertIn("tree_verify_eager_fallback_count", can_src)
 
     def test_build_tree_verify_kv_slots_matches_visible(self):
@@ -1159,6 +1169,7 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
         self.assertIn("_graph_key_captured", can_src)
         capture_src = _function_source(_CUDA_GRAPH_RUNNER, "capture")
         self.assertIn("_capture_extra_keys", capture_src)
+        self.assertIn("_capture_extra_keys(ntpb)", capture_src)
         self.assertIn("_active_capture_extra", capture_src)
 
     def test_compact_fia_backend_wiring(self):
@@ -1169,6 +1180,9 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
         self.assertIn("get_max_workspace", compact_src)
         self.assertIn("npu_fused_infer_attention_score.out", compact_src)
         self.assertNotIn("block_table", compact_src)
+        self.assertIn("if self.graph_mode", compact_src)
+        self.assertIn("[1] * rows", compact_src)
+        self.assertNotIn(".cpu()", compact_src)
         verify_src = _function_source(_ASCEND_BACKEND, "_run_tree_verify_slot_gather")
         self.assertIn("_run_tree_compact_fia", verify_src)
         self.assertIn("tree_verify_attention", verify_src)

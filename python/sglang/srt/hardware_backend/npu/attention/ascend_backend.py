@@ -842,7 +842,11 @@ class AscendAttnBackend(AttentionBackend):
         if actual is None:
             actual = self.tree_fia_kv_lens_cpu
         if actual is None or len(actual) != rows:
-            actual = tree_fia_actual_seq_lengths_kv(kv_len_t, rows)
+            if self.graph_mode:
+                # Capture/replay must not D2H; replay fill updates CPU lens + graph.update.
+                actual = [1] * rows
+            else:
+                actual = tree_fia_actual_seq_lengths_kv(kv_len_t, rows)
         fia_kwargs = dict(
             num_heads=n_q_heads,
             num_key_value_heads=n_kv_heads,
@@ -1410,8 +1414,18 @@ class AscendAttnBackend(AttentionBackend):
             self._bind_graph_draft_slot_views(
                 metadata, bs, self._tree_draft_table_rows(bs, num_tokens)
             )
+            dest_lens = getattr(metadata, "tree_draft_kv_lens_t", None)
+            if dest_lens is not None:
+                self.forward_metadata = metadata
+                n_rows = int(dest_lens.shape[0])
+                self._store_tree_fia_kv_lens_cpu([0] * n_rows, n_rows)
         elif forward_mode.is_target_verify() and self.verify_tree_topk > 1:
             self._bind_graph_verify_slot_views(metadata, bs, num_tokens)
+            dest_lens = getattr(metadata, "tree_verify_kv_lens_t", None)
+            if dest_lens is not None:
+                self.forward_metadata = metadata
+                n_rows = int(dest_lens.shape[0])
+                self._store_tree_fia_kv_lens_cpu([0] * n_rows, n_rows)
 
         if (
             self.q_head_num_padding is not None
