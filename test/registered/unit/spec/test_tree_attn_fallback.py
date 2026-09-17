@@ -18,6 +18,7 @@ from sglang.srt.speculative.tree_attn_fallback import (
     MAX_ATTN_CHUNKS,
     build_tree_verify_kv_slots,
     build_tree_verify_kv_slots_ref,
+    fill_tree_verify_kv_slots_,
     chunked_attend,
     flatten_paged_kv,
     gather_kv_by_slots,
@@ -1062,13 +1063,86 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
             self.assertTrue(torch.equal(a, b), msg=str(seq_lens))
             self.assertTrue(torch.equal(la, lb), msg=str(seq_lens))
 
+    def test_fill_tree_verify_kv_slots_in_place_and_clears_workspace(self):
+        seq_lens = [2, 1]
+        num_draft = 2
+        bs = len(seq_lens)
+        rows = []
+        for seq in seq_lens:
+            width = seq + num_draft
+            for _t in range(num_draft):
+                rows.append(torch.randint(0, 2, (width,), dtype=torch.bool))
+        custom = torch.cat(rows)
+        req = torch.arange(bs * 32).view(bs, 32)
+        pool = torch.arange(bs)
+        draft = torch.arange(100, 100 + bs * num_draft)
+        built, built_lens = build_tree_verify_kv_slots(
+            custom, seq_lens, req, pool, draft, num_draft, max_kv=8
+        )
+        slots_out = torch.full_like(built, 99)
+        lens_out = torch.full_like(built_lens, 99)
+        workspace = torch.full((built.shape[0], built.shape[1] + 1), 77, dtype=torch.int64)
+        fill_tree_verify_kv_slots_(
+            custom,
+            seq_lens,
+            req,
+            pool,
+            draft,
+            num_draft,
+            slots_out,
+            lens_out,
+            workspace,
+            max_kv=8,
+        )
+        self.assertTrue(torch.equal(slots_out, built))
+        self.assertTrue(torch.equal(lens_out, built_lens))
+        self.assertEqual(int(workspace[:, -1].sum()), 0)
+
+    def test_inplace_fill_matches_build_and_clears_workspace(self):
+        seq_lens, num_draft = [2, 1], 2
+        bs = len(seq_lens)
+        rows = []
+        for seq in seq_lens:
+            width = seq + num_draft
+            for _t in range(num_draft):
+                rows.append(torch.randint(0, 2, (width,), dtype=torch.bool))
+        custom = torch.cat(rows)
+        req = torch.arange(bs * 32).view(bs, 32)
+        pool = torch.arange(bs)
+        draft = torch.arange(100, 100 + bs * num_draft)
+        built, built_lens = build_tree_verify_kv_slots(
+            custom, seq_lens, req, pool, draft, num_draft, max_kv=8
+        )
+        slots = torch.full_like(built, 99)
+        lens = torch.full_like(built_lens, 99)
+        workspace = torch.full((built.shape[0], built.shape[1] + 1), 77, dtype=torch.int64)
+        fill_tree_verify_kv_slots_(
+            custom,
+            seq_lens,
+            req,
+            pool,
+            draft,
+            num_draft,
+            slots,
+            lens,
+            workspace,
+            max_kv=8,
+        )
+        self.assertTrue(torch.equal(slots, built))
+        self.assertTrue(torch.equal(lens, built_lens))
+        self.assertEqual(int(workspace[:, 8].sum()), 0)
+
     def test_hot_path_has_no_per_query_python_filter(self):
-        src = _function_source(_FALLBACK, "build_tree_verify_kv_slots")
+        src = _function_source(_FALLBACK, "fill_tree_verify_kv_slots_")
         self.assertNotIn("visible_token_indices", src)
         self.assertNotIn("iter_full_mask_rows", src)
         self.assertNotIn(".item()", src)
+        self.assertNotIn("widths.max()", src)
+        self.assertNotIn("req_to_token[req_pool[:bs]]", src)
         self.assertIn("cumsum", src)
         self.assertIn("scatter_", src)
+        self.assertIn("workspace", src)
+        self.assertIn("max(seq_list, default=0) + num_draft", src)
 
     def test_invalid_columns_do_not_clobber_compact_slots(self):
         custom = torch.tensor(
@@ -1157,7 +1231,8 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
             / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py",
             "_replay",
         )
-        self.assertIn("len(cpu_update_input) != n_records", replay_src)
+        self.assertIn("len(payload) != n_records", replay_src)
+        self.assertIn("fill_fia_cpu_update_payload", replay_src)
 
     def test_cuda_graph_capture_has_optional_extra_dim(self):
         extra_src = _function_source(_CUDA_GRAPH_RUNNER, "_capture_extra_keys")

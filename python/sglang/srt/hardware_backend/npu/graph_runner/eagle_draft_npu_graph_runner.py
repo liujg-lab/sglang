@@ -33,6 +33,8 @@ from sglang.srt.speculative.spec_utils import (
     NpuGraphReplaySubmittedError,
     build_draft_graph_step_kv_lens,
     expand_fia_cpu_update_inputs,
+    fill_fia_cpu_update_payload,
+    run_npu_graph_update_and_replay,
     validate_draft_graph_step_kv_lens,
     validate_tree_draft_fia_records,
 )
@@ -102,6 +104,25 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         super().__init__(eagle_worker)
         self._clear_tree_replay_plan()
 
+    def filter_capture_batch_sizes(self, capture_bs, compile_bs):
+        if not getattr(self, "_slot_gather_graph", False):
+            return capture_bs, compile_bs
+        allow = set(
+            parse_tree_draft_capture_bs(os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV))
+        )
+        capture_bs = [b for b in capture_bs if b in allow]
+        compile_bs = [b for b in compile_bs if b in capture_bs]
+        if not capture_bs:
+            self.tree_graph_disabled_reason = (
+                "tree draft capture_bs filter is empty"
+            )
+            logger.warning(
+                "NPU tree draft graphs disabled: capture_bs filter is empty"
+            )
+        else:
+            logger.info("NPU tree draft capture_bs restricted to %s", capture_bs)
+        return capture_bs, compile_bs
+
     def _capture_extra_keys(self, ntpb=None):
         del ntpb
         if not getattr(self, "_slot_gather_graph", False):
@@ -138,15 +159,20 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._tree_replay_plan = None
         self._tree_replay_batch_id = None
         self._tree_replay_stream_idx = None
-        self._tree_replay_graphs_id = None
-        self._tree_replay_graph_keys = None
+        self._tree_replay_graph = None
 
     def _save_tree_replay_plan(self, plan: TreeReplayPlan, forward_batch: ForwardBatch):
         self._tree_replay_plan = plan
         self._tree_replay_batch_id = id(forward_batch)
         self._tree_replay_stream_idx = None
-        self._tree_replay_graphs_id = id(self.graphs)
-        self._tree_replay_graph_keys = frozenset(self.graphs)
+        self._tree_replay_graph = self.graphs[plan.graph_key]
+
+    def _assert_tree_replay_graph(self, plan: TreeReplayPlan):
+        if self.graphs.get(plan.graph_key) is not self._tree_replay_graph:
+            raise NpuGraphPreparationError(
+                "captured graph changed after admission",
+                scope="graph",
+            )
 
     def _padded_capture_bs(self, forward_batch: ForwardBatch):
         """Same conversion as ``EAGLEDraftCudaGraphRunner.replay``."""
@@ -243,6 +269,16 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def replay(self, forward_batch: ForwardBatch):
         snap = self._snapshot_forward_batch_fields(forward_batch)
+        plan = self._tree_replay_plan
+        if plan is not None:
+            self._assert_tree_replay_graph(plan)
+            backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
+                self.model_runner, "attn_backend", None
+            )
+            if backend is not None:
+                backend._tree_replay_raw_bs = plan.raw_bs
+                backend._tree_replay_capture_bs = plan.capture_bs
+                backend._tree_replay_kv_bucket = plan.kv_bucket
         try:
             return super().replay(forward_batch)
         except NpuGraphPreparationError:
@@ -322,6 +358,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             n_records, step_ids = validate_tree_draft_fia_records(
                 records, n_steps, num_layers, self.update_attr_name
             )
+            n_lens = int(num_seqs) * max(int(self.topk), 1)
+            placeholder = [1] * n_lens
+            step_lens_list = [list(placeholder) for _ in range(n_steps)]
+            payload = expand_fia_cpu_update_inputs(
+                step_lens_list, num_layers, self.update_attr_name
+            )
             self._tree_fia_maps[map_key] = {
                 "n_records": n_records,
                 "n_steps": n_steps,
@@ -329,6 +371,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 "step_ids": step_ids,
                 "bs": int(num_seqs),
                 "extra": extra,
+                "payload": payload,
             }
         except NpuGraphPreparationError as e:
             if getattr(e, "scope", "graph") == "format":
@@ -341,16 +384,19 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return graph, out
 
     def capture(self):
-        if self._slot_gather_graph:
-            allow = set(
-                parse_tree_draft_capture_bs(os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV))
+        if not self.capture_bs:
+            self.graphs.clear()
+            self.max_bs = 0
+            if not self.tree_graph_disabled_reason:
+                self.tree_graph_disabled_reason = "tree draft capture_bs is empty"
+            logger.warning(
+                "NPU tree draft graphs disabled: reason=%s "
+                "tree_graph_replay_count=%s tree_eager_fallback_count=%s",
+                self.tree_graph_disabled_reason,
+                self.tree_graph_replay_count,
+                self.tree_eager_fallback_count,
             )
-            self.capture_bs = [b for b in self.capture_bs if b in allow]
-            self.compile_bs = [b for b in self.compile_bs if b in self.capture_bs]
-            self.max_bs = max(self.capture_bs) if self.capture_bs else 0
-            logger.info(
-                "NPU tree draft capture_bs restricted to %s", self.capture_bs
-            )
+            return
         if self.tree_graph_disabled_reason:
             self.graphs.clear()
             self.capture_bs = []
@@ -429,15 +475,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 "tree draft graph replay has no TreeReplayPlan for this batch",
                 scope="graph",
             )
-        if (
-            id(self.graphs) != self._tree_replay_graphs_id
-            or frozenset(self.graphs) != self._tree_replay_graph_keys
-            or plan.graph_key not in self.graphs
-        ):
-            raise NpuGraphPreparationError(
-                f"tree draft graph recapture invalidated plan key={plan.graph_key!r}",
-                scope="graph",
-            )
+        self._assert_tree_replay_graph(plan)
+        graph = self._tree_replay_graph
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
@@ -464,7 +503,6 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 scope="graph",
             )
         graph_key = plan.graph_key
-        graph = self.graphs[graph_key]
         self.output_buffers[self.bs] = self.output_buffers[graph_key]
         skip_fia = is_deepseek_nsa(
             self.model_runner.model_config.hf_config
@@ -537,14 +575,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
         n_records = int(fia_map["n_records"])
         num_layers = int(fia_map["num_layers"])
-        cpu_update_input = expand_fia_cpu_update_inputs(
-            step_lens_list, num_layers, self.update_attr_name
-        )
-        if len(cpu_update_input) != n_records:
+        payload = fia_map.get("payload")
+        if payload is None or len(payload) != n_records:
             raise NpuGraphPreparationError(
-                f"cpu_update_input length {len(cpu_update_input)} != records {n_records}",
+                f"tree draft graph key={graph_key!r} has no reusable FIA payload",
                 scope="graph",
             )
+        fill_fia_cpu_update_payload(
+            payload, step_lens_list, fia_map["step_ids"], self.update_attr_name
+        )
         log_key = graph_key
         if log_key not in self._logged_tree_fia_update_bs:
             logger.info(
@@ -556,28 +595,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 n_records,
                 n_steps,
                 num_layers,
-                len(cpu_update_input),
+                len(payload),
                 plan.kv_bucket,
             )
             self._logged_tree_fia_update_bs.add(log_key)
 
-        errors = []
-        replay_error = None
-        thread = threading.Thread(
-            target=self._replay_update, args=(graph, cpu_update_input, errors)
+        run_npu_graph_update_and_replay(
+            lambda: graph.update(cpu_update_input=payload),
+            graph.replay,
         )
-        thread.start()
-        try:
-            graph.replay()
-        except Exception as exc:
-            replay_error = exc
-        finally:
-            thread.join()
-        if replay_error is not None or errors:
-            cause = replay_error if replay_error is not None else errors[0]
-            raise NpuGraphReplaySubmittedError(
-                "NPU graph update/replay failed"
-            ) from cause
         self.tree_graph_replay_count += 1
         if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
             logger.info(

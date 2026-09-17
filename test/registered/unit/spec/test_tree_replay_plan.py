@@ -94,8 +94,7 @@ class _FakeRunner:
         self.plan = None
         self.batch_id = None
         self.stream_idx = None
-        self.graphs_id = None
-        self.graph_keys = None
+        self.graph = None
 
     def can_run(self, batch, graph_key, stream_idx=None):
         self._clear()
@@ -110,11 +109,10 @@ class _FakeRunner:
         )
         self.batch_id = id(batch)
         self.stream_idx = stream_idx
-        self.graphs_id = id(self.graphs)
-        self.graph_keys = frozenset(self.graphs)
+        self.graph = self.graphs[graph_key]
         return True
 
-    def replay(self, batch, stream_idx=None, recapture=None):
+    def replay(self, batch, stream_idx=None, recapture=None, replace_key=None):
         plan = self.plan
         batch_id = self.batch_id
         try:
@@ -122,11 +120,9 @@ class _FakeRunner:
                 raise RuntimeError("prep")
             if recapture is not None:
                 self.graphs = recapture
-            if (
-                id(self.graphs) != self.graphs_id
-                or frozenset(self.graphs) != self.graph_keys
-                or plan.graph_key not in self.graphs
-            ):
+            if replace_key is not None:
+                self.graphs[plan.graph_key] = replace_key
+            if self.graphs.get(plan.graph_key) is not self.graph:
                 raise RuntimeError("prep")
             return plan.graph_key
         finally:
@@ -196,6 +192,17 @@ class TestTreeReplayPlan(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "prep"):
             runner.replay(batch, recapture={"2": object()})
         self.assertIsNone(runner.plan)
+
+        g1 = object()
+        runner = _FakeRunner({1: g1})
+        self.assertTrue(runner.can_run(batch, 1))
+        with self.assertRaisesRegex(RuntimeError, "prep"):
+            runner.replay(batch, replace_key=object())
+        self.assertIsNone(runner.plan)
+
+        runner = _FakeRunner({1: g1})
+        self.assertTrue(runner.can_run(batch, 1))
+        self.assertEqual(runner.replay(batch), 1)
 
     def test_update_replay_join_on_replay_error(self):
         joined = []
@@ -267,15 +274,14 @@ class TestTreeReplayPlan(CustomTestCase):
         target_replay = _class_method_source(
             _NPU_GRAPH_RUNNER, "NPUGraphRunner", "replay"
         )
-        self.assertIn("thread.join()", target_replay)
+        self.assertIn("run_npu_graph_update_and_replay", target_replay)
+        self.assertIn("_assert_tree_replay_graph", target_replay)
         self.assertIn("NpuGraphReplaySubmittedError", target_replay)
         self.assertIn("output_buffers[graph_key]", target_replay)
-        join_at = target_replay.find("thread.join()")
-        output_at = target_replay.find("output_buffers[graph_key]")
-        self.assertGreater(output_at, join_at)
         self.assertIn("finally:", target_replay)
         self.assertIn("_clear_tree_replay_plan", target_replay)
         self.assertNotIn("NPU graph miss", target_replay)
+        self.assertNotIn("_tree_replay_graphs_id", target_replay)
 
         draft_can = _class_method_source(
             _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "can_run"
@@ -296,8 +302,43 @@ class TestTreeReplayPlan(CustomTestCase):
         draft_inner = _class_method_source(
             _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "_replay"
         )
-        self.assertIn("thread.join()", draft_inner)
+        self.assertIn("run_npu_graph_update_and_replay", draft_inner)
+        self.assertIn("_assert_tree_replay_graph", draft_inner)
+        self.assertIn("fill_fia_cpu_update_payload", draft_inner)
         self.assertIn("NpuGraphReplaySubmittedError", draft_inner)
+        self.assertNotIn("_tree_replay_graphs_id", draft_inner)
+
+    def test_npu_graph_runner_inits_capture_attrs_before_parent(self):
+        init_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "__init__")
+        self.assertIn("super().__init__", init_src)
+        before, after = init_src.split("super().__init__", 1)
+        self.assertIn("self._fia_payloads = {}", before)
+        self.assertIn("self.update_attr_name = None", before)
+        self.assertNotIn("self._fia_payloads = {}", after)
+        self.assertNotIn("self.update_attr_name = None", after)
+
+        ensure_src = _class_method_source(
+            _NPU_GRAPH_RUNNER, "NPUGraphRunner", "_ensure_capture_attrs"
+        )
+        self.assertIn("_init_arch_map", ensure_src)
+        self.assertIn("attr_name", ensure_src)
+        self.assertIn("_fia_payloads", ensure_src)
+
+        cap_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "capture")
+        self.assertIn("_ensure_capture_attrs", cap_src)
+        self.assertIn("super().capture()", cap_src)
+        self.assertLess(
+            cap_src.find("_ensure_capture_attrs"), cap_src.find("super().capture()")
+        )
+
+        one_src = _class_method_source(
+            _NPU_GRAPH_RUNNER, "NPUGraphRunner", "capture_one_batch_size"
+        )
+        self.assertIn("_ensure_capture_attrs", one_src)
+        self.assertLess(
+            one_src.find("_ensure_capture_attrs"),
+            one_src.find("_get_update_attr_name"),
+        )
 
 
 if __name__ == "__main__":

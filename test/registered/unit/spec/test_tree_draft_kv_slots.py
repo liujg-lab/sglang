@@ -41,11 +41,19 @@ _SR_TREE = (
     _REPO_ROOT
     / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
 )
+_ATTENTION_REGISTRY = (
+    _REPO_ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
+)
 _HELPER_NAMES = (
     "_raise_tree_draft_pos_overflow",
+    "_as_cpu_prefix_lens",
+    "_tree_draft_cpu_max_token_pos",
     "build_tree_draft_kv_slots",
+    "fill_tree_draft_metadata_",
     "build_paged_draft_cache_locs",
     "split_draft_cache_locs",
+    "expand_fia_cpu_update_inputs",
+    "fill_fia_cpu_update_payload",
 )
 
 
@@ -74,8 +82,11 @@ def _load_helpers():
 
 _HELPERS = _load_helpers()
 build_tree_draft_kv_slots = _HELPERS["build_tree_draft_kv_slots"]
+fill_tree_draft_metadata_ = _HELPERS["fill_tree_draft_metadata_"]
 build_paged_draft_cache_locs = _HELPERS["build_paged_draft_cache_locs"]
 split_draft_cache_locs = _HELPERS["split_draft_cache_locs"]
+expand_fia_cpu_update_inputs = _HELPERS["expand_fia_cpu_update_inputs"]
+fill_fia_cpu_update_payload = _HELPERS["fill_fia_cpu_update_payload"]
 
 
 def _function_source(path: pathlib.Path, name: str) -> str:
@@ -233,6 +244,86 @@ class TestTreeDraftKvSlots(CustomTestCase):
                 num_steps=2,
             )
         self.assertIn("out of req_to_token range", str(ctx.exception))
+
+    def test_fill_tree_draft_metadata_matches_build_and_keeps_page_size(self):
+        page_size, topk, num_steps = 4, 3, 2
+        seqs = [5, 3]
+        raw_bs = len(seqs)
+        capture_bs = 3
+        kv_bucket = 16
+        pool_len = max(paged_end(s, page_size, topk, num_steps) for s in seqs) + 8
+        req_to_token = torch.arange(raw_bs * pool_len, dtype=torch.int32).view(
+            raw_bs, pool_len
+        )
+        pool_idx = torch.arange(raw_bs, dtype=torch.int64)
+        n_forward = num_steps - 1
+        rows = capture_bs * topk
+        slots_out = [
+            torch.full((rows, kv_bucket), -1, dtype=torch.int64) for _ in range(n_forward)
+        ]
+        lens_out = [
+            torch.full((rows,), -1, dtype=torch.int32) for _ in range(n_forward)
+        ]
+        cpu_lens = fill_tree_draft_metadata_(
+            req_to_token,
+            pool_idx,
+            seqs,
+            slots_out,
+            lens_out,
+            raw_bs=raw_bs,
+            capture_bs=capture_bs,
+            page_size=page_size,
+            topk=topk,
+            speculative_num_steps=num_steps,
+            kv_bucket=kv_bucket,
+        )
+        self.assertEqual(len(cpu_lens), n_forward)
+        for step_id in range(n_forward):
+            built, built_lens = build_tree_draft_kv_slots(
+                req_to_token,
+                pool_idx,
+                torch.tensor(seqs),
+                page_size,
+                topk,
+                step_id,
+                num_steps,
+                max_kv=kv_bucket,
+            )
+            raw_rows = raw_bs * topk
+            self.assertTrue(
+                torch.equal(slots_out[step_id][:raw_rows], built[:raw_rows]),
+                msg=f"step={step_id}",
+            )
+            self.assertTrue(
+                torch.equal(lens_out[step_id][:raw_rows], built_lens[:raw_rows]),
+                msg=f"step={step_id}",
+            )
+            self.assertEqual(cpu_lens[step_id][:raw_rows], built_lens.tolist())
+            self.assertEqual(
+                slots_out[step_id][raw_rows:].tolist(),
+                [[0] * kv_bucket] * (rows - raw_rows),
+            )
+            self.assertEqual(lens_out[step_id][raw_rows:].tolist(), [0] * (rows - raw_rows))
+        src = _function_source(_SPEC_UTILS, "fill_tree_draft_metadata_")
+        self.assertIn("page_size", src)
+        self.assertIn("speculative_num_steps", src)
+        self.assertNotIn(".item()", src)
+
+    def test_fia_payload_reuses_list_objects_and_keeps_step_lens(self):
+        step0 = [4, 4, 4]
+        step1 = [5, 5, 5]
+        payload = expand_fia_cpu_update_inputs([step0, step1], 2, "actual_seq_lengths_kv")
+        self.assertEqual(len(payload), 4)
+        first = payload[0]["actual_seq_lengths_kv"]
+        fill_fia_cpu_update_payload(
+            payload, [[7, 7, 7], [8, 8, 8]], [0, 0, 1, 1], "actual_seq_lengths_kv"
+        )
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], first)
+        self.assertEqual(payload[0]["actual_seq_lengths_kv"], [7, 7, 7])
+        self.assertEqual(payload[1]["actual_seq_lengths_kv"], [7, 7, 7])
+        self.assertEqual(payload[2]["actual_seq_lengths_kv"], [8, 8, 8])
+        self.assertEqual(payload[3]["actual_seq_lengths_kv"], [8, 8, 8])
+        self.assertNotEqual(payload[0]["actual_seq_lengths_kv"], payload[3]["actual_seq_lengths_kv"])
 
 
 def paged_end(seq, page_size, topk, num_steps):
@@ -420,11 +511,22 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         capture_src = _function_source(_NPU_GRAPH, "capture")
         self.assertIn("tree_graph_disabled_reason", capture_src)
         self.assertIn("_slot_gather_graph", capture_src)
-        self.assertIn("parse_tree_draft_capture_bs", capture_src)
+        filter_src = _function_source(_NPU_GRAPH, "filter_capture_batch_sizes")
+        self.assertIn("parse_tree_draft_capture_bs", filter_src)
+        cuda_src = (
+            _REPO_ROOT / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+        )
+        cuda_init = _function_source(cuda_src, "__init__")
+        self.assertIn("filter_capture_batch_sizes", cuda_init)
+        idx_filter = cuda_init.find("filter_capture_batch_sizes")
+        idx_state = cuda_init.find("init_cuda_graph_state")
+        self.assertGreater(idx_state, idx_filter)
         replay_src = _function_source(_NPU_GRAPH, "_replay")
         self.assertIn("_slot_gather_graph", replay_src)
         self.assertIn("_tree_compact_fia", replay_src)
-        self.assertIn("expand_fia_cpu_update_inputs", replay_src)
+        self.assertIn("fill_fia_cpu_update_payload", replay_src)
+        self.assertIn("run_npu_graph_update_and_replay", replay_src)
+        self.assertNotIn("expand_fia_cpu_update_inputs", replay_src)
         can_src = _function_source(_NPU_GRAPH, "can_run")
         self.assertIn("tree_slot_graph_can_run", can_src)
         self.assertIn("capture_bs", can_src)
@@ -438,7 +540,14 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         replay_meta = _function_source(
             _ASCEND_BACKEND, "init_forward_metadata_replay_cuda_graph"
         )
+        self.assertIn("_central_tree_draft_fill", replay_meta)
         self.assertIn("_fill_tree_draft_kv_slots", replay_meta)
+        multi_src = _function_source(
+            _ASCEND_BACKEND, "_fill_central_tree_draft_graph_metadata"
+        )
+        self.assertIn("fill_tree_draft_metadata_", multi_src)
+        self.assertIn("page_size", multi_src)
+        self.assertIn("speculative_num_steps", multi_src)
         self.assertIn("_copy_into_graph_slot_buffers", _ASCEND_BACKEND.read_text())
         max_kv_src = _function_source(_ASCEND_BACKEND, "_slot_gather_graph_max_kv")
         self.assertIn("_slot_gather_kv_pool_size", max_kv_src)
@@ -461,6 +570,29 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("build_paged_draft_cache_locs", src)
         self.assertIn("skip the copy", src.lower())
         self.assertNotIn("token_to_kv_pool.move_kv_cache", src)
+
+    def test_graph_row_capacity_uses_roles_not_mixed_max(self):
+        cap_src = _function_source(_ASCEND_BACKEND, "_graph_row_capacity")
+        self.assertIn("AttnGraphRole.TREE_DRAFT", cap_src)
+        self.assertIn("AttnGraphRole.TARGET_VERIFY", cap_src)
+        self.assertIn("AttnGraphRole.DECODE", cap_src)
+        self.assertIn("graph_roles", _ASCEND_BACKEND.read_text())
+        self.assertIn("TREE_DRAFT", _ASCEND_BACKEND.read_text())
+        state_src = _function_source(_ASCEND_BACKEND, "init_cuda_graph_state")
+        self.assertIn("_graph_row_capacity", state_src)
+        self.assertNotIn("max(draft, int(self.draft_topk)", state_src)
+
+    def test_create_ascend_backend_verify_role_follows_capture_mode(self):
+        src = _function_source(_ATTENTION_REGISTRY, "create_ascend_backend")
+        self.assertIn("captures_target_verify_cuda_graph", src)
+        self.assertIn("AttnGraphRole.DECODE", src)
+        self.assertIn("AttnGraphRole.TARGET_VERIFY", src)
+        self.assertIn("if captures_verify:", src)
+        self.assertLess(
+            src.find("captures_target_verify_cuda_graph"),
+            src.find("TARGET_VERIFY"),
+        )
+        self.assertLess(src.find("if captures_verify:"), src.find("TARGET_VERIFY"))
 
 
 if __name__ == "__main__":

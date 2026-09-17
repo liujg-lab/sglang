@@ -654,31 +654,49 @@ def _prepare_tree_verify_slot_dims(
     return seq_list, bs, num_draft, rows, int(max_kv)
 
 
-def build_tree_verify_kv_slots(
+def fill_tree_verify_kv_slots_(
     custom_mask: torch.Tensor,
     seq_lens: SeqLens,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft: int,
+    slots_out: torch.Tensor,
+    lens_out: torch.Tensor,
+    workspace: torch.Tensor,
     max_kv: Optional[int] = None,
     rows_limit: Optional[int] = None,
 ):
-    """Visible token slots per TARGET_VERIFY query.
+    """Write visible token slots into preallocated graph buffers.
 
-    Fixed-shape fill for the replay hot path. Returns
-    ``(kv_slots[T, max_kv], kv_lens[T])`` with ``T = bs * num_draft``.
-    Padding columns stay 0 and are ignored via ``kv_lens``.
+    Keeps mask prefix-sum + batched scatter. ``workspace`` is ``(rows, max_kv+1)``
+    and is zeroed every call so a shorter visible path cannot leave stale slots.
+    The final ``slots_out.copy_(workspace[:, :max_kv])`` is kept to preserve
+    the pinned graph-buffer address.
     """
     seq_list, bs, num_draft, rows, max_kv = _prepare_tree_verify_slot_dims(
         seq_lens, num_draft, rows_limit, max_kv
     )
     assert_full_mask_layout(
-        custom_mask, seq_list, num_draft, where="build_tree_verify_kv_slots"
+        custom_mask, seq_list, num_draft, where="fill_tree_verify_kv_slots_"
     )
     device = req_to_token.device
-    slots_out = torch.zeros((rows, max_kv), dtype=torch.int64, device=device)
-    lens_out = torch.zeros((rows,), dtype=torch.int32, device=device)
+    if slots_out.shape[0] < rows or (max_kv > 0 and slots_out.shape[1] < max_kv):
+        raise ValueError(
+            f"slots_out shape {tuple(slots_out.shape)} smaller than ({rows}, {max_kv})"
+        )
+    if lens_out.shape[0] < rows:
+        raise ValueError(
+            f"lens_out shape {tuple(lens_out.shape)} smaller than ({rows},)"
+        )
+    if workspace.shape[0] < rows or workspace.shape[1] < max_kv + 1:
+        raise ValueError(
+            f"workspace shape {tuple(workspace.shape)} smaller than ({rows}, {max_kv + 1})"
+        )
+
+    slots_out[:rows].fill_(0)
+    lens_out[:rows].fill_(0)
+    workspace[:rows].fill_(0)
     if rows == 0 or max_kv == 0:
         return slots_out, lens_out
 
@@ -687,33 +705,33 @@ def build_tree_verify_kv_slots(
     need_loc = bs * num_draft
     if int(draft_locs_all.numel()) < need_loc:
         raise ValueError(
-            "build_tree_verify_kv_slots: out_cache_loc too short: "
+            "fill_tree_verify_kv_slots_: out_cache_loc too short: "
             f"numel={int(draft_locs_all.numel())} need={need_loc} "
             f"bs={bs} num_draft={num_draft}"
         )
     if int(req_pool.numel()) < bs:
         raise ValueError(
-            "build_tree_verify_kv_slots: req_pool_indices too short: "
+            "fill_tree_verify_kv_slots_: req_pool_indices too short: "
             f"numel={int(req_pool.numel())} need={bs}"
         )
 
-    seq_t = torch.as_tensor(seq_list, dtype=torch.int64, device=device)
-    widths = seq_t + num_draft
-    max_width = int(widths.max()) if bs else 0
+    max_width = max(seq_list, default=0) + num_draft
     if max_width > max_kv:
         raise RuntimeError(
             f"tree verify visible slots exceed max_kv={max_kv}: "
             f"max uncompacted row width={max_width}"
         )
 
+    seq_t = torch.as_tensor(seq_list, dtype=torch.int64, device=device)
+    widths = seq_t + num_draft
     block = widths * num_draft
     block_start = torch.zeros((bs,), dtype=torch.int64, device=device)
     if bs > 1:
         block_start[1:] = torch.cumsum(block[:-1], dim=0)
     t_ids = torch.arange(num_draft, device=device, dtype=torch.int64)
-    row_start = (block_start.unsqueeze(1) + t_ids.unsqueeze(0) * widths.unsqueeze(1)).reshape(
-        rows
-    )
+    row_start = (
+        block_start.unsqueeze(1) + t_ids.unsqueeze(0) * widths.unsqueeze(1)
+    ).reshape(rows)
     col = torch.arange(max_kv, device=device, dtype=torch.int64)
     widths_row = widths.unsqueeze(1).expand(bs, num_draft).reshape(rows)
     valid_col = col.unsqueeze(0) < widths_row.unsqueeze(1)
@@ -728,12 +746,14 @@ def build_tree_verify_kv_slots(
         attend = mask_flat[safe_idx] & valid_col
 
     ctx_len = int(req_to_token.shape[1]) if req_to_token.ndim >= 2 else 0
-    prefix_table = req_to_token[req_pool[:bs]].to(device=device)
-    if ctx_len <= 0:
-        prefix_vals = torch.zeros((bs, max_kv), dtype=torch.int64, device=device)
-    else:
-        prefix_col = col.clamp(max=ctx_len - 1)
-        prefix_vals = prefix_table[:, prefix_col].to(dtype=torch.int64)
+    max_prefix = max(seq_list, default=0)
+    need_prefix_cols = min(ctx_len, max_prefix) if max_prefix > 0 else 0
+    prefix_vals = torch.zeros((bs, max_kv), dtype=torch.int64, device=device)
+    if need_prefix_cols > 0:
+        prefix_part = req_to_token[
+            req_pool[:bs], :need_prefix_cols
+        ].to(device=device, dtype=torch.int64)
+        prefix_vals[:, :need_prefix_cols] = prefix_part
 
     seq_col = seq_t.unsqueeze(1)
     is_prefix = col.unsqueeze(0) < seq_col
@@ -765,11 +785,49 @@ def build_tree_verify_kv_slots(
         pos,
         torch.full_like(pos, dummy),
     )
-    padded = slots_out.new_zeros((rows, max_kv + 1))
+    padded = workspace[:rows, : max_kv + 1]
     padded.scatter_(1, index, cand)
-    slots_out.copy_(padded[:, :max_kv])
-    lens_out.copy_(lens)
+    slots_out[:rows, :max_kv].copy_(padded[:, :max_kv])
+    lens_out[:rows].copy_(lens.to(dtype=lens_out.dtype))
     return slots_out, lens_out
+
+
+def build_tree_verify_kv_slots(
+    custom_mask: torch.Tensor,
+    seq_lens: SeqLens,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    num_draft: int,
+    max_kv: Optional[int] = None,
+    rows_limit: Optional[int] = None,
+):
+    """Visible token slots per TARGET_VERIFY query.
+
+    Fixed-shape fill for the replay hot path. Returns
+    ``(kv_slots[T, max_kv], kv_lens[T])`` with ``T = bs * num_draft``.
+    Padding columns stay 0 and are ignored via ``kv_lens``.
+    """
+    seq_list, bs, num_draft, rows, max_kv = _prepare_tree_verify_slot_dims(
+        seq_lens, num_draft, rows_limit, max_kv
+    )
+    device = req_to_token.device
+    slots_out = torch.zeros((rows, max_kv), dtype=torch.int64, device=device)
+    lens_out = torch.zeros((rows,), dtype=torch.int32, device=device)
+    workspace = torch.zeros((rows, max_kv + 1), dtype=torch.int64, device=device)
+    return fill_tree_verify_kv_slots_(
+        custom_mask,
+        seq_list,
+        req_to_token,
+        req_pool_indices,
+        out_cache_loc,
+        num_draft,
+        slots_out,
+        lens_out,
+        workspace,
+        max_kv=max_kv,
+        rows_limit=rows_limit,
+    )
 
 
 def tree_verify_attention(

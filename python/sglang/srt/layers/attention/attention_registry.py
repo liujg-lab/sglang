@@ -77,9 +77,26 @@ def create_wave_backend(runner):
 def create_ascend_backend(runner):
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
+        AttnGraphRole,
+    )
+    from sglang.srt.speculative.tree_attn_fallback import (
+        verify_tree_topk_from_server_args,
     )
 
-    return AscendAttnBackend(runner)
+    roles = {AttnGraphRole.DECODE}
+    spec = getattr(runner, "spec_algorithm", None)
+    server_args = getattr(runner, "server_args", None)
+    is_draft = bool(getattr(runner, "is_draft_worker", False))
+    captures_verify = bool(
+        spec is not None
+        and hasattr(spec, "captures_target_verify_cuda_graph")
+        and spec.captures_target_verify_cuda_graph(server_args, is_draft)
+    )
+    if captures_verify:
+        verify_topk = verify_tree_topk_from_server_args(server_args)
+        if verify_topk > 1:
+            roles.add(AttnGraphRole.TARGET_VERIFY)
+    return AscendAttnBackend(runner, graph_roles=frozenset(roles))
 
 
 @register_attention_backend("nsa")

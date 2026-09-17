@@ -38,6 +38,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
+    run_npu_graph_update_and_replay,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
     TreeReplayPlan,
@@ -89,15 +90,29 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
-        super().__init__(model_runner)
+        # Parent CudaGraphRunner.__init__ calls capture() before returning.
+        # Payload dict and FIA attr names must exist for capture_one_batch_size.
         self.update_attr_name = None
         self.update_attr_type = None
+        self._fia_payloads = {}
+        super().__init__(model_runner)
         self.model_runner = model_runner
-        self._init_arch_map()
+        if not hasattr(self, "attr_name"):
+            self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.tree_verify_replay_count = 0
         self.tree_verify_eager_fallback_count = 0
         self._clear_tree_replay_plan()
+
+    def _ensure_capture_attrs(self):
+        if not hasattr(self, "attr_name"):
+            self._init_arch_map()
+        if getattr(self, "_fia_payloads", None) is None:
+            self._fia_payloads = {}
+
+    def capture(self):
+        self._ensure_capture_attrs()
+        super().capture()
 
     def _capture_extra_keys(self, ntpb=None):
         """S_cap buckets only for tree TARGET_VERIFY. DECODE keeps integer / r1 keys."""
@@ -124,8 +139,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self._tree_replay_plan = None
         self._tree_replay_batch_id = None
         self._tree_replay_stream_idx = None
-        self._tree_replay_graphs_id = None
-        self._tree_replay_graph_keys = None
+        self._tree_replay_graph = None
 
     def _save_tree_replay_plan(
         self,
@@ -136,8 +150,14 @@ class NPUGraphRunner(CudaGraphRunner):
         self._tree_replay_plan = plan
         self._tree_replay_batch_id = id(forward_batch)
         self._tree_replay_stream_idx = stream_idx
-        self._tree_replay_graphs_id = id(self.graphs)
-        self._tree_replay_graph_keys = frozenset(self.graphs)
+        self._tree_replay_graph = self.graphs[plan.graph_key]
+
+    def _assert_tree_replay_graph(self, plan: TreeReplayPlan):
+        if self.graphs.get(plan.graph_key) is not self._tree_replay_graph:
+            raise NpuGraphPreparationError(
+                "captured graph changed after admission",
+                scope="graph",
+            )
 
     def _padded_capture_bs(self, forward_batch: ForwardBatch, actual_ntpb: int):
         """Same conversion as ``CudaGraphRunner.replay_prepare``."""
@@ -258,14 +278,51 @@ class NPUGraphRunner(CudaGraphRunner):
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
 
+    def capture_one_batch_size(
+        self,
+        bs: int,
+        forward,
+        stream_idx=None,
+        ntpb_override=None,
+    ):
+        graph, out = super().capture_one_batch_size(
+            bs, forward, stream_idx, ntpb_override
+        )
+        self._ensure_capture_attrs()
+        self.update_attr_name = self._get_update_attr_name()
+        ntpb = ntpb_override if ntpb_override is not None else self.num_tokens_per_bs
+        extra = getattr(self, "_active_capture_extra", None)
+        key = self._make_graph_key(
+            bs,
+            stream_idx,
+            ntpb if _uses_dual_ntpb(self) else None,
+            extra=extra,
+        )
+        n_lens = int(bs) * int(ntpb) if extra is not None else int(bs)
+        self._fia_payloads[key] = [{self.update_attr_name: [1] * n_lens}]
+        return graph, out
+
     def _update_inputs(self, seq_lens, graph_key=None):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+            key = self.bs if graph_key is None else graph_key
+            graph = self.graphs[key]
+            graph.update(cpu_update_input=[{self.update_attr_name: seq_lens}])
+            return
 
         key = self.bs if graph_key is None else graph_key
-        self.graphs[key].update(
-            cpu_update_input=[{self.update_attr_name: seq_lens}]
-        )
+        values = list(seq_lens)
+        payload = self._fia_payloads.get(key)
+        if payload is None:
+            payload = [{self.update_attr_name: list(values)}]
+            self._fia_payloads[key] = payload
+        else:
+            dest = payload[0].setdefault(self.update_attr_name, [])
+            dest[:] = values
+        graph = self._tree_replay_graph
+        if graph is None:
+            graph = self.graphs[key]
+        graph.update(cpu_update_input=payload)
 
     def _replay_update(self, seq_lens, graph_key, errors):
         try:
@@ -313,8 +370,6 @@ class NPUGraphRunner(CudaGraphRunner):
         plan = self._tree_replay_plan
         batch_id = self._tree_replay_batch_id
         stream_idx_saved = self._tree_replay_stream_idx
-        graphs_id = self._tree_replay_graphs_id
-        graph_keys = self._tree_replay_graph_keys
         try:
             if plan is None or batch_id != id(forward_batch):
                 raise NpuGraphPreparationError(
@@ -331,6 +386,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     f"NPU graph stream_idx {stream_idx!r} != plan {stream_idx_saved!r}",
                     scope="graph",
                 )
+            self._assert_tree_replay_graph(plan)
             if not skip_attn_backend_init:
                 self.replay_prepare(forward_batch, pp_proxy_tensors)
             else:
@@ -341,16 +397,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 self.buffers.positions[: self.raw_num_token].copy_(
                     forward_batch.positions
                 )
-
-            if (
-                id(self.graphs) != graphs_id
-                or frozenset(self.graphs) != graph_keys
-                or plan.graph_key not in self.graphs
-            ):
-                raise NpuGraphPreparationError(
-                    f"NPU graph recapture invalidated plan key={plan.graph_key!r}",
-                    scope="graph",
-                )
+            self._assert_tree_replay_graph(plan)
 
             backend = getattr(self.model_runner, "attn_backend", None)
             is_tree_verify = self._is_tree_verify_batch(forward_batch)
@@ -373,6 +420,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     scope="graph",
                 )
             graph_key = plan.graph_key
+            graph = self._tree_replay_graph
 
             self.update_attr_name = self._get_update_attr_name()
             self.update_attr_type = self._get_update_attr_type()
@@ -412,28 +460,14 @@ class NPUGraphRunner(CudaGraphRunner):
                     seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                         self.bs - self.raw_bs
                     )
-                errors = []
-                replay_error = None
-                thread = threading.Thread(
-                    target=self._replay_update,
-                    args=(seq_lens, graph_key, errors),
+                run_npu_graph_update_and_replay(
+                    lambda: self._update_inputs(seq_lens, graph_key),
+                    graph.replay,
                 )
-                thread.start()
-                try:
-                    self.graphs[graph_key].replay()
-                except Exception as exc:
-                    replay_error = exc
-                finally:
-                    thread.join()
-                if replay_error is not None or errors:
-                    cause = replay_error if replay_error is not None else errors[0]
-                    raise NpuGraphReplaySubmittedError(
-                        "NPU graph update/replay failed"
-                    ) from cause
             else:
                 replay_error = None
                 try:
-                    self.graphs[graph_key].replay()
+                    graph.replay()
                 except Exception as exc:
                     replay_error = exc
                 if replay_error is not None:

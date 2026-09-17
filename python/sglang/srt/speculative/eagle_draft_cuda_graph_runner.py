@@ -82,9 +82,19 @@ class EAGLEDraftCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, self.compile_bs = self.filter_capture_batch_sizes(
+            self.capture_bs, self.compile_bs
+        )
 
         # Attention backend
         self.num_tokens_per_bs = self.topk
+        if not self.capture_bs:
+            self.max_bs = 0
+            self.max_num_token = 0
+            self.graphs = {}
+            self.output_buffers = {}
+            self.buffers = None
+            return
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
@@ -166,6 +176,10 @@ class EAGLEDraftCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def filter_capture_batch_sizes(self, capture_bs, compile_bs):
+        """Optional capture-bs filter before max_bs and buffer allocation."""
+        return capture_bs, compile_bs
 
     def _cache_loc_dtype(self):
         return torch.int64

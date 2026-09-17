@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 import triton
@@ -185,6 +186,64 @@ def expand_fia_cpu_update_inputs(step_lens_list, num_layers, attr_name):
         for step_lens in step_lens_list
         for _ in range(num_layers)
     ]
+
+
+def fill_fia_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
+    """Copy this round's per-step lengths into a captured cpu_update_input.
+
+    Mutates existing list objects in ``payload``. Callers must not rewrite
+    ``payload`` until the NPU graph update thread has joined.
+    """
+    if not attr_name:
+        raise ValueError("FIA update attr_name must not be empty")
+    if payload is None:
+        raise ValueError("FIA update payload must not be None")
+    n = len(payload)
+    if n != len(step_ids):
+        raise ValueError(
+            f"FIA payload length {n} != step_ids length {len(step_ids)}"
+        )
+    n_steps = len(step_lens_list)
+    for i, rec in enumerate(payload):
+        step = int(step_ids[i])
+        if step < 0 or step >= n_steps:
+            raise ValueError(
+                f"FIA step_ids[{i}]={step} out of range n_steps={n_steps}"
+            )
+        dest = rec[attr_name]
+        src = list(step_lens_list[step])
+        dest[:] = src
+    return payload
+
+
+def run_npu_graph_update_and_replay(update_fn, replay_fn):
+    """Run graph.update in a side thread and graph.replay concurrently.
+
+    Joins the update thread even if replay raises. After replay has been
+    invoked, failures become ``NpuGraphReplaySubmittedError``.
+    """
+    errors = []
+
+    def _update():
+        try:
+            update_fn()
+        except Exception as exc:
+            errors.append(exc)
+
+    replay_error = None
+    thread = threading.Thread(target=_update)
+    thread.start()
+    try:
+        replay_fn()
+    except Exception as exc:
+        replay_error = exc
+    finally:
+        thread.join()
+    if replay_error is not None or errors:
+        cause = replay_error if replay_error is not None else errors[0]
+        raise NpuGraphReplaySubmittedError(
+            "NPU graph update/replay failed"
+        ) from cause
 
 
 def normalize_fia_op_name(name):
@@ -613,6 +672,197 @@ def build_tree_draft_kv_slots(
         )
 
     return slots.reshape(bs * topk, n_cols), kv_lens
+
+
+def _tree_draft_cpu_max_token_pos(
+    prefix_lens, page_size, topk, speculative_num_steps, step_id
+):
+    """Max req_to_token column a valid cell of this step can touch."""
+    page_size = int(page_size)
+    topk = max(int(topk), 1)
+    num_steps = max(int(speculative_num_steps), 0)
+    kv_extra = int(step_id) + 1
+    max_pos = -1
+    for seq in prefix_lens:
+        seq = int(seq)
+        prefix_max = seq - 1 if seq > 0 else -1
+        if kv_extra <= 0:
+            max_pos = max(max_pos, prefix_max)
+            continue
+        draft_i_max = kv_extra - 1
+        if topk == 1 or page_size == 1:
+            pos = seq + (topk - 1) * num_steps + draft_i_max
+        else:
+            last = seq % page_size
+            base = seq - last
+            nnp = (last + num_steps + page_size - 1) // page_size
+            pos = base + (topk - 1) * nnp * page_size + last + draft_i_max
+        max_pos = max(max_pos, pos, prefix_max)
+    return max_pos
+
+
+def _as_cpu_prefix_lens(prefix_lens, raw_bs):
+    if prefix_lens is None:
+        raise ValueError("tree draft prefix_lens must not be None")
+    if isinstance(prefix_lens, torch.Tensor):
+        if prefix_lens.device.type != "cpu":
+            raise ValueError("tree draft prefix_lens must be a CPU tensor or sequence")
+        values = [int(x) for x in prefix_lens.reshape(-1).tolist()]
+    else:
+        values = [int(x) for x in list(prefix_lens)]
+    raw_bs = int(raw_bs)
+    if raw_bs < 0:
+        raise ValueError(f"raw_bs must be >= 0, got {raw_bs}")
+    if len(values) < raw_bs:
+        raise ValueError(
+            f"prefix_lens length {len(values)} smaller than raw_bs={raw_bs}"
+        )
+    return values[:raw_bs]
+
+
+def fill_tree_draft_metadata_(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens,
+    slots_out,
+    lens_out,
+    *,
+    raw_bs,
+    capture_bs,
+    page_size,
+    topk,
+    speculative_num_steps,
+    kv_bucket,
+):
+    """Fill preallocated tree-draft slot/lens buffers for all forward steps.
+
+    Writes ``speculative_num_steps - 1`` steps. Branch reservation still uses
+    the full ``speculative_num_steps``. CPU ``prefix_lens`` drive lengths and
+    bounds; device tensors are only used to index ``req_to_token``.
+    Returns a list of CPU KV-length vectors (padding 0, no FIA placeholder).
+    """
+    raw_bs = int(raw_bs)
+    capture_bs = int(capture_bs)
+    page_size = int(page_size)
+    topk = max(int(topk), 1)
+    num_steps = max(int(speculative_num_steps), 0)
+    n_forward = max(num_steps - 1, 0)
+    n_cols = int(kv_bucket)
+    rows = capture_bs * topk
+    if capture_bs < raw_bs:
+        raise ValueError(f"capture_bs={capture_bs} smaller than raw_bs={raw_bs}")
+    if n_forward <= 0:
+        return []
+    if len(slots_out) < n_forward or len(lens_out) < n_forward:
+        raise ValueError(
+            f"slots/lens buffers {len(slots_out)}/{len(lens_out)} "
+            f"smaller than n_forward={n_forward}"
+        )
+
+    prefix = _as_cpu_prefix_lens(prefix_lens, raw_bs)
+    device = req_to_token.device
+    ctx_len = int(req_to_token.shape[1]) if req_to_token.ndim >= 2 else 0
+
+    last_step = n_forward - 1
+    max_pos = _tree_draft_cpu_max_token_pos(
+        prefix, page_size, topk, num_steps, last_step
+    )
+    if raw_bs > 0 and max_pos >= ctx_len:
+        raise RuntimeError(
+            "tree draft kv slots token_pos out of req_to_token range: "
+            f"max_valid_pos={max_pos} ctx_len={ctx_len}"
+        )
+    need_cols = 0
+    if raw_bs > 0 and ctx_len > 0 and max_pos >= 0:
+        need_cols = min(ctx_len, max_pos + 1)
+
+    pool = req_pool_indices.reshape(-1)
+    if int(pool.numel()) < raw_bs:
+        raise ValueError(
+            f"req_pool_indices too short: numel={int(pool.numel())} need={raw_bs}"
+        )
+    table = None
+    if raw_bs > 0 and need_cols > 0:
+        table = req_to_token[pool[:raw_bs].to(device=device, dtype=torch.int64), :need_cols]
+
+    seq = None
+    if raw_bs > 0:
+        seq = torch.tensor(prefix, dtype=torch.int64, device=device)
+
+    cpu_lens_by_step = []
+    for step_id in range(n_forward):
+        dest_slots = slots_out[step_id]
+        dest_lens = lens_out[step_id]
+        if dest_slots.shape[0] < rows or dest_slots.shape[1] < n_cols:
+            raise ValueError(
+                f"step {step_id} slots shape {tuple(dest_slots.shape)} "
+                f"smaller than ({rows}, {n_cols})"
+            )
+        if dest_lens.shape[0] < rows:
+            raise ValueError(
+                f"step {step_id} lens shape {tuple(dest_lens.shape)} "
+                f"smaller than ({rows},)"
+            )
+        dest_slots[:rows].fill_(0)
+        dest_lens[:rows].fill_(0)
+        if dest_slots.shape[0] > rows:
+            dest_slots[rows:].fill_(0)
+        if dest_lens.shape[0] > rows:
+            dest_lens[rows:].fill_(0)
+
+        cpu_kv = []
+        for b in range(capture_bs):
+            seq_b = prefix[b] if b < raw_bs else 0
+            kv_len = seq_b + step_id + 1 if b < raw_bs else 0
+            cpu_kv.extend([kv_len] * topk)
+        cpu_lens_by_step.append(cpu_kv)
+
+        if raw_bs == 0 or n_cols <= 0:
+            continue
+
+        kv_extra = step_id + 1
+        kv_len = seq + kv_extra
+        raw_rows = raw_bs * topk
+        dest_lens[:raw_rows].copy_(kv_len.repeat_interleave(topk).to(dtype=dest_lens.dtype))
+
+        col = torch.arange(n_cols, device=device, dtype=torch.int64)
+        seq_3d = seq.view(raw_bs, 1, 1)
+        col_3d = col.view(1, 1, n_cols)
+        k_ids = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk, 1)
+        draft_i = col_3d - seq_3d
+        valid = col_3d < kv_len.view(raw_bs, 1, 1)
+
+        if topk == 1 or page_size == 1:
+            draft_pos = seq_3d + k_ids * num_steps + draft_i
+        else:
+            last_page_len = (seq % page_size).view(raw_bs, 1, 1)
+            prefix_base = seq_3d - last_page_len
+            num_new_pages = (seq % page_size + num_steps + page_size - 1) // page_size
+            draft_pos = (
+                prefix_base
+                + k_ids * num_new_pages.view(raw_bs, 1, 1) * page_size
+                + last_page_len
+                + draft_i
+            )
+
+        token_pos = torch.where(col_3d < seq_3d, col_3d.expand_as(draft_pos), draft_pos)
+        valid = valid.expand_as(token_pos)
+        if table is None or need_cols <= 0:
+            continue
+        token_pos_safe = torch.where(
+            valid, token_pos.clamp(min=0, max=need_cols - 1), torch.zeros_like(token_pos)
+        )
+        row_idx = torch.arange(raw_bs, device=device, dtype=torch.int64)
+        gather_idx = row_idx.view(raw_bs, 1, 1).expand(raw_bs, topk, n_cols)
+        token_ids = table[gather_idx, token_pos_safe]
+        slots = torch.where(
+            valid,
+            token_ids.to(torch.int64),
+            torch.zeros_like(token_ids, dtype=torch.int64),
+        )
+        dest_slots[:raw_rows, :n_cols].copy_(slots.reshape(raw_rows, n_cols)[:, :n_cols])
+
+    return cpu_lens_by_step
 
 
 def is_remote_spec_algorithm(server_args: Optional[ServerArgs] = None) -> bool:
