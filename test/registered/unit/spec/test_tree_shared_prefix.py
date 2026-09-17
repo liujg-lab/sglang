@@ -1,0 +1,1141 @@
+"""CPU execution of shared-prefix production math, metadata and NPU dispatch."""
+
+import ast
+import logging
+import math
+import threading
+import time
+import unittest
+from collections import Counter
+from contextlib import nullcontext
+from pathlib import Path
+from types import MethodType, SimpleNamespace as NS
+from unittest.mock import Mock, patch
+
+import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+
+from sglang.srt.speculative import tree_shared_prefix as shared
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import SRRoundMetrics
+from sglang.srt.speculative.tree_attn_fallback import (
+    build_tree_verify_kv_slots_ref,
+    tree_fia_actual_seq_lengths_kv,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+
+ROOT = Path(__file__).resolve().parents[4]
+NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
+
+
+def methods(path, cls, names, ns=None):
+    """Execute production methods without loading accelerator-only imports."""
+    ns = dict(ns or {})
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    klass = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+    nodes = [
+        n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    assert len(nodes) == len(names)
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *nodes], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    return {name: ns[name] for name in names}
+
+
+def mask_for(lengths, queries, device="cpu"):
+    # Root 0; siblings 1,2; subsequent nodes extend the first sibling's path.
+    tree = torch.eye(queries, dtype=torch.bool)
+    tree[:, 0] = True
+    for q in range(3, queries):
+        tree[q, 1] = True
+    return torch.cat(
+        [
+            torch.cat((torch.ones(queries, p, dtype=torch.bool), tree), 1).flatten()
+            for p in lengths
+        ]
+    ).to(device)
+
+
+def visible_slots(md, b, q):
+    p, a = int(md.prefix_lens[b]), int(md.path_lens[b, q])
+    return torch.cat(
+        (md.prefix_slots[b, :p], md.node_slots[b, md.ancestor_indices[b, q, :a]])
+    )
+
+
+def dense_reference(q, k, v, md):
+    bs, queries, heads, dim = q.shape
+    kv_heads = k.shape[-2]
+    k, v = k.reshape(-1, kv_heads, dim).float(), v.reshape(-1, kv_heads, dim).float()
+    out = torch.zeros_like(q, dtype=torch.float32)
+    for b in range(bs):
+        for row in range(queries):
+            slots = visible_slots(md, b, row)
+            if slots.numel():
+                keys = k[slots].repeat_interleave(heads // kv_heads, 1)
+                vals = v[slots].repeat_interleave(heads // kv_heads, 1)
+                probs = (
+                    torch.einsum("hd,shd->hs", q[b, row].float(), keys)
+                    .mul(dim**-0.5)
+                    .softmax(-1)
+                )
+                out[b, row] = torch.einsum("hs,shd->hd", probs, vals)
+    return out.reshape(bs * queries, heads * dim)
+
+
+class TestSharedPrefix(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(73)
+        torch.set_num_threads(1)
+
+    def fixture(
+        self,
+        lengths=(3, 5),
+        queries=4,
+        cap=512,
+        dtype=torch.float32,
+        heads=4,
+        kv_heads=2,
+        dim=64,
+    ):
+        table = (torch.randperm(2048).view(2, 1024) + 1).int()
+        pool = torch.tensor([1, 0])
+        md = shared.SharedPrefixMetadata.allocate(
+            3, queries, cap, queries, queries, "cpu"
+        )
+        nodes = torch.arange(2100, 2100 + len(lengths) * queries)
+        shared.fill_shared_verify_(
+            md, table, pool, list(lengths), nodes, mask_for(lengths, queries), queries
+        )
+        q = torch.randn(3, queries, heads, dim).to(dtype)
+        k = torch.randn(18, 128, kv_heads, dim).to(dtype)
+        v = torch.randn_like(k)
+        return md, q, k, v, table, pool, nodes
+
+    def test_numerics_and_padding(self):
+        for heads, kv_heads in ((2, 2), (4, 2)):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                for lengths in ((0, 0), (3, 5), (257, 511)):
+                    md, q, k, v, *_ = self.fixture(
+                        lengths, dtype=dtype, heads=heads, kv_heads=kv_heads
+                    )
+                    # Unused slots may contain garbage: padding must remain zero.
+                    k.view(-1, kv_heads, 64)[0].fill_(float("nan"))
+                    v.view(-1, kv_heads, 64)[0].fill_(float("nan"))
+                    actual = shared.shared_prefix_attention(
+                        q, k, v, md, scale=1 / 8, kv_heads=kv_heads
+                    )
+                    expected = dense_reference(q, k, v, md).to(dtype)
+                    # The last cast can straddle a rounding boundary by one ULP.
+                    tolerance = (
+                        (2e-5, 2e-6)
+                        if dtype == torch.float32
+                        else ((1e-2, 1e-3) if dtype == torch.bfloat16 else (2e-3, 1e-3))
+                    )
+                    torch.testing.assert_close(
+                        actual, expected, rtol=tolerance[0], atol=tolerance[1]
+                    )
+                    self.assertEqual(torch.count_nonzero(actual[-q.shape[1] :]), 0)
+
+    def test_union_normalization_not_sum_of_outputs(self):
+        md = shared.SharedPrefixMetadata.allocate(1, 1, 1, 1, 1, "cpu")
+        md.prefix_slots.fill_(1)
+        md.node_slots.fill_(2)
+        md.prefix_lens.fill_(1)
+        md.path_lens.fill_(1)
+        q = torch.ones(1, 1, 1, 64)
+        k = torch.zeros(3, 1, 64)
+        k[1].fill_(100)
+        k[2].fill_(-100)
+        v = torch.zeros_like(k)
+        v[1].fill_(2)
+        v[2].fill_(7)
+        out = shared.shared_prefix_attention(q, k, v, md, scale=1 / 8, kv_heads=1)
+        torch.testing.assert_close(out, torch.full_like(out, 2))
+        self.assertFalse(torch.allclose(out, torch.full_like(out, 9)))
+        md.path_lens.zero_()
+        torch.testing.assert_close(
+            shared.shared_prefix_attention(q, k, v, md, scale=1 / 8, kv_heads=1), out
+        )
+        md.prefix_lens.zero_()
+        self.assertEqual(
+            shared.shared_prefix_attention(
+                q, k, v, md, scale=1 / 8, kv_heads=1
+            ).count_nonzero(),
+            0,
+        )
+
+    def test_sibling_isolation_and_prefix_visibility(self):
+        md, q, k, v, *_ = self.fixture()
+        run = lambda: shared.shared_prefix_attention(
+            q, k, v, md, scale=1 / 8, kv_heads=2
+        )
+        before = run()
+        v.view(-1, 2, 64)[md.node_slots[0, 2]] += 20
+        after = run()
+        torch.testing.assert_close(before[1], after[1])
+        self.assertFalse(torch.allclose(before[2], after[2]))
+        v.view(-1, 2, 64)[md.prefix_slots[0, 0]] += 20
+        self.assertFalse(torch.allclose(after[1], run()[1]))
+
+    def test_verify_layout_and_short_replay(self):
+        md, q, k, v, table, pool, nodes = self.fixture((127, 129))
+        pointers = [x.data_ptr() for x in vars(md).values()]
+        for lengths in ([127, 129], [128, 0], [3]):
+            mask = mask_for(lengths, 4)
+            shared.fill_shared_verify_(md, table, pool, lengths, nodes, mask, 4)
+            slots, lens = build_tree_verify_kv_slots_ref(
+                mask, lengths, table, pool, nodes, 4
+            )
+            for b in range(len(lengths)):
+                for row in range(4):
+                    torch.testing.assert_close(
+                        visible_slots(md, b, row),
+                        slots[b * 4 + row, : lens[b * 4 + row]],
+                    )
+            self.assertEqual(pointers, [x.data_ptr() for x in vars(md).values()])
+            self.assertEqual(md.path_lens[len(lengths) :].count_nonzero(), 0)
+            actual = shared.shared_prefix_attention(
+                q, k, v, md, scale=1 / 8, kv_heads=2
+            )
+            torch.testing.assert_close(
+                actual, dense_reference(q, k, v, md), rtol=2e-5, atol=2e-6
+            )
+
+    def test_draft_page_layout_and_remapped_values(self):
+        # Load the old production slot builder as an independent layout oracle.
+        path = ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "build_tree_draft_kv_slots"
+        )
+        ns = {"torch": torch}
+        mod = ast.parse("from __future__ import annotations")
+        mod.body.append(node)
+        exec(compile(mod, str(path), "exec"), ns)
+        table = torch.randperm(4096).view(2, 2048).int()
+        pool = torch.tensor([1, 0])
+        for page in (1, 128):
+            for prefix in (127, 128, 129):
+                lengths = [prefix, 7]
+                md = shared.SharedPrefixMetadata.allocate(3, 3, 256, 15, 5, "cpu")
+                for step in (0, 3, 1):
+                    shared.fill_shared_draft_(
+                        md,
+                        table,
+                        pool,
+                        lengths,
+                        page_size=page,
+                        topk=3,
+                        steps=5,
+                        step=step,
+                    )
+                    slots, lens = ns["build_tree_draft_kv_slots"](
+                        table, pool, torch.tensor(lengths), page, 3, step, 5
+                    )
+                    for b in range(2):
+                        for row in range(3):
+                            torch.testing.assert_close(
+                                visible_slots(md, b, row),
+                                slots[b * 3 + row, : lens[b * 3 + row]],
+                            )
+                    self.assertEqual(md.path_lens[2].count_nonzero(), 0)
+                # The allocator/remapper changes physical contents, not paths.
+                q = torch.randn(3, 3, 4, 64)
+                k, v = torch.randn(32, 128, 2, 64), torch.randn(32, 128, 2, 64)
+                flat = v.view(-1, 2, 64)
+                flat[md.node_slots[0, 5]] = flat[md.node_slots[0, 0]].clone()
+                actual = shared.shared_prefix_attention(
+                    q, k, v, md, scale=1 / 8, kv_heads=2
+                )
+                torch.testing.assert_close(
+                    actual, dense_reference(q, k, v, md), rtol=2e-5, atol=2e-6
+                )
+
+    def test_prefix_gather_is_per_request_per_chunk(self):
+        md, q, k, v, *_ = self.fixture((257, 511))
+        calls = []
+        original = shared._gather
+
+        def gather(cache, slots):
+            result = original(cache, slots)
+            calls.append((tuple(slots.shape), tuple(result.shape)))
+            return result
+
+        with patch.object(shared, "_gather", gather):
+            shared.shared_prefix_attention(q, k, v, md, scale=1 / 8, kv_heads=2)
+        self.assertEqual([x[0] for x in calls], [(3, 256)] * 4 + [(3, 4, 4)] * 2)
+        self.assertEqual(calls[0][1], (3, 256, 2, 64))
+
+    def test_draft_mapping_dtypes_and_fixed_buffers(self):
+        class NoIndexPut(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if "index_put" in str(func):
+                    raise AssertionError(f"metadata must use slice copy, got {func}")
+                return func(*args, **(kwargs or {}))
+
+        for dtype in (torch.int32, torch.int64):
+            for page in (1, 128):
+                for prefix in (127, 128, 129):
+                    with self.subTest(dtype=dtype, page=page, prefix=prefix):
+                        table = torch.randperm(4096).view(2, 2048).to(dtype)
+                        pool = torch.tensor([1, 0])
+                        md = shared.SharedPrefixMetadata.allocate(
+                            2, 3, 256, 15, 5, "cpu"
+                        )
+                        pointers = [x.data_ptr() for x in vars(md).values()]
+                        for step, lengths in (
+                            (0, [prefix, 7]),
+                            (3, [prefix]),
+                            (1, [7, prefix]),
+                        ):
+                            pool = pool.flip(0)
+                            with NoIndexPut():
+                                shared.fill_shared_draft_(
+                                    md,
+                                    table,
+                                    pool,
+                                    lengths,
+                                    page_size=page,
+                                    topk=3,
+                                    steps=5,
+                                    step=step,
+                                )
+                            for b, p in enumerate(lengths):
+                                stride = (
+                                    5
+                                    if page == 1
+                                    else ((p % page + 5 + page - 1) // page) * page
+                                )
+                                for branch in range(3):
+                                    expected = torch.cat(
+                                        (
+                                            table[pool[b], :p],
+                                            table[
+                                                pool[b],
+                                                p
+                                                + branch * stride : p
+                                                + branch * stride
+                                                + step
+                                                + 1,
+                                            ],
+                                        )
+                                    ).long()
+                                    torch.testing.assert_close(
+                                        visible_slots(md, b, branch), expected
+                                    )
+                                    self.assertEqual(
+                                        md.node_slots[
+                                            b, branch * 5 + step + 1 : (branch + 1) * 5
+                                        ].count_nonzero(),
+                                        0,
+                                    )
+                                self.assertEqual(
+                                    md.ancestor_indices[
+                                        b, :, step + 1 :
+                                    ].count_nonzero(),
+                                    0,
+                                )
+                            for tensor in vars(md).values():
+                                self.assertEqual(
+                                    tensor[len(lengths) :].count_nonzero(), 0
+                                )
+                            self.assertEqual(
+                                pointers, [x.data_ptr() for x in vars(md).values()]
+                            )
+                            self.assertEqual(md.node_slots.dtype, torch.int64)
+                            self.assertEqual(md.path_lens.dtype, torch.int32)
+
+    def test_invalid_metadata_and_sparse_prefix_rejected(self):
+        md, _, _, _, table, pool, nodes = self.fixture()
+        mask = mask_for([3, 5], 4)
+        mask[0] = False
+        with self.assertRaises(RuntimeError):
+            shared.fill_shared_verify_(md, table, pool, [3, 5], nodes, mask, 4)
+        with self.assertRaises(ValueError):
+            shared.fill_shared_verify_(
+                md, table, pool, [513], nodes, mask_for([513], 4), 4
+            )
+
+    def test_head_dim_128_and_empty_draft_batch(self):
+        md, q, k, v, *_ = self.fixture((0, 257), dim=128)
+        result = shared.shared_prefix_attention(
+            q, k, v, md, scale=128**-0.5, kv_heads=2
+        )
+        torch.testing.assert_close(
+            result, dense_reference(q, k, v, md), rtol=2e-5, atol=2e-6
+        )
+        md = shared.SharedPrefixMetadata.allocate(2, 3, 256, 15, 5, "cpu")
+        md.path_lens.fill_(4)
+        shared.fill_shared_draft_(
+            md,
+            torch.zeros(1, 512, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+            [],
+            page_size=128,
+            topk=3,
+            steps=5,
+            step=1,
+        )
+        self.assertEqual(md.path_lens.count_nonzero(), 0)
+
+    def test_selection_checks_all_layers_and_cache(self):
+        class Layer:
+            attn_type = NS(value="decoder")
+            qk_head_dim = v_head_dim = 64
+            tp_q_head_num, tp_k_head_num, tp_v_head_num = 4, 2, 2
+            is_cross_attention = False
+            sliding_window_size = -1
+            logit_cap = 0
+            layer_id = 0
+
+        layer = Layer()
+        cache = torch.zeros(2, 128, 2, 64, dtype=torch.float16)
+        pool = NS(get_key_buffer=lambda i: cache, get_value_buffer=lambda i: cache)
+        runner = NS(
+            server_args=NS(
+                speculative_algorithm="STANDALONE_REMOTE",
+                standalone_remote_role="target",
+            ),
+            model=NS(modules=lambda: [Layer(), layer]),
+            token_to_kv_pool=pool,
+        )
+        backend = NS(
+            model_runner=runner,
+            _use_tree_compact_fia=lambda: True,
+            verify_tree_topk=3,
+            use_mla=False,
+            use_alibi=False,
+            is_hybrid_swa=False,
+            is_dllm_model=False,
+            model_dtype=torch.float16,
+            page_size=128,
+        )
+        fn = methods(
+            NPU / "attention/ascend_backend.py",
+            "AscendAttnBackend",
+            ["_init_tree_shared_prefix"],
+            dict(
+                vars(shared),
+                torch_npu=NS(get_npu_format=lambda x: 0),
+                logger=logging.getLogger(__name__),
+            ),
+        )["_init_tree_shared_prefix"]
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.layers.radix_attention": NS(RadixAttention=Layer)},
+        ):
+            fn(backend)
+            self.assertEqual(backend.tree_attention_impl, shared.SHARED_PREFIX_IMPL)
+            for role, page, expected in (
+                ("draft", 128, "compact_fia"),
+                ("draft", 1, shared.SHARED_PREFIX_IMPL),
+                ("target", 128, shared.SHARED_PREFIX_IMPL),
+                ("target", 1, shared.SHARED_PREFIX_IMPL),
+            ):
+                runner.server_args.standalone_remote_role = role
+                backend.page_size = page
+                # A remote Draft is not necessarily a local draft worker.
+                for local_draft in (False, True):
+                    runner.is_draft_worker = local_draft
+                    fn(backend)
+                    self.assertEqual(backend.tree_attention_impl, expected)
+            runner.server_args.standalone_remote_role = "draft"
+            runner.page_size = backend.page_size = 128
+
+            def make_step(model_runner, **kwargs):
+                inner = NS(**vars(backend))
+                fn(inner)
+                inner._use_tree_shared_prefix = (
+                    lambda: inner.tree_attention_impl == shared.SHARED_PREFIX_IMPL
+                )
+                return inner
+
+            init_steps = methods(
+                NPU / "attention/ascend_backend.py",
+                "AscendAttnMultiStepDraftBackend",
+                ["__init__"],
+                dict(AscendAttnBackend=make_step, AttnGraphRole=NS(TREE_DRAFT="draft")),
+            )["__init__"]
+            multi = NS()
+            init_steps(multi, runner, 3, 5)
+            self.assertEqual(
+                [b.tree_attention_impl for b in multi.attn_backends],
+                ["compact_fia"] * 5,
+            )
+            self.assertTrue(multi._central_tree_draft_fill)
+            self.assertTrue(
+                all(b._central_tree_draft_fill for b in multi.attn_backends)
+            )
+            runner.server_args.standalone_remote_role = "target"
+            for attr, bad in (
+                ("sliding_window_size", 128),
+                ("is_cross_attention", True),
+                ("logit_cap", 1),
+                ("qk_head_dim", 256),
+            ):
+                original = getattr(layer, attr)
+                setattr(layer, attr, bad)
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "compact_fia")
+                setattr(layer, attr, original)
+            for role in ("draft", "target"):
+                runner.server_args.standalone_remote_role = role
+                backend.use_mla = True
+                backend._use_tree_compact_fia = lambda: False
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "chunked")
+            backend.use_mla = False
+            backend._use_tree_compact_fia = lambda: True
+            cache = cache.to(torch.uint8)
+            fn(backend)
+            self.assertEqual(backend.tree_attention_impl, "compact_fia")
+            runner.server_args.speculative_algorithm = "EAGLE"
+            cache = cache.half()
+            fn(backend)
+            self.assertEqual(backend.tree_attention_impl, "compact_fia")
+
+    def test_real_backend_dispatch_and_fallback(self):
+        fn = methods(
+            NPU / "attention/ascend_backend.py",
+            "AscendAttnBackend",
+            [
+                "_run_tree_shared_prefix_attention",
+                "_run_tree_draft_slot_gather",
+                "_run_tree_verify_slot_gather",
+            ],
+            {
+                "shared_prefix_attention": shared.shared_prefix_attention,
+                "shared_prefix_layer_supported": shared.shared_prefix_layer_supported,
+                "log_tree_draft_slot_gather_once": lambda *a: None,
+                "log_tree_verify_fallback_once": lambda *a: None,
+            },
+        )
+        md, q, k, v, *_ = self.fixture()
+        layer = NS(
+            attn_type=NS(value="decoder"),
+            qk_head_dim=64,
+            v_head_dim=64,
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            is_cross_attention=False,
+            sliding_window_size=-1,
+            logit_cap=0,
+            scaling=1 / 8,
+        )
+        backend = NS(
+            forward_metadata=NS(tree_shared=md), _use_tree_shared_prefix=lambda: True
+        )
+        backend._run_tree_shared_prefix_attention = MethodType(
+            fn["_run_tree_shared_prefix_attention"], backend
+        )
+        for name in ("_run_tree_draft_slot_gather", "_run_tree_verify_slot_gather"):
+            extra = (NS(), None) if "verify" in name else ()
+            result = fn[name](
+                backend, q, k, v, layer, *extra, qk_head_dim=64, v_head_dim=64
+            )
+            torch.testing.assert_close(
+                result, dense_reference(q, k, v, md), rtol=2e-5, atol=2e-6
+            )
+        layer.sliding_window_size = 128
+        self.assertFalse(shared.shared_prefix_layer_supported(layer))
+        with self.assertRaises(RuntimeError):
+            backend._run_tree_shared_prefix_attention(q, k, v, layer)
+        backend._use_tree_shared_prefix = lambda: False
+        backend._use_tree_compact_fia = lambda *args: True
+        backend.is_hybrid_swa, backend.draft_topk, backend.page_size = False, 3, 128
+        backend.forward_metadata.tree_draft_kv_slots = torch.zeros(1, 1)
+        backend.forward_metadata.tree_draft_kv_lens_t = torch.ones(1)
+        backend._run_tree_compact_fia = Mock(return_value="fallback")
+        self.assertEqual(
+            fn["_run_tree_draft_slot_gather"](
+                backend, q, k, v, layer, qk_head_dim=64, v_head_dim=64
+            ),
+            "fallback",
+        )
+
+
+class TestTreeFailureHandling(unittest.TestCase):
+    def setUp(self):
+        # Load the actual exception type without importing accelerator modules.
+        path = ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "NpuGraphReplaySubmittedError"
+        )
+        ns = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+        self.submitted_error = ns[node.name]
+        self.logger = Mock()
+        names = [
+            "expand_batch",
+            "_expand_one",
+            "_log_tree_failure",
+            "_init_cuda_graphs",
+        ]
+        functions = methods(
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+            "SRTreeDrafter",
+            names,
+            dict(
+                logger=self.logger,
+                is_device_context_error=is_device_context_error,
+                NpuGraphReplaySubmittedError=self.submitted_error,
+                device_backend_key=lambda _: "cuda",
+                nullcontext=nullcontext,
+            ),
+        )
+        md = shared.SharedPrefixMetadata.allocate(1, 3, 256, 15, 5, "cpu")
+        inner = NS(
+            tree_attention_impl=shared.SHARED_PREFIX_IMPL,
+            forward_metadata=NS(tree_shared=md),
+        )
+        self.drafter = NS(
+            _tree_failure_counts={},
+            draft_attn_backend=NS(attn_backends=[inner]),
+            req_to_token_pool=NS(req_to_token=torch.zeros(1, 512, dtype=torch.int32)),
+            _stack_seeds=Mock(return_value=(None,) * 4),
+            _expand_tree=Mock(side_effect=RuntimeError("metadata dtype mismatch")),
+            server_args=NS(disable_cuda_graph=False),
+            speculative_num_steps=5,
+            draft_model_runner=NS(draft_attn_backend="original"),
+            device="cpu",
+        )
+        for name, fn in functions.items():
+            setattr(self.drafter, name, MethodType(fn, self.drafter))
+        self.req = NS(rid="request", req_pool_idx=0, sr_tree_seed=(None,) * 4)
+
+    def test_single_eligible_request_does_not_retry(self):
+        self.drafter._expand_one = Mock(side_effect=AssertionError("duplicate retry"))
+        skipped = NS(req_pool_idx=None)
+        result = self.drafter.expand_batch([skipped, self.req])
+        self.assertEqual(result, [([], None, None)] * 2)
+        self.drafter._expand_tree.assert_called_once()
+        self.drafter._expand_one.assert_not_called()
+
+    def test_multi_request_failure_still_isolates_requests(self):
+        output = ([9], [0], [0])
+        self.drafter._expand_one = Mock(return_value=output)
+        self.assertEqual(
+            self.drafter.expand_batch([self.req, self.req]), [output, output]
+        )
+        self.assertEqual(self.drafter._expand_one.call_count, 2)
+
+    def test_submitted_and_device_errors_propagate(self):
+        for exc in (
+            self.submitted_error("submitted"),
+            RuntimeError("illegal memory access"),
+        ):
+            for name in ("expand_batch", "_expand_one"):
+                self.drafter._expand_tree.reset_mock(side_effect=True)
+                self.drafter._expand_tree.side_effect = exc
+                with self.assertRaises(type(exc)) as caught:
+                    getattr(self.drafter, name)(
+                        [self.req] if name == "expand_batch" else self.req
+                    )
+                self.assertIs(caught.exception, exc)
+                self.drafter._expand_tree.assert_called_once()
+        self.logger.warning.assert_not_called()
+
+    def test_failures_log_traceback_once_then_totals(self):
+        for _ in range(32):
+            self.drafter.expand_batch([self.req])
+        self.assertEqual(self.drafter._expand_tree.call_count, 32)
+        self.assertEqual(self.logger.warning.call_count, 2)
+        first, repeated = self.logger.warning.call_args_list
+        self.assertEqual(first.args[1:3], ("expand_batch", shared.SHARED_PREFIX_IMPL))
+        self.assertEqual(first.args[3]["req_to_token"], "torch.int32")
+        self.assertEqual(first.args[3]["node_slots"], "torch.int64")
+        self.assertIsNotNone(first.kwargs["exc_info"][2])
+        self.assertEqual(repeated.args[4], 32)
+        self.assertIsNone(repeated.kwargs["exc_info"])
+
+    def test_capture_status_does_not_claim_configured_graph_is_ready(self):
+        runner_cls = Mock()
+        module = NS(EAGLEDraftCudaGraphRunner=runner_cls)
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.speculative.eagle_draft_cuda_graph_runner": module},
+        ):
+            for graphs, ready in (({}, False), ({1: object()}, True)):
+                runner_cls.return_value = NS(graphs=graphs)
+                self.drafter._init_cuda_graphs()
+                self.assertEqual(self.drafter.tree_graph_capture_succeeded, ready)
+                self.assertEqual(
+                    self.drafter.tree_graph_disabled_reason,
+                    None if ready else "no graphs",
+                )
+                self.assertEqual(
+                    self.drafter.draft_model_runner.draft_attn_backend, "original"
+                )
+            runner_cls.side_effect = RuntimeError("capture failed")
+            self.drafter._init_cuda_graphs()
+            self.assertFalse(self.drafter.tree_graph_capture_succeeded)
+            self.assertIsNone(self.drafter.cuda_graph_runner)
+            self.assertIn("capture failed", self.drafter.tree_graph_disabled_reason)
+            for exc in (
+                self.submitted_error("submitted"),
+                RuntimeError("illegal memory access"),
+            ):
+                runner_cls.side_effect = exc
+                with self.assertRaises(type(exc)):
+                    self.drafter._init_cuda_graphs()
+                self.assertEqual(
+                    self.drafter.draft_model_runner.draft_attn_backend, "original"
+                )
+
+    def test_target_normal_decode_counts_only_fallback(self):
+        fn = methods(
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py",
+            "StandaloneRemoteWorker",
+            ["_forward_normal_decode"],
+            dict(
+                torch=torch,
+                ForwardMode=NS(DECODE="decode"),
+                GenerationBatchResult=NS,
+                _align_seq_lens_to_committed=lambda batch: None,
+                alloc_for_decode=lambda batch, **kw: torch.tensor([3]),
+                _is_health_check=lambda req: False,
+                _default_draft=lambda: {},
+            ),
+        )["_forward_normal_decode"]
+        req = NS(
+            output_ids=[2],
+            kv_committed_len=3,
+            kv_allocated_len=3,
+            grammar=None,
+            check_finished=Mock(),
+        )
+        metrics = NS(counts=Counter())
+        batch = NS(
+            reqs=[req],
+            batch_size=lambda: 1,
+            seq_lens=torch.tensor([3]),
+            seq_lens_cpu=torch.tensor([3]),
+            orig_seq_lens=None,
+            seq_lens_sum=3,
+            global_num_tokens=None,
+            global_num_tokens_for_logprob=None,
+            return_logprob=False,
+            get_model_worker_batch=lambda: NS(),
+            sampling_info=NS(penalizer_orchestrator=NS(is_required=False)),
+            sr_round_metrics=metrics,
+        )
+        worker = NS(
+            _forward_target_eager=Mock(
+                return_value=NS(next_token_ids=torch.tensor([4]), logits_output=None)
+            )
+        )
+        result = fn(worker, batch)
+        self.assertEqual(req.output_ids, [2, 4])
+        self.assertEqual(result.accept_length_per_req_cpu, [1])
+        self.assertFalse(result.can_run_cuda_graph)
+        self.assertEqual(
+            metrics.counts,
+            Counter(
+                normal_decode_fallback_batches=1, normal_decode_fallback_requests=1
+            ),
+        )
+
+    def test_forward_device_event_ends_before_result_wait(self):
+        for graph_mode in (True, False):
+            trace = []
+            events = []
+
+            class Event:
+                def __init__(self, **kwargs):
+                    self.index = len(events)
+                    events.append(self)
+
+                def record(self):
+                    trace.append(f"event{self.index}")
+
+                def query(self):
+                    return True
+
+                def elapsed_time(self, end):
+                    return 7.0
+
+            class Result:
+                def __getitem__(self, row):
+                    return self
+
+                def detach(self):
+                    return self
+
+                def to(self, device):
+                    trace.append("result_d2h")
+                    return self
+
+                def tolist(self):
+                    return [1]
+
+            def forward(*args):
+                trace.append("forward")
+                return (Result(),) * 3
+
+            metrics = SRRoundMetrics("Draft", NS(Event=Event))
+            batch = NS(get_model_worker_batch=lambda: NS())
+            self.drafter.scheduler = NS(
+                _sr_round_metrics=metrics, _sr_make_decode_batch=lambda reqs: batch
+            )
+            self.drafter.topk = 3
+            self.drafter._alloc_tree_kv = Mock(return_value="snapshot")
+            self.drafter.token_to_kv_pool_allocator = NS(restore_state=Mock())
+            self.drafter.draft_attn_backend.init_forward_metadata = Mock()
+            self.drafter.cuda_graph_runner = NS(
+                can_run=lambda batch: graph_mode,
+                replay=Mock(side_effect=forward),
+                tree_graph_replay_count=0,
+            )
+            self.drafter._draft_forward = forward
+            fn = methods(
+                ROOT
+                / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+                "SRTreeDrafter",
+                ["_expand_tree"],
+                dict(
+                    time=time,
+                    nullcontext=nullcontext,
+                    logger=self.logger,
+                    EagleDraftInput=NS,
+                    CaptureHiddenMode=NS(LAST="last"),
+                    ForwardBatch=NS(
+                        init_new=lambda *args: NS(
+                            forward_mode=NS(is_idle=lambda: False)
+                        )
+                    ),
+                    NpuGraphReplaySubmittedError=self.submitted_error,
+                    NpuGraphPreparationError=ValueError,
+                ),
+            )["_expand_tree"]
+            self.drafter._expand_tree = MethodType(fn, self.drafter)
+            with metrics.round():
+                self.assertEqual(
+                    self.drafter.expand_batch([self.req]), [([1], [1], [1])]
+                )
+            self.assertEqual(
+                trace, ["event0", "forward", "event1"] + ["result_d2h"] * 3
+            )
+            self.assertIn("tree_forward", metrics.host)
+            self.assertIn("tree_result_wait_pack", metrics.host)
+            self.assertEqual(len(metrics.pending), 1)
+            metrics.poll()
+            self.assertEqual(metrics.device_ms["tree_forward"], 7.0)
+            self.drafter.token_to_kv_pool_allocator.restore_state.assert_called_once_with(
+                "snapshot"
+            )
+            if graph_mode:
+                # Never record an end event or restore memory after a submitted
+                # replay failure; preserve the worker's fatal-error path.
+                metrics.rounds = 32
+                self.drafter.cuda_graph_runner.replay.side_effect = (
+                    self.submitted_error("submitted")
+                )
+                self.drafter.token_to_kv_pool_allocator.restore_state.reset_mock()
+                with self.assertRaises(self.submitted_error), metrics.round():
+                    self.drafter.expand_batch([self.req])
+                self.assertEqual(len(events), 4)
+                self.assertEqual(trace[-1], "event2")
+                self.assertEqual(len(metrics.pending), 0)
+                self.drafter.token_to_kv_pool_allocator.restore_state.assert_not_called()
+
+
+class TestGraphDispatch(unittest.TestCase):
+    def test_compact_draft_updates_existing_fia_payload(self):
+        path = ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        names = {
+            "NpuGraphPreparationError",
+            "NpuGraphReplaySubmittedError",
+            "fill_fia_cpu_update_payload",
+            "run_npu_graph_update_and_replay",
+        }
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
+        ]
+        ns = dict(threading=threading)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
+        ns.update(
+            logger=logging.getLogger(__name__),
+            is_deepseek_nsa=lambda _: False,
+            tree_fia_actual_seq_lengths_kv=tree_fia_actual_seq_lengths_kv,
+        )
+        fn = methods(
+            NPU / "graph_runner/eagle_draft_npu_graph_runner.py",
+            "EAGLEDraftNpuGraphRunner",
+            ["_replay", "_assert_tree_replay_graph"],
+            ns,
+        )
+        batch = NS(seq_lens_cpu=torch.tensor([127]))
+        inners = [
+            NS(_replay_tree_s_cap=256, tree_fia_kv_lens_cpu=[128 + i] * 3 + [0] * 3)
+            for i in range(4)
+        ]
+        payload = [{"actual_seq_lengths_kv": [1] * 6} for _ in range(8)]
+        addresses = [id(x["actual_seq_lengths_kv"]) for x in payload]
+        graph = NS(update=Mock(), replay=Mock())
+        plan = NS(
+            graph_key="2_s256", capture_bs=2, raw_bs=1, tokens_per_req=3, kv_bucket=256
+        )
+        runner = NS(
+            _tree_replay_plan=plan,
+            _tree_replay_batch_id=id(batch),
+            _tree_replay_graph=graph,
+            graphs={plan.graph_key: graph},
+            _tree_attention_impls={plan.graph_key: "compact_fia"},
+            _current_tree_attention_impl=lambda: "compact_fia",
+            model_runner=NS(
+                draft_attn_backend=NS(attn_backends=inners),
+                model_config=NS(hf_config=NS()),
+            ),
+            bs=2,
+            raw_bs=1,
+            num_tokens_per_bs=3,
+            topk=3,
+            _get_update_attr_name=lambda: "actual_seq_lengths_kv",
+            _get_update_attr_type=lambda: [],
+            output_buffers={plan.graph_key: object()},
+            _slot_gather_graph=True,
+            _tree_compact_fia=True,
+            _tree_fia_maps={
+                plan.graph_key: dict(
+                    n_steps=4,
+                    n_records=8,
+                    num_layers=2,
+                    step_ids=[0, 0, 1, 1, 2, 2, 3, 3],
+                    payload=payload,
+                )
+            },
+            _logged_tree_fia_update_bs=set(),
+            tree_graph_replay_count=0,
+            tree_eager_fallback_count=0,
+        )
+        runner._assert_tree_replay_graph = MethodType(
+            fn["_assert_tree_replay_graph"], runner
+        )
+        for prefix in (127, 3):
+            batch.seq_lens_cpu.fill_(prefix)
+            for i, inner in enumerate(inners):
+                inner.tree_fia_kv_lens_cpu[:] = [prefix + i + 1] * 3 + [0] * 3
+            fn["_replay"](runner, batch)
+            graph.update.assert_called_with(cpu_update_input=payload)
+            for i, record in enumerate(payload):
+                # FIA clamps padding to one safe slot; the slot-length tensor
+                # remains zero and masks the padded outputs in the backend.
+                self.assertEqual(
+                    record["actual_seq_lengths_kv"], [prefix + i // 2 + 1] * 3 + [1] * 3
+                )
+            self.assertEqual(
+                addresses, [id(x["actual_seq_lengths_kv"]) for x in payload]
+            )
+        self.assertEqual(graph.replay.call_count, 2)
+        runner._tree_attention_impls[plan.graph_key] = shared.SHARED_PREFIX_IMPL
+        with self.assertRaises(ns["NpuGraphPreparationError"]):
+            fn["_replay"](runner, batch)
+        self.assertEqual(graph.replay.call_count, 2)
+
+    def test_oversized_batch_keeps_eager_compact_fallback(self):
+        fn = methods(
+            NPU / "attention/ascend_backend.py",
+            "AscendAttnBackend",
+            ["_prepare_shared_eager"],
+            dict(vars(shared)),
+        )["_prepare_shared_eager"]
+        backend = NS(
+            _is_tree_draft=lambda batch: True,
+            draft_topk=3,
+            draft_num_steps=5,
+            tree_kv_buckets=[256, 512],
+            _log_tree_fallback_once=Mock(),
+            _shared_metadata=Mock(
+                side_effect=AssertionError("must use old eager metadata")
+            ),
+        )
+        self.assertFalse(
+            fn(backend, NS(seq_lens_cpu=torch.tensor([510]), batch_size=1))
+        )
+        backend._shared_metadata.assert_not_called()
+
+    def test_real_metadata_capture_rebinds_bucket_and_padding(self):
+        names = [
+            "_shared_metadata",
+            "_sync_active_tree_s_cap",
+            "_fill_shared_metadata",
+            "init_forward_metadata_capture_cuda_graph",
+            "init_forward_metadata_replay_cuda_graph",
+        ]
+        functions = methods(
+            NPU / "attention/ascend_backend.py",
+            "AscendAttnBackend",
+            names,
+            dict(vars(shared), ForwardMetadata=NS),
+        )
+        backend = NS(
+            _use_tree_shared_prefix=lambda: True,
+            draft_topk=1,
+            draft_num_steps=5,
+            verify_tree_topk=3,
+            _shared_graph_metadata={},
+            graph_metadata={},
+            _replay_tree_s_cap=None,
+            device="cpu",
+            tree_kv_buckets=[256, 512],
+            req_to_token=torch.arange(2048, dtype=torch.int32).view(2, 1024),
+            _tree_verify_mask_layout=lambda spec, seq: (
+                spec.seq_lens_cpu,
+                len(spec.seq_lens_cpu),
+            ),
+        )
+        for name, fn in functions.items():
+            setattr(backend, name, MethodType(fn, backend))
+        mode = NS(is_target_verify=lambda: True, is_decode_or_idle=lambda: False)
+        pool = torch.tensor([0, 1])
+        for width in (512, 256):
+            backend._shared_capture_width = width
+            backend.init_forward_metadata_capture_cuda_graph(
+                2, 6, pool, torch.zeros(2), None, mode, NS()
+            )
+        addresses = {
+            key: [v.data_ptr() for v in vars(md).values()]
+            for key, md in backend._shared_graph_metadata.items()
+        }
+        nodes = torch.arange(1600, 1606)
+        backend._graph_out_cache_loc = lambda n: nodes[:n]
+        backend._shared_capture_width = None
+        for width, lengths in ((256, [127, 3]), (512, [300]), (256, [3])):
+            backend._replay_tree_s_cap = width
+            spec = NS(
+                draft_token_num=3,
+                seq_lens_cpu=lengths,
+                custom_mask=mask_for(lengths, 3),
+            )
+            backend.init_forward_metadata_replay_cuda_graph(
+                2, pool, torch.zeros(2), 0, None, mode, spec, torch.tensor(lengths)
+            )
+            md = backend.forward_metadata.tree_shared
+            self.assertEqual(md.prefix_slots.shape, (2, width))
+            self.assertEqual(
+                md.prefix_lens.tolist(), lengths + [0] * (2 - len(lengths))
+            )
+            self.assertEqual(
+                addresses[(2, 3, width, False)],
+                [v.data_ptr() for v in vars(md).values()],
+            )
+
+    def test_both_runners_skip_fia_and_propagate_submitted_failure(self):
+        class PreparationError(RuntimeError):
+            def __init__(self, message, **kwargs):
+                super().__init__(message)
+
+        class SubmittedError(RuntimeError):
+            pass
+
+        class Output(NS):
+            pass
+
+        for draft in (True, False):
+            file = "eagle_draft_npu_graph_runner.py" if draft else "npu_graph_runner.py"
+            klass = "EAGLEDraftNpuGraphRunner" if draft else "NPUGraphRunner"
+            method = "_replay" if draft else "replay"
+            fail = Mock(side_effect=AssertionError("FIA must not be used"))
+            ns = {
+                "is_deepseek_nsa": lambda cfg: False,
+                "logger": logging.getLogger(__name__),
+                "NpuGraphPreparationError": PreparationError,
+                "NpuGraphReplaySubmittedError": SubmittedError,
+                "LogitsProcessorOutput": Output,
+                "tree_fia_actual_seq_lengths_kv": fail,
+                "run_npu_graph_update_and_replay": fail,
+            }
+            fn = methods(
+                NPU / "graph_runner" / file,
+                klass,
+                [method, "_assert_tree_replay_graph"],
+                ns,
+            )
+            batch = NS()
+            graph = NS(replay=Mock(), update=fail)
+            backend = NS(
+                _replay_tree_s_cap=256,
+                _use_tree_compact_fia=lambda: True,
+                _use_tree_shared_prefix=lambda: True,
+            )
+            plan = NS(
+                graph_key="tree",
+                capture_bs=1,
+                raw_bs=1,
+                tokens_per_req=3,
+                kv_bucket=256,
+            )
+            runner = NS(
+                _tree_replay_plan=plan,
+                _tree_replay_batch_id=id(batch),
+                _tree_replay_stream_idx=None,
+                _tree_replay_graph=graph,
+                graphs={"tree": graph},
+                bs=1,
+                raw_bs=1,
+                raw_num_token=3,
+                num_tokens_per_bs=3,
+                output_buffers={
+                    "tree": Output(
+                        next_token_logits=torch.ones(3, 5), hidden_states=None
+                    )
+                },
+                model_runner=NS(attn_backend=backend, model_config=NS(hf_config=NS())),
+                _get_update_attr_name=lambda: "unused",
+                _get_update_attr_type=lambda: [],
+                _slot_gather_graph=True,
+                _tree_compact_fia=False,
+                tree_graph_replay_count=0,
+                tree_eager_fallback_count=0,
+                tree_verify_replay_count=0,
+                tree_verify_eager_fallback_count=0,
+                _current_tree_attention_impl=lambda: shared.SHARED_PREFIX_IMPL,
+                _tree_attention_impls={"tree": shared.SHARED_PREFIX_IMPL},
+                _clear_tree_replay_plan=Mock(),
+                replay_prepare=Mock(),
+                _is_tree_verify_batch=lambda b: True,
+                is_dllm=False,
+            )
+            runner._assert_tree_replay_graph = MethodType(
+                fn["_assert_tree_replay_graph"], runner
+            )
+            fn[method](runner, batch)
+            graph.replay.assert_called_once()
+            fail.assert_not_called()
+            graph.replay.side_effect = RuntimeError("device error")
+            with self.assertRaises(SubmittedError):
+                fn[method](runner, batch)
+            self.assertEqual(graph.replay.call_count, 2)
+            runner._tree_attention_impls["tree"] = "compact_fia"
+            with self.assertRaises(PreparationError):
+                fn[method](runner, batch)
+            self.assertEqual(graph.replay.call_count, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

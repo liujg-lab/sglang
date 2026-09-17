@@ -95,6 +95,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self._fia_payloads = {}
+        self._tree_attention_impls = {}
         super().__init__(model_runner)
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
@@ -153,11 +154,24 @@ class NPUGraphRunner(CudaGraphRunner):
         self._tree_replay_graph = self.graphs[plan.graph_key]
 
     def _assert_tree_replay_graph(self, plan: TreeReplayPlan):
+        implementations = getattr(self, "_tree_attention_impls", {})
+        if (
+            plan.graph_key in implementations
+            and implementations[plan.graph_key] != self._current_tree_attention_impl()
+        ):
+            raise NpuGraphPreparationError(
+                "tree attention implementation changed after capture", scope="graph"
+            )
         if self.graphs.get(plan.graph_key) is not self._tree_replay_graph:
             raise NpuGraphPreparationError(
                 "captured graph changed after admission",
                 scope="graph",
             )
+
+    def _current_tree_attention_impl(self):
+        return getattr(
+            self.model_runner.attn_backend, "tree_attention_impl", "compact_fia"
+        )
 
     def _padded_capture_bs(self, forward_batch: ForwardBatch, actual_ntpb: int):
         """Same conversion as ``CudaGraphRunner.replay_prepare``."""
@@ -225,6 +239,12 @@ class NPUGraphRunner(CudaGraphRunner):
             if is_tree_verify:
                 self.tree_verify_eager_fallback_count += 1
             return False
+        if (
+            graph_key in self._tree_attention_impls
+            and self._tree_attention_impls[graph_key]
+            != self._current_tree_attention_impl()
+        ):
+            return False
         self._save_tree_replay_plan(
             TreeReplayPlan(
                 graph_key=graph_key,
@@ -285,9 +305,17 @@ class NPUGraphRunner(CudaGraphRunner):
         stream_idx=None,
         ntpb_override=None,
     ):
-        graph, out = super().capture_one_batch_size(
-            bs, forward, stream_idx, ntpb_override
-        )
+        backend = self.model_runner.attn_backend
+        shared = getattr(backend, "_use_tree_shared_prefix", lambda: False)()
+        if shared:
+            backend._shared_capture_width = getattr(self, "_active_capture_extra", None)
+        try:
+            graph, out = super().capture_one_batch_size(
+                bs, forward, stream_idx, ntpb_override
+            )
+        finally:
+            if shared:
+                backend._shared_capture_width = None
         self._ensure_capture_attrs()
         self.update_attr_name = self._get_update_attr_name()
         ntpb = ntpb_override if ntpb_override is not None else self.num_tokens_per_bs
@@ -298,6 +326,10 @@ class NPUGraphRunner(CudaGraphRunner):
             ntpb if _uses_dual_ntpb(self) else None,
             extra=extra,
         )
+        if extra is not None:
+            self._tree_attention_impls[key] = self._current_tree_attention_impl()
+            if shared:
+                return graph, out
         n_lens = int(bs) * int(ntpb) if extra is not None else int(bs)
         self._fia_payloads[key] = [{self.update_attr_name: [1] * n_lens}]
         return graph, out
@@ -427,6 +459,7 @@ class NPUGraphRunner(CudaGraphRunner):
             compact_fia = bool(
                 backend is not None
                 and getattr(backend, "_use_tree_compact_fia", lambda: False)()
+                and not getattr(backend, "_use_tree_shared_prefix", lambda: False)()
             )
             skip_fia_update = is_deepseek_nsa(
                 self.model_runner.model_config.hf_config
@@ -482,18 +515,17 @@ class NPUGraphRunner(CudaGraphRunner):
                 ):
                     logger.info(
                         "NPU tree verify graph replay count=%s bucket=%s key=%s "
-                        "needed_len_max=%s eager_fallback=%s",
+                        "needed_len_max=%s eager_fallback=%s implementation=%s",
                         self.tree_verify_replay_count,
                         kv_bucket,
                         graph_key,
                         (
                             max(seq_lens)
-                            if not skip_fia_update
-                            and is_tree_verify
-                            and compact_fia
+                            if not skip_fia_update and is_tree_verify and compact_fia
                             else None
                         ),
                         self.tree_verify_eager_fallback_count,
+                        self._current_tree_attention_impl(),
                     )
 
             output = self.output_buffers[graph_key]

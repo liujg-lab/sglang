@@ -26,6 +26,16 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.tree_shared_prefix import (
+    SHARED_PREFIX_IMPL,
+    SharedPrefixMetadata,
+    cache_view,
+    cpu_prefix_lengths,
+    fill_shared_draft_,
+    fill_shared_verify_,
+    shared_prefix_attention,
+    shared_prefix_layer_supported,
+)
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
@@ -99,6 +109,7 @@ class AttnGraphRole:
 @dataclass
 class ForwardMetadata:
 
+    tree_shared: Optional[SharedPrefixMetadata] = None
     sr_tail: Optional[SRTailAttentionMetadata] = None
 
     # calculated map for kv positions [bs * maxseqlen]
@@ -397,6 +408,153 @@ class AscendAttnBackend(AttentionBackend):
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
 
+        self._shared_graph_metadata = {}
+        self._init_tree_shared_prefix()
+
+    def _init_tree_shared_prefix(self):
+        """Select once, before either runner starts capturing graphs."""
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        self.tree_attention_impl = (
+            "compact_fia" if self._use_tree_compact_fia() else "chunked"
+        )
+        reason = None
+        args = self.model_runner.server_args
+        if (
+            args.speculative_algorithm != "STANDALONE_REMOTE"
+            or self.verify_tree_topk <= 1
+        ):
+            return
+        if self.use_mla or self.is_hybrid_swa or self.is_dllm_model or self.use_alibi:
+            reason = "specialized attention architecture"
+        else:
+            modules = list(self.model_runner.model.modules())
+            layers = [m for m in modules if isinstance(m, RadixAttention)]
+            if not layers or not all(shared_prefix_layer_supported(m) for m in layers):
+                reason = "unsupported attention layer"
+            elif any(getattr(m, "sinks", None) is not None for m in modules):
+                reason = "attention sinks"
+            else:
+                pool = self.model_runner.token_to_kv_pool
+                # Public accessors may wait for layer-wise cache transfers;
+                # capability inspection must not wait for request data.
+                get_key = getattr(pool, "_get_key_buffer", pool.get_key_buffer)
+                get_value = getattr(pool, "_get_value_buffer", pool.get_value_buffer)
+                try:
+                    for layer in layers:
+                        for cache in (
+                            get_key(layer.layer_id),
+                            get_value(layer.layer_id),
+                        ):
+                            if (
+                                cache.dtype not in (torch.float16, torch.bfloat16)
+                                or cache.dtype != self.model_dtype
+                            ):
+                                raise ValueError("quantized or mixed KV dtype")
+                            if torch_npu.get_npu_format(cache) == 29:
+                                raise ValueError("NZ KV layout")
+                            cache_view(cache, layer.tp_k_head_num, layer.qk_head_dim)
+                except (ValueError, RuntimeError) as exc:
+                    reason = str(exc)
+        if reason is None:
+            # Remote Draft is a standalone server, not a local draft worker.
+            # Three-query, multi-step expansion regresses with the FP32 torch
+            # path. Keep paged Draft on fused FIA; Target still shares prefix KV.
+            if (
+                getattr(args, "standalone_remote_role", None) == "draft"
+                and self.page_size > 1
+            ):
+                reason = "paged SR Draft latency policy: prefer compact-FIA"
+            else:
+                self.tree_attention_impl = SHARED_PREFIX_IMPL
+        logger.info(
+            "NPU SR tree attention implementation=%s fallback_reason=%s",
+            self.tree_attention_impl,
+            reason,
+        )
+
+    def _use_tree_shared_prefix(self):
+        return getattr(self, "tree_attention_impl", None) == SHARED_PREFIX_IMPL
+
+    def _shared_metadata(self, bs, queries, width, *, draft, graph):
+        key = (bs, queries, width, draft)
+        if graph and key in self._shared_graph_metadata:
+            return self._shared_graph_metadata[key]
+        nodes = self.draft_topk * self.draft_num_steps if draft else queries
+        path = self.draft_num_steps if draft else queries
+        md = SharedPrefixMetadata.allocate(bs, queries, width, nodes, path, self.device)
+        if graph:
+            self._shared_graph_metadata[key] = md
+        return md
+
+    def _prepare_shared_eager(self, batch):
+        draft = self._is_tree_draft(batch)
+        if draft:
+            lengths = cpu_prefix_lengths(batch.seq_lens_cpu, batch.batch_size)
+            queries = self.draft_topk
+        else:
+            lengths, raw_bs = self._tree_verify_mask_layout(
+                batch.spec_info, batch.seq_lens_cpu
+            )
+            lengths = cpu_prefix_lengths(lengths, raw_bs)
+            queries = int(batch.spec_info.draft_token_num)
+        extra = self.draft_num_steps if draft else queries
+        if self.tree_kv_buckets and max(lengths, default=0) + extra > max(
+            self.tree_kv_buckets
+        ):
+            self._log_tree_fallback_once(
+                "capacity",
+                "shared-prefix batch exceeds captured buckets; using eager compact-FIA",
+            )
+            return False
+        md = self._shared_metadata(
+            len(lengths), queries, max(lengths, default=0), draft=draft, graph=False
+        )
+        self.forward_metadata.tree_shared = md
+        self._fill_shared_metadata(
+            md, batch.req_pool_indices, lengths, draft=draft, batch=batch
+        )
+        return True
+
+    def _fill_shared_metadata(self, md, pool, lengths, *, draft, batch=None):
+        if draft:
+            fill_shared_draft_(
+                md,
+                self.req_to_token,
+                pool,
+                lengths,
+                page_size=self.page_size,
+                topk=self.draft_topk,
+                steps=self.draft_num_steps,
+                step=self.speculative_step_id,
+            )
+        else:
+            fill_shared_verify_(
+                md,
+                self.req_to_token,
+                pool,
+                lengths,
+                batch.out_cache_loc,
+                batch.spec_info.custom_mask,
+                int(batch.spec_info.draft_token_num),
+            )
+
+    def _run_tree_shared_prefix_attention(self, q, k_cache, v_cache, layer):
+        md = self.forward_metadata.tree_shared
+        if md is None or not shared_prefix_layer_supported(layer):
+            raise RuntimeError(
+                "shared-prefix attention capability changed after graph selection"
+            )
+        bs, queries = md.path_lens.shape
+        return shared_prefix_attention(
+            q.view(bs, queries, layer.tp_q_head_num, layer.qk_head_dim),
+            k_cache,
+            v_cache,
+            md,
+            scale=layer.scaling,
+            kv_heads=layer.tp_k_head_num,
+        )
+
     def _graph_row_capacity(self, max_bs: int, max_num_tokens: int) -> int:
         roles = getattr(self, "graph_roles", None)
         if not roles:
@@ -511,7 +669,9 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def _use_tree_draft_slot_gather(self, forward_batch: ForwardBatch) -> bool:
-        return self._is_tree_draft(forward_batch) and self.page_size > 1
+        return self._is_tree_draft(forward_batch) and (
+            self.page_size > 1 or self._use_tree_shared_prefix()
+        )
 
     def _fill_tree_draft_kv_slots(
         self,
@@ -595,6 +755,12 @@ class AscendAttnBackend(AttentionBackend):
 
     def tree_slot_graph_width(self) -> Optional[int]:
         """Captured slot-table columns, or None before graph buffers exist."""
+        if self._use_tree_shared_prefix():
+            return (
+                self._replay_tree_s_cap
+                or self._active_tree_s_cap
+                or max(self.tree_kv_buckets, default=self.tree_graph_max_kv)
+            )
         slots = self.cuda_graph_kv_slots
         if slots is None:
             return None
@@ -637,7 +803,7 @@ class AscendAttnBackend(AttentionBackend):
             fm is not None
             and fm.is_decode_or_idle()
             and int(self.draft_topk) > 1
-            and int(self.page_size) > 1
+            and (int(self.page_size) > 1 or self._use_tree_shared_prefix())
         )
         seq = getattr(forward_batch, "seq_lens_cpu", None)
         if seq is None:
@@ -796,6 +962,11 @@ class AscendAttnBackend(AttentionBackend):
         metadata.tree_verify_kv_lens_t = lens
 
     def _sync_active_tree_s_cap(self) -> None:
+        if self._use_tree_shared_prefix():
+            self._active_tree_s_cap = (
+                getattr(self, "_shared_capture_width", None) or self._replay_tree_s_cap
+            )
+            return
         runner = getattr(self.model_runner, "graph_runner", None)
         extra = getattr(runner, "_active_capture_extra", None)
         if extra is None:
@@ -1038,6 +1209,11 @@ class AscendAttnBackend(AttentionBackend):
         k_rope_cache: Optional[torch.Tensor] = None,
         rope_head_dim: Optional[int] = None,
     ) -> torch.Tensor:
+        if (
+            self._use_tree_shared_prefix()
+            and self.forward_metadata.tree_shared is not None
+        ):
+            return self._run_tree_shared_prefix_attention(q, k_cache, v_cache, layer)
         log_tree_verify_fallback_once(self.verify_tree_topk)
         num_draft = int(
             getattr(forward_batch.spec_info, "draft_token_num", None)
@@ -1100,6 +1276,11 @@ class AscendAttnBackend(AttentionBackend):
         k_rope_cache: Optional[torch.Tensor] = None,
         rope_head_dim: Optional[int] = None,
     ) -> torch.Tensor:
+        if (
+            self._use_tree_shared_prefix()
+            and self.forward_metadata.tree_shared is not None
+        ):
+            return self._run_tree_shared_prefix_attention(q, k_cache, v_cache, layer)
         slots = self.forward_metadata.tree_draft_kv_slots
         if slots is None:
             raise RuntimeError(
@@ -1211,6 +1392,16 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        if self._use_tree_shared_prefix() and (
+            self._is_tree_draft(forward_batch)
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.verify_tree_topk > 1
+            )
+        ):
+            if self._prepare_shared_eager(forward_batch):
+                self.graph_mode = False
+                return
         is_sr_tail = getattr(forward_batch, "is_sr_tail_extend", False)
         self.sr_tail_attention_paths = set()
         seq_lens_max = (
@@ -1383,14 +1574,24 @@ class AscendAttnBackend(AttentionBackend):
         self.cuda_graph_verify_positions = torch.empty(
             (max_q,), dtype=torch.int64, device=self.device
         )
-        self.cuda_graph_kv_slots = torch.zeros(
-            (max_q, slot_max_kv), dtype=torch.int64, device=self.device
+        self.cuda_graph_kv_slots = (
+            None
+            if self._use_tree_shared_prefix()
+            else torch.zeros(
+                (max_q, slot_max_kv), dtype=torch.int64, device=self.device
+            )
         )
-        self.cuda_graph_kv_lens = torch.zeros(
-            (max_q,), dtype=torch.int32, device=self.device
+        self.cuda_graph_kv_lens = (
+            None
+            if self._use_tree_shared_prefix()
+            else torch.zeros((max_q,), dtype=torch.int32, device=self.device)
         )
-        self.cuda_graph_verify_workspace = torch.zeros(
-            (max_q, slot_max_kv + 1), dtype=torch.int64, device=self.device
+        self.cuda_graph_verify_workspace = (
+            None
+            if self._use_tree_shared_prefix()
+            else torch.zeros(
+                (max_q, slot_max_kv + 1), dtype=torch.int64, device=self.device
+            )
         )
         logger.info(
             "tree slot-gather graph buffers: max_q=%s slot_max_kv=%s "
@@ -1431,6 +1632,25 @@ class AscendAttnBackend(AttentionBackend):
     ):
         self._sync_active_tree_s_cap()
         metadata = ForwardMetadata()
+
+        draft = (
+            self.draft_topk > 1
+            and spec_info is not None
+            and not forward_mode.is_target_verify()
+        )
+        if self._use_tree_shared_prefix() and (
+            draft or (forward_mode.is_target_verify() and self.verify_tree_topk > 1)
+        ):
+            queries = self.draft_topk if draft else num_tokens // bs
+            width = int(self._active_tree_s_cap or max(self.tree_kv_buckets))
+            metadata.tree_shared = self._shared_metadata(
+                bs, queries, width, draft=draft, graph=True
+            )
+            metadata.tree_shared.clear()
+            self.graph_metadata[bs] = metadata
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
 
         table_rows = self._tree_draft_table_rows(bs, num_tokens)
         metadata.block_tables = self.graph_metadata["block_tables"][:table_rows, :]
@@ -1557,6 +1777,45 @@ class AscendAttnBackend(AttentionBackend):
     ):
         self._sync_active_tree_s_cap()
         metadata = self.graph_metadata[bs]
+        draft = (
+            self.draft_topk > 1
+            and spec_info is not None
+            and forward_mode.is_decode_or_idle()
+        )
+        if self._use_tree_shared_prefix() and (
+            draft or (forward_mode.is_target_verify() and self.verify_tree_topk > 1)
+        ):
+            queries = self.draft_topk if draft else int(spec_info.draft_token_num)
+            width = int(self._replay_tree_s_cap or self._active_tree_s_cap)
+            key = (bs, queries, width, draft)
+            if key not in self._shared_graph_metadata:
+                raise NpuGraphPreparationError(
+                    "missing captured shared-prefix buffers", scope="graph"
+                )
+            md = self._shared_graph_metadata[key]
+            metadata.tree_shared = md
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            if draft:
+                # Filled centrally with raw_bs, never the padded graph batch size.
+                return
+            lengths, raw_bs = self._tree_verify_mask_layout(spec_info, seq_lens_cpu)
+            lengths = cpu_prefix_lengths(lengths, raw_bs)
+            loc = self._graph_out_cache_loc(raw_bs * queries)
+            if loc is None:
+                raise NpuGraphPreparationError(
+                    "shared-prefix verify missing out_cache_loc", scope="graph"
+                )
+            fill_shared_verify_(
+                md,
+                self.req_to_token,
+                req_pool_indices,
+                lengths,
+                loc,
+                spec_info.custom_mask,
+                queries,
+            )
+            return
         replay_seq_lens = seq_lens_cpu[:bs] if seq_lens_cpu is not None else seq_lens[:bs]
         use_tree_draft_slots = (
             self.draft_topk > 1
@@ -2585,6 +2844,18 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
+        if (
+            self._use_tree_shared_prefix()
+            and forward_batch.forward_mode.is_target_verify()
+            and self.forward_metadata.tree_shared is not None
+        ):
+            return self._run_tree_shared_prefix_attention(
+                q,
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                layer,
+            )
+
         if not self.use_mla:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                 layer.layer_id
@@ -3369,6 +3640,7 @@ class AscendAttnMultiStepDraftBackend:
             and self.page_size > 1
             and bool(self.attn_backends)
             and self.attn_backends[0]._use_tree_compact_fia()
+            and not self.attn_backends[0]._use_tree_shared_prefix()
         )
         if self._central_tree_draft_fill:
             for inner in self.attn_backends:
@@ -3441,6 +3713,19 @@ class AscendAttnMultiStepDraftBackend:
     def _fill_central_tree_draft_graph_metadata(
         self, forward_batch: ForwardBatch, capture_bs: Optional[int] = None
     ):
+        if self.attn_backends and self.attn_backends[0]._use_tree_shared_prefix():
+            raw_bs = getattr(self, "_tree_replay_raw_bs", None)
+            if raw_bs is None:
+                raw_bs = forward_batch.batch_size
+            lengths = cpu_prefix_lengths(forward_batch.seq_lens_cpu, int(raw_bs))
+            for inner in self.attn_backends[: max(self.speculative_num_steps - 1, 0)]:
+                inner._fill_shared_metadata(
+                    inner.forward_metadata.tree_shared,
+                    forward_batch.req_pool_indices,
+                    lengths,
+                    draft=True,
+                )
+            return
         if not self._central_tree_draft_fill:
             return
         n_forward = max(int(self.speculative_num_steps) - 1, 0)

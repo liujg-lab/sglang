@@ -196,6 +196,7 @@ class TestTailAttention(unittest.TestCase):
         )
         backend.draft_topk = 3
         backend.is_hybrid_swa = False
+        backend._use_tree_shared_prefix = lambda: False
         backend._use_tree_draft_slot_gather = lambda batch: False
         mapping = torch.empty(2, 256, dtype=torch.int64)
         mapping[0] = torch.cat((torch.arange(512, 640), torch.arange(128, 256)))

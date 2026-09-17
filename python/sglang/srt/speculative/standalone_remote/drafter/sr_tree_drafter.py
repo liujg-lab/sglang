@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -74,6 +75,9 @@ class SRTreeDrafter:
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
         self.draft_attn_backend = None
         self.cuda_graph_runner = None
+        self._tree_failure_counts = {}
+        self.tree_graph_capture_succeeded = False
+        self.tree_graph_disabled_reason = None
         self._init_attention_backend()
         self._init_cuda_graphs()
 
@@ -85,6 +89,39 @@ class SRTreeDrafter:
     def draft_forward(self, forward_batch: ForwardBatch):
         """Alias for CUDA-graph capture, which calls ``eagle_worker.draft_forward``."""
         return self._draft_forward(forward_batch)
+
+    def _log_tree_failure(self, stage: str, exc: Exception) -> None:
+        """One traceback per failure signature; repeated failures report totals."""
+        # NPU errors append timestamps/PIDs on subsequent lines. Do not include
+        # request IDs in this key, otherwise every new request logs a traceback.
+        message = str(exc).splitlines()
+        summary = message[0] if message else type(exc).__name__
+        key = (stage, type(exc), summary)
+        count = self._tree_failure_counts.get(key, 0) + 1
+        self._tree_failure_counts[key] = count
+        if count != 1 and count % 32:
+            return
+        backend = self.draft_attn_backend
+        inners = getattr(backend, "attn_backends", None)
+        if inners:
+            backend = inners[0]
+        metadata = getattr(getattr(backend, "forward_metadata", None), "tree_shared", None)
+        dtypes = (
+            {name: str(value.dtype) for name, value in vars(metadata).items()}
+            if metadata is not None
+            else {}
+        )
+        dtypes["req_to_token"] = str(self.req_to_token_pool.req_to_token.dtype)
+        logger.warning(
+            "[SR] tree failure stage=%s implementation=%s metadata_dtypes=%s "
+            "occurrences=%s error=%s",
+            stage,
+            getattr(backend, "tree_attention_impl", type(backend).__name__),
+            dtypes,
+            count,
+            summary,
+            exc_info=(type(exc), exc, exc.__traceback__) if count == 1 else None,
+        )
 
     def _init_attention_backend(self) -> None:
         if self.speculative_num_steps <= 1:
@@ -104,9 +141,13 @@ class SRTreeDrafter:
     def _init_cuda_graphs(self) -> None:
         """Capture v1 EAGLE draft-tree graphs. Skip draft-extend graphs (not used by SR)."""
         self.cuda_graph_runner = None
+        self.tree_graph_capture_succeeded = False
+        self.tree_graph_disabled_reason = None
         if getattr(self.server_args, "disable_cuda_graph", False):
+            self.tree_graph_disabled_reason = "disabled by configuration"
             return
         if self.speculative_num_steps <= 1 or self.draft_attn_backend is None:
+            self.tree_graph_disabled_reason = "no multi-step attention backend"
             return
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         try:
@@ -132,6 +173,7 @@ class SRTreeDrafter:
             )
             graphs = getattr(self.cuda_graph_runner, "graphs", None)
             if reason or not graphs:
+                self.tree_graph_disabled_reason = reason or "no graphs"
                 logger.warning(
                     "[SR] tree draft graphs disabled after capture: %s "
                     "(tree_graph_replay_count=%s tree_eager_fallback_count=%s)",
@@ -140,9 +182,16 @@ class SRTreeDrafter:
                     getattr(self.cuda_graph_runner, "tree_eager_fallback_count", 0),
                 )
                 self.cuda_graph_runner = None
+            else:
+                self.tree_graph_capture_succeeded = True
             logger.info("[SR] Capture tree draft graph end.")
+        except NpuGraphReplaySubmittedError:
+            raise
         except Exception as e:
-            logger.warning("[SR] tree draft graph capture failed: %s", e)
+            if is_device_context_error(e):
+                raise
+            self._log_tree_failure("capture", e)
+            self.tree_graph_disabled_reason = "capture failed; see tree failure traceback"
             self.cuda_graph_runner = None
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
@@ -173,20 +222,23 @@ class SRTreeDrafter:
         except Exception as e:
             if is_device_context_error(e):
                 raise
-            logger.warning(
-                "[SR] tree expand_batch failed for %s: %s; falling back per-req",
-                [r.rid for r in keep],
-                e,
-            )
+            self._log_tree_failure("expand_batch", e)
+            # Retrying the very same single-request batch cannot isolate a bad
+            # request. Preserve the empty-window fallback without a second run.
+            if len(keep) == 1:
+                return windows
             for j, req in enumerate(keep):
                 windows[keep_idx[j]] = self._expand_one(req)
             return windows
-        for j, idx in enumerate(keep_idx):
-            windows[idx] = (
-                draft_tokens[j].detach().to("cpu").tolist(),
-                parent_list[j].detach().to("cpu").tolist(),
-                top_scores_index[j].detach().to("cpu").tolist(),
-            )
+        metrics = getattr(self.scheduler, "_sr_round_metrics", None)
+        # The first D2H waits for the asynchronously submitted tree forward.
+        with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
+            for j, idx in enumerate(keep_idx):
+                windows[idx] = (
+                    draft_tokens[j].detach().to("cpu").tolist(),
+                    parent_list[j].detach().to("cpu").tolist(),
+                    top_scores_index[j].detach().to("cpu").tolist(),
+                )
         return windows
 
     def _expand_one(self, req: "Req") -> SRTreeWindow:
@@ -203,13 +255,15 @@ class SRTreeDrafter:
         except Exception as e:
             if is_device_context_error(e):
                 raise
-            logger.warning("[SR] tree expand failed for %s: %s", req.rid, e)
+            self._log_tree_failure("expand_one", e)
             return empty
-        return (
-            draft_tokens[0].detach().to("cpu").tolist(),
-            parent_list[0].detach().to("cpu").tolist(),
-            top_scores_index[0].detach().to("cpu").tolist(),
-        )
+        metrics = getattr(self.scheduler, "_sr_round_metrics", None)
+        with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
+            return (
+                draft_tokens[0].detach().to("cpu").tolist(),
+                parent_list[0].detach().to("cpu").tolist(),
+                top_scores_index[0].detach().to("cpu").tolist(),
+            )
 
     def _stack_seeds(
         self, reqs: List["Req"]
@@ -267,6 +321,7 @@ class SRTreeDrafter:
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         graph_submitted = False
+        metrics = getattr(scheduler, "_sr_round_metrics", None)
         t_prep = time.perf_counter()
         try:
             if self.draft_attn_backend is not None:
@@ -280,52 +335,58 @@ class SRTreeDrafter:
                 and self.cuda_graph_runner.can_run(forward_batch)
             )
             t_exec = time.perf_counter()
-            if can_cuda_graph:
-                try:
-                    parent_list, top_scores_index, draft_tokens = (
-                        self.cuda_graph_runner.replay(forward_batch)
-                    )
-                except NpuGraphReplaySubmittedError:
-                    self.cuda_graph_runner = None
-                    graph_submitted = True
-                    raise
-                except NpuGraphPreparationError as e:
-                    logger.warning(
-                        "[SR] tree draft graph replay prep failed: %s; "
-                        "falling back to eager",
-                        e,
-                    )
-                    if getattr(e, "scope", "graph") == "format":
+            # End the device event before returning tensors for D2H/packing.
+            # No synchronize here: SRRoundMetrics polls completed samples later.
+            with (
+                metrics.phase("tree_forward", device=True) if metrics else nullcontext()
+            ):
+                if can_cuda_graph:
+                    try:
+                        parent_list, top_scores_index, draft_tokens = (
+                            self.cuda_graph_runner.replay(forward_batch)
+                        )
+                    except NpuGraphReplaySubmittedError:
                         self.cuda_graph_runner = None
-                    else:
-                        runner = self.cuda_graph_runner
-                        if runner is not None:
-                            runner.tree_eager_fallback_count = (
-                                getattr(runner, "tree_eager_fallback_count", 0) + 1
-                            )
-                    can_cuda_graph = False
-            if not can_cuda_graph:
-                if (
-                    self.draft_attn_backend is not None
-                    and self.speculative_num_steps > 1
-                    and not forward_batch.forward_mode.is_idle()
-                ):
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                parent_list, top_scores_index, draft_tokens = self._draft_forward(
-                    forward_batch
-                )
+                        graph_submitted = True
+                        raise
+                    except NpuGraphPreparationError as e:
+                        logger.warning(
+                            "[SR] tree draft graph replay prep failed: %s; "
+                            "falling back to eager",
+                            e,
+                        )
+                        if getattr(e, "scope", "graph") == "format":
+                            self.cuda_graph_runner = None
+                        else:
+                            runner = self.cuda_graph_runner
+                            if runner is not None:
+                                runner.tree_eager_fallback_count = (
+                                    getattr(runner, "tree_eager_fallback_count", 0) + 1
+                                )
+                        can_cuda_graph = False
+                if not can_cuda_graph:
+                    if (
+                        self.draft_attn_backend is not None
+                        and self.speculative_num_steps > 1
+                        and not forward_batch.forward_mode.is_idle()
+                    ):
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    parent_list, top_scores_index, draft_tokens = self._draft_forward(
+                        forward_batch
+                    )
+            exec_s = time.perf_counter() - t_exec
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
             if not graph_submitted:
                 self.token_to_kv_pool_allocator.restore_state(
                     token_to_kv_pool_state_backup
                 )
-        exec_s = time.perf_counter() - t_exec
         runner = self.cuda_graph_runner
         replay_n = getattr(runner, "tree_graph_replay_count", 0) if runner else 0
         if replay_n <= 1 or replay_n % 8 == 0:
             logger.info(
-                "[SR] tree draft timings: prep=%.3fs exec=%.3fs graph=%s "
+                "[SR] tree draft timings: prepare_host=%.3fs "
+                "forward_call_host=%.3fs graph=%s "
                 "replay=%s eager_fallback=%s",
                 prep_s,
                 exec_s,

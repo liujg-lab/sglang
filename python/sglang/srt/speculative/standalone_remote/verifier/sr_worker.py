@@ -349,8 +349,12 @@ class StandaloneRemoteWorker:
         )
         batch.spec_info = res.draft_input
         if metrics:
-            metrics.host["accept_commit"] += time.perf_counter() - accept_start
+            # Verification is asynchronous; acceptance can wait on its results.
+            metrics.host["accept_commit_including_wait"] += (
+                time.perf_counter() - accept_start
+            )
             lengths = res.accept_length_per_req_cpu
+            metrics.counts["verify_batches"] += 1
             metrics.counts["verify_requests"] += len(lengths)
             metrics.counts["accepted_draft_tokens"] += sum(lengths)
             metrics.counts["accepted_tokens_including_bonus"] += sum(lengths) + len(lengths)
@@ -498,6 +502,10 @@ class StandaloneRemoteWorker:
             req.sr_step_id = int(getattr(req, "sr_step_id", 0) or 0) + 1
             req.len_output_ids = len(req.output_ids)
 
+        metrics = getattr(batch, "sr_round_metrics", None)
+        if metrics:
+            metrics.counts["normal_decode_fallback_batches"] += 1
+            metrics.counts["normal_decode_fallback_requests"] += bs
         return GenerationBatchResult(
             logits_output=batch_result.logits_output,
             next_token_ids=batch_result.next_token_ids,

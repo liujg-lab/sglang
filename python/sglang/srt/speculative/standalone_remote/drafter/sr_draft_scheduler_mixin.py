@@ -131,9 +131,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         if topk > 1:
             self.sr_tree_drafter = SRTreeDrafter(self)
         logger.info(
-            "[SR] Draft scheduler ready (tree=%s topk=%s)",
+            "[SR] Draft scheduler ready (tree_configured=%s topk=%s "
+            "tree_graph_captured=%s tree_graph_disabled_reason=%s)",
             self.sr_tree_drafter is not None,
             topk,
+            getattr(self.sr_tree_drafter, "tree_graph_capture_succeeded", False),
+            getattr(
+                self.sr_tree_drafter, "tree_graph_disabled_reason", "tree not configured"
+            ),
         )
 
     def _sr_tree_mode(self) -> bool:
@@ -1354,7 +1359,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_resume_req(req)
         self._sr_park_in_running_many(ready)
         try:
-            with metrics.phase("tree_expand_pack", device=True):
+            # Aggregate host duration; _expand_tree records the device interval
+            # before result D2H, so CPU packing is not counted as device work.
+            with metrics.phase("tree_expand_pack"):
                 got = self.sr_tree_drafter.expand_batch(ready)
         except NpuGraphReplaySubmittedError:
             raise

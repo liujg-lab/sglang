@@ -76,6 +76,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.update_attr_type = None
         self._logged_tree_fia_update_bs = set()
         self._tree_fia_maps = {}
+        self._tree_attention_impls = {}
         self.tree_graph_replay_count = 0
         self.tree_eager_fallback_count = 0
         self.tree_graph_disabled_reason = None
@@ -93,6 +94,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._tree_compact_fia = self._slot_gather_graph and tree_compact_fia_layout_supported(
             use_mla=use_mla, has_rope_split=False
         )
+        backend = getattr(model, "draft_attn_backend", None)
+        inners = getattr(backend, "attn_backends", [])
+        self._tree_shared_prefix = bool(
+            inners and getattr(inners[0], "_use_tree_shared_prefix", lambda: False)()
+        )
+        if self._tree_shared_prefix:
+            self._slot_gather_graph = topk > 1
+            self._tree_compact_fia = False
         if self._slot_gather_graph:
             logger.info(
                 "NPU tree draft graphs use token-level slot gather "
@@ -168,11 +177,28 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._tree_replay_graph = self.graphs[plan.graph_key]
 
     def _assert_tree_replay_graph(self, plan: TreeReplayPlan):
+        implementations = getattr(self, "_tree_attention_impls", {})
+        if (
+            plan.graph_key in implementations
+            and implementations[plan.graph_key] != self._current_tree_attention_impl()
+        ):
+            raise NpuGraphPreparationError(
+                "tree attention implementation changed after capture", scope="graph"
+            )
         if self.graphs.get(plan.graph_key) is not self._tree_replay_graph:
             raise NpuGraphPreparationError(
                 "captured graph changed after admission",
                 scope="graph",
             )
+
+    def _current_tree_attention_impl(self):
+        backend = getattr(self.model_runner, "draft_attn_backend", None)
+        inners = getattr(backend, "attn_backends", [])
+        return (
+            getattr(inners[0], "tree_attention_impl", "compact_fia")
+            if inners
+            else "compact_fia"
+        )
 
     def _padded_capture_bs(self, forward_batch: ForwardBatch):
         """Same conversion as ``EAGLEDraftCudaGraphRunner.replay``."""
@@ -255,6 +281,13 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             if getattr(self, "_slot_gather_graph", False):
                 self.tree_eager_fallback_count += 1
             return False
+        if (
+            self._tree_attention_impls.get(
+                graph_key, self._current_tree_attention_impl()
+            )
+            != self._current_tree_attention_impl()
+        ):
+            return False
         self._save_tree_replay_plan(
             TreeReplayPlan(
                 graph_key=graph_key,
@@ -279,6 +312,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 backend._tree_replay_raw_bs = plan.raw_bs
                 backend._tree_replay_capture_bs = plan.capture_bs
                 backend._tree_replay_kv_bucket = plan.kv_bucket
+                if getattr(self, "_tree_shared_prefix", False):
+                    for inner in backend.attn_backends:
+                        inner._replay_tree_s_cap = plan.kv_bucket
         try:
             return super().replay(forward_batch)
         except NpuGraphPreparationError:
@@ -342,7 +378,23 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
-        graph, out = super().capture_one_batch_size(num_seqs, forward, stream_idx)
+        backend = self.model_runner.draft_attn_backend
+        inners = getattr(backend, "attn_backends", [])
+        if self._tree_shared_prefix:
+            for inner in inners:
+                inner._shared_capture_width = getattr(
+                    self, "_active_capture_extra", None
+                )
+        try:
+            graph, out = super().capture_one_batch_size(num_seqs, forward, stream_idx)
+        finally:
+            if self._tree_shared_prefix:
+                for inner in inners:
+                    inner._shared_capture_width = None
+        extra = getattr(self, "_active_capture_extra", None)
+        self._tree_attention_impls[self._make_graph_key(int(num_seqs), extra=extra)] = (
+            self._current_tree_attention_impl()
+        )
         skip_fia = self.tree_graph_disabled_reason or (
             self._slot_gather_graph and not self._tree_compact_fia
         )
@@ -412,8 +464,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         super().capture()
         if self._slot_gather_graph and not self._tree_compact_fia:
             logger.info(
-                "NPU tree draft slot-gather graphs ready: graphs=%s "
+                "NPU tree draft %s graphs ready: graphs=%s "
                 "tree_graph_replay_count=%s tree_eager_fallback_count=%s",
+                self._current_tree_attention_impl(),
                 sorted(map(str, self.graphs)),
                 self.tree_graph_replay_count,
                 self.tree_eager_fallback_count,
@@ -518,6 +571,17 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                     "NPU graph update/replay failed"
                 ) from replay_error
             self.tree_graph_replay_count += 1
+            if (
+                self.tree_graph_replay_count == 1
+                or self.tree_graph_replay_count % 32 == 0
+            ):
+                logger.info(
+                    "NPU tree draft graph replay count=%s key=%s implementation=%s eager_fallback=%s",
+                    self.tree_graph_replay_count,
+                    graph_key,
+                    self._current_tree_attention_impl(),
+                    self.tree_eager_fallback_count,
+                )
             return
 
         if forward_batch.seq_lens_cpu is None:
@@ -608,10 +672,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
             logger.info(
                 "NPU tree draft graph replay count=%s key=%s bucket=%s "
-                "eager_fallback=%s",
+                "implementation=%s eager_fallback=%s",
                 self.tree_graph_replay_count,
                 graph_key,
                 plan.kv_bucket,
+                self._current_tree_attention_impl(),
                 self.tree_eager_fallback_count,
             )
 
