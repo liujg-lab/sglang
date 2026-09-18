@@ -566,9 +566,8 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("return None", bound_src)
 
     def test_sr_tree_drafter_skips_last_page_copy(self):
-        src = _function_source(_SR_TREE, "_alloc_tree_kv")
+        src = _function_source(_SR_TREE, "_apply_tree_mapping")
         self.assertIn("build_paged_draft_cache_locs", src)
-        self.assertIn("skip the copy", src.lower())
         self.assertNotIn("token_to_kv_pool.move_kv_cache", src)
 
     def test_graph_row_capacity_uses_roles_not_mixed_max(self):

@@ -56,6 +56,10 @@ def _apply_reply_to_req(req: Req, reply: SRDraftReply) -> None:
         "parent_list": reply.parent_list,
         "top_scores_index": reply.top_scores_index,
     }
+    req.sr_draft_tree_version = reply.tree_version
+    req.sr_draft_tree_base_committed_len = (
+        int(reply.base_committed_len) if reply.tree_version is not None else None
+    )
 
 
 def _clear_draft(req: Req) -> None:
@@ -65,6 +69,9 @@ def _clear_draft(req: Req) -> None:
         "parent_list": None,
         "top_scores_index": None,
     }
+    req.sr_draft_tree_version = None
+    req.sr_draft_tree_base_committed_len = None
+    req.sr_accepted_tree_candidate_indices = None
 
 
 @dataclass
@@ -219,6 +226,14 @@ class SchedulerStandaloneRemoteTargetMixin:
                 ),
                 sampling_params=req.sampling_params if include_full_context else None,
                 has_mm=has_mm,
+                commit_tree_version=getattr(req, "sr_draft_tree_version", None),
+                commit_tree_base_committed_len=getattr(
+                    req, "sr_draft_tree_base_committed_len", None
+                ),
+                commit_candidate_indices=list(
+                    getattr(req, "sr_accepted_tree_candidate_indices", None) or []
+                )
+                or None,
             ),
             mm_payload,
         )

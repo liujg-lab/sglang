@@ -89,6 +89,9 @@ class SRDraftRequest:
     padded_input_ids: Optional[List[int]] = None
     sampling_params: Optional[SamplingParams] = None
     has_mm: bool = False
+    commit_tree_version: Optional[int] = None
+    commit_tree_base_committed_len: Optional[int] = None
+    commit_candidate_indices: Optional[List[int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -131,6 +134,7 @@ class SRDraftReply:
     status: SRReplyStatus = SRReplyStatus.OK
     parent_list: Optional[List[int]] = None
     top_scores_index: Optional[List[int]] = None
+    tree_version: Optional[int] = None
 
     def matches(self, pending: SRPendingEntry) -> Tuple[bool, Optional[str]]:
         if self.step_id != pending.step_id:

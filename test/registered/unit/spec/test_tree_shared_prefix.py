@@ -650,6 +650,9 @@ class TestTreeFailureHandling(unittest.TestCase):
         )
         for name, fn in functions.items():
             setattr(self.drafter, name, MethodType(fn, self.drafter))
+        self.drafter._publish_tree_leases = lambda *a, **k: None
+        self.drafter._free_lease_alloc = lambda *a, **k: None
+        self.drafter._pending_lease_state = None
         self.req = NS(rid="request", req_pool_idx=0, sr_tree_seed=(None,) * 4)
 
     def test_single_eligible_request_does_not_retry(self):
@@ -842,12 +845,12 @@ class TestTreeFailureHandling(unittest.TestCase):
                 return (Result(),) * 3
 
             metrics = SRRoundMetrics("Draft", NS(Event=Event))
-            batch = NS(get_model_worker_batch=lambda: NS())
+            batch = NS(get_model_worker_batch=lambda: NS(), out_cache_loc=None)
             self.drafter.scheduler = NS(
                 _sr_round_metrics=metrics, _sr_make_decode_batch=lambda reqs: batch
             )
             self.drafter.topk = 3
-            self.drafter._alloc_tree_kv = Mock(return_value="snapshot")
+            self.drafter._alloc_tree_kv = Mock(return_value=("snapshot", None))
             self.drafter.token_to_kv_pool_allocator = NS(restore_state=Mock())
             self.drafter.draft_attn_backend.init_forward_metadata = Mock()
             self.drafter.cuda_graph_runner = NS(
@@ -923,7 +926,7 @@ class TestGraphDispatch(unittest.TestCase):
             for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
         ]
-        ns = dict(threading=threading)
+        ns = {}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
         ns.update(
             logger=logging.getLogger(__name__),

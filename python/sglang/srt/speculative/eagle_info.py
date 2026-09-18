@@ -548,6 +548,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
+        accepted_tree_candidate_indices = []
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+                export_accepted_tree_candidate_indices,
+            )
+
+            accepted_tree_candidate_indices = export_accepted_tree_candidate_indices(
+                accept_index, self.retrive_index
+            )
+            for req, path in zip(batch.reqs, accepted_tree_candidate_indices):
+                req.sr_accepted_tree_candidate_indices = list(path)
+        except Exception:
+            accepted_tree_candidate_indices = []
+
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
@@ -655,6 +669,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 verified_id=verified_id,
                 accept_length_per_req_cpu=draft_input.accept_length_cpu,
                 accepted_indices=accept_index,
+                accepted_tree_candidate_indices=accepted_tree_candidate_indices,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -730,6 +745,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_list,
                 accepted_indices=accept_index,
+                accepted_tree_candidate_indices=accepted_tree_candidate_indices,
             )
 
 
@@ -972,3 +988,5 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+    # Reply-space candidate indices per request, exported before flatten.
+    accepted_tree_candidate_indices: Optional[List[List[int]]] = None

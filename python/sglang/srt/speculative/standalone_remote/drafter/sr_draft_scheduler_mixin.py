@@ -1,6 +1,7 @@
 import logging
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -19,6 +20,12 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftStateManager,
     SRWindow,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    SRTreeLeaseStore,
+    live_accept_prefix,
+    snapshot_sr_align,
+    validate_lease_commit,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     SRTailExtendTransaction,
     TailExtendRecoveryRequired,
@@ -33,7 +40,6 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     DraftDecision,
     apply_tree_seed_topk,
     broadcast_sr_obj,
-    classify_prefix_alignment,
     committed_tail_not_in_kv,
     decide_draft_action,
     draft_needed_max_new_tokens,
@@ -130,6 +136,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         self.draft_paused_reqs: List[Req] = []
         self.paused_reqs = self.draft_paused_reqs
         self.sr_tree_drafter: Optional[SRTreeDrafter] = None
+        self.sr_tree_leases = SRTreeLeaseStore()
         topk = int(self.server_args.speculative_eagle_topk or 1)
         if topk > 1:
             self.sr_tree_drafter = SRTreeDrafter(self)
@@ -233,6 +240,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             if req is None:
                 continue
             self._sr_remove_req(req)
+            self._sr_release_tree_lease(state.req_id)
             release_mm_resources(req.multimodal_inputs)
             req.multimodal_inputs = None
             req.req_pool_idx = None
@@ -251,6 +259,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             self.cur_batch = None
             self.last_batch = None
         else:
+            store = getattr(self, "sr_tree_leases", None)
+            if store is not None:
+                store.release_all(self.token_to_kv_pool_allocator)
             self._sr_reset_scheduler_caches()
         if self.sr_server is not None:
             self.sr_server.last_rpc_seq = -1
@@ -529,6 +540,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.to_abort = True
             req.finished_reason = FINISH_ABORT("Target request finished")
         if req.req_pool_idx is not None:
+            self._sr_release_tree_lease(rid)
             self.sr_kv.release_all_kv_for_finished_req(req)
         if release_mm:
             release_mm_resources(req.multimodal_inputs)
@@ -567,6 +579,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             if state.degraded:
                 return
             state.degraded = True
+            self._sr_release_tree_lease(rid)
         logger.warning("[SR] degrading %s to AR (no speculation): %s", rid, reason)
 
     def _sr_is_degraded(self, rid: str) -> bool:
@@ -770,23 +783,26 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_align(
         self, req: Req, dreq: SRDraftRequest, state: SRDraftState
     ) -> None:
+        prefix_len = self.sr_kv.get_prefix_len(req)
+        result = snapshot_sr_align(req, dreq, prefix_len)
+        req.sr_align_result = result
+        req.sr_pending_dreq = dreq
         padded = list(getattr(req, "sr_padded_ids", None) or req.origin_input_ids)
         local = list(req.origin_input_ids) + list(req.output_ids or [])
         target = list(padded) + list(dreq.committed_ids or [])
-        if local == target:
+        if result.kind == "equal":
             req.draft_generation_start_len = len(req.output_ids or [])
             req.draft_tokens_target = dreq.num_draft_tokens
             return
 
         invalidate_tree_seed(req)
 
-        prefix_len = self.sr_kv.get_prefix_len(req)
-        kind = classify_prefix_alignment(local, target, prefix_len)
+        kind = result.kind
         allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
         if allocated <= 0:
             allocated = max(0, len(local) - 1)
-        committed = int(getattr(req, "kv_committed_len", 0) or 0)
-        _, fork = find_fork_point(local, target)
+        committed = int(result.old_kv_committed_len)
+        fork = result.fork
 
         if kind == "replace_tail":
             req.output_ids[-1] = target[-1]
@@ -1069,6 +1085,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Fold a long committed tail into one extend instead of N decodes."""
         rebuilt: List[Req] = []
         for req in reqs:
+            self._sr_release_tree_lease(req.rid)
             fill_ids = snapshot_reprefill_fill_ids(
                 req.origin_input_ids, req.output_ids
             )
@@ -1088,31 +1105,32 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_make_tail_extend_batch(self, plans) -> ScheduleBatch:
         return make_tail_extend_batch(self, plans)
 
-    def _sr_ingest_tree_tails(self, reqs: List[Req]) -> None:
+    def _sr_ingest_tree_tails(self, reqs: List[Req], plans=None) -> None:
         """Materialize all missing tree-prefix tokens in one EXTEND."""
         metrics = get_sr_round_metrics(self, "Draft")
         plan_start = time.perf_counter()
         runner = self.tp_worker.model_runner
-        plans = []
         recover = []
-        for req in reqs:
-            self._sr_ensure_window_budget(req, req.draft_tokens_target)
-            if self._sr_is_degraded(req.rid):
-                continue
-            try:
-                plan = plan_tail_extend(
-                    req,
-                    vocab_size=self.model_config.vocab_size,
-                    model_is_mrope=runner.model_is_mrope,
-                )
-            except TailExtendRecoveryRequired as e:
-                logger.info("[SR] tail prefix recovery for %s: %s", req.rid, e)
-                recover.append(req)
-                continue
-            if plan is not None:
-                plans.append(plan)
-            else:
-                metrics.counts["seed_reused"] += 1
+        if plans is None:
+            plans = []
+            for req in reqs:
+                self._sr_ensure_window_budget(req, req.draft_tokens_target)
+                if self._sr_is_degraded(req.rid):
+                    continue
+                try:
+                    plan = plan_tail_extend(
+                        req,
+                        vocab_size=self.model_config.vocab_size,
+                        model_is_mrope=runner.model_is_mrope,
+                    )
+                except TailExtendRecoveryRequired as e:
+                    logger.info("[SR] tail prefix recovery for %s: %s", req.rid, e)
+                    recover.append(req)
+                    continue
+                if plan is not None:
+                    plans.append(plan)
+                else:
+                    metrics.counts["seed_reused"] += 1
 
         # Recovery may use the scheduler/allocator, so finish it before opening
         # the tail allocation transaction. It is not the normal ingest path.
@@ -1155,6 +1173,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_replay_grammars(active, strict=True)
                 batch = self._sr_make_tail_extend_batch(plans)
                 transaction.allocate(batch)
+                transaction.copy_reused_tree_kv()
                 worker_batch = batch.get_model_worker_batch()
             metrics.counts["tail_requests"] += len(plans)
             metrics.counts["tail_tokens"] += sum(p.length for p in plans)
@@ -1187,6 +1206,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                             )
                             miss_reason = "prep"
                             plan = None
+                transaction.wait_copy_done()
                 if plan is not None:
                     transaction.submitted = True
                     logits_output = tail_runner.replay_filled(plan)
@@ -1364,6 +1384,90 @@ class StandaloneRemoteDraftSchedulerMixin:
                 continue
             self._sr_mark_degraded(req.rid, "tree seed recovery failed")
 
+    def _sr_release_tree_lease(self, rid: str, event=None) -> None:
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return
+        store.release_rid(
+            rid, allocator=self.token_to_kv_pool_allocator, event=event
+        )
+
+    def _sr_commit_tree_leases(self, reqs: List[Req]) -> Tuple[List[Req], List]:
+        """Pin reusable leases and return (full_tail_reqs, copy_plans)."""
+        store = getattr(self, "sr_tree_leases", None)
+        full: List[Req] = []
+        copy_plans = []
+        if store is None:
+            return list(reqs), copy_plans
+        store.poll_pending_frees(self.token_to_kv_pool_allocator)
+        runner = self.tp_worker.model_runner
+        for req in reqs:
+            dreq = getattr(req, "sr_pending_dreq", None)
+            align = getattr(req, "sr_align_result", None)
+            lease = store.get(req.rid)
+            if lease is None:
+                full.append(req)
+                continue
+            if align is None or align.kind not in ("append_one", "append_n"):
+                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
+                full.append(req)
+                continue
+            tokens = list(req.origin_input_ids or []) + list(req.output_ids or [])
+            indices = list(getattr(dreq, "commit_candidate_indices", None) or [])
+            old_len = len(align.old_committed_tokens)
+            path_tokens = tokens[old_len : old_len + len(indices)]
+            miss = validate_lease_commit(
+                lease,
+                commit_tree_version=getattr(dreq, "commit_tree_version", None),
+                commit_tree_base_committed_len=getattr(
+                    dreq, "commit_tree_base_committed_len", None
+                ),
+                commit_candidate_indices=indices,
+                align=align,
+                path_tokens=path_tokens,
+            )
+            if miss:
+                store.counts[f"tree_kv_commit_miss_{miss}"] += 1
+                if miss == "depth":
+                    store.counts["tree_kv_reuse_skip_depth"] += 1
+                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
+                full.append(req)
+                continue
+            src_slots = live_accept_prefix(lease.candidate_slots, indices)
+            store.pin(req.rid)
+            original = int(align.old_kv_committed_len)
+            effective = original + len(src_slots)
+            try:
+                plan = plan_tail_extend(
+                    req,
+                    vocab_size=self.model_config.vocab_size,
+                    model_is_mrope=runner.model_is_mrope,
+                    materialized_len=effective,
+                )
+            except TailExtendRecoveryRequired:
+                store.unpin(req.rid)
+                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
+                full.append(req)
+                continue
+            if plan is None:
+                store.unpin(req.rid)
+                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
+                full.append(req)
+                continue
+            plan = replace(
+                plan,
+                materialized_len=original,
+                original_len=original,
+                copy_src_slots=list(src_slots),
+            )
+            copy_plans.append((req, lease, plan, len(src_slots)))
+            store.counts["tree_kv_commit_hit"] += 1
+            store.counts["tree_kv_reused_tokens"] += len(src_slots)
+            store.counts["tree_kv_unmaterialized_leaf_tokens"] += max(
+                plan.length, 0
+            )
+        return full, copy_plans
+
     def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
         empty: SRWindow = ([], None, None)
         if not reqs:
@@ -1371,7 +1475,35 @@ class StandaloneRemoteDraftSchedulerMixin:
         metrics = get_sr_round_metrics(self, "Draft")
         with metrics.phase("prefix_materialize", device=True):
             self._sr_materialize_prefix_batch(reqs)
-        self._sr_ingest_committed_batch(reqs)
+        full, copy_jobs = self._sr_commit_tree_leases(reqs)
+        store = getattr(self, "sr_tree_leases", None)
+        if copy_jobs:
+            if store is not None:
+                store.reclaim_idle(
+                    self.token_to_kv_pool_allocator,
+                    skip_rids={job[0].rid for job in copy_jobs},
+                )
+            try:
+                self._sr_ingest_tree_tails(
+                    [job[0] for job in copy_jobs],
+                    plans=[job[2] for job in copy_jobs],
+                )
+            finally:
+                for req, lease, plan, _n in copy_jobs:
+                    if store is None:
+                        continue
+                    event = getattr(lease, "pending_free_event", None)
+                    store.unpin(req.rid)
+                    store.release(
+                        lease,
+                        allocator=self.token_to_kv_pool_allocator,
+                        event=event,
+                    )
+                    done = int(getattr(req, "kv_committed_len", 0) or 0) >= plan.end
+                    if not done:
+                        full.append(req)
+        if full:
+            self._sr_ingest_committed_batch(full)
         self._sr_ensure_tree_seeds(reqs)
         self._sr_replay_grammars(reqs)
         windows: List[SRWindow] = [empty] * len(reqs)
@@ -1411,8 +1543,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_resume_req(req)
         self._sr_park_in_running_many(ready)
         try:
-            # Aggregate host duration; _expand_tree records the device interval
-            # before result D2H, so CPU packing is not counted as device work.
             with metrics.phase("tree_expand_pack"):
                 got = self.sr_tree_drafter.expand_batch(ready)
         except NpuGraphReplaySubmittedError:
@@ -1447,6 +1577,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
     ) -> None:
+        self._sr_release_tree_lease(req.rid)
         req.draft_tokens_target = dreq.num_draft_tokens
         self._sr_enqueue_for_reprefill(req, target_fill_ids)
 
@@ -1574,7 +1705,17 @@ class StandaloneRemoteDraftSchedulerMixin:
             status=status,
             parent_list=pl,
             top_scores_index=ix,
+            tree_version=self._sr_reply_tree_version(dreq.rid, status),
         )
+
+    def _sr_reply_tree_version(self, rid: str, status: SRReplyStatus):
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return None
+        lease = store.get(rid)
+        if lease is None:
+            return None
+        return lease.version
 
     def _sr_prepare_one(
         self,
@@ -1626,6 +1767,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                         status=SRReplyStatus.IDEMPOTENT,
                         parent_list=pl,
                         top_scores_index=ix,
+                        tree_version=self._sr_reply_tree_version(
+                            dreq.rid, SRReplyStatus.IDEMPOTENT
+                        ),
                     ),
                     None,
                 )

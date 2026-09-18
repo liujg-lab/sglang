@@ -236,6 +236,7 @@ Draft 编译失败或降级不能代替 Target 约束。`return_logprob` 按实�
 | Draft 链 | 普通 decode；满足条件时使用对应 backend 的 decode graph |
 | Draft tail EXTEND | 专用 tail EXTEND 图（普通 EXTEND + `is_sr_tail_extend`）；bucket 不匹配或捕获失败时走 eager；不送入单 token decode graph |
 | Draft 树 | CUDA / NPU 各自的树图 runner；捕获整段树展开，依赖深度仍然串行 |
+| Draft 树 KV lease | `topk>1` 且 `page_size>1` 时按页持有独占树 KV，下一 STEP 只复制仍存活的已接受路径，再 tail-extend 剩余 token |
 | Target 树验证 | 根据 batch、验证 token 数及支持的长度 bucket 捕获 / replay |
 | Target 无草稿降级 | 单 token 普通 AR 当前强制 eager；存在 `r1` 图不代表该路径会使用它 |
 
@@ -251,6 +252,13 @@ NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定
 `shared_prefix_torch` replay 跳过 FIA 长度 update；compact-FIA 保留相应更新和 scratch。
 两端 page size 是本地 KV/backend 配置，不在 SR 协议中交换；示例使用相同值便于排查，
 不把相同 page size 作为 wire 协议要求。
+
+树 KV lease 只复用**搬运后仍存活**的已接受路径 KV，不承诺所有非末层节点可复用。
+页数随 prefix 余数 `r` 变化：`pages_per_branch = ceil((r + steps) / page_size)`。
+对 `topk=3、steps=5、page_size=128`（不是通用常量）：`r=0/123` 为 3 页/请求，
+`r=124/127` 为 6 页/请求。`reusable_depth>=2` 与页预算是实验策略。
+正确性以 KV/seed 与完整 tail 参考一致、无页泄漏为准；吞吐是否下降要单独看整轮耗时
+和页驻留，不能为了加速放松约束。CPU 图替身只覆盖 buffer 生命周期；NPU 连续 replay 需实机验证。
 
 <a id="transport"></a>
 

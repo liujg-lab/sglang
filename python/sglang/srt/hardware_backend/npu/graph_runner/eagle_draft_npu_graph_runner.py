@@ -667,6 +667,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         run_npu_graph_update_and_replay(
             lambda: graph.update(cpu_update_input=payload),
             graph.replay,
+            overlap=not os.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE"),
         )
         self.tree_graph_replay_count += 1
         if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:

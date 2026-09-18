@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -46,6 +48,43 @@ def stamp_tree_seed(req: Req, boundary: int) -> None:
     req.sr_tree_seed_revision = int(getattr(req, "sr_prefix_revision", 0))
 
 
+def wait_copy_event(event) -> None:
+    """Wait for copy on the current device stream. Do not CPU-synchronize."""
+    if event is None:
+        return
+    device = getattr(event, "device", None)
+    dev_type = getattr(device, "type", None) if device is not None else None
+    if dev_type is None or "cpu" in str(dev_type):
+        return
+    try:
+        module = torch.get_device_module(dev_type)
+        stream = module.current_stream(device)
+        wait = getattr(stream, "wait_event", None)
+        if callable(wait):
+            wait(event)
+    except Exception:
+        return
+
+
+def copy_stream_context(device):
+    """Side stream for KV copy when the device module exposes Stream."""
+    if device is None:
+        return None, nullcontext()
+    dev_type = getattr(device, "type", None) or str(device)
+    if dev_type == "cpu" or "cpu" in str(dev_type):
+        return None, nullcontext()
+    try:
+        module = torch.get_device_module(dev_type)
+        factory = getattr(module, "Stream", None)
+        ctx_fn = getattr(module, "stream", None)
+        if not callable(factory) or not callable(ctx_fn):
+            return None, nullcontext()
+        stream = factory()
+        return stream, ctx_fn(stream)
+    except Exception:
+        return None, nullcontext()
+
+
 def validate_tail_mrope(mm_input, start: int, length: int) -> None:
     if mm_input is None:
         return
@@ -83,6 +122,8 @@ class SRTailExtendPlan:
     prefix_len: int
     revision: int
     recapture: bool = False
+    original_len: Optional[int] = None
+    copy_src_slots: Optional[List[int]] = None
 
     @property
     def end(self) -> int:
@@ -92,17 +133,47 @@ class SRTailExtendPlan:
     def length(self) -> int:
         return self.end - self.prefix_len
 
+    @property
+    def alloc_start(self) -> int:
+        if self.original_len is None:
+            return self.prefix_len
+        return int(self.original_len)
 
-def plan_tail_extend(req: Req, *, vocab_size: int, model_is_mrope: bool):
+    @property
+    def reused_tokens(self) -> int:
+        if self.copy_src_slots is None:
+            return 0
+        return len(self.copy_src_slots)
+
+    @property
+    def needs_suffix_alloc(self) -> bool:
+        return (not self.recapture) or bool(self.reused_tokens)
+
+
+def plan_tail_extend(
+    req: Req,
+    *,
+    vocab_size: int,
+    model_is_mrope: bool,
+    materialized_len: Optional[int] = None,
+):
     tokens = list(req.origin_input_ids or []) + list(req.output_ids or [])
-    materialized = int(req.kv_committed_len)
+    materialized = (
+        int(req.kv_committed_len)
+        if materialized_len is None
+        else int(materialized_len)
+    )
     allocated = int(req.kv_allocated_len)
+    published = int(req.kv_committed_len)
     if (
         req.req_pool_idx is None
         or not tokens
         or materialized < len(req.origin_input_ids or [])
         or materialized > len(tokens)
-        or allocated != materialized
+        or (
+            allocated != published
+            and allocated != materialized
+        )
     ):
         raise TailExtendRecoveryRequired("invalid or overallocated linear KV prefix")
     if materialized == len(tokens) and tree_seed_is_current(req):
@@ -248,31 +319,30 @@ class SRTailExtendTransaction:
         self.grammars = [p.req.grammar for p in plans]
         self.submitted = False
         self.committed = False
+        self.copy_done_event = None
+        self._copy_stream = None
 
     def allocate(self, batch: ScheduleBatch) -> None:
         if any(p.end > self.mapping.shape[1] for p in self.plans):
             raise RuntimeError("SR tail exceeds request-to-token mapping capacity")
-        additions = [p for p in self.plans if not p.recapture]
+        additions = [p for p in self.plans if p.needs_suffix_alloc]
         page_size = self.allocator.page_size
-        count = sum(p.length for p in additions)
+        count = sum(p.end - p.alloc_start for p in additions)
         capacity = sum(
             (
                 (p.end + page_size - 1) // page_size
-                - (p.prefix_len + page_size - 1) // page_size
+                - (p.alloc_start + page_size - 1) // page_size
             )
             * page_size
             for p in additions
         )
         if count:
             _evict_tail_capacity(self.scheduler.tree_cache, capacity)
-            # Some allocators launch the index kernel before reporting OOM.
-            # Reject insufficient capacity before that kernel can read past
-            # the free-page array.
             if self.allocator.available_size() < capacity:
                 raise RuntimeError("insufficient KV capacity for SR tail extend")
         self.allocator_state = self.allocator.backup_state()
         self.mapping_snapshots = [
-            self.mapping[p.req.req_pool_idx, p.prefix_len : p.end].clone()
+            self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].clone()
             for p in self.plans
         ]
         allocated = None
@@ -281,16 +351,17 @@ class SRTailExtendTransaction:
                 allocated = self.allocator.alloc(count)
             else:
                 prefix_cpu = torch.tensor(
-                    [p.prefix_len for p in additions], dtype=torch.int64
+                    [p.alloc_start for p in additions], dtype=torch.int64
                 )
                 end_cpu = torch.tensor([p.end for p in additions], dtype=torch.int64)
                 last_loc = torch.cat(
                     [
                         (
                             self.mapping[
-                                p.req.req_pool_idx, p.prefix_len - 1 : p.prefix_len
+                                p.req.req_pool_idx,
+                                p.alloc_start - 1 : p.alloc_start,
                             ]
-                            if p.prefix_len
+                            if p.alloc_start
                             else torch.tensor(
                                 [-1], device=batch.device, dtype=torch.int64
                             )
@@ -311,14 +382,93 @@ class SRTailExtendTransaction:
         locations = []
         offset = 0
         for p in self.plans:
-            if p.recapture:
+            if p.recapture and not p.reused_tokens:
                 slots = self.mapping[p.req.req_pool_idx, p.prefix_len : p.end].clone()
             else:
-                slots = allocated[offset : offset + p.length]
-                offset += p.length
-                self.mapping[p.req.req_pool_idx, p.prefix_len : p.end] = slots
+                span = p.end - p.alloc_start
+                suffix = allocated[offset : offset + span]
+                offset += span
+                self.mapping[p.req.req_pool_idx, p.alloc_start : p.end] = suffix
+                slots = self.mapping[p.req.req_pool_idx, p.prefix_len : p.end]
             locations.append(slots)
-        batch.out_cache_loc = torch.cat(locations)
+        batch.out_cache_loc = torch.cat(locations) if locations else torch.empty(
+            0, dtype=torch.int64, device=batch.device
+        )
+
+    def copy_reused_tree_kv(self) -> None:
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            record_device_event,
+        )
+
+        self.copy_done_event = None
+        self._copy_stream = None
+        kv_pool = getattr(
+            getattr(self.scheduler, "tp_worker", None), "model_runner", None
+        )
+        kv_pool = getattr(kv_pool, "token_to_kv_pool", None) if kv_pool else None
+        if kv_pool is None:
+            if any(p.copy_src_slots for p in self.plans):
+                raise RuntimeError("tree KV copy required but kv pool is missing")
+            return
+        jobs = []
+        device = None
+        for p in self.plans:
+            src_list = p.copy_src_slots or []
+            if not src_list:
+                continue
+            dst = self.mapping[
+                p.req.req_pool_idx, p.alloc_start : p.alloc_start + len(src_list)
+            ]
+            if src_list == dst.detach().reshape(-1).tolist():
+                continue
+            src = torch.as_tensor(src_list, dtype=torch.int64, device=dst.device)
+            device = dst.device
+            jobs.append((src, dst))
+        if not jobs:
+            return
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_mha_kv_by_slot,
+            copy_paged_kv_buffer_by_slot,
+        )
+
+        def _run_copies():
+            for src, dst in jobs:
+                kv_buffer = getattr(kv_pool, "kv_buffer", None)
+                if torch.is_tensor(kv_buffer) and kv_buffer.dim() == 6:
+                    copy_paged_kv_buffer_by_slot(kv_buffer, src, dst)
+                    continue
+                mover = getattr(kv_pool, "move_kv_cache", None)
+                if callable(mover) and getattr(kv_pool, "_kv_copy_config", None) is not None:
+                    mover(dst, src)
+                    continue
+                copy_mha_kv_by_slot(
+                    getattr(kv_pool, "k_buffer", None),
+                    getattr(kv_pool, "v_buffer", None),
+                    src,
+                    dst,
+                    getattr(kv_pool, "index_k_buffer", None),
+                )
+
+        t0 = time.perf_counter()
+        stream, ctx = copy_stream_context(device)
+        self._copy_stream = stream
+        with ctx:
+            _run_copies()
+            event = record_device_event(device)
+        store = getattr(self.scheduler, "sr_tree_leases", None)
+        if store is not None:
+            store.counts["tree_kv_copy_submit_ms"] += int(
+                (time.perf_counter() - t0) * 1000
+            )
+        self.copy_done_event = event
+        if store is not None and event is not None:
+            for p in self.plans:
+                lease = store.get(p.req.rid)
+                if lease is not None and p.copy_src_slots:
+                    lease.pending_free_event = event
+
+    def wait_copy_done(self) -> None:
+        wait_copy_event(self.copy_done_event)
 
     def commit(self, logits_output) -> None:
         count = len(self.plans)
@@ -363,7 +513,7 @@ class SRTailExtendTransaction:
         if self.allocator_state is not None:
             device_module.synchronize()
             for p, previous in zip(self.plans, self.mapping_snapshots):
-                self.mapping[p.req.req_pool_idx, p.prefix_len : p.end].copy_(previous)
+                self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].copy_(previous)
             self.allocator.restore_state(self.allocator_state)
         for p, grammar in zip(self.plans, self.grammars):
             p.req.grammar = grammar

@@ -192,7 +192,7 @@ def fill_fia_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
     """Copy this round's per-step lengths into a captured cpu_update_input.
 
     Mutates existing list objects in ``payload``. Callers must not rewrite
-    ``payload`` until the NPU graph update thread has joined.
+    ``payload`` until ``graph.update`` has returned.
     """
     if not attr_name:
         raise ValueError("FIA update attr_name must not be empty")
@@ -216,34 +216,50 @@ def fill_fia_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
     return payload
 
 
-def run_npu_graph_update_and_replay(update_fn, replay_fn):
-    """Run graph.update in a side thread and graph.replay concurrently.
+def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
+    """Run graph.update then graph.replay.
 
-    Joins the update thread even if replay raises. After replay has been
-    invoked, failures become ``NpuGraphReplaySubmittedError``.
+    Default is serial on one thread. Concurrent update/replay deadlocks ATB
+    PagedAttention; pass ``overlap=True`` only for compact-FIA tree graphs.
+
+    After replay has been invoked, or if update fails, wrap as
+    ``NpuGraphReplaySubmittedError`` so callers do not free in-flight graph
+    slots. Overlap uses a non-daemon thread that must be joined.
     """
+    if not overlap:
+        try:
+            update_fn()
+            replay_fn()
+        except Exception as exc:
+            raise NpuGraphReplaySubmittedError(
+                "NPU graph update/replay failed"
+            ) from exc
+        return
+
     errors = []
 
-    def _update():
+    def _run_update():
         try:
             update_fn()
         except Exception as exc:
             errors.append(exc)
 
-    replay_error = None
-    thread = threading.Thread(target=_update)
+    thread = threading.Thread(target=_run_update)
     thread.start()
+    replay_error = None
     try:
         replay_fn()
     except Exception as exc:
         replay_error = exc
-    finally:
-        thread.join()
-    if replay_error is not None or errors:
-        cause = replay_error if replay_error is not None else errors[0]
+    thread.join()
+    if replay_error is not None:
         raise NpuGraphReplaySubmittedError(
             "NPU graph update/replay failed"
-        ) from cause
+        ) from replay_error
+    if errors:
+        raise NpuGraphReplaySubmittedError(
+            "NPU graph update/replay failed"
+        ) from errors[0]
 
 
 def normalize_fia_op_name(name):

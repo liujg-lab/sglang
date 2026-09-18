@@ -595,6 +595,34 @@ class TestTailTransaction(unittest.TestCase):
         with self.assertRaises(tail.TailExtendRecoveryRequired):
             tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
 
+    def test_copy_plus_recapture_allocates_from_original(self):
+        from dataclasses import replace
+
+        req = request(10, (7, 8))
+        plan = tail.plan_tail_extend(
+            req, vocab_size=32, model_is_mrope=False, materialized_len=12
+        )
+        self.assertTrue(plan.recapture)
+        self.assertEqual(plan.prefix_len, 11)
+        plan = replace(
+            plan,
+            materialized_len=10,
+            original_len=10,
+            copy_src_slots=[99, 100],
+        )
+        self.assertEqual(plan.alloc_start, 10)
+        self.assertTrue(plan.needs_suffix_alloc)
+        scheduler, _ = transaction_fixture([req], 128)
+        txn = tail.SRTailExtendTransaction(scheduler, [plan])
+        batch = NS(device="cpu")
+        txn.allocate(batch)
+        mapping = scheduler.req_to_token_pool.req_to_token
+        self.assertTrue(bool((mapping[0, 10:12] >= 0).all()))
+        self.assertEqual(int(batch.out_cache_loc.numel()), 1)
+        self.assertEqual(int(batch.out_cache_loc[0]), int(mapping[0, 11]))
+        txn.commit(seed_output(1))
+        self.assertEqual(req.kv_committed_len, 12)
+
     def test_mrope_stored_slice_and_generated_delta(self):
         stored = torch.tensor([[0, 1, 2, 3], [0, 1, 1, 2], [0, 1, 2, 2]])
         mm = NS(mrope_positions=stored, mrope_position_delta=torch.tensor([-1]))
@@ -939,9 +967,169 @@ class TestTailGraphBuckets(unittest.TestCase):
             / "python/sglang/srt/hardware_backend/npu/graph_runner/sr_tail_extend_npu_graph_runner.py"
         ).read_text(encoding="utf-8")
         self.assertIn("run_npu_graph_update_and_replay", src)
+        self.assertNotIn("overlap=True", src)
         self.assertNotIn("threading.Thread", src)
         self.assertIn("context_lens", src)
         self.assertIn("actual_seq_lengths_kv", src)
+        helper = (
+            ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        ).read_text(encoding="utf-8")
+        start = helper.index("def run_npu_graph_update_and_replay")
+        end = helper.index("\ndef normalize_fia_op_name")
+        body = helper[start:end]
+        self.assertIn("overlap=False", body)
+        serial = body.split("if not overlap:", 1)[1].split("return", 1)[0]
+        self.assertNotIn("threading.Thread", serial)
+        self.assertLess(serial.index("update_fn()"), serial.index("replay_fn()"))
+
+    def test_wait_copy_event_before_replay_only_when_copy(self):
+        class Event:
+            def __init__(self):
+                self.syncs = 0
+
+            def synchronize(self):
+                self.syncs += 1
+
+        event = Event()
+        tail.wait_copy_event(event)
+        self.assertEqual(event.syncs, 0)
+        tail.wait_copy_event(None)
+        self.assertEqual(event.syncs, 0)
+        req = request(3)
+        scheduler, plans = transaction_fixture([req], 128)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.wait_copy_done()
+        txn.copy_done_event = event
+        txn.wait_copy_done()
+        self.assertEqual(event.syncs, 0)
+        ingest_src = SCHEDULER.read_text(encoding="utf-8")
+        copy_at = ingest_src.index("transaction.copy_reused_tree_kv()")
+        wait_at = ingest_src.index("transaction.wait_copy_done()")
+        replay_at = ingest_src.index("tail_runner.replay_filled(plan)")
+        eager_at = ingest_src.index("self.tp_worker.forward_batch_generation(")
+        fill_at = ingest_src.index("tail_runner.fill(forward_batch, plan)")
+        init_at = ingest_src.index("tail_runner.init_forward_batch(worker_batch)")
+        worker_batch_at = ingest_src.index("batch.get_model_worker_batch()")
+        self.assertLess(copy_at, wait_at)
+        self.assertLess(worker_batch_at, wait_at)
+        self.assertLess(init_at, wait_at)
+        self.assertLess(fill_at, wait_at)
+        self.assertLess(wait_at, replay_at)
+        self.assertLess(wait_at, eager_at)
+        self.assertNotIn("event.synchronize", ingest_src)
+        src = tail.wait_copy_event.__doc__ or ""
+        body = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tail_extend.py"
+        ).read_text(encoding="utf-8")
+        start = body.index("def wait_copy_event")
+        end = body.index("\ndef copy_stream_context")
+        helper = body[start:end]
+        self.assertNotIn(".synchronize", helper)
+        self.assertIn("wait_event", helper)
+        self.assertIn("def copy_stream_context", body)
+
+    def test_wait_copy_event_uses_stream_wait_event(self):
+        class Stream:
+            def __init__(self):
+                self.seen = []
+
+            def wait_event(self, ev):
+                self.seen.append(ev)
+
+        stream = Stream()
+
+        class Mod:
+            def current_stream(self, device=None):
+                return stream
+
+        event = NS(device=NS(type="npu"))
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            tail.wait_copy_event(event)
+        self.assertEqual(stream.seen, [event])
+
+    def test_copy_stream_context_uses_side_stream_when_available(self):
+        entered = []
+
+        class Ctx:
+            def __enter__(self):
+                entered.append("in")
+                return self
+
+            def __exit__(self, *exc):
+                entered.append("out")
+                return False
+
+        class Mod:
+            def Stream(self):
+                return "side"
+
+            def stream(self, s):
+                entered.append(s)
+                return Ctx()
+
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            stream, ctx = tail.copy_stream_context(NS(type="npu"))
+        self.assertEqual(stream, "side")
+        with ctx:
+            pass
+        self.assertEqual(entered, ["side", "in", "out"])
+        cpu_stream, _ = tail.copy_stream_context(NS(type="cpu"))
+        self.assertIsNone(cpu_stream)
+
+    def test_copy_reused_tree_kv_skips_empty_and_identical_slots(self):
+        from dataclasses import replace
+
+        req = request(10, (7, 8))
+        plan = tail.plan_tail_extend(
+            req, vocab_size=32, model_is_mrope=False, materialized_len=12
+        )
+        scheduler, _ = transaction_fixture([req], 128)
+        copies = []
+
+        def spy_mha(*args, **kwargs):
+            copies.append("mha")
+
+        pool = NS(
+            kv_buffer=None,
+            k_buffer=torch.zeros(2, 32, 1, 2),
+            v_buffer=torch.zeros(2, 32, 1, 2),
+            move_kv_cache=None,
+            _kv_copy_config=None,
+        )
+        scheduler.tp_worker = NS(model_runner=NS(token_to_kv_pool=pool))
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+
+        empty = replace(
+            plan, materialized_len=10, original_len=10, copy_src_slots=None
+        )
+        txn = tail.SRTailExtendTransaction(scheduler, [empty])
+        txn.allocate(NS(device="cpu"))
+        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+            txn.copy_reused_tree_kv()
+        self.assertEqual(copies, [])
+        self.assertIsNone(txn.copy_done_event)
+
+        ident = replace(
+            plan, materialized_len=10, original_len=10, copy_src_slots=[99, 100]
+        )
+        txn = tail.SRTailExtendTransaction(scheduler, [ident])
+        txn.allocate(NS(device="cpu"))
+        mapping = scheduler.req_to_token_pool.req_to_token
+        mapping[0, ident.alloc_start : ident.alloc_start + 2] = torch.tensor([99, 100])
+        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+            txn.copy_reused_tree_kv()
+        self.assertEqual(copies, [])
+        self.assertIsNone(txn.copy_done_event)
+
+        real = replace(
+            plan, materialized_len=10, original_len=10, copy_src_slots=[99, 100]
+        )
+        txn = tail.SRTailExtendTransaction(scheduler, [real])
+        txn.allocate(NS(device="cpu"))
+        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+            txn.copy_reused_tree_kv()
+        self.assertEqual(copies, ["mha"])
 
     def test_capture_buffers_keep_cpu_seq_lens_and_mrope_shape(self):
         GRAPH = (

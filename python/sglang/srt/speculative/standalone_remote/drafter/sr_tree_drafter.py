@@ -1,7 +1,8 @@
 """STANDALONE-style top-k tree expansion on the remote Draft process.
 
 Uses the Draft server's existing TpModelWorker (no second weight load).
-Linear KV stays the Target committed prefix; tree KV is ephemeral.
+Linear KV stays the Target committed prefix. Tree KV is allocated on exclusive
+pages and may be leased for the next STEP when topk>1 and page_size>1.
 """
 
 from __future__ import annotations
@@ -34,6 +35,17 @@ from sglang.srt.speculative.spec_utils import (
     paged_tree_mapping_fits,
     select_top_k_tokens,
     split_draft_cache_locs,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    SRTreeKVLease,
+    first_forward_node_ids,
+    immediate_free_pages,
+    later_forward_node_ids,
+    lease_budget_ok,
+    lookup_candidate_slots,
+    plan_paged_tree_layout,
+    prefix_window_tokens,
+    remap_slot_node_ids,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -78,11 +90,14 @@ def _wait_d2h_event(device, host: dict) -> None:
         return
 
 
-def _ensure_host_staging_slot(slots, idx: int, bs: int, token_w: int, parent_w: int, index_w: int):
+def _ensure_host_staging_slot(
+    slots, idx: int, bs: int, token_w: int, parent_w: int, index_w: int, slot_w: int = 0
+):
     host = slots[idx]
     token_w = max(int(token_w), 0)
     parent_w = max(int(parent_w), 0)
     index_w = max(int(index_w), 0)
+    slot_w = max(int(slot_w), 0)
     bs = max(int(bs), 1)
     need_new = host is None
     if not need_new:
@@ -91,12 +106,15 @@ def _ensure_host_staging_slot(slots, idx: int, bs: int, token_w: int, parent_w: 
             or host["tokens"].shape[1] < token_w
             or host["parents"].shape[1] < parent_w
             or host["indices"].shape[1] < index_w
+            or host.get("slots") is None
+            or host["slots"].shape[1] < max(slot_w, 1)
         )
     if need_new:
         host = {
             "tokens": torch.zeros((bs, max(token_w, 1)), dtype=torch.int64),
             "parents": torch.zeros((bs, max(parent_w, 1)), dtype=torch.int64),
             "indices": torch.zeros((bs, max(index_w, 1)), dtype=torch.int64),
+            "slots": torch.full((bs, max(slot_w, 1)), -1, dtype=torch.int64),
             "event": None,
             "in_use": False,
         }
@@ -135,8 +153,42 @@ class SRTreeDrafter:
         # not yet been split into RPC lists.
         self._host_staging = [None, None]
         self._staging_index = 0
+        self._last_out_cache_loc = None
+        self._last_candidate_slots = None
+        max_bs = max(int(getattr(self.server_args, "cuda_graph_max_bs", 0) or 8), 8)
+        self._identity_rows = max(max_bs, 1) * max(self.topk, 1)
+        id_dev = self.device
+        self._slot_node_ids = torch.full(
+            (self.speculative_num_steps, self._identity_rows),
+            -1,
+            dtype=torch.int64,
+            device=id_dev,
+        )
+        self._slot_node_id_tmp = torch.empty(
+            (self._identity_rows,), dtype=torch.int64, device=id_dev
+        )
+        self._step0_node_ids = first_forward_node_ids(
+            self.topk, max_bs, device=id_dev
+        )
         self._init_attention_backend()
         self._init_cuda_graphs()
+
+    def _lease_supported(self) -> bool:
+        return self.page_size > 1 and self.topk > 1
+
+    def _ensure_identity_capacity(self, rows: int) -> None:
+        rows = max(int(rows), 1)
+        if self._slot_node_ids is not None and self._slot_node_ids.shape[1] >= rows:
+            return
+        device = self._slot_node_ids.device if self._slot_node_ids is not None else self.device
+        steps = self.speculative_num_steps
+        self._slot_node_ids = torch.full(
+            (steps, rows), -1, dtype=torch.int64, device=device
+        )
+        self._slot_node_id_tmp = torch.empty((rows,), dtype=torch.int64, device=device)
+        max_bs = max((rows + self.topk - 1) // max(self.topk, 1), 1)
+        self._step0_node_ids = first_forward_node_ids(self.topk, max_bs, device=device)
+        self._identity_rows = rows
 
     @property
     def model_runner(self):
@@ -320,11 +372,16 @@ class SRTreeDrafter:
                 windows[keep_idx[j]] = self._expand_one(req)
             return windows
         metrics = getattr(self.scheduler, "_sr_round_metrics", None)
-        # Batched D2H waits for the asynchronously submitted tree forward.
-        with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
-            self._pack_tree_windows(
-                parent_list, top_scores_index, draft_tokens, keep_idx, windows
-            )
+        try:
+            with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
+                self._pack_tree_windows(
+                    parent_list, top_scores_index, draft_tokens, keep_idx, windows, keep
+                )
+        except Exception:
+            lease_state = getattr(self, "_pending_lease_state", None)
+            self._pending_lease_state = None
+            self._free_lease_alloc(lease_state)
+            raise
         return windows
 
     def _expand_one(self, req: "Req") -> SRTreeWindow:
@@ -345,10 +402,16 @@ class SRTreeDrafter:
             return empty
         windows: List[SRTreeWindow] = [empty]
         metrics = getattr(self.scheduler, "_sr_round_metrics", None)
-        with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
-            self._pack_tree_windows(
-                parent_list, top_scores_index, draft_tokens, [0], windows
-            )
+        try:
+            with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
+                self._pack_tree_windows(
+                    parent_list, top_scores_index, draft_tokens, [0], windows, [req]
+                )
+        except Exception:
+            lease_state = getattr(self, "_pending_lease_state", None)
+            self._pending_lease_state = None
+            self._free_lease_alloc(lease_state)
+            raise
         return windows[0]
 
     def _pack_tree_windows(
@@ -358,17 +421,80 @@ class SRTreeDrafter:
         draft_tokens,
         keep_idx: List[int],
         windows: List[SRTreeWindow],
+        reqs: Optional[List["Req"]] = None,
     ) -> None:
         """One D2H per tree tensor, then CPU row splits into RPC lists."""
-        tokens_cpu, parents_cpu, indices_cpu = self._d2h_tree_outputs(
+        tokens_cpu, parents_cpu, indices_cpu, slots_cpu = self._d2h_tree_outputs(
             draft_tokens, parent_list, top_scores_index
         )
+        packed = []
         for j, idx in enumerate(keep_idx):
-            windows[idx] = (
+            window = (
                 tokens_cpu[j].tolist(),
                 parents_cpu[j].tolist(),
                 indices_cpu[j].tolist(),
             )
+            windows[idx] = window
+            packed.append(window)
+        self._publish_tree_leases(reqs or [], packed, slots_cpu)
+
+    def _publish_tree_leases(self, reqs, windows, slots_cpu) -> None:
+        lease_state = getattr(self, "_pending_lease_state", None)
+        self._pending_lease_state = None
+        if not lease_state:
+            return
+        store = getattr(self.scheduler, "sr_tree_leases", None)
+        if store is None:
+            self._free_lease_alloc(lease_state)
+            return
+        unpublished = set(range(len(lease_state["page_slots"])))
+        try:
+            for j, req in enumerate(lease_state["reqs"]):
+                tokens, pl, ix = windows[j] if j < len(windows) else ([], None, None)
+                if not tokens or pl is None or ix is None:
+                    self.token_to_kv_pool_allocator.free(lease_state["page_slots"][j])
+                    unpublished.discard(j)
+                    continue
+                if slots_cpu is not None and j < slots_cpu.shape[0]:
+                    cand = [int(x) for x in slots_cpu[j].tolist()]
+                    if len(cand) < len(ix):
+                        cand = cand + [-1] * (len(ix) - len(cand))
+                    cand = cand[: len(ix)]
+                else:
+                    cand = [-1] * len(ix)
+                base = int(getattr(req, "kv_committed_len", 0) or 0)
+                if base <= 0:
+                    origin = req.origin_input_ids or []
+                    output = req.output_ids or []
+                    base = len(origin) + len(output)
+                lease = SRTreeKVLease(
+                    rid=req.rid,
+                    version=store.next_version(),
+                    revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
+                    base_committed_len=base,
+                    prefix_tokens=prefix_window_tokens(
+                        req.origin_input_ids or (),
+                        req.output_ids or (),
+                        base,
+                    ),
+                    page_ids=[],
+                    page_slots=lease_state["page_slots"][j],
+                    candidate_slots=list(cand),
+                    parent_list=list(pl),
+                    top_scores_index=list(ix),
+                    draft_tokens=list(tokens),
+                    page_count=int(lease_state["page_counts"][j]),
+                )
+                prev = store.pop(req.rid)
+                if prev is not None:
+                    store.release(prev, allocator=self.token_to_kv_pool_allocator)
+                store.register(lease)
+                unpublished.discard(j)
+                req.sr_tree_version = lease.version
+        except Exception:
+            for j in unpublished:
+                self.token_to_kv_pool_allocator.free(lease_state["page_slots"][j])
+            raise
 
     def _d2h_tree_outputs(self, draft_tokens, parent_list, top_scores_index):
         tensors = (draft_tokens, parent_list, top_scores_index)
@@ -380,26 +506,47 @@ class SRTreeDrafter:
             token_w = int(tokens.shape[1]) if tokens.dim() > 1 else 1
             parent_w = int(parents.shape[1]) if parents.dim() > 1 else 1
             index_w = int(indices.shape[1]) if indices.dim() > 1 else 1
-            host = self._acquire_host_staging(n, token_w, parent_w, index_w)
+            slot_w = index_w
+            slots_dev = None
+            lease_state = getattr(self, "_pending_lease_state", None)
+            if lease_state is not None:
+                compact = getattr(self, "_lease_compact_slots", None)
+                if compact is not None and self._slot_node_ids is not None:
+                    phys = compact.reshape(
+                        n, self.topk, self.speculative_num_steps
+                    ).permute(2, 0, 1).reshape(self.speculative_num_steps, -1)
+                    slots_dev = lookup_candidate_slots(
+                        self._slot_node_ids, phys, indices, n, self.topk
+                    ).clone()
+                    slot_w = int(slots_dev.shape[1])
+            host = self._acquire_host_staging(n, token_w, parent_w, index_w, slot_w)
             non_blocking = tokens.device.type != "cpu"
             host["tokens"][:n, :token_w].copy_(tokens, non_blocking=non_blocking)
             host["parents"][:n, :parent_w].copy_(parents, non_blocking=non_blocking)
             host["indices"][:n, :index_w].copy_(indices, non_blocking=non_blocking)
+            if slots_dev is not None:
+                host["slots"][:n, :slot_w].copy_(slots_dev, non_blocking=non_blocking)
+            else:
+                host["slots"][:n].fill_(-1)
             _wait_d2h_event(tokens.device, host)
             host["in_use"] = False
+            slots_cpu = host["slots"][:n, :slot_w] if slots_dev is not None else None
             return (
                 host["tokens"][:n, :token_w],
                 host["parents"][:n, :parent_w],
                 host["indices"][:n, :index_w],
+                slots_cpu,
             )
-        # Test doubles expose detach().to("cpu") on the whole batch object.
         return (
             draft_tokens.detach().to("cpu"),
             parent_list.detach().to("cpu"),
             top_scores_index.detach().to("cpu"),
+            None,
         )
 
-    def _acquire_host_staging(self, bs: int, token_w: int, parent_w: int, index_w: int):
+    def _acquire_host_staging(
+        self, bs: int, token_w: int, parent_w: int, index_w: int, slot_w: int = 0
+    ):
         slots = getattr(self, "_host_staging", None)
         if not slots:
             self._host_staging = [None, None]
@@ -412,7 +559,9 @@ class SRTreeDrafter:
             if event is not None:
                 event.synchronize()
             other["in_use"] = False
-        host = _ensure_host_staging_slot(slots, idx, bs, token_w, parent_w, index_w)
+        host = _ensure_host_staging_slot(
+            slots, idx, bs, token_w, parent_w, index_w, slot_w
+        )
         host["in_use"] = True
         self._staging_index = (idx + 1) % 2
         return host
@@ -468,7 +617,9 @@ class SRTreeDrafter:
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.spec_info = spec_info
         batch.return_hidden_states = False
-        token_to_kv_pool_state_backup = self._alloc_tree_kv(batch)
+        token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
+        self._pending_lease_state = lease_state
+        self._lease_compact_slots = batch.out_cache_loc
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
@@ -487,8 +638,6 @@ class SRTreeDrafter:
                 and self.cuda_graph_runner.can_run(forward_batch)
             )
             t_exec = time.perf_counter()
-            # End the device event before returning tensors for D2H/packing.
-            # No synchronize here: SRRoundMetrics polls completed samples later.
             with (
                 metrics.phase("tree_forward", device=True) if metrics else nullcontext()
             ):
@@ -527,9 +676,19 @@ class SRTreeDrafter:
                         forward_batch
                     )
             exec_s = time.perf_counter() - t_exec
+        except Exception:
+            if lease_state is not None and not graph_submitted:
+                self._restore_tree_mapping(batch, lease_state)
+                self._free_lease_alloc(lease_state)
+                self._pending_lease_state = None
+            raise
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
-            if not graph_submitted:
+            if graph_submitted:
+                self._pending_lease_state = None
+            elif lease_state is not None and self._pending_lease_state is not None:
+                self._restore_tree_mapping(batch, lease_state)
+            elif token_to_kv_pool_state_backup is not None:
                 self.token_to_kv_pool_allocator.restore_state(
                     token_to_kv_pool_state_backup
                 )
@@ -555,6 +714,7 @@ class SRTreeDrafter:
 
         num_seqs = batch.batch_size()
         token_to_kv_pool_state_backup = None
+        lease_state = None
         pool_len = batch.req_to_token_pool.req_to_token.shape[1]
         if not paged_tree_mapping_fits(
             batch.seq_lens,
@@ -568,6 +728,16 @@ class SRTreeDrafter:
                 f"pool_len={pool_len} page_size={self.page_size} "
                 f"topk={self.topk} steps={self.speculative_num_steps}"
             )
+        leased = self._try_alloc_lease_tree_kv(batch)
+        if leased is not None:
+            raw_cache_loc, lease_state = leased
+            try:
+                self._apply_tree_mapping(batch, raw_cache_loc)
+                return None, lease_state
+            except Exception:
+                self._restore_tree_mapping(batch, lease_state)
+                self._free_lease_alloc(lease_state)
+                raise
         if self.page_size == 1:
             alloc_len = self.speculative_num_steps * self.topk
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
@@ -626,51 +796,134 @@ class SRTreeDrafter:
                 )
             )
         try:
-            raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
-                out_cache_loc,
-                num_seqs,
-                self.topk,
-                self.speculative_num_steps,
-                self.page_size,
-            )
-            assign_draft_cache_locs[(num_seqs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                self.extend_lens,
-                raw_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                self.topk,
-                self.speculative_num_steps,
-                self.page_size,
-                next_power_of_2(num_seqs),
-            )
-            if self.page_size > 1 and self.topk > 1:
-                # Compact draft slots in PyTorch (former Triton Part 3).
-                # Last-page KV duplication (former Part 2 / move_kv_cache) is
-                # only required for page-level attention. Token-level slot
-                # gather reads the original prefix slots, so skip the copy.
-                draft_cache_loc = build_paged_draft_cache_locs(
-                    batch.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    batch.seq_lens,
-                    self.num_new_pages_per_topk,
-                    self.topk,
-                    self.speculative_num_steps,
-                    self.page_size,
-                )
-            batch.out_cache_loc = draft_cache_loc
-            batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
-            batch.spec_info.positions = batch.seq_lens.repeat_interleave(
-                self.topk, dim=0
-            )
-            return token_to_kv_pool_state_backup
+            self._apply_tree_mapping(batch, out_cache_loc)
+            return token_to_kv_pool_state_backup, None
         except Exception:
             if token_to_kv_pool_state_backup is not None:
                 self.token_to_kv_pool_allocator.restore_state(
                     token_to_kv_pool_state_backup
                 )
             raise
+
+    def _try_alloc_lease_tree_kv(self, batch: "ScheduleBatch"):
+        if not self._lease_supported():
+            return None
+        seq_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
+        layout = plan_paged_tree_layout(
+            seq_cpu, self.page_size, self.topk, self.speculative_num_steps
+        )
+        need = int(sum(layout.pages_per_req))
+        store = getattr(self.scheduler, "sr_tree_leases", None)
+        if store is not None:
+            store.poll_pending_frees(self.token_to_kv_pool_allocator)
+        live = int(store.live_pages()) if store is not None else 0
+        free = immediate_free_pages(self.token_to_kv_pool_allocator)
+        if not lease_budget_ok(free, live, need):
+            if store is not None:
+                store.reclaim_idle(self.token_to_kv_pool_allocator)
+                live = int(store.live_pages())
+                free = immediate_free_pages(self.token_to_kv_pool_allocator)
+        if not lease_budget_ok(free, live, need):
+            if store is not None:
+                store.counts["tree_lease_skip_budget"] += 1
+            return None
+        allocated = self.token_to_kv_pool_allocator.alloc(need * self.page_size)
+        if allocated is None:
+            if store is not None:
+                store.counts["tree_lease_skip_budget"] += 1
+            return None
+        try:
+            mapping = batch.req_to_token_pool.req_to_token
+            raw_parts = []
+            lease_state = {
+                "reqs": list(batch.reqs),
+                "starts": [],
+                "extend": layout.extend_lens,
+                "mapping_snaps": [],
+                "page_counts": [],
+                "page_slots": [],
+                "remainders": layout.remainders,
+            }
+            offset = 0
+            ps = int(self.page_size)
+            for b, req in enumerate(batch.reqs):
+                n_pages = layout.pages_per_req[b]
+                chunk = allocated[ps * offset : ps * (offset + n_pages)]
+                offset += n_pages
+                r = layout.remainders[b]
+                raw_parts.append(chunk[r:])
+                start = layout.prefix_lens[b]
+                ext = layout.extend_lens[b]
+                snap = mapping[req.req_pool_idx, start : start + ext].clone()
+                lease_state["starts"].append(start)
+                lease_state["mapping_snaps"].append(snap)
+                lease_state["page_counts"].append(n_pages)
+                lease_state["page_slots"].append(chunk)
+            raw_cache_loc = torch.cat(raw_parts) if raw_parts else allocated[:0]
+            self.extend_lens = torch.tensor(
+                layout.extend_lens, dtype=torch.int64, device=self.device
+            )
+            self.num_new_pages_per_topk = torch.tensor(
+                layout.pages_per_branch, dtype=torch.int64, device=self.device
+            )
+            return raw_cache_loc, lease_state
+        except Exception:
+            self.token_to_kv_pool_allocator.free(allocated)
+            raise
+
+    def _apply_tree_mapping(self, batch: "ScheduleBatch", raw_cache_loc):
+        num_seqs = batch.batch_size()
+        raw_cache_loc, draft_cache_loc = split_draft_cache_locs(
+            raw_cache_loc,
+            num_seqs,
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+        )
+        assign_draft_cache_locs[(num_seqs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            self.extend_lens,
+            raw_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+            next_power_of_2(num_seqs),
+        )
+        if self.page_size > 1 and self.topk > 1:
+            draft_cache_loc = build_paged_draft_cache_locs(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                batch.seq_lens,
+                self.num_new_pages_per_topk,
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+            )
+        batch.out_cache_loc = draft_cache_loc
+        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.spec_info.positions = batch.seq_lens.repeat_interleave(
+            self.topk, dim=0
+        )
+
+    def _restore_tree_mapping(self, batch: "ScheduleBatch", lease_state) -> None:
+        if not lease_state:
+            return
+        mapping = batch.req_to_token_pool.req_to_token
+        for req, start, snap in zip(
+            lease_state["reqs"], lease_state["starts"], lease_state["mapping_snaps"]
+        ):
+            if req.req_pool_idx is None:
+                continue
+            mapping[req.req_pool_idx, start : start + snap.numel()].copy_(snap)
+
+    def _free_lease_alloc(self, lease_state) -> None:
+        if not lease_state:
+            return
+        for slots in lease_state["page_slots"]:
+            self.token_to_kv_pool_allocator.free(slots)
 
     def _draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
@@ -688,6 +941,9 @@ class SRTreeDrafter:
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
+        rows = int(out_cache_loc.shape[1])
+        self._ensure_identity_capacity(rows)
+        self._slot_node_ids.fill_(-1)
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
@@ -705,6 +961,12 @@ class SRTreeDrafter:
                 break
             if i > 0 and self.topk > 1 and parent_rows is not None:
                 self._remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)
+            if i == 0:
+                self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
+            else:
+                self._slot_node_ids[i, :rows].copy_(
+                    later_forward_node_ids(tree_info[2])[:rows]
+                )
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             advance_tree_draft_positions_for_step(
@@ -735,6 +997,7 @@ class SRTreeDrafter:
                 f"SR draft_forward step {i}: topk_index OOB",
             )
             hidden_states = logits_output.hidden_states
+        self._last_out_cache_loc = out_cache_loc
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
@@ -745,6 +1008,9 @@ class SRTreeDrafter:
         parent_rows: torch.Tensor,
         n_prev_steps: int,
     ) -> None:
+        remap_slot_node_ids(
+            self._slot_node_ids, parent_rows, n_prev_steps, self._slot_node_id_tmp
+        )
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         if kv_pool is None:
             return

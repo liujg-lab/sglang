@@ -2,7 +2,7 @@
 
 Does not import torch_npu. Runtime helpers come from ``tree_attn_fallback``;
 NPU runner wiring is source-guarded via AST. A small in-process fake covers
-plan lifecycle and update/replay join without launching a graph.
+plan lifecycle and sequential update-then-replay without launching a graph.
 """
 
 from __future__ import annotations
@@ -60,28 +60,35 @@ class _SubmittedError(RuntimeError):
     """Stand-in for NpuGraphReplaySubmittedError; spec_utils pulls Triton."""
 
 
-def _run_update_replay(update_fn, replay_fn):
-    errors = []
-    replay_error = None
+def _run_update_replay(update_fn, replay_fn, overlap=False):
+    if not overlap:
+        try:
+            update_fn()
+            replay_fn()
+        except Exception as exc:
+            raise _SubmittedError("NPU graph update/replay failed") from exc
+        return "ok"
 
-    def _update():
+    errors = []
+
+    def _run_update():
         try:
             update_fn()
         except Exception as exc:
             errors.append(exc)
 
-    thread = threading.Thread(target=_update)
+    thread = threading.Thread(target=_run_update)
     thread.start()
+    replay_error = None
     try:
         replay_fn()
     except Exception as exc:
         replay_error = exc
-    finally:
-        thread.join()
-
-    if replay_error is not None or errors:
-        cause = replay_error if replay_error is not None else errors[0]
-        raise _SubmittedError("NPU graph update/replay failed") from cause
+    thread.join()
+    if replay_error is not None:
+        raise _SubmittedError("NPU graph update/replay failed") from replay_error
+    if errors:
+        raise _SubmittedError("NPU graph update/replay failed") from errors[0]
     return "ok"
 
 
@@ -204,35 +211,103 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertTrue(runner.can_run(batch, 1))
         self.assertEqual(runner.replay(batch), 1)
 
-    def test_update_replay_join_on_replay_error(self):
-        joined = []
+    def test_update_then_replay_skips_replay_on_update_error(self):
+        order = []
 
         def update():
-            threading.Event().wait(0.02)
-            joined.append("update")
+            order.append("update")
+            raise ValueError("update boom")
 
         def replay():
+            order.append("replay")
+
+        with self.assertRaises(_SubmittedError) as ctx:
+            _run_update_replay(update, replay)
+        self.assertEqual(order, ["update"])
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+
+    def test_update_then_replay_wraps_replay_error(self):
+        order = []
+
+        def update():
+            order.append("update")
+
+        def replay():
+            order.append("replay")
             raise RuntimeError("replay boom")
 
         with self.assertRaises(_SubmittedError) as ctx:
             _run_update_replay(update, replay)
-        self.assertEqual(joined, ["update"])
+        self.assertEqual(order, ["update", "replay"])
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
         self.assertIn("replay boom", str(ctx.exception.__cause__))
 
-    def test_update_replay_join_on_update_error(self):
+    def test_update_replay_success_is_sequential(self):
+        order = []
+        self.assertEqual(
+            _run_update_replay(
+                lambda: order.append("update"), lambda: order.append("replay")
+            ),
+            "ok",
+        )
+        self.assertEqual(order, ["update", "replay"])
+
+    def test_spec_utils_update_replay_has_no_side_thread(self):
+        src = (
+            _REPO_ROOT / "python/sglang/srt/speculative/spec_utils.py"
+        ).read_text()
+        start = src.index("def run_npu_graph_update_and_replay")
+        end = src.index("\ndef normalize_fia_op_name")
+        helper = src[start:end]
+        self.assertIn("overlap=False", helper)
+        serial = helper.split("if not overlap:", 1)[1].split("return", 1)[0]
+        self.assertNotIn("threading.Thread", serial)
+        self.assertIn("update_fn()", serial)
+        self.assertIn("replay_fn()", serial)
+        self.assertLess(serial.index("update_fn()"), serial.index("replay_fn()"))
+        overlap = helper.split("if not overlap:", 1)[1].split("return", 1)[1]
+        self.assertIn("threading.Thread", overlap)
+
+    def test_overlap_replay_starts_before_update_finishes(self):
+        started = threading.Event()
+        release = threading.Event()
+        order = []
+
         def update():
+            order.append("update_start")
+            started.set()
+            self.assertTrue(release.wait(timeout=2))
+            order.append("update_end")
+
+        def replay():
+            self.assertTrue(started.wait(timeout=2))
+            order.append("replay")
+            release.set()
+
+        self.assertEqual(_run_update_replay(update, replay, overlap=True), "ok")
+        self.assertEqual(order[0], "update_start")
+        self.assertLess(order.index("replay"), order.index("update_end"))
+
+    def test_overlap_update_error_after_replay_is_submitted(self):
+        started = threading.Event()
+        release = threading.Event()
+        order = []
+
+        def update():
+            order.append("update_start")
+            started.set()
+            self.assertTrue(release.wait(timeout=2))
             raise ValueError("update boom")
 
         def replay():
-            return None
+            self.assertTrue(started.wait(timeout=2))
+            order.append("replay")
+            release.set()
 
         with self.assertRaises(_SubmittedError) as ctx:
-            _run_update_replay(update, replay)
+            _run_update_replay(update, replay, overlap=True)
+        self.assertIn("replay", order)
         self.assertIsInstance(ctx.exception.__cause__, ValueError)
-
-    def test_update_replay_success_returns_after_join(self):
-        self.assertEqual(_run_update_replay(lambda: None, lambda: None), "ok")
 
     def test_draft_restore_original_batch_fields(self):
         batch = SimpleNamespace(
@@ -275,6 +350,7 @@ class TestTreeReplayPlan(CustomTestCase):
             _NPU_GRAPH_RUNNER, "NPUGraphRunner", "replay"
         )
         self.assertIn("run_npu_graph_update_and_replay", target_replay)
+        self.assertNotIn("overlap=", target_replay)
         self.assertIn("_assert_tree_replay_graph", target_replay)
         self.assertIn("NpuGraphReplaySubmittedError", target_replay)
         self.assertIn("output_buffers[graph_key]", target_replay)
@@ -303,6 +379,8 @@ class TestTreeReplayPlan(CustomTestCase):
             _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "_replay"
         )
         self.assertIn("run_npu_graph_update_and_replay", draft_inner)
+        self.assertIn("overlap=", draft_inner)
+        self.assertIn("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE", draft_inner)
         self.assertIn("_assert_tree_replay_graph", draft_inner)
         self.assertIn("fill_fia_cpu_update_payload", draft_inner)
         self.assertIn("NpuGraphReplaySubmittedError", draft_inner)

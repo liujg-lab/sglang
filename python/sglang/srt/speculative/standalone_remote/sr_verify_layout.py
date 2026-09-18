@@ -44,6 +44,47 @@ def advance_tree_draft_positions_for_step(
     advance_tree_draft_positions(positions, mrope_positions)
 
 
+def export_accepted_tree_candidate_indices(
+    accept_index,
+    retrive_index,
+) -> List[List[int]]:
+    """Map 2D ``accept_index`` to reply candidate indices (exclude root).
+
+    ``accept_index[b, j]`` stores ``retrive_index`` values. Column 0 is the
+    tree root. Later columns that are not ``-1`` are accepted draft nodes.
+    Bonus lives in ``predict[last_accepted]``, not an extra accept slot.
+    """
+    if accept_index is None:
+        return []
+    if hasattr(accept_index, "detach"):
+        rows = accept_index.detach().to("cpu").tolist()
+    else:
+        rows = list(accept_index)
+    if not rows:
+        return []
+    if hasattr(retrive_index, "detach"):
+        roots = retrive_index[:, 0].detach().to("cpu").reshape(-1).tolist()
+    elif retrive_index is not None:
+        roots = [int(row[0]) for row in retrive_index]
+    else:
+        roots = [0] * len(rows)
+    out: List[List[int]] = []
+    for b, row in enumerate(rows):
+        root = int(roots[b]) if b < len(roots) else 0
+        path: List[int] = []
+        seq = row if isinstance(row, (list, tuple)) else [row]
+        for j, idx in enumerate(seq):
+            if j == 0:
+                continue
+            if idx is None or int(idx) < 0:
+                break
+            local = int(idx) - root
+            if local >= 1:
+                path.append(local - 1)
+        out.append(path)
+    return out
+
+
 def copy_paged_kv_buffer_by_slot(
     kv_buffer: torch.Tensor,
     src_loc: torch.Tensor,
