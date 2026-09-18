@@ -51,6 +51,59 @@ logger = logging.getLogger(__name__)
 SRTreeWindow = Tuple[List[int], Optional[List[int]], Optional[List[int]]]
 
 
+def _as_2d(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 0:
+        return tensor.unsqueeze(0).unsqueeze(0)
+    if tensor.dim() == 1:
+        return tensor.unsqueeze(0)
+    return tensor
+
+
+def _wait_d2h_event(device, host: dict) -> None:
+    """Block until the batched D2H into ``host`` is visible on CPU."""
+    host["event"] = None
+    if device is None:
+        return
+    dev_type = getattr(device, "type", None) or str(device)
+    if dev_type == "cpu":
+        return
+    try:
+        module = torch.get_device_module(dev_type)
+        event = module.Event()
+        event.record()
+        event.synchronize()
+        host["event"] = event
+    except Exception:
+        # CPU tests and missing device modules still have finished copy_ data.
+        return
+
+
+def _ensure_host_staging_slot(slots, idx: int, bs: int, token_w: int, parent_w: int, index_w: int):
+    host = slots[idx]
+    token_w = max(int(token_w), 0)
+    parent_w = max(int(parent_w), 0)
+    index_w = max(int(index_w), 0)
+    bs = max(int(bs), 1)
+    need_new = host is None
+    if not need_new:
+        need_new = (
+            host["tokens"].shape[0] < bs
+            or host["tokens"].shape[1] < token_w
+            or host["parents"].shape[1] < parent_w
+            or host["indices"].shape[1] < index_w
+        )
+    if need_new:
+        host = {
+            "tokens": torch.zeros((bs, max(token_w, 1)), dtype=torch.int64),
+            "parents": torch.zeros((bs, max(parent_w, 1)), dtype=torch.int64),
+            "indices": torch.zeros((bs, max(index_w, 1)), dtype=torch.int64),
+            "event": None,
+            "in_use": False,
+        }
+        slots[idx] = host
+    return host
+
+
 class SRTreeDrafter:
     def __init__(self, scheduler) -> None:
         self.scheduler = scheduler
@@ -78,6 +131,10 @@ class SRTreeDrafter:
         self._tree_failure_counts = {}
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
+        # Two host stagings so a later replay cannot overwrite a D2H that has
+        # not yet been split into RPC lists.
+        self._host_staging = [None, None]
+        self._staging_index = 0
         self._init_attention_backend()
         self._init_cuda_graphs()
 
@@ -225,20 +282,18 @@ class SRTreeDrafter:
             self._log_tree_failure("expand_batch", e)
             # Retrying the very same single-request batch cannot isolate a bad
             # request. Preserve the empty-window fallback without a second run.
+            # Do not pack the failed batch's graph outputs before per-req replay.
             if len(keep) == 1:
                 return windows
             for j, req in enumerate(keep):
                 windows[keep_idx[j]] = self._expand_one(req)
             return windows
         metrics = getattr(self.scheduler, "_sr_round_metrics", None)
-        # The first D2H waits for the asynchronously submitted tree forward.
+        # Batched D2H waits for the asynchronously submitted tree forward.
         with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
-            for j, idx in enumerate(keep_idx):
-                windows[idx] = (
-                    draft_tokens[j].detach().to("cpu").tolist(),
-                    parent_list[j].detach().to("cpu").tolist(),
-                    top_scores_index[j].detach().to("cpu").tolist(),
-                )
+            self._pack_tree_windows(
+                parent_list, top_scores_index, draft_tokens, keep_idx, windows
+            )
         return windows
 
     def _expand_one(self, req: "Req") -> SRTreeWindow:
@@ -257,13 +312,79 @@ class SRTreeDrafter:
                 raise
             self._log_tree_failure("expand_one", e)
             return empty
+        windows: List[SRTreeWindow] = [empty]
         metrics = getattr(self.scheduler, "_sr_round_metrics", None)
         with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
-            return (
-                draft_tokens[0].detach().to("cpu").tolist(),
-                parent_list[0].detach().to("cpu").tolist(),
-                top_scores_index[0].detach().to("cpu").tolist(),
+            self._pack_tree_windows(
+                parent_list, top_scores_index, draft_tokens, [0], windows
             )
+        return windows[0]
+
+    def _pack_tree_windows(
+        self,
+        parent_list,
+        top_scores_index,
+        draft_tokens,
+        keep_idx: List[int],
+        windows: List[SRTreeWindow],
+    ) -> None:
+        """One D2H per tree tensor, then CPU row splits into RPC lists."""
+        tokens_cpu, parents_cpu, indices_cpu = self._d2h_tree_outputs(
+            draft_tokens, parent_list, top_scores_index
+        )
+        for j, idx in enumerate(keep_idx):
+            windows[idx] = (
+                tokens_cpu[j].tolist(),
+                parents_cpu[j].tolist(),
+                indices_cpu[j].tolist(),
+            )
+
+    def _d2h_tree_outputs(self, draft_tokens, parent_list, top_scores_index):
+        tensors = (draft_tokens, parent_list, top_scores_index)
+        if all(isinstance(t, torch.Tensor) for t in tensors):
+            tokens = _as_2d(draft_tokens.detach())
+            parents = _as_2d(parent_list.detach())
+            indices = _as_2d(top_scores_index.detach())
+            n = int(tokens.shape[0])
+            token_w = int(tokens.shape[1]) if tokens.dim() > 1 else 1
+            parent_w = int(parents.shape[1]) if parents.dim() > 1 else 1
+            index_w = int(indices.shape[1]) if indices.dim() > 1 else 1
+            host = self._acquire_host_staging(n, token_w, parent_w, index_w)
+            non_blocking = tokens.device.type != "cpu"
+            host["tokens"][:n, :token_w].copy_(tokens, non_blocking=non_blocking)
+            host["parents"][:n, :parent_w].copy_(parents, non_blocking=non_blocking)
+            host["indices"][:n, :index_w].copy_(indices, non_blocking=non_blocking)
+            _wait_d2h_event(tokens.device, host)
+            host["in_use"] = False
+            return (
+                host["tokens"][:n, :token_w],
+                host["parents"][:n, :parent_w],
+                host["indices"][:n, :index_w],
+            )
+        # Test doubles expose detach().to("cpu") on the whole batch object.
+        return (
+            draft_tokens.detach().to("cpu"),
+            parent_list.detach().to("cpu"),
+            top_scores_index.detach().to("cpu"),
+        )
+
+    def _acquire_host_staging(self, bs: int, token_w: int, parent_w: int, index_w: int):
+        slots = getattr(self, "_host_staging", None)
+        if not slots:
+            self._host_staging = [None, None]
+            self._staging_index = 0
+            slots = self._host_staging
+        idx = int(getattr(self, "_staging_index", 0) or 0) % 2
+        other = slots[idx]
+        if other is not None and other.get("in_use"):
+            event = other.get("event")
+            if event is not None:
+                event.synchronize()
+            other["in_use"] = False
+        host = _ensure_host_staging_slot(slots, idx, bs, token_w, parent_w, index_w)
+        host["in_use"] = True
+        self._staging_index = (idx + 1) % 2
+        return host
 
     def _stack_seeds(
         self, reqs: List["Req"]

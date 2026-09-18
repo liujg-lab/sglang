@@ -43,14 +43,39 @@ def _req_committed_len(req) -> int:
     return max(0, len(req.origin_input_ids) + len(req.output_ids))
 
 
-def _sync_kv_from_seq_lens(batch: ScheduleBatch) -> None:
-    seq_lens = batch.seq_lens.tolist()
-    for req, sl in zip(batch.reqs, seq_lens):
+def _snapshot_seq_lens_cpu(batch: ScheduleBatch) -> Optional[torch.Tensor]:
+    cpu = getattr(batch, "seq_lens_cpu", None)
+    if cpu is None:
+        return None
+    return cpu.clone()
+
+
+def _sync_kv_from_cpu_lengths(
+    batch: ScheduleBatch,
+    seq_lens_cpu_pre,
+    accept_length_per_req_cpu,
+) -> None:
+    """SET KV bounds from CPU pre-verify lengths plus accepted draft + bonus.
+
+    ``accept_length`` is draft tokens only; +1 is the Target bonus. Finished
+    requests use the same formula after eagle_info truncates accept_index.
+    Do not read device ``seq_lens``: paged topk>1 may leave it unchanged.
+    """
+    if seq_lens_cpu_pre is None:
+        pre_list = [_req_committed_len(req) for req in batch.reqs]
+    elif isinstance(seq_lens_cpu_pre, torch.Tensor):
+        pre_list = seq_lens_cpu_pre.tolist()
+    else:
+        pre_list = list(seq_lens_cpu_pre)
+    acc = list(accept_length_per_req_cpu or [])
+    for i, req in enumerate(batch.reqs):
         if _is_health_check(req):
             continue
-        sl_i = int(sl)
-        req.kv_committed_len = sl_i
-        req.kv_allocated_len = sl_i
+        accepted = int(acc[i]) if i < len(acc) else 0
+        pre = int(pre_list[i]) if i < len(pre_list) else _req_committed_len(req)
+        committed = pre + accepted + 1
+        req.kv_committed_len = committed
+        req.kv_allocated_len = committed
 
 
 def _align_seq_lens_to_committed(batch: ScheduleBatch) -> None:
@@ -112,6 +137,18 @@ class StandaloneRemoteWorker:
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self._verify_max_bs = max(
+            int(getattr(server_args, "cuda_graph_max_bs", 0) or 0),
+            int(getattr(server_args, "max_running_requests", 0) or 0),
+            int(getattr(server_args, "standalone_remote_max_batch_size", 0) or 0),
+            1,
+        )
+        self._verify_tokens_buf = None
+        self._verify_parents_buf = None
+        self._verify_indices_buf = None
+        self._verify_id_buf = None
+        self._verify_mask_buf = None
+        self._verify_pos_buf = None
 
     @property
     def draft_model_runner(self):
@@ -197,12 +234,11 @@ class StandaloneRemoteWorker:
         topk = self.topk
         token_width = max(num_draft_tokens - 1, 1)
 
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
-        if (
-            batch.seq_lens_cpu is None
-            or batch.seq_lens_cpu.sum().item() != batch.seq_lens_sum
-        ):
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        else:
             batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
 
         verified_id, parent_list, top_scores_index, draft_tokens = (
             self._assemble_draft_tensors(
@@ -214,6 +250,15 @@ class StandaloneRemoteWorker:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 verified_id
             )
+
+        needed_mask = (
+            int(batch.seq_lens_sum) * num_draft_tokens
+            + num_draft_tokens * num_draft_tokens * bs
+        )
+        needed_pos = bs * num_draft_tokens
+        tree_mask_buf, position_buf, wrote_graph_mask, wrote_graph_pos = (
+            self._verify_mask_position_bufs(needed_mask, needed_pos, device)
+        )
 
         (
             tree_mask,
@@ -232,9 +277,11 @@ class StandaloneRemoteWorker:
             topk=topk,
             spec_steps=spec_steps,
             num_verify_tokens=num_draft_tokens,
+            tree_mask_buf=tree_mask_buf,
+            position_buf=position_buf,
         )
 
-        return EagleVerifyInput(
+        spec_info = EagleVerifyInput(
             draft_token=final_draft_tokens,
             custom_mask=tree_mask,
             positions=positions,
@@ -249,11 +296,15 @@ class StandaloneRemoteWorker:
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        if not wrote_graph_mask or not wrote_graph_pos:
+            self._maybe_update_graph_verify_buffers(spec_info)
+        return spec_info
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         metrics = getattr(batch, "sr_round_metrics", None)
         prepare_start = time.perf_counter()
         seq_lens_pre_verify = batch.seq_lens.clone()
+        seq_lens_cpu_pre = _snapshot_seq_lens_cpu(batch)
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = spec_info.draft_token_num
         batch.return_hidden_states = False
@@ -318,7 +369,9 @@ class StandaloneRemoteWorker:
             vocab_mask,
         )
         if not batch.forward_mode.is_idle():
-            _sync_kv_from_seq_lens(batch)
+            _sync_kv_from_cpu_lengths(
+                batch, seq_lens_cpu_pre, res.accept_length_per_req_cpu
+            )
 
         for req in batch.reqs:
             if _is_health_check(req):
@@ -528,6 +581,101 @@ class StandaloneRemoteWorker:
         finally:
             runner.graph_runner = graph_runner
 
+    def _attn_backend(self):
+        runner = getattr(self.target_worker, "model_runner", None)
+        return getattr(runner, "attn_backend", None)
+
+    def _grow_int64_buf(self, name: str, rows: int, cols: int, device):
+        buf = getattr(self, name, None)
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        cols = max(int(cols), 1)
+        rows = max(int(rows), 1)
+        if (
+            buf is None
+            or buf.device != dev
+            or buf.dtype != torch.int64
+            or buf.dim() != 2
+            or buf.shape[0] < rows
+            or buf.shape[1] < cols
+        ):
+            buf = torch.zeros((rows, cols), dtype=torch.int64, device=dev)
+            setattr(self, name, buf)
+        return buf
+
+    def _verify_input_bufs(self, bs: int, token_width: int, parent_w: int, index_w: int, device):
+        cap = max(int(getattr(self, "_verify_max_bs", 1) or 1), bs)
+        tokens = self._grow_int64_buf("_verify_tokens_buf", cap, token_width, device)
+        parents = self._grow_int64_buf("_verify_parents_buf", cap, max(parent_w, 1), device)
+        indices = self._grow_int64_buf("_verify_indices_buf", cap, max(index_w, 1), device)
+        verified = getattr(self, "_verify_id_buf", None)
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if (
+            verified is None
+            or verified.device != dev
+            or verified.dtype != torch.int64
+            or verified.numel() < cap
+        ):
+            verified = torch.empty((cap,), dtype=torch.int64, device=dev)
+            self._verify_id_buf = verified
+        return verified[:bs], parents[:bs], indices[:bs], tokens[:bs]
+
+    def _verify_mask_position_bufs(self, needed_mask: int, needed_pos: int, device):
+        backend = self._attn_backend()
+        graph_mask = graph_pos = None
+        getter = getattr(backend, "get_verify_buffers_to_fill_after_draft", None)
+        if getter is not None:
+            bufs = getter() or [None, None]
+            graph_mask = bufs[0] if len(bufs) > 0 else None
+            graph_pos = bufs[1] if len(bufs) > 1 else None
+
+        wrote_graph_mask = False
+        if graph_mask is not None:
+            if graph_mask.numel() < needed_mask:
+                raise RuntimeError(
+                    f"SR verify tree_mask ({needed_mask}) exceeds graph buffer "
+                    f"({graph_mask.numel()})"
+                )
+            mask_buf = graph_mask.reshape(-1)[:needed_mask]
+            wrote_graph_mask = True
+        else:
+            mask_buf = self._ensure_own_mask(needed_mask, device)
+
+        wrote_graph_pos = False
+        if graph_pos is not None:
+            if graph_pos.numel() < needed_pos:
+                raise RuntimeError(
+                    f"SR verify positions ({needed_pos}) exceeds graph buffer "
+                    f"({graph_pos.numel()})"
+                )
+            pos_buf = graph_pos.reshape(-1)[:needed_pos]
+            wrote_graph_pos = True
+        else:
+            pos_buf = self._ensure_own_pos(needed_pos, device)
+        return mask_buf, pos_buf, wrote_graph_mask, wrote_graph_pos
+
+    def _ensure_own_mask(self, needed: int, device):
+        buf = getattr(self, "_verify_mask_buf", None)
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if buf is None or buf.device != dev or buf.numel() < needed:
+            buf = torch.empty((needed,), dtype=torch.bool, device=dev)
+            self._verify_mask_buf = buf
+        return buf.reshape(-1)[:needed]
+
+    def _ensure_own_pos(self, needed: int, device):
+        buf = getattr(self, "_verify_pos_buf", None)
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if buf is None or buf.device != dev or buf.numel() < needed:
+            buf = torch.empty((needed,), dtype=torch.int64, device=dev)
+            self._verify_pos_buf = buf
+        return buf.reshape(-1)[:needed]
+
+    def _maybe_update_graph_verify_buffers(self, spec_info: EagleVerifyInput) -> None:
+        backend = self._attn_backend()
+        updater = getattr(backend, "update_verify_buffers_to_fill_after_draft", None)
+        if updater is None:
+            return
+        updater(spec_info, None)
+
     def _assemble_draft_tensors(
         self,
         batch: ScheduleBatch,
@@ -539,13 +687,13 @@ class StandaloneRemoteWorker:
         token_width: int,
     ):
         """Build verify tensors. Never synthesizes a SPECTRE-style fake bush."""
-        verified_id_buf = torch.empty(bs, dtype=torch.int64)
+        verified_cpu = torch.empty(bs, dtype=torch.int64)
         token_rows = []
         parent_rows: List[Optional[list]] = []
         index_rows: List[Optional[list]] = []
 
         for i, req in enumerate(batch.reqs):
-            verified_id_buf[i] = (
+            verified_cpu[i] = (
                 req.output_ids[-1]
                 if len(req.output_ids) > 0
                 else req.origin_input_ids[-1]
@@ -558,7 +706,12 @@ class StandaloneRemoteWorker:
             parent_rows.append(pl)
             index_rows.append(ix)
 
-        verified_id = verified_id_buf.to(device=device, non_blocking=True)
+        parent_w = max(spec_steps, 1)
+        index_w = token_width
+        verified_id, out_parents, out_indices, out_tokens = self._verify_input_bufs(
+            bs, token_width, parent_w, index_w, device
+        )
+        verified_id.copy_(verified_cpu, non_blocking=True)
         parents, indices, draft_tokens = assemble_draft_rows(
             token_rows,
             parent_rows,
@@ -567,18 +720,17 @@ class StandaloneRemoteWorker:
             spec_steps=spec_steps,
             num_draft_tokens=num_draft_tokens,
             device=device,
+            out_tokens=out_tokens,
+            out_parents=out_parents,
+            out_indices=out_indices,
         )
         if draft_tokens.shape[1] != token_width:
             if draft_tokens.shape[1] > token_width:
-                draft_tokens = draft_tokens[:, :token_width].contiguous()
+                draft_tokens = draft_tokens[:, :token_width]
             else:
-                pad = torch.zeros(
-                    bs,
-                    token_width - draft_tokens.shape[1],
-                    dtype=draft_tokens.dtype,
-                    device=draft_tokens.device,
-                )
-                draft_tokens = torch.cat([draft_tokens, pad], dim=1)
+                out_tokens[:, : draft_tokens.shape[1]].copy_(draft_tokens)
+                out_tokens[:, draft_tokens.shape[1] : token_width].zero_()
+                draft_tokens = out_tokens[:, :token_width]
         return verified_id, parents, indices, draft_tokens
 
 

@@ -1873,6 +1873,17 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(windows[1][1], [-1, 1])
 
+        copies = {"n": 0}
+        orig_copy = torch.Tensor.copy_
+
+        def counting_copy(self, *args, **kwargs):
+            copies["n"] += 1
+            return orig_copy(self, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "copy_", counting_copy):
+            drafter.expand_batch([r0, r1])
+        self.assertEqual(copies["n"], 3)
+
     def test_tree_drafter_exposes_eagle_draft_graph_aliases(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
@@ -1955,6 +1966,129 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(parents[0].tolist(), chain_p.tolist())
         self.assertEqual(indices[0].tolist(), chain_i.tolist())
         self.assertNotEqual(dt[0, 0].item(), dt[0, 1].item())
+
+    def test_assemble_writes_out_buffers(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            assemble_draft_rows,
+        )
+
+        out_tokens = torch.full((2, 4), 7, dtype=torch.int64)
+        out_parents = torch.full((2, 4), 9, dtype=torch.int64)
+        out_indices = torch.full((2, 4), 8, dtype=torch.int64)
+        parents, indices, dt = assemble_draft_rows(
+            [[11, 12, 13], [21, 22, 23]],
+            [[-1, 0], [-1, 1]],
+            [[0, 1, 2], [3, 4, 5]],
+            topk=2,
+            spec_steps=3,
+            num_draft_tokens=4,
+            device="cpu",
+            out_tokens=out_tokens,
+            out_parents=out_parents,
+            out_indices=out_indices,
+        )
+        self.assertEqual(dt[0].tolist(), [11, 12, 13])
+        self.assertEqual(dt.shape, (2, 3))
+        self.assertEqual(dt.data_ptr(), out_tokens.data_ptr())
+        self.assertEqual(parents[0, :2].tolist(), [-1, 0])
+        self.assertEqual(indices[1, :3].tolist(), [3, 4, 5])
+
+    def test_sync_kv_from_cpu_lengths_sets_bonus_and_finished(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        import ast
+        from pathlib import Path
+
+        from sglang.srt.speculative.standalone_remote.sr_protocol import (
+            is_health_check_req,
+        )
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in {"_req_committed_len", "_sync_kv_from_cpu_lengths"}
+        ]
+        ns = {
+            "torch": torch,
+            "_is_health_check": is_health_check_req,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(
+                        body=[
+                            ast.parse("from __future__ import annotations").body[0],
+                            *nodes,
+                        ],
+                        type_ignores=[],
+                    )
+                ),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        _sync_kv_from_cpu_lengths = ns["_sync_kv_from_cpu_lengths"]
+
+        live = SimpleNamespace(
+            rid="live",
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            kv_committed_len=3,
+            kv_allocated_len=3,
+        )
+        finished = SimpleNamespace(
+            rid="finished",
+            origin_input_ids=[1, 2],
+            output_ids=[3, 4],
+            kv_committed_len=3,
+            kv_allocated_len=3,
+        )
+        health = SimpleNamespace(
+            rid="HEALTH_CHECK_0",
+            origin_input_ids=[1],
+            output_ids=[],
+            kv_committed_len=1,
+            kv_allocated_len=1,
+        )
+        batch = SimpleNamespace(
+            reqs=[live, finished, health],
+            seq_lens=torch.tensor([3, 3, 1]),
+        )
+        _sync_kv_from_cpu_lengths(
+            batch,
+            torch.tensor([3, 3, 1], dtype=torch.int64),
+            [2, 0, 9],
+        )
+        self.assertEqual(live.kv_committed_len, 6)
+        self.assertEqual(live.kv_allocated_len, 6)
+        self.assertEqual(finished.kv_committed_len, 4)
+        self.assertEqual(finished.kv_allocated_len, 4)
+        self.assertEqual(health.kv_committed_len, 1)
+        self.assertEqual(health.kv_allocated_len, 1)
+
+        paged = SimpleNamespace(
+            rid="paged",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            kv_committed_len=99,
+            kv_allocated_len=99,
+        )
+        stale_device = SimpleNamespace(
+            reqs=[paged],
+            seq_lens=torch.tensor([4]),
+        )
+        _sync_kv_from_cpu_lengths(stale_device, torch.tensor([4]), [1])
+        self.assertEqual(paged.kv_committed_len, 6)
+        self.assertEqual(paged.kv_allocated_len, 6)
 
     def test_build_request_sends_speculative_num_draft_tokens(self):
         mixin_cls = self._import_mixin()

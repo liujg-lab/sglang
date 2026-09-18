@@ -590,10 +590,34 @@ class TestTreeFailureHandling(unittest.TestCase):
             "_expand_one",
             "_log_tree_failure",
             "_init_cuda_graphs",
+            "_pack_tree_windows",
+            "_d2h_tree_outputs",
+            "_acquire_host_staging",
         ]
-        functions = methods(
+        src_path = (
             ROOT
-            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        tree = ast.parse(src_path.read_text(encoding="utf-8"))
+        helper_ns = dict(torch=torch)
+        helper_nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in {"_as_2d", "_wait_d2h_event", "_ensure_host_staging_slot"}
+        ]
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=helper_nodes, type_ignores=[])
+                ),
+                str(src_path),
+                "exec",
+            ),
+            helper_ns,
+        )
+        functions = methods(
+            src_path,
             "SRTreeDrafter",
             names,
             dict(
@@ -602,6 +626,10 @@ class TestTreeFailureHandling(unittest.TestCase):
                 NpuGraphReplaySubmittedError=self.submitted_error,
                 device_backend_key=lambda _: "cuda",
                 nullcontext=nullcontext,
+                torch=torch,
+                _as_2d=helper_ns["_as_2d"],
+                _wait_d2h_event=helper_ns["_wait_d2h_event"],
+                _ensure_host_staging_slot=helper_ns["_ensure_host_staging_slot"],
             ),
         )
         md = shared.SharedPrefixMetadata.allocate(1, 3, 256, 15, 5, "cpu")
@@ -639,6 +667,25 @@ class TestTreeFailureHandling(unittest.TestCase):
             self.drafter.expand_batch([self.req, self.req]), [output, output]
         )
         self.assertEqual(self.drafter._expand_one.call_count, 2)
+
+    def test_expand_batch_copies_each_tree_tensor_once(self):
+        parent = torch.tensor([[-1, 0], [-1, 1]], dtype=torch.int64)
+        index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64)
+        tokens = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int64)
+        self.drafter._expand_tree = Mock(return_value=(parent, index, tokens))
+        self.drafter.scheduler = NS(_sr_round_metrics=None)
+        copies = {"n": 0}
+        orig = torch.Tensor.copy_
+
+        def counting_copy(self, *args, **kwargs):
+            copies["n"] += 1
+            return orig(self, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "copy_", counting_copy):
+            windows = self.drafter.expand_batch([self.req, self.req])
+        self.assertEqual(windows[0][0], [10, 11, 12])
+        self.assertEqual(windows[1][0], [20, 21, 22])
+        self.assertEqual(copies["n"], 3)
 
     def test_submitted_and_device_errors_propagate(self):
         for exc in (

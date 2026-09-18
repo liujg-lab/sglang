@@ -196,36 +196,49 @@ def _load_sr_tree_expand_methods():
         is_device_context_error,
     )
 
-    helpers = _load_tree_draft_helpers()
+    draft_helpers = _load_tree_draft_helpers()
     src_path = (
         _REPO
         / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
     )
     tree = ast.parse(src_path.read_text())
     methods = {}
+    helper_nodes = []
     for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in {
+            "_as_2d",
+            "_wait_d2h_event",
+            "_ensure_host_staging_slot",
+        }:
+            helper_nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter":
             for item in node.body:
                 if isinstance(item, ast.FunctionDef) and item.name in {
                     "expand_batch",
                     "_expand_one",
+                    "_pack_tree_windows",
+                    "_d2h_tree_outputs",
+                    "_acquire_host_staging",
                 }:
                     methods[item.name] = item
     future = ast.parse("from __future__ import annotations").body
-    mod = ast.Module(body=future + list(methods.values()), type_ignores=[])
-    ast.fix_missing_locations(mod)
     ns = {
-        "NpuGraphReplaySubmittedError": helpers.NpuGraphReplaySubmittedError,
+        "NpuGraphReplaySubmittedError": draft_helpers.NpuGraphReplaySubmittedError,
         "is_device_context_error": is_device_context_error,
         "logger": __import__("logging").getLogger("sr_tree_expand"),
         "List": list,
         "SRTreeWindow": tuple,
+        "torch": __import__("torch"),
     }
+    mod = ast.Module(
+        body=future + helper_nodes + list(methods.values()), type_ignores=[]
+    )
+    ast.fix_missing_locations(mod)
     exec(compile(mod, str(src_path), "exec"), ns)
     return SimpleNamespace(
         expand_batch=ns["expand_batch"],
         expand_one=ns["_expand_one"],
-        NpuGraphReplaySubmittedError=helpers.NpuGraphReplaySubmittedError,
+        NpuGraphReplaySubmittedError=draft_helpers.NpuGraphReplaySubmittedError,
     )
 
 

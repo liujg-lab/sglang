@@ -670,7 +670,7 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `tail_prepare_allocate` | grammar 恢复、batch 构造、KV 分配及前向输入准备 |
 | `tail_forward_seed_commit` | tail EXTEND、末位置 seed 处理和成功后事务提交 |
 | `tree_forward` | 树前向或图 replay 的主机调用区间，通常主要是异步提交 |
-| `tree_result_wait_pack` | 等待树结果、转 CPU、转列表及整理窗口 |
+| `tree_result_wait_pack` | 等待树结果、**批量** D2H 到 host staging、再按行转列表；不是每个请求 3 次 `.to("cpu")` |
 | `tree_expand_pack` | 整个树展开及结果打包，包含 tree_forward、tree_result_wait_pack 和其他准备/清理 |
 | `reply_prepare` | 将生成窗口组织为带请求身份的回复记录 |
 | `reply_send` | 调用 transport 发送回复，包括打包、发送和相关主机开销 |
@@ -718,7 +718,7 @@ Draft total              112.407ms
 ```
 
 树展开约占整轮 80.8%，tail 前向约 17.5%。不能把 90.827、12.259、76.305 三项相加。
-`.to("cpu").tolist()` 会等待之前异步提交的设备执行，所以 76.305ms 不是纯 D2H 或 Python 打包时间。
+批量 D2H（三个树张量各一次 `copy_` 到 host staging）会等待之前异步提交的设备执行，所以 76.305ms 不是纯传输或 Python 打包时间。
 设备 `tree_forward=89.975ms`、`device_samples.tree_forward=1` 支持设备树展开较重的判断，
 但它仅是一个样本，不能当成 32 轮均值或与其他阶段重复相加。
 

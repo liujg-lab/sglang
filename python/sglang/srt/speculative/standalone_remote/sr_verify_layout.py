@@ -166,14 +166,32 @@ def copy_tokens_into_row(
     if src is None or token_width <= 0:
         return
     if isinstance(src, torch.Tensor):
-        flat = src.detach().to("cpu").flatten()
+        flat = src.detach().reshape(-1)
+        if flat.device != dest.device:
+            flat = flat.to(dest.device)
         n = min(int(flat.numel()), token_width)
         if n:
             dest[:n] = flat[:n]
         return
     n = min(len(src), token_width)
     if n:
-        dest[:n] = torch.tensor(src[:n], dtype=torch.int64)
+        dest[:n] = torch.as_tensor(src[:n], dtype=torch.int64)
+
+
+def _export_assembled_rows(
+    cpu_tensor: torch.Tensor,
+    out: Optional[torch.Tensor],
+    device,
+) -> torch.Tensor:
+    bs, width = int(cpu_tensor.shape[0]), int(cpu_tensor.shape[1])
+    if out is not None and out.shape[0] >= bs and out.shape[1] >= width:
+        view = out[:bs, :width]
+        if width:
+            view.copy_(cpu_tensor, non_blocking=view.device.type != "cpu")
+        return view
+    if device is None or torch.device(device).type == "cpu":
+        return cpu_tensor
+    return cpu_tensor.to(device=device, non_blocking=True)
 
 
 def assemble_draft_rows(
@@ -184,28 +202,35 @@ def assemble_draft_rows(
     spec_steps: int,
     num_draft_tokens: int,
     device=None,
+    out_tokens: Optional[torch.Tensor] = None,
+    out_parents: Optional[torch.Tensor] = None,
+    out_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (parent_list, top_scores_index, draft_tokens). Never fakes a bush."""
     dev = device if device is not None else torch.device("cpu")
     bs = len(token_rows)
     token_width = max(num_draft_tokens - 1, 1)
-    draft_tokens = torch.zeros(bs, token_width, dtype=torch.int64, device=dev)
+    draft_cpu = torch.zeros(bs, token_width, dtype=torch.int64)
     parsed_parents: List[Optional[torch.Tensor]] = [None] * bs
     parsed_indices: List[Optional[torch.Tensor]] = [None] * bs
     n_tree = 0
     for i in range(bs):
-        copy_tokens_into_row(draft_tokens[i], token_rows[i], token_width)
+        copy_tokens_into_row(draft_cpu[i], token_rows[i], token_width)
         pl = parent_rows[i] if i < len(parent_rows) else None
         ix = index_rows[i] if i < len(index_rows) else None
         if pl is not None and ix is not None:
             n_tree += 1
             parsed_parents[i] = torch.as_tensor(pl, dtype=torch.int64)
             parsed_indices[i] = torch.as_tensor(ix, dtype=torch.int64)
-    chain_p, chain_i = chain_tree_structure(num_draft_tokens, spec_steps, device=dev)
+    chain_p, chain_i = chain_tree_structure(num_draft_tokens, spec_steps, device="cpu")
     if topk <= 1 or n_tree == 0:
-        parents = chain_p.unsqueeze(0).expand(bs, -1).contiguous()
-        indices = chain_i.unsqueeze(0).expand(bs, -1).contiguous()
-        return parents, indices, draft_tokens
+        parents_cpu = chain_p.unsqueeze(0).expand(bs, -1).contiguous()
+        indices_cpu = chain_i.unsqueeze(0).expand(bs, -1).contiguous()
+        return (
+            _export_assembled_rows(parents_cpu, out_parents, dev),
+            _export_assembled_rows(indices_cpu, out_indices, dev),
+            _export_assembled_rows(draft_cpu, out_tokens, dev),
+        )
     parent_w = int(chain_p.numel())
     index_w = int(chain_i.numel())
     for p, ix in zip(parsed_parents, parsed_indices):
@@ -213,17 +238,21 @@ def assemble_draft_rows(
             parent_w = max(parent_w, int(p.numel()))
         if ix is not None:
             index_w = max(index_w, int(ix.numel()))
-    parents = torch.full((bs, parent_w), -1, dtype=torch.int64, device=dev)
-    indices = torch.zeros((bs, index_w), dtype=torch.int64, device=dev)
+    parents_cpu = torch.full((bs, parent_w), -1, dtype=torch.int64)
+    indices_cpu = torch.zeros((bs, index_w), dtype=torch.int64)
     for i, (p, ix) in enumerate(zip(parsed_parents, parsed_indices)):
         if p is None or ix is None:
             n = min(parent_w, int(chain_p.numel()))
-            parents[i, :n] = chain_p[:n]
+            parents_cpu[i, :n] = chain_p[:n]
             n = min(index_w, int(chain_i.numel()))
-            indices[i, :n] = chain_i[:n]
+            indices_cpu[i, :n] = chain_i[:n]
             continue
         n = min(parent_w, int(p.numel()))
-        parents[i, :n] = p.flatten()[:n].to(dev)
+        parents_cpu[i, :n] = p.flatten()[:n]
         n = min(index_w, int(ix.numel()))
-        indices[i, :n] = ix.flatten()[:n].to(dev)
-    return parents, indices, draft_tokens
+        indices_cpu[i, :n] = ix.flatten()[:n]
+    return (
+        _export_assembled_rows(parents_cpu, out_parents, dev),
+        _export_assembled_rows(indices_cpu, out_indices, dev),
+        _export_assembled_rows(draft_cpu, out_tokens, dev),
+    )
