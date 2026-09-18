@@ -380,9 +380,13 @@ class SRDraftServer(_CommEndpoint):
             pass
 
     def drain(self) -> int:
+        """Discard queued messages, preserving the received request's timing.
+
+        Session reset calls this while processing the current request. Its
+        identity and residence start must survive until the matching reply.
+        """
         import zmq
 
-        self._finish_comm("abandoned")
         n = 0
         while True:
             try:

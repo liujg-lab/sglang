@@ -1,9 +1,12 @@
 """Deterministic CPU coverage of the real SR protocol and transport paths."""
 
+import ast
+import logging
 import pickle
 import sys
 import unittest
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -313,10 +316,94 @@ class TestCommTransport(unittest.TestCase):
             [b"id", *transport._pack_request(self.request())]
         )
         self.server.recv_batch()
+        pending = self.server._comm_pending
         self.server._socket.incoming.append(
             [b"id", *transport._pack_request(self.request(seq=2))]
         )
         self.assertEqual(self.server.drain(), 1)
+        self.assertIs(self.server._comm_pending, pending)
+        self.assertEqual(self.window(self.server, "unknown")["counts"]["stale_request"], 1)
+
+    def test_new_session_prefill_reset_preserves_received_request_timing(self):
+        # Execute the production reset method without importing GPU scheduler
+        # dependencies. Only cache/model state is replaced; transport is real.
+        path = Path(transport.__file__).parent / "drafter/sr_draft_scheduler_mixin.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cls = next(
+            n for n in tree.body
+            if isinstance(n, ast.ClassDef)
+            and n.name == "StandaloneRemoteDraftSchedulerMixin"
+        )
+        method = next(
+            n for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_sr_wipe_all"
+        )
+        namespace = {"logger": logging.getLogger(__name__)}
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+            namespace,
+        )
+        reset = namespace["_sr_wipe_all"]
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                request = SRBatchRequest("new-session", int(queued), SRAction.PREFILL)
+                self.client.send_batch(request)
+                self.clock.advance(1)
+                self.server._socket.incoming.append(
+                    [b"current", *self.client._socket.sent[-1]]
+                )
+                self.server.recv_batch()
+                pending = self.server._comm_pending
+                start = pending.start_ns
+                if queued:
+                    old = SRBatchRequest("old-session", 9, SRAction.STEP)
+                    self.server._socket.incoming.append(
+                        [b"old-identity", *transport._pack_request(old)]
+                    )
+                scheduler = SimpleNamespace(
+                    sr_state=SimpleNamespace(clear=lambda: []),
+                    sr_waiting=[],
+                    sr_server=self.server,
+                    _sr_http_alive=lambda: False,
+                    _sr_reset_scheduler_caches=lambda: self.clock.advance(20),
+                )
+                reset(scheduler)
+                self.assertIs(self.server._comm_pending, pending)
+                self.assertEqual(pending.start_ns, start)
+                self.assertEqual(pending.key, (request.session_id, request.rpc_seq))
+                self.assertEqual(pending.identity, b"current")
+                self.assertEqual(self.server.last_rpc_seq, -1)
+                self.assertFalse(self.server._socket.incoming)
+                self.clock.advance(170)
+                self.server.send_batch(SRBatchReply(request.session_id, request.rpc_seq))
+                frames = self.server._socket.sent[-1]
+                self.assertEqual(frames[0], b"current")
+                self.assertEqual(
+                    transport._unpack_reply(frames[1:]).draft_residence_ns,
+                    190_000_000,
+                )
+                self.assertIsNone(self.server._comm_pending)
+                self.clock.advance(3)  # Target local prefill overlaps Draft work.
+                self.client._socket.incoming.append(frames[1:])
+                self.client.recv_batch(request.session_id, request.rpc_seq)
+                values = self.window(self.client, "prefill")["values"]
+                self.assertEqual(values["recv_entry_gap_ms"][-1], 194)
+                self.assertEqual(values["rpc_elapsed_ms"][-1], 194)
+                self.assertEqual(values["non_draft_elapsed_ms"][-1], 4)
+        self.assertEqual(self.window(self.server, "prefill")["counts"], {"success": 2})
+        self.assertEqual(self.window(self.client, "prefill")["counts"], {"success": 2})
+        self.assertEqual(self.window(self.server, "unknown")["counts"]["stale_request"], 1)
+
+    def test_next_receive_abandons_unanswered_request_after_drain(self):
+        for seq in (1, 2):
+            self.server._socket.incoming.append(
+                [b"id", *transport._pack_request(self.request(seq=seq))]
+            )
+            self.server.recv_batch()
+            self.assertEqual(self.server._comm_pending.key, ("session", seq))
+            self.assertEqual(self.server.drain(), 0)
+        self.assertEqual(self.window(self.server)["counts"]["abandoned"], 1)
+        self.server.send_batch(SRBatchReply("session", 2))
         self.assertIsNone(self.server._comm_pending)
 
     def test_stale_traffic_does_not_extend_receive_deadline(self):

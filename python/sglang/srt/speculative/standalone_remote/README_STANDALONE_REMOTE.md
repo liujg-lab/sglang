@@ -627,9 +627,12 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `unmatched_reply` | Draft 尝试发送不匹配当前 identity/session/rpc 的回复，不附用当前请求的驻留时长 |
 
 `kind=sample` 的 counts 只展示该样本的 success；完整缺失/非法等事件计数看 window。
-已有计时边界问题：新 session 触发 Draft 状态重置时会调用 `drain()`，它同时清理已经收到的
-当前请求计时，因此首条 PREFILL 回复可能没有 `draft_residence_ns`。这不代表推理失败；
-本文仅记录现状，未修复实现。不要把不同 session 的两个 PREFILL 样本直接配对。
+新 session 触发 Draft 状态重置时，`drain()` 只清理排队消息，保留已接收请求的 identity 和
+计时起点，因此首条 PREFILL 的 `draft_residence_ns` 包含 session reset 耗时。
+旧版本 Draft 仍可能缺少该字段，不能将缺失值当作零。不要把不同 session 的两个 PREFILL
+样本直接配对；PREFILL 与 STEP 必须分组解读。PREFILL 的 Target 本地计算可与 Draft 处理
+重叠，因此 `recv_entry_gap_ms` 可以大于 `non_draft_elapsed_ms`，两者不能直接相加。
+例如约 195ms 的 RPC 若有约 194ms 的延后收包间隔，不能将整段 RPC 时间解释为通信延迟。
 
 示例：某 STEP 窗口 `rpc_elapsed_ms.mean=111.464`，`draft_residence_ms.mean=111.212`，
 `non_draft_elapsed_ms.mean=0.252`。几百字节消息的发送调用耗时不是 111ms；
@@ -800,7 +803,7 @@ accept rate = 同一输出 token 数 / Σ(batch_size * 本批 draft_num_tokens)
 | `Target recv timeout ... waited_ms=...` | 接收等待超时；区分 Draft 未就绪、处理慢、异常和链路问题 |
 | `drop stale reply` / `drained ... stale frames` | 旧 session/rpc 回复被过滤；调度层还检查 step/base_len |
 | `breaker CLOSED -> OPEN` 等 | 连续失败与冷却状态转换；不是接受率过低导致熔断 |
-| `Draft wiped RPC state for new session` | 新会话重置；首次 PREFILL 计时可能受上述 drain 边界影响 |
+| `Draft wiped RPC state for new session` | 新会话重置；清理排队消息，保留当前请求计时，驻留时间包含重置耗时 |
 | `tree expand failed` / 图捕获或准备失败 | 看 traceback、实现和阶段；失败后可能无候选，不能只看 graph 开关 |
 | tail ingest / seed recovery failed | 检查 prefix 边界、seed revision、分配事务及位置数据；设备上下文错误不能盲目重试 |
 | 可选模型 import warning | 需判断是否属于实际加载的模型；不是所有缺失可选模块都影响当前 Qwen3-VL |
