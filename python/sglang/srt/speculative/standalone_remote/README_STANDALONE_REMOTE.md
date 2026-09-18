@@ -234,7 +234,7 @@ Draft 编译失败或降级不能代替 Target 约束。`return_logprob` 按实�
 | 路径 | 当前行为 |
 | --- | --- |
 | Draft 链 | 普通 decode；满足条件时使用对应 backend 的 decode graph |
-| Draft tail EXTEND | 普通 eager EXTEND，保留 prefix KV；无 tail 专用图，不送入单 token decode graph |
+| Draft tail EXTEND | 专用 tail EXTEND 图（普通 EXTEND + `is_sr_tail_extend`）；bucket 不匹配或捕获失败时走 eager；不送入单 token decode graph |
 | Draft 树 | CUDA / NPU 各自的树图 runner；捕获整段树展开，依赖深度仍然串行 |
 | Target 树验证 | 根据 batch、验证 token 数及支持的长度 bucket 捕获 / replay |
 | Target 无草稿降级 | 单 token 普通 AR 当前强制 eager；存在 `r1` 图不代表该路径会使用它 |

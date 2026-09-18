@@ -68,7 +68,10 @@ from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRDraftServer,
     make_transport_from_server_args,
 )
-from sglang.srt.speculative.spec_utils import NpuGraphReplaySubmittedError
+from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
+    NpuGraphReplaySubmittedError,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
     SRTreeDrafter,
 )
@@ -1086,7 +1089,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         return make_tail_extend_batch(self, plans)
 
     def _sr_ingest_tree_tails(self, reqs: List[Req]) -> None:
-        """Materialize all missing tree-prefix tokens in one eager EXTEND."""
+        """Materialize all missing tree-prefix tokens in one EXTEND."""
         metrics = get_sr_round_metrics(self, "Draft")
         plan_start = time.perf_counter()
         runner = self.tp_worker.model_runner
@@ -1159,17 +1162,48 @@ class StandaloneRemoteDraftSchedulerMixin:
             for p in plans:
                 metrics.counts[f"tail_len_{p.length if p.length <= 16 else 'gt16'}"] += 1
             with metrics.phase("tail_forward_seed_commit", device=True):
-                transaction.submitted = True
-                result = self.tp_worker.forward_batch_generation(
-                    worker_batch, seed_only=True
+                drafter = getattr(self, "sr_tree_drafter", None)
+                tail_runner = (
+                    getattr(drafter, "tail_graph_runner", None) if drafter else None
                 )
-                transaction.commit(result.logits_output)
+                plan = tail_runner.plan(batch) if tail_runner is not None else None
+                logits_output = None
+                forward_batch = None
+                if plan is not None:
+                    try:
+                        forward_batch = tail_runner.init_forward_batch(worker_batch)
+                        tail_runner.fill(forward_batch, plan)
+                    except NpuGraphPreparationError as e:
+                        logger.warning(
+                            "[SR] tail graph prep failed: %s; falling back to eager",
+                            e,
+                        )
+                        tail_runner.eager_fallback_count = (
+                            getattr(tail_runner, "eager_fallback_count", 0) + 1
+                        )
+                        plan = None
+                if plan is not None:
+                    transaction.submitted = True
+                    logits_output = tail_runner.replay_filled(plan)
+                    tail_runner.model_runner.capture_tree_seed_only(
+                        logits_output, forward_batch
+                    )
+                    metrics.paths["tail_extend_graph"] += 1
+                else:
+                    transaction.submitted = True
+                    result = self.tp_worker.forward_batch_generation(
+                        worker_batch, seed_only=True
+                    )
+                    logits_output = result.logits_output
+                transaction.commit(logits_output)
             paths = getattr(runner.attn_backend, "sr_tail_attention_paths", None)
             for path in paths or ("ordinary_extend",):
                 metrics.paths[path] += 1
         except Exception as e:
-            if _sr_is_device_context_error(e) or (
-                self.tp_size > 1 and transaction.submitted
+            if (
+                _sr_is_device_context_error(e)
+                or isinstance(e, NpuGraphReplaySubmittedError)
+                or (self.tp_size > 1 and transaction.submitted)
             ):
                 # Device execution may still own the slots. Do not recycle them.
                 # A TP peer may be inside a collective; do not block here on a

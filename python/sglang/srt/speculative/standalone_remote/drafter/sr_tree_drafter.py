@@ -196,8 +196,9 @@ class SRTreeDrafter:
             self.draft_attn_backend = None
 
     def _init_cuda_graphs(self) -> None:
-        """Capture v1 EAGLE draft-tree graphs. Skip draft-extend graphs (not used by SR)."""
+        """Capture v1 EAGLE draft-tree graphs. Skip EAGLE draft-extend graphs."""
         self.cuda_graph_runner = None
+        self.tail_graph_runner = None
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
         if getattr(self.server_args, "disable_cuda_graph", False):
@@ -205,6 +206,7 @@ class SRTreeDrafter:
             return
         if self.speculative_num_steps <= 1 or self.draft_attn_backend is None:
             self.tree_graph_disabled_reason = "no multi-step attention backend"
+            getattr(self, "_init_tail_graphs", lambda: None)()
             return
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         try:
@@ -252,6 +254,35 @@ class SRTreeDrafter:
             self.cuda_graph_runner = None
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
+        getattr(self, "_init_tail_graphs", lambda: None)()
+
+    def _init_tail_graphs(self) -> None:
+        """Capture SR-only tail EXTEND graphs. Keep ordinary EXTEND attention."""
+        self.tail_graph_runner = None
+        if getattr(self.server_args, "disable_cuda_graph", False):
+            return
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend_graph import (
+                create_sr_tail_extend_graph_runner,
+            )
+
+            runner = create_sr_tail_extend_graph_runner(self)
+            if runner is None or not getattr(runner, "graphs", None):
+                reason = getattr(runner, "disabled_reason", None) if runner else None
+                logger.info("[SR] tail EXTEND graphs disabled: %s", reason or "no graphs")
+                return
+            self.tail_graph_runner = runner
+            logger.info(
+                "[SR] tail EXTEND graphs captured: buckets=%s",
+                list(runner.graphs),
+            )
+        except NpuGraphReplaySubmittedError:
+            raise
+        except Exception as e:
+            if is_device_context_error(e):
+                raise
+            logger.warning("[SR] tail EXTEND graph init failed: %s", e)
+            self.tail_graph_runner = None
 
     def expand_batch(self, reqs: List["Req"]) -> List[SRTreeWindow]:
         """Fused tree expand for every req that has a pool slot and a seed."""

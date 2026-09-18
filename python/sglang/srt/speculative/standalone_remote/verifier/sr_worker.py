@@ -149,6 +149,15 @@ class StandaloneRemoteWorker:
         self._verify_id_buf = None
         self._verify_mask_buf = None
         self._verify_pos_buf = None
+        runner = getattr(target_worker, "model_runner", None)
+        self._hybrid_needs_hidden = bool(
+            runner is not None
+            and (
+                getattr(runner, "hybrid_gdn_config", None) is not None
+                or getattr(runner, "mamba2_config", None) is not None
+                or getattr(runner, "hybrid_lightning_config", None) is not None
+            )
+        )
 
     @property
     def draft_model_runner(self):
@@ -164,6 +173,31 @@ class StandaloneRemoteWorker:
 
     def clear_cache_pool(self):
         pass
+
+    def _need_target_hidden(self, batch: Optional[ScheduleBatch] = None) -> bool:
+        """Keep Target hidden states for HTTP return or hybrid models.
+
+        Ordinary SR Target does not send hidden states to remote Draft.
+        """
+        if getattr(self.server_args, "enable_return_hidden_states", False):
+            return True
+        if self._hybrid_needs_hidden:
+            return True
+        if batch is None:
+            return False
+        if getattr(batch, "return_hidden_states", False):
+            return True
+        for req in getattr(batch, "reqs", None) or []:
+            if getattr(req, "return_hidden_states", False):
+                return True
+        return False
+
+    def _target_capture_hidden_mode(
+        self, batch: Optional[ScheduleBatch] = None
+    ) -> CaptureHiddenMode:
+        if self._need_target_hidden(batch):
+            return CaptureHiddenMode.FULL
+        return CaptureHiddenMode.NULL
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -201,7 +235,7 @@ class StandaloneRemoteWorker:
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor]]:
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.capture_hidden_mode = self._target_capture_hidden_mode(batch)
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         return (
             batch_result.logits_output,
@@ -292,7 +326,7 @@ class StandaloneRemoteWorker:
             spec_steps=spec_steps,
             topk=topk,
             draft_token_num=num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self._target_capture_hidden_mode(batch),
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
@@ -303,6 +337,7 @@ class StandaloneRemoteWorker:
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         metrics = getattr(batch, "sr_round_metrics", None)
         prepare_start = time.perf_counter()
+        prepare_hidden = self._need_target_hidden(batch)
         seq_lens_pre_verify = batch.seq_lens.clone()
         seq_lens_cpu_pre = _snapshot_seq_lens_cpu(batch)
         spec_info.prepare_for_verify(batch, self.page_size)
@@ -367,6 +402,7 @@ class StandaloneRemoteWorker:
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            prepare_local_draft_hidden=prepare_hidden,
         )
         if not batch.forward_mode.is_idle():
             _sync_kv_from_cpu_lengths(
@@ -383,7 +419,10 @@ class StandaloneRemoteWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -426,10 +465,16 @@ class StandaloneRemoteWorker:
         if batch.forward_mode.is_idle():
             return
 
+        hidden = logits_output.hidden_states
+        device = (
+            hidden.device
+            if hidden is not None
+            else getattr(logits_output.next_token_logits, "device", batch.device)
+        )
         accepted_length = (
             torch.tensor(
                 res.accept_length_per_req_cpu,
-                device=logits_output.hidden_states.device,
+                device=device,
                 dtype=torch.int64,
             )
             + 1

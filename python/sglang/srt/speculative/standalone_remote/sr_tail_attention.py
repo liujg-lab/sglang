@@ -39,6 +39,80 @@ def build_tail_attention_metadata(prefix_lens, extend_lens, block_tables):
     )
 
 
+def tail_graph_max_pages(max_kv, page_size) -> int:
+    """Pages needed to cover ``max_kv`` tokens, at least 1."""
+    page_size = max(int(page_size or 1), 1)
+    max_kv = max(int(max_kv or 0), 0)
+    return max((max_kv + page_size - 1) // page_size, 1)
+
+
+def tail_graph_fits_pages(max_seq, captured_pages, page_size) -> bool:
+    return tail_graph_max_pages(max_seq, page_size) <= int(captured_pages or 0)
+
+
+def widen_tail_block_tables(tables, max_pages):
+    """Right-pad page columns with zeros so capture/replay share one width."""
+    max_pages = int(max_pages)
+    if max_pages < 1:
+        raise ValueError("SR tail graph page table width must be positive")
+    if tables.shape[1] >= max_pages:
+        return tables
+    pad = torch.zeros(
+        (tables.shape[0], max_pages - tables.shape[1]),
+        dtype=tables.dtype,
+        device=tables.device,
+    )
+    return torch.cat([tables, pad], dim=1)
+
+
+def copy_tail_attention_metadata_(dst, src):
+    """Copy ``src`` into captured ``dst`` tensors. Graph replay needs the same storage."""
+    if src.block_tables.shape[0] != dst.block_tables.shape[0]:
+        raise ValueError("SR tail graph query row mismatch")
+    if src.block_tables.shape[1] > dst.block_tables.shape[1]:
+        raise ValueError("SR tail graph page table is too narrow")
+    if src.context_lens_cpu.numel() != dst.context_lens_cpu.numel():
+        raise ValueError("SR tail graph context length row mismatch")
+    if len(src.context_lens_list) != len(dst.context_lens_list):
+        raise ValueError("SR tail graph context length list mismatch")
+    dst.block_tables.zero_()
+    n_pages = src.block_tables.shape[1]
+    dst.block_tables[:, :n_pages].copy_(src.block_tables)
+    dst.context_lens_cpu.copy_(
+        src.context_lens_cpu.to(
+            dtype=dst.context_lens_cpu.dtype, device=dst.context_lens_cpu.device
+        )
+    )
+    dst.context_lens_list[:] = list(src.context_lens_list)
+
+
+def pad_tail_attention_metadata(metadata, token_cap, dummy_slot=0):
+    """Append dummy query rows that only see ``dummy_slot``.
+
+    Dummy rows are packed after real queries. They do not share a real
+    request's prefix pages, and real queries never include them in context.
+    """
+    if dummy_slot != 0:
+        raise ValueError("SR tail graph dummy queries must use reserved slot 0")
+    n_real = len(metadata.context_lens_list)
+    if n_real > token_cap:
+        raise ValueError("SR tail exceeds graph token capacity")
+    if n_real == token_cap:
+        return metadata
+    pad = token_cap - n_real
+    dummy_tables = torch.zeros(
+        (pad, metadata.block_tables.shape[1]),
+        dtype=metadata.block_tables.dtype,
+        device=metadata.block_tables.device,
+    )
+    dummy_ctx = torch.ones(pad, dtype=metadata.context_lens_cpu.dtype)
+    return SRTailAttentionMetadata(
+        torch.cat([metadata.block_tables, dummy_tables], dim=0),
+        torch.cat([metadata.context_lens_cpu, dummy_ctx], dim=0),
+        list(metadata.context_lens_list) + [1] * pad,
+    )
+
+
 def validate_tail_forward_batch(batch):
     """Check the packed contract without synchronizing device tensors."""
     prefix, lengths = batch.extend_prefix_lens_cpu, batch.extend_seq_lens_cpu

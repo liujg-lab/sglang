@@ -331,6 +331,116 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.NULL)
 
 
+class TestSRTargetHiddenSkip(CustomTestCase):
+    def test_select_hidden_states_for_draft_skip_and_gather(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        import ast
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/eagle_info.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "select_hidden_states_for_draft"
+        )
+        ns = {}
+        exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+        hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        index = torch.tensor([0, 2])
+        gathered = ns["select_hidden_states_for_draft"](hidden, index, True)
+        self.assertEqual(gathered.tolist(), [[0.0, 1.0], [4.0, 5.0]])
+        self.assertIsNone(ns["select_hidden_states_for_draft"](hidden, index, False))
+        self.assertIsNone(ns["select_hidden_states_for_draft"](None, index, True))
+
+    def test_verify_defaults_to_preparing_local_draft_hidden(self):
+        from pathlib import Path
+
+        eagle = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/eagle_info.py"
+        )
+        src = eagle.read_text(encoding="utf-8")
+        self.assertIn("prepare_local_draft_hidden: bool = True", src)
+        spectre = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/spectre/verifier/spectre_worker.py"
+        )
+        eagle_worker = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/eagle_worker.py"
+        )
+        for path in (spectre, eagle_worker):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("prepare_local_draft_hidden=", text)
+
+    def _load_hidden_helpers(self):
+        import ast
+        from pathlib import Path
+        from typing import Optional
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        class_node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "StandaloneRemoteWorker"
+        )
+        wanted = {"_need_target_hidden", "_target_capture_hidden_mode"}
+        capture = SimpleNamespace(NULL=0, LAST=1, FULL=2)
+        ns = {
+            "CaptureHiddenMode": capture,
+            "Optional": Optional,
+            "ScheduleBatch": object,
+        }
+        for node in class_node.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+        return ns["_need_target_hidden"], ns["_target_capture_hidden_mode"], capture
+
+    def test_need_target_hidden_skip_and_overrides(self):
+        need, capture_fn, CaptureHiddenMode = self._load_hidden_helpers()
+        worker = SimpleNamespace(
+            server_args=SimpleNamespace(enable_return_hidden_states=False),
+            _hybrid_needs_hidden=False,
+        )
+        worker._need_target_hidden = lambda batch=None: need(worker, batch)
+        self.assertFalse(need(worker, None))
+        self.assertEqual(capture_fn(worker, None), CaptureHiddenMode.NULL)
+        batch = SimpleNamespace(return_hidden_states=False, reqs=[])
+        self.assertFalse(need(worker, batch))
+        self.assertEqual(capture_fn(worker, batch), CaptureHiddenMode.NULL)
+        batch.reqs = [SimpleNamespace(return_hidden_states=True)]
+        self.assertTrue(need(worker, batch))
+        self.assertEqual(capture_fn(worker, batch), CaptureHiddenMode.FULL)
+        worker.server_args.enable_return_hidden_states = True
+        self.assertTrue(need(worker, SimpleNamespace(return_hidden_states=False, reqs=[])))
+        worker.server_args.enable_return_hidden_states = False
+        worker._hybrid_needs_hidden = True
+        self.assertTrue(need(worker, None))
+        self.assertEqual(capture_fn(worker, None), CaptureHiddenMode.FULL)
+
+    def test_sr_worker_guards_none_hidden_states(self):
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("prepare_local_draft_hidden=prepare_hidden", src)
+        self.assertIn("if logits_output.hidden_states is not None:", src)
+        self.assertIn("CaptureHiddenMode.NULL", src)
+        self.assertIn("_need_target_hidden", src)
+
+
 class TestSRTpBroadcast(CustomTestCase):
     def test_wrap_unwrap_bool_none_dict_tuple(self):
         for obj in (True, False, None, {"k": 1}, (1, 2)):

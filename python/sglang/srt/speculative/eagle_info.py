@@ -74,6 +74,21 @@ def _log_verify_method_once(
         logger.info("Speculative verify method: %s", resolved)
 
 
+def select_hidden_states_for_draft(
+    hidden_states,
+    index,
+    prepare_local_draft_hidden: bool = True,
+):
+    """Gather accepted-node hidden states for the next local draft.
+
+    Remote Target workers can skip this gather. ``index`` is unused when
+    hidden states are absent or the caller does not prepare local draft input.
+    """
+    if not prepare_local_draft_hidden or hidden_states is None:
+        return None
+    return hidden_states[index]
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -255,6 +270,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        prepare_local_draft_hidden: bool = True,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -265,6 +281,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         This API updates values inside logits_output based on the accepted
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
+
+        ``prepare_local_draft_hidden`` (default True) gathers accepted-node
+        hidden states into ``EagleDraftInput`` for in-process EAGLE. Remote
+        Target workers that do not consume Target hidden states can pass
+        False; accept indices, KV commit, grammar, and logprob are unchanged.
         """
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
@@ -615,7 +636,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
             draft_input = EagleDraftInput(
-                hidden_states=batch.spec_info.hidden_states[accept_index],
+                hidden_states=select_hidden_states_for_draft(
+                    getattr(batch.spec_info, "hidden_states", None),
+                    accept_index,
+                    prepare_local_draft_hidden,
+                ),
                 verified_id=verified_id,
                 accept_length=accept_length,
                 accept_length_cpu=accept_length_list,
@@ -676,9 +701,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     )
 
                 draft_input = EagleDraftInput(
-                    hidden_states=batch.spec_info.hidden_states[
-                        unfinished_accept_index
-                    ],
+                    hidden_states=select_hidden_states_for_draft(
+                        getattr(batch.spec_info, "hidden_states", None),
+                        unfinished_accept_index,
+                        prepare_local_draft_hidden,
+                    ),
                     verified_id=predict[unfinished_accept_index],
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
