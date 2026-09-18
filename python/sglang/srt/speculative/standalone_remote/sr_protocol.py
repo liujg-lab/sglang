@@ -202,13 +202,17 @@ class SRBatchReply:
     session_id: str
     rpc_seq: int
     reqs: List[SRDraftReply] = field(default_factory=list)
+    draft_residence_ns: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "session_id": self.session_id,
             "rpc_seq": self.rpc_seq,
             "reqs": [r.to_dict() for r in self.reqs],
         }
+        if type(self.draft_residence_ns) is int and self.draft_residence_ns >= 0:
+            result["draft_residence_ns"] = self.draft_residence_ns
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SRBatchReply":
@@ -220,6 +224,9 @@ class SRBatchReply:
             session_id=d["session_id"],
             rpc_seq=int(d["rpc_seq"]),
             reqs=reqs,
+            # Preserve malformed optional telemetry for transport validation;
+            # it must never prevent an otherwise valid reply from being used.
+            draft_residence_ns=d.get("draft_residence_ns"),
         )
 
 
