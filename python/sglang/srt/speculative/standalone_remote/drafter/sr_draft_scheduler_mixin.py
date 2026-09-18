@@ -1166,22 +1166,27 @@ class StandaloneRemoteDraftSchedulerMixin:
                 tail_runner = (
                     getattr(drafter, "tail_graph_runner", None) if drafter else None
                 )
-                plan = tail_runner.plan(batch) if tail_runner is not None else None
+                plan = None
+                miss_reason = "no_runner"
                 logits_output = None
                 forward_batch = None
-                if plan is not None:
-                    try:
-                        forward_batch = tail_runner.init_forward_batch(worker_batch)
-                        tail_runner.fill(forward_batch, plan)
-                    except NpuGraphPreparationError as e:
-                        logger.warning(
-                            "[SR] tail graph prep failed: %s; falling back to eager",
-                            e,
-                        )
-                        tail_runner.eager_fallback_count = (
-                            getattr(tail_runner, "eager_fallback_count", 0) + 1
-                        )
-                        plan = None
+                if tail_runner is not None:
+                    if hasattr(tail_runner, "plan_with_reason"):
+                        plan, miss_reason = tail_runner.plan_with_reason(batch)
+                    else:
+                        plan = tail_runner.plan(batch)
+                        miss_reason = "ok" if plan is not None else "no_bucket"
+                    if plan is not None:
+                        try:
+                            forward_batch = tail_runner.init_forward_batch(worker_batch)
+                            tail_runner.fill(forward_batch, plan)
+                        except NpuGraphPreparationError as e:
+                            logger.warning(
+                                "[SR] tail graph prep failed: %s; falling back to eager",
+                                e,
+                            )
+                            miss_reason = "prep"
+                            plan = None
                 if plan is not None:
                     transaction.submitted = True
                     logits_output = tail_runner.replay_filled(plan)
@@ -1189,16 +1194,29 @@ class StandaloneRemoteDraftSchedulerMixin:
                         logits_output, forward_batch
                     )
                     metrics.paths["tail_extend_graph"] += 1
+                    paths = getattr(
+                        runner.attn_backend, "sr_tail_attention_paths", None
+                    )
+                    if paths:
+                        for path in paths:
+                            metrics.paths[path] += 1
                 else:
+                    if tail_runner is not None:
+                        tail_runner.eager_fallback_count = (
+                            getattr(tail_runner, "eager_fallback_count", 0) + 1
+                        )
+                    metrics.counts[f"tail_graph_miss_{miss_reason}"] += 1
                     transaction.submitted = True
                     result = self.tp_worker.forward_batch_generation(
                         worker_batch, seed_only=True
                     )
                     logits_output = result.logits_output
+                    paths = getattr(
+                        runner.attn_backend, "sr_tail_attention_paths", None
+                    )
+                    for path in paths or ("ordinary_extend",):
+                        metrics.paths[path] += 1
                 transaction.commit(logits_output)
-            paths = getattr(runner.attn_backend, "sr_tail_attention_paths", None)
-            for path in paths or ("ordinary_extend",):
-                metrics.paths[path] += 1
         except Exception as e:
             if (
                 _sr_is_device_context_error(e)

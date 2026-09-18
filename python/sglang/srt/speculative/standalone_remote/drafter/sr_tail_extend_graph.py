@@ -22,8 +22,8 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
-    build_tail_attention_metadata,
     copy_tail_attention_metadata_,
+    fill_tail_attention_metadata_,
     pad_tail_attention_metadata,
     tail_graph_fits_pages,
     tail_graph_max_pages,
@@ -45,12 +45,34 @@ def default_tail_token_caps(speculative_num_steps: int) -> Tuple[int, ...]:
     return tuple(sorted(c for c in caps if c > 0))
 
 
+def tail_max_per_request(speculative_num_steps: int) -> int:
+    return max(int(speculative_num_steps or 0), 0) + 1
+
+
 def trim_capture_batch_sizes(capture_bs: Sequence[int], limit: int = 6) -> List[int]:
     values = [int(bs) for bs in capture_bs if int(bs) > 0]
     values = sorted(set(values))
     if len(values) <= limit:
         return values
     return values[: limit - 1] + [values[-1]]
+
+
+def tail_token_caps_for_bs(
+    bs: int,
+    max_per_req: int,
+    *,
+    dummy: bool = False,
+    max_bs: int = 1,
+) -> Tuple[int, ...]:
+    """Packed batch token caps. Dummy bs covers inexact concurrent sums."""
+    max_per_req = max(int(max_per_req), 1)
+    bs = int(bs)
+    if dummy:
+        packed = max(int(max_bs), 1) * max_per_req
+        return tuple(sorted(c for c in {4, 6, 8, packed} if c > 0))
+    if bs <= 1:
+        return tuple(sorted(c for c in {1, 2, 4, max_per_req} if c > 0))
+    return tuple(range(bs, bs * max_per_req + 1))
 
 
 def default_tail_graph_buckets(
@@ -64,6 +86,40 @@ def default_tail_graph_buckets(
             for attn_cap in attn_caps:
                 cap = None if attn_cap is None else int(attn_cap)
                 buckets.append((int(bs), int(token_cap), cap))
+    return buckets
+
+
+def packed_tail_graph_buckets(
+    capture_bs: Sequence[int],
+    speculative_num_steps: int,
+    attn_caps: Sequence[Optional[int]] = (None,),
+) -> List[TailGraphBucket]:
+    """Per-bs packed caps plus dummy_bs = max(capture_bs) + 1."""
+    sizes = trim_capture_batch_sizes(capture_bs)
+    if not sizes:
+        return []
+    max_bs = max(sizes)
+    max_per_req = tail_max_per_request(speculative_num_steps)
+    buckets: List[TailGraphBucket] = []
+    seen = set()
+
+    def add(bs: int, token_cap: int) -> None:
+        for attn_cap in attn_caps:
+            cap = None if attn_cap is None else int(attn_cap)
+            key = (int(bs), int(token_cap), cap)
+            if key in seen:
+                continue
+            seen.add(key)
+            buckets.append(key)
+
+    for bs in sizes:
+        for token_cap in tail_token_caps_for_bs(bs, max_per_req, max_bs=max_bs):
+            add(bs, token_cap)
+    dummy_bs = max_bs + 1
+    for token_cap in tail_token_caps_for_bs(
+        dummy_bs, max_per_req, dummy=True, max_bs=max_bs
+    ):
+        add(dummy_bs, token_cap)
     return buckets
 
 
@@ -93,6 +149,46 @@ def select_tail_graph_bucket(
         if best is None or key < (best[0], best[1], best[2] if best[2] is not None else 0):
             best = (bs_cap, token_cap, attn_cap)
     return best
+
+
+def build_tail_graph_plan(
+    batch,
+    graphs,
+    buckets: Sequence[TailGraphBucket],
+    captured_pages: int,
+    page_size: int,
+) -> Tuple[Optional[TailGraphPlan], str]:
+    """Classify a tail batch against captured graphs. Reasons: ok / no_graphs / pages / no_bucket."""
+    if not graphs:
+        return None, "no_graphs"
+    extend_lens = list(getattr(batch, "extend_lens", None) or [])
+    prefix_lens = list(getattr(batch, "prefix_lens", None) or [])
+    if not extend_lens:
+        extend_lens = list(getattr(batch, "extend_seq_lens_cpu", None) or [])
+        prefix_lens = list(getattr(batch, "extend_prefix_lens_cpu", None) or [])
+    n_tokens = int(getattr(batch, "extend_num_tokens", 0) or sum(extend_lens))
+    raw_bs = len(extend_lens)
+    if raw_bs <= 0 or n_tokens <= 0:
+        return None, "no_bucket"
+    max_seq = max((p + n for p, n in zip(prefix_lens, extend_lens)), default=0)
+    if not tail_graph_fits_pages(max_seq, captured_pages, page_size):
+        return None, "pages"
+    bucket = select_tail_graph_bucket(raw_bs, n_tokens, max_seq, buckets)
+    if bucket is None or bucket not in graphs:
+        return None, "no_bucket"
+    dummy_tokens = bucket[1] - n_tokens
+    return (
+        TailGraphPlan(
+            bucket=bucket,
+            raw_bs=raw_bs,
+            raw_tokens=n_tokens,
+            dummy_tokens=dummy_tokens,
+            prefix_lens=[int(v) for v in prefix_lens],
+            extend_lens=[int(v) for v in extend_lens],
+            max_seq=int(max_seq),
+        ),
+        "ok",
+    )
 
 
 def real_seed_rows(extend_lens: Sequence[int]) -> List[int]:
@@ -126,6 +222,8 @@ class _TailGraphBuffers:
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
+    extend_lens_cpu: torch.Tensor
+    req_page_tables: torch.Tensor
     next_token_logits: torch.Tensor
     hidden_states: Optional[torch.Tensor]
     mrope_positions: torch.Tensor
@@ -148,6 +246,15 @@ def tail_graph_kv_tokens(runner) -> int:
     return max(pool_tokens, total, 1)
 
 
+def tail_graph_page_kv_tokens(runner) -> int:
+    """Cap captured page-table width to the tree KV bucket, default 1024 tokens."""
+    kv = tail_graph_kv_tokens(runner)
+    backend = getattr(runner, "attn_backend", None)
+    buckets = getattr(backend, "tree_kv_buckets", None) if backend is not None else None
+    tree_max = max(int(v) for v in buckets) if buckets else 1024
+    return min(max(int(kv), 1), max(int(tree_max), 1))
+
+
 def make_tail_graph_buffers(
     *,
     bs_cap: int,
@@ -157,6 +264,7 @@ def make_tail_graph_buffers(
     hidden: int,
     dtype,
     loc_dtype,
+    pages: int = 1,
 ) -> _TailGraphBuffers:
     """Allocate capture buffers.
 
@@ -172,6 +280,10 @@ def make_tail_graph_buffers(
         seq_lens=torch.ones((bs_cap,), dtype=torch.int64, device=device),
         seq_lens_cpu=torch.ones((bs_cap,), dtype=torch.int64, device="cpu"),
         extend_seq_lens=torch.ones((bs_cap,), dtype=torch.int64, device=device),
+        extend_lens_cpu=torch.zeros((bs_cap,), dtype=torch.int64, device="cpu"),
+        req_page_tables=torch.zeros(
+            (bs_cap, max(int(pages), 1)), dtype=torch.int32, device=device
+        ),
         next_token_logits=torch.zeros((bs_cap, vocab), dtype=torch.float, device=device),
         hidden_states=torch.zeros((bs_cap, hidden), dtype=dtype, device=device),
         mrope_positions=torch.zeros((3, token_cap), dtype=torch.int64, device=device),
@@ -208,37 +320,17 @@ class SRTailExtendGraphRunner:
     def _device_synchronize(self):
         torch.cuda.synchronize()
 
-    def _replay_graph(self, graph, seq_lens_kv):
+    def _replay_graph(self, graph, seq_lens_kv, bucket=None):
         graph.replay()
 
-    def plan(self, batch) -> Optional[TailGraphPlan]:
-        if not self.graphs:
-            return None
-        extend_lens = list(getattr(batch, "extend_lens", None) or [])
-        prefix_lens = list(getattr(batch, "prefix_lens", None) or [])
-        if not extend_lens:
-            extend_lens = list(getattr(batch, "extend_seq_lens_cpu", None) or [])
-            prefix_lens = list(getattr(batch, "extend_prefix_lens_cpu", None) or [])
-        n_tokens = int(getattr(batch, "extend_num_tokens", 0) or sum(extend_lens))
-        raw_bs = len(extend_lens)
-        if raw_bs <= 0 or n_tokens <= 0:
-            return None
-        max_seq = max((p + n for p, n in zip(prefix_lens, extend_lens)), default=0)
-        if not tail_graph_fits_pages(max_seq, self.captured_pages, self.page_size):
-            return None
-        bucket = select_tail_graph_bucket(raw_bs, n_tokens, max_seq, self.buckets)
-        if bucket is None or bucket not in self.graphs:
-            return None
-        dummy_tokens = bucket[1] - n_tokens
-        return TailGraphPlan(
-            bucket=bucket,
-            raw_bs=raw_bs,
-            raw_tokens=n_tokens,
-            dummy_tokens=dummy_tokens,
-            prefix_lens=[int(v) for v in prefix_lens],
-            extend_lens=[int(v) for v in extend_lens],
-            max_seq=int(max_seq),
+    def plan_with_reason(self, batch) -> Tuple[Optional[TailGraphPlan], str]:
+        return build_tail_graph_plan(
+            batch, self.graphs, self.buckets, self.captured_pages, self.page_size
         )
+
+    def plan(self, batch) -> Optional[TailGraphPlan]:
+        planned, _reason = self.plan_with_reason(batch)
+        return planned
 
     def can_run(self, batch) -> bool:
         return self.plan(batch) is not None
@@ -268,15 +360,16 @@ class SRTailExtendGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(
                 forward_batch.seq_lens_cpu[:raw_bs].to(device="cpu")
             )
-        extend = torch.tensor(
-            plan.extend_lens, dtype=buffers.extend_seq_lens.dtype, device=buffers.extend_seq_lens.device
-        )
-        buffers.extend_seq_lens[:raw_bs].copy_(extend)
+        cpu_extend = buffers.extend_lens_cpu
+        cpu_extend.zero_()
+        for i, length in enumerate(plan.extend_lens):
+            cpu_extend[i] = int(length)
         if plan.dummy_tokens:
             buffers.req_pool_indices[raw_bs:bs_cap] = int(self.dummy_req_idx or 0)
-            buffers.extend_seq_lens[raw_bs] = plan.dummy_tokens
+            cpu_extend[raw_bs] = int(plan.dummy_tokens)
             buffers.seq_lens[raw_bs] = plan.dummy_tokens
             buffers.seq_lens_cpu[raw_bs] = plan.dummy_tokens
+        buffers.extend_seq_lens.copy_(cpu_extend)
         self._fill_mrope_positions(buffers, forward_batch, raw_tokens)
         self._fill_attention_metadata(forward_batch, plan, buffers)
 
@@ -286,7 +379,7 @@ class SRTailExtendGraphRunner:
         kv_lens = getattr(self, "_padded_context_lens", None) or buffers.seq_lens_cpu[
             : plan.bucket[0]
         ].tolist()
-        self._replay_graph(graph, kv_lens)
+        self._replay_graph(graph, kv_lens, plan.bucket)
         self.replay_count += 1
         output = self.output_buffers[plan.bucket]
         raw_bs = plan.raw_bs
@@ -333,30 +426,32 @@ class SRTailExtendGraphRunner:
         extend = list(plan.extend_lens)
         seq_max = max(plan.max_seq, 1)
         page_size = int(getattr(backend, "page_size", self.page_size) or 1)
-        tables = (
-            forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices[: plan.raw_bs], :seq_max:page_size
-            ]
-            // page_size
-        ).to(torch.int32).contiguous()
-        metadata = pad_tail_attention_metadata(
-            build_tail_attention_metadata(prefix, extend, tables),
-            token_cap,
-            dummy_slot=TAIL_DUMMY_SLOT,
-        )
+        tables = buffers.req_page_tables
+        tables.zero_()
+        src = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices[: plan.raw_bs], :seq_max:page_size
+        ]
+        n_pages = min(int(src.shape[1]), int(tables.shape[1]))
+        if n_pages > 0:
+            gathered = src[:, :n_pages]
+            if page_size != 1:
+                gathered = gathered // page_size
+            tables[: plan.raw_bs, :n_pages].copy_(gathered.to(dtype=torch.int32))
         captured = self.attn_metadata.get(plan.bucket)
         if captured is None:
             raise NpuGraphPreparationError(
                 "missing captured SR tail attention buffers", scope="graph"
             )
         try:
-            copy_tail_attention_metadata_(captured, metadata)
+            fill_tail_attention_metadata_(
+                captured, prefix, extend, tables[: plan.raw_bs]
+            )
         except ValueError as e:
             raise NpuGraphPreparationError(str(e), scope="graph") from e
         if getattr(backend, "forward_metadata", None) is None:
             backend.forward_metadata = type("ForwardMetadata", (), {})()
         backend.forward_metadata.sr_tail = captured
-        self._padded_context_lens = list(captured.context_lens_list)
+        self._padded_context_lens = captured.context_lens_list
 
     def _capture(self) -> None:
         if getattr(self.server_args, "disable_cuda_graph", False):
@@ -368,7 +463,7 @@ class SRTailExtendGraphRunner:
             backend = getattr(self.model_runner, "attn_backend", None)
             self.page_size = int(getattr(backend, "page_size", 1) or 1)
             self.captured_pages = tail_graph_max_pages(
-                tail_graph_kv_tokens(self.model_runner), self.page_size
+                tail_graph_page_kv_tokens(self.model_runner), self.page_size
             )
             self.buckets = self._build_buckets()
             if not self.buckets:
@@ -402,12 +497,11 @@ class SRTailExtendGraphRunner:
             capture_bs, _ = get_batch_sizes_to_capture(self.model_runner)
         except Exception:
             capture_bs = [1, 2, 4]
-        token_caps = default_tail_token_caps(
-            int(getattr(self.server_args, "speculative_num_steps", 0) or 0)
-        )
         backend = getattr(self.model_runner, "attn_backend", None)
-        return default_tail_graph_buckets(
-            capture_bs, token_caps, tail_graph_attn_caps(backend)
+        return packed_tail_graph_buckets(
+            capture_bs,
+            int(getattr(self.server_args, "speculative_num_steps", 0) or 0),
+            tail_graph_attn_caps(backend),
         )
 
     def _reserve_dummy_req(self) -> Optional[int]:
@@ -448,6 +542,7 @@ class SRTailExtendGraphRunner:
             hidden=hidden,
             dtype=dtype,
             loc_dtype=loc_dtype,
+            pages=self.captured_pages,
         )
         dummy = int(self.dummy_req_idx or 0)
         buffers.req_pool_indices.fill_(dummy)

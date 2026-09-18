@@ -86,6 +86,52 @@ def copy_tail_attention_metadata_(dst, src):
     dst.context_lens_list[:] = list(src.context_lens_list)
 
 
+def fill_tail_attention_metadata_(dst, prefix_lens, extend_lens, req_tables, dummy_slot=0):
+    """Write query rows into captured ``dst`` without allocating a padded copy."""
+    if dummy_slot != 0:
+        raise ValueError("SR tail graph dummy queries must use reserved slot 0")
+    if (
+        len(prefix_lens) != len(extend_lens)
+        or len(prefix_lens) != req_tables.shape[0]
+    ):
+        raise ValueError("SR tail request/length/page-table row mismatch")
+    token_cap = int(dst.block_tables.shape[0])
+    max_pages = int(dst.block_tables.shape[1])
+    n_real = 0
+    for prefix, length in zip(prefix_lens, extend_lens):
+        if int(prefix) < 0 or int(length) <= 0:
+            raise ValueError("SR tail requires nonnegative prefix and nonempty tail")
+        n_real += int(length)
+    if n_real > token_cap:
+        raise ValueError("SR tail exceeds graph token capacity")
+    src_pages = int(req_tables.shape[1])
+    if src_pages > max_pages:
+        raise ValueError("SR tail graph page table is too narrow")
+    if dst.context_lens_cpu.numel() != token_cap:
+        raise ValueError("SR tail graph context length row mismatch")
+    if len(dst.context_lens_list) != token_cap:
+        raise ValueError("SR tail graph context length list mismatch")
+    dst.block_tables.zero_()
+    dst.context_lens_cpu.fill_(1)
+    offset = 0
+    n_copy = src_pages
+    for row, (prefix, length) in enumerate(zip(prefix_lens, extend_lens)):
+        length = int(length)
+        prefix = int(prefix)
+        if n_copy:
+            dst.block_tables[offset : offset + length, :n_copy].copy_(
+                req_tables[row, :n_copy].unsqueeze(0).expand(length, -1)
+            )
+        for i in range(length):
+            ctx = prefix + i + 1
+            dst.context_lens_cpu[offset + i] = ctx
+            dst.context_lens_list[offset + i] = ctx
+        offset += length
+    for i in range(offset, token_cap):
+        dst.context_lens_list[i] = 1
+    return dst
+
+
 def pad_tail_attention_metadata(metadata, token_cap, dummy_slot=0):
     """Append dummy query rows that only see ``dummy_slot``.
 

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace as NS
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 import unittest
 from unittest.mock import Mock, patch
 
@@ -28,6 +28,7 @@ from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
     copy_tail_attention_metadata_,
+    fill_tail_attention_metadata_,
     pad_tail_attention_metadata,
     tail_graph_fits_pages,
     tail_graph_max_pages,
@@ -712,20 +713,50 @@ class TestTailGraphBuckets(unittest.TestCase):
             ROOT
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tail_extend_graph.py"
         )
-        return load_functions(
-            GRAPH,
-            [
-                "default_tail_token_caps",
-                "trim_capture_batch_sizes",
-                "select_tail_graph_bucket",
-                "real_seed_rows",
-                "default_tail_graph_buckets",
-                "tail_graph_attn_caps",
-                "tail_graph_kv_tokens",
-            ],
-            dict(torch=torch, Optional=object, Sequence=object),
-            strip_imports=True,
+        tree = ast.parse(GRAPH.read_text(encoding="utf-8"))
+        names = {
+            "default_tail_token_caps",
+            "trim_capture_batch_sizes",
+            "select_tail_graph_bucket",
+            "real_seed_rows",
+            "default_tail_graph_buckets",
+            "tail_graph_attn_caps",
+            "tail_graph_kv_tokens",
+            "tail_token_caps_for_bs",
+            "packed_tail_graph_buckets",
+            "tail_max_per_request",
+            "tail_graph_page_kv_tokens",
+            "build_tail_graph_plan",
+        }
+        body = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "TailGraphPlan":
+                body.append(copy.deepcopy(node))
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                fn = copy.deepcopy(node)
+                fn.body = [
+                    n
+                    for n in fn.body
+                    if not isinstance(n, (ast.Import, ast.ImportFrom))
+                ]
+                body.append(fn)
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
         )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[future] + body, type_ignores=[])
+        )
+        ns = dict(
+            torch=torch,
+            dataclass=dataclass,
+            Optional=Optional,
+            Sequence=Sequence,
+            Tuple=Tuple,
+            List=List,
+            tail_graph_fits_pages=tail_graph_fits_pages,
+        )
+        exec(compile(module, str(GRAPH), "exec"), ns)
+        return ns
 
     def test_select_bucket_requires_dummy_request_for_token_padding(self):
         helpers = self._helpers()
@@ -737,6 +768,77 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIsNone(select(2, 4, 8, [(4, 4, None)]))
         self.assertIsNone(select(1, 5, 8, buckets))
         self.assertIsNone(select(1, 2, 64, [(1, 2, 32)]))
+
+    def test_packed_caps_cover_concurrent_tails(self):
+        helpers = self._helpers()
+        buckets = helpers["packed_tail_graph_buckets"]([1, 2], 5, (None,))
+        select = helpers["select_tail_graph_bucket"]
+        self.assertEqual(select(1, 3, 8, buckets), (2, 4, None))
+        self.assertEqual(select(1, 6, 8, buckets), (1, 6, None))
+        self.assertEqual(select(2, 6, 8, buckets), (2, 6, None))
+        self.assertEqual(select(2, 8, 8, buckets), (2, 8, None))
+        self.assertEqual(select(2, 7, 8, buckets), (2, 7, None))
+        self.assertEqual(select(2, 7, 8, [(3, 8, None)]), (3, 8, None))
+        self.assertIn((2, 8, None), buckets)
+        self.assertIn((3, 8, None), buckets)
+        self.assertIn((3, 4, None), buckets)
+
+    def test_plan_miss_reasons_pages_and_no_bucket(self):
+        helpers = self._helpers()
+        plan_fn = helpers["build_tail_graph_plan"]
+        graphs = {(1, 6, None): object(), (2, 8, None): object()}
+        buckets = [(1, 6, None), (2, 8, None)]
+        empty, reason = plan_fn(NS(), {}, buckets, 8, 128)
+        self.assertIsNone(empty)
+        self.assertEqual(reason, "no_graphs")
+        too_long, reason = plan_fn(
+            NS(extend_lens=[1], prefix_lens=[128], extend_num_tokens=1),
+            graphs,
+            buckets,
+            captured_pages=1,
+            page_size=128,
+        )
+        self.assertIsNone(too_long)
+        self.assertEqual(reason, "pages")
+        miss, reason = plan_fn(
+            NS(extend_lens=[4, 4], prefix_lens=[3, 3], extend_num_tokens=8),
+            {(1, 6, None): object()},
+            [(1, 6, None)],
+            captured_pages=8,
+            page_size=128,
+        )
+        self.assertIsNone(miss)
+        self.assertEqual(reason, "no_bucket")
+        hit, reason = plan_fn(
+            NS(extend_lens=[4, 4], prefix_lens=[3, 3], extend_num_tokens=8),
+            graphs,
+            buckets,
+            captured_pages=8,
+            page_size=128,
+        )
+        self.assertEqual(reason, "ok")
+        self.assertEqual(hit.bucket, (2, 8, None))
+        self.assertEqual(hit.raw_bs, 2)
+        self.assertEqual(hit.dummy_tokens, 0)
+
+    def test_page_kv_tokens_caps_to_tree_buckets(self):
+        helpers = self._helpers()
+        runner = NS(
+            token_to_kv_pool=NS(size=8192),
+            max_total_num_tokens=8192,
+            attn_backend=NS(tree_kv_buckets=[256, 512, 1024]),
+        )
+        self.assertEqual(helpers["tail_graph_page_kv_tokens"](runner), 1024)
+        self.assertEqual(
+            helpers["tail_graph_page_kv_tokens"](
+                NS(
+                    token_to_kv_pool=NS(size=8192),
+                    max_total_num_tokens=8192,
+                    attn_backend=NS(tree_kv_buckets=None),
+                )
+            ),
+            1024,
+        )
 
     def test_seed_rows_are_last_real_tokens(self):
         helpers = self._helpers()
@@ -786,6 +888,27 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(dst.block_tables.tolist(), [[5, 6, 0, 0], [7, 8, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
         self.assertEqual(dst.context_lens_cpu.tolist(), [129, 130, 1, 1])
         self.assertEqual(dst.context_lens_list, [129, 130, 1, 1])
+
+    def test_fill_tail_attention_keeps_captured_storage(self):
+        dst = SRTailAttentionMetadata(
+            torch.zeros((6, 2), dtype=torch.int32),
+            torch.ones(6, dtype=torch.int32),
+            [1, 1, 1, 1, 1, 1],
+        )
+        tables = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+        tables_id = id(dst.block_tables)
+        lens_id = id(dst.context_lens_cpu)
+        fill_tail_attention_metadata_(dst, [3, 5], [2, 1], tables)
+        self.assertEqual(id(dst.block_tables), tables_id)
+        self.assertEqual(id(dst.context_lens_cpu), lens_id)
+        padded = pad_tail_attention_metadata(
+            build_tail_attention_metadata([3, 5], [2, 1], tables), 6
+        )
+        self.assertEqual(dst.block_tables.tolist(), padded.block_tables.tolist())
+        self.assertEqual(dst.context_lens_cpu.tolist(), padded.context_lens_cpu.tolist())
+        self.assertEqual(dst.context_lens_list, padded.context_lens_list)
+        with self.assertRaises(ValueError):
+            fill_tail_attention_metadata_(dst, [3, 5], [2, 1], tables, dummy_slot=3)
 
     def test_copy_and_plan_reject_too_many_pages(self):
         dst = SRTailAttentionMetadata(
@@ -855,6 +978,19 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(str(buffers.input_ids.device), "cpu")
         self.assertEqual(buffers.next_token_logits.dtype, torch.float32)
         self.assertEqual(buffers.hidden_states.dtype, torch.bfloat16)
+        self.assertEqual(str(buffers.extend_lens_cpu.device), "cpu")
+        self.assertEqual(tuple(buffers.req_page_tables.shape), (2, 1))
+        wide = ns["make_tail_graph_buffers"](
+            bs_cap=2,
+            token_cap=6,
+            device="cpu",
+            vocab=8,
+            hidden=4,
+            dtype=torch.bfloat16,
+            loc_dtype=torch.int32,
+            pages=8,
+        )
+        self.assertEqual(tuple(wide.req_page_tables.shape), (2, 8))
 
     def test_non_fia_buckets_do_not_multiply_tree_kv_caps(self):
         helpers = self._helpers()
@@ -874,18 +1010,42 @@ class TestTailGraphBuckets(unittest.TestCase):
             ROOT
             / "python/sglang/srt/hardware_backend/npu/graph_runner/sr_tail_extend_npu_graph_runner.py"
         )
-        payload_fn = load_functions(
+        helpers = load_functions(
             npu_runner,
-            ["tail_graph_cpu_update_payload"],
+            [
+                "make_tail_graph_cpu_update_payload",
+                "fill_tail_graph_cpu_update_payload",
+                "tail_graph_cpu_update_payload",
+            ],
             dict(torch=torch),
             strip_imports=True,
-        )["tail_graph_cpu_update_payload"]
+        )
+        payload_fn = helpers["tail_graph_cpu_update_payload"]
         fia = payload_fn([3, 4, 1], use_fia=True)
         self.assertEqual(fia, [{"actual_seq_lengths_kv": [3, 4, 1]}])
         atb = payload_fn([3, 4, 1], use_fia=False)
         self.assertEqual(list(atb[0]), ["context_lens"])
         self.assertEqual(str(atb[0]["context_lens"].device), "cpu")
         self.assertEqual(atb[0]["context_lens"].tolist(), [3, 4, 1])
+        captured = helpers["make_tail_graph_cpu_update_payload"](6, use_fia=False)
+        lens = captured[0]["context_lens"]
+        helpers["fill_tail_graph_cpu_update_payload"](
+            captured, [3, 4, 1, 1, 1, 1], use_fia=False
+        )
+        self.assertIs(captured[0]["context_lens"], lens)
+        self.assertEqual(lens.tolist(), [3, 4, 1, 1, 1, 1])
+        helpers["fill_tail_graph_cpu_update_payload"](
+            captured, [9, 8, 7, 1, 1, 1], use_fia=False
+        )
+        self.assertIs(captured[0]["context_lens"], lens)
+        self.assertEqual(lens.tolist(), [9, 8, 7, 1, 1, 1])
+        fia_payload = helpers["make_tail_graph_cpu_update_payload"](3, use_fia=True)
+        fia_list = fia_payload[0]["actual_seq_lengths_kv"]
+        helpers["fill_tail_graph_cpu_update_payload"](
+            fia_payload, [9, 8, 1], use_fia=True
+        )
+        self.assertIs(fia_payload[0]["actual_seq_lengths_kv"], fia_list)
+        self.assertEqual(fia_list, [9, 8, 1])
 
     def test_skip_bucket_log_includes_exception_type(self):
         src = (
@@ -895,8 +1055,10 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIn("type(e).__name__", src)
         self.assertIn("skip tail graph bucket %s: %s: %s", src)
         self.assertIn("copy_tail_attention_metadata_", src)
+        self.assertIn("fill_tail_attention_metadata_", src)
         self.assertIn("widen_tail_block_tables", src)
         self.assertIn("tail_graph_fits_pages", src)
+        self.assertIn("packed_tail_graph_buckets", src)
 
     def test_scheduler_graph_replay_then_submitted_error_skips_rollback(self):
         submitted = type("Submitted", (Exception,), {})
@@ -929,6 +1091,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         plan = NS(bucket=(1, 2, None))
         runner = NS(
             plan=lambda _batch: plan,
+            plan_with_reason=lambda _batch: (plan, "ok"),
             init_forward_batch=Mock(return_value=NS(sampling_info=NS())),
             model_runner=NS(
                 capture_tree_seed_only=Mock(),
@@ -988,8 +1151,10 @@ class TestTailGraphBuckets(unittest.TestCase):
             extend_num_tokens=2,
             get_model_worker_batch=lambda: NS(),
         )
+        plan = NS(bucket=(1, 2, None))
         runner = NS(
-            plan=lambda _batch: NS(bucket=(1, 2, None)),
+            plan=lambda _batch: plan,
+            plan_with_reason=lambda _batch: (plan, "ok"),
             init_forward_batch=Mock(return_value=NS(sampling_info=NS())),
             model_runner=NS(capture_tree_seed_only=Mock()),
             fill=Mock(),
@@ -1018,6 +1183,71 @@ class TestTailGraphBuckets(unittest.TestCase):
         scheduler.tp_worker.forward_batch_generation.assert_not_called()
         self.assertEqual(reqs[0].kv_committed_len, 5)
         self.assertTrue(tail.tree_seed_is_current(reqs[0]))
+        self.assertEqual(runner.eager_fallback_count, 0)
+        metrics = get_sr_round_metrics(scheduler, "Draft")
+        self.assertEqual(metrics.paths["tail_extend_graph"], 1)
+        self.assertEqual(metrics.paths["ordinary_extend"], 0)
+
+    def test_scheduler_records_plan_miss_and_falls_back(self):
+        method = load_functions(
+            SCHEDULER,
+            ["_sr_ingest_tree_tails"],
+            dict(
+                time=time,
+                logger=logging.getLogger(__name__),
+                get_sr_round_metrics=get_sr_round_metrics,
+                plan_tail_extend=tail.plan_tail_extend,
+                TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
+                tree_seed_is_current=tail.tree_seed_is_current,
+                SRTailExtendTransaction=tail.SRTailExtendTransaction,
+                _sr_is_device_context_error=lambda exc: False,
+                NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                NpuGraphPreparationError=type("Prep", (Exception,), {}),
+            ),
+        )["_sr_ingest_tree_tails"]
+        reqs = [request(3, (7, 8), 0)]
+        scheduler, _ = transaction_fixture(reqs, 128)
+        seed = seed_output(1)
+        batch = NS(
+            is_sr_tail_extend=True,
+            device="cpu",
+            extend_lens=[2],
+            prefix_lens=[3],
+            extend_num_tokens=2,
+            get_model_worker_batch=lambda: NS(),
+        )
+        runner = NS(
+            plan=lambda _batch: None,
+            plan_with_reason=lambda _batch: (None, "no_bucket"),
+            init_forward_batch=Mock(side_effect=AssertionError("graph")),
+            fill=Mock(side_effect=AssertionError("graph")),
+            replay_filled=Mock(side_effect=AssertionError("graph")),
+            eager_fallback_count=0,
+        )
+        scheduler.model_config = NS(vocab_size=32)
+        scheduler.server_args = NS(speculative_eagle_topk=3)
+        scheduler.spec_algorithm = "STANDALONE_REMOTE"
+        scheduler.tp_size = 1
+        scheduler._sr_ensure_window_budget = Mock()
+        scheduler._sr_is_degraded = lambda rid: False
+        scheduler._sr_enable_tree_seed_hidden = Mock()
+        scheduler._sr_replay_grammars = Mock()
+        scheduler._sr_pause_req = Mock()
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_make_tail_extend_batch = lambda plans: batch
+        scheduler.sr_tree_drafter = NS(tail_graph_runner=runner)
+        scheduler.tp_worker = NS(
+            model_runner=NS(model_is_mrope=False, attn_backend=NS()),
+            forward_batch_generation=Mock(return_value=NS(logits_output=seed)),
+        )
+        method(scheduler, reqs)
+        scheduler.tp_worker.forward_batch_generation.assert_called_once()
+        self.assertEqual(runner.eager_fallback_count, 1)
+        metrics = get_sr_round_metrics(scheduler, "Draft")
+        self.assertEqual(metrics.counts["tail_graph_miss_no_bucket"], 1)
+        self.assertEqual(metrics.paths["ordinary_extend"], 1)
+        self.assertEqual(metrics.paths["tail_extend_graph"], 0)
+        self.assertEqual(reqs[0].kv_committed_len, 5)
 
 
 class TestSeedOnlyForward(unittest.TestCase):
