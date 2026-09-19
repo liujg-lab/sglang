@@ -241,9 +241,15 @@ Draft 编译失败或降级不能代替 Target 约束。`return_logprob` 按实�
 | Target 无草稿降级 | 单 token 普通 AR 当前强制 eager；存在 `r1` 图不代表该路径会使用它 |
 
 NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定选择实现：
-分页 Draft 当前优先 `compact_fia`；Target 可选 `shared_prefix_torch`，按请求分块共享 prefix KV，
-与祖先路径统一 softmax。能力不满足时保留 compact-FIA / chunked 等原分派，
-不在已捕获图内部临时换算子。特殊布局不能套用这条选择规则。
+合格 NPU Draft（`topk>1` 且 `page_size>1`）**默认**使用原生分页树 attention
+（`paged_atb` / `paged_fia`），无需设置 `SGLANG_NPU_SR_TREE_PAGED=1`。
+启动前设置 `SGLANG_NPU_SR_TREE_PAGED=0` 可恢复 compact-FIA；该变量只在 Draft
+初始化时读取，不是运行时热切换。`ASCEND_USE_FIA` 决定分页树走 ATB 还是 FIA，
+与 tail 的 FIA 开关是不同维度。该默认值不影响 Target、CUDA 和 tail EXTEND。
+Target 可选 `shared_prefix_torch`，按请求分块共享 prefix KV，与祖先路径统一 softmax。
+能力不满足时保留 compact-FIA / chunked 等原分派，不在已捕获图内部临时换算子。
+特殊布局不能套用这条选择规则。请以捕获和 replay 日志中的 `implementation`
+判断实际运行路径。
 共享 prefix 路径的首版能力范围包括 FP16/BF16、普通可 view 的 MHA/GQA cache、
 同维 K/V、head dimension 64/128；实际是否启用还取决于所有相关层的能力检查。
 
@@ -776,7 +782,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | 日志或字段 | 如何解释 |
 | --- | --- |
 | `Draft scheduler ready (tree_configured=..., tree_graph_captured=..., tree_graph_disabled_reason=...)` | 分开报告配置树模式、是否捕获图和禁用原因；配置开启不代表图可用 |
-| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`shared_prefix_torch/compact_fia/chunked` 代表不同实现，reason 可以是性能策略而非报错 |
+| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
 | `eager_fallback` | 对应 runner 记录的 eager fallback 累计数；不覆盖所有独立降级入口 |

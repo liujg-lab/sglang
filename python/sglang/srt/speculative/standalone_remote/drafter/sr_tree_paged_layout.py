@@ -41,8 +41,9 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def read_sr_tree_paged_env(env=None) -> bool:
-    """Parse the experimental switch. Callers must invoke this at init only."""
-    raw = (env if env is not None else os.environ).get(SR_TREE_PAGED_ENV, "")
+    """Read once during initialization; default eligible Drafts to paged."""
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TREE_PAGED_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 

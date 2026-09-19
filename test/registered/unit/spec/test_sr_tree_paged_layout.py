@@ -111,10 +111,12 @@ def _draft_slots(prefixes, page, topk, steps, branch_page_ids) -> torch.Tensor:
 
 
 class TestSrTreePagedEnv(CustomTestCase):
-    def test_default_off(self):
-        self.assertFalse(read_sr_tree_paged_env({}))
-        self.assertFalse(read_sr_tree_paged_env({SR_TREE_PAGED_ENV: ""}))
-        self.assertFalse(read_sr_tree_paged_env({SR_TREE_PAGED_ENV: "0"}))
+    def test_default_on_when_unset(self):
+        self.assertTrue(read_sr_tree_paged_env({}))
+
+    def test_explicit_off(self):
+        for raw in ("", "0", "false", "no", "off", "maybe"):
+            self.assertFalse(read_sr_tree_paged_env({SR_TREE_PAGED_ENV: raw}))
 
     def test_truthy(self):
         for raw in ("1", "true", "YES", "on"):
@@ -423,7 +425,8 @@ class TestSourceGuards(CustomTestCase):
         )
         self.assertIn("not self._paged_impl_selected()", decode_src)
         init_src = _fn_source(_BACKEND, "_init_tree_shared_prefix")
-        self.assertIn("SGLANG_NPU_SR_TREE_PAGED", init_src)
+        self.assertIn("read_sr_tree_paged_env", init_src)
+        self.assertIn("paged_capable", init_src)
         self.assertIn(SR_TREE_PAGED_ENV, _source(_LAYOUT))
         self.assertIn("prepare_sr_tree_paged_eager", _source(_BACKEND))
         self.assertIn("bind_sr_tree_paged_capture", _source(_BACKEND))

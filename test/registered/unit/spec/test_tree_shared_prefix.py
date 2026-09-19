@@ -3,11 +3,12 @@
 import ast
 import logging
 import math
+import os
 import threading
 import time
 import unittest
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -16,6 +17,10 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.speculative import tree_shared_prefix as shared
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    SR_TREE_PAGED_ENV,
+    read_sr_tree_paged_env,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import SRRoundMetrics
 from sglang.srt.speculative.tree_attn_fallback import (
@@ -28,6 +33,16 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
+
+
+@contextmanager
+def isolated_sr_tree_paged_env(value=None):
+    """Isolate SGLANG_NPU_SR_TREE_PAGED. value=None unsets the variable."""
+    extra = {} if value is None else {SR_TREE_PAGED_ENV: value}
+    cleaned = {k: v for k, v in os.environ.items() if k != SR_TREE_PAGED_ENV}
+    cleaned.update(extra)
+    with patch.dict(os.environ, cleaned, clear=True):
+        yield
 
 
 def methods(path, cls, names, ns=None):
@@ -419,6 +434,8 @@ class TestSharedPrefix(unittest.TestCase):
             model_runner=runner,
             _use_tree_compact_fia=lambda: True,
             verify_tree_topk=3,
+            draft_topk=3,
+            use_fia=False,
             use_mla=False,
             use_alibi=False,
             is_hybrid_swa=False,
@@ -434,38 +451,19 @@ class TestSharedPrefix(unittest.TestCase):
                 vars(shared),
                 torch_npu=NS(get_npu_format=lambda x: 0),
                 logger=logging.getLogger(__name__),
+                read_sr_tree_paged_env=read_sr_tree_paged_env,
             ),
         )["_init_tree_shared_prefix"]
-        with patch.dict(
-            "sys.modules",
-            {"sglang.srt.layers.radix_attention": NS(RadixAttention=Layer)},
-        ):
-            fn(backend)
-            self.assertEqual(backend.tree_attention_impl, shared.SHARED_PREFIX_IMPL)
-            for role, page, expected in (
-                ("draft", 128, "compact_fia"),
-                ("draft", 1, shared.SHARED_PREFIX_IMPL),
-                ("target", 128, shared.SHARED_PREFIX_IMPL),
-                ("target", 1, shared.SHARED_PREFIX_IMPL),
-            ):
-                runner.server_args.standalone_remote_role = role
-                backend.page_size = page
-                # A remote Draft is not necessarily a local draft worker.
-                for local_draft in (False, True):
-                    runner.is_draft_worker = local_draft
-                    fn(backend)
-                    self.assertEqual(backend.tree_attention_impl, expected)
-            runner.server_args.standalone_remote_role = "draft"
-            runner.page_size = backend.page_size = 128
 
-            def make_step(model_runner, **kwargs):
-                inner = NS(**vars(backend))
-                fn(inner)
-                inner._use_tree_shared_prefix = (
-                    lambda: inner.tree_attention_impl == shared.SHARED_PREFIX_IMPL
-                )
-                return inner
+        def make_step(model_runner, **kwargs):
+            inner = NS(**vars(backend))
+            fn(inner)
+            inner._use_tree_shared_prefix = (
+                lambda: inner.tree_attention_impl == shared.SHARED_PREFIX_IMPL
+            )
+            return inner
 
+        def init_multi_steps():
             init_steps = methods(
                 NPU / "attention/ascend_backend.py",
                 "AscendAttnMultiStepDraftBackend",
@@ -474,41 +472,99 @@ class TestSharedPrefix(unittest.TestCase):
             )["__init__"]
             multi = NS()
             init_steps(multi, runner, 3, 5)
-            self.assertEqual(
-                [b.tree_attention_impl for b in multi.attn_backends],
-                ["compact_fia"] * 5,
-            )
-            self.assertTrue(multi._central_tree_draft_fill)
-            self.assertTrue(
-                all(b._central_tree_draft_fill for b in multi.attn_backends)
-            )
-            runner.server_args.standalone_remote_role = "target"
-            for attr, bad in (
-                ("sliding_window_size", 128),
-                ("is_cross_attention", True),
-                ("logit_cap", 1),
-                ("qk_head_dim", 256),
-            ):
-                original = getattr(layer, attr)
-                setattr(layer, attr, bad)
+            return multi
+
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.layers.radix_attention": NS(RadixAttention=Layer)},
+        ):
+            with isolated_sr_tree_paged_env(None):
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, shared.SHARED_PREFIX_IMPL)
+                for role, page, expected in (
+                    ("draft", 128, "paged_atb"),
+                    ("draft", 1, shared.SHARED_PREFIX_IMPL),
+                    ("target", 128, shared.SHARED_PREFIX_IMPL),
+                    ("target", 1, shared.SHARED_PREFIX_IMPL),
+                ):
+                    runner.server_args.standalone_remote_role = role
+                    backend.page_size = page
+                    # A remote Draft is not necessarily a local draft worker.
+                    for local_draft in (False, True):
+                        runner.is_draft_worker = local_draft
+                        fn(backend)
+                        self.assertEqual(backend.tree_attention_impl, expected)
+                runner.server_args.standalone_remote_role = "draft"
+                runner.page_size = backend.page_size = 128
+                backend.use_fia = True
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "paged_fia")
+                backend.use_fia = False
+                backend.draft_topk = 1
                 fn(backend)
                 self.assertEqual(backend.tree_attention_impl, "compact_fia")
-                setattr(layer, attr, original)
-            for role in ("draft", "target"):
-                runner.server_args.standalone_remote_role = role
-                backend.use_mla = True
-                backend._use_tree_compact_fia = lambda: False
+                backend.draft_topk = 3
+                multi = init_multi_steps()
+                self.assertEqual(
+                    [b.tree_attention_impl for b in multi.attn_backends],
+                    ["paged_atb"] * 5,
+                )
+                self.assertTrue(multi._central_tree_draft_fill)
+                self.assertTrue(
+                    all(b._central_tree_draft_fill for b in multi.attn_backends)
+                )
+            with isolated_sr_tree_paged_env("0"):
+                runner.server_args.standalone_remote_role = "draft"
+                backend.page_size = 128
+                backend.draft_topk = 3
+                backend.use_fia = False
                 fn(backend)
-                self.assertEqual(backend.tree_attention_impl, "chunked")
-            backend.use_mla = False
-            backend._use_tree_compact_fia = lambda: True
-            cache = cache.to(torch.uint8)
-            fn(backend)
-            self.assertEqual(backend.tree_attention_impl, "compact_fia")
-            runner.server_args.speculative_algorithm = "EAGLE"
-            cache = cache.half()
-            fn(backend)
-            self.assertEqual(backend.tree_attention_impl, "compact_fia")
+                self.assertEqual(backend.tree_attention_impl, "compact_fia")
+                multi = init_multi_steps()
+                self.assertEqual(
+                    [b.tree_attention_impl for b in multi.attn_backends],
+                    ["compact_fia"] * 5,
+                )
+            for env_value in (None, "1"):
+                with isolated_sr_tree_paged_env(env_value):
+                    for role in ("draft", "target"):
+                        runner.server_args.standalone_remote_role = role
+                        backend.page_size = 128
+                        backend.draft_topk = 3
+                        backend.use_fia = False
+                        backend.use_mla = False
+                        backend._use_tree_compact_fia = lambda: True
+                        for attr, bad in (
+                            ("sliding_window_size", 128),
+                            ("is_cross_attention", True),
+                            ("logit_cap", 1),
+                            ("qk_head_dim", 256),
+                        ):
+                            original = getattr(layer, attr)
+                            setattr(layer, attr, bad)
+                            fn(backend)
+                            self.assertEqual(
+                                backend.tree_attention_impl, "compact_fia"
+                            )
+                            setattr(layer, attr, original)
+                        backend.use_mla = True
+                        backend._use_tree_compact_fia = lambda: False
+                        fn(backend)
+                        self.assertEqual(backend.tree_attention_impl, "chunked")
+                        backend.use_mla = False
+                        backend._use_tree_compact_fia = lambda: True
+                        quantized = cache.to(torch.uint8)
+                        pool.get_key_buffer = lambda i, _c=quantized: _c
+                        pool.get_value_buffer = lambda i, _c=quantized: _c
+                        fn(backend)
+                        self.assertEqual(backend.tree_attention_impl, "compact_fia")
+                        pool.get_key_buffer = lambda i: cache
+                        pool.get_value_buffer = lambda i: cache
+            with isolated_sr_tree_paged_env(None):
+                runner.server_args.speculative_algorithm = "EAGLE"
+                runner.server_args.standalone_remote_role = "draft"
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "compact_fia")
 
     def test_real_backend_dispatch_and_fallback(self):
         fn = methods(

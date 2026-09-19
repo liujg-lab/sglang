@@ -46,6 +46,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     make_dummy_block_tables,
     max_query_pages_for_tree,
     prepare_tree_paged_view,
+    read_sr_tree_paged_env,
     select_page_bucket,
 )
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
@@ -438,10 +439,7 @@ class AscendAttnBackend(AttentionBackend):
         """Select once, before either runner starts capturing graphs."""
         from sglang.srt.layers.radix_attention import RadixAttention
 
-        import os as _os
-
-        raw = str(_os.environ.get("SGLANG_NPU_SR_TREE_PAGED", "")).strip().lower()
-        self._sr_tree_paged_requested = raw in {"1", "true", "yes", "on"}
+        self._sr_tree_paged_requested = read_sr_tree_paged_env()
         self.tree_attention_impl = (
             "compact_fia" if self._use_tree_compact_fia() else "chunked"
         )
@@ -483,6 +481,8 @@ class AscendAttnBackend(AttentionBackend):
                             cache_view(cache, layer.tp_k_head_num, layer.qk_head_dim)
                 except (ValueError, RuntimeError) as exc:
                     reason = str(exc)
+        # Capture layer/cache capability before Draft/Target policy rewrites reason.
+        paged_capable = reason is None
         if reason is None:
             # Remote Draft is a standalone server, not a local draft worker.
             # Three-query, multi-step expansion regresses with the FP32 torch
@@ -496,6 +496,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.tree_attention_impl = SHARED_PREFIX_IMPL
         if (
             self._sr_tree_paged_requested
+            and paged_capable
             and self.tree_attention_impl == "compact_fia"
             and getattr(args, "speculative_algorithm", None) == "STANDALONE_REMOTE"
             and getattr(args, "standalone_remote_role", None) == "draft"
