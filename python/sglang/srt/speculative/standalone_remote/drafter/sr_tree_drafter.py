@@ -47,6 +47,13 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     prefix_window_tokens,
     remap_slot_node_ids,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    ALLOC_LEASE,
+    ALLOC_ORDINARY,
+    IMPL_PAGED_ATB,
+    IMPL_PAGED_FIA,
+    SRTreeExpandTxn,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import (
     is_device_context_error,
     seq_lens_cpu_for_host,
@@ -174,6 +181,13 @@ class SRTreeDrafter:
             self.topk, max_bs, device=id_dev
         )
         self._init_attention_backend()
+        self.sr_tree_paged = False
+        self._paged_dummy_page = 0
+        if self.draft_attn_backend is not None:
+            inners = getattr(self.draft_attn_backend, "attn_backends", None) or []
+            if inners:
+                impl = getattr(inners[0], "tree_attention_impl", None)
+                self.sr_tree_paged = impl in (IMPL_PAGED_ATB, IMPL_PAGED_FIA)
         self._init_cuda_graphs()
 
     def _lease_supported(self) -> bool:
@@ -620,7 +634,38 @@ class SRTreeDrafter:
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.spec_info = spec_info
         batch.return_hidden_states = False
+        txn_cls = globals().get("SRTreeExpandTxn")
+        if txn_cls is None:
+
+            class txn_cls:
+                def __init__(self):
+                    self.allocation_owned = False
+                    self.prefix_copy_submitted = False
+                    self.tree_compute_submitted = False
+                    self.completion_confirmed = False
+                    self.rolled_back = False
+                    self.lease_state = None
+                    self.allocator_backup = None
+
+                def mark_copy_begin(self):
+                    self.prefix_copy_submitted = True
+
+                def mark_compute_begin(self):
+                    self.tree_compute_submitted = True
+
+                def in_flight(self):
+                    return (
+                        self.prefix_copy_submitted or self.tree_compute_submitted
+                    ) and not self.completion_confirmed
+
+                def may_rollback(self):
+                    return (not self.in_flight()) or self.completion_confirmed
+
+        txn = txn_cls()
         token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
+        txn.allocation_owned = True
+        txn.lease_state = lease_state
+        txn.allocator_backup = token_to_kv_pool_state_backup
         self._pending_lease_state = lease_state
         self._lease_compact_slots = batch.out_cache_loc
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -635,15 +680,25 @@ class SRTreeDrafter:
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
+            if getattr(self, "sr_tree_paged", False):
+                txn.mark_copy_begin()
+                prepare = getattr(self, "_prepare_paged_tree_round", None)
+                if prepare is not None:
+                    prepare(forward_batch, batch, lease_state is not None)
             prep_s = time.perf_counter() - t_prep
-            can_cuda_graph = (
-                self.cuda_graph_runner is not None
-                and self.cuda_graph_runner.can_run(forward_batch)
-            )
+            can_fn = getattr(self, "_can_run_tree_graph", None)
+            if can_fn is not None:
+                can_cuda_graph = can_fn(forward_batch)
+            else:
+                runner = getattr(self, "cuda_graph_runner", None)
+                can_cuda_graph = bool(
+                    runner is not None and runner.can_run(forward_batch)
+                )
             t_exec = time.perf_counter()
             with (
                 metrics.phase("tree_forward", device=True) if metrics else nullcontext()
             ):
+                txn.mark_compute_begin()
                 if can_cuda_graph:
                     try:
                         parent_list, top_scores_index, draft_tokens = (
@@ -679,16 +734,44 @@ class SRTreeDrafter:
                         forward_batch
                     )
             exec_s = time.perf_counter() - t_exec
-        except Exception:
-            if lease_state is not None and not graph_submitted:
-                self._restore_tree_mapping(batch, lease_state)
-                self._free_lease_alloc(lease_state)
-                self._pending_lease_state = None
+            txn.completion_confirmed = True
+        except NpuGraphReplaySubmittedError:
+            graph_submitted = True
+            raise
+        except Exception as e:
+            ctx_err = globals().get("is_device_context_error")
+            if ctx_err is not None and ctx_err(e):
+                graph_submitted = True
+                raise NpuGraphReplaySubmittedError(
+                    "tree expand device context error"
+                ) from e
+            if txn.in_flight():
+                confirm = getattr(self, "_try_confirm_tree_completion", lambda: True)
+                if not confirm():
+                    graph_submitted = True
+                    raise NpuGraphReplaySubmittedError(
+                        "tree expand in-flight; refuse rollback"
+                    ) from e
+                txn.completion_confirmed = True
+            if txn.may_rollback() and not graph_submitted:
+                rollback = getattr(self, "_rollback_tree_expand", None)
+                if rollback is not None:
+                    rollback(batch, txn)
+                elif token_to_kv_pool_state_backup is not None:
+                    self.token_to_kv_pool_allocator.restore_state(
+                        token_to_kv_pool_state_backup
+                    )
+                    txn.rolled_back = True
             raise
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
-            if graph_submitted:
+            abandon = graph_submitted or (
+                txn.in_flight() and not txn.completion_confirmed
+            )
+            if abandon:
                 self._pending_lease_state = None
+            elif txn.rolled_back:
+                pass
             elif lease_state is not None and self._pending_lease_state is not None:
                 self._restore_tree_mapping(batch, lease_state)
             elif token_to_kv_pool_state_backup is not None:
@@ -709,6 +792,56 @@ class SRTreeDrafter:
                 getattr(runner, "tree_eager_fallback_count", 0) if runner else 0,
             )
         return parent_list, top_scores_index, draft_tokens
+
+    def _can_run_tree_graph(self, forward_batch) -> bool:
+        runner = self.cuda_graph_runner
+        if runner is None:
+            return False
+        if self.sr_tree_paged and not getattr(runner, "_tree_paged", False):
+            return False
+        return bool(runner.can_run(forward_batch))
+
+    def _try_confirm_tree_completion(self) -> bool:
+        device = self.device
+        if device is None:
+            return True
+        dev_type = getattr(device, "type", None) or str(device)
+        if dev_type == "cpu":
+            return True
+        try:
+            torch.get_device_module(dev_type).synchronize()
+            return True
+        except Exception:
+            return False
+
+    def _rollback_tree_expand(self, batch, txn: SRTreeExpandTxn) -> None:
+        if txn.rolled_back or not txn.may_rollback():
+            return
+        if txn.lease_state is not None:
+            self._restore_tree_mapping(batch, txn.lease_state)
+            self._free_lease_alloc(txn.lease_state)
+            self._pending_lease_state = None
+        elif txn.allocator_backup is not None:
+            self.token_to_kv_pool_allocator.restore_state(txn.allocator_backup)
+        txn.rolled_back = True
+        txn.allocation_owned = False
+
+    def _prepare_paged_tree_round(self, forward_batch, batch, leased: bool) -> None:
+        backend = self.draft_attn_backend
+        if backend is None or not hasattr(backend, "prepare_sr_tree_paged_eager"):
+            return
+        prefix = seq_lens_cpu_for_host(batch)
+        kind = ALLOC_LEASE if leased else ALLOC_ORDINARY
+        compact = batch.out_cache_loc
+        kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        backend.prepare_sr_tree_paged_eager(
+            forward_batch,
+            compact,
+            prefix,
+            kind,
+            kv_pool,
+            dummy_page=self._paged_dummy_page,
+        )
 
     def _alloc_tree_kv(self, batch: "ScheduleBatch"):
         from sglang.srt.speculative.eagle_worker import (

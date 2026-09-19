@@ -36,6 +36,18 @@ from sglang.srt.speculative.tree_shared_prefix import (
     shared_prefix_attention,
     shared_prefix_layer_supported,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    IMPL_PAGED_ATB,
+    IMPL_PAGED_FIA,
+    SRTreePagedMetadata,
+    build_step_context_lens,
+    context_lens_list,
+    kv_buckets_to_page_buckets,
+    make_dummy_block_tables,
+    max_query_pages_for_tree,
+    prepare_tree_paged_view,
+    select_page_bucket,
+)
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
@@ -111,6 +123,7 @@ class ForwardMetadata:
 
     tree_shared: Optional[SharedPrefixMetadata] = None
     sr_tail: Optional[SRTailAttentionMetadata] = None
+    sr_tree_paged: Optional[SRTreePagedMetadata] = None
 
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
@@ -311,6 +324,10 @@ class AscendAttnBackend(AttentionBackend):
         else:
             self.graph_roles = frozenset(graph_roles)
         self._central_tree_draft_fill = False
+        self._sr_tree_paged_requested = False
+        self._sr_tree_paged_meta = None
+        self._sr_tree_paged_prep_count = 0
+        self._sr_tree_paged_copy_count = 0
         self.cuda_graph_verify_workspace = None
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -411,10 +428,20 @@ class AscendAttnBackend(AttentionBackend):
         self._shared_graph_metadata = {}
         self._init_tree_shared_prefix()
 
+    def _paged_impl_selected(self) -> bool:
+        return getattr(self, "tree_attention_impl", None) in (
+            IMPL_PAGED_ATB,
+            IMPL_PAGED_FIA,
+        )
+
     def _init_tree_shared_prefix(self):
         """Select once, before either runner starts capturing graphs."""
         from sglang.srt.layers.radix_attention import RadixAttention
 
+        import os as _os
+
+        raw = str(_os.environ.get("SGLANG_NPU_SR_TREE_PAGED", "")).strip().lower()
+        self._sr_tree_paged_requested = raw in {"1", "true", "yes", "on"}
         self.tree_attention_impl = (
             "compact_fia" if self._use_tree_compact_fia() else "chunked"
         )
@@ -467,6 +494,22 @@ class AscendAttnBackend(AttentionBackend):
                 reason = "paged SR Draft latency policy: prefer compact-FIA"
             else:
                 self.tree_attention_impl = SHARED_PREFIX_IMPL
+        if (
+            self._sr_tree_paged_requested
+            and self.tree_attention_impl == "compact_fia"
+            and getattr(args, "speculative_algorithm", None) == "STANDALONE_REMOTE"
+            and getattr(args, "standalone_remote_role", None) == "draft"
+            and self.draft_topk > 1
+            and int(self.page_size) > 1
+            and not self.use_mla
+            and not self.is_hybrid_swa
+            and not self.use_alibi
+            and not self.is_dllm_model
+        ):
+            self.tree_attention_impl = (
+                "paged_fia" if getattr(self, "use_fia", False) else "paged_atb"
+            )
+            reason = None
         logger.info(
             "NPU SR tree attention implementation=%s fallback_reason=%s",
             self.tree_attention_impl,
@@ -669,8 +712,10 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def _use_tree_draft_slot_gather(self, forward_batch: ForwardBatch) -> bool:
-        return self._is_tree_draft(forward_batch) and (
-            self.page_size > 1 or self._use_tree_shared_prefix()
+        return (
+            self._is_tree_draft(forward_batch)
+            and (self.page_size > 1 or self._use_tree_shared_prefix())
+            and not self._paged_impl_selected()
         )
 
     def _fill_tree_draft_kv_slots(
@@ -814,6 +859,45 @@ class AscendAttnBackend(AttentionBackend):
             producer_seq_lens = getattr(spec_info, "seq_lens_cpu", None)
             fallback = seq if producer_seq_lens is None else producer_seq_lens
         buckets = list(self.tree_kv_buckets) if self.tree_kv_buckets else None
+        if self._paged_impl_selected() and is_draft:
+            prefixes = []
+            if seq is not None:
+                prefixes = [
+                    int(x)
+                    for x in (
+                        seq.reshape(-1).tolist()
+                        if isinstance(seq, torch.Tensor)
+                        else seq
+                    )
+                ][: int(getattr(forward_batch, "batch_size", len(seq)))]
+            needed_pages = max(
+                max_query_pages_for_tree(
+                    prefixes, self.draft_num_steps, self.page_size
+                )
+                or [1]
+            )
+            page_buckets = (
+                kv_buckets_to_page_buckets(buckets, self.page_size)
+                if buckets
+                else None
+            )
+            dest = getattr(self, "cuda_graph_paged_block_tables", None)
+            if not page_buckets and dest is not None and dest.ndim == 2:
+                page_buckets = [int(dest.shape[1])]
+            if not page_buckets:
+                self._replay_tree_s_cap = None
+                return False
+            chosen = select_page_bucket(needed_pages, page_buckets)
+            if chosen is None:
+                self.tree_capacity_fallback_count += 1
+                self._log_tree_fallback_once(
+                    "capacity",
+                    f"needed_pages={needed_pages} page_buckets={page_buckets}",
+                )
+                self._replay_tree_s_cap = None
+                return False
+            self._replay_tree_s_cap = int(chosen)
+            return True
         ok = tree_slot_graph_can_run_batch(
             slot_width=self.tree_slot_graph_width(),
             slot_gather_enabled=self._slot_gather_tree_attn(),
@@ -1420,8 +1504,12 @@ class AscendAttnBackend(AttentionBackend):
             self.draft_topk > 1
             and forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
+            and not self._paged_impl_selected()
         )
-        if use_tree_draft_tables:
+        if self._paged_impl_selected() and self._sr_tree_paged_meta is not None:
+            self.forward_metadata.sr_tree_paged = self._sr_tree_paged_meta
+            self.forward_metadata.block_tables = self._sr_tree_paged_meta.block_tables
+        elif use_tree_draft_tables:
             self.forward_metadata.block_tables = self._build_tree_draft_block_tables(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1468,7 +1556,9 @@ class AscendAttnBackend(AttentionBackend):
                     .to(torch.int32)
                     .contiguous()
                 )
-        if self._use_tree_draft_slot_gather(forward_batch):
+        if self._use_tree_draft_slot_gather(forward_batch) and not (
+            self._paged_impl_selected() and self._sr_tree_paged_meta is not None
+        ):
             self._fill_tree_draft_kv_slots(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1560,8 +1650,20 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.tree_kv_buckets:
             slot_max_kv = max(self.tree_kv_buckets)
-        self._tree_scratch_max_rows = max_q
-        self._tree_scratch_max_cols = slot_max_kv
+        if self._paged_impl_selected():
+            page = max(int(self.page_size), 1)
+            max_pages = max((int(slot_max_kv) + page - 1) // page, 1)
+            self.cuda_graph_paged_block_tables = torch.zeros(
+                (max_q, max_pages), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_paged_active = torch.zeros(
+                (max_q,), dtype=torch.bool, device=self.device
+            )
+            self._tree_scratch_max_rows = 0
+            self._tree_scratch_max_cols = 0
+        else:
+            self._tree_scratch_max_rows = max_q
+            self._tree_scratch_max_cols = slot_max_kv
         self.cuda_graph_custom_mask = torch.empty(
             (max_q * mask_max_kv,), dtype=torch.bool, device=self.device
         )
@@ -1712,14 +1814,18 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if self.draft_topk > 1 and spec_info is not None and not forward_mode.is_target_verify():
-            self._bind_graph_draft_slot_views(
-                metadata, bs, self._tree_draft_table_rows(bs, num_tokens)
-            )
-            dest_lens = getattr(metadata, "tree_draft_kv_lens_t", None)
-            if dest_lens is not None:
-                self.forward_metadata = metadata
-                n_rows = int(dest_lens.shape[0])
-                self._store_tree_fia_kv_lens_cpu([0] * n_rows, n_rows)
+            if self._paged_impl_selected() and self._sr_tree_paged_meta is not None:
+                metadata.sr_tree_paged = self._sr_tree_paged_meta
+                metadata.block_tables = self._sr_tree_paged_meta.block_tables
+            else:
+                self._bind_graph_draft_slot_views(
+                    metadata, bs, self._tree_draft_table_rows(bs, num_tokens)
+                )
+                dest_lens = getattr(metadata, "tree_draft_kv_lens_t", None)
+                if dest_lens is not None:
+                    self.forward_metadata = metadata
+                    n_rows = int(dest_lens.shape[0])
+                    self._store_tree_fia_kv_lens_cpu([0] * n_rows, n_rows)
         elif forward_mode.is_target_verify() and self.verify_tree_topk > 1:
             self._bind_graph_verify_slot_views(metadata, bs, num_tokens)
             dest_lens = getattr(metadata, "tree_verify_kv_lens_t", None)
@@ -1817,6 +1923,17 @@ class AscendAttnBackend(AttentionBackend):
             )
             return
         replay_seq_lens = seq_lens_cpu[:bs] if seq_lens_cpu is not None else seq_lens[:bs]
+        if self._paged_impl_selected() and self._sr_tree_paged_meta is not None:
+            metadata.sr_tree_paged = self._sr_tree_paged_meta
+            metadata.block_tables = self._sr_tree_paged_meta.block_tables
+            if forward_mode.is_target_verify():
+                seq_lens = seq_lens + self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                seq_lens = seq_lens + self.speculative_step_offset_npu
+            metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
         use_tree_draft_slots = (
             self.draft_topk > 1
             and self.page_size > 1
@@ -2209,6 +2326,74 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         return attn_out
+
+    def _can_run_sr_tree_paged(self, layer, forward_batch, sinks, slopes):
+        if not self._paged_impl_selected():
+            return False
+        meta = None
+        if self.forward_metadata is not None:
+            meta = getattr(self.forward_metadata, "sr_tree_paged", None)
+        if meta is None:
+            meta = self._sr_tree_paged_meta
+        if meta is None:
+            return False
+        return (
+            self.draft_topk > 1
+            and int(self.page_size) > 1
+            and not self.use_mla
+            and not self.use_alibi
+            and not layer.is_cross_attention
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+            and forward_batch.encoder_lens is None
+            and layer.sliding_window_size == -1
+            and layer.logit_cap == 0
+            and sinks is None
+            and slopes is None
+        )
+
+    def bind_sr_tree_paged_metadata(self, meta: SRTreePagedMetadata) -> None:
+        self._sr_tree_paged_meta = meta
+
+    def _run_sr_tree_paged_attention(self, q, k_cache, v_cache, layer):
+        """Read raw paged cache. Caller already wrote this step's K/V."""
+        metadata = None
+        if self.forward_metadata is not None:
+            metadata = getattr(self.forward_metadata, "sr_tree_paged", None)
+        if metadata is None:
+            metadata = self._sr_tree_paged_meta
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if metadata is None or query.shape[0] != int(metadata.block_tables.shape[0]):
+            raise ValueError("SR tree paged attention query/metadata row mismatch")
+        if self.use_fia:
+            output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                query.unsqueeze(1),
+                k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=None,
+                block_size=self.page_size,
+                block_table=metadata.block_tables,
+                actual_seq_lengths_kv=metadata.context_lens_list,
+                scale=layer.scaling,
+            )
+        else:
+            output = query.new_empty(
+                (query.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+            )
+            torch_npu._npu_paged_attention(
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                num_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                scale_value=layer.scaling,
+                block_table=metadata.block_tables,
+                context_lens=metadata.context_lens_cpu,
+                out=output,
+            )
+        return output.reshape(query.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
     def _can_run_sr_tail_paged(self, layer, forward_batch, sinks, slopes):
         return (
@@ -3274,8 +3459,27 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
+        if not self.use_mla and self._can_run_sr_tree_paged(
+            layer, forward_batch, sinks, slopes
+        ):
+            if save_kv_cache and k is not None and v is not None:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            attn_output = self._run_sr_tree_paged_attention(
+                q, k_cache, v_cache, layer
+            )
+            return attn_output.view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
         if self.graph_mode and (not self.enable_torch_compile):
-            if not self._use_tree_draft_slot_gather(forward_batch):
+            if not self._use_tree_draft_slot_gather(
+                forward_batch
+            ) and not self._paged_impl_selected():
                 return self.forward_decode_graph(
                     q,
                     k,
@@ -3641,7 +3845,18 @@ class AscendAttnMultiStepDraftBackend:
             and bool(self.attn_backends)
             and self.attn_backends[0]._use_tree_compact_fia()
             and not self.attn_backends[0]._use_tree_shared_prefix()
+            and not getattr(
+                self.attn_backends[0], "_paged_impl_selected", lambda: False
+            )()
         )
+        self._paged_prep_count = 0
+        self._paged_copy_count = 0
+        self._paged_round_tables = None
+        self._paged_round_active = None
+        self._paged_round_prefix = None
+        self._paged_round_dummy = 0
+        self._paged_round_impl = None
+        self._paged_dummy_page = 0
         if self._central_tree_draft_fill:
             for inner in self.attn_backends:
                 inner._central_tree_draft_fill = True
@@ -3659,6 +3874,196 @@ class AscendAttnMultiStepDraftBackend:
         for inner in self.attn_backends[1:]:
             inner._replay_tree_s_cap = s_cap
         return ok
+
+    def paged_impl_selected(self) -> bool:
+        return bool(self.attn_backends) and self.attn_backends[0]._paged_impl_selected()
+
+    def prepare_sr_tree_paged_eager(
+        self,
+        forward_batch: ForwardBatch,
+        compact_slots: torch.Tensor,
+        prefix_lens_cpu,
+        allocation_kind: str,
+        kv_pool,
+        dummy_page: int = 0,
+    ) -> bool:
+        """Build page tables once and optionally submit prefix-tail copy."""
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+            materialize_prefix_tail_copy_slots,
+            plan_prefix_tail_copy_indices,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_kv_pool_by_slot,
+        )
+
+        if not self.paged_impl_selected():
+            return False
+        inner0 = self.attn_backends[0]
+        inner0._sr_tree_paged_prep_count += 1
+        self._paged_prep_count += 1
+        raw_bs = int(forward_batch.batch_size)
+        topk = int(self.topk)
+        slots = compact_slots.reshape(raw_bs, topk, self.speculative_num_steps)
+        tables, _shared, branch, active, _n_sh, _n_q = prepare_tree_paged_view(
+            inner0.req_to_token,
+            forward_batch.req_pool_indices[:raw_bs],
+            slots,
+            prefix_lens_cpu,
+            self.page_size,
+            topk,
+            self.speculative_num_steps,
+            dummy_page=dummy_page,
+        )
+        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
+        dummy = int(dummy_page)
+        if dest is not None:
+            dest.fill_(dummy)
+            rows, cols = int(tables.shape[0]), int(tables.shape[1])
+            if dest.shape[0] < rows or dest.shape[1] < cols:
+                raise RuntimeError("paged tree block_tables exceed graph buffer")
+            dest[:rows, :cols].copy_(tables)
+            act = getattr(inner0, "cuda_graph_paged_active", None)
+            if act is not None:
+                act.zero_()
+                n_act = min(int(act.numel()), int(active.numel()))
+                act[:n_act].copy_(active[:n_act].to(device=act.device))
+        self._paged_round_tables = tables
+        self._paged_round_active = active
+        self._paged_round_prefix = prefix_lens_cpu
+        self._paged_round_dummy = dummy
+        self._paged_round_impl = inner0.tree_attention_impl
+        copied = False
+        indices = plan_prefix_tail_copy_indices(
+            prefix_lens_cpu, allocation_kind, topk, self.page_size
+        )
+        if len(indices):
+            src, dst = materialize_prefix_tail_copy_slots(
+                inner0.req_to_token,
+                forward_batch.req_pool_indices[:raw_bs],
+                branch,
+                indices,
+                self.page_size,
+            )
+            if int(src.numel()) > 0:
+                inner0._sr_tree_paged_copy_count += 1
+                self._paged_copy_count += 1
+                copy_kv_pool_by_slot(kv_pool, src, dst)
+                copied = True
+        impl = inner0.tree_attention_impl
+        n_rows = int(tables.shape[0])
+        n_fwd = max(int(self.speculative_num_steps) - 1, 0)
+        for inner in self.attn_backends:
+            step = int(inner.speculative_step_id)
+            if n_fwd:
+                step = min(step, n_fwd - 1)
+            lens = build_step_context_lens(prefix_lens_cpu, topk, step, n_rows)
+            meta = SRTreePagedMetadata(
+                block_tables=tables,
+                active_rows=active,
+                context_lens_cpu=lens,
+                context_lens_list=context_lens_list(lens),
+                dummy_page=int(dummy_page),
+                max_pages=int(tables.shape[1]) if tables.ndim == 2 else 0,
+                impl=impl,
+            )
+            inner.bind_sr_tree_paged_metadata(meta)
+            if inner.forward_metadata is None:
+                inner.forward_metadata = ForwardMetadata()
+            inner.forward_metadata.sr_tree_paged = meta
+            inner.forward_metadata.block_tables = tables
+        return copied
+
+    def _paged_graph_table_view(self, capture_bs: int, max_pages: int, dummy_page: int):
+        rows = int(capture_bs) * int(self.topk)
+        pages = max(int(max_pages), 1)
+        dummy = int(dummy_page)
+        inner0 = self.attn_backends[0]
+        device = inner0.device
+        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
+        if dest is not None:
+            if dest.shape[0] < rows or dest.shape[1] < pages:
+                raise RuntimeError("paged tree capture view exceeds graph buffer")
+            tables = dest[:rows, :pages]
+            act = getattr(inner0, "cuda_graph_paged_active", None)
+            if act is not None:
+                active = act[:rows]
+            else:
+                active = torch.zeros((rows,), dtype=torch.bool, device=device)
+        else:
+            tables = make_dummy_block_tables(rows, pages, dummy, device=device)
+            active = torch.zeros((rows,), dtype=torch.bool, device=device)
+        return tables, active
+
+    def bind_sr_tree_paged_capture(self, capture_bs: int, max_pages: int, dummy_page: int):
+        if not self.paged_impl_selected():
+            return
+        dummy = int(dummy_page)
+        tables, active = self._paged_graph_table_view(capture_bs, max_pages, dummy)
+        tables.fill_(dummy)
+        active.zero_()
+        impl = self.attn_backends[0].tree_attention_impl
+        n_fwd = max(int(self.speculative_num_steps) - 1, 0)
+        rows = int(tables.shape[0])
+        pages = int(tables.shape[1]) if tables.ndim == 2 else 0
+        for inner in self.attn_backends:
+            step = int(inner.speculative_step_id)
+            if n_fwd:
+                step = min(step, n_fwd - 1)
+            lens = torch.ones((rows,), dtype=torch.int32)
+            meta = SRTreePagedMetadata(
+                block_tables=tables,
+                active_rows=active,
+                context_lens_cpu=lens,
+                context_lens_list=context_lens_list(lens),
+                dummy_page=dummy,
+                max_pages=pages,
+                impl=impl,
+            )
+            inner.bind_sr_tree_paged_metadata(meta)
+            if inner.forward_metadata is None:
+                inner.forward_metadata = ForwardMetadata()
+            inner.forward_metadata.sr_tree_paged = meta
+            inner.forward_metadata.block_tables = tables
+
+    def bind_sr_tree_paged_replay(self, capture_bs: int, max_pages: int):
+        if not self.paged_impl_selected():
+            return
+        dummy = int(getattr(self, "_paged_round_dummy", getattr(self, "_paged_dummy_page", 0)))
+        tables, active = self._paged_graph_table_view(capture_bs, max_pages, dummy)
+        tables.fill_(dummy)
+        active.zero_()
+        src = getattr(self, "_paged_round_tables", None)
+        src_act = getattr(self, "_paged_round_active", None)
+        if src is not None:
+            rows = min(int(src.shape[0]), int(tables.shape[0]))
+            cols = min(int(src.shape[1]), int(tables.shape[1]))
+            tables[:rows, :cols].copy_(src[:rows, :cols])
+        if src_act is not None:
+            n_act = min(int(src_act.numel()), int(active.numel()))
+            active[:n_act].copy_(src_act[:n_act].to(device=active.device))
+        prefix = getattr(self, "_paged_round_prefix", None) or []
+        impl = getattr(self, "_paged_round_impl", self.attn_backends[0].tree_attention_impl)
+        n_rows = int(tables.shape[0])
+        n_fwd = max(int(self.speculative_num_steps) - 1, 0)
+        for inner in self.attn_backends:
+            step = int(inner.speculative_step_id)
+            if n_fwd:
+                step = min(step, n_fwd - 1)
+            lens = build_step_context_lens(prefix, self.topk, step, n_rows)
+            meta = SRTreePagedMetadata(
+                block_tables=tables,
+                active_rows=active,
+                context_lens_cpu=lens,
+                context_lens_list=context_lens_list(lens),
+                dummy_page=dummy,
+                max_pages=int(tables.shape[1]) if tables.ndim == 2 else 0,
+                impl=impl,
+            )
+            inner.bind_sr_tree_paged_metadata(meta)
+            if inner.forward_metadata is None:
+                inner.forward_metadata = ForwardMetadata()
+            inner.forward_metadata.sr_tree_paged = meta
+            inner.forward_metadata.block_tables = tables
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None
@@ -3678,6 +4083,12 @@ class AscendAttnMultiStepDraftBackend:
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        if self.paged_impl_selected():
+            extra = getattr(self, "_paged_capture_max_pages", 1)
+            dummy = int(getattr(self, "_paged_dummy_page", 0) or 0)
+            self.bind_sr_tree_paged_capture(
+                int(forward_batch.batch_size), extra, dummy
+            )
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,

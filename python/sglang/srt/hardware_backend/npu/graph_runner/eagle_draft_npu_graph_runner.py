@@ -38,6 +38,15 @@ from sglang.srt.speculative.spec_utils import (
     validate_draft_graph_step_kv_lens,
     validate_tree_draft_fia_records,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    IMPL_PAGED_ATB,
+    IMPL_PAGED_FIA,
+    build_step_context_lens,
+    context_lens_list,
+    fill_paged_cpu_update_payload,
+    kv_buckets_to_page_buckets,
+    validate_tree_draft_paged_records,
+)
 from sglang.srt.speculative.tree_attn_fallback import (
     TREE_DRAFT_CAPTURE_BS_ENV,
     TreeReplayPlan,
@@ -99,16 +108,26 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._tree_shared_prefix = bool(
             inners and getattr(inners[0], "_use_tree_shared_prefix", lambda: False)()
         )
+        impl = getattr(inners[0], "tree_attention_impl", None) if inners else None
+        self._tree_paged = impl in (IMPL_PAGED_ATB, IMPL_PAGED_FIA)
+        self._paged_dummy_page = 0
+        if self._tree_paged:
+            self._tree_compact_fia = False
+            self._slot_gather_graph = page_size > 1 and topk > 1
+            multi = getattr(model, "draft_attn_backend", None)
+            if multi is not None:
+                multi._paged_dummy_page = self._paged_dummy_page
         if self._tree_shared_prefix:
             self._slot_gather_graph = topk > 1
             self._tree_compact_fia = False
         if self._slot_gather_graph:
             logger.info(
                 "NPU tree draft graphs use token-level slot gather "
-                "page_size=%s topk=%s compact_fia=%s",
+                "page_size=%s topk=%s compact_fia=%s paged=%s",
                 page_size,
                 topk,
                 self._tree_compact_fia,
+                getattr(self, "_tree_paged", False),
             )
         super().__init__(eagle_worker)
         self._clear_tree_replay_plan()
@@ -146,6 +165,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             if inner:
                 backend = inner[0]
         buckets = getattr(backend, "tree_kv_buckets", None) if backend is not None else None
+        if getattr(self, "_tree_paged", False):
+            page = max(int(getattr(self.eagle_worker, "page_size", 1) or 1), 1)
+            if buckets:
+                return kv_buckets_to_page_buckets(buckets, page)
+            dest = getattr(backend, "cuda_graph_paged_block_tables", None)
+            if dest is not None and dest.ndim == 2:
+                return [max(int(dest.shape[1]), 1)]
+            return [1]
         if buckets:
             return list(reversed(list(buckets)))
         return [None]
@@ -281,6 +308,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             if getattr(self, "_slot_gather_graph", False):
                 self.tree_eager_fallback_count += 1
             return False
+        if getattr(self, "_tree_paged", False) and graph_key not in getattr(
+            self, "_tree_fia_maps", {}
+        ):
+            self.tree_eager_fallback_count += 1
+            return False
         if (
             self._tree_attention_impls.get(
                 graph_key, self._current_tree_attention_impl()
@@ -312,6 +344,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 backend._tree_replay_raw_bs = plan.raw_bs
                 backend._tree_replay_capture_bs = plan.capture_bs
                 backend._tree_replay_kv_bucket = plan.kv_bucket
+                if getattr(self, "_tree_paged", False) and hasattr(
+                    backend, "bind_sr_tree_paged_replay"
+                ):
+                    pages = int(plan.kv_bucket) if plan.kv_bucket is not None else 1
+                    backend.bind_sr_tree_paged_replay(plan.capture_bs, pages)
                 if getattr(self, "_tree_shared_prefix", False):
                     for inner in backend.attn_backends:
                         inner._replay_tree_s_cap = plan.kv_bucket
@@ -385,6 +422,16 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 inner._shared_capture_width = getattr(
                     self, "_active_capture_extra", None
                 )
+        if getattr(self, "_tree_paged", False) and hasattr(
+            backend, "bind_sr_tree_paged_capture"
+        ):
+            extra = getattr(self, "_active_capture_extra", None)
+            max_pages = int(extra) if extra is not None else 1
+            backend._paged_capture_max_pages = max_pages
+            backend._paged_dummy_page = getattr(self, "_paged_dummy_page", 0)
+            backend.bind_sr_tree_paged_capture(
+                int(num_seqs), max_pages, self._paged_dummy_page
+            )
         try:
             graph, out = super().capture_one_batch_size(num_seqs, forward, stream_idx)
         finally:
@@ -396,26 +443,48 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             self._current_tree_attention_impl()
         )
         skip_fia = self.tree_graph_disabled_reason or (
-            self._slot_gather_graph and not self._tree_compact_fia
+            self._slot_gather_graph
+            and not self._tree_compact_fia
+            and not getattr(self, "_tree_paged", False)
         )
         if skip_fia:
             return graph, out
-        self.update_attr_name = self._get_update_attr_name()
+        impl = self._current_tree_attention_impl()
+        if getattr(self, "_tree_paged", False):
+            self.update_attr_name = (
+                "actual_seq_lengths_kv" if impl == IMPL_PAGED_FIA else "context_lens"
+            )
+        else:
+            self.update_attr_name = self._get_update_attr_name()
         n_steps = max(int(self.speculative_num_steps) - 1, 0)
         extra = getattr(self, "_active_capture_extra", None)
         map_key = self._make_graph_key(int(num_seqs), extra=extra)
         try:
             num_layers = self._num_model_layers()
             records = _iter_graph_dispatch_records(graph)
-            n_records, step_ids = validate_tree_draft_fia_records(
-                records, n_steps, num_layers, self.update_attr_name
-            )
+            if getattr(self, "_tree_paged", False):
+                n_records, step_ids = validate_tree_draft_paged_records(
+                    records, n_steps, num_layers, self.update_attr_name, impl
+                )
+            else:
+                n_records, step_ids = validate_tree_draft_fia_records(
+                    records, n_steps, num_layers, self.update_attr_name
+                )
             n_lens = int(num_seqs) * max(int(self.topk), 1)
             placeholder = [1] * n_lens
             step_lens_list = [list(placeholder) for _ in range(n_steps)]
-            payload = expand_fia_cpu_update_inputs(
-                step_lens_list, num_layers, self.update_attr_name
-            )
+            if getattr(self, "_tree_paged", False) and impl == IMPL_PAGED_ATB:
+                payload = [
+                    {
+                        "context_lens": torch.ones((n_lens,), dtype=torch.int32)
+                    }
+                    for step_lens in step_lens_list
+                    for _ in range(num_layers)
+                ]
+            else:
+                payload = expand_fia_cpu_update_inputs(
+                    step_lens_list, num_layers, self.update_attr_name
+                )
             self._tree_fia_maps[map_key] = {
                 "n_records": n_records,
                 "n_steps": n_steps,
@@ -424,6 +493,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 "bs": int(num_seqs),
                 "extra": extra,
                 "payload": payload,
+                "impl": impl,
+                "attr_name": self.update_attr_name,
             }
         except NpuGraphPreparationError as e:
             if getattr(e, "scope", "graph") == "format":
@@ -530,7 +601,16 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
         self._assert_tree_replay_graph(plan)
         graph = self._tree_replay_graph
-        self.update_attr_name = self._get_update_attr_name()
+        fia_maps = getattr(self, "_tree_fia_maps", None) or {}
+        fia_map_peek = fia_maps.get(plan.graph_key)
+        if getattr(self, "_tree_paged", False) and fia_map_peek is not None:
+            self.update_attr_name = fia_map_peek.get("attr_name") or (
+                "actual_seq_lengths_kv"
+                if fia_map_peek.get("impl") == IMPL_PAGED_FIA
+                else "context_lens"
+            )
+        else:
+            self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
             self.model_runner, "attn_backend", None
@@ -559,7 +639,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.output_buffers[self.bs] = self.output_buffers[graph_key]
         skip_fia = is_deepseek_nsa(
             self.model_runner.model_config.hf_config
-        ) or (self._slot_gather_graph and not self._tree_compact_fia)
+        ) or (
+            self._slot_gather_graph
+            and not self._tree_compact_fia
+            and not getattr(self, "_tree_paged", False)
+        )
         if skip_fia:
             replay_error = None
             try:
@@ -590,7 +674,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 scope="graph",
             )
 
-        fia_map = self._tree_fia_maps.get(graph_key)
+        fia_map = fia_maps.get(graph_key)
         if fia_map is None:
             raise NpuGraphPreparationError(
                 f"tree draft graph key={graph_key!r} has no FIA map",
@@ -601,10 +685,28 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         step_lens_list = []
         n_steps = int(fia_map["n_steps"])
         step_backends = inner if inner else None
+        capture_rows = int(self.bs) * max(int(self.topk), 1)
         try:
             for speculative_step_id in range(n_steps):
                 seq_lens = None
-                if self._tree_compact_fia and step_backends is not None:
+                if getattr(self, "_tree_paged", False):
+                    meta = None
+                    if step_backends is not None and speculative_step_id < len(
+                        step_backends
+                    ):
+                        meta = getattr(step_backends[speculative_step_id], "_sr_tree_paged_meta", None)
+                    if meta is not None:
+                        seq_lens = list(meta.context_lens_list)
+                    else:
+                        seq_lens = context_lens_list(
+                            build_step_context_lens(
+                                prefix_lens,
+                                self.topk,
+                                speculative_step_id,
+                                capture_rows,
+                            )
+                        )
+                elif self._tree_compact_fia and step_backends is not None:
                     if speculative_step_id < len(step_backends):
                         seq_lens = getattr(
                             step_backends[speculative_step_id],
@@ -625,8 +727,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                     )
                     if self._tree_compact_fia:
                         seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens)
-                else:
-                    capture_rows = int(self.bs) * max(int(self.topk), 1)
+                elif not getattr(self, "_tree_paged", False) and self._tree_compact_fia:
                     seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens, capture_rows)
                 step_lens_list.append(seq_lens)
         except NpuGraphPreparationError:
@@ -645,9 +746,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 f"tree draft graph key={graph_key!r} has no reusable FIA payload",
                 scope="graph",
             )
-        fill_fia_cpu_update_payload(
-            payload, step_lens_list, fia_map["step_ids"], self.update_attr_name
-        )
+        attr_name = fia_map.get("attr_name") or self.update_attr_name
+        if getattr(self, "_tree_paged", False):
+            fill_paged_cpu_update_payload(
+                payload, step_lens_list, fia_map["step_ids"], attr_name
+            )
+        else:
+            fill_fia_cpu_update_payload(
+                payload, step_lens_list, fia_map["step_ids"], attr_name
+            )
         log_key = graph_key
         if log_key not in self._logged_tree_fia_update_bs:
             logger.info(
@@ -664,10 +771,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
             self._logged_tree_fia_update_bs.add(log_key)
 
+        env_mod = globals().get("os")
+        overlap = False
+        if not getattr(self, "_tree_paged", False) and env_mod is not None:
+            overlap = not env_mod.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE")
         run_npu_graph_update_and_replay(
             lambda: graph.update(cpu_update_input=payload),
             graph.replay,
-            overlap=not os.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE"),
+            overlap=overlap,
         )
         self.tree_graph_replay_count += 1
         if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
