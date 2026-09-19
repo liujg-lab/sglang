@@ -1135,6 +1135,21 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("advance_tree_draft_positions_for_step", drafter_src)
         self.assertIn("copy_kv_pool_by_slot", drafter_src)
         self.assertIn("seq_lens_sum_from_batch", drafter_src)
+        self.assertIn("seq_lens_cpu_for_host", drafter_src)
+        alloc_src = drafter_src[
+            drafter_src.index("def _alloc_tree_kv") : drafter_src.index(
+                "def _try_alloc_lease_tree_kv"
+            )
+        ]
+        self.assertIn("paged_tree_mapping_fits(\n            seq_lens_cpu_for_host(batch)", alloc_src)
+        self.assertNotIn("paged_tree_mapping_fits(\n            batch.seq_lens", alloc_src)
+        eagle_src = (
+            _REPO / "python/sglang/srt/speculative/eagle_worker.py"
+        ).read_text()
+        self.assertIn(
+            "paged_tree_mapping_fits(\n            batch.seq_lens,",
+            eagle_src,
+        )
         self.assertIn("def _remap_tree_kv_to_parents", drafter_src)
         self.assertIn("parent_rows", drafter_src)
         self.assertNotIn("for s in range(n_prev_steps)", drafter_src)

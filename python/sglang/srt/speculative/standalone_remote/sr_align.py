@@ -103,8 +103,8 @@ def sr_decode_seq_len(req) -> int:
     return max(0, len(origin) + len(output) - 1)
 
 
-def seq_lens_sum_from_batch(batch) -> int:
-    """Host sum of current batch lengths. Never reads device seq_lens values."""
+def seq_lens_cpu_for_host(batch):
+    """CPU sequence lengths. Never reads device seq_lens values."""
     cpu = getattr(batch, "seq_lens_cpu", None)
     reqs = getattr(batch, "reqs", None) or ()
     n_req = len(reqs)
@@ -123,11 +123,20 @@ def seq_lens_sum_from_batch(batch) -> int:
             raise RuntimeError(
                 f"seq_lens_cpu rows {n_cpu} != seq_lens rows {n_dev}"
             )
-        values = cpu.tolist() if hasattr(cpu, "tolist") else list(cpu)
-        return int(sum(int(x) for x in values))
+        return cpu
     if not n_req:
-        return 0
-    return int(sum(sr_decode_seq_len(req) for req in reqs))
+        return []
+    return [sr_decode_seq_len(req) for req in reqs]
+
+
+def seq_lens_sum_from_batch(batch) -> int:
+    """Host sum of current batch lengths. Never reads device seq_lens values."""
+    values = seq_lens_cpu_for_host(batch)
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    else:
+        values = list(values)
+    return int(sum(int(x) for x in values))
 
 
 def draft_needed_max_new_tokens(

@@ -47,7 +47,11 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     prefix_window_tokens,
     remap_slot_node_ids,
 )
-from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error, seq_lens_sum_from_batch
+from sglang.srt.speculative.standalone_remote.sr_align import (
+    is_device_context_error,
+    seq_lens_cpu_for_host,
+    seq_lens_sum_from_batch,
+)
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     advance_tree_draft_positions_for_step,
     copy_kv_pool_by_slot,
@@ -716,7 +720,7 @@ class SRTreeDrafter:
         lease_state = None
         pool_len = batch.req_to_token_pool.req_to_token.shape[1]
         if not paged_tree_mapping_fits(
-            batch.seq_lens,
+            seq_lens_cpu_for_host(batch),
             self.page_size,
             self.topk,
             self.speculative_num_steps,

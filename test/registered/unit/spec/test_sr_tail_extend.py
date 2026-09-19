@@ -2762,6 +2762,51 @@ class TestBatchedKvCopy(unittest.TestCase):
                     )
                 )
 
+    def test_paged_mapping_fits_reads_cpu_not_device_tolist(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            seq_lens_cpu_for_host,
+        )
+
+        helpers = load_functions(
+            ROOT / "python/sglang/srt/speculative/spec_utils.py",
+            ["paged_tree_mapping_end", "paged_tree_mapping_fits"],
+            {"torch": torch},
+        )
+        paged_tree_mapping_end = helpers["paged_tree_mapping_end"]
+        paged_tree_mapping_fits = helpers["paged_tree_mapping_fits"]
+
+        class Boom:
+            shape = (2,)
+
+            def tolist(self):
+                raise AssertionError("device seq_lens.tolist")
+
+        reqs = [
+            NS(kv_committed_len=123, origin_input_ids=[], output_ids=[]),
+            NS(kv_committed_len=124, origin_input_ids=[], output_ids=[]),
+        ]
+        cpu = torch.tensor([123, 124], dtype=torch.int64)
+        batch = NS(reqs=reqs, seq_lens=Boom(), seq_lens_cpu=cpu)
+        host = seq_lens_cpu_for_host(batch)
+        page, topk, steps = 128, 3, 5
+        end = max(paged_tree_mapping_end(int(x), page, topk, steps) for x in cpu)
+        self.assertTrue(paged_tree_mapping_fits(host, page, topk, steps, end))
+        self.assertFalse(paged_tree_mapping_fits(host, page, topk, steps, end - 1))
+        self.assertTrue(paged_tree_mapping_fits(host, 1, topk, steps, 1))
+        self.assertTrue(paged_tree_mapping_fits(host, page, 1, steps, 1))
+        with self.assertRaisesRegex(RuntimeError, "request count"):
+            seq_lens_cpu_for_host(
+                NS(reqs=reqs[:1], seq_lens=Boom(), seq_lens_cpu=cpu)
+            )
+        with self.assertRaisesRegex(RuntimeError, "seq_lens rows"):
+            seq_lens_cpu_for_host(
+                NS(
+                    reqs=reqs,
+                    seq_lens=NS(shape=(1,), tolist=Boom.tolist),
+                    seq_lens_cpu=cpu,
+                )
+            )
+
     def test_merged_lease_copy_one_helper_and_hold(self):
         from dataclasses import replace
 
