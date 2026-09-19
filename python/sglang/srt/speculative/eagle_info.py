@@ -503,6 +503,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         predict_cpu = predict.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
+        spec_algo = getattr(batch, "spec_algorithm", None)
+        export_sr_paths = bool(
+            spec_algo is not None
+            and callable(getattr(spec_algo, "is_standalone_remote", None))
+            and spec_algo.is_standalone_remote()
+        )
+        sr_eos_cut = [None] * len(accept_index_cpu) if export_sr_paths else None
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -521,6 +528,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     has_finished = True
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
+                    if sr_eos_cut is not None:
+                        sr_eos_cut[i] = j + 1
                     break
                 else:
                     if req.grammar is not None:
@@ -549,18 +558,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
         accepted_tree_candidate_indices = []
-        try:
-            from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-                export_accepted_tree_candidate_indices,
-            )
+        if export_sr_paths:
+            for req in batch.reqs:
+                req.sr_accepted_tree_candidate_indices = None
+            try:
+                from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+                    export_accepted_tree_candidate_indices,
+                )
 
-            accepted_tree_candidate_indices = export_accepted_tree_candidate_indices(
-                accept_index, self.retrive_index
-            )
-            for req, path in zip(batch.reqs, accepted_tree_candidate_indices):
-                req.sr_accepted_tree_candidate_indices = list(path)
-        except Exception:
-            accepted_tree_candidate_indices = []
+                sr_rows = []
+                for i, row in enumerate(accept_index_cpu):
+                    copied = list(row)
+                    cut = sr_eos_cut[i] if sr_eos_cut is not None else None
+                    if cut is not None:
+                        for k in range(cut, len(copied)):
+                            copied[k] = -1
+                    sr_rows.append(copied)
+                accepted_tree_candidate_indices = export_accepted_tree_candidate_indices(
+                    sr_rows
+                )
+                for req, path in zip(batch.reqs, accepted_tree_candidate_indices):
+                    req.sr_accepted_tree_candidate_indices = list(path)
+            except Exception:
+                accepted_tree_candidate_indices = []
+                for req in batch.reqs:
+                    req.sr_accepted_tree_candidate_indices = None
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them

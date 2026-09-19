@@ -10,7 +10,8 @@ import math
 import os
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MethodType
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import List, Optional, Sequence, Tuple
@@ -498,6 +499,15 @@ def transaction_fixture(reqs, page_size):
     return scheduler, plans
 
 
+def _tail_plans_for(reqs):
+    plans = []
+    for req in reqs:
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        if plan is not None:
+            plans.append(plan)
+    return plans
+
+
 def seed_output(rows):
     return NS(
         tree_seed_topk_p=torch.ones(rows, 3) / 3,
@@ -662,7 +672,7 @@ class TestTailTransaction(unittest.TestCase):
         )["make_tail_extend_batch"]
         method = load_functions(
             SCHEDULER,
-            ["_sr_ingest_tree_tails"],
+            ["_sr_execute_tree_tails"],
             dict(
                 time=time,
                 logger=logging.getLogger(__name__),
@@ -675,7 +685,7 @@ class TestTailTransaction(unittest.TestCase):
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
-        )["_sr_ingest_tree_tails"]
+        )["_sr_execute_tree_tails"]
         for fail in (False, True):
             with self.subTest(fail=fail):
                 reqs = [request(3, (7, 8), 0), request(5, (9,), 1)]
@@ -714,7 +724,7 @@ class TestTailTransaction(unittest.TestCase):
                     model_runner=NS(model_is_mrope=False, attn_backend=NS()),
                     forward_batch_generation=Mock(side_effect=execute),
                 )
-                method(scheduler, reqs)
+                method(scheduler, _tail_plans_for(reqs))
                 scheduler.tp_worker.forward_batch_generation.assert_called_once()
                 self.assertEqual(scheduler._sr_pause_req.call_count, 2)
                 self.assertEqual([r.output_ids for r in reqs], [[7, 8], [9]])
@@ -726,7 +736,8 @@ class TestTailTransaction(unittest.TestCase):
                     self.assertEqual(scheduler._sr_mark_degraded.call_count, 2)
                 else:
                     self.assertEqual([r.kv_committed_len for r in reqs], [5, 6])
-                    method(scheduler, reqs)
+                    self.assertEqual(_tail_plans_for(reqs), [])
+                    method(scheduler, _tail_plans_for(reqs))
                     scheduler.tp_worker.forward_batch_generation.assert_called_once()
 
 
@@ -1164,8 +1175,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         mapping[0, ident.alloc_start : ident.alloc_start + 2] = torch.tensor([99, 100])
         with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
             txn.copy_reused_tree_kv()
-        self.assertEqual(copies, [])
-        self.assertIsNone(txn.copy_done_event)
+        self.assertEqual(copies, ["mha"])
 
         real = replace(
             plan, materialized_len=10, original_len=10, copy_src_slots=[99, 100]
@@ -1174,7 +1184,17 @@ class TestTailGraphBuckets(unittest.TestCase):
         txn.allocate(NS(device="cpu"))
         with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
             txn.copy_reused_tree_kv()
-        self.assertEqual(copies, ["mha"])
+        self.assertEqual(copies, ["mha", "mha"])
+        copy_src = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tail_extend.py"
+        ).read_text(encoding="utf-8")
+        fn = copy_src[
+            copy_src.index("def copy_reused_tree_kv") : copy_src.index(
+                "def wait_copy_done"
+            )
+        ]
+        self.assertNotIn(".tolist()", fn)
 
     def _copy_job_txn(self):
         from dataclasses import replace
@@ -1245,6 +1265,9 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         store.register(lease)
         scheduler.sr_tree_leases = store
+        from dataclasses import replace as _replace
+
+        txn.plans = [_replace(txn.plans[0], copy_lease=lease)]
 
         def fake_record(device, stream=None, *, required=False):
             ev = NS(device=NS(type="npu"), required=required)
@@ -1337,6 +1360,9 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         store.register(lease)
         scheduler.sr_tree_leases = store
+        from dataclasses import replace as _replace
+
+        txn.plans = [_replace(txn.plans[0], copy_lease=lease)]
         records = []
 
         def fake_record(device, stream=None, *, required=False):
@@ -1522,7 +1548,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         submitted = type("Submitted", (Exception,), {})
         method = load_functions(
             SCHEDULER,
-            ["_sr_ingest_tree_tails"],
+            ["_sr_execute_tree_tails"],
             dict(
                 time=time,
                 logger=logging.getLogger(__name__),
@@ -1535,7 +1561,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 NpuGraphReplaySubmittedError=submitted,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
-        )["_sr_ingest_tree_tails"]
+        )["_sr_execute_tree_tails"]
         reqs = [request(3, (7, 8), 0)]
         scheduler, _ = transaction_fixture(reqs, 128)
         batch = NS(
@@ -1575,7 +1601,7 @@ class TestTailGraphBuckets(unittest.TestCase):
             forward_batch_generation=Mock(side_effect=AssertionError("eager")),
         )
         with self.assertRaises(submitted):
-            method(scheduler, reqs)
+            method(scheduler, _tail_plans_for(reqs))
         scheduler.tp_worker.forward_batch_generation.assert_not_called()
         scheduler._sr_mark_degraded.assert_not_called()
         self.assertEqual(reqs[0].kv_committed_len, 3)
@@ -1584,7 +1610,7 @@ class TestTailGraphBuckets(unittest.TestCase):
     def test_scheduler_uses_graph_logits_and_skips_eager(self):
         method = load_functions(
             SCHEDULER,
-            ["_sr_ingest_tree_tails"],
+            ["_sr_execute_tree_tails"],
             dict(
                 time=time,
                 logger=logging.getLogger(__name__),
@@ -1597,7 +1623,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
-        )["_sr_ingest_tree_tails"]
+        )["_sr_execute_tree_tails"]
         reqs = [request(3, (7, 8), 0)]
         scheduler, _ = transaction_fixture(reqs, 128)
         seed = seed_output(1)
@@ -1635,7 +1661,7 @@ class TestTailGraphBuckets(unittest.TestCase):
             model_runner=NS(model_is_mrope=False, attn_backend=NS()),
             forward_batch_generation=Mock(side_effect=AssertionError("eager")),
         )
-        method(scheduler, reqs)
+        method(scheduler, _tail_plans_for(reqs))
         runner.replay_filled.assert_called_once()
         runner.model_runner.capture_tree_seed_only.assert_called_once()
         scheduler.tp_worker.forward_batch_generation.assert_not_called()
@@ -1649,7 +1675,7 @@ class TestTailGraphBuckets(unittest.TestCase):
     def test_scheduler_records_plan_miss_and_falls_back(self):
         method = load_functions(
             SCHEDULER,
-            ["_sr_ingest_tree_tails"],
+            ["_sr_execute_tree_tails"],
             dict(
                 time=time,
                 logger=logging.getLogger(__name__),
@@ -1662,7 +1688,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
-        )["_sr_ingest_tree_tails"]
+        )["_sr_execute_tree_tails"]
         reqs = [request(3, (7, 8), 0)]
         scheduler, _ = transaction_fixture(reqs, 128)
         seed = seed_output(1)
@@ -1698,7 +1724,7 @@ class TestTailGraphBuckets(unittest.TestCase):
             model_runner=NS(model_is_mrope=False, attn_backend=NS()),
             forward_batch_generation=Mock(return_value=NS(logits_output=seed)),
         )
-        method(scheduler, reqs)
+        method(scheduler, _tail_plans_for(reqs))
         scheduler.tp_worker.forward_batch_generation.assert_called_once()
         self.assertEqual(runner.eager_fallback_count, 1)
         metrics = get_sr_round_metrics(scheduler, "Draft")
@@ -1864,6 +1890,562 @@ class TestRoundMetrics(unittest.TestCase):
         metrics.poll()
         self.assertEqual(metrics.device_ms["forward"], 2.5)
         self.assertEqual(len(metrics.pending), 0)
+
+
+@dataclass(frozen=True)
+class _FakeTailPlan:
+    req: object
+    copy_src_slots: object = None
+    copy_lease: object = None
+    length: int = 1
+    recapture: bool = False
+
+
+@dataclass
+class _SRTreePlanDraft:
+    req: object
+    kind: str
+    plan: object = None
+    lease: object = None
+    miss: object = None
+
+
+class TestTreeIngestLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.evict = patch.object(tail, "_evict_tail_capacity")
+        self.evict.start()
+        self.addCleanup(self.evict.stop)
+
+    def _lease(self, rid, version=1):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeKVLease,
+        )
+
+        return SRTreeKVLease(
+            rid=rid,
+            version=version,
+            revision=0,
+            base_committed_len=1,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(2),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+
+    def _bind(self, scheduler, *, plan_tail_extend=None, execute=None):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            live_accept_prefix,
+            validate_lease_commit,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            draft_needed_max_new_tokens,
+        )
+
+        fns = load_functions(
+            SCHEDULER,
+            [
+                "_sr_tree_req_alive",
+                "_sr_prepare_tree_reqs",
+                "_sr_inspect_lease_copy",
+                "_sr_inspect_tree_plans",
+                "_sr_record_inspect_misses",
+                "_sr_acquire_tree_plans",
+                "_sr_release_unused_leases",
+                "_sr_release_held_leases",
+                "_sr_record_committed_reuse",
+                "_sr_run_tree_ingest",
+                "_sr_mark_degraded",
+                "_sr_is_degraded",
+                "_sr_ensure_window_budget",
+                "_sr_release_tree_lease",
+                "_sr_execute_tree_tails",
+            ],
+            dict(
+                time=time,
+                logger=logging.getLogger(__name__),
+                get_sr_round_metrics=get_sr_round_metrics,
+                plan_tail_extend=plan_tail_extend or tail.plan_tail_extend,
+                TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
+                tree_seed_is_current=tail.tree_seed_is_current,
+                SRTailExtendTransaction=tail.SRTailExtendTransaction,
+                _sr_is_device_context_error=lambda exc: False,
+                NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                NpuGraphPreparationError=type("Prep", (Exception,), {}),
+                _SRTreePlanDraft=_SRTreePlanDraft,
+                replace=replace,
+                draft_needed_max_new_tokens=draft_needed_max_new_tokens,
+                validate_lease_commit=validate_lease_commit,
+                live_accept_prefix=live_accept_prefix,
+            ),
+            class_name="StandaloneRemoteDraftSchedulerMixin",
+        )
+        for name, fn in fns.items():
+            setattr(scheduler, name, MethodType(fn, scheduler))
+        if execute is not None:
+            scheduler._sr_execute_tree_tails = execute
+        scheduler._sr_tree_req_alive = lambda req: True
+        if not hasattr(scheduler, "model_config"):
+            scheduler.model_config = NS(vocab_size=32)
+        if not hasattr(scheduler, "tp_worker"):
+            scheduler.tp_worker = NS(model_runner=NS(model_is_mrope=False))
+        if not hasattr(scheduler, "token_to_kv_pool_allocator"):
+            scheduler.token_to_kv_pool_allocator = NS(free=lambda slots: None)
+        elif not callable(getattr(scheduler.token_to_kv_pool_allocator, "free", None)):
+            scheduler.token_to_kv_pool_allocator.free = lambda slots: None
+        return scheduler
+
+    def test_expand_and_execute_are_unidirectional(self):
+        src = SCHEDULER.read_text(encoding="utf-8")
+        execute = src[
+            src.index("def _sr_execute_tree_tails") : src.index(
+                "def _sr_ingest_committed_batch"
+            )
+        ]
+        self.assertNotIn("_sr_run_tree_ingest", execute)
+        self.assertNotIn("plan_tail_extend", execute)
+        expand = src[
+            src.index("def _sr_tree_expand_batch") : src.index("def _sr_reprefill(")
+        ]
+        self.assertEqual(expand.count("_sr_run_tree_ingest"), 1)
+        self.assertNotIn("_sr_ingest_committed_batch", expand)
+        inspect = src[
+            src.index("def _sr_inspect_tree_plans") : src.index(
+                "def _sr_record_inspect_misses"
+            )
+        ]
+        self.assertNotIn("pin_lease", inspect)
+        self.assertNotIn("release_rid", inspect)
+        self.assertNotIn("_sr_ensure_window_budget", inspect)
+        self.assertNotIn("_sr_mark_degraded", inspect)
+        prepare = src[
+            src.index("def _sr_prepare_tree_reqs") : src.index(
+                "def _sr_inspect_lease_copy"
+            )
+        ]
+        self.assertIn("_sr_ensure_window_budget", prepare)
+        acquire = src[
+            src.index("def _sr_acquire_tree_plans") : src.index(
+                "def _sr_release_unused_leases"
+            )
+        ]
+        self.assertIn("held.append", acquire)
+        self.assertLess(acquire.index("pin_lease"), acquire.index("held.append"))
+        ingest = src[
+            src.index("def _sr_ingest_committed_batch") : src.index(
+                "def _sr_ingest_committed_chain_batch"
+            )
+        ]
+        self.assertIn("_sr_run_tree_ingest", ingest)
+        copy_inspect = src[
+            src.index("def _sr_inspect_lease_copy") : src.index(
+                "def _sr_inspect_tree_plans"
+            )
+        ]
+        self.assertNotIn("pin_lease", copy_inspect)
+        run = src[
+            src.index("def _sr_run_tree_ingest") : src.index("def _sr_ingest_tree_tails")
+        ]
+        self.assertLess(
+            run.index("_sr_release_unused_leases"), run.index("_sr_execute_tree_tails")
+        )
+
+    def test_mixed_hit_and_ordinary_one_execute(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        lease = self._lease("a")
+        store.register(lease)
+        a = NS(rid="a")
+        b = NS(rid="b")
+        plan_a = _FakeTailPlan(req=a, copy_src_slots=[7], copy_lease=lease, length=1)
+        plan_b = _FakeTailPlan(req=b, length=2)
+        calls = []
+        scheduler = self._bind(NS(sr_tree_leases=store), execute=lambda plans: calls.append(list(plans)) or True)
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [
+            _SRTreePlanDraft(a, "copy", plan=plan_a, lease=lease),
+            _SRTreePlanDraft(b, "ordinary", plan=plan_b),
+        ]
+        self.assertTrue(scheduler._sr_run_tree_ingest([a, b]))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 2)
+        self.assertTrue(lease.released)
+        self.assertEqual(store.counts["tree_kv_commit_hit"], 1)
+        self.assertEqual(store.counts["tree_kv_reused_tokens"], 1)
+
+    def test_valid_empty_tail_stays_out_of_batch(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        seed = NS(rid="s")
+        calls = []
+        scheduler = self._bind(NS(sr_tree_leases=store), execute=lambda plans: calls.append(plans) or True)
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [_SRTreePlanDraft(seed, "skip")]
+        self.assertTrue(scheduler._sr_run_tree_ingest([seed]))
+        self.assertEqual(calls, [])
+
+    def test_second_pin_failure_releases_first_held_lease(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        first = self._lease("a", 1)
+        second = self._lease("b", 1)
+        store.register(first)
+        store.register(second)
+        a = NS(rid="a")
+        b = NS(rid="b")
+        plan_a = _FakeTailPlan(req=a, copy_src_slots=[1], length=1)
+        plan_b = _FakeTailPlan(req=b, copy_src_slots=[2], length=1)
+        n = {"n": 0}
+        real_pin = store.pin_lease
+        held_during_fail = []
+
+        def pin_once(lease):
+            n["n"] += 1
+            if n["n"] > 1:
+                held_during_fail.append((first.in_use, first.released, store.get("a") is first))
+                return None
+            return real_pin(lease)
+
+        store.pin_lease = pin_once
+        calls = []
+
+        def no_recovery(*_a, **_k):
+            raise tail.TailExtendRecoveryRequired("need recovery")
+
+        scheduler = self._bind(
+            NS(sr_tree_leases=store),
+            plan_tail_extend=no_recovery,
+            execute=lambda plans: calls.append(list(plans)) or True,
+        )
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [
+            _SRTreePlanDraft(a, "copy", plan=plan_a, lease=first),
+            _SRTreePlanDraft(b, "copy", plan=plan_b, lease=second),
+        ]
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_run_tree_ingest([a, b])
+        self.assertEqual(held_during_fail, [(True, False, True)])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0].req is a, True)
+        self.assertTrue(first.released)
+        self.assertFalse(first.in_use)
+        replacement = self._lease("a", 2)
+        store.register(replacement)
+        store.release(first)
+        self.assertIs(store.get("a"), replacement)
+        self.assertFalse(replacement.released)
+
+    def test_mid_pin_exception_releases_already_held_lease(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        first = self._lease("a", 1)
+        second = self._lease("b", 1)
+        store.register(first)
+        store.register(second)
+        a = NS(rid="a")
+        b = NS(rid="b")
+        plan_a = _FakeTailPlan(req=a, copy_src_slots=[1], length=1)
+        plan_b = _FakeTailPlan(req=b, copy_src_slots=[2], length=1)
+        n = {"n": 0}
+        real_pin = store.pin_lease
+
+        def pin_then_raise(lease):
+            n["n"] += 1
+            if n["n"] > 1:
+                raise RuntimeError("pin boom")
+            return real_pin(lease)
+
+        store.pin_lease = pin_then_raise
+        calls = []
+        scheduler = self._bind(
+            NS(sr_tree_leases=store),
+            execute=lambda plans: calls.append(list(plans)) or True,
+        )
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [
+            _SRTreePlanDraft(a, "copy", plan=plan_a, lease=first),
+            _SRTreePlanDraft(b, "copy", plan=plan_b, lease=second),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "pin boom"):
+            scheduler._sr_run_tree_ingest([a, b])
+        self.assertEqual(calls, [])
+        self.assertTrue(first.released)
+        self.assertFalse(first.in_use)
+        self.assertIsNone(store.get("a"))
+        self.assertIs(store.get("b"), second)
+
+    def test_unused_lease_released_before_execute_and_no_hit_on_rollback(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        lease = self._lease("a")
+        store.register(lease)
+        a = NS(rid="a")
+        b = NS(rid="b")
+        plan_b = _FakeTailPlan(req=b, length=1)
+        seen = []
+        freed = []
+        allocator = NS(free=lambda slots: freed.append(slots))
+
+        def execute(plans):
+            seen.append((lease.released, store.get("a") is None, list(freed)))
+            return False
+
+        scheduler = self._bind(
+            NS(sr_tree_leases=store, token_to_kv_pool_allocator=allocator),
+            execute=execute,
+        )
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [
+            _SRTreePlanDraft(a, "ordinary", lease=lease, miss="version"),
+            _SRTreePlanDraft(b, "ordinary", plan=plan_b),
+        ]
+        self.assertFalse(scheduler._sr_run_tree_ingest([a, b]))
+        self.assertEqual(seen[0][0], True)
+        self.assertTrue(seen[0][1])
+        self.assertEqual(len(seen[0][2]), 1)
+        self.assertEqual(store.counts["tree_kv_commit_hit"], 0)
+        self.assertIsNone(store.get("a"))
+
+    def test_budget_degrade_releases_lease_before_inspect(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+            SRDraftState,
+            SRDraftStateManager,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        lease = self._lease("a")
+        store.register(lease)
+        req = NS(
+            rid="a",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[],
+            draft_tokens_target=8,
+            sampling_params=NS(max_new_tokens=1),
+        )
+        sr_state = SRDraftStateManager()
+        sr_state.set("a", SRDraftState(req_id="a", session_id="s", req_object=req))
+        scheduler = self._bind(
+            NS(
+                sr_tree_leases=store,
+                sr_state=sr_state,
+                server_args=NS(speculative_num_steps=4),
+                max_req_input_len=4,
+            )
+        )
+        scheduler._sr_tree_req_alive = MethodType(
+            load_functions(
+                SCHEDULER,
+                ["_sr_tree_req_alive"],
+                dict(),
+                class_name="StandaloneRemoteDraftSchedulerMixin",
+            )["_sr_tree_req_alive"],
+            scheduler,
+        )
+        inspects = []
+        scheduler._sr_inspect_tree_plans = lambda reqs: inspects.append(list(reqs)) or []
+        alive = scheduler._sr_prepare_tree_reqs([req])
+        self.assertEqual(alive, [])
+        self.assertTrue(scheduler._sr_is_degraded("a"))
+        self.assertTrue(lease.released)
+        self.assertIsNone(store.get("a"))
+        scheduler._sr_run_tree_ingest([req])
+        self.assertEqual(inspects, [[]])
+
+    def test_recovery_once_then_retract_original_hit(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        lease = self._lease("a")
+        store.register(lease)
+        a = NS(rid="a")
+        b = NS(rid="b")
+        copy_plan = _FakeTailPlan(req=a, copy_src_slots=[3], copy_lease=lease, length=1)
+        ordinary_a = _FakeTailPlan(req=a, length=1)
+        ordinary_b = _FakeTailPlan(req=b, length=1)
+        inspects = []
+        recovered = []
+        executed = []
+
+        def inspect(reqs):
+            inspects.append([r.rid for r in reqs])
+            if len(inspects) == 1:
+                return [
+                    _SRTreePlanDraft(a, "copy", plan=copy_plan, lease=lease),
+                    _SRTreePlanDraft(b, "recover", lease=None),
+                ]
+            return [
+                _SRTreePlanDraft(a, "ordinary", plan=ordinary_a, lease=lease, miss="revision"),
+                _SRTreePlanDraft(b, "ordinary", plan=ordinary_b),
+            ]
+
+        scheduler = self._bind(
+            NS(sr_tree_leases=store),
+            execute=lambda plans: executed.append([p.req.rid for p in plans]) or True,
+        )
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = inspect
+        scheduler._sr_reprefill_committed = lambda reqs: recovered.append([r.rid for r in reqs])
+        self.assertTrue(scheduler._sr_run_tree_ingest([a, b]))
+        self.assertEqual(recovered, [["b"]])
+        self.assertEqual(len(inspects), 2)
+        self.assertEqual(executed, [["a", "b"]])
+        self.assertTrue(lease.released)
+        self.assertEqual(store.counts["tree_kv_commit_hit"], 0)
+
+    def test_second_recovery_is_degraded_not_retried(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        store = SRTreeLeaseStore()
+        a = NS(rid="a")
+        recovered = []
+        executed = []
+        degraded = []
+        scheduler = self._bind(
+            NS(sr_tree_leases=store),
+            execute=lambda plans: executed.append(list(plans)) or True,
+        )
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [_SRTreePlanDraft(a, "recover")]
+        scheduler._sr_reprefill_committed = lambda reqs: recovered.append([r.rid for r in reqs])
+        scheduler._sr_mark_degraded = lambda rid, reason: degraded.append((rid, reason))
+        self.assertTrue(scheduler._sr_run_tree_ingest([a]))
+        self.assertEqual(recovered, [["a"]])
+        self.assertEqual(executed, [])
+        self.assertEqual(degraded[0][0], "a")
+
+    def test_seed_fail_does_not_partial_commit_or_count_hits(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeLeaseStore,
+        )
+
+        reqs = [request(3, (7, 8), 0), request(5, (9,), 1)]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        store = SRTreeLeaseStore()
+        lease = self._lease(reqs[0].rid)
+        store.register(lease)
+        plans[0] = replace(plans[0], copy_src_slots=[7], copy_lease=lease)
+        scheduler.sr_tree_leases = store
+        scheduler.model_config = NS(vocab_size=32)
+        scheduler.server_args = NS(speculative_eagle_topk=3)
+        scheduler.spec_algorithm = "STANDALONE_REMOTE"
+        scheduler.tp_size = 1
+        built = []
+
+        def make(ps):
+            batch = NS(
+                is_sr_tail_extend=True,
+                device="cpu",
+                get_model_worker_batch=lambda: built[0] if built else NS(),
+            )
+            built.append(batch)
+            return batch
+
+        self._bind(scheduler)
+        scheduler.token_to_kv_pool_allocator.free = lambda slots: None
+        scheduler._sr_replay_grammars = Mock()
+        scheduler._sr_pause_req = Mock()
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_make_tail_extend_batch = make
+        scheduler.tp_worker = NS(
+            model_runner=NS(model_is_mrope=False, attn_backend=NS()),
+            forward_batch_generation=Mock(return_value=NS(logits_output=seed_output(1))),
+        )
+        before = scheduler.req_to_token_pool.req_to_token.clone()
+        with patch.object(tail.SRTailExtendTransaction, "copy_reused_tree_kv"):
+            committed = scheduler._sr_execute_tree_tails(plans)
+        self.assertFalse(committed)
+        torch.testing.assert_close(scheduler.req_to_token_pool.req_to_token, before)
+        self.assertEqual([r.kv_committed_len for r in reqs], [3, 5])
+        self.assertEqual(scheduler._sr_mark_degraded.call_count, 2)
+        scheduler._sr_prepare_tree_reqs = lambda reqs: reqs
+        scheduler._sr_inspect_tree_plans = lambda reqs: [
+            _SRTreePlanDraft(reqs[0], "copy", plan=plans[0], lease=lease),
+            _SRTreePlanDraft(reqs[1], "ordinary", plan=plans[1]),
+        ]
+        with patch.object(tail.SRTailExtendTransaction, "copy_reused_tree_kv"):
+            self.assertFalse(scheduler._sr_run_tree_ingest(reqs))
+        self.assertEqual(store.counts["tree_kv_commit_hit"], 0)
+        scheduler.tp_worker.forward_batch_generation.assert_called()
+        self.assertEqual(scheduler.tp_worker.forward_batch_generation.call_count, 2)
+
+    def test_graph_bucket_miss_is_one_eager_forward(self):
+        reqs = [request(3, (7, 8), 0), request(5, (9,), 1)]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        seed = seed_output(2)
+        batch = NS(
+            is_sr_tail_extend=True,
+            device="cpu",
+            extend_lens=[2, 1],
+            prefix_lens=[3, 5],
+            extend_num_tokens=3,
+            get_model_worker_batch=lambda: NS(),
+        )
+        runner = NS(
+            plan=lambda _batch: None,
+            plan_with_reason=lambda _batch: (None, "no_bucket"),
+            init_forward_batch=Mock(side_effect=AssertionError("graph")),
+            fill=Mock(side_effect=AssertionError("graph")),
+            replay_filled=Mock(side_effect=AssertionError("graph")),
+            eager_fallback_count=0,
+        )
+        scheduler.model_config = NS(vocab_size=32)
+        scheduler.server_args = NS(speculative_eagle_topk=3)
+        scheduler.spec_algorithm = "STANDALONE_REMOTE"
+        scheduler.tp_size = 1
+        scheduler._sr_replay_grammars = Mock()
+        scheduler._sr_pause_req = Mock()
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_make_tail_extend_batch = lambda ps: batch
+        scheduler.sr_tree_drafter = NS(tail_graph_runner=runner)
+        scheduler.tp_worker = NS(
+            model_runner=NS(model_is_mrope=False, attn_backend=NS()),
+            forward_batch_generation=Mock(return_value=NS(logits_output=seed)),
+        )
+        method = load_functions(
+            SCHEDULER,
+            ["_sr_execute_tree_tails"],
+            dict(
+                time=time,
+                logger=logging.getLogger(__name__),
+                get_sr_round_metrics=get_sr_round_metrics,
+                plan_tail_extend=tail.plan_tail_extend,
+                TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
+                tree_seed_is_current=tail.tree_seed_is_current,
+                SRTailExtendTransaction=tail.SRTailExtendTransaction,
+                _sr_is_device_context_error=lambda exc: False,
+                NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                NpuGraphPreparationError=type("Prep", (Exception,), {}),
+            ),
+            class_name="StandaloneRemoteDraftSchedulerMixin",
+        )["_sr_execute_tree_tails"]
+        method(scheduler, plans)
+        scheduler.tp_worker.forward_batch_generation.assert_called_once()
+        self.assertEqual(runner.eager_fallback_count, 1)
+        self.assertEqual([r.kv_committed_len for r in reqs], [5, 6])
 
 
 if __name__ == "__main__":

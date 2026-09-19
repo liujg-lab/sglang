@@ -405,6 +405,45 @@ class TestLeaseLifecycle(unittest.TestCase):
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [4])
 
+    def test_pin_lease_requires_same_object_and_version(self):
+        store = SRTreeLeaseStore()
+        first = SRTreeKVLease(
+            rid="p",
+            version=1,
+            revision=0,
+            base_committed_len=1,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(2),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(first)
+        self.assertIs(store.pin_lease(first), first)
+        store.unpin_lease(first)
+        second = SRTreeKVLease(
+            rid="p",
+            version=2,
+            revision=0,
+            base_committed_len=1,
+            prefix_tokens=(1,),
+            page_ids=[2],
+            page_slots=torch.arange(2),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(second)
+        self.assertIsNone(store.pin_lease(first))
+        self.assertIs(store.pin_lease(second), second)
+        store.unpin_lease(first)
+        self.assertTrue(second.in_use)
+        store.unpin_lease(second)
+        self.assertFalse(second.in_use)
+
     def test_event_without_query_stays_pending(self):
         store = SRTreeLeaseStore()
         lease = SRTreeKVLease(
@@ -642,6 +681,31 @@ class TestProtocolAndExport(unittest.TestCase):
         retrive = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
         paths = export_accepted_tree_candidate_indices(accept, retrive)
         self.assertEqual(paths, [[1, 2], [0]])
+        cpu_rows = [[10, 12, 13, -1], [20, 21, -1, -1]]
+        self.assertEqual(
+            export_accepted_tree_candidate_indices(cpu_rows),
+            [[1, 2], [0]],
+        )
+        eos = [[10, 12, -1, 13], [20, -1, -1, -1]]
+        self.assertEqual(export_accepted_tree_candidate_indices(eos), [[1], []])
+        bonus_only = [[4, -1], [8, -1]]
+        self.assertEqual(export_accepted_tree_candidate_indices(bonus_only), [[], []])
+        self.assertEqual(export_accepted_tree_candidate_indices([[-1]]), [[]])
+        self.assertEqual(export_accepted_tree_candidate_indices([[]]), [[]])
+
+    def test_eagle_verify_gates_sr_export(self):
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/eagle_info.py"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            src.index("is_standalone_remote"),
+            src.index("export_accepted_tree_candidate_indices"),
+        )
+        self.assertIn("sr_eos_cut", src)
+        self.assertIn("sr_accepted_tree_candidate_indices = None", src)
 
 
 if __name__ == "__main__":

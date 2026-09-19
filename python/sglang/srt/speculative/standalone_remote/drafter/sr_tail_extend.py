@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -163,6 +163,7 @@ class SRTailExtendPlan:
     recapture: bool = False
     original_len: Optional[int] = None
     copy_src_slots: Optional[List[int]] = None
+    copy_lease: Any = None
 
     @property
     def end(self) -> int:
@@ -452,6 +453,7 @@ class SRTailExtendTransaction:
                 raise RuntimeError("tree KV copy required but kv pool is missing")
             return
         jobs = []
+        copy_plans = []
         device = None
         for p in self.plans:
             src_list = p.copy_src_slots or []
@@ -460,11 +462,10 @@ class SRTailExtendTransaction:
             dst = self.mapping[
                 p.req.req_pool_idx, p.alloc_start : p.alloc_start + len(src_list)
             ]
-            if src_list == dst.detach().reshape(-1).tolist():
-                continue
             src = torch.as_tensor(src_list, dtype=torch.int64, device=dst.device)
             device = dst.device
             jobs.append((src, dst))
+            copy_plans.append(p)
         if not jobs:
             return
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -490,12 +491,12 @@ class SRTailExtendTransaction:
                     getattr(kv_pool, "index_k_buffer", None),
                 )
 
-        def _pin_leases(ev) -> None:
-            if store is None or ev is None:
+        def _bind_copy_event(ev) -> None:
+            if ev is None:
                 return
-            for p in self.plans:
-                lease = store.get(p.req.rid)
-                if lease is not None and p.copy_src_slots:
+            for p in copy_plans:
+                lease = getattr(p, "copy_lease", None)
+                if lease is not None:
                     lease.pending_free_event = ev
 
         self._copy_hold = jobs
@@ -515,12 +516,12 @@ class SRTailExtendTransaction:
             ctx_fn = getattr(self.scheduler, "_sr_kv_copy_ctx", None)
             if not callable(ctx_fn):
                 raise RuntimeError("copy stream context missing after probe")
-            _pin_leases(_UnfinishedCopyEvent())
+            _bind_copy_event(_UnfinishedCopyEvent())
             with ctx_fn(copy_stream):
                 _run_copies()
                 event = record_device_event(device, required=True)
         elif use_device_event:
-            _pin_leases(_UnfinishedCopyEvent())
+            _bind_copy_event(_UnfinishedCopyEvent())
             _run_copies()
             event = record_device_event(device, required=True)
         else:
@@ -533,7 +534,7 @@ class SRTailExtendTransaction:
         if (use_device_event or copy_stream is not None) and event is None:
             raise RuntimeError("KV copy submitted without a completion event")
         self.copy_done_event = event
-        _pin_leases(event)
+        _bind_copy_event(event)
 
     def wait_copy_done(self) -> None:
         wait_copy_event(self.copy_done_event)

@@ -778,7 +778,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         mixin = object.__new__(StandaloneRemoteDraftSchedulerMixin)
         mixin.sr_tree_drafter = FakeDrafter()
         mixin._sr_materialize_prefix_batch = lambda _reqs: None
-        mixin._sr_ingest_committed_batch = lambda _reqs: None
+        mixin._sr_run_tree_ingest = lambda _reqs: True
+        mixin._sr_ensure_tree_seeds = lambda _reqs: None
+        mixin._sr_is_degraded = lambda _rid: False
         mixin._sr_replay_grammars = lambda _reqs: None
         mixin._sr_resume_req = lambda _req: None
         mixin._sr_park_in_running_many = lambda _reqs: None

@@ -3073,7 +3073,8 @@ class TestSRDegradedRequests(CustomTestCase):
         mixin.sr_state.set("a", SRDraftState(req_id="a", session_id="s", req_object=req))
         mixin.sr_tree_drafter = None
         mixin._sr_materialize_prefix_batch = lambda reqs: None
-        mixin._sr_ingest_committed_batch = lambda reqs: None
+        mixin._sr_run_tree_ingest = lambda reqs: True
+        mixin._sr_ensure_tree_seeds = lambda reqs: None
         mixin._sr_replay_grammars = lambda reqs: None
 
         windows = mixin._sr_tree_expand_batch([req])

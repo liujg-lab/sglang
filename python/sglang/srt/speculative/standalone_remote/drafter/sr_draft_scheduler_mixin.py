@@ -1,7 +1,7 @@
 import logging
 import time
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -21,6 +21,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRWindow,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    SRTreeKVLease,
     SRTreeLeaseStore,
     live_accept_prefix,
     snapshot_sr_align,
@@ -104,6 +105,15 @@ def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
         if x != y:
             return i
     return None
+
+
+@dataclass
+class _SRTreePlanDraft:
+    req: Req
+    kind: str
+    plan: object = None
+    lease: Optional[SRTreeKVLease] = None
+    miss: Optional[str] = None
 
 
 def _sr_is_device_context_error(exc: BaseException) -> bool:
@@ -579,7 +589,10 @@ class StandaloneRemoteDraftSchedulerMixin:
             if state.degraded:
                 return
             state.degraded = True
-            self._sr_release_tree_lease(rid)
+            store = getattr(self, "sr_tree_leases", None)
+            lease = store.get(rid) if store is not None else None
+            if lease is None or not lease.in_use:
+                self._sr_release_tree_lease(rid)
         logger.warning("[SR] degrading %s to AR (no speculation): %s", rid, reason)
 
     def _sr_is_degraded(self, rid: str) -> bool:
@@ -1105,66 +1118,284 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_make_tail_extend_batch(self, plans) -> ScheduleBatch:
         return make_tail_extend_batch(self, plans)
 
-    def _sr_ingest_tree_tails(self, reqs: List[Req], plans=None) -> None:
-        """Materialize all missing tree-prefix tokens in one EXTEND."""
-        metrics = get_sr_round_metrics(self, "Draft")
-        plan_start = time.perf_counter()
-        runner = self.tp_worker.model_runner
-        recover = []
-        if plans is None:
-            plans = []
-            for req in reqs:
-                self._sr_ensure_window_budget(req, req.draft_tokens_target)
-                if self._sr_is_degraded(req.rid):
-                    continue
-                try:
-                    plan = plan_tail_extend(
-                        req,
-                        vocab_size=self.model_config.vocab_size,
-                        model_is_mrope=runner.model_is_mrope,
-                    )
-                except TailExtendRecoveryRequired as e:
-                    logger.info("[SR] tail prefix recovery for %s: %s", req.rid, e)
-                    recover.append(req)
-                    continue
-                if plan is not None:
-                    plans.append(plan)
-                else:
-                    metrics.counts["seed_reused"] += 1
+    def _sr_tree_req_alive(self, req: Req) -> bool:
+        if req is None:
+            return False
+        finished = getattr(req, "finished", None)
+        if callable(finished):
+            try:
+                if finished():
+                    return False
+            except TypeError:
+                pass
+        if self._sr_is_degraded(req.rid):
+            return False
+        sr_state = getattr(self, "sr_state", None)
+        if sr_state is not None:
+            st = sr_state.get(req.rid)
+            if st is None:
+                return False
+            obj = getattr(st, "req_object", None)
+            if obj is not None and obj is not req:
+                return False
+        return True
 
-        # Recovery may use the scheduler/allocator, so finish it before opening
-        # the tail allocation transaction. It is not the normal ingest path.
-        if recover:
-            with metrics.phase("prefix_recovery", device=True):
-                self._sr_reprefill_committed(recover)
-            metrics.counts["prefix_recovered"] += len(recover)
-            for req in recover:
-                if not tree_seed_is_current(req):
-                    self._sr_mark_degraded(req.rid, "tail prefix recovery failed")
-            # Prefix recovery runs the scheduler and can retract other requests.
-            # Never allocate from a plan made before that scheduler work.
-            refreshed = []
-            for old_plan in plans:
-                req = old_plan.req
-                if self._sr_is_degraded(req.rid):
+    def _sr_prepare_tree_reqs(self, reqs: List[Req]) -> List[Req]:
+        for req in reqs:
+            if not self._sr_tree_req_alive(req):
+                continue
+            self._sr_ensure_window_budget(req, getattr(req, "draft_tokens_target", None))
+        return [req for req in reqs if self._sr_tree_req_alive(req)]
+
+    def _sr_inspect_lease_copy(self, req: Req, lease: SRTreeKVLease, runner):
+        align = getattr(req, "sr_align_result", None)
+        if align is None or align.kind not in ("append_one", "append_n"):
+            return _SRTreePlanDraft(req, "ordinary", lease=lease, miss="fields")
+        dreq = getattr(req, "sr_pending_dreq", None)
+        tokens = list(req.origin_input_ids or []) + list(req.output_ids or [])
+        indices = list(getattr(dreq, "commit_candidate_indices", None) or [])
+        old_len = len(align.old_committed_tokens)
+        path_tokens = tokens[old_len : old_len + len(indices)]
+        miss = validate_lease_commit(
+            lease,
+            commit_tree_version=getattr(dreq, "commit_tree_version", None),
+            commit_tree_base_committed_len=getattr(
+                dreq, "commit_tree_base_committed_len", None
+            ),
+            commit_candidate_indices=indices,
+            align=align,
+            path_tokens=path_tokens,
+        )
+        if miss:
+            return _SRTreePlanDraft(req, "ordinary", lease=lease, miss=miss)
+        src_slots = live_accept_prefix(lease.candidate_slots, indices)
+        original = int(align.old_kv_committed_len)
+        effective = original + len(src_slots)
+        try:
+            plan = plan_tail_extend(
+                req,
+                vocab_size=self.model_config.vocab_size,
+                model_is_mrope=runner.model_is_mrope,
+                materialized_len=effective,
+            )
+        except TailExtendRecoveryRequired:
+            return _SRTreePlanDraft(req, "recover", lease=lease)
+        if plan is None:
+            return _SRTreePlanDraft(req, "skip", lease=lease)
+        plan = replace(
+            plan,
+            materialized_len=original,
+            original_len=original,
+            copy_src_slots=list(src_slots),
+            copy_lease=lease,
+        )
+        return _SRTreePlanDraft(req, "copy", plan=plan, lease=lease)
+
+    def _sr_inspect_tree_plans(self, reqs: List[Req]) -> List[_SRTreePlanDraft]:
+        store = getattr(self, "sr_tree_leases", None)
+        runner = self.tp_worker.model_runner
+        drafts: List[_SRTreePlanDraft] = []
+        for req in reqs:
+            lease = store.get(req.rid) if store is not None else None
+            if tree_seed_is_current(req):
+                drafts.append(_SRTreePlanDraft(req, "skip", lease=lease))
+                continue
+            if lease is not None:
+                draft = self._sr_inspect_lease_copy(req, lease, runner)
+                if draft.kind == "copy":
+                    drafts.append(draft)
+                    continue
+                if draft.kind == "recover":
+                    drafts.append(draft)
+                    continue
+                ordinary_from_lease = draft
+            else:
+                ordinary_from_lease = None
+            try:
+                plan = plan_tail_extend(
+                    req,
+                    vocab_size=self.model_config.vocab_size,
+                    model_is_mrope=runner.model_is_mrope,
+                )
+            except TailExtendRecoveryRequired:
+                drafts.append(
+                    _SRTreePlanDraft(
+                        req,
+                        "recover",
+                        lease=lease,
+                        miss=getattr(ordinary_from_lease, "miss", None),
+                    )
+                )
+                continue
+            if plan is None:
+                drafts.append(
+                    _SRTreePlanDraft(
+                        req,
+                        "skip",
+                        lease=lease,
+                        miss=getattr(ordinary_from_lease, "miss", None),
+                    )
+                )
+                continue
+            drafts.append(
+                _SRTreePlanDraft(
+                    req,
+                    "ordinary",
+                    plan=plan,
+                    lease=lease,
+                    miss=getattr(ordinary_from_lease, "miss", None),
+                )
+            )
+        return drafts
+
+    def _sr_record_inspect_misses(self, drafts: List[_SRTreePlanDraft]) -> None:
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return
+        for d in drafts:
+            if not d.miss:
+                continue
+            store.counts[f"tree_kv_commit_miss_{d.miss}"] += 1
+            if d.miss == "depth":
+                store.counts["tree_kv_reuse_skip_depth"] += 1
+
+    def _sr_acquire_tree_plans(
+        self, drafts: List[_SRTreePlanDraft], held: List[SRTreeKVLease]
+    ):
+        store = getattr(self, "sr_tree_leases", None)
+        runner = self.tp_worker.model_runner
+        plans = []
+        for d in drafts:
+            if not self._sr_tree_req_alive(d.req):
+                continue
+            if d.kind == "skip":
+                continue
+            if d.kind == "recover":
+                self._sr_mark_degraded(d.req.rid, "prefix still invalid after recovery")
+                continue
+            if d.kind == "copy":
+                pinned = store.pin_lease(d.lease) if store is not None else None
+                if pinned is not None:
+                    held.append(pinned)
+                    plans.append(replace(d.plan, copy_lease=pinned))
                     continue
                 try:
                     plan = plan_tail_extend(
-                        req,
+                        d.req,
                         vocab_size=self.model_config.vocab_size,
                         model_is_mrope=runner.model_is_mrope,
                     )
                 except TailExtendRecoveryRequired:
-                    self._sr_mark_degraded(req.rid, "prefix changed during recovery")
+                    self._sr_mark_degraded(
+                        d.req.rid, "lease pin failed and prefix needs recovery"
+                    )
                     continue
                 if plan is not None:
-                    refreshed.append(plan)
-            plans = refreshed
-        if metrics.active:
-            metrics.host["tail_plan_including_recovery"] += time.perf_counter() - plan_start
-        if not plans:
-            return
+                    plans.append(plan)
+                continue
+            if d.plan is not None:
+                plans.append(d.plan)
+        inspected = []
+        seen = set()
+        for d in drafts:
+            if d.lease is None:
+                continue
+            key = id(d.lease)
+            if key in seen:
+                continue
+            seen.add(key)
+            inspected.append(d.lease)
+        held_ids = {id(lease) for lease in held}
+        unused = [
+            lease
+            for lease in inspected
+            if id(lease) not in held_ids and not lease.released
+        ]
+        return plans, unused
 
+    def _sr_release_unused_leases(self, unused: List[SRTreeKVLease]) -> None:
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return
+        allocator = self.token_to_kv_pool_allocator
+        for lease in unused:
+            store.release(lease, allocator=allocator)
+
+    def _sr_release_held_leases(self, held: List[SRTreeKVLease]) -> None:
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return
+        allocator = self.token_to_kv_pool_allocator
+        for lease in held:
+            event = getattr(lease, "pending_free_event", None)
+            store.release(lease, allocator=allocator, event=event)
+
+    def _sr_record_committed_reuse(self, plans) -> None:
+        store = getattr(self, "sr_tree_leases", None)
+        if store is None:
+            return
+        for p in plans:
+            src = p.copy_src_slots or []
+            if not src or getattr(p, "copy_lease", None) is None:
+                continue
+            store.counts["tree_kv_commit_hit"] += 1
+            store.counts["tree_kv_reused_tokens"] += len(src)
+            store.counts["tree_kv_unmaterialized_leaf_tokens"] += max(p.length, 0)
+
+    def _sr_run_tree_ingest(self, reqs: List[Req]) -> bool:
+        """Prepare, inspect, recover once, pin, then execute one packed EXTEND."""
+        if not reqs:
+            return True
+        metrics = get_sr_round_metrics(self, "Draft")
+        plan_start = time.perf_counter()
+        store = getattr(self, "sr_tree_leases", None)
+        if store is not None:
+            store.poll_pending_frees(self.token_to_kv_pool_allocator)
+        prepared = self._sr_prepare_tree_reqs(reqs)
+        drafts = self._sr_inspect_tree_plans(prepared)
+        recover = [d.req for d in drafts if d.kind == "recover"]
+        if recover:
+            with metrics.phase("prefix_recovery", device=True):
+                self._sr_reprefill_committed(recover)
+            metrics.counts["prefix_recovered"] += len(recover)
+            prepared = self._sr_prepare_tree_reqs(reqs)
+            drafts = self._sr_inspect_tree_plans(prepared)
+        self._sr_record_inspect_misses(drafts)
+        if metrics.active:
+            metrics.host["tail_plan_including_recovery"] += (
+                time.perf_counter() - plan_start
+            )
+        held: List[SRTreeKVLease] = []
+        try:
+            plans, unused = self._sr_acquire_tree_plans(drafts, held)
+            self._sr_release_unused_leases(unused)
+            skip_count = sum(
+                1
+                for d in drafts
+                if d.kind == "skip" and self._sr_tree_req_alive(d.req)
+            )
+            if skip_count:
+                metrics.counts["seed_reused"] += skip_count
+            if not plans:
+                return True
+            committed = self._sr_execute_tree_tails(plans)
+            if committed:
+                self._sr_record_committed_reuse(plans)
+            return committed
+        finally:
+            self._sr_release_held_leases(held)
+
+    def _sr_ingest_tree_tails(self, reqs: List[Req], plans=None):
+        if plans is None:
+            return self._sr_run_tree_ingest(reqs)
+        return self._sr_execute_tree_tails(plans)
+
+    def _sr_execute_tree_tails(self, plans) -> bool:
+        """Run one transaction on final plans. Does not plan, recover, or pin."""
+        if not plans:
+            return True
+        metrics = get_sr_round_metrics(self, "Draft")
+        runner = self.tp_worker.model_runner
         transaction = SRTailExtendTransaction(self, plans)
         active = [p.req for p in plans]
         worker_failed = False
@@ -1237,15 +1468,13 @@ class StandaloneRemoteDraftSchedulerMixin:
                     for path in paths or ("ordinary_extend",):
                         metrics.paths[path] += 1
                 transaction.commit(logits_output)
+                return True
         except Exception as e:
             if (
                 _sr_is_device_context_error(e)
                 or isinstance(e, NpuGraphReplaySubmittedError)
                 or (self.tp_size > 1 and transaction.submitted)
             ):
-                # Device execution may still own the slots. Do not recycle them.
-                # A TP peer may be inside a collective; do not block here on a
-                # local synchronize or let ranks continue with different state.
                 worker_failed = True
                 raise
             try:
@@ -1259,17 +1488,16 @@ class StandaloneRemoteDraftSchedulerMixin:
             metrics.counts["tail_failed_requests"] += len(active)
             for req in active:
                 self._sr_mark_degraded(req.rid, f"tail extend failed: {e}")
+            return False
         finally:
             if not worker_failed:
                 for req in active:
                     self._sr_pause_req(req)
-            # Discard old decode metadata; the next tree/window builds it from
-            # the committed request lengths, never from this EXTEND batch.
             self.last_batch = None
 
     def _sr_ingest_committed_batch(self, reqs: List[Req]) -> None:
         if self._sr_tree_mode():
-            self._sr_ingest_tree_tails(reqs)
+            self._sr_run_tree_ingest(reqs)
             return
         self._sr_ingest_committed_chain_batch(reqs)
 
@@ -1392,82 +1620,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             rid, allocator=self.token_to_kv_pool_allocator, event=event
         )
 
-    def _sr_commit_tree_leases(self, reqs: List[Req]) -> Tuple[List[Req], List]:
-        """Pin reusable leases and return (full_tail_reqs, copy_plans)."""
-        store = getattr(self, "sr_tree_leases", None)
-        full: List[Req] = []
-        copy_plans = []
-        if store is None:
-            return list(reqs), copy_plans
-        store.poll_pending_frees(self.token_to_kv_pool_allocator)
-        runner = self.tp_worker.model_runner
-        for req in reqs:
-            dreq = getattr(req, "sr_pending_dreq", None)
-            align = getattr(req, "sr_align_result", None)
-            lease = store.get(req.rid)
-            if lease is None:
-                full.append(req)
-                continue
-            if align is None or align.kind not in ("append_one", "append_n"):
-                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
-                full.append(req)
-                continue
-            tokens = list(req.origin_input_ids or []) + list(req.output_ids or [])
-            indices = list(getattr(dreq, "commit_candidate_indices", None) or [])
-            old_len = len(align.old_committed_tokens)
-            path_tokens = tokens[old_len : old_len + len(indices)]
-            miss = validate_lease_commit(
-                lease,
-                commit_tree_version=getattr(dreq, "commit_tree_version", None),
-                commit_tree_base_committed_len=getattr(
-                    dreq, "commit_tree_base_committed_len", None
-                ),
-                commit_candidate_indices=indices,
-                align=align,
-                path_tokens=path_tokens,
-            )
-            if miss:
-                store.counts[f"tree_kv_commit_miss_{miss}"] += 1
-                if miss == "depth":
-                    store.counts["tree_kv_reuse_skip_depth"] += 1
-                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
-                full.append(req)
-                continue
-            src_slots = live_accept_prefix(lease.candidate_slots, indices)
-            store.pin(req.rid)
-            original = int(align.old_kv_committed_len)
-            effective = original + len(src_slots)
-            try:
-                plan = plan_tail_extend(
-                    req,
-                    vocab_size=self.model_config.vocab_size,
-                    model_is_mrope=runner.model_is_mrope,
-                    materialized_len=effective,
-                )
-            except TailExtendRecoveryRequired:
-                store.unpin(req.rid)
-                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
-                full.append(req)
-                continue
-            if plan is None:
-                store.unpin(req.rid)
-                store.release_rid(req.rid, allocator=self.token_to_kv_pool_allocator)
-                full.append(req)
-                continue
-            plan = replace(
-                plan,
-                materialized_len=original,
-                original_len=original,
-                copy_src_slots=list(src_slots),
-            )
-            copy_plans.append((req, lease, plan, len(src_slots)))
-            store.counts["tree_kv_commit_hit"] += 1
-            store.counts["tree_kv_reused_tokens"] += len(src_slots)
-            store.counts["tree_kv_unmaterialized_leaf_tokens"] += max(
-                plan.length, 0
-            )
-        return full, copy_plans
-
     def _sr_tree_expand_batch(self, reqs: List[Req]) -> List[SRWindow]:
         empty: SRWindow = ([], None, None)
         if not reqs:
@@ -1475,35 +1627,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         metrics = get_sr_round_metrics(self, "Draft")
         with metrics.phase("prefix_materialize", device=True):
             self._sr_materialize_prefix_batch(reqs)
-        full, copy_jobs = self._sr_commit_tree_leases(reqs)
-        store = getattr(self, "sr_tree_leases", None)
-        if copy_jobs:
-            if store is not None:
-                store.reclaim_idle(
-                    self.token_to_kv_pool_allocator,
-                    skip_rids={job[0].rid for job in copy_jobs},
-                )
-            try:
-                self._sr_ingest_tree_tails(
-                    [job[0] for job in copy_jobs],
-                    plans=[job[2] for job in copy_jobs],
-                )
-            finally:
-                for req, lease, plan, _n in copy_jobs:
-                    if store is None:
-                        continue
-                    event = getattr(lease, "pending_free_event", None)
-                    store.unpin(req.rid)
-                    store.release(
-                        lease,
-                        allocator=self.token_to_kv_pool_allocator,
-                        event=event,
-                    )
-                    done = int(getattr(req, "kv_committed_len", 0) or 0) >= plan.end
-                    if not done:
-                        full.append(req)
-        if full:
-            self._sr_ingest_committed_batch(full)
+        self._sr_run_tree_ingest(reqs)
         self._sr_ensure_tree_seeds(reqs)
         self._sr_replay_grammars(reqs)
         windows: List[SRWindow] = [empty] * len(reqs)

@@ -46,13 +46,16 @@ def advance_tree_draft_positions_for_step(
 
 def export_accepted_tree_candidate_indices(
     accept_index,
-    retrive_index,
+    retrive_index=None,
 ) -> List[List[int]]:
     """Map 2D ``accept_index`` to reply candidate indices (exclude root).
 
     ``accept_index[b, j]`` stores ``retrive_index`` values. Column 0 is the
     tree root. Later columns that are not ``-1`` are accepted draft nodes.
     Bonus lives in ``predict[last_accepted]``, not an extra accept slot.
+
+    When ``retrive_index`` is omitted, each CPU row uses ``row[0]`` as root.
+    Empty rows or invalid roots yield an empty path. Never default root to 0.
     """
     if accept_index is None:
         return []
@@ -62,17 +65,28 @@ def export_accepted_tree_candidate_indices(
         rows = list(accept_index)
     if not rows:
         return []
-    if hasattr(retrive_index, "detach"):
-        roots = retrive_index[:, 0].detach().to("cpu").reshape(-1).tolist()
-    elif retrive_index is not None:
-        roots = [int(row[0]) for row in retrive_index]
-    else:
-        roots = [0] * len(rows)
+    roots = None
+    if retrive_index is not None:
+        if hasattr(retrive_index, "detach"):
+            roots = retrive_index[:, 0].detach().to("cpu").reshape(-1).tolist()
+        else:
+            roots = [int(row[0]) for row in retrive_index]
     out: List[List[int]] = []
     for b, row in enumerate(rows):
-        root = int(roots[b]) if b < len(roots) else 0
-        path: List[int] = []
         seq = row if isinstance(row, (list, tuple)) else [row]
+        if roots is not None:
+            root = int(roots[b]) if b < len(roots) else None
+        elif not seq:
+            root = None
+        else:
+            try:
+                root = int(seq[0])
+            except (TypeError, ValueError):
+                root = None
+        if root is None or root < 0:
+            out.append([])
+            continue
+        path: List[int] = []
         for j, idx in enumerate(seq):
             if j == 0:
                 continue

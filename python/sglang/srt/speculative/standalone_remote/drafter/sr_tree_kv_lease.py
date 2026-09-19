@@ -396,15 +396,28 @@ class SRTreeLeaseStore:
         self.counts["tree_lease_pages"] += lease_page_count(lease)
 
     def pin(self, rid: str) -> Optional[SRTreeKVLease]:
-        lease = self._leases.get(rid)
-        if lease is None:
+        return self.pin_lease(self._leases.get(rid))
+
+    def pin_lease(self, lease: Optional[SRTreeKVLease]) -> Optional[SRTreeKVLease]:
+        """Pin this exact object if it is still the stored version."""
+        if lease is None or lease.released:
+            return None
+        stored = self._leases.get(lease.rid)
+        if stored is not lease or int(stored.version) != int(lease.version):
             return None
         lease.in_use = True
         return lease
 
     def unpin(self, rid: str) -> None:
-        lease = self._leases.get(rid)
-        if lease is not None:
+        stored = self._leases.get(rid)
+        if stored is not None:
+            stored.in_use = False
+
+    def unpin_lease(self, lease: Optional[SRTreeKVLease]) -> None:
+        if lease is None:
+            return
+        stored = self._leases.get(lease.rid)
+        if stored is lease:
             lease.in_use = False
 
     def pop(self, rid: str) -> Optional[SRTreeKVLease]:
