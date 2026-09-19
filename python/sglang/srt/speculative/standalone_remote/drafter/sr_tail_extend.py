@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -48,41 +47,81 @@ def stamp_tree_seed(req: Req, boundary: int) -> None:
     req.sr_tree_seed_revision = int(getattr(req, "sr_prefix_revision", 0))
 
 
+class _UnfinishedCopyEvent:
+    """Keep lease pages pinned if copy already submitted but completion record failed."""
+
+    def query(self) -> bool:
+        return False
+
+
+def _device_type(device):
+    if device is None:
+        return None
+    return getattr(device, "type", None) or str(device)
+
+
+def _is_cpu_device(device) -> bool:
+    dev_type = _device_type(device)
+    return device is None or dev_type is None or "cpu" in str(dev_type)
+
+
 def wait_copy_event(event) -> None:
     """Wait for copy on the current device stream. Do not CPU-synchronize."""
     if event is None:
         return
     device = getattr(event, "device", None)
-    dev_type = getattr(device, "type", None) if device is not None else None
+    if device is None:
+        return
+    dev_type = getattr(device, "type", None)
     if dev_type is None or "cpu" in str(dev_type):
         return
-    try:
-        module = torch.get_device_module(dev_type)
-        stream = module.current_stream(device)
-        wait = getattr(stream, "wait_event", None)
-        if callable(wait):
-            wait(event)
-    except Exception:
-        return
+    module = torch.get_device_module(dev_type)
+    stream = module.current_stream(device)
+    wait = getattr(stream, "wait_event", None)
+    if not callable(wait):
+        raise RuntimeError("cannot wait for KV copy: stream.wait_event missing")
+    wait(event)
 
 
-def copy_stream_context(device):
-    """Side stream for KV copy when the device module exposes Stream."""
-    if device is None:
-        return None, nullcontext()
-    dev_type = getattr(device, "type", None) or str(device)
-    if dev_type == "cpu" or "cpu" in str(dev_type):
-        return None, nullcontext()
+def get_kv_copy_stream(scheduler, device):
+    """Return a persistent side copy stream, or None to copy on the compute stream.
+
+    Probe failures are cached. After a copy is submitted, callers must not
+    fall back through this helper.
+    """
+    if scheduler is None or _is_cpu_device(device):
+        return None
+    cached = getattr(scheduler, "_sr_kv_copy_stream", None)
+    if cached is not None:
+        return cached
+    if getattr(scheduler, "_sr_kv_copy_stream_unsupported", False):
+        return None
     try:
-        module = torch.get_device_module(dev_type)
+        module = torch.get_device_module(_device_type(device))
         factory = getattr(module, "Stream", None)
         ctx_fn = getattr(module, "stream", None)
-        if not callable(factory) or not callable(ctx_fn):
-            return None, nullcontext()
+        event_factory = getattr(module, "Event", None)
+        current_stream_fn = getattr(module, "current_stream", None)
+        if not all(
+            callable(fn)
+            for fn in (factory, ctx_fn, event_factory, current_stream_fn)
+        ):
+            scheduler._sr_kv_copy_stream_unsupported = True
+            return None
+        current = current_stream_fn(device)
+        if not callable(getattr(current, "wait_event", None)):
+            scheduler._sr_kv_copy_stream_unsupported = True
+            return None
         stream = factory()
-        return stream, ctx_fn(stream)
+        if not callable(getattr(stream, "wait_event", None)):
+            scheduler._sr_kv_copy_stream_unsupported = True
+            return None
     except Exception:
-        return None, nullcontext()
+        scheduler._sr_kv_copy_stream_unsupported = True
+        return None
+    scheduler._sr_kv_copy_stream = stream
+    scheduler._sr_kv_copy_ctx = ctx_fn
+    return stream
 
 
 def validate_tail_mrope(mm_input, start: int, length: int) -> None:
@@ -321,6 +360,7 @@ class SRTailExtendTransaction:
         self.committed = False
         self.copy_done_event = None
         self._copy_stream = None
+        self._copy_hold = None
 
     def allocate(self, batch: ScheduleBatch) -> None:
         if any(p.end > self.mapping.shape[1] for p in self.plans):
@@ -402,6 +442,7 @@ class SRTailExtendTransaction:
 
         self.copy_done_event = None
         self._copy_stream = None
+        self._copy_hold = None
         kv_pool = getattr(
             getattr(self.scheduler, "tp_worker", None), "model_runner", None
         )
@@ -449,26 +490,54 @@ class SRTailExtendTransaction:
                     getattr(kv_pool, "index_k_buffer", None),
                 )
 
+        def _pin_leases(ev) -> None:
+            if store is None or ev is None:
+                return
+            for p in self.plans:
+                lease = store.get(p.req.rid)
+                if lease is not None and p.copy_src_slots:
+                    lease.pending_free_event = ev
+
+        self._copy_hold = jobs
         t0 = time.perf_counter()
-        stream, ctx = copy_stream_context(device)
-        self._copy_stream = stream
-        with ctx:
-            _run_copies()
-            event = record_device_event(device)
         store = getattr(self.scheduler, "sr_tree_leases", None)
+        copy_stream = get_kv_copy_stream(self.scheduler, device)
+        self._copy_stream = copy_stream
+        use_device_event = not _is_cpu_device(device)
+        if copy_stream is not None:
+            ready = record_device_event(device, required=True)
+            wait = getattr(copy_stream, "wait_event", None)
+            if not callable(wait):
+                raise RuntimeError(
+                    "cannot wait for slot prep: copy stream wait_event missing"
+                )
+            wait(ready)
+            ctx_fn = getattr(self.scheduler, "_sr_kv_copy_ctx", None)
+            if not callable(ctx_fn):
+                raise RuntimeError("copy stream context missing after probe")
+            _pin_leases(_UnfinishedCopyEvent())
+            with ctx_fn(copy_stream):
+                _run_copies()
+                event = record_device_event(device, required=True)
+        elif use_device_event:
+            _pin_leases(_UnfinishedCopyEvent())
+            _run_copies()
+            event = record_device_event(device, required=True)
+        else:
+            _run_copies()
+            event = None
         if store is not None:
             store.counts["tree_kv_copy_submit_ms"] += int(
                 (time.perf_counter() - t0) * 1000
             )
+        if (use_device_event or copy_stream is not None) and event is None:
+            raise RuntimeError("KV copy submitted without a completion event")
         self.copy_done_event = event
-        if store is not None and event is not None:
-            for p in self.plans:
-                lease = store.get(p.req.rid)
-                if lease is not None and p.copy_src_slots:
-                    lease.pending_free_event = event
+        _pin_leases(event)
 
     def wait_copy_done(self) -> None:
         wait_copy_event(self.copy_done_event)
+        self._copy_hold = None
 
     def commit(self, logits_output) -> None:
         count = len(self.plans)

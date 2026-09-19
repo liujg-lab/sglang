@@ -470,17 +470,14 @@ class SRTreeLeaseStore:
         keep = []
         for lease in pending:
             event = lease.pending_free_event
-            done = event is None
-            if event is not None:
-                query = getattr(event, "query", None)
-                if callable(query):
-                    done = bool(query())
-                else:
-                    done = True
-            if done:
+            if event is None:
                 _free_lease_pages(allocator, lease)
-            else:
+                continue
+            query = getattr(event, "query", None)
+            if not callable(query) or not query():
                 keep.append(lease)
+                continue
+            _free_lease_pages(allocator, lease)
         pending[:] = keep
 
     def _pending_frees(self, allocator) -> List[SRTreeKVLease]:
@@ -519,8 +516,8 @@ def immediate_free_pages(allocator) -> int:
     return int(len(free_pages))
 
 
-def record_device_event(device):
-    """Record a completion event on the current stream. CPU returns None."""
+def record_device_event(device, stream=None, *, required=False):
+    """Record a completion event on stream or the current stream. CPU returns None."""
     if device is None:
         return None
     dev_type = getattr(device, "type", None) or str(device)
@@ -529,7 +526,15 @@ def record_device_event(device):
     try:
         module = torch.get_device_module(dev_type)
         event = module.Event()
-        event.record()
+        if stream is not None:
+            try:
+                event.record(stream)
+            except TypeError:
+                event.record()
+        else:
+            event.record()
         return event
     except Exception:
+        if required:
+            raise
         return None

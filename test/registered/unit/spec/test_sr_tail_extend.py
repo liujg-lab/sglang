@@ -1023,11 +1023,12 @@ class TestTailGraphBuckets(unittest.TestCase):
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tail_extend.py"
         ).read_text(encoding="utf-8")
         start = body.index("def wait_copy_event")
-        end = body.index("\ndef copy_stream_context")
+        end = body.index("\ndef get_kv_copy_stream")
         helper = body[start:end]
         self.assertNotIn(".synchronize", helper)
+        self.assertNotIn("except Exception", helper)
         self.assertIn("wait_event", helper)
-        self.assertIn("def copy_stream_context", body)
+        self.assertIn("def get_kv_copy_stream", body)
 
     def test_wait_copy_event_uses_stream_wait_event(self):
         class Stream:
@@ -1048,34 +1049,78 @@ class TestTailGraphBuckets(unittest.TestCase):
             tail.wait_copy_event(event)
         self.assertEqual(stream.seen, [event])
 
-    def test_copy_stream_context_uses_side_stream_when_available(self):
-        entered = []
+    def test_wait_copy_event_propagates_wait_failure(self):
+        class Stream:
+            def wait_event(self, ev):
+                raise RuntimeError("wait failed")
 
-        class Ctx:
-            def __enter__(self):
-                entered.append("in")
-                return self
+        class Mod:
+            def current_stream(self, device=None):
+                return Stream()
 
-            def __exit__(self, *exc):
-                entered.append("out")
-                return False
+        event = NS(device=NS(type="npu"))
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            with self.assertRaisesRegex(RuntimeError, "wait failed"):
+                tail.wait_copy_event(event)
+
+    def test_wait_copy_event_raises_when_wait_event_missing(self):
+        class Stream:
+            pass
+
+        class Mod:
+            def current_stream(self, device=None):
+                return Stream()
+
+        event = NS(device=NS(type="npu"))
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            with self.assertRaisesRegex(RuntimeError, "wait_event missing"):
+                tail.wait_copy_event(event)
+
+    def test_get_kv_copy_stream_reuses_persistent_stream(self):
+        class Stream:
+            def wait_event(self, ev):
+                return None
+
+        created = []
 
         class Mod:
             def Stream(self):
-                return "side"
+                stream = Stream()
+                created.append(stream)
+                return stream
 
             def stream(self, s):
-                entered.append(s)
-                return Ctx()
+                return NS()
 
+            def Event(self):
+                return NS()
+
+            def current_stream(self, device=None):
+                return Stream()
+
+        scheduler = NS()
         with patch.object(torch, "get_device_module", return_value=Mod()):
-            stream, ctx = tail.copy_stream_context(NS(type="npu"))
-        self.assertEqual(stream, "side")
-        with ctx:
+            first = tail.get_kv_copy_stream(scheduler, NS(type="npu"))
+            second = tail.get_kv_copy_stream(scheduler, NS(type="npu"))
+        self.assertIs(first, second)
+        self.assertEqual(created, [first])
+        self.assertIsNone(tail.get_kv_copy_stream(NS(), NS(type="cpu")))
+
+    def test_get_kv_copy_stream_falls_back_before_submit(self):
+        class Mod:
             pass
-        self.assertEqual(entered, ["side", "in", "out"])
-        cpu_stream, _ = tail.copy_stream_context(NS(type="cpu"))
-        self.assertIsNone(cpu_stream)
+
+        scheduler = NS()
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            self.assertIsNone(tail.get_kv_copy_stream(scheduler, NS(type="npu")))
+        self.assertTrue(scheduler._sr_kv_copy_stream_unsupported)
+
+        class Capable:
+            def Stream(self):
+                raise AssertionError("must not retry Stream after unsupported")
+
+        with patch.object(torch, "get_device_module", return_value=Capable()):
+            self.assertIsNone(tail.get_kv_copy_stream(scheduler, NS(type="npu")))
 
     def test_copy_reused_tree_kv_skips_empty_and_identical_slots(self):
         from dataclasses import replace
@@ -1130,6 +1175,231 @@ class TestTailGraphBuckets(unittest.TestCase):
         with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
             txn.copy_reused_tree_kv()
         self.assertEqual(copies, ["mha"])
+
+    def _copy_job_txn(self):
+        from dataclasses import replace
+
+        req = request(10, (7, 8))
+        plan = replace(
+            tail.plan_tail_extend(
+                req, vocab_size=32, model_is_mrope=False, materialized_len=12
+            ),
+            materialized_len=10,
+            original_len=10,
+            copy_src_slots=[99, 100],
+        )
+        scheduler, _ = transaction_fixture([req], 128)
+        scheduler.tp_worker = NS(
+            model_runner=NS(
+                token_to_kv_pool=NS(
+                    kv_buffer=None,
+                    k_buffer=torch.zeros(2, 32, 1, 2),
+                    v_buffer=torch.zeros(2, 32, 1, 2),
+                    move_kv_cache=None,
+                    _kv_copy_config=None,
+                )
+            )
+        )
+        txn = tail.SRTailExtendTransaction(scheduler, [plan])
+        txn.allocate(NS(device="cpu"))
+        return scheduler, txn, plan, req
+
+    def test_copy_reused_tree_kv_side_stream_handshake(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeKVLease,
+            SRTreeLeaseStore,
+        )
+
+        scheduler, txn, plan, req = self._copy_job_txn()
+        order = []
+        events = []
+
+        class CopyStream:
+            def wait_event(self, ev):
+                order.append(("copy_wait", ev))
+
+        class Ctx:
+            def __enter__(self):
+                order.append("ctx_in")
+                return self
+
+            def __exit__(self, *exc):
+                order.append("ctx_out")
+                return False
+
+        copy_stream = CopyStream()
+        scheduler._sr_kv_copy_ctx = lambda s: Ctx()
+        store = SRTreeLeaseStore()
+        lease = SRTreeKVLease(
+            rid=req.rid,
+            version=1,
+            revision=0,
+            base_committed_len=10,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(4),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(lease)
+        scheduler.sr_tree_leases = store
+
+        def fake_record(device, stream=None, *, required=False):
+            ev = NS(device=NS(type="npu"), required=required)
+            events.append(ev)
+            order.append(("record", required))
+            return ev
+
+        def spy_mha(*args, **kwargs):
+            order.append("copy")
+
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(tail, "get_kv_copy_stream", return_value=copy_stream), patch.object(
+            tail, "_is_cpu_device", return_value=False
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_mha_kv_by_slot", spy_mha
+        ):
+            txn.copy_reused_tree_kv()
+
+        self.assertEqual(
+            [step if isinstance(step, str) else step[0] for step in order],
+            ["record", "copy_wait", "ctx_in", "copy", "record", "ctx_out"],
+        )
+        self.assertIs(order[1][1], events[0])
+        self.assertTrue(events[0].required)
+        self.assertTrue(events[1].required)
+        self.assertIs(txn.copy_done_event, events[1])
+        self.assertIs(lease.pending_free_event, events[1])
+        self.assertIsNotNone(txn._copy_hold)
+        self.assertEqual(len(txn._copy_hold), 1)
+        compute = NS(seen=[])
+
+        class ComputeMod:
+            def current_stream(self, device=None):
+                return NS(wait_event=lambda ev: compute.seen.append(ev))
+
+        with patch.object(torch, "get_device_module", return_value=ComputeMod()):
+            txn.wait_copy_done()
+        self.assertEqual(compute.seen, [events[1]])
+        self.assertIsNone(txn._copy_hold)
+
+    def test_copy_reused_tree_kv_main_stream_records_event(self):
+        scheduler, txn, _, _ = self._copy_job_txn()
+        order = []
+
+        def fake_record(device, stream=None, *, required=False):
+            ev = NS(device=NS(type="npu"), required=required)
+            order.append(("record", required))
+            return ev
+
+        def spy_mha(*args, **kwargs):
+            order.append("copy")
+
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(tail, "get_kv_copy_stream", return_value=None), patch.object(
+            tail, "_is_cpu_device", return_value=False
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_mha_kv_by_slot", spy_mha
+        ):
+            txn.copy_reused_tree_kv()
+        self.assertEqual(order, ["copy", ("record", True)])
+        self.assertIsNotNone(txn.copy_done_event)
+        self.assertTrue(txn.copy_done_event.required)
+
+    def test_copy_record_failure_keeps_lease_pages(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeKVLease,
+            SRTreeLeaseStore,
+        )
+
+        scheduler, txn, _, req = self._copy_job_txn()
+        store = SRTreeLeaseStore()
+        lease = SRTreeKVLease(
+            rid=req.rid,
+            version=1,
+            revision=0,
+            base_committed_len=10,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(4),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(lease)
+        scheduler.sr_tree_leases = store
+        records = []
+
+        def fake_record(device, stream=None, *, required=False):
+            records.append(required)
+            if len(records) == 1:
+                return NS(device=NS(type="npu"))
+            raise RuntimeError("record failed")
+
+        class CopyStream:
+            def wait_event(self, ev):
+                return None
+
+        class Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        scheduler._sr_kv_copy_ctx = lambda s: Ctx()
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
+            tail, "_is_cpu_device", return_value=False
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_mha_kv_by_slot", lambda *a, **k: None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "record failed"):
+                txn.copy_reused_tree_kv()
+        self.assertIsInstance(lease.pending_free_event, tail._UnfinishedCopyEvent)
+
+        class Alloc:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, slots):
+                self.freed.append(int(slots.numel()))
+
+        alloc = Alloc()
+        store.release(lease, allocator=alloc, event=lease.pending_free_event)
+        self.assertEqual(alloc.freed, [])
+        store.poll_pending_frees(alloc)
+        self.assertEqual(alloc.freed, [])
+
+    def test_wait_copy_done_keeps_hold_when_wait_fails(self):
+        scheduler, txn, _, _ = self._copy_job_txn()
+        txn._copy_hold = [("src", "dst")]
+        txn.copy_done_event = NS(device=NS(type="npu"))
+
+        class Stream:
+            def wait_event(self, ev):
+                raise RuntimeError("wait failed")
+
+        class Mod:
+            def current_stream(self, device=None):
+                return Stream()
+
+        with patch.object(torch, "get_device_module", return_value=Mod()):
+            with self.assertRaisesRegex(RuntimeError, "wait failed"):
+                txn.wait_copy_done()
+        self.assertEqual(txn._copy_hold, [("src", "dst")])
 
     def test_capture_buffers_keep_cpu_seq_lens_and_mrope_shape(self):
         GRAPH = (

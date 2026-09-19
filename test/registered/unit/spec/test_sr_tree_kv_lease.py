@@ -24,6 +24,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     physical_tree_slot,
     plan_paged_tree_layout,
     prefix_window_tokens,
+    record_device_event,
     remap_slot_node_ids,
     snapshot_sr_align,
     tree_raw_span_len,
@@ -403,6 +404,50 @@ class TestLeaseLifecycle(unittest.TestCase):
         event.ready = True
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [4])
+
+    def test_event_without_query_stays_pending(self):
+        store = SRTreeLeaseStore()
+        lease = SRTreeKVLease(
+            rid="q",
+            version=1,
+            revision=0,
+            base_committed_len=1,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(4),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(lease)
+
+        class Alloc:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, slots):
+                self.freed.append(int(slots.numel()))
+
+        alloc = Alloc()
+        store.release(lease, allocator=alloc, event=object())
+        store.poll_pending_frees(alloc)
+        self.assertEqual(alloc.freed, [])
+
+    def test_record_device_event_required_propagates(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace as NS
+
+        class Mod:
+            def Event(self):
+                raise RuntimeError("no event")
+
+        with patch("torch.get_device_module", return_value=Mod()):
+            with self.assertRaisesRegex(RuntimeError, "no event"):
+                record_device_event(NS(type="npu"), required=True)
+            self.assertIsNone(record_device_event(NS(type="npu")))
+        self.assertIsNone(record_device_event(NS(type="cpu"), required=True))
+        self.assertIsNone(record_device_event(None, required=True))
 
     def test_release_is_idempotent_and_wipe_recycles(self):
         store = SRTreeLeaseStore()
