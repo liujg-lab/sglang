@@ -358,6 +358,7 @@ class SRTailExtendTransaction:
         self.mapping_snapshots = []
         self.grammars = [p.req.grammar for p in plans]
         self.submitted = False
+        self.copy_submitted = False
         self.committed = False
         self.copy_done_event = None
         self._copy_stream = None
@@ -440,10 +441,14 @@ class SRTailExtendTransaction:
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             record_device_event,
         )
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_kv_pool_by_slot,
+        )
 
         self.copy_done_event = None
         self._copy_stream = None
         self._copy_hold = None
+        self.copy_submitted = False
         kv_pool = getattr(
             getattr(self.scheduler, "tp_worker", None), "model_runner", None
         )
@@ -452,9 +457,9 @@ class SRTailExtendTransaction:
             if any(p.copy_src_slots for p in self.plans):
                 raise RuntimeError("tree KV copy required but kv pool is missing")
             return
-        jobs = []
+        src_host = []
+        dst_parts = []
         copy_plans = []
-        device = None
         for p in self.plans:
             src_list = p.copy_src_slots or []
             if not src_list:
@@ -462,34 +467,18 @@ class SRTailExtendTransaction:
             dst = self.mapping[
                 p.req.req_pool_idx, p.alloc_start : p.alloc_start + len(src_list)
             ]
-            src = torch.as_tensor(src_list, dtype=torch.int64, device=dst.device)
-            device = dst.device
-            jobs.append((src, dst))
+            src_host.extend(int(x) for x in src_list)
+            dst_parts.append(dst)
             copy_plans.append(p)
-        if not jobs:
+        if not dst_parts:
             return
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_mha_kv_by_slot,
-            copy_paged_kv_buffer_by_slot,
+        merged_dst = torch.cat(dst_parts)
+        merged_src = torch.as_tensor(
+            src_host, dtype=torch.int64, device=merged_dst.device
         )
-
-        def _run_copies():
-            for src, dst in jobs:
-                kv_buffer = getattr(kv_pool, "kv_buffer", None)
-                if torch.is_tensor(kv_buffer) and kv_buffer.dim() == 6:
-                    copy_paged_kv_buffer_by_slot(kv_buffer, src, dst)
-                    continue
-                mover = getattr(kv_pool, "move_kv_cache", None)
-                if callable(mover) and getattr(kv_pool, "_kv_copy_config", None) is not None:
-                    mover(dst, src)
-                    continue
-                copy_mha_kv_by_slot(
-                    getattr(kv_pool, "k_buffer", None),
-                    getattr(kv_pool, "v_buffer", None),
-                    src,
-                    dst,
-                    getattr(kv_pool, "index_k_buffer", None),
-                )
+        if int(merged_src.numel()) != int(merged_dst.numel()):
+            raise RuntimeError("tree KV copy src/dst length mismatch")
+        self._copy_hold = (merged_src, merged_dst)
 
         def _bind_copy_event(ev) -> None:
             if ev is None:
@@ -499,9 +488,9 @@ class SRTailExtendTransaction:
                 if lease is not None:
                     lease.pending_free_event = ev
 
-        self._copy_hold = jobs
         t0 = time.perf_counter()
         store = getattr(self.scheduler, "sr_tree_leases", None)
+        device = merged_dst.device
         copy_stream = get_kv_copy_stream(self.scheduler, device)
         self._copy_stream = copy_stream
         use_device_event = not _is_cpu_device(device)
@@ -517,15 +506,18 @@ class SRTailExtendTransaction:
             if not callable(ctx_fn):
                 raise RuntimeError("copy stream context missing after probe")
             _bind_copy_event(_UnfinishedCopyEvent())
+            self.copy_submitted = True
             with ctx_fn(copy_stream):
-                _run_copies()
+                copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
                 event = record_device_event(device, required=True)
         elif use_device_event:
             _bind_copy_event(_UnfinishedCopyEvent())
-            _run_copies()
+            self.copy_submitted = True
+            copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
             event = record_device_event(device, required=True)
         else:
-            _run_copies()
+            self.copy_submitted = True
+            copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
             event = None
         if store is not None:
             store.counts["tree_kv_copy_submit_ms"] += int(
@@ -587,3 +579,4 @@ class SRTailExtendTransaction:
             self.allocator.restore_state(self.allocator_state)
         for p, grammar in zip(self.plans, self.grammars):
             p.req.grammar = grammar
+        self._copy_hold = None

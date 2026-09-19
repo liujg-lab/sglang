@@ -1133,11 +1133,13 @@ class TestRemoteSpecDevice(CustomTestCase):
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
         ).read_text()
         self.assertIn("advance_tree_draft_positions_for_step", drafter_src)
-        self.assertIn("copy_paged_kv_buffer_by_slot", drafter_src)
-        self.assertIn("copy_mha_kv_by_slot", drafter_src)
+        self.assertIn("copy_kv_pool_by_slot", drafter_src)
+        self.assertIn("seq_lens_sum_from_batch", drafter_src)
         self.assertIn("def _remap_tree_kv_to_parents", drafter_src)
-        self.assertIn("move_kv_cache", drafter_src)
         self.assertIn("parent_rows", drafter_src)
+        self.assertNotIn("for s in range(n_prev_steps)", drafter_src)
+        self.assertNotIn("move_kv_cache", drafter_src)
+        self.assertNotIn("torch.sum(batch.seq_lens)", drafter_src)
         self.assertNotIn("advance_tree_draft_positions(", drafter_src)
         self.assertIn("if is_device_context_error(e):", drafter_src)
         self.assertNotIn("if kv_buffer is None:", drafter_src)
@@ -1160,6 +1162,112 @@ class TestRemoteSpecDevice(CustomTestCase):
         src = (_REPO / "python/sglang/srt/speculative/eagle_utils.py").read_text()
         self.assertIn("verify_tree_greedy_ref", src)
         self.assertNotIn("sgl_kernel_npu", src)
+
+    def test_copy_kv_pool_by_slot_validates_before_write(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            UnsupportedTreeKVLayout,
+            copy_kv_pool_by_slot,
+        )
+
+        src = torch.tensor([1, 2], dtype=torch.int64)
+        tgt = torch.tensor([3, 4], dtype=torch.int64)
+        with self.assertRaises(UnsupportedTreeKVLayout):
+            copy_kv_pool_by_slot(SimpleNamespace(), src, tgt)
+        k = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+        pool = SimpleNamespace(k_buffer=k.clone(), v_buffer=None)
+        with self.assertRaises(UnsupportedTreeKVLayout):
+            copy_kv_pool_by_slot(pool, src, tgt)
+        torch.testing.assert_close(pool.k_buffer, k)
+        with self.assertRaisesRegex(RuntimeError, "length mismatch"):
+            copy_kv_pool_by_slot(
+                SimpleNamespace(k_buffer=k.clone(), v_buffer=k.clone()),
+                torch.tensor([1]),
+                tgt,
+            )
+        copy_kv_pool_by_slot(SimpleNamespace(), torch.tensor([]), torch.tensor([]))
+        with self.assertRaisesRegex(RuntimeError, "length mismatch"):
+            copy_kv_pool_by_slot(
+                SimpleNamespace(k_buffer=k.clone(), v_buffer=k.clone()),
+                torch.tensor([]),
+                tgt,
+            )
+
+    def test_copy_kv_pool_by_slot_rejects_incomplete_index_before_write(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            UnsupportedTreeKVLayout,
+            copy_kv_pool_by_slot,
+        )
+
+        src = torch.tensor([1, 0], dtype=torch.int64)
+        tgt = torch.tensor([0, 1], dtype=torch.int64)
+        k5 = torch.arange(1 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(1, 2, 2, 1, 2)
+        v5 = k5.clone() + 3
+        pool = SimpleNamespace(
+            kv_buffer=None,
+            k_buffer=k5.clone(),
+            v_buffer=v5.clone(),
+            index_k_buffer=torch.arange(4, dtype=torch.float32),
+        )
+        with self.assertRaises(UnsupportedTreeKVLayout):
+            copy_kv_pool_by_slot(pool, src, tgt)
+        torch.testing.assert_close(pool.k_buffer, k5)
+        torch.testing.assert_close(pool.v_buffer, v5)
+
+    def test_copy_kv_pool_by_slot_copies_list_and_mla5(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_kv_pool_by_slot,
+        )
+
+        src = torch.tensor([1, 0], dtype=torch.int64)
+        tgt = torch.tensor([0, 1], dtype=torch.int64)
+        k_list = [
+            torch.arange(6, dtype=torch.float32).reshape(6, 1),
+            torch.arange(6, dtype=torch.float32).reshape(6, 1) + 10,
+        ]
+        v_list = [b.clone() + 1 for b in k_list]
+        pool = SimpleNamespace(
+            kv_buffer=None,
+            k_buffer=[b.clone() for b in k_list],
+            v_buffer=[b.clone() for b in v_list],
+            index_k_buffer=None,
+        )
+        copy_kv_pool_by_slot(pool, src, tgt)
+        torch.testing.assert_close(pool.k_buffer[0][0], k_list[0][1])
+        torch.testing.assert_close(pool.k_buffer[0][1], k_list[0][0])
+        k5 = torch.arange(1 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(1, 2, 2, 1, 2)
+        v5 = k5.clone() + 3
+        idx = k5.clone() + 9
+        pool5 = SimpleNamespace(
+            kv_buffer=None,
+            k_buffer=k5.clone(),
+            v_buffer=v5.clone(),
+            index_k_buffer=idx.clone(),
+        )
+        copy_kv_pool_by_slot(pool5, src, tgt)
+        flat_k = k5.view(1, -1, 1, 2)
+        gold = flat_k.index_select(1, src)
+        got = pool5.k_buffer.view(1, -1, 1, 2)
+        torch.testing.assert_close(got.index_select(1, tgt), gold)
+        torch.testing.assert_close(
+            pool5.index_k_buffer.view(1, -1, 1, 2).index_select(1, tgt),
+            idx.view(1, -1, 1, 2).index_select(1, src),
+        )
+
+        kv_list = [b.clone() for b in k_list]
+        pool_kv = SimpleNamespace(kv_buffer=kv_list, k_buffer=None, v_buffer=None)
+        copy_kv_pool_by_slot(pool_kv, src, tgt)
+        torch.testing.assert_close(pool_kv.kv_buffer[0][0], k_list[0][1])
+
+        paged = torch.arange(2 * 1 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(
+            2, 1, 2, 2, 1, 2
+        )
+        pool6 = SimpleNamespace(kv_buffer=paged.clone(), k_buffer=None, v_buffer=None)
+        copy_kv_pool_by_slot(pool6, src, tgt)
+        flat = paged.view(2, 1, -1, 1, 2)
+        torch.testing.assert_close(
+            pool6.kv_buffer.view(2, 1, -1, 1, 2).index_select(2, tgt),
+            flat.index_select(2, src),
+        )
 
 
 if __name__ == "__main__":

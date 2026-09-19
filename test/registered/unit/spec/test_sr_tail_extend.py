@@ -1299,7 +1299,9 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIs(txn.copy_done_event, events[1])
         self.assertIs(lease.pending_free_event, events[1])
         self.assertIsNotNone(txn._copy_hold)
-        self.assertEqual(len(txn._copy_hold), 1)
+        self.assertEqual(len(txn._copy_hold), 2)
+        self.assertTrue(torch.is_tensor(txn._copy_hold[0]))
+        self.assertTrue(torch.is_tensor(txn._copy_hold[1]))
         compute = NS(seen=[])
 
         class ComputeMod:
@@ -2446,6 +2448,490 @@ class TestTreeIngestLifecycle(unittest.TestCase):
         scheduler.tp_worker.forward_batch_generation.assert_called_once()
         self.assertEqual(runner.eager_fallback_count, 1)
         self.assertEqual([r.kv_committed_len for r in reqs], [5, 6])
+
+
+class TestBatchedKvCopy(unittest.TestCase):
+    def setUp(self):
+        self.evict = patch.object(tail, "_evict_tail_capacity")
+        self.evict.start()
+        self.addCleanup(self.evict.stop)
+
+    def _drafter(self, pool, copies, node_ids=None):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            remap_slot_node_ids,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_kv_pool_by_slot,
+        )
+
+        fns = load_functions(
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+            ["_remap_tree_kv_to_parents", "_copy_tree_kv_slots"],
+            dict(
+                torch=torch,
+                remap_slot_node_ids=remap_slot_node_ids,
+                copy_kv_pool_by_slot=lambda *a, **k: copies.append(
+                    (a[1].detach().clone(), a[2].detach().clone())
+                )
+                or copy_kv_pool_by_slot(*a, **k),
+            ),
+            class_name="SRTreeDrafter",
+        )
+        obj = NS(
+            draft_model_runner=NS(token_to_kv_pool=pool),
+            _slot_node_ids=(
+                torch.arange(16).reshape(4, 4)
+                if node_ids is None
+                else node_ids.clone()
+            ),
+            _slot_node_id_tmp=torch.empty(8, dtype=torch.int64),
+        )
+        obj._copy_tree_kv_slots = MethodType(fns["_copy_tree_kv_slots"], obj)
+        obj._remap_tree_kv_to_parents = MethodType(
+            fns["_remap_tree_kv_to_parents"], obj
+        )
+        return obj
+
+    @staticmethod
+    def _staged_gold(buf, loc, parent, n_prev):
+        gold = buf.clone()
+        for step in range(int(n_prev)):
+            src = loc[step].index_select(0, parent)
+            tgt = loc[step]
+            staged = gold.index_select(0, src)
+            gold = gold.clone()
+            gold.index_copy_(0, tgt, staged)
+        return gold
+
+    def test_remap_flattens_steps_and_matches_staged_gold(self):
+        k = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+        v = k.clone() + 1
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=v.clone())
+        copies = []
+        drafter = self._drafter(pool, copies)
+        loc = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+        parent = torch.tensor([1, 0], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc, parent, 2)
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][0].tolist(), [6, 5, 8, 7])
+        self.assertEqual(copies[0][1].tolist(), [5, 6, 7, 8])
+        torch.testing.assert_close(pool.k_buffer, self._staged_gold(k, loc, parent, 2))
+        torch.testing.assert_close(pool.v_buffer, self._staged_gold(v, loc, parent, 2))
+        self.assertEqual(drafter._slot_node_ids[0, :2].tolist(), [1, 0])
+        self.assertEqual(drafter._slot_node_ids[1, :2].tolist(), [5, 4])
+        torch.testing.assert_close(pool.k_buffer[5], k[6])
+        torch.testing.assert_close(pool.k_buffer[7], k[8])
+
+    def test_remap_duplicate_parent_and_multi_request_offsets(self):
+        k = torch.arange(32, dtype=torch.float32).reshape(32, 1)
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies)
+        loc = torch.tensor([[5, 6]], dtype=torch.int64)
+        parent = torch.tensor([0, 0], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(len(copies), 1)
+        torch.testing.assert_close(pool.k_buffer[5], k[5])
+        torch.testing.assert_close(pool.k_buffer[6], k[5])
+        self.assertEqual(drafter._slot_node_ids[0, :2].tolist(), [0, 0])
+
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies)
+        loc = torch.tensor([[10, 11, 20, 21]], dtype=torch.int64)
+        parent = torch.tensor([1, 0, 3, 2], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(copies[0][0].tolist(), [11, 10, 21, 20])
+        torch.testing.assert_close(pool.k_buffer[10], k[11])
+        torch.testing.assert_close(pool.k_buffer[20], k[21])
+        self.assertEqual(drafter._slot_node_ids[0, :4].tolist(), [1, 0, 3, 2])
+
+    def test_remap_dummy_rows_stay_dummy_to_dummy(self):
+        dummy = 0
+        k = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+        dummy_val = k[dummy].clone()
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies)
+        loc = torch.tensor([[5, 6, dummy, dummy]], dtype=torch.int64)
+        parent = torch.tensor([1, 0, 2, 3], dtype=torch.int64)
+        with self.assertRaisesRegex(RuntimeError, "parent_rows width"):
+            drafter._remap_tree_kv_to_parents(loc, torch.tensor([1, 0]), 1)
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][0].tolist(), [6, 5, dummy, dummy])
+        torch.testing.assert_close(pool.k_buffer[dummy], dummy_val)
+        after_live = pool.k_buffer[5].clone()
+        loc[:, 2] = 9
+        copies.clear()
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(int(copies[0][0].shape[0]), 4)
+        torch.testing.assert_close(pool.k_buffer[dummy], dummy_val)
+        torch.testing.assert_close(pool.k_buffer[5], k[5])
+        loc[:, 2] = dummy
+        copies.clear()
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(int(copies[0][0].shape[0]), 4)
+        torch.testing.assert_close(pool.k_buffer[dummy], dummy_val)
+        torch.testing.assert_close(pool.k_buffer[5], after_live)
+
+    def test_remap_n_prev_steps_and_noncontiguous_loc(self):
+        k = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies)
+        loc = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+        parent = torch.tensor([1, 0], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc, parent, 0)
+        self.assertEqual(copies, [])
+        torch.testing.assert_close(pool.k_buffer, k)
+
+        drafter._remap_tree_kv_to_parents(loc, parent, 1)
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][0].tolist(), [6, 5])
+        torch.testing.assert_close(pool.k_buffer, self._staged_gold(k, loc, parent, 1))
+
+        loc_nc = torch.tensor([[5, 7], [6, 8]], dtype=torch.int64).t()
+        self.assertFalse(loc_nc.is_contiguous())
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies)
+        drafter._remap_tree_kv_to_parents(loc_nc, parent, 2)
+        self.assertEqual(copies[0][0].tolist(), [6, 5, 8, 7])
+        torch.testing.assert_close(
+            pool.k_buffer, self._staged_gold(k, loc_nc.contiguous(), parent, 2)
+        )
+
+        copies.clear()
+        parent2 = torch.tensor([0, 1], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc_nc, parent2, 2)
+        self.assertEqual(copies[0][0].tolist(), [5, 6, 7, 8])
+
+    def test_seq_lens_sum_from_cpu_and_mismatch(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            seq_lens_sum_from_batch,
+            sr_decode_seq_len,
+        )
+
+        reqs = [NS(kv_committed_len=3, origin_input_ids=[1], output_ids=[2])]
+        batch = NS(
+            reqs=reqs,
+            seq_lens=torch.tensor([3, 4]),
+            seq_lens_cpu=torch.tensor([3, 4]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "request count"):
+            seq_lens_sum_from_batch(batch)
+        batch.reqs = [
+            reqs[0],
+            NS(kv_committed_len=4, origin_input_ids=[], output_ids=[]),
+        ]
+        self.assertEqual(seq_lens_sum_from_batch(batch), 7)
+        batch.seq_lens = torch.tensor([7])
+        with self.assertRaisesRegex(RuntimeError, "seq_lens rows"):
+            seq_lens_sum_from_batch(batch)
+        missing = NS(reqs=batch.reqs, seq_lens=None, seq_lens_cpu=None)
+        self.assertEqual(seq_lens_sum_from_batch(missing), 7)
+        self.assertEqual(sr_decode_seq_len(reqs[0]), 3)
+        empty = NS(
+            kv_committed_len=0, origin_input_ids=[1, 2, 3], output_ids=[4, 5]
+        )
+        self.assertEqual(sr_decode_seq_len(empty), 4)
+        mixin = SCHEDULER.read_text(encoding="utf-8")
+        self.assertIn("sr_decode_seq_len(r)", mixin)
+        try:
+            meta = torch.zeros(2, device="meta")
+        except Exception:
+            meta = None
+        if meta is not None:
+            with self.assertRaisesRegex(RuntimeError, "must stay on CPU"):
+                seq_lens_sum_from_batch(
+                    NS(
+                        reqs=batch.reqs,
+                        seq_lens=torch.tensor([3, 4]),
+                        seq_lens_cpu=meta,
+                    )
+                )
+
+    def test_merged_lease_copy_one_helper_and_hold(self):
+        from dataclasses import replace
+
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeKVLease,
+            SRTreeLeaseStore,
+        )
+
+        reqs = [request(10, (7, 8), 0), request(10, (9,), 1)]
+        plans = []
+        leases = []
+        store = SRTreeLeaseStore()
+        for req, src in zip(reqs, ([99, 100], [101])):
+            lease = SRTreeKVLease(
+                rid=req.rid,
+                version=1,
+                revision=0,
+                base_committed_len=10,
+                prefix_tokens=(1,),
+                page_ids=[1],
+                page_slots=torch.arange(4),
+                candidate_slots=[0],
+                parent_list=[],
+                top_scores_index=[],
+                draft_tokens=[],
+            )
+            store.register(lease)
+            leases.append(lease)
+            plans.append(
+                replace(
+                    tail.plan_tail_extend(
+                        req, vocab_size=32, model_is_mrope=False
+                    ),
+                    materialized_len=int(req.kv_committed_len),
+                    original_len=int(req.kv_committed_len),
+                    copy_src_slots=src,
+                    copy_lease=lease,
+                )
+            )
+        scheduler, _ = transaction_fixture(reqs, 128)
+        scheduler.sr_tree_leases = store
+        pool = NS(
+            kv_buffer=None,
+            k_buffer=torch.zeros(128, 1, 2),
+            v_buffer=torch.zeros(128, 1, 2),
+        )
+        scheduler.tp_worker = NS(model_runner=NS(token_to_kv_pool=pool))
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.allocate(NS(device="cpu"))
+        calls = []
+        as_calls = []
+        real_as = torch.as_tensor
+        order = []
+
+        def spy_as(*args, **kwargs):
+            as_calls.append(args[0] if args else None)
+            return real_as(*args, **kwargs)
+
+        def spy_copy(*args, **kwargs):
+            calls.append(args)
+            order.append("copy")
+
+        def fake_record(device, stream=None, *, required=False):
+            self.assertIsNotNone(txn._copy_hold)
+            self.assertEqual(len(txn._copy_hold), 2)
+            ev = NS(device=NS(type="npu"), required=required)
+            order.append(("record", required))
+            return ev
+
+        class CopyStream:
+            def wait_event(self, ev):
+                order.append(("copy_wait", ev))
+
+        class Ctx:
+            def __enter__(self):
+                order.append("ctx_in")
+                return self
+
+            def __exit__(self, *exc):
+                order.append("ctx_out")
+                return False
+
+        scheduler._sr_kv_copy_ctx = lambda s: Ctx()
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(torch, "as_tensor", spy_as), patch.object(
+            tail, "get_kv_copy_stream", return_value=CopyStream()
+        ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_kv_pool_by_slot", spy_copy
+        ):
+            txn.copy_reused_tree_kv()
+        host_lists = [item for item in as_calls if isinstance(item, list)]
+        self.assertEqual(host_lists, [[99, 100, 101]])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(int(calls[0][1].numel()), 3)
+        self.assertIs(txn._copy_hold[0], calls[0][1])
+        self.assertIs(txn._copy_hold[1], calls[0][2])
+        self.assertTrue(txn.copy_submitted)
+        self.assertIs(leases[0].pending_free_event, txn.copy_done_event)
+        self.assertIs(leases[1].pending_free_event, txn.copy_done_event)
+        self.assertEqual(
+            [step if isinstance(step, str) else step[0] for step in order],
+            ["record", "copy_wait", "ctx_in", "copy", "record", "ctx_out"],
+        )
+
+    def test_copy_record_failure_after_submit_keeps_hold(self):
+        scheduler, txn, _, _ = self._copy_job_txn()
+        records = []
+
+        def fake_record(device, stream=None, *, required=False):
+            records.append(required)
+            if len(records) == 1:
+                return NS(device=NS(type="npu"))
+            raise RuntimeError("record failed")
+
+        class CopyStream:
+            def wait_event(self, ev):
+                return None
+
+        class Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        scheduler._sr_kv_copy_ctx = lambda s: Ctx()
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
+            tail, "_is_cpu_device", return_value=False
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_kv_pool_by_slot", lambda *a, **k: None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "record failed"):
+                txn.copy_reused_tree_kv()
+        self.assertTrue(txn.copy_submitted)
+        self.assertIsNotNone(txn._copy_hold)
+        self.assertEqual(len(txn._copy_hold), 2)
+
+    def test_execute_copy_failure_classes(self):
+        hold = (torch.tensor([1]), torch.tensor([2]))
+
+        class BaseTxn:
+            def __init__(self, scheduler, plans):
+                self.scheduler = scheduler
+                self.submitted = False
+                self.copy_submitted = False
+                self._copy_hold = hold
+                self.committed = False
+
+            def allocate(self, batch):
+                return None
+
+            def wait_copy_done(self):
+                raise AssertionError("should not wait after copy failure")
+
+            def commit(self, logits):
+                return None
+
+        class NotSubmitted(BaseTxn):
+            def copy_reused_tree_kv(self):
+                raise RuntimeError("wait_event missing")
+
+            def rollback(self):
+                self._copy_hold = None
+
+        class SubmittedSyncOk(BaseTxn):
+            def copy_reused_tree_kv(self):
+                self.copy_submitted = True
+                raise RuntimeError("copy helper failed")
+
+            def rollback(self):
+                self.scheduler.device_module.synchronize()
+                self._copy_hold = None
+
+        class SubmittedUnconfirmed(BaseTxn):
+            def copy_reused_tree_kv(self):
+                self.copy_submitted = True
+                raise RuntimeError("copy helper failed")
+
+            def rollback(self):
+                raise RuntimeError("synchronize failed")
+
+        cases = [
+            (NotSubmitted, False, False, "wait_event missing"),
+            (SubmittedSyncOk, True, False, "copy helper failed"),
+            (SubmittedUnconfirmed, True, True, "synchronize failed"),
+        ]
+        for txn_cls, submitted, fatal, msg in cases:
+            with self.subTest(txn=txn_cls.__name__):
+                execute, scheduler, reqs, _submitted = self._execute(txn_cls)
+                if fatal:
+                    with self.assertRaisesRegex(RuntimeError, msg):
+                        execute(scheduler, _tail_plans_for(reqs))
+                    self.assertEqual(scheduler._sr_pending_copy_holds, [hold])
+                    scheduler._sr_mark_degraded.assert_not_called()
+                    scheduler._sr_pause_req.assert_not_called()
+                else:
+                    self.assertFalse(execute(scheduler, _tail_plans_for(reqs)))
+                    self.assertFalse(getattr(scheduler, "_sr_pending_copy_holds", []))
+                    scheduler._sr_mark_degraded.assert_called()
+                    self.assertIsNone(
+                        getattr(scheduler, "_last_txn", None)
+                    )
+                self.assertEqual(bool(submitted), txn_cls is not NotSubmitted)
+
+    def _execute(self, txn_cls):
+        fns = load_functions(
+            SCHEDULER,
+            ["_sr_execute_tree_tails", "_sr_park_copy_hold"],
+            dict(
+                time=time,
+                logger=logging.getLogger(__name__),
+                get_sr_round_metrics=get_sr_round_metrics,
+                plan_tail_extend=tail.plan_tail_extend,
+                TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
+                tree_seed_is_current=tail.tree_seed_is_current,
+                SRTailExtendTransaction=txn_cls,
+                _sr_is_device_context_error=lambda exc: False,
+                NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                NpuGraphPreparationError=type("Prep", (Exception,), {}),
+            ),
+        )
+        reqs = [request(3, (7, 8), 0)]
+        scheduler, _ = transaction_fixture(reqs, 128)
+        scheduler.model_config = NS(vocab_size=32)
+        scheduler.server_args = NS(speculative_eagle_topk=3)
+        scheduler.spec_algorithm = "STANDALONE_REMOTE"
+        scheduler.tp_size = 1
+        scheduler._sr_replay_grammars = Mock()
+        scheduler._sr_pause_req = Mock()
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_make_tail_extend_batch = lambda plans: NS(
+            get_model_worker_batch=lambda: NS()
+        )
+        scheduler.sr_tree_drafter = None
+        scheduler.tp_worker = NS(
+            model_runner=NS(model_is_mrope=False, attn_backend=NS()),
+            forward_batch_generation=Mock(
+                return_value=NS(logits_output=seed_output(1))
+            ),
+        )
+        scheduler._sr_park_copy_hold = MethodType(
+            fns["_sr_park_copy_hold"], scheduler
+        )
+        return fns["_sr_execute_tree_tails"], scheduler, reqs, None
+
+    def _copy_job_txn(self):
+        from dataclasses import replace
+
+        req = request(10, (7, 8))
+        plan = replace(
+            tail.plan_tail_extend(
+                req, vocab_size=32, model_is_mrope=False, materialized_len=12
+            ),
+            materialized_len=10,
+            original_len=10,
+            copy_src_slots=[99, 100],
+        )
+        scheduler, _ = transaction_fixture([req], 128)
+        scheduler.tp_worker = NS(
+            model_runner=NS(
+                token_to_kv_pool=NS(
+                    kv_buffer=None,
+                    k_buffer=torch.zeros(128, 1, 2),
+                    v_buffer=torch.zeros(128, 1, 2),
+                    move_kv_cache=None,
+                    _kv_copy_config=None,
+                )
+            )
+        )
+        txn = tail.SRTailExtendTransaction(scheduler, [plan])
+        txn.allocate(NS(device="cpu"))
+        return scheduler, txn, plan, req
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     plan_tree_seed_recovery,
     replay_grammar_from_committed,
     snapshot_reprefill_fill_ids,
+    sr_decode_seq_len,
     tree_seed_matches_prefix,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -465,13 +466,7 @@ class StandaloneRemoteDraftSchedulerMixin:
 
                 device = get_device()
 
-        def _seq_len(r: Req) -> int:
-            committed = int(getattr(r, "kv_committed_len", 0) or 0)
-            if committed > 0:
-                return committed
-            return max(0, len(r.origin_input_ids) + len(r.output_ids or []) - 1)
-
-        seq_lens_list = [_seq_len(r) for r in reqs]
+        seq_lens_list = [sr_decode_seq_len(r) for r in reqs]
         batch = ScheduleBatch(
             reqs=list(reqs),
             req_to_token_pool=self.req_to_token_pool,
@@ -1470,16 +1465,21 @@ class StandaloneRemoteDraftSchedulerMixin:
                 transaction.commit(logits_output)
                 return True
         except Exception as e:
+            copy_submitted = bool(getattr(transaction, "copy_submitted", False))
             if (
                 _sr_is_device_context_error(e)
                 or isinstance(e, NpuGraphReplaySubmittedError)
-                or (self.tp_size > 1 and transaction.submitted)
+                or (self.tp_size > 1 and (transaction.submitted or copy_submitted))
             ):
+                if copy_submitted:
+                    self._sr_park_copy_hold(getattr(transaction, "_copy_hold", None))
                 worker_failed = True
                 raise
             try:
                 transaction.rollback()
             except Exception:
+                if copy_submitted:
+                    self._sr_park_copy_hold(getattr(transaction, "_copy_hold", None))
                 worker_failed = True
                 raise
             if self.tp_size > 1:
@@ -1611,6 +1611,15 @@ class StandaloneRemoteDraftSchedulerMixin:
             ):
                 continue
             self._sr_mark_degraded(req.rid, "tree seed recovery failed")
+
+    def _sr_park_copy_hold(self, hold) -> None:
+        if hold is None:
+            return
+        bag = getattr(self, "_sr_pending_copy_holds", None)
+        if bag is None:
+            self._sr_pending_copy_holds = [hold]
+            return
+        bag.append(hold)
 
     def _sr_release_tree_lease(self, rid: str, event=None) -> None:
         store = getattr(self, "sr_tree_leases", None)

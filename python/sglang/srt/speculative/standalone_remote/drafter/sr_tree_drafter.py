@@ -47,11 +47,10 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     prefix_window_tokens,
     remap_slot_node_ids,
 )
-from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error, seq_lens_sum_from_batch
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     advance_tree_draft_positions_for_step,
-    copy_mha_kv_by_slot,
-    copy_paged_kv_buffer_by_slot,
+    copy_kv_pool_by_slot,
 )
 from sglang.srt.utils import next_power_of_2
 
@@ -903,7 +902,7 @@ class SRTreeDrafter:
                 self.page_size,
             )
         batch.out_cache_loc = draft_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = seq_lens_sum_from_batch(batch)
         batch.spec_info.positions = batch.seq_lens.repeat_interleave(
             self.topk, dim=0
         )
@@ -1008,36 +1007,21 @@ class SRTreeDrafter:
         parent_rows: torch.Tensor,
         n_prev_steps: int,
     ) -> None:
+        if n_prev_steps <= 0:
+            return
+        rows = int(out_cache_loc.shape[1])
+        if int(parent_rows.numel()) != rows:
+            raise RuntimeError("parent_rows width must match out_cache_loc rows")
         remap_slot_node_ids(
             self._slot_node_ids, parent_rows, n_prev_steps, self._slot_node_id_tmp
         )
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         if kv_pool is None:
             return
-        for s in range(n_prev_steps):
-            src = out_cache_loc[s][parent_rows]
-            tgt = out_cache_loc[s]
-            self._copy_tree_kv_slots(kv_pool, src, tgt)
+        hist = out_cache_loc[:n_prev_steps]
+        src = hist[:, parent_rows.to(dtype=torch.int64)].reshape(-1)
+        tgt = hist.reshape(-1)
+        self._copy_tree_kv_slots(kv_pool, src, tgt)
 
     def _copy_tree_kv_slots(self, kv_pool, src: torch.Tensor, tgt: torch.Tensor) -> None:
-        kv_buffer = getattr(kv_pool, "kv_buffer", None)
-        if torch.is_tensor(kv_buffer) and kv_buffer.dim() == 6:
-            copy_paged_kv_buffer_by_slot(kv_buffer, src, tgt)
-            return
-        mover = getattr(kv_pool, "move_kv_cache", None)
-        if callable(mover) and getattr(kv_pool, "_kv_copy_config", None) is not None:
-            mover(tgt, src)
-            return
-        k_buffer = getattr(kv_pool, "k_buffer", None)
-        v_buffer = getattr(kv_pool, "v_buffer", None)
-        if k_buffer is not None:
-            copy_mha_kv_by_slot(
-                k_buffer,
-                v_buffer,
-                src,
-                tgt,
-                getattr(kv_pool, "index_k_buffer", None),
-            )
-            return
-        if isinstance(kv_buffer, (list, tuple)):
-            copy_mha_kv_by_slot(kv_buffer, None, src, tgt)
+        copy_kv_pool_by_slot(kv_pool, src, tgt)

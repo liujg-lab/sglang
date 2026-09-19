@@ -93,6 +93,43 @@ def draft_token_budget(num_draft_tokens: Optional[int], spec_steps: Optional[int
     return max(n + 4, 8)
 
 
+def sr_decode_seq_len(req) -> int:
+    """Materialized decode length used to build the Draft tree/decode batch."""
+    committed = int(getattr(req, "kv_committed_len", 0) or 0)
+    if committed > 0:
+        return committed
+    origin = getattr(req, "origin_input_ids", None) or []
+    output = getattr(req, "output_ids", None) or []
+    return max(0, len(origin) + len(output) - 1)
+
+
+def seq_lens_sum_from_batch(batch) -> int:
+    """Host sum of current batch lengths. Never reads device seq_lens values."""
+    cpu = getattr(batch, "seq_lens_cpu", None)
+    reqs = getattr(batch, "reqs", None) or ()
+    n_req = len(reqs)
+    seq = getattr(batch, "seq_lens", None)
+    n_dev = int(seq.shape[0]) if seq is not None and hasattr(seq, "shape") else None
+    if cpu is not None:
+        device = getattr(cpu, "device", None)
+        if device is not None and getattr(device, "type", "cpu") != "cpu":
+            raise RuntimeError("seq_lens_cpu must stay on CPU")
+        n_cpu = int(cpu.shape[0]) if hasattr(cpu, "shape") else len(cpu)
+        if n_req and n_cpu != n_req:
+            raise RuntimeError(
+                f"seq_lens_cpu rows {n_cpu} != request count {n_req}"
+            )
+        if n_dev is not None and n_cpu != n_dev:
+            raise RuntimeError(
+                f"seq_lens_cpu rows {n_cpu} != seq_lens rows {n_dev}"
+            )
+        values = cpu.tolist() if hasattr(cpu, "tolist") else list(cpu)
+        return int(sum(int(x) for x in values))
+    if not n_req:
+        return 0
+    return int(sum(sr_decode_seq_len(req) for req in reqs))
+
+
 def draft_needed_max_new_tokens(
     already_generated: int,
     num_draft_tokens: Optional[int],

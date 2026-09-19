@@ -141,6 +141,126 @@ def _copy_token_slots(buf: torch.Tensor, src: torch.Tensor, tgt: torch.Tensor) -
     buf.index_copy_(0, tgt, staged)
 
 
+class UnsupportedTreeKVLayout(RuntimeError):
+    """KV pool layout is not one of the staged copy paths."""
+
+
+def _flat_copy_locs(src_loc, tgt_loc):
+    src_empty = src_loc is None or int(src_loc.numel()) == 0
+    tgt_empty = tgt_loc is None or int(tgt_loc.numel()) == 0
+    if src_empty and tgt_empty:
+        return None, None
+    if src_loc is None or tgt_loc is None or src_empty or tgt_empty:
+        raise RuntimeError("tree KV copy src/dst length mismatch")
+    src = src_loc.reshape(-1)
+    tgt = tgt_loc.reshape(-1)
+    if int(src.numel()) != int(tgt.numel()):
+        raise RuntimeError("tree KV copy src/dst length mismatch")
+    return src, tgt
+
+
+def _is_layer_list(buf) -> bool:
+    return isinstance(buf, (list, tuple)) and bool(buf) and all(
+        torch.is_tensor(item) for item in buf
+    )
+
+
+def _validate_token_axis_buffer(buf: torch.Tensor, *, mla5: bool) -> None:
+    if mla5:
+        if buf.dim() != 5:
+            raise UnsupportedTreeKVLayout(
+                f"NPU MLA KV buffer must be 5D, got {tuple(buf.shape)}"
+            )
+        buf.view(int(buf.shape[0]), -1, *buf.shape[3:])
+        return
+    if buf.dim() < 1:
+        raise UnsupportedTreeKVLayout("token-major KV buffer has no token axis")
+    if buf.dim() >= 5:
+        buf.view(int(buf.shape[0]), -1, *buf.shape[3:])
+
+
+def _validate_paged6(kv_buffer: torch.Tensor) -> None:
+    if kv_buffer.dim() != 6 or int(kv_buffer.shape[0]) != 2:
+        raise UnsupportedTreeKVLayout(
+            f"paged kv_buffer must be [2, layer, pages, page_size, head, dim], got {tuple(kv_buffer.shape)}"
+        )
+    kv_buffer.view(
+        int(kv_buffer.shape[0]),
+        int(kv_buffer.shape[1]),
+        -1,
+        int(kv_buffer.shape[4]),
+        int(kv_buffer.shape[5]),
+    )
+
+
+def _validate_matching_pair(k_buffer, v_buffer, index_k_buffer, *, mla5: bool) -> None:
+    if not torch.is_tensor(k_buffer) or not torch.is_tensor(v_buffer):
+        raise UnsupportedTreeKVLayout("K/V buffers must both be tensors")
+    _validate_token_axis_buffer(k_buffer, mla5=mla5)
+    _validate_token_axis_buffer(v_buffer, mla5=mla5)
+    if int(k_buffer.shape[0]) != int(v_buffer.shape[0]):
+        raise UnsupportedTreeKVLayout("K/V layer or token axes do not match")
+    if index_k_buffer is None:
+        return
+    if not torch.is_tensor(index_k_buffer):
+        raise UnsupportedTreeKVLayout("index_k_buffer must match stacked K layout")
+    _validate_token_axis_buffer(index_k_buffer, mla5=mla5)
+    if int(index_k_buffer.shape[0]) != int(k_buffer.shape[0]):
+        raise UnsupportedTreeKVLayout("index_k_buffer layer axis does not match K")
+
+
+def _validate_layer_lists(k_buffer, v_buffer, index_k_buffer) -> None:
+    if not _is_layer_list(k_buffer) or not _is_layer_list(v_buffer):
+        raise UnsupportedTreeKVLayout("per-layer K/V must both be non-empty tensor lists")
+    if len(k_buffer) != len(v_buffer):
+        raise UnsupportedTreeKVLayout("per-layer K/V list lengths do not match")
+    for buf in list(k_buffer) + list(v_buffer):
+        _validate_token_axis_buffer(buf, mla5=False)
+    if index_k_buffer is None:
+        return
+    if torch.is_tensor(index_k_buffer):
+        _validate_token_axis_buffer(index_k_buffer, mla5=False)
+        return
+    if not _is_layer_list(index_k_buffer) or len(index_k_buffer) != len(k_buffer):
+        raise UnsupportedTreeKVLayout("index_k_buffer list length does not match K")
+    for buf in index_k_buffer:
+        _validate_token_axis_buffer(buf, mla5=False)
+
+
+def copy_kv_pool_by_slot(kv_pool, src_loc, tgt_loc) -> None:
+    """Copy token slots using an explicit pool layout. Fail before any write."""
+    src, tgt = _flat_copy_locs(src_loc, tgt_loc)
+    if src is None:
+        return
+    kv_buffer = getattr(kv_pool, "kv_buffer", None)
+    k_buffer = getattr(kv_pool, "k_buffer", None)
+    v_buffer = getattr(kv_pool, "v_buffer", None)
+    index_k_buffer = getattr(kv_pool, "index_k_buffer", None)
+
+    if torch.is_tensor(kv_buffer) and kv_buffer.dim() == 6:
+        _validate_paged6(kv_buffer)
+        copy_paged_kv_buffer_by_slot(kv_buffer, src, tgt)
+        return
+    if _is_layer_list(k_buffer):
+        _validate_layer_lists(k_buffer, v_buffer, index_k_buffer)
+        copy_mha_kv_by_slot(k_buffer, v_buffer, src, tgt, index_k_buffer)
+        return
+    if torch.is_tensor(k_buffer) and k_buffer.dim() == 5:
+        _validate_matching_pair(k_buffer, v_buffer, index_k_buffer, mla5=True)
+        copy_mha_kv_by_slot(k_buffer, v_buffer, src, tgt, index_k_buffer)
+        return
+    if _is_layer_list(kv_buffer):
+        for buf in kv_buffer:
+            _validate_token_axis_buffer(buf, mla5=False)
+        copy_mha_kv_by_slot(kv_buffer, None, src, tgt)
+        return
+    if torch.is_tensor(k_buffer):
+        _validate_matching_pair(k_buffer, v_buffer, index_k_buffer, mla5=False)
+        copy_mha_kv_by_slot(k_buffer, v_buffer, src, tgt, index_k_buffer)
+        return
+    raise UnsupportedTreeKVLayout("unrecognized tree KV pool layout")
+
+
 def copy_mha_kv_by_slot(
     k_buffer: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
     v_buffer: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
