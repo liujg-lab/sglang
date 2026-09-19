@@ -363,6 +363,7 @@ class SRTailExtendTransaction:
         self.copy_done_event = None
         self._copy_stream = None
         self._copy_hold = None
+        self._copy_leases = []
 
     def allocate(self, batch: ScheduleBatch) -> None:
         if any(p.end > self.mapping.shape[1] for p in self.plans):
@@ -448,6 +449,7 @@ class SRTailExtendTransaction:
         self.copy_done_event = None
         self._copy_stream = None
         self._copy_hold = None
+        self._copy_leases = []
         self.copy_submitted = False
         kv_pool = getattr(
             getattr(self.scheduler, "tp_worker", None), "model_runner", None
@@ -485,8 +487,11 @@ class SRTailExtendTransaction:
                 return
             for p in copy_plans:
                 lease = getattr(p, "copy_lease", None)
-                if lease is not None:
-                    lease.pending_free_event = ev
+                if lease is None:
+                    continue
+                lease.pending_free_event = ev
+                if lease not in self._copy_leases:
+                    self._copy_leases.append(lease)
 
         t0 = time.perf_counter()
         store = getattr(self.scheduler, "sr_tree_leases", None)
@@ -566,6 +571,15 @@ class SRTailExtendTransaction:
             p.req.draft_generation_start_len = len(p.req.output_ids or [])
         self.committed = True
 
+    def _clear_installed_copy_markers(self) -> None:
+        done = self.copy_done_event
+        for lease in self._copy_leases:
+            ev = getattr(lease, "pending_free_event", None)
+            if ev is None:
+                continue
+            if isinstance(ev, _UnfinishedCopyEvent) or ev is done:
+                lease.pending_free_event = None
+
     def rollback(self) -> None:
         if self.committed:
             return
@@ -577,6 +591,7 @@ class SRTailExtendTransaction:
             for p, previous in zip(self.plans, self.mapping_snapshots):
                 self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].copy_(previous)
             self.allocator.restore_state(self.allocator_state)
+            self._clear_installed_copy_markers()
         for p, grammar in zip(self.plans, self.grammars):
             p.req.grammar = grammar
         self._copy_hold = None

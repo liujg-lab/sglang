@@ -1411,6 +1411,115 @@ class TestTailGraphBuckets(unittest.TestCase):
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [])
 
+    def _record_fail_copy_txn(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRTreeKVLease,
+            SRTreeLeaseStore,
+        )
+
+        scheduler, txn, _, req = self._copy_job_txn()
+        store = SRTreeLeaseStore()
+        lease = SRTreeKVLease(
+            rid=req.rid,
+            version=1,
+            revision=0,
+            base_committed_len=10,
+            prefix_tokens=(1,),
+            page_ids=[1],
+            page_slots=torch.arange(4),
+            candidate_slots=[0],
+            parent_list=[],
+            top_scores_index=[],
+            draft_tokens=[],
+        )
+        store.register(lease)
+        scheduler.sr_tree_leases = store
+        from dataclasses import replace as _replace
+
+        txn.plans = [_replace(txn.plans[0], copy_lease=lease)]
+        records = []
+
+        def fake_record(device, stream=None, *, required=False):
+            records.append(required)
+            if len(records) == 1:
+                return NS(device=NS(type="npu"))
+            raise RuntimeError("record failed")
+
+        class CopyStream:
+            def wait_event(self, ev):
+                return None
+
+        class Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        scheduler._sr_kv_copy_ctx = lambda s: Ctx()
+        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
+            tail, "_is_cpu_device", return_value=False
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
+            fake_record,
+        ), patch(
+            layout + ".copy_kv_pool_by_slot", lambda *a, **k: None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "record failed"):
+                txn.copy_reused_tree_kv()
+        return scheduler, txn, lease, store
+
+    def test_rollback_after_record_failure_frees_lease_pages_once(self):
+        scheduler, txn, lease, store = self._record_fail_copy_txn()
+        self.assertIsInstance(lease.pending_free_event, tail._UnfinishedCopyEvent)
+        self.assertTrue(txn.copy_submitted)
+        txn.rollback()
+        self.assertIsNone(lease.pending_free_event)
+        self.assertIsNone(txn._copy_hold)
+        scheduler.device_module.synchronize.assert_called()
+
+        class Alloc:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, slots):
+                self.freed.append(int(slots.numel()))
+
+        alloc = Alloc()
+        scheduler.token_to_kv_pool_allocator = alloc
+        release = load_functions(SCHEDULER, ["_sr_release_held_leases"], {})[
+            "_sr_release_held_leases"
+        ]
+        MethodType(release, scheduler)([lease])
+        self.assertEqual(alloc.freed, [4])
+        store.poll_pending_frees(alloc)
+        self.assertEqual(alloc.freed, [4])
+
+    def test_rollback_sync_failure_keeps_unfinished_lease_pages(self):
+        scheduler, txn, lease, store = self._record_fail_copy_txn()
+        hold = txn._copy_hold
+        scheduler.device_module.synchronize = Mock(
+            side_effect=RuntimeError("synchronize failed")
+        )
+        with self.assertRaisesRegex(RuntimeError, "synchronize failed"):
+            txn.rollback()
+        self.assertIsInstance(lease.pending_free_event, tail._UnfinishedCopyEvent)
+        self.assertIs(txn._copy_hold, hold)
+
+        class Alloc:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, slots):
+                self.freed.append(int(slots.numel()))
+
+        alloc = Alloc()
+        store.release(lease, allocator=alloc, event=lease.pending_free_event)
+        self.assertEqual(alloc.freed, [])
+        store.poll_pending_frees(alloc)
+        self.assertEqual(alloc.freed, [])
+
     def test_wait_copy_done_keeps_hold_when_wait_fails(self):
         scheduler, txn, _, _ = self._copy_job_txn()
         txn._copy_hold = [("src", "dst")]
