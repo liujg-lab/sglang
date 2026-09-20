@@ -248,14 +248,41 @@ NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定
 与 tail 的 FIA 开关是不同维度。该默认值不影响 Target、CUDA 和 tail EXTEND。
 eager 分页树能力不受草稿图捕获 batch 上限约束：`prepare_sr_tree_paged_eager`
 只绑定本轮新建的页表，图缓冲区归 `bind_sr_tree_paged_replay` 所有。
-`raw_bs` 超出草稿图已捕获 `capture_bs` 时走一次批量 eager，不再因图缓冲区
-行数不足抛裸 `RuntimeError` 并触发请求隔离。草稿图 `capture_bs` 默认跟随
-`--cuda-graph-bs`；仅当显式设置 `SGLANG_NPU_TREE_DRAFT_CAPTURE_BS` 时才按
-该环境变量求交集限制。分页树的容量类失败统一为可回退的
-`NpuGraphPreparationError`（`scope="graph"`）。草稿图的 `block_table` 与
-`active` 都按 `(rows, pages)` 分配独立连续缓冲，不再从一块
+eager 只量化 `block_tables` 的 query 宽度：`page_buckets` 由 `tree_kv_buckets`
+推出（`page_size=128` 时为 `2/4/8`），经 `quantize_page_width` 取最小可容桶，
+超出最大桶时退到 2 的幂；只放宽不收窄，多出的列填 `dummy_page`，
+`assemble_block_tables` 仍按真实 `n_shared` / `n_query` 限制读取范围。
+`shared` 与 `branch` 中间张量保持数据相关的原始页数，不再一起抬到桶宽：加宽它们
+每轮多出约 0.2-0.3ms 主机时间，而预热一旦枚举原始 shared 页数就已覆盖全部可达
+形状，收益为零。图键选择走 `select_page_bucket`，与 eager 表宽量化独立。`raw_bs` 超出草稿图已捕获 `capture_bs` 时走一次批量
+eager，不再因图缓冲区行数不足抛裸 `RuntimeError` 并触发请求隔离。草稿图
+`capture_bs` 默认跟随 `--cuda-graph-bs`；仅当显式设置
+`SGLANG_NPU_TREE_DRAFT_CAPTURE_BS` 时才按该环境变量求交集限制。分页树的容量
+类失败统一为可回退的 `NpuGraphPreparationError`（`scope="graph"`）。草稿图的
+`block_table` 与 `active` 都按 `(rows, pages)` 分配独立连续缓冲，不再从一块
 `(max_q, max_pages)` 共享张量切片；replay 缺键或缓冲不连续同样回退 eager。
 `SGLANG_NPU_TREE_DRAFT_CAPTURE_BS=1,2` 只作显式收窄/兜底，不是默认规避。
+启动期 `_sr_warm_tree_shapes` 对每个 `capture_bs` 枚举
+`shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与
+`rem ∈ {1, page_size - num_steps + 1, page_size - 1}`，
+`prefix = shared * page_size + rem`。枚举桶值是无效的：`n_query` 恒为
+`shared + 1` 或 `shared + 2`，只取桶值永远碰不到真实 prefix 产生的
+`(shared, width)` 组合。三个 `rem` 恰好张开全部可达的 `(nnp, n_query)` 组合：
+`1` → `nnp=1, n_query=shared+1`；`page_size - num_steps + 1` → `nnp=2` 但
+`n_query` 仍是 `shared+1`；`page_size - 1` → `nnp=2, n_query=shared+2`；
+`nnp=1` 配 `shared+2` 不可达。三者 `remainder != 0`。NPU 分页路径对每个去重后的
+形状调用生产函数 `prepare_sr_tree_paged_eager`（`ALLOC_ORDINARY` 与 `ALLOC_LEASE`
+各一次），`req_pool_indices` 用互异的 `arange(bs)`，`slots` 用非零值，从而覆盖
+view / prefix-tail copy / 五个 step bind。全部 combo 结束后调用
+`_sr_clear_paged_round_state`，避免脏 `_paged_round_*` 泄漏进第一轮请求。
+没有该生产函数时（CUDA / 无分页 backend）退回 builder 旁路
+`prepare_tree_paged_view` / `build_step_context_lens`。`page_size=128` 时约 63 组。
+`test_warmup_rem_ladder_covers_every_reachable_shape` 锁住形状覆盖不变量。预热完
+成的 combos 写入 `_seen_tree_paged_shapes`，因此稳态 `tree_shape_first_use` 应为 0。
+并对每个 `capture_bs` 走一次 `alloc_paged_token_slots_extend(..., backup_state=True)`
+后立刻 `restore_state`。默认开启；启动前设置 `SGLANG_NPU_SR_TREE_WARMUP=0` 可关闭。
+设备上下文错误与 `NpuGraphReplaySubmittedError` 仍直接抛出，其余预热失败只
+warn，不阻止启动。
 实机确认 bs=4 命中图：草稿启动日志含 `4_s2/4_s4/4_s8`；`[SR Draft round]
 counters` 中 `tree_eager_batches` 为 0；`tree_forward` host 回到约 11-13ms；
 无 `ACL stream synchronize failed, error code:507011`。rows=12 上若复现
@@ -711,7 +738,12 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `tail_forward_seed_commit` | tail EXTEND、末位置 seed 处理和成功后事务提交 |
 | `tree_make_batch` | `_expand_tree` 内构造 decode batch；不包含 KV 分配或 attention 元数据 |
 | `tree_alloc_kv` | 树 KV 租赁或普通 paged 分配，以及随后的 mapping 写入 |
-| `tree_prepare_meta` | `ForwardBatch.init_new` 与 paged 树元数据准备；原先只出现在 `prepare_host` 日志，现在进入 round 统计 |
+| `tree_prepare_meta` | `ForwardBatch.init_new` 与 paged 树元数据准备的总和，兼容旧日志 |
+| `tree_init_forward_batch` | 仅 `ForwardBatch.init_new`；与 `tree_paged_eager` 之和等于 `tree_prepare_meta` |
+| `tree_paged_eager` | 仅 `_prepare_paged_tree_round` / `prepare_sr_tree_paged_eager`，等于下面三段之和 |
+| `tree_paged_view` | `prepare_tree_paged_view` 建共享/分支页与 block table |
+| `tree_paged_copy` | prefix-tail `plan/materialize` 与 `copy_kv_pool_by_slot` |
+| `tree_paged_bind` | 给各 step backend 绑定 `SRTreePagedMetadata` |
 | `tree_forward` | 树前向或图 replay 的主机调用区间，通常主要是异步提交 |
 | `tree_result_wait_pack` | 等待树结果、**批量** D2H 到 host staging、再按行转列表；不是每个请求 3 次 `.to("cpu")` |
 | `tree_expand_pack` | 整个树展开及结果打包，包含 tree_make_batch、tree_alloc_kv、tree_prepare_meta、tree_forward、tree_result_wait_pack 和 finally 清理；残差现在应当很小 |
@@ -727,6 +759,7 @@ Draft total
 ├─ tail_forward_seed_commit
 ├─ tree_expand_pack
 │  ├─ tree_make_batch / tree_alloc_kv / tree_prepare_meta
+│  │    （tree_init_forward_batch + tree_paged_eager）
 │  ├─ tree_forward：主机提交；设备可继续异步执行
 │  ├─ tree_result_wait_pack：可能等待设备完成
 │  └─ finally 清理与其余准备
@@ -750,6 +783,8 @@ round 从调度处理开始，到发送调用完成结束。两者显示相同�
 | `tree_eager_<reason>` | eager 原因细分，例如 `tree_eager_bs_over_max_capture_bs`、`tree_eager_graph_unavailable`、`tree_eager_prep_failed`；CUDA runner 无拒绝原因时记 `graph_unavailable` |
 | `tree_graph_key_first_use` | 本窗口首次见到的树图键次数；进程内每个键只计一次 |
 | `tree_graph_first_<key>` | 对应图键的首次使用，例如 `tree_graph_first_4_s4`；CUDA 无 `_tree_replay_plan` 时不会计 |
+| `tree_shape_first_use` | 本窗口首次见到的形状元组 `(bs, shared, nnp, width)` 次数（`shared` / `nnp` 为原始页数，`width` 已量化）；进程内每个元组只计一次。预热生效后稳态应为 0 |
+| `tree_shape_<bs>_<shared>_<nnp>_<width>` | 对应形状元组的首次使用，例如 `tree_shape_1_2_1_4` |
 | `failed_rounds` | 整轮抛出异常的次数 |
 
 `tail_attention={'paged_atb': 32}` 表示 tail 前向使用 paged ATB 32 次，
@@ -817,6 +852,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | 日志或字段 | 如何解释 |
 | --- | --- |
 | `Draft scheduler ready (tree_configured=..., tree_graph_captured=..., tree_graph_disabled_reason=...)` | 分开报告配置树模式、是否捕获图和禁用原因；配置开启不代表图可用 |
+| `tree shape warmup done combos=... alloc_bs=... elapsed=...` | 启动期预热完成；`combos` 是量化后的 `(bs, shared_w, nnp_w, width)` 列表，`alloc_bs` 是分配器预热过的 batch。`elapsed` 若仍远小于 100ms，说明形状预热没有打到首次 tiling 代价。`tree shape warmup skipped` 表示 `SGLANG_NPU_SR_TREE_WARMUP=0`；`tree shape warmup failed` 只说明预热放弃，服务仍继续 |
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |

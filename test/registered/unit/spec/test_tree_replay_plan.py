@@ -448,6 +448,22 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("NpuGraphReplaySubmittedError", draft_inner)
         self.assertNotIn("_tree_replay_graphs_id", draft_inner)
 
+        eager_src = _class_method_source(
+            _ASCEND_BACKEND, "AscendAttnMultiStepDraftBackend", "prepare_sr_tree_paged_eager"
+        )
+        can_src = _class_method_source(
+            _ASCEND_BACKEND, "AscendAttnBackend", "tree_slot_graph_can_run"
+        )
+        self.assertIn("quantize_page_width", eager_src)
+        self.assertIn("max_pages=max_pages", eager_src)
+        self.assertIn("metrics=None", eager_src)
+        self.assertIn("tree_paged_view", eager_src)
+        self.assertIn("tree_paged_copy", eager_src)
+        self.assertIn("tree_paged_bind", eager_src)
+        self.assertIn("select_page_bucket", can_src)
+        self.assertNotIn("quantize_page_width", can_src)
+        self.assertIn("tree_slot_graph_can_run", draft_can)
+
     def test_npu_graph_runner_inits_capture_attrs_before_parent(self):
         init_src = _class_method_source(_NPU_GRAPH_RUNNER, "NPUGraphRunner", "__init__")
         self.assertIn("super().__init__", init_src)

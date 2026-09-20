@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -52,7 +53,17 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     ALLOC_ORDINARY,
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
+    SR_TREE_WARMUP_ENV,
     SRTreeExpandTxn,
+    build_step_context_lens,
+    context_lens_list,
+    kv_buckets_to_page_buckets,
+    materialize_prefix_tail_copy_slots,
+    plan_prefix_tail_copy_indices,
+    prepare_tree_paged_view,
+    read_sr_tree_warmup_env,
+    resolve_eager_page_buckets,
+    tree_paged_shape_key,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     is_device_context_error,
@@ -289,10 +300,12 @@ class SRTreeDrafter:
         self.tree_graph_disabled_reason = None
         if getattr(self.server_args, "disable_cuda_graph", False):
             self.tree_graph_disabled_reason = "disabled by configuration"
+            getattr(self, "_sr_warm_tree_shapes", lambda: None)()
             return
         if self.speculative_num_steps <= 1 or self.draft_attn_backend is None:
             self.tree_graph_disabled_reason = "no multi-step attention backend"
             getattr(self, "_init_tail_graphs", lambda: None)()
+            getattr(self, "_sr_warm_tree_shapes", lambda: None)()
             return
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         try:
@@ -341,6 +354,7 @@ class SRTreeDrafter:
         finally:
             self.draft_model_runner.draft_attn_backend = prev_draft_backend
         getattr(self, "_init_tail_graphs", lambda: None)()
+        getattr(self, "_sr_warm_tree_shapes", lambda: None)()
 
     def _init_tail_graphs(self) -> None:
         """Capture SR-only tail EXTEND graphs. Keep ordinary EXTEND attention."""
@@ -369,6 +383,266 @@ class SRTreeDrafter:
                 raise
             logger.warning("[SR] tail EXTEND graph init failed: %s", e)
             self.tail_graph_runner = None
+
+    def _sr_warmup_capture_bs(self) -> list[int]:
+        runner = self.cuda_graph_runner
+        capture_bs = [int(b) for b in (getattr(runner, "capture_bs", None) or [])]
+        if not capture_bs:
+            raw = getattr(self.server_args, "cuda_graph_bs", None) or [1]
+            capture_bs = [int(b) for b in raw]
+        return [b for b in capture_bs if b > 0]
+
+    def _sr_warmup_page_buckets(self) -> list[int]:
+        backend = self.draft_attn_backend
+        inners = getattr(backend, "attn_backends", None) if backend is not None else None
+        inner = inners[0] if inners else None
+        page_buckets = resolve_eager_page_buckets(
+            getattr(inner, "tree_kv_buckets", None),
+            self.page_size,
+            getattr(inner, "_paged_graph_max_pages", None),
+        )
+        if not page_buckets:
+            page_buckets = kv_buckets_to_page_buckets([256, 512, 1024], self.page_size)
+        return sorted({max(int(b), 1) for b in page_buckets})
+
+    def _sr_warm_layout_shapes_builders(self) -> list[tuple[int, int, int, int]]:
+        """CUDA / no-eager-backend fallback: prime builders without bind state."""
+        req_to_token = self.req_to_token_pool.req_to_token
+        device = req_to_token.device
+        dummy = int(self._paged_dummy_page)
+        page_buckets = self._sr_warmup_page_buckets()
+        kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        pool_cols = int(req_to_token.shape[1])
+        page = int(self.page_size)
+        max_shared = max(int(b) for b in page_buckets)
+        steps = max(int(self.speculative_num_steps), 1)
+        rem_choices = sorted({1, max(page - steps + 1, 1), max(page - 1, 1)})
+        combos = []
+        seen = set()
+        for bs in self._sr_warmup_capture_bs():
+            pool_rows = min(int(bs), int(req_to_token.shape[0]))
+            pool = torch.arange(pool_rows, dtype=torch.int64, device=device)
+            if pool_rows < int(bs):
+                continue
+            slots = torch.arange(
+                int(bs) * self.topk * self.speculative_num_steps,
+                dtype=torch.int64,
+                device=device,
+            ).reshape(int(bs), self.topk, self.speculative_num_steps)
+            for shared in range(max_shared + 1):
+                for rem in rem_choices:
+                    prefix = shared * page + rem
+                    prefixes = [prefix] * int(bs)
+                    key = tree_paged_shape_key(
+                        prefixes,
+                        page,
+                        self.topk,
+                        self.speculative_num_steps,
+                        page_buckets,
+                    )
+                    if key in seen or prefix >= pool_cols:
+                        continue
+                    seen.add(key)
+                    width = key[3]
+                    tables, _shared, branch, active, _n_sh, _n_q = (
+                        prepare_tree_paged_view(
+                            req_to_token,
+                            pool,
+                            slots,
+                            prefixes,
+                            page,
+                            self.topk,
+                            self.speculative_num_steps,
+                            dummy_page=dummy,
+                            max_pages=width,
+                        )
+                    )
+                    n_rows = int(tables.shape[0])
+                    n_fwd = max(int(self.speculative_num_steps) - 1, 0)
+                    for step in range(max(n_fwd, 1)):
+                        lens = build_step_context_lens(
+                            prefixes, self.topk, step, n_rows
+                        )
+                        context_lens_list(lens)
+                    tables.contiguous()
+                    active.contiguous()
+                    if rem:
+                        indices = plan_prefix_tail_copy_indices(
+                            prefixes, ALLOC_ORDINARY, self.topk, page
+                        )
+                        if len(indices) and kv_pool is not None:
+                            src, dst = materialize_prefix_tail_copy_slots(
+                                req_to_token,
+                                pool,
+                                branch,
+                                indices,
+                                page,
+                            )
+                            if int(src.numel()) > 0:
+                                copy_kv_pool_by_slot(kv_pool, src, dst)
+                    combos.append(key)
+        return combos
+
+    def _sr_warm_layout_shapes(self) -> list[tuple[int, int, int, int]]:
+        backend = self.draft_attn_backend
+        prepare = getattr(backend, "prepare_sr_tree_paged_eager", None)
+        if prepare is None:
+            return self._sr_warm_layout_shapes_builders()
+        req_to_token = self.req_to_token_pool.req_to_token
+        device = req_to_token.device
+        dummy = int(self._paged_dummy_page)
+        page_buckets = self._sr_warmup_page_buckets()
+        kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        pool_cols = int(req_to_token.shape[1])
+        pool_rows_max = int(req_to_token.shape[0])
+        page = int(self.page_size)
+        # Enumerate raw shared page counts, not bucket values: n_query is always
+        # shared+1 or shared+2, so bucket values alone never reach the
+        # (shared, width) pairs real prefixes produce.
+        max_shared = max(int(b) for b in page_buckets)
+        # rem=1 gives nnp=1 with n_query=shared+1; page-steps+1 is the smallest
+        # rem where nnp=2 while n_query is still shared+1; page-1 gives nnp=2
+        # with n_query=shared+2. nnp=1 with shared+2 is unreachable. All three
+        # keep remainder != 0 so the prefix-tail copy path is warmed too.
+        steps = max(int(self.speculative_num_steps), 1)
+        rem_choices = sorted({1, max(page - steps + 1, 1), max(page - 1, 1)})
+        combos = []
+        seen = set()
+        try:
+            for bs in self._sr_warmup_capture_bs():
+                raw_bs = int(bs)
+                if raw_bs > pool_rows_max:
+                    continue
+                pool = torch.arange(raw_bs, dtype=torch.int64, device=device)
+                slots = torch.arange(
+                    raw_bs * self.topk * self.speculative_num_steps,
+                    dtype=torch.int64,
+                    device=device,
+                ).reshape(raw_bs, self.topk, self.speculative_num_steps)
+                dummy_fb = SimpleNamespace(
+                    batch_size=raw_bs, req_pool_indices=pool
+                )
+                for shared in range(max_shared + 1):
+                    for rem in rem_choices:
+                        prefix = shared * page + rem
+                        prefixes = [prefix] * raw_bs
+                        key = tree_paged_shape_key(
+                            prefixes,
+                            page,
+                            self.topk,
+                            self.speculative_num_steps,
+                            page_buckets,
+                        )
+                        if key in seen or prefix >= pool_cols:
+                            continue
+                        seen.add(key)
+                        prepare(
+                            dummy_fb,
+                            slots,
+                            prefixes,
+                            ALLOC_ORDINARY,
+                            kv_pool,
+                            dummy_page=dummy,
+                        )
+                        prepare(
+                            dummy_fb,
+                            slots,
+                            prefixes,
+                            ALLOC_LEASE,
+                            kv_pool,
+                            dummy_page=dummy,
+                        )
+                        combos.append(key)
+        finally:
+            clear = getattr(backend, "_sr_clear_paged_round_state", None)
+            if clear is not None:
+                clear()
+        return combos
+
+    def _sr_warm_allocator_shapes(self) -> list[int]:
+        if self.page_size <= 1 or self.topk <= 1:
+            return []
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return []
+        device = self.device
+        req_to_token = self.req_to_token_pool.req_to_token
+        warmed = []
+        for bs in self._sr_warmup_capture_bs():
+            prefix = int(self.page_size)
+            req_pool = torch.zeros((int(bs),), dtype=torch.int64, device=device)
+            seq_lens = torch.full(
+                (int(bs),), prefix, dtype=torch.int64, device=device
+            )
+            seq_lens_cpu = torch.full((int(bs),), prefix, dtype=torch.int64)
+            (
+                prefix_lens,
+                seq_lens_out,
+                last_loc,
+                _num_new_pages,
+                _extend_lens,
+                _last_page_lens,
+            ) = get_last_loc_large_page_size_large_top_k(
+                req_to_token,
+                req_pool,
+                seq_lens,
+                self.speculative_num_steps,
+                self.topk,
+                self.page_size,
+            )
+            last_page_lens_cpu = seq_lens_cpu % self.page_size
+            num_new_pages = (
+                last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
+            ) // self.page_size
+            seq_lens_cpu_out = (
+                seq_lens_cpu // self.page_size * self.page_size
+                + num_new_pages * (self.page_size * self.topk)
+            )
+            extend_num_tokens = int(torch.sum(seq_lens_cpu_out - seq_lens_cpu).item())
+            _out, backup = alloc_paged_token_slots_extend(
+                tree_cache,
+                prefix_lens,
+                seq_lens_cpu,
+                seq_lens_out,
+                seq_lens_cpu_out,
+                last_loc,
+                extend_num_tokens,
+                backup_state=True,
+            )
+            if backup is not None:
+                self.token_to_kv_pool_allocator.restore_state(backup)
+            warmed.append(int(bs))
+        return warmed
+
+    def _sr_warm_tree_shapes(self) -> None:
+        """Prime eager table/context and allocator shapes before the first request."""
+        if not read_sr_tree_warmup_env():
+            logger.info("[SR] tree shape warmup skipped: %s=0", SR_TREE_WARMUP_ENV)
+            return
+        if not self.sr_tree_paged:
+            return
+        t0 = time.perf_counter()
+        try:
+            combos = self._sr_warm_layout_shapes()
+            alloc_bs = self._sr_warm_allocator_shapes()
+        except NpuGraphReplaySubmittedError:
+            raise
+        except Exception as e:
+            if is_device_context_error(e):
+                raise
+            logger.warning("[SR] tree shape warmup failed: %s", e)
+            return
+        seen = getattr(self, "_seen_tree_paged_shapes", None)
+        if seen is None:
+            seen = set()
+            self._seen_tree_paged_shapes = seen
+        seen.update(combos)
+        logger.info(
+            "[SR] tree shape warmup done combos=%s alloc_bs=%s elapsed=%.3fs",
+            combos,
+            alloc_bs,
+            time.perf_counter() - t0,
+        )
 
     def expand_batch(self, reqs: List["Req"]) -> List[SRTreeWindow]:
         """Fused tree expand for every req that has a pool slot and a seed."""
@@ -703,13 +977,20 @@ class SRTreeDrafter:
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
+            init_s = time.perf_counter() - t_prep
+            t_paged = time.perf_counter()
             if getattr(self, "sr_tree_paged", False):
                 txn.mark_copy_begin()
                 prepare = getattr(self, "_prepare_paged_tree_round", None)
                 if prepare is not None:
-                    prepare(forward_batch, batch, lease_state is not None)
+                    prepare(
+                        forward_batch, batch, lease_state is not None, metrics
+                    )
+            paged_s = time.perf_counter() - t_paged
             prep_s = time.perf_counter() - t_prep
             if metrics is not None:
+                metrics.add_host("tree_init_forward_batch", init_s)
+                metrics.add_host("tree_paged_eager", paged_s)
                 metrics.add_host("tree_prepare_meta", prep_s)
             can_fn = getattr(self, "_can_run_tree_graph", None)
             if can_fn is not None:
@@ -877,11 +1158,36 @@ class SRTreeDrafter:
         txn.rolled_back = True
         txn.allocation_owned = False
 
-    def _prepare_paged_tree_round(self, forward_batch, batch, leased: bool) -> None:
+    def _prepare_paged_tree_round(
+        self, forward_batch, batch, leased: bool, metrics=None
+    ) -> None:
         backend = self.draft_attn_backend
         if backend is None or not hasattr(backend, "prepare_sr_tree_paged_eager"):
             return
         prefix = seq_lens_cpu_for_host(batch)
+        if metrics is not None:
+            inners = getattr(backend, "attn_backends", None)
+            inner = inners[0] if inners else None
+            page_buckets = resolve_eager_page_buckets(
+                getattr(inner, "tree_kv_buckets", None),
+                self.page_size,
+                getattr(inner, "_paged_graph_max_pages", None),
+            )
+            key = tree_paged_shape_key(
+                prefix,
+                self.page_size,
+                self.topk,
+                self.speculative_num_steps,
+                page_buckets,
+            )
+            seen = getattr(self, "_seen_tree_paged_shapes", None)
+            if seen is None:
+                seen = set()
+                self._seen_tree_paged_shapes = seen
+            if key not in seen:
+                seen.add(key)
+                metrics.counts["tree_shape_first_use"] += 1
+                metrics.counts["tree_shape_{}_{}_{}_{}".format(*key)] += 1
         kind = ALLOC_LEASE if leased else ALLOC_ORDINARY
         compact = batch.out_cache_loc
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
@@ -892,6 +1198,7 @@ class SRTreeDrafter:
             kind,
             kv_pool,
             dummy_page=self._paged_dummy_page,
+            metrics=metrics,
         )
 
     def _alloc_tree_kv(self, batch: "ScheduleBatch"):

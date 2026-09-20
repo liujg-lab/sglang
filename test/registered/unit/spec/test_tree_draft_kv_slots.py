@@ -572,6 +572,38 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("build_paged_draft_cache_locs", src)
         self.assertNotIn("token_to_kv_pool.move_kv_cache", src)
 
+    def test_sr_tree_shape_warmup_guards(self):
+        warm_src = _function_source(_SR_TREE, "_sr_warm_tree_shapes")
+        self.assertIn("read_sr_tree_warmup_env", warm_src)
+        self.assertIn("SR_TREE_WARMUP_ENV", warm_src)
+        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", warm_src)
+        self.assertIn("is_device_context_error", warm_src)
+        self.assertIn("tree shape warmup failed", warm_src)
+        self.assertIn("tree shape warmup done", warm_src)
+        self.assertIn("_seen_tree_paged_shapes", warm_src)
+        self.assertNotIn("prepare_sr_tree_paged_eager", warm_src)
+        layout_src = _function_source(_SR_TREE, "_sr_warm_layout_shapes")
+        self.assertIn("prepare_sr_tree_paged_eager", layout_src)
+        self.assertIn("ALLOC_LEASE", layout_src)
+        self.assertIn("torch.arange", layout_src)
+        self.assertIn("_sr_clear_paged_round_state", layout_src)
+        self.assertIn("for shared in range(max_shared + 1)", layout_src)
+        self.assertIn("for rem in rem_choices", layout_src)
+        self.assertNotIn("prepare_tree_paged_view", layout_src)
+        builder_src = _function_source(_SR_TREE, "_sr_warm_layout_shapes_builders")
+        self.assertIn("prepare_tree_paged_view", builder_src)
+        alloc_src = _function_source(_SR_TREE, "_sr_warm_allocator_shapes")
+        self.assertIn("get_last_loc_large_page_size_large_top_k", alloc_src)
+        self.assertIn("alloc_paged_token_slots_extend", alloc_src)
+        self.assertIn("backup_state=True", alloc_src)
+        self.assertIn("restore_state", alloc_src)
+        init_src = _function_source(_SR_TREE, "_init_cuda_graphs")
+        self.assertIn("_sr_warm_tree_shapes", init_src)
+        self.assertGreater(
+            init_src.rfind("_sr_warm_tree_shapes"),
+            init_src.rfind("_init_tail_graphs"),
+        )
+
     def test_graph_row_capacity_uses_roles_not_mixed_max(self):
         cap_src = _function_source(_ASCEND_BACKEND, "_graph_row_capacity")
         self.assertIn("AttnGraphRole.TREE_DRAFT", cap_src)

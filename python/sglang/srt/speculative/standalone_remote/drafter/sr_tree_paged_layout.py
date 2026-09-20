@@ -17,6 +17,7 @@ import torch
 SeqLens = Union[torch.Tensor, Sequence[int]]
 
 SR_TREE_PAGED_ENV = "SGLANG_NPU_SR_TREE_PAGED"
+SR_TREE_WARMUP_ENV = "SGLANG_NPU_SR_TREE_WARMUP"
 ALLOC_ORDINARY = "ordinary"
 ALLOC_LEASE = "lease"
 IMPL_PAGED_ATB = "paged_atb"
@@ -44,6 +45,13 @@ def read_sr_tree_paged_env(env=None) -> bool:
     """Read once during initialization; default eligible Drafts to paged."""
     environ = os.environ if env is None else env
     raw = environ.get(SR_TREE_PAGED_ENV, "1")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_tree_warmup_env(env=None) -> bool:
+    """Read once during Draft init; default on. Set 0 to skip shape warmup."""
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TREE_WARMUP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 
@@ -345,6 +353,66 @@ def select_page_bucket(needed_pages: int, page_buckets: Sequence[int]) -> Option
     return fitted[0] if fitted else None
 
 
+def quantize_page_width(needed_pages, page_buckets=None) -> int:
+    """Eager table width snapped to graph buckets, then to powers of two.
+
+    Always returns a value ``>= needed_pages`` so tables are only widened.
+    Empty or undersized buckets fall back to the next power of two.
+    """
+    need = max(int(needed_pages), 1)
+    chosen = select_page_bucket(need, page_buckets or [])
+    if chosen is not None:
+        return int(chosen)
+    width = 1
+    while width < need:
+        width *= 2
+    return width
+
+
+def resolve_eager_page_buckets(kv_buckets, page_size: int, max_pages=None):
+    """Same bucket source as draft ``can_run``: kv buckets, else max pages."""
+    buckets = list(kv_buckets) if kv_buckets else None
+    if buckets:
+        return kv_buckets_to_page_buckets(buckets, page_size)
+    if max_pages is not None:
+        return [max(int(max_pages), 1)]
+    return None
+
+
+def tree_paged_shape_key(
+    prefix_lens_cpu: SeqLens,
+    page_size: int,
+    topk: int,
+    num_steps: int,
+    page_buckets=None,
+    max_pages: Optional[int] = None,
+):
+    """Shapes the eager builders allocate: raw shared/branch, quantized width.
+
+    Only the query width is bucketed, so shared and branch stay data driven.
+    Widening them cost host time every round and bought nothing once warmup
+    enumerates raw shared page counts.
+    """
+    del topk
+    prefixes = _as_int_list(prefix_lens_cpu)
+    n_shared = [shared_page_count(p, page_size) for p in prefixes]
+    n_query_total = max_query_pages_for_tree(prefixes, num_steps, page_size)
+    nnp_list = [
+        pages_per_branch(remainder(p, page_size), num_steps, page_size)
+        for p in prefixes
+    ]
+    if max_pages is not None:
+        width = int(max_pages)
+    else:
+        width = quantize_page_width(max(n_query_total, default=1), page_buckets)
+    return (
+        len(prefixes),
+        max(n_shared, default=0),
+        max(nnp_list, default=0),
+        width,
+    )
+
+
 def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
     """Copy independent per-step CPU lengths into captured update records."""
     if not attr_name:
@@ -429,7 +497,6 @@ def prepare_tree_paged_view(
         req_pool_indices,
         prefixes,
         page_size,
-        max_shared=max(n_shared, default=0),
         dummy_page=dummy_page,
     )
     branch = materialize_branch_pages(

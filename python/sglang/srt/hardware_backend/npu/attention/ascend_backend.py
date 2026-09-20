@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -46,7 +47,9 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     make_dummy_block_tables,
     max_query_pages_for_tree,
     prepare_tree_paged_view,
+    quantize_page_width,
     read_sr_tree_paged_env,
+    resolve_eager_page_buckets,
     select_page_bucket,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
@@ -4048,6 +4051,21 @@ class AscendAttnMultiStepDraftBackend:
     def paged_impl_selected(self) -> bool:
         return bool(self.attn_backends) and self.attn_backends[0]._paged_impl_selected()
 
+    def _sr_clear_paged_round_state(self) -> None:
+        """Drop warmup/round tables so the next request rebuilds them."""
+        self._paged_round_tables = None
+        self._paged_round_active = None
+        self._paged_round_prefix = None
+        self._paged_round_dummy = 0
+        self._paged_round_impl = None
+        for inner in self.attn_backends:
+            inner._sr_tree_paged_meta = None
+            metadata = getattr(inner, "forward_metadata", None)
+            if metadata is None:
+                continue
+            metadata.sr_tree_paged = None
+            metadata.block_tables = None
+
     def prepare_sr_tree_paged_eager(
         self,
         forward_batch: ForwardBatch,
@@ -4056,6 +4074,7 @@ class AscendAttnMultiStepDraftBackend:
         allocation_kind: str,
         kv_pool,
         dummy_page: int = 0,
+        metrics=None,
     ) -> bool:
         """Build page tables once and optionally submit prefix-tail copy."""
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
@@ -4074,6 +4093,19 @@ class AscendAttnMultiStepDraftBackend:
         raw_bs = int(forward_batch.batch_size)
         topk = int(self.topk)
         slots = compact_slots.reshape(raw_bs, topk, self.speculative_num_steps)
+        needed_pages = max(
+            max_query_pages_for_tree(
+                prefix_lens_cpu, self.speculative_num_steps, self.page_size
+            )
+            or [1]
+        )
+        page_buckets = resolve_eager_page_buckets(
+            getattr(inner0, "tree_kv_buckets", None),
+            self.page_size,
+            getattr(inner0, "_paged_graph_max_pages", None),
+        )
+        max_pages = quantize_page_width(needed_pages, page_buckets)
+        t_view = time.perf_counter()
         tables, _shared, branch, active, _n_sh, _n_q = prepare_tree_paged_view(
             inner0.req_to_token,
             forward_batch.req_pool_indices[:raw_bs],
@@ -4083,7 +4115,10 @@ class AscendAttnMultiStepDraftBackend:
             topk,
             self.speculative_num_steps,
             dummy_page=dummy_page,
+            max_pages=max_pages,
         )
+        if metrics is not None:
+            metrics.add_host("tree_paged_view", time.perf_counter() - t_view)
         # Graph buffers belong to bind_sr_tree_paged_replay; eager binds fresh tables.
         dummy = int(dummy_page)
         self._paged_round_tables = tables
@@ -4092,6 +4127,7 @@ class AscendAttnMultiStepDraftBackend:
         self._paged_round_dummy = dummy
         self._paged_round_impl = inner0.tree_attention_impl
         copied = False
+        t_copy = time.perf_counter()
         indices = plan_prefix_tail_copy_indices(
             prefix_lens_cpu, allocation_kind, topk, self.page_size
         )
@@ -4108,9 +4144,12 @@ class AscendAttnMultiStepDraftBackend:
                 self._paged_copy_count += 1
                 copy_kv_pool_by_slot(kv_pool, src, dst)
                 copied = True
+        if metrics is not None:
+            metrics.add_host("tree_paged_copy", time.perf_counter() - t_copy)
         impl = inner0.tree_attention_impl
         n_rows = int(tables.shape[0])
         n_fwd = max(int(self.speculative_num_steps) - 1, 0)
+        t_bind = time.perf_counter()
         for inner in self.attn_backends:
             step = int(inner.speculative_step_id)
             if n_fwd:
@@ -4130,6 +4169,8 @@ class AscendAttnMultiStepDraftBackend:
                 inner.forward_metadata = ForwardMetadata()
             inner.forward_metadata.sr_tree_paged = meta
             inner.forward_metadata.block_tables = tables
+        if metrics is not None:
+            metrics.add_host("tree_paged_bind", time.perf_counter() - t_bind)
         return copied
 
     def _paged_graph_table_view(

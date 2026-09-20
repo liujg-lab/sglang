@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import pathlib
 import sys
+import time
 import types
 import unittest
 from types import MethodType, SimpleNamespace
@@ -18,6 +19,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
     SR_TREE_PAGED_ENV,
+    SR_TREE_WARMUP_ENV,
     SRTreeExpandTxn,
     SRTreePagedMetadata,
     build_step_context_lens,
@@ -33,11 +35,15 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     pages_per_branch,
     plan_prefix_tail_copy_indices,
     prepare_tree_paged_view,
+    quantize_page_width,
     query_page_count,
     read_sr_tree_paged_env,
+    read_sr_tree_warmup_env,
     remainder,
+    resolve_eager_page_buckets,
     select_page_bucket,
     shared_page_count,
+    tree_paged_shape_key,
     validate_tree_draft_paged_records,
     visible_token_slots_from_pages,
 )
@@ -123,6 +129,11 @@ class TestSrTreePagedEnv(CustomTestCase):
     def test_truthy(self):
         for raw in ("1", "true", "YES", "on"):
             self.assertTrue(read_sr_tree_paged_env({SR_TREE_PAGED_ENV: raw}))
+
+    def test_warmup_env_default_on(self):
+        self.assertTrue(read_sr_tree_warmup_env({}))
+        self.assertFalse(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "0"}))
+        self.assertTrue(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "1"}))
 
 
 class TestPrefixTailCopyPlan(CustomTestCase):
@@ -412,6 +423,146 @@ class TestPagedGraphRecords(CustomTestCase):
         self.assertEqual(select_page_bucket(3, pages), 4)
         self.assertIsNone(select_page_bucket(8, pages))
 
+    def test_quantize_page_width_bucket_then_pow2(self):
+        pages = kv_buckets_to_page_buckets([256, 512, 1024], 128)
+        self.assertEqual(sorted(pages), [2, 4, 8])
+        self.assertEqual(quantize_page_width(1, pages), 2)
+        self.assertEqual(quantize_page_width(3, pages), 4)
+        self.assertEqual(quantize_page_width(8, pages), 8)
+        self.assertEqual(quantize_page_width(9, pages), 16)
+        self.assertEqual(quantize_page_width(0, None), 1)
+        self.assertEqual(quantize_page_width(-3, []), 1)
+        for need in (1, 2, 3, 5, 9, 17):
+            self.assertGreaterEqual(quantize_page_width(need, pages), need)
+            self.assertGreaterEqual(quantize_page_width(need, None), need)
+
+    def test_resolve_eager_page_buckets_matches_can_run(self):
+        self.assertEqual(
+            resolve_eager_page_buckets([256, 512, 1024], 128),
+            kv_buckets_to_page_buckets([256, 512, 1024], 128),
+        )
+        self.assertEqual(resolve_eager_page_buckets(None, 128, max_pages=8), [8])
+        self.assertIsNone(resolve_eager_page_buckets(None, 128))
+
+    def test_prepare_view_widens_to_max_pages_with_dummy_cols(self):
+        page, topk, steps = 128, 2, 5
+        prefixes = [124]
+        dummy = 99
+        req = _req_to_token([[40]], page)
+        pool = torch.tensor([0])
+        branch_ids = [[[40, 77], [55, 88]]]
+        slots = _draft_slots(prefixes, page, topk, steps, branch_ids)
+        lens_before = build_step_context_lens(prefixes, topk, 0, topk)
+        tables, _shared, _branch, _active, n_sh, n_q = prepare_tree_paged_view(
+            req,
+            pool,
+            slots,
+            prefixes,
+            page,
+            topk,
+            steps,
+            dummy_page=dummy,
+            max_pages=4,
+        )
+        self.assertEqual(n_sh, [0])
+        self.assertEqual(n_q, [1])
+        self.assertEqual(int(tables.shape[1]), 4)
+        self.assertTrue(torch.equal(tables[:, 0], torch.tensor([40, 55], dtype=torch.int32)))
+        self.assertTrue(torch.equal(tables[:, 1:], torch.full((2, 3), dummy, dtype=torch.int32)))
+        lens_after = build_step_context_lens(prefixes, topk, 0, topk)
+        self.assertTrue(torch.equal(lens_before, lens_after))
+
+    def test_tree_paged_shape_key_keeps_shared_and_branch_raw(self):
+        page, topk, steps = 128, 3, 5
+        buckets = kv_buckets_to_page_buckets([256, 512, 1024], page)
+        self.assertEqual(sorted(buckets), [2, 4, 8])
+        # Only the query width is bucketed: prefix 50 needs 1 page, snapped to 2.
+        self.assertEqual(
+            tree_paged_shape_key([200], page, topk, steps, buckets),
+            (1, 1, 1, 2),
+        )
+        self.assertEqual(
+            tree_paged_shape_key([50], page, topk, steps, buckets),
+            (1, 0, 1, 2),
+        )
+        self.assertEqual(
+            tree_paged_shape_key([50, 200], page, topk, steps, buckets),
+            (2, 1, 1, 2),
+        )
+        self.assertEqual(
+            tree_paged_shape_key([200], page, topk, steps, buckets)[2],
+            pages_per_branch(remainder(200, page), steps, page),
+        )
+        self.assertEqual(
+            tree_paged_shape_key([200], page, topk, steps, buckets, max_pages=8)[3], 8
+        )
+
+    def test_warmup_rem_ladder_covers_every_reachable_shape(self):
+        page, topk = 128, 3
+        buckets = kv_buckets_to_page_buckets([256, 512, 1024], page)
+        for steps in (2, 5, 8):
+            # Same ladder as _sr_warm_layout_shapes.
+            rems = sorted({1, max(page - steps + 1, 1), max(page - 1, 1)})
+            warm = {
+                tree_paged_shape_key([s * page + r] * bs, page, topk, steps, buckets)
+                for bs in (1, 2, 4)
+                for s in range(max(buckets) + 1)
+                for r in rems
+            }
+            for bs in (1, 2, 4):
+                for prefix in range(1, max(buckets) * page):
+                    key = tree_paged_shape_key(
+                        [prefix] * bs, page, topk, steps, buckets
+                    )
+                    self.assertIn(key, warm, f"steps={steps} bs={bs} prefix={prefix}")
+
+    def test_prepare_view_keeps_shared_width_data_dependent(self):
+        page, topk, steps = 128, 2, 5
+        prefixes = [200]
+        dummy = 99
+        req = _req_to_token([[11, 12]], page)
+        pool = torch.tensor([0])
+        branch_ids = [[[12, 30], [21, 31]]]
+        slots = _draft_slots(prefixes, page, topk, steps, branch_ids)
+        tables, shared, _branch, _act, n_sh, n_q = prepare_tree_paged_view(
+            req,
+            pool,
+            slots,
+            prefixes,
+            page,
+            topk,
+            steps,
+            dummy_page=dummy,
+            max_pages=4,
+        )
+        # shared/branch stay at the exact page counts; only the block table is
+        # widened to the quantized query width.
+        self.assertEqual(int(shared.shape[1]), shared_page_count(200, page))
+        self.assertEqual(n_sh, [1])
+        self.assertEqual(n_q, [1])
+        self.assertEqual(int(tables.shape[1]), 4)
+
+    def test_prepare_view_keeps_empty_shared_when_prefix_below_page(self):
+        page, topk, steps = 128, 2, 5
+        prefixes = [50]
+        dummy = 7
+        req = _req_to_token([[40]], page)
+        pool = torch.tensor([0])
+        branch_ids = [[[40, 77], [55, 88]]]
+        slots = _draft_slots(prefixes, page, topk, steps, branch_ids)
+        _tables, shared, _branch, _active, n_sh, _n_q = prepare_tree_paged_view(
+            req,
+            pool,
+            slots,
+            prefixes,
+            page,
+            topk,
+            steps,
+            dummy_page=dummy,
+        )
+        self.assertEqual(n_sh, [0])
+        self.assertEqual(tuple(shared.shape), (1, 0))
+
 
 class TestSourceGuards(CustomTestCase):
     def test_bind_validates_before_buffer_write(self):
@@ -466,6 +617,17 @@ class TestSourceGuards(CustomTestCase):
         prep_src = _fn_source(_BACKEND, "prepare_sr_tree_paged_eager")
         self.assertIn("_sr_tree_paged_prep_count += 1", prep_src)
         self.assertIn("plan_prefix_tail_copy_indices", prep_src)
+        self.assertIn("quantize_page_width", prep_src)
+        self.assertIn("resolve_eager_page_buckets", prep_src)
+        self.assertIn("max_pages=max_pages", prep_src)
+        self.assertIn("metrics=None", prep_src)
+        self.assertIn('metrics.add_host("tree_paged_view"', prep_src)
+        self.assertIn('metrics.add_host("tree_paged_copy"', prep_src)
+        self.assertIn('metrics.add_host("tree_paged_bind"', prep_src)
+        clear_src = _fn_source(_BACKEND, "_sr_clear_paged_round_state")
+        self.assertIn("_paged_round_tables = None", clear_src)
+        self.assertIn("_sr_tree_paged_meta = None", clear_src)
+        self.assertIn("metadata.sr_tree_paged = None", clear_src)
         self.assertNotIn("cuda_graph_paged_block_tables", prep_src)
         self.assertNotIn("cuda_graph_paged_active", prep_src)
         self.assertNotIn("exceed graph buffer", prep_src)
@@ -518,7 +680,36 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("tree_make_batch", src)
         self.assertIn("tree_alloc_kv", src)
         self.assertIn("tree_prepare_meta", src)
+        self.assertIn("tree_init_forward_batch", src)
+        self.assertIn("tree_paged_eager", src)
         self.assertIn("tree_graph_key_first_use", src)
+        prep_round_src = _fn_source(_DRAFTER, "_prepare_paged_tree_round")
+        self.assertIn("tree_paged_shape_key", prep_round_src)
+        self.assertIn("tree_shape_first_use", prep_round_src)
+        self.assertIn("metrics=metrics", prep_round_src)
+        warm_src = _fn_source(_DRAFTER, "_sr_warm_tree_shapes")
+        self.assertIn("read_sr_tree_warmup_env", warm_src)
+        self.assertIn("NpuGraphReplaySubmittedError", warm_src)
+        self.assertIn("is_device_context_error", warm_src)
+        self.assertIn("_sr_warm_layout_shapes", warm_src)
+        self.assertIn("_sr_warm_allocator_shapes", warm_src)
+        self.assertIn("_seen_tree_paged_shapes", warm_src)
+        self.assertNotIn("prepare_sr_tree_paged_eager", warm_src)
+        layout_src = _fn_source(_DRAFTER, "_sr_warm_layout_shapes")
+        self.assertIn("prepare_sr_tree_paged_eager", layout_src)
+        self.assertIn("ALLOC_LEASE", layout_src)
+        self.assertIn("ALLOC_ORDINARY", layout_src)
+        self.assertIn("torch.arange", layout_src)
+        self.assertIn("_sr_clear_paged_round_state", layout_src)
+        self.assertIn("for shared in range(max_shared + 1)", layout_src)
+        self.assertIn("for rem in rem_choices", layout_src)
+        self.assertIn("max(page - steps + 1, 1)", layout_src)
+        self.assertNotIn("prepare_tree_paged_view", layout_src)
+        builder_src = _fn_source(_DRAFTER, "_sr_warm_layout_shapes_builders")
+        self.assertIn("prepare_tree_paged_view", builder_src)
+        init_src = _fn_source(_DRAFTER, "_init_cuda_graphs")
+        self.assertIn("_sr_warm_tree_shapes", init_src)
+        self.assertGreater(init_src.rfind("_sr_warm_tree_shapes"), init_src.rfind("_init_tail_graphs"))
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
         self.assertIn("not getattr(runner, \"_tree_paged\", False)", can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
@@ -859,10 +1050,14 @@ class TestPagedEagerPrep(CustomTestCase):
             "AscendAttnMultiStepDraftBackend",
             ["prepare_sr_tree_paged_eager"],
             dict(
+                time=time,
                 torch=torch,
                 prepare_tree_paged_view=prepare_tree_paged_view,
                 build_step_context_lens=build_step_context_lens,
                 context_lens_list=context_lens_list,
+                max_query_pages_for_tree=max_query_pages_for_tree,
+                resolve_eager_page_buckets=resolve_eager_page_buckets,
+                quantize_page_width=quantize_page_width,
                 SRTreePagedMetadata=SRTreePagedMetadata,
                 ForwardMetadata=_ForwardMetadata,
             ),
@@ -886,6 +1081,8 @@ class TestPagedEagerPrep(CustomTestCase):
                 cuda_graph_paged_block_tables=dest,
                 cuda_graph_paged_active=dest_act,
                 req_to_token=req,
+                tree_kv_buckets=[],
+                _paged_graph_max_pages=None,
                 _sr_tree_paged_prep_count=0,
                 _sr_tree_paged_copy_count=0,
                 _sr_tree_paged_meta=None,
@@ -968,6 +1165,69 @@ class TestPagedEagerPrep(CustomTestCase):
         need = 2 * topk
         self.assertEqual(int(backend._paged_round_tables.shape[0]), need)
         self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables)
+
+    def test_eager_width_snaps_to_graph_bucket_dummy_extra_cols(self):
+        page, topk, steps = 128, 2, 3
+        dummy = 99
+        prefixes = [256]
+        req = _req_to_token([[1, 2]], page)
+        pool = torch.arange(1)
+        branch_ids = [[[2, 3], [4, 5]]]
+        slots = _draft_slots(prefixes, page, topk, steps, branch_ids)
+        compact = slots.reshape(-1)
+        dest = torch.full((2, 8), 777, dtype=torch.int32)
+        dest_act = torch.full((2,), 9, dtype=torch.int32)
+        inners = []
+        for step in (0, 1):
+            inner = SimpleNamespace(
+                speculative_step_id=step,
+                tree_attention_impl="paged_atb",
+                req_to_token=req,
+                tree_kv_buckets=[256, 512, 1024],
+                _paged_graph_max_pages=8,
+                _sr_tree_paged_prep_count=0,
+                _sr_tree_paged_copy_count=0,
+                _sr_tree_paged_meta=None,
+                forward_metadata=_ForwardMetadata(),
+            )
+            inner.bind_sr_tree_paged_metadata = MethodType(
+                lambda self, meta: setattr(self, "_sr_tree_paged_meta", meta),
+                inner,
+            )
+            inners.append(inner)
+        backend = SimpleNamespace(
+            topk=topk,
+            page_size=page,
+            speculative_num_steps=steps,
+            attn_backends=inners,
+            _paged_prep_count=0,
+            _paged_copy_count=0,
+            paged_impl_selected=lambda: True,
+        )
+        backend.prepare_sr_tree_paged_eager = MethodType(self._prep_fn, backend)
+        needed = max(max_query_pages_for_tree(prefixes, steps, page) or [1])
+        self.assertEqual(needed, 3)
+        lens_before = build_step_context_lens(prefixes, topk, 0, topk)
+        backend.prepare_sr_tree_paged_eager(
+            SimpleNamespace(batch_size=1, req_pool_indices=pool),
+            compact,
+            torch.tensor(prefixes, dtype=torch.int32),
+            ALLOC_ORDINARY,
+            kv_pool=None,
+            dummy_page=dummy,
+        )
+        tables = backend._paged_round_tables
+        self.assertEqual(int(tables.shape[1]), 4)
+        self.assertTrue(torch.equal(tables[:, 3], torch.full((2,), dummy, dtype=torch.int32)))
+        self.assertEqual(int(inners[0]._sr_tree_paged_meta.max_pages), 4)
+        self.assertTrue(
+            torch.equal(
+                inners[0]._sr_tree_paged_meta.context_lens_cpu,
+                lens_before,
+            )
+        )
+        self.assertTrue(torch.equal(dest, torch.full_like(dest, 777)))
+        self.assertTrue(torch.equal(dest_act, torch.full_like(dest_act, 9)))
 
 
 class TestPagedGraphTableBuffers(CustomTestCase):
