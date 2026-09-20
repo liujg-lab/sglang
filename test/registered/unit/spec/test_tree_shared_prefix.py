@@ -19,6 +19,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sglang.srt.speculative import tree_shared_prefix as shared
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     SR_TREE_PAGED_ENV,
+    SRTreePagedMetadata,
+    build_step_context_lens,
+    context_lens_list,
     read_sr_tree_paged_env,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
@@ -695,6 +698,7 @@ class TestTreeFailureHandling(unittest.TestCase):
         )
         self.drafter = NS(
             _tree_failure_counts={},
+            _tree_batch_isolate_count=0,
             draft_attn_backend=NS(attn_backends=[inner]),
             req_to_token_pool=NS(req_to_token=torch.zeros(1, 512, dtype=torch.int32)),
             _stack_seeds=Mock(return_value=(None,) * 4),
@@ -718,6 +722,7 @@ class TestTreeFailureHandling(unittest.TestCase):
         self.assertEqual(result, [([], None, None)] * 2)
         self.drafter._expand_tree.assert_called_once()
         self.drafter._expand_one.assert_not_called()
+        self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
 
     def test_multi_request_failure_still_isolates_requests(self):
         output = ([9], [0], [0])
@@ -726,12 +731,16 @@ class TestTreeFailureHandling(unittest.TestCase):
             self.drafter.expand_batch([self.req, self.req]), [output, output]
         )
         self.assertEqual(self.drafter._expand_one.call_count, 2)
+        self.assertEqual(self.drafter._tree_batch_isolate_count, 1)
+        self.assertEqual(self.logger.warning.call_args.args[5], 1)
 
     def test_expand_batch_copies_each_tree_tensor_once(self):
         parent = torch.tensor([[-1, 0], [-1, 1]], dtype=torch.int64)
         index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64)
         tokens = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int64)
         self.drafter._expand_tree = Mock(return_value=(parent, index, tokens))
+        expand_one = Mock(side_effect=AssertionError("isolate"))
+        self.drafter._expand_one = expand_one
         self.drafter.scheduler = NS(_sr_round_metrics=None)
         copies = {"n": 0}
         orig = torch.Tensor.copy_
@@ -745,6 +754,8 @@ class TestTreeFailureHandling(unittest.TestCase):
         self.assertEqual(windows[0][0], [10, 11, 12])
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(copies["n"], 3)
+        self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
+        self.drafter._expand_one.assert_not_called()
 
     def test_submitted_and_device_errors_propagate(self):
         for exc in (
@@ -761,6 +772,16 @@ class TestTreeFailureHandling(unittest.TestCase):
                 self.assertIs(caught.exception, exc)
                 self.drafter._expand_tree.assert_called_once()
         self.logger.warning.assert_not_called()
+        self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
+
+    def test_submitted_multi_request_does_not_isolate(self):
+        self.drafter._expand_tree.side_effect = self.submitted_error("submitted")
+        expand_one = Mock(side_effect=AssertionError("isolate"))
+        self.drafter._expand_one = expand_one
+        with self.assertRaises(self.submitted_error):
+            self.drafter.expand_batch([self.req, self.req])
+        expand_one.assert_not_called()
+        self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
 
     def test_failures_log_traceback_once_then_totals(self):
         for _ in range(32):
@@ -1241,6 +1262,281 @@ class TestGraphDispatch(unittest.TestCase):
             with self.assertRaises(PreparationError):
                 fn[method](runner, batch)
             self.assertEqual(graph.replay.call_count, 2)
+
+
+def _load_spec_utils_errors():
+    path = ROOT / "python/sglang/srt/speculative/spec_utils.py"
+    names = {"NpuGraphPreparationError", "NpuGraphReplaySubmittedError"}
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    nodes = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name in names
+    ]
+    ns = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
+    return ns["NpuGraphPreparationError"], ns["NpuGraphReplaySubmittedError"]
+
+
+class _ForwardMetadata:
+    def __init__(self):
+        self.sr_tree_paged = None
+        self.block_tables = None
+
+
+class TestPagedReplayRestore(unittest.TestCase):
+    def setUp(self):
+        self.PrepError, self.SubmittedError = _load_spec_utils_errors()
+        path = NPU / "graph_runner/eagle_draft_npu_graph_runner.py"
+        names = [
+            "_snapshot_forward_batch_fields",
+            "_restore_forward_batch_fields",
+            "_snapshot_paged_eager_metadata",
+            "_paged_eager_restore_valid",
+            "_restore_paged_eager_metadata",
+            "_clear_tree_replay_plan",
+            "_assert_tree_replay_graph",
+            "replay",
+        ]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        klass = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "EAGLEDraftNpuGraphRunner"
+        )
+        nodes = [
+            n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in names
+        ]
+        self.assertEqual({n.name for n in nodes}, set(names))
+
+        class SuperReplay:
+            def replay(self, forward_batch):
+                return self._super_replay(forward_batch)
+
+        ns = {
+            "SuperReplay": SuperReplay,
+            "NpuGraphPreparationError": self.PrepError,
+            "NpuGraphReplaySubmittedError": self.SubmittedError,
+            "ForwardBatch": object,
+        }
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        class_def = ast.ClassDef(
+            name="PagedReplayRunner",
+            bases=[ast.Name(id="SuperReplay", ctx=ast.Load())],
+            keywords=[],
+            body=nodes,
+            decorator_list=[],
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[future, class_def], type_ignores=[])
+                ),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        self.Runner = ns["PagedReplayRunner"]
+        bind_ns = dict(
+            torch=torch,
+            NpuGraphPreparationError=self.PrepError,
+            build_step_context_lens=build_step_context_lens,
+            context_lens_list=context_lens_list,
+            SRTreePagedMetadata=SRTreePagedMetadata,
+            ForwardMetadata=_ForwardMetadata,
+        )
+        fns = methods(
+            NPU / "attention/ascend_backend.py",
+            "AscendAttnMultiStepDraftBackend",
+            ["_validate_sr_tree_paged_replay", "bind_sr_tree_paged_replay"],
+            bind_ns,
+        )
+        self.bind_fn = fns["bind_sr_tree_paged_replay"]
+        self.validate_fn = fns["_validate_sr_tree_paged_replay"]
+
+    def _eager_meta(self, tables, active, dummy=0):
+        lens = torch.arange(int(tables.shape[0]), dtype=torch.int32) + 3
+        return SRTreePagedMetadata(
+            block_tables=tables,
+            active_rows=active,
+            context_lens_cpu=lens,
+            context_lens_list=context_lens_list(lens),
+            dummy_page=dummy,
+            max_pages=int(tables.shape[1]),
+            impl="paged_atb",
+        )
+
+    def _make(self, raw_bs=2, capture_bs=2, topk=2, max_pages=4, dummy=7, had_fm=True):
+        src = torch.arange(raw_bs * topk * max_pages, dtype=torch.int32).reshape(
+            raw_bs * topk, max_pages
+        )
+        src_act = torch.ones(raw_bs * topk, dtype=torch.int32)
+        dest = torch.full((capture_bs * topk, max_pages), 111, dtype=torch.int32)
+        dest_act = torch.full((capture_bs * topk,), 5, dtype=torch.int32)
+        eager = self._eager_meta(src, src_act, dummy=dummy)
+        inners = []
+        for step in range(2):
+            inner = NS(
+                speculative_step_id=step,
+                tree_attention_impl="paged_atb",
+                cuda_graph_paged_block_tables=dest,
+                cuda_graph_paged_active=dest_act,
+                _sr_tree_paged_meta=eager,
+                forward_metadata=_ForwardMetadata() if had_fm else None,
+            )
+            if had_fm:
+                inner.forward_metadata.sr_tree_paged = eager
+                inner.forward_metadata.block_tables = eager.block_tables
+            inner.bind_sr_tree_paged_metadata = MethodType(
+                lambda self, meta: setattr(self, "_sr_tree_paged_meta", meta),
+                inner,
+            )
+            inners.append(inner)
+        prefix = torch.zeros(raw_bs, dtype=torch.int32)
+        backend = NS(
+            topk=topk,
+            speculative_num_steps=3,
+            attn_backends=inners,
+            _tree_replay_raw_bs=raw_bs,
+            _paged_round_prefix=prefix,
+            _paged_round_tables=src,
+            _paged_round_active=src_act,
+            _paged_round_dummy=dummy,
+            _paged_round_impl="paged_atb",
+            paged_impl_selected=lambda: True,
+        )
+        backend.bind_sr_tree_paged_replay = MethodType(self.bind_fn, backend)
+        backend._validate_sr_tree_paged_replay = MethodType(self.validate_fn, backend)
+        batch = NS(
+            batch_size=raw_bs,
+            seq_lens=torch.tensor([1] * raw_bs),
+            req_pool_indices=torch.arange(raw_bs),
+            positions=torch.arange(raw_bs),
+            mrope_positions=None,
+            seq_lens_cpu=torch.tensor([8] * raw_bs),
+        )
+        graph = NS()
+        plan = NS(
+            graph_key="2_s4",
+            raw_bs=raw_bs,
+            capture_bs=capture_bs,
+            tokens_per_req=topk,
+            kv_bucket=max_pages,
+        )
+        runner = self.Runner()
+        runner._tree_paged = True
+        runner._tree_shared_prefix = False
+        runner._tree_replay_plan = plan
+        runner._tree_replay_graph = graph
+        runner._tree_replay_batch_id = id(batch)
+        runner._tree_replay_stream_idx = None
+        runner.graphs = {plan.graph_key: graph}
+        runner._tree_attention_impls = {plan.graph_key: "paged_atb"}
+        runner._current_tree_attention_impl = lambda: "paged_atb"
+        runner.model_runner = NS(draft_attn_backend=backend, attn_backend=None)
+        runner._super_replay = Mock(return_value="ok")
+        return runner, backend, batch, eager, inners, dest, dest_act, src
+
+    def _assert_eager_restored(self, inners, eager, had_fm=True):
+        for inner in inners:
+            self.assertIs(inner._sr_tree_paged_meta, eager)
+            self.assertEqual(
+                list(inner._sr_tree_paged_meta.context_lens_list),
+                list(eager.context_lens_list),
+            )
+            self.assertIs(inner._sr_tree_paged_meta.block_tables, eager.block_tables)
+            torch.testing.assert_close(
+                inner._sr_tree_paged_meta.block_tables, eager.block_tables
+            )
+            if had_fm:
+                self.assertIs(inner.forward_metadata.sr_tree_paged, eager)
+                self.assertIs(
+                    inner.forward_metadata.block_tables, eager.block_tables
+                )
+            else:
+                self.assertIsNone(inner.forward_metadata)
+
+    def test_prep_error_after_bind_restores_eager_meta(self):
+        runner, backend, batch, eager, inners, dest, _, src = self._make()
+        runner._super_replay.side_effect = self.PrepError("after bind", scope="graph")
+        with self.assertRaises(self.PrepError):
+            runner.replay(batch)
+        self._assert_eager_restored(inners, eager)
+        self.assertIsNone(runner._tree_replay_plan)
+        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, src)
+        self.assertIsNot(inners[0]._sr_tree_paged_meta.block_tables, dest)
+        torch.testing.assert_close(dest[: src.shape[0]], src)
+
+    def test_mid_bind_failure_restores_first_step(self):
+        runner, backend, batch, eager, inners, dest, _, src = self._make()
+        calls = {"n": 0}
+        orig = inners[0].bind_sr_tree_paged_metadata
+
+        def boom(meta):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise self.PrepError("second step", scope="graph")
+            return orig(meta)
+
+        for inner in inners:
+            inner.bind_sr_tree_paged_metadata = boom
+        with self.assertRaises(self.PrepError):
+            runner.replay(batch)
+        self.assertEqual(calls["n"], 2)
+        self._assert_eager_restored(inners, eager)
+        self.assertIsNone(runner._tree_replay_plan)
+
+    def test_raw_one_capture_two_restores_true_rows(self):
+        runner, backend, batch, eager, inners, dest, _, src = self._make(
+            raw_bs=1, capture_bs=2
+        )
+        self.assertEqual(batch.batch_size, 1)
+
+        def pad_then_fail(fb):
+            fb.batch_size = 2
+            fb.seq_lens = torch.tensor([1, 0])
+            raise self.PrepError("pad fail", scope="graph")
+
+        runner._super_replay.side_effect = pad_then_fail
+        with self.assertRaises(self.PrepError):
+            runner.replay(batch)
+        self.assertEqual(batch.batch_size, 1)
+        self.assertEqual(int(batch.seq_lens.numel()), 1)
+        self.assertEqual(int(eager.block_tables.shape[0]), 2)
+        self._assert_eager_restored(inners, eager)
+        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, src)
+        self.assertIsNone(runner._tree_replay_plan)
+
+    def test_invalid_eager_meta_does_not_reraise_prep_error(self):
+        runner, backend, batch, eager, inners, _, _, _ = self._make()
+        inners[0]._sr_tree_paged_meta = None
+        inners[1]._sr_tree_paged_meta = None
+        runner._super_replay.side_effect = self.PrepError("no eager", scope="graph")
+        with self.assertRaises(RuntimeError) as caught:
+            runner.replay(batch)
+        self.assertNotIsInstance(caught.exception, self.PrepError)
+        self.assertIsNone(runner._tree_replay_plan)
+
+    def test_submitted_does_not_restore_for_eager(self):
+        runner, backend, batch, eager, inners, dest, _, src = self._make()
+        restored = []
+        runner._restore_paged_eager_metadata = lambda snap: restored.append(snap)
+        runner._super_replay.side_effect = self.SubmittedError("submitted")
+        with self.assertRaises(self.SubmittedError):
+            runner.replay(batch)
+        self.assertEqual(restored, [])
+        self.assertIsNone(runner._tree_replay_plan)
+        self.assertIsNot(inners[0]._sr_tree_paged_meta, eager)
+
+    def test_none_forward_metadata_restored_to_none(self):
+        runner, backend, batch, eager, inners, _, _, _ = self._make(had_fm=False)
+        runner._super_replay.side_effect = self.PrepError("after bind", scope="graph")
+        with self.assertRaises(self.PrepError):
+            runner.replay(batch)
+        self._assert_eager_restored(inners, eager, had_fm=False)
 
 
 if __name__ == "__main__":

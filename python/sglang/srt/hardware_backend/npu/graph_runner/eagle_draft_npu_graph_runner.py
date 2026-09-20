@@ -256,6 +256,111 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         for name, value in snap.items():
             setattr(forward_batch, name, value)
 
+    def _snapshot_paged_eager_metadata(self, backend):
+        steps = []
+        for inner in getattr(backend, "attn_backends", None) or []:
+            fm = getattr(inner, "forward_metadata", None)
+            steps.append(
+                {
+                    "inner": inner,
+                    "meta": getattr(inner, "_sr_tree_paged_meta", None),
+                    "had_forward_metadata": fm is not None,
+                }
+            )
+        return steps
+
+    def _paged_eager_restore_valid(self, backend, snap, raw_bs) -> bool:
+        inners = list(getattr(backend, "attn_backends", None) or [])
+        if not snap or len(snap) != len(inners):
+            return False
+        if raw_bs is None:
+            return False
+        need = int(raw_bs) * int(getattr(backend, "topk", 1) or 1)
+        if need <= 0:
+            return False
+        round_tables = getattr(backend, "_paged_round_tables", None)
+        for item, inner in zip(snap, inners):
+            if item.get("inner") is not inner:
+                return False
+            meta = item.get("meta")
+            if meta is None:
+                return False
+            tables = getattr(meta, "block_tables", None)
+            active = getattr(meta, "active_rows", None)
+            if tables is None or active is None:
+                return False
+            if int(tables.shape[0]) != need or int(active.numel()) != need:
+                return False
+            if round_tables is None or tables is not round_tables:
+                return False
+        return True
+
+    def _restore_paged_eager_metadata(self, snap) -> None:
+        for item in snap:
+            inner = item["inner"]
+            saved_meta = item["meta"]
+            inner._sr_tree_paged_meta = saved_meta
+            if not item["had_forward_metadata"]:
+                inner.forward_metadata = None
+                continue
+            fm = inner.forward_metadata
+            if fm is None:
+                continue
+            fm.sr_tree_paged = saved_meta
+            fm.block_tables = (
+                None if saved_meta is None else saved_meta.block_tables
+            )
+
+    def replay(self, forward_batch: ForwardBatch):
+        snap = self._snapshot_forward_batch_fields(forward_batch)
+        backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
+            self.model_runner, "attn_backend", None
+        )
+        meta_snap = None
+        raw_bs = None
+        try:
+            plan = self._tree_replay_plan
+            if (
+                getattr(self, "_tree_paged", False)
+                and backend is not None
+                and hasattr(backend, "bind_sr_tree_paged_replay")
+            ):
+                raw_bs = None if plan is None else plan.raw_bs
+                meta_snap = self._snapshot_paged_eager_metadata(backend)
+            if plan is not None:
+                self._assert_tree_replay_graph(plan)
+                if backend is not None:
+                    backend._tree_replay_raw_bs = plan.raw_bs
+                    backend._tree_replay_capture_bs = plan.capture_bs
+                    backend._tree_replay_kv_bucket = plan.kv_bucket
+                    raw_bs = plan.raw_bs
+                    if getattr(self, "_tree_paged", False) and hasattr(
+                        backend, "bind_sr_tree_paged_replay"
+                    ):
+                        pages = int(plan.kv_bucket) if plan.kv_bucket is not None else 1
+                        backend.bind_sr_tree_paged_replay(plan.capture_bs, pages)
+                    if getattr(self, "_tree_shared_prefix", False):
+                        for inner in backend.attn_backends:
+                            inner._replay_tree_s_cap = plan.kv_bucket
+            return super().replay(forward_batch)
+        except NpuGraphPreparationError as exc:
+            self._restore_forward_batch_fields(forward_batch, snap)
+            if not getattr(self, "_tree_paged", False):
+                raise
+            if meta_snap is not None and self._paged_eager_restore_valid(
+                backend, meta_snap, raw_bs
+            ):
+                self._restore_paged_eager_metadata(meta_snap)
+                raise
+            raise RuntimeError(
+                "paged tree graph prep failed without restorable eager metadata"
+            ) from exc
+        except NpuGraphReplaySubmittedError:
+            self._restore_forward_batch_fields(forward_batch, snap)
+            raise
+        finally:
+            self._clear_tree_replay_plan()
+
     def can_run(self, forward_batch: ForwardBatch):
         self._clear_tree_replay_plan()
         if self.require_mlp_tp_gather:
@@ -331,37 +436,6 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             forward_batch,
         )
         return True
-
-    def replay(self, forward_batch: ForwardBatch):
-        snap = self._snapshot_forward_batch_fields(forward_batch)
-        plan = self._tree_replay_plan
-        if plan is not None:
-            self._assert_tree_replay_graph(plan)
-            backend = getattr(self.model_runner, "draft_attn_backend", None) or getattr(
-                self.model_runner, "attn_backend", None
-            )
-            if backend is not None:
-                backend._tree_replay_raw_bs = plan.raw_bs
-                backend._tree_replay_capture_bs = plan.capture_bs
-                backend._tree_replay_kv_bucket = plan.kv_bucket
-                if getattr(self, "_tree_paged", False) and hasattr(
-                    backend, "bind_sr_tree_paged_replay"
-                ):
-                    pages = int(plan.kv_bucket) if plan.kv_bucket is not None else 1
-                    backend.bind_sr_tree_paged_replay(plan.capture_bs, pages)
-                if getattr(self, "_tree_shared_prefix", False):
-                    for inner in backend.attn_backends:
-                        inner._replay_tree_s_cap = plan.kv_bucket
-        try:
-            return super().replay(forward_batch)
-        except NpuGraphPreparationError:
-            self._restore_forward_batch_fields(forward_batch, snap)
-            raise
-        except NpuGraphReplaySubmittedError:
-            self._restore_forward_batch_fields(forward_batch, snap)
-            raise
-        finally:
-            self._clear_tree_replay_plan()
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -660,9 +734,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 or self.tree_graph_replay_count % 32 == 0
             ):
                 logger.info(
-                    "NPU tree draft graph replay count=%s key=%s implementation=%s eager_fallback=%s",
+                    "NPU tree draft graph replay count=%s key=%s "
+                    "raw_bs=%s capture_bs=%s implementation=%s eager_fallback=%s",
                     self.tree_graph_replay_count,
                     graph_key,
+                    getattr(self, "raw_bs", None),
+                    getattr(self, "bs", None),
                     self._current_tree_attention_impl(),
                     self.tree_eager_fallback_count,
                 )
@@ -784,10 +861,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
             logger.info(
                 "NPU tree draft graph replay count=%s key=%s bucket=%s "
-                "implementation=%s eager_fallback=%s",
+                "raw_bs=%s capture_bs=%s implementation=%s eager_fallback=%s",
                 self.tree_graph_replay_count,
                 graph_key,
                 plan.kv_bucket,
+                plan.raw_bs,
+                plan.capture_bs,
                 self._current_tree_attention_impl(),
                 self.tree_eager_fallback_count,
             )

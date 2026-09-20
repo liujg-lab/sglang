@@ -7,7 +7,7 @@ import pathlib
 import sys
 import types
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -19,7 +19,9 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     IMPL_PAGED_FIA,
     SR_TREE_PAGED_ENV,
     SRTreeExpandTxn,
+    SRTreePagedMetadata,
     build_step_context_lens,
+    context_lens_list,
     fill_active_rows,
     fill_paged_cpu_update_payload,
     kv_buckets_to_page_buckets,
@@ -412,6 +414,36 @@ class TestPagedGraphRecords(CustomTestCase):
 
 
 class TestSourceGuards(CustomTestCase):
+    def test_bind_validates_before_buffer_write(self):
+        bind_src = _fn_source(_BACKEND, "bind_sr_tree_paged_replay")
+        validate_src = _fn_source(_BACKEND, "_validate_sr_tree_paged_replay")
+        self.assertNotIn("or []", bind_src)
+        self.assertNotIn("or []", validate_src)
+        self.assertNotIn("rows = min", bind_src)
+        self.assertNotIn("cols = min", bind_src)
+        self.assertLess(
+            bind_src.find("_validate_sr_tree_paged_replay"),
+            bind_src.find("fill_"),
+        )
+        self.assertLess(
+            bind_src.find("_validate_sr_tree_paged_replay"),
+            bind_src.find("copy_"),
+        )
+        for banned in (".cpu()", ".item()", ".tolist()"):
+            self.assertNotIn(banned, validate_src)
+        replay_src = _fn_source(_RUNNER, "replay")
+        self.assertLess(
+            replay_src.find("try:"), replay_src.find("bind_sr_tree_paged_replay")
+        )
+        self.assertIn("_snapshot_paged_eager_metadata", replay_src)
+        self.assertIn("_restore_paged_eager_metadata", replay_src)
+        self.assertIn("_paged_eager_restore_valid", replay_src)
+        batch_src = _fn_source(_DRAFTER, "expand_batch")
+        self.assertLess(
+            batch_src.find("_tree_batch_isolate_count"),
+            batch_src.find("_log_tree_failure"),
+        )
+
     def test_backend_paged_path_reads_cache_only(self):
         run_src = _fn_source(_BACKEND, "_run_sr_tree_paged_attention")
         self.assertNotIn("gather_kv_into", run_src)
@@ -496,6 +528,288 @@ class TestAssembleSharedAndBranch(CustomTestCase):
         self.assertEqual(int(shared[0, 0]), 4)
         self.assertEqual(shared_page_count(129, page), 1)
         self.assertEqual(shared_page_count(127, page), 0)
+
+
+def _extract_class_methods(path: pathlib.Path, cls: str, names, ns):
+    tree = ast.parse(path.read_text())
+    klass = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+    nodes = [
+        n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    if len(nodes) != len(names):
+        missing = set(names) - {n.name for n in nodes}
+        raise AssertionError(f"missing {missing} in {cls}")
+    ns = dict(ns)
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *nodes], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    return {name: ns[name] for name in names}
+
+
+def _load_npu_graph_prep_error():
+    path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
+    tree = ast.parse(path.read_text())
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "NpuGraphPreparationError"
+    )
+    ns = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    return ns["NpuGraphPreparationError"]
+
+
+class _ForwardMetadata:
+    def __init__(self):
+        self.sr_tree_paged = None
+        self.block_tables = None
+
+
+class TestPagedReplayBind(CustomTestCase):
+    def setUp(self):
+        self.PrepError = _load_npu_graph_prep_error()
+        fn = _extract_class_methods(
+            _BACKEND,
+            "AscendAttnMultiStepDraftBackend",
+            ["_validate_sr_tree_paged_replay", "bind_sr_tree_paged_replay"],
+            dict(
+                torch=torch,
+                NpuGraphPreparationError=self.PrepError,
+                build_step_context_lens=build_step_context_lens,
+                context_lens_list=context_lens_list,
+                SRTreePagedMetadata=SRTreePagedMetadata,
+                ForwardMetadata=_ForwardMetadata,
+            ),
+        )
+        self._bind_fn = fn["bind_sr_tree_paged_replay"]
+        self._validate_fn = fn["_validate_sr_tree_paged_replay"]
+
+    def _inner(self, step, dest, dest_act, eager_meta=None, had_fm=True):
+        inner = SimpleNamespace(
+            speculative_step_id=step,
+            tree_attention_impl="paged_atb",
+            cuda_graph_paged_block_tables=dest,
+            cuda_graph_paged_active=dest_act,
+            _sr_tree_paged_meta=eager_meta,
+            forward_metadata=_ForwardMetadata() if had_fm else None,
+        )
+        if had_fm:
+            inner.forward_metadata.sr_tree_paged = eager_meta
+            inner.forward_metadata.block_tables = (
+                None if eager_meta is None else eager_meta.block_tables
+            )
+        inner.bind_sr_tree_paged_metadata = MethodType(
+            lambda self, meta: setattr(self, "_sr_tree_paged_meta", meta),
+            inner,
+        )
+        return inner
+
+    def _eager_meta(self, tables, active, dummy=0, impl="paged_atb"):
+        lens = torch.ones(int(tables.shape[0]), dtype=torch.int32)
+        return SRTreePagedMetadata(
+            block_tables=tables,
+            active_rows=active,
+            context_lens_cpu=lens,
+            context_lens_list=context_lens_list(lens),
+            dummy_page=dummy,
+            max_pages=int(tables.shape[1]),
+            impl=impl,
+        )
+
+    def _backend(self, raw_bs, capture_bs, topk, max_pages, prefix, src, src_act, dummy=0):
+        dest = torch.full(
+            (capture_bs * topk, max_pages), 777, dtype=torch.int32
+        )
+        dest_act = torch.full((capture_bs * topk,), 9, dtype=torch.int32)
+        eager = self._eager_meta(src, src_act, dummy=dummy)
+        inners = [
+            self._inner(0, dest, dest_act, eager_meta=eager),
+            self._inner(1, dest, dest_act, eager_meta=eager),
+        ]
+        backend = SimpleNamespace(
+            topk=topk,
+            speculative_num_steps=3,
+            attn_backends=inners,
+            _tree_replay_raw_bs=raw_bs,
+            _tree_replay_capture_bs=capture_bs,
+            _paged_round_prefix=prefix,
+            _paged_round_tables=src,
+            _paged_round_active=src_act,
+            _paged_round_dummy=dummy,
+            _paged_round_impl="paged_atb",
+            paged_impl_selected=lambda: True,
+        )
+        backend.bind_sr_tree_paged_replay = MethodType(self._bind_fn, backend)
+        backend._validate_sr_tree_paged_replay = MethodType(
+            self._validate_fn, backend
+        )
+        return backend, dest, dest_act, eager, inners
+
+    def test_int_prefix_dual_request_binds_step_lengths(self):
+        topk, capture_bs, max_pages = 2, 2, 4
+        src = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+        src_act = torch.tensor([1, 1, 1, 1], dtype=torch.int32)
+        for dtype in (torch.int32, torch.int64):
+            prefix = torch.tensor([10, 20], dtype=dtype)
+            backend, dest, dest_act, _, inners = self._backend(
+                2, capture_bs, topk, max_pages, prefix, src, src_act, dummy=99
+            )
+            backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+            torch.testing.assert_close(dest[:4, :4], src.to(torch.int32))
+            torch.testing.assert_close(dest_act[:4], src_act)
+            self.assertEqual(
+                list(inners[0]._sr_tree_paged_meta.context_lens_list),
+                [11, 11, 21, 21],
+            )
+            self.assertEqual(
+                list(inners[1]._sr_tree_paged_meta.context_lens_list),
+                [12, 12, 22, 22],
+            )
+            self.assertEqual(
+                inners[0]._sr_tree_paged_meta.block_tables.data_ptr(), dest.data_ptr()
+            )
+            self.assertIs(
+                inners[0].forward_metadata.sr_tree_paged,
+                inners[0]._sr_tree_paged_meta,
+            )
+
+    def test_zero_prefix_is_valid_not_missing(self):
+        topk, capture_bs, max_pages = 2, 2, 3
+        src = torch.ones((4, 2), dtype=torch.int32)
+        src_act = torch.ones(4, dtype=torch.int32)
+        prefix = torch.tensor([0, 0], dtype=torch.int32)
+        backend, _, _, _, inners = self._backend(
+            2, capture_bs, topk, max_pages, prefix, src, src_act
+        )
+        backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+        self.assertEqual(
+            list(inners[0]._sr_tree_paged_meta.context_lens_list),
+            [1, 1, 1, 1],
+        )
+
+    def test_prefix_shape_error_does_not_write_buffers(self):
+        topk, capture_bs, max_pages = 2, 2, 4
+        src = torch.ones((4, 2), dtype=torch.int32)
+        src_act = torch.ones(4, dtype=torch.int32)
+        prefix = torch.tensor([10], dtype=torch.int32)
+        backend, dest, dest_act, eager, inners = self._backend(
+            2, capture_bs, topk, max_pages, prefix, src, src_act
+        )
+        with self.assertRaises(self.PrepError):
+            backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+        self.assertTrue(torch.equal(dest, torch.full_like(dest, 777)))
+        self.assertTrue(torch.equal(dest_act, torch.full_like(dest_act, 9)))
+        self.assertIs(inners[0]._sr_tree_paged_meta, eager)
+        self.assertIs(inners[1]._sr_tree_paged_meta, eager)
+        backend._paged_round_prefix = None
+        with self.assertRaises(self.PrepError):
+            backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+        self.assertTrue(torch.equal(dest, torch.full_like(dest, 777)))
+
+    def test_capacity_fail_before_any_graph_write(self):
+        topk, capture_bs, max_pages = 2, 2, 4
+        src = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+        src_act = torch.ones(4, dtype=torch.int32)
+        prefix = torch.tensor([3, 5], dtype=torch.int32)
+        backend, dest, dest_act, eager, inners = self._backend(
+            2, capture_bs, topk, max_pages, prefix, src, src_act
+        )
+        dest.resize_(3, 4)
+        writes = []
+        orig_fill = torch.Tensor.fill_
+        orig_copy = torch.Tensor.copy_
+
+        def watch_fill(tensor, value):
+            if tensor.data_ptr() in {dest.data_ptr(), dest_act.data_ptr()}:
+                writes.append("fill")
+            return orig_fill(tensor, value)
+
+        def watch_copy(tensor, src_t, *args, **kwargs):
+            if tensor.data_ptr() in {dest.data_ptr(), dest_act.data_ptr()}:
+                writes.append("copy")
+            return orig_copy(tensor, src_t, *args, **kwargs)
+
+        with mock.patch.object(torch.Tensor, "fill_", watch_fill), mock.patch.object(
+            torch.Tensor, "copy_", watch_copy
+        ):
+            with self.assertRaises(self.PrepError):
+                backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+        self.assertEqual(writes, [])
+        self.assertIs(inners[0]._sr_tree_paged_meta, eager)
+
+    def test_missing_capture_buffers_do_not_allocate_substitutes(self):
+        topk, capture_bs, max_pages = 2, 2, 4
+        src = torch.ones((4, 2), dtype=torch.int32)
+        src_act = torch.ones(4, dtype=torch.int32)
+        prefix = torch.tensor([4, 6], dtype=torch.int32)
+        backend, dest, dest_act, _, inners = self._backend(
+            2, capture_bs, topk, max_pages, prefix, src, src_act
+        )
+        inners[0].cuda_graph_paged_block_tables = None
+        inners[0].cuda_graph_paged_active = None
+        with self.assertRaises(self.PrepError):
+            backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+        self.assertIsNone(inners[0].cuda_graph_paged_block_tables)
+        self.assertIsNone(inners[0].cuda_graph_paged_active)
+
+    def test_raw_bs_shrink_grow_leaves_no_padding_residue(self):
+        topk, capture_bs, max_pages, dummy = 2, 2, 4, 99
+        dest_holder = {}
+
+        def run(raw_bs, prefix, src, src_act):
+            backend, dest, dest_act, _, inners = self._backend(
+                raw_bs, capture_bs, topk, max_pages, prefix, src, src_act, dummy=dummy
+            )
+            if "dest" not in dest_holder:
+                dest_holder["dest"] = dest
+                dest_holder["dest_act"] = dest_act
+            else:
+                inners[0].cuda_graph_paged_block_tables = dest_holder["dest"]
+                inners[0].cuda_graph_paged_active = dest_holder["dest_act"]
+                inners[1].cuda_graph_paged_block_tables = dest_holder["dest"]
+                inners[1].cuda_graph_paged_active = dest_holder["dest_act"]
+            backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
+            return dest_holder["dest"], dest_holder["dest_act"], inners
+
+        src2 = torch.arange(16, dtype=torch.int32).reshape(4, 4) + 10
+        act2 = torch.tensor([1, 0, 1, 0], dtype=torch.int32)
+        dest, dest_act, inners = run(
+            2, torch.tensor([8, 16], dtype=torch.int32), src2, act2
+        )
+        ptr = dest.data_ptr()
+        src1 = torch.arange(8, dtype=torch.int32).reshape(2, 4) + 50
+        act1 = torch.tensor([1, 1], dtype=torch.int32)
+        dest, dest_act, inners = run(
+            1, torch.tensor([8], dtype=torch.int32), src1, act1
+        )
+        self.assertEqual(dest.data_ptr(), ptr)
+        torch.testing.assert_close(dest[:2], src1)
+        self.assertTrue(torch.equal(dest[2:], torch.full((2, 4), dummy, dtype=torch.int32)))
+        self.assertTrue(torch.equal(dest_act[2:], torch.zeros(2, dtype=torch.int32)))
+        self.assertEqual(
+            list(inners[0]._sr_tree_paged_meta.context_lens_list),
+            [9, 9, 1, 1],
+        )
+        dest, dest_act, inners = run(
+            2, torch.tensor([8, 16], dtype=torch.int32), src2, act2
+        )
+        self.assertEqual(dest.data_ptr(), ptr)
+        torch.testing.assert_close(dest[:4], src2)
+        torch.testing.assert_close(dest_act[:4], act2)
+        self.assertEqual(
+            list(inners[0]._sr_tree_paged_meta.context_lens_list),
+            [9, 9, 17, 17],
+        )
 
 
 if __name__ == "__main__":

@@ -157,6 +157,7 @@ class SRTreeDrafter:
         self.draft_attn_backend = None
         self.cuda_graph_runner = None
         self._tree_failure_counts = {}
+        self._tree_batch_isolate_count = 0
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
         # Two host stagings so a later replay cannot overwrite a D2H that has
@@ -240,11 +241,12 @@ class SRTreeDrafter:
         dtypes["req_to_token"] = str(self.req_to_token_pool.req_to_token.dtype)
         logger.warning(
             "[SR] tree failure stage=%s implementation=%s metadata_dtypes=%s "
-            "occurrences=%s error=%s",
+            "occurrences=%s isolate_batches=%s error=%s",
             stage,
             getattr(backend, "tree_attention_impl", type(backend).__name__),
             dtypes,
             count,
+            getattr(self, "_tree_batch_isolate_count", 0),
             summary,
             exc_info=(type(exc), exc, exc.__traceback__) if count == 1 else None,
         )
@@ -379,6 +381,10 @@ class SRTreeDrafter:
         except Exception as e:
             if is_device_context_error(e):
                 raise
+            if len(keep) > 1:
+                self._tree_batch_isolate_count = (
+                    getattr(self, "_tree_batch_isolate_count", 0) + 1
+                )
             self._log_tree_failure("expand_batch", e)
             # Retrying the very same single-request batch cannot isolate a bad
             # request. Preserve the empty-window fallback without a second run.

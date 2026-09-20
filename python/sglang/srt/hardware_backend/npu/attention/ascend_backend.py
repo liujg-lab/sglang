@@ -4026,23 +4026,106 @@ class AscendAttnMultiStepDraftBackend:
             inner.forward_metadata.sr_tree_paged = meta
             inner.forward_metadata.block_tables = tables
 
+    def _validate_sr_tree_paged_replay(self, capture_bs: int, max_pages: int):
+        """Host-only checks. Must run before any graph buffer write."""
+        raw_bs = int(getattr(self, "_tree_replay_raw_bs", 0) or 0)
+        capture_bs = int(capture_bs)
+        max_pages = int(max_pages)
+        topk = int(self.topk)
+        prefix = getattr(self, "_paged_round_prefix", None)
+        if prefix is None:
+            raise NpuGraphPreparationError(
+                "missing paged tree prefix lengths", scope="graph"
+            )
+        if not torch.is_tensor(prefix):
+            raise NpuGraphPreparationError(
+                "paged tree prefix must be a CPU tensor", scope="graph"
+            )
+        if (
+            prefix.device.type != "cpu"
+            or int(prefix.ndim) != 1
+            or prefix.dtype not in (torch.int32, torch.int64)
+        ):
+            raise NpuGraphPreparationError(
+                "paged tree prefix must be rank-1 CPU int32/int64",
+                scope="graph",
+            )
+        if not (0 < raw_bs <= capture_bs) or int(prefix.numel()) != raw_bs:
+            raise NpuGraphPreparationError(
+                f"paged tree prefix numel {int(prefix.numel())} "
+                f"raw_bs {raw_bs} capture_bs {capture_bs}",
+                scope="graph",
+            )
+        src = getattr(self, "_paged_round_tables", None)
+        src_act = getattr(self, "_paged_round_active", None)
+        if src is None or src_act is None:
+            raise NpuGraphPreparationError(
+                "missing paged tree source tables", scope="graph"
+            )
+        need_src = raw_bs * topk
+        need_cap = capture_bs * topk
+        if int(src.dim()) != 2 or int(src.shape[0]) != need_src:
+            raise NpuGraphPreparationError(
+                f"paged tree source rows {tuple(src.shape)} != {need_src}",
+                scope="graph",
+            )
+        if int(src_act.numel()) != need_src:
+            raise NpuGraphPreparationError(
+                f"paged tree source active {int(src_act.numel())} != {need_src}",
+                scope="graph",
+            )
+        if int(src.shape[1]) > max_pages:
+            raise NpuGraphPreparationError(
+                f"paged tree source cols {int(src.shape[1])} > bucket {max_pages}",
+                scope="graph",
+            )
+        inner0 = self.attn_backends[0]
+        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
+        dest_act = getattr(inner0, "cuda_graph_paged_active", None)
+        if dest is None or dest_act is None:
+            raise NpuGraphPreparationError(
+                "missing paged tree capture buffers", scope="graph"
+            )
+        if int(dest.shape[0]) < need_cap or int(dest.shape[1]) < max_pages:
+            raise NpuGraphPreparationError(
+                f"paged tree capture tables {tuple(dest.shape)} "
+                f"< ({need_cap}, {max_pages})",
+                scope="graph",
+            )
+        if int(dest_act.numel()) < need_cap:
+            raise NpuGraphPreparationError(
+                f"paged tree capture active {int(dest_act.numel())} < {need_cap}",
+                scope="graph",
+            )
+        dummy = int(
+            getattr(self, "_paged_round_dummy", getattr(self, "_paged_dummy_page", 0))
+        )
+        return prefix, src, src_act, dest, dest_act, dummy, raw_bs, capture_bs, max_pages, topk
+
     def bind_sr_tree_paged_replay(self, capture_bs: int, max_pages: int):
         if not self.paged_impl_selected():
             return
-        dummy = int(getattr(self, "_paged_round_dummy", getattr(self, "_paged_dummy_page", 0)))
-        tables, active = self._paged_graph_table_view(capture_bs, max_pages, dummy)
+        (
+            prefix,
+            src,
+            src_act,
+            dest,
+            dest_act,
+            dummy,
+            _raw_bs,
+            capture_bs,
+            max_pages,
+            topk,
+        ) = self._validate_sr_tree_paged_replay(capture_bs, max_pages)
+        need_src = int(src.shape[0])
+        need_cap = int(capture_bs) * int(topk)
+        src_cols = int(src.shape[1])
+        tables = dest[:need_cap, :max_pages]
+        active = dest_act[:need_cap]
         tables.fill_(dummy)
         active.zero_()
-        src = getattr(self, "_paged_round_tables", None)
-        src_act = getattr(self, "_paged_round_active", None)
-        if src is not None:
-            rows = min(int(src.shape[0]), int(tables.shape[0]))
-            cols = min(int(src.shape[1]), int(tables.shape[1]))
-            tables[:rows, :cols].copy_(src[:rows, :cols])
-        if src_act is not None:
-            n_act = min(int(src_act.numel()), int(active.numel()))
-            active[:n_act].copy_(src_act[:n_act].to(device=active.device))
-        prefix = getattr(self, "_paged_round_prefix", None) or []
+        tables[:need_src, :src_cols].copy_(src)
+        active[:need_src].copy_(src_act.to(device=active.device))
         impl = getattr(self, "_paged_round_impl", self.attn_backends[0].tree_attention_impl)
         n_rows = int(tables.shape[0])
         n_fwd = max(int(self.speculative_num_steps) - 1, 0)
@@ -4050,7 +4133,7 @@ class AscendAttnMultiStepDraftBackend:
             step = int(inner.speculative_step_id)
             if n_fwd:
                 step = min(step, n_fwd - 1)
-            lens = build_step_context_lens(prefix, self.topk, step, n_rows)
+            lens = build_step_context_lens(prefix, topk, step, n_rows)
             meta = SRTreePagedMetadata(
                 block_tables=tables,
                 active_rows=active,
