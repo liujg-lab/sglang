@@ -107,6 +107,13 @@ class NPUGraphRunner(CudaGraphRunner):
         self._last_can_run_reject = None
         self.tree_verify_replay_count = 0
         self.tree_verify_eager_fallback_count = 0
+        args = model_runner.server_args
+        self._plain_ar_update_overlap = (
+            model_runner.spec_algorithm.is_none()
+            and not model_runner.is_draft_worker
+            and args.standalone_remote_role is None
+            and args.spectre_role is None
+        )
         super().__init__(model_runner)
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
@@ -445,6 +452,10 @@ class NPUGraphRunner(CudaGraphRunner):
             )
         graph.update(cpu_update_input=info["payload"])
 
+    def _update_decode_inputs(self, seq_lens, graph_key):
+        torch.npu.set_device(self.model_runner.gpu_id)
+        self._update_inputs(seq_lens, graph_key)
+
     def _update_inputs(self, seq_lens, graph_key=None):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
@@ -645,9 +656,15 @@ class NPUGraphRunner(CudaGraphRunner):
                     seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                         self.bs - self.raw_bs
                     )
+                    overlap_decode = (
+                        self._plain_ar_update_overlap
+                        and forward_batch.forward_mode.is_decode()
+                        and not forward_batch.is_sr_tail_extend
+                    )
                     run_npu_graph_update_and_replay(
-                        lambda: self._update_inputs(seq_lens, graph_key),
+                        lambda: self._update_decode_inputs(seq_lens, graph_key),
                         graph.replay,
+                        overlap=overlap_decode,
                     )
             else:
                 replay_error = None

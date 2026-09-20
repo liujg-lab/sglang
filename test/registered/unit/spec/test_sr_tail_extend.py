@@ -1007,6 +1007,51 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertNotIn("threading.Thread", serial)
         self.assertLess(serial.index("update_fn()"), serial.index("replay_fn()"))
 
+        runner_path = (
+            ROOT
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/sr_tail_extend_npu_graph_runner.py"
+        )
+        calls = []
+
+        def helper(update_fn, replay_fn, overlap=False):
+            calls.append({"overlap": overlap, "replay_fn": replay_fn})
+            update_fn()
+            replay_fn()
+
+        ns = {"torch": torch, "run_npu_graph_update_and_replay": helper}
+        fns = load_functions(
+            runner_path,
+            [
+                "_tail_graph_uses_fia",
+                "make_tail_graph_cpu_update_payload",
+                "fill_tail_graph_cpu_update_payload",
+                "_replay_graph",
+            ],
+            ns,
+        )
+
+        class Graph:
+            def __init__(self):
+                self.n_upd = 0
+                self.n_rep = 0
+
+            def update(self, cpu_update_input=None):
+                self.n_upd += 1
+
+            def replay(self):
+                self.n_rep += 1
+
+        graph = Graph()
+        runner = NS(
+            model_runner=NS(attn_backend=NS(use_fia=False)),
+            update_payloads={},
+        )
+        MethodType(fns["_replay_graph"], runner)(graph, [3, 4], bucket=(1, 2))
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["overlap"], False)
+        self.assertIs(calls[0]["replay_fn"].__self__, graph)
+        self.assertEqual((graph.n_upd, graph.n_rep), (1, 1))
+
     def test_wait_copy_event_before_replay_only_when_copy(self):
         class Event:
             def __init__(self):

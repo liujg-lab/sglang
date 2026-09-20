@@ -530,6 +530,10 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         replay = _fn_source(_RUNNER, "NPUGraphRunner", "replay")
         self.assertIn("not compact_fia and not target_fia", replay)
         self.assertIn("overlap=False", replay)
+        target_call = replay.split("if is_tree_verify and target_fia:", 1)[1]
+        target_call = target_call.split("elif is_tree_verify and compact_fia:", 1)[0]
+        self.assertIn("overlap=False", target_call)
+        self.assertNotIn("overlap=True", target_call)
         self.assertNotIn("overlap=True", replay)
         self.assertIn("raw_bs", replay)
         self.assertIn("capture_bs", replay)
@@ -566,6 +570,62 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         with self.assertRaises(ns["NpuGraphReplaySubmittedError"]):
             ns["run_npu_graph_update_and_replay"](update, replay, overlap=False)
         self.assertEqual(calls, ["update"])
+
+    def test_target_fia_replay_keeps_serial_overlap(self):
+        replay = _fn_source(_RUNNER, "NPUGraphRunner", "replay")
+        calls = []
+
+        def helper(update_fn, replay_fn, overlap=False):
+            calls.append({"overlap": overlap, "replay_fn": replay_fn})
+            update_fn()
+            replay_fn()
+
+        class _Graph:
+            def replay(self):
+                return None
+
+        graph = _Graph()
+        loc = {
+            "self": SimpleNamespace(
+                _target_fia_maps={1: {"payload": []}},
+                bs=1,
+                _update_target_tree_fia_inputs=lambda info, kv_lens: None,
+            ),
+            "run_npu_graph_update_and_replay": helper,
+            "is_tree_verify": True,
+            "target_fia": True,
+            "graph_key": 1,
+            "graph": graph,
+            "backend": SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    sr_target_tree_fia=SimpleNamespace(kv_lens_cpu=[4])
+                )
+            ),
+            "NpuGraphPreparationError": RuntimeError,
+        }
+        tree = ast.parse(replay)
+        fn = tree.body[0]
+        target_if = None
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.If)
+                and ast.unparse(node.test) == "is_tree_verify and target_fia"
+            ):
+                target_if = node
+                break
+        self.assertIsNotNone(target_if)
+        exec(
+            compile(
+                ast.Module(body=list(target_if.body), type_ignores=[]),
+                str(_RUNNER),
+                "exec",
+            ),
+            loc,
+            loc,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["overlap"], False)
+        self.assertIs(calls[0]["replay_fn"].__self__, graph)
 
 
 class TestPrimeCapture(CustomTestCase):
