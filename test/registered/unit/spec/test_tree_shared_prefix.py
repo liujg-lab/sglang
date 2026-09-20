@@ -978,6 +978,7 @@ class TestTreeFailureHandling(unittest.TestCase):
                     ),
                     NpuGraphReplaySubmittedError=self.submitted_error,
                     NpuGraphPreparationError=ValueError,
+                    record_tree_expand_admission=lambda *args, **kwargs: False,
                 ),
             )["_expand_tree"]
             self.drafter._expand_tree = MethodType(fn, self.drafter)
@@ -990,6 +991,9 @@ class TestTreeFailureHandling(unittest.TestCase):
             )
             self.assertIn("tree_forward", metrics.host)
             self.assertIn("tree_result_wait_pack", metrics.host)
+            self.assertIn("tree_make_batch", metrics.host)
+            self.assertIn("tree_alloc_kv", metrics.host)
+            self.assertIn("tree_prepare_meta", metrics.host)
             self.assertEqual(len(metrics.pending), 1)
             metrics.poll()
             self.assertEqual(metrics.device_ms["tree_forward"], 7.0)
@@ -1377,11 +1381,16 @@ class TestPagedReplayRestore(unittest.TestCase):
         fns = methods(
             NPU / "attention/ascend_backend.py",
             "AscendAttnMultiStepDraftBackend",
-            ["_validate_sr_tree_paged_replay", "bind_sr_tree_paged_replay"],
+            [
+                "_paged_graph_table_view",
+                "_validate_sr_tree_paged_replay",
+                "bind_sr_tree_paged_replay",
+            ],
             bind_ns,
         )
         self.bind_fn = fns["bind_sr_tree_paged_replay"]
         self.validate_fn = fns["_validate_sr_tree_paged_replay"]
+        self.view_fn = fns["_paged_graph_table_view"]
 
     def _eager_meta(self, tables, active, dummy=0):
         lens = torch.arange(int(tables.shape[0]), dtype=torch.int32) + 3
@@ -1403,13 +1412,16 @@ class TestPagedReplayRestore(unittest.TestCase):
         dest = torch.full((capture_bs * topk, max_pages), 111, dtype=torch.int32)
         dest_act = torch.full((capture_bs * topk,), 5, dtype=torch.int32)
         eager = self._eager_meta(src, src_act, dummy=dummy)
+        rows = int(dest.shape[0])
+        pages = int(dest.shape[1])
         inners = []
         for step in range(2):
             inner = NS(
                 speculative_step_id=step,
                 tree_attention_impl="paged_atb",
-                cuda_graph_paged_block_tables=dest,
-                cuda_graph_paged_active=dest_act,
+                device=dest.device,
+                cuda_graph_paged_tables={(rows, pages): dest},
+                cuda_graph_paged_actives={(rows, pages): dest_act},
                 _sr_tree_paged_meta=eager,
                 forward_metadata=_ForwardMetadata() if had_fm else None,
             )
@@ -1436,6 +1448,7 @@ class TestPagedReplayRestore(unittest.TestCase):
         )
         backend.bind_sr_tree_paged_replay = MethodType(self.bind_fn, backend)
         backend._validate_sr_tree_paged_replay = MethodType(self.validate_fn, backend)
+        backend._paged_graph_table_view = MethodType(self.view_fn, backend)
         batch = NS(
             batch_size=raw_bs,
             seq_lens=torch.tensor([1] * raw_bs),

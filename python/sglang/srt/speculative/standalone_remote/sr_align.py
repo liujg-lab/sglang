@@ -382,6 +382,11 @@ def is_device_context_error(exc: BaseException) -> bool:
         or "cudaerrorillegaladdress" in msg
         or "npu error" in msg
         or ("ascend" in msg and "illegal" in msg)
+        or "acl stream synchronize failed" in msg
+        or "model execution failed" in msg
+        or "rtstreamsynchronize" in msg
+        or "rtdevicesynchronize" in msg
+        or "error code:5070" in msg
     )
 
 

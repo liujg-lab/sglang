@@ -513,6 +513,8 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("_slot_gather_graph", capture_src)
         filter_src = _function_source(_NPU_GRAPH, "filter_capture_batch_sizes")
         self.assertIn("parse_tree_draft_capture_bs", filter_src)
+        self.assertIn("follow --cuda-graph-bs", filter_src)
+        self.assertIn("os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV)", filter_src)
         cuda_src = (
             _REPO_ROOT / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
         )

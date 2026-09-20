@@ -11,7 +11,7 @@ import ast
 import pathlib
 import threading
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -49,6 +49,34 @@ def _class_method_source(path: pathlib.Path, class_name: str, method_name: str) 
                 if isinstance(child, ast.FunctionDef) and child.name == method_name:
                     return ast.get_source_segment(text, child) or ast.unparse(child)
     raise AssertionError(f"{class_name}.{method_name} not found in {path}")
+
+
+def _extract_class_methods(path: pathlib.Path, class_name: str, names, ns):
+    tree = ast.parse(path.read_text())
+    klass = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
+    )
+    nodes = [
+        n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    if len(nodes) != len(names):
+        missing = set(names) - {n.name for n in nodes}
+        raise AssertionError(f"missing {missing} in {class_name}")
+    ns = dict(ns)
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *nodes], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    return {name: ns[name] for name in names}
 
 
 def _producer_fallback(spec_info, seq):
@@ -345,6 +373,22 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("graph_key not in self.graphs", target_can)
         self.assertIn("TreeReplayPlan", target_can)
         self.assertNotIn("endswith(suffix)", target_can)
+        self.assertIn("capture_bs is None", target_can)
+        self.assertLess(
+            target_can.find("capture_bs is None"),
+            target_can.find("_save_tree_replay_plan"),
+        )
+        self.assertLess(
+            target_can.find("_clear_tree_replay_plan"),
+            target_can.find("capture_bs is None"),
+        )
+        self.assertIn("tree_verify_eager_fallback_count", target_can)
+        self.assertIn("_last_can_run_reject", target_can)
+        self.assertIn("bs_over_max_capture_bs", target_can)
+        self.assertLess(
+            target_can.find("if not super().can_run"),
+            target_can.find("tree_verify_eager_fallback_count += 1"),
+        )
 
         target_replay = _class_method_source(
             _NPU_GRAPH_RUNNER, "NPUGraphRunner", "replay"
@@ -366,6 +410,23 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("tokens_per_req = self.num_tokens_per_bs", draft_can)
         self.assertIn("graph_key not in self.graphs", draft_can)
         self.assertNotIn("endswith(suffix)", draft_can)
+        self.assertIn("capture_bs is None", draft_can)
+        self.assertLess(
+            draft_can.find("capture_bs is None"),
+            draft_can.find("_save_tree_replay_plan"),
+        )
+        self.assertLess(
+            draft_can.find("_clear_tree_replay_plan"),
+            draft_can.find("capture_bs is None"),
+        )
+        self.assertIn("tree_eager_fallback_count", draft_can)
+        self.assertIn("_last_can_run_reject", draft_can)
+        self.assertIn("bs_over_max_capture_bs", draft_can)
+        self.assertIn("empty_capture_bs", draft_can)
+        self.assertLess(
+            draft_can.find("not is_bs_supported or not self.capture_bs"),
+            draft_can.find("tree_eager_fallback_count += 1"),
+        )
 
         draft_replay = _class_method_source(
             _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "replay"
@@ -418,6 +479,177 @@ class TestTreeReplayPlan(CustomTestCase):
             one_src.find("_ensure_capture_attrs"),
             one_src.find("_get_update_attr_name"),
         )
+
+    def test_padded_capture_bs_over_max_returns_none(self):
+        import bisect
+
+        draft_fn = _extract_class_methods(
+            _EAGLE_DRAFT_NPU,
+            "EAGLEDraftNpuGraphRunner",
+            ["_padded_capture_bs"],
+            {"bisect": bisect},
+        )["_padded_capture_bs"]
+        target_fn = _extract_class_methods(
+            _NPU_GRAPH_RUNNER,
+            "NPUGraphRunner",
+            ["_padded_capture_bs"],
+            {"bisect": bisect},
+        )["_padded_capture_bs"]
+        draft = SimpleNamespace(capture_bs=[1, 2], require_mlp_tp_gather=False)
+        draft._padded_capture_bs = MethodType(draft_fn, draft)
+        target = SimpleNamespace(capture_bs=[1, 2, 4], require_mlp_tp_gather=False)
+        target._padded_capture_bs = MethodType(target_fn, target)
+
+        raw, cap = draft._padded_capture_bs(SimpleNamespace(batch_size=4))
+        self.assertEqual(raw, 4)
+        self.assertIsNone(cap)
+        raw, cap = draft._padded_capture_bs(SimpleNamespace(batch_size=1))
+        self.assertEqual((raw, cap), (1, 1))
+        raw, cap = draft._padded_capture_bs(SimpleNamespace(batch_size=2))
+        self.assertEqual((raw, cap), (2, 2))
+
+        raw, cap = target._padded_capture_bs(SimpleNamespace(batch_size=8), actual_ntpb=1)
+        self.assertEqual(raw, 8)
+        self.assertIsNone(cap)
+        raw, cap = target._padded_capture_bs(SimpleNamespace(batch_size=3), actual_ntpb=1)
+        self.assertEqual((raw, cap), (3, 4))
+        empty = SimpleNamespace(capture_bs=[], require_mlp_tp_gather=False)
+        empty._padded_capture_bs = MethodType(draft_fn, empty)
+        raw, cap = empty._padded_capture_bs(SimpleNamespace(batch_size=1))
+        self.assertEqual(raw, 1)
+        self.assertIsNone(cap)
+
+    def test_can_run_over_max_bs_counts_and_records_reason(self):
+        import bisect
+
+        fns = _extract_class_methods(
+            _EAGLE_DRAFT_NPU,
+            "EAGLEDraftNpuGraphRunner",
+            [
+                "can_run",
+                "_padded_capture_bs",
+                "_clear_tree_replay_plan",
+                "_make_graph_key",
+                "_save_tree_replay_plan",
+            ],
+            {"bisect": bisect, "TreeReplayPlan": TreeReplayPlan},
+        )
+        runner = SimpleNamespace(
+            require_mlp_tp_gather=False,
+            require_mlp_sync=False,
+            disable_padding=False,
+            capture_bs=[1, 2],
+            max_bs=2,
+            _slot_gather_graph=True,
+            _tree_paged=True,
+            tree_eager_fallback_count=0,
+            _last_can_run_reject=None,
+            graphs={},
+            _tree_fia_maps={},
+            _tree_attention_impls={},
+            num_tokens_per_bs=3,
+        )
+        for name, fn in fns.items():
+            setattr(runner, name, MethodType(fn, runner))
+        self.assertFalse(runner.can_run(SimpleNamespace(batch_size=4)))
+        self.assertEqual(runner.tree_eager_fallback_count, 1)
+        self.assertIn("bs_over_max_capture_bs", runner._last_can_run_reject)
+        self.assertIn("bs=4", runner._last_can_run_reject)
+        self.assertIn("max_bs=2", runner._last_can_run_reject)
+
+    def test_record_tree_expand_admission_reasons(self):
+        path = (
+            _REPO_ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        tree = ast.parse(path.read_text())
+        node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "record_tree_expand_admission"
+        )
+        ns = {}
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"),
+            ns,
+        )
+        record = ns["record_tree_expand_admission"]
+        from collections import Counter
+
+        graph_metrics = SimpleNamespace(counts=Counter())
+        self.assertFalse(record(graph_metrics, True, None))
+        self.assertEqual(graph_metrics.counts["tree_graph_batches"], 1)
+        self.assertEqual(graph_metrics.counts["tree_eager_batches"], 0)
+
+        eager_metrics = SimpleNamespace(counts=Counter())
+        runner = SimpleNamespace(
+            _last_can_run_reject="bs_over_max_capture_bs bs=4 max_bs=2"
+        )
+        self.assertTrue(record(eager_metrics, False, runner))
+        self.assertEqual(eager_metrics.counts["tree_eager_batches"], 1)
+        self.assertEqual(eager_metrics.counts["tree_eager_bs_over_max_capture_bs"], 1)
+
+        missing = SimpleNamespace(counts=Counter())
+        self.assertTrue(record(missing, False, SimpleNamespace()))
+        self.assertEqual(missing.counts["tree_eager_graph_unavailable"], 1)
+        self.assertFalse(record(None, False, None))
+
+    def test_filter_capture_bs_follows_cuda_graph_unless_env(self):
+        import logging
+        import os
+
+        from sglang.srt.speculative.tree_attn_fallback import (
+            TREE_DRAFT_CAPTURE_BS_ENV,
+            parse_tree_draft_capture_bs,
+        )
+
+        fn = _extract_class_methods(
+            _EAGLE_DRAFT_NPU,
+            "EAGLEDraftNpuGraphRunner",
+            ["filter_capture_batch_sizes"],
+            {
+                "os": os,
+                "parse_tree_draft_capture_bs": parse_tree_draft_capture_bs,
+                "TREE_DRAFT_CAPTURE_BS_ENV": TREE_DRAFT_CAPTURE_BS_ENV,
+                "logger": logging.getLogger("test.filter_capture_bs"),
+            },
+        )["filter_capture_batch_sizes"]
+        runner = SimpleNamespace(
+            _slot_gather_graph=True, tree_graph_disabled_reason=None
+        )
+        runner.filter_capture_batch_sizes = MethodType(fn, runner)
+        old = os.environ.pop(TREE_DRAFT_CAPTURE_BS_ENV, None)
+        try:
+            got, compile_bs = runner.filter_capture_batch_sizes([1, 2, 4], [1, 2, 4])
+            self.assertEqual(got, [1, 2, 4])
+            self.assertEqual(compile_bs, [1, 2, 4])
+            self.assertIsNone(runner.tree_graph_disabled_reason)
+
+            os.environ[TREE_DRAFT_CAPTURE_BS_ENV] = "1,2"
+            got, compile_bs = runner.filter_capture_batch_sizes([1, 2, 4], [1, 2, 4])
+            self.assertEqual(got, [1, 2])
+            self.assertEqual(compile_bs, [1, 2])
+
+            os.environ[TREE_DRAFT_CAPTURE_BS_ENV] = "8"
+            got, compile_bs = runner.filter_capture_batch_sizes([1, 2, 4], [1, 2, 4])
+            self.assertEqual(got, [])
+            self.assertEqual(compile_bs, [])
+            self.assertEqual(
+                runner.tree_graph_disabled_reason,
+                "tree draft capture_bs filter is empty",
+            )
+        finally:
+            if old is None:
+                os.environ.pop(TREE_DRAFT_CAPTURE_BS_ENV, None)
+            else:
+                os.environ[TREE_DRAFT_CAPTURE_BS_ENV] = old
+
+        filter_src = _class_method_source(
+            _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "filter_capture_batch_sizes"
+        )
+        self.assertIn("follow --cuda-graph-bs", filter_src)
+        self.assertIn("os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV)", filter_src)
 
 
 if __name__ == "__main__":

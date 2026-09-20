@@ -466,6 +466,29 @@ class TestSourceGuards(CustomTestCase):
         prep_src = _fn_source(_BACKEND, "prepare_sr_tree_paged_eager")
         self.assertIn("_sr_tree_paged_prep_count += 1", prep_src)
         self.assertIn("plan_prefix_tail_copy_indices", prep_src)
+        self.assertNotIn("cuda_graph_paged_block_tables", prep_src)
+        self.assertNotIn("cuda_graph_paged_active", prep_src)
+        self.assertNotIn("exceed graph buffer", prep_src)
+        view_src = _fn_source(_BACKEND, "_paged_graph_table_view")
+        self.assertIn("NpuGraphPreparationError", view_src)
+        self.assertNotIn("RuntimeError", view_src)
+        self.assertIn("allow_alloc", view_src)
+        self.assertIn("is_contiguous", view_src)
+        self.assertIn("cuda_graph_paged_tables", view_src)
+        self.assertIn("actives_map.get(key)", view_src)
+        self.assertNotIn("actives_map.get(rows)", view_src)
+        self.assertNotIn("[:rows, :pages]", view_src)
+        self.assertNotIn("cuda_graph_paged_block_tables", view_src)
+        init_graph_src = _fn_source(_BACKEND, "init_cuda_graph_state")
+        self.assertIn("cuda_graph_paged_tables", init_graph_src)
+        self.assertIn("_paged_graph_max_pages", init_graph_src)
+        self.assertNotIn("cuda_graph_paged_block_tables", init_graph_src)
+        can_src = _fn_source(_BACKEND, "tree_slot_graph_can_run")
+        self.assertIn("_paged_graph_max_pages", can_src)
+        self.assertNotIn("cuda_graph_paged_block_tables", can_src)
+        runner_src = _source(_RUNNER)
+        self.assertIn("_paged_graph_max_pages", runner_src)
+        self.assertNotIn("cuda_graph_paged_block_tables", runner_src)
 
     def test_graph_runner_paged_serial_and_validator(self):
         src = _source(_RUNNER)
@@ -488,6 +511,14 @@ class TestSourceGuards(CustomTestCase):
         self.assertLess(src.find("mark_compute_begin"), src.find("replay"))
         self.assertIn("NpuGraphReplaySubmittedError", src)
         self.assertIn("abandon", src)
+        self.assertIn("record_tree_expand_admission", src)
+        self.assertIn("tree_eager_prep_failed", src)
+        self.assertIn("_tree_forward_calls", src)
+        self.assertIn("reason=%s", src)
+        self.assertIn("tree_make_batch", src)
+        self.assertIn("tree_alloc_kv", src)
+        self.assertIn("tree_prepare_meta", src)
+        self.assertIn("tree_graph_key_first_use", src)
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
         self.assertIn("not getattr(runner, \"_tree_paged\", False)", can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
@@ -581,7 +612,11 @@ class TestPagedReplayBind(CustomTestCase):
         fn = _extract_class_methods(
             _BACKEND,
             "AscendAttnMultiStepDraftBackend",
-            ["_validate_sr_tree_paged_replay", "bind_sr_tree_paged_replay"],
+            [
+                "_paged_graph_table_view",
+                "_validate_sr_tree_paged_replay",
+                "bind_sr_tree_paged_replay",
+            ],
             dict(
                 torch=torch,
                 NpuGraphPreparationError=self.PrepError,
@@ -593,13 +628,17 @@ class TestPagedReplayBind(CustomTestCase):
         )
         self._bind_fn = fn["bind_sr_tree_paged_replay"]
         self._validate_fn = fn["_validate_sr_tree_paged_replay"]
+        self._view_fn = fn["_paged_graph_table_view"]
 
     def _inner(self, step, dest, dest_act, eager_meta=None, had_fm=True):
+        rows = int(dest.shape[0])
+        pages = int(dest.shape[1])
         inner = SimpleNamespace(
             speculative_step_id=step,
             tree_attention_impl="paged_atb",
-            cuda_graph_paged_block_tables=dest,
-            cuda_graph_paged_active=dest_act,
+            device=dest.device,
+            cuda_graph_paged_tables={(rows, pages): dest},
+            cuda_graph_paged_actives={(rows, pages): dest_act},
             _sr_tree_paged_meta=eager_meta,
             forward_metadata=_ForwardMetadata() if had_fm else None,
         )
@@ -653,6 +692,7 @@ class TestPagedReplayBind(CustomTestCase):
         backend._validate_sr_tree_paged_replay = MethodType(
             self._validate_fn, backend
         )
+        backend._paged_graph_table_view = MethodType(self._view_fn, backend)
         return backend, dest, dest_act, eager, inners
 
     def test_int_prefix_dual_request_binds_step_lengths(self):
@@ -755,12 +795,12 @@ class TestPagedReplayBind(CustomTestCase):
         backend, dest, dest_act, _, inners = self._backend(
             2, capture_bs, topk, max_pages, prefix, src, src_act
         )
-        inners[0].cuda_graph_paged_block_tables = None
-        inners[0].cuda_graph_paged_active = None
+        inners[0].cuda_graph_paged_tables = None
+        inners[0].cuda_graph_paged_actives = None
         with self.assertRaises(self.PrepError):
             backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
-        self.assertIsNone(inners[0].cuda_graph_paged_block_tables)
-        self.assertIsNone(inners[0].cuda_graph_paged_active)
+        self.assertIsNone(inners[0].cuda_graph_paged_tables)
+        self.assertIsNone(inners[0].cuda_graph_paged_actives)
 
     def test_raw_bs_shrink_grow_leaves_no_padding_residue(self):
         topk, capture_bs, max_pages, dummy = 2, 2, 4, 99
@@ -774,10 +814,10 @@ class TestPagedReplayBind(CustomTestCase):
                 dest_holder["dest"] = dest
                 dest_holder["dest_act"] = dest_act
             else:
-                inners[0].cuda_graph_paged_block_tables = dest_holder["dest"]
-                inners[0].cuda_graph_paged_active = dest_holder["dest_act"]
-                inners[1].cuda_graph_paged_block_tables = dest_holder["dest"]
-                inners[1].cuda_graph_paged_active = dest_holder["dest_act"]
+                key = (int(dest_holder["dest"].shape[0]), int(dest_holder["dest"].shape[1]))
+                for inner in inners:
+                    inner.cuda_graph_paged_tables = {key: dest_holder["dest"]}
+                    inner.cuda_graph_paged_actives = {key: dest_holder["dest_act"]}
             backend.bind_sr_tree_paged_replay(capture_bs, max_pages)
             return dest_holder["dest"], dest_holder["dest_act"], inners
 
@@ -810,6 +850,187 @@ class TestPagedReplayBind(CustomTestCase):
             list(inners[0]._sr_tree_paged_meta.context_lens_list),
             [9, 9, 17, 17],
         )
+
+
+class TestPagedEagerPrep(CustomTestCase):
+    def setUp(self):
+        fn = _extract_class_methods(
+            _BACKEND,
+            "AscendAttnMultiStepDraftBackend",
+            ["prepare_sr_tree_paged_eager"],
+            dict(
+                torch=torch,
+                prepare_tree_paged_view=prepare_tree_paged_view,
+                build_step_context_lens=build_step_context_lens,
+                context_lens_list=context_lens_list,
+                SRTreePagedMetadata=SRTreePagedMetadata,
+                ForwardMetadata=_ForwardMetadata,
+            ),
+        )
+        self._prep_fn = fn["prepare_sr_tree_paged_eager"]
+
+    def _backend(self, raw_bs, dest_bs, topk=2, dest_pages=4, page_size=128, steps=3, dummy=99):
+        dest = torch.full((dest_bs * topk, dest_pages), 777, dtype=torch.int32)
+        dest_act = torch.full((dest_bs * topk,), 9, dtype=torch.int32)
+        prefixes = [page_size] * raw_bs
+        req = _req_to_token([[1]] * raw_bs, page_size)
+        pool = torch.arange(raw_bs)
+        branch_ids = [[[2] for _ in range(topk)] for _ in range(raw_bs)]
+        slots = _draft_slots(prefixes, page_size, topk, steps, branch_ids)
+        compact = slots.reshape(-1)
+        inners = []
+        for step in (0, 1):
+            inner = SimpleNamespace(
+                speculative_step_id=step,
+                tree_attention_impl="paged_atb",
+                cuda_graph_paged_block_tables=dest,
+                cuda_graph_paged_active=dest_act,
+                req_to_token=req,
+                _sr_tree_paged_prep_count=0,
+                _sr_tree_paged_copy_count=0,
+                _sr_tree_paged_meta=None,
+                forward_metadata=_ForwardMetadata(),
+            )
+            inner.bind_sr_tree_paged_metadata = MethodType(
+                lambda self, meta: setattr(self, "_sr_tree_paged_meta", meta),
+                inner,
+            )
+            inners.append(inner)
+        backend = SimpleNamespace(
+            topk=topk,
+            page_size=page_size,
+            speculative_num_steps=steps,
+            attn_backends=inners,
+            _paged_prep_count=0,
+            _paged_copy_count=0,
+            paged_impl_selected=lambda: True,
+        )
+        backend.prepare_sr_tree_paged_eager = MethodType(self._prep_fn, backend)
+        forward_batch = SimpleNamespace(batch_size=raw_bs, req_pool_indices=pool)
+        prefix = torch.tensor(prefixes, dtype=torch.int32)
+        return backend, dest, dest_act, inners, forward_batch, compact, prefix, dummy
+
+    def _assert_no_dest_writes(self, backend, dest, dest_act, forward_batch, compact, prefix, dummy):
+        writes = []
+        orig_fill = torch.Tensor.fill_
+        orig_copy = torch.Tensor.copy_
+        dest_ptrs = {dest.data_ptr(), dest_act.data_ptr()}
+
+        def watch_fill(tensor, value):
+            if tensor.data_ptr() in dest_ptrs:
+                writes.append("fill")
+            return orig_fill(tensor, value)
+
+        def watch_copy(tensor, src_t, *args, **kwargs):
+            if tensor.data_ptr() in dest_ptrs:
+                writes.append("copy")
+            return orig_copy(tensor, src_t, *args, **kwargs)
+
+        with mock.patch.object(torch.Tensor, "fill_", watch_fill), mock.patch.object(
+            torch.Tensor, "copy_", watch_copy
+        ):
+            copied = backend.prepare_sr_tree_paged_eager(
+                forward_batch,
+                compact,
+                prefix,
+                ALLOC_ORDINARY,
+                kv_pool=None,
+                dummy_page=dummy,
+            )
+        self.assertFalse(copied)
+        self.assertEqual(writes, [])
+        self.assertTrue(torch.equal(dest, torch.full_like(dest, 777)))
+        self.assertTrue(torch.equal(dest_act, torch.full_like(dest_act, 9)))
+        return backend.attn_backends
+
+    def test_eager_over_graph_capacity_does_not_write_or_raise(self):
+        topk = 2
+        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = self._backend(
+            raw_bs=4, dest_bs=2, topk=topk
+        )
+        inners = self._assert_no_dest_writes(
+            backend, dest, dest_act, forward_batch, compact, prefix, dummy
+        )
+        need = 4 * topk
+        self.assertEqual(int(backend._paged_round_tables.shape[0]), need)
+        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables)
+        self.assertEqual(int(inners[0]._sr_tree_paged_meta.block_tables.shape[0]), need)
+        self.assertEqual(int(inners[0].forward_metadata.block_tables.shape[0]), need)
+
+    def test_eager_fitting_capacity_still_skips_graph_buffers(self):
+        topk = 2
+        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = self._backend(
+            raw_bs=2, dest_bs=2, topk=topk
+        )
+        inners = self._assert_no_dest_writes(
+            backend, dest, dest_act, forward_batch, compact, prefix, dummy
+        )
+        need = 2 * topk
+        self.assertEqual(int(backend._paged_round_tables.shape[0]), need)
+        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables)
+
+
+class TestPagedGraphTableBuffers(CustomTestCase):
+    def setUp(self):
+        self.PrepError = _load_npu_graph_prep_error()
+        fn = _extract_class_methods(
+            _BACKEND,
+            "AscendAttnMultiStepDraftBackend",
+            ["_paged_graph_table_view"],
+            dict(torch=torch, NpuGraphPreparationError=self.PrepError),
+        )
+        self._view_fn = fn["_paged_graph_table_view"]
+
+    def _backend(self, topk=3):
+        inner = SimpleNamespace(
+            device=torch.device("cpu"),
+            cuda_graph_paged_tables={},
+            cuda_graph_paged_actives={},
+        )
+        backend = SimpleNamespace(topk=topk, attn_backends=[inner])
+        backend._paged_graph_table_view = MethodType(self._view_fn, backend)
+        return backend, inner
+
+    def test_capture_allocates_independent_contiguous_buffers(self):
+        backend, inner = self._backend()
+        seen = []
+        for rows, pages in ((3, 2), (3, 4), (6, 4)):
+            tables, active = backend._paged_graph_table_view(
+                rows // 3, pages, 0, allow_alloc=True
+            )
+            self.assertTrue(tables.is_contiguous())
+            self.assertEqual(tuple(tables.stride()), (pages, 1))
+            self.assertEqual(tuple(tables.shape), (rows, pages))
+            self.assertEqual(int(active.numel()), rows)
+            seen.append(tables.data_ptr())
+        self.assertEqual(len(set(seen)), 3)
+        again, _ = backend._paged_graph_table_view(1, 4, 0, allow_alloc=True)
+        self.assertEqual(again.data_ptr(), seen[1])
+        self.assertIs(again, inner.cuda_graph_paged_tables[(3, 4)])
+        self.assertEqual(
+            set(inner.cuda_graph_paged_tables), set(inner.cuda_graph_paged_actives)
+        )
+        act_s2 = inner.cuda_graph_paged_actives[(3, 2)]
+        act_s4 = inner.cuda_graph_paged_actives[(3, 4)]
+        self.assertIsNot(act_s2, act_s4)
+        self.assertNotEqual(act_s2.data_ptr(), act_s4.data_ptr())
+
+    def test_replay_missing_key_does_not_allocate(self):
+        backend, inner = self._backend()
+        with self.assertRaises(self.PrepError) as ctx:
+            backend._paged_graph_table_view(1, 4, 0, allow_alloc=False)
+        self.assertIn("missing", str(ctx.exception))
+        self.assertEqual(inner.cuda_graph_paged_tables, {})
+        self.assertEqual(inner.cuda_graph_paged_actives, {})
+
+    def test_strided_stored_buffer_is_rejected(self):
+        backend, inner = self._backend()
+        shared = torch.zeros((6, 8), dtype=torch.int32)
+        inner.cuda_graph_paged_tables[(3, 4)] = shared[:3, :4]
+        inner.cuda_graph_paged_actives[(3, 4)] = torch.zeros((3,), dtype=torch.bool)
+        with self.assertRaises(self.PrepError) as ctx:
+            backend._paged_graph_table_view(1, 4, 0, allow_alloc=False)
+        self.assertIn("contiguous", str(ctx.exception))
 
 
 if __name__ == "__main__":

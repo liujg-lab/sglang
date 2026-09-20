@@ -88,6 +88,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self._tree_attention_impls = {}
         self.tree_graph_replay_count = 0
         self.tree_eager_fallback_count = 0
+        self._last_can_run_reject = None
         self.tree_graph_disabled_reason = None
         self._init_arch_map()
         page_size = int(getattr(eagle_worker, "page_size", 1) or 1)
@@ -135,9 +136,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def filter_capture_batch_sizes(self, capture_bs, compile_bs):
         if not getattr(self, "_slot_gather_graph", False):
             return capture_bs, compile_bs
-        allow = set(
-            parse_tree_draft_capture_bs(os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV))
-        )
+        raw = os.environ.get(TREE_DRAFT_CAPTURE_BS_ENV)
+        if raw is None:
+            logger.info(
+                "NPU tree draft capture_bs follow --cuda-graph-bs %s",
+                capture_bs,
+            )
+            return capture_bs, compile_bs
+        allow = set(parse_tree_draft_capture_bs(raw))
+        requested = list(capture_bs)
         capture_bs = [b for b in capture_bs if b in allow]
         compile_bs = [b for b in compile_bs if b in capture_bs]
         if not capture_bs:
@@ -148,7 +155,18 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 "NPU tree draft graphs disabled: capture_bs filter is empty"
             )
         else:
-            logger.info("NPU tree draft capture_bs restricted to %s", capture_bs)
+            logger.info(
+                "NPU tree draft capture_bs restricted by %s to %s",
+                TREE_DRAFT_CAPTURE_BS_ENV,
+                capture_bs,
+            )
+            omitted = [b for b in requested if b not in capture_bs]
+            if omitted:
+                logger.warning(
+                    "NPU tree draft capture_bs env omits %s; "
+                    "those batch sizes use eager",
+                    omitted,
+                )
         return capture_bs, compile_bs
 
     def _capture_extra_keys(self, ntpb=None):
@@ -169,9 +187,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             page = max(int(getattr(self.eagle_worker, "page_size", 1) or 1), 1)
             if buckets:
                 return kv_buckets_to_page_buckets(buckets, page)
-            dest = getattr(backend, "cuda_graph_paged_block_tables", None)
-            if dest is not None and dest.ndim == 2:
-                return [max(int(dest.shape[1]), 1)]
+            max_pages = getattr(backend, "_paged_graph_max_pages", None)
+            if max_pages is not None:
+                return [max(int(max_pages), 1)]
             return [1]
         if buckets:
             return list(reversed(list(buckets)))
@@ -240,6 +258,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if index >= len(self.capture_bs):
+            return raw_bs, None
         return raw_bs, self.capture_bs[index]
 
     def _snapshot_forward_batch_fields(self, forward_batch: ForwardBatch):
@@ -363,6 +383,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def can_run(self, forward_batch: ForwardBatch):
         self._clear_tree_replay_plan()
+        self._last_can_run_reject = None
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -379,6 +400,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
         if not is_bs_supported or not self.capture_bs:
+            if not self.capture_bs:
+                self._last_can_run_reject = "empty_capture_bs"
+            else:
+                self._last_can_run_reject = (
+                    f"bs_over_max_capture_bs bs={int(cuda_graph_bs)} "
+                    f"max_bs={int(getattr(self, 'max_bs', 0) or 0)}"
+                )
+            if getattr(self, "_slot_gather_graph", False):
+                self.tree_eager_fallback_count += 1
             return False
         kv_bucket = None
         if getattr(self, "_slot_gather_graph", False):
@@ -403,19 +433,30 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             if fn is not None:
                 ok = bool(fn(forward_batch))
                 if not ok:
+                    self._last_can_run_reject = "slot_graph_reject"
                     self.tree_eager_fallback_count += 1
                     return False
                 kv_bucket = getattr(backend, "_replay_tree_s_cap", None)
         tokens_per_req = self.num_tokens_per_bs  # currently equals topk
         raw_bs, capture_bs = self._padded_capture_bs(forward_batch)
+        if capture_bs is None:
+            self._last_can_run_reject = (
+                f"bs_over_max_capture_bs bs={int(raw_bs)} "
+                f"max_bs={int(getattr(self, 'max_bs', 0) or 0)}"
+            )
+            if getattr(self, "_slot_gather_graph", False):
+                self.tree_eager_fallback_count += 1
+            return False
         graph_key = self._make_graph_key(capture_bs, extra=kv_bucket)
         if graph_key not in self.graphs:
+            self._last_can_run_reject = "graph_key_missing"
             if getattr(self, "_slot_gather_graph", False):
                 self.tree_eager_fallback_count += 1
             return False
         if getattr(self, "_tree_paged", False) and graph_key not in getattr(
             self, "_tree_fia_maps", {}
         ):
+            self._last_can_run_reject = "fia_map_missing"
             self.tree_eager_fallback_count += 1
             return False
         if (
@@ -424,7 +465,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             )
             != self._current_tree_attention_impl()
         ):
+            self._last_can_run_reject = "impl_changed"
             return False
+        self._last_can_run_reject = None
         self._save_tree_replay_plan(
             TreeReplayPlan(
                 graph_key=graph_key,

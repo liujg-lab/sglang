@@ -4,7 +4,7 @@ import ast
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -367,7 +367,79 @@ class TestRemoteSpecDevice(CustomTestCase):
 
         self.assertTrue(_sr_is_device_context_error(NPUError("illegal memory access")))
         self.assertTrue(_sr_is_device_context_error(RuntimeError("NPU error: illegal")))
+        self.assertTrue(
+            _sr_is_device_context_error(
+                RuntimeError("ACL stream synchronize failed, error code:507011")
+            )
+        )
+        self.assertTrue(
+            _sr_is_device_context_error(RuntimeError("Model execution failed."))
+        )
+        self.assertTrue(
+            _sr_is_device_context_error(
+                RuntimeError("rtStreamSynchronize execution failed")
+            )
+        )
         self.assertFalse(_sr_is_device_context_error(RuntimeError("rpc timeout")))
+
+    def test_finish_rid_skips_kv_release_when_poisoned(self):
+        mixin = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
+        )
+        tree = ast.parse(mixin.read_text())
+        klass = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef)
+            and n.name == "StandaloneRemoteDraftSchedulerMixin"
+        )
+        node = next(
+            n
+            for n in klass.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_sr_finish_rid"
+        )
+        ns = {
+            "Optional": Optional,
+            "SRDraftState": object,
+            "FINISH_ABORT": lambda msg: msg,
+            "release_mm_resources": lambda mm: None,
+            "logger": SimpleNamespace(error=lambda *a, **k: None),
+        }
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[future, node], type_ignores=[])
+                ),
+                str(mixin),
+                "exec",
+            ),
+            ns,
+        )
+        released = []
+        req = SimpleNamespace(
+            finished=lambda: True,
+            req_pool_idx=0,
+            multimodal_inputs=None,
+        )
+        scheduler = SimpleNamespace(
+            _sr_device_poisoned=True,
+            sr_state=SimpleNamespace(delete=lambda rid: SimpleNamespace(req_object=req)),
+            _sr_remove_req=lambda r: None,
+            _sr_release_tree_lease=lambda rid: None,
+            sr_kv=SimpleNamespace(
+                release_all_kv_for_finished_req=lambda r: released.append(r)
+            ),
+        )
+        MethodType(ns["_sr_finish_rid"], scheduler)("rid-1")
+        self.assertEqual(released, [])
+
+        scheduler._sr_device_poisoned = False
+        MethodType(ns["_sr_finish_rid"], scheduler)("rid-1")
+        self.assertEqual(released, [req])
 
     def test_npu_graph_runner_replay_uses_make_graph_key(self):
         src = (
@@ -1023,6 +1095,8 @@ class TestRemoteSpecDevice(CustomTestCase):
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
         ).read_text()
         self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", mixin_src)
+        self.assertIn("self._sr_device_poisoned = True", mixin_src)
+        self.assertIn("NPU context already poisoned; skip KV release", mixin_src)
 
     def test_npu_tree_draft_fia_alignment_source_guards(self):
         src = (

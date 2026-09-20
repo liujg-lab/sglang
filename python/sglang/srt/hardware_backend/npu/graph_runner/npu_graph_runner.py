@@ -104,13 +104,14 @@ class NPUGraphRunner(CudaGraphRunner):
         self._fia_payloads = {}
         self._tree_attention_impls = {}
         self._target_fia_maps = {}
+        self._last_can_run_reject = None
+        self.tree_verify_replay_count = 0
+        self.tree_verify_eager_fallback_count = 0
         super().__init__(model_runner)
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
             self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.tree_verify_replay_count = 0
-        self.tree_verify_eager_fallback_count = 0
         self._clear_tree_replay_plan()
 
     def _ensure_capture_attrs(self):
@@ -201,6 +202,8 @@ class NPUGraphRunner(CudaGraphRunner):
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if index >= len(self.capture_bs):
+            return raw_bs, None
         return raw_bs, self.capture_bs[index]
 
     def _is_tree_verify_batch(self, forward_batch: ForwardBatch) -> bool:
@@ -219,23 +222,42 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def can_run(self, forward_batch: ForwardBatch):
         self._clear_tree_replay_plan()
+        self._last_can_run_reject = None
+        is_tree_verify = self._is_tree_verify_batch(forward_batch)
         if not super().can_run(forward_batch):
+            if is_tree_verify:
+                self.tree_verify_eager_fallback_count += 1
+                self._last_can_run_reject = (
+                    f"bs_over_max_capture_bs bs={int(forward_batch.batch_size)} "
+                    f"max_bs={int(getattr(self, 'max_bs', 0) or 0)}"
+                )
             return False
         if not self.capture_bs:
+            if is_tree_verify:
+                self.tree_verify_eager_fallback_count += 1
+                self._last_can_run_reject = "empty_capture_bs"
             return False
         backend = getattr(self.model_runner, "attn_backend", None)
-        is_tree_verify = self._is_tree_verify_batch(forward_batch)
         kv_bucket = None
         fn = getattr(backend, "tree_slot_graph_can_run", None)
         if fn is not None:
             ok = bool(fn(forward_batch))
             if not ok:
+                self._last_can_run_reject = "slot_graph_reject"
                 self.tree_verify_eager_fallback_count += 1
                 return False
             if is_tree_verify:
                 kv_bucket = getattr(backend, "_replay_tree_s_cap", None)
         tokens_per_req = self._get_actual_ntpb(forward_batch)
         raw_bs, capture_bs = self._padded_capture_bs(forward_batch, tokens_per_req)
+        if capture_bs is None:
+            self._last_can_run_reject = (
+                f"bs_over_max_capture_bs bs={int(raw_bs)} "
+                f"max_bs={int(getattr(self, 'max_bs', 0) or 0)}"
+            )
+            if is_tree_verify:
+                self.tree_verify_eager_fallback_count += 1
+            return False
         stream_idx = (
             get_current_stream_idx() if getattr(self, "enable_pdmux", False) else None
         )
@@ -246,6 +268,7 @@ class NPUGraphRunner(CudaGraphRunner):
             extra=kv_bucket,
         )
         if graph_key not in self.graphs:
+            self._last_can_run_reject = "graph_key_missing"
             if is_tree_verify:
                 self.tree_verify_eager_fallback_count += 1
             return False
@@ -254,14 +277,17 @@ class NPUGraphRunner(CudaGraphRunner):
             and self._tree_attention_impls[graph_key]
             != self._current_tree_attention_impl()
         ):
+            self._last_can_run_reject = "impl_changed"
             return False
         if (
             self._current_tree_attention_impl() == IMPL_TREE_PAGED_FIA
             and getattr(self, "_target_fia_maps", {}).get(graph_key) is None
         ):
+            self._last_can_run_reject = "fia_map_missing"
             if is_tree_verify:
                 self.tree_verify_eager_fallback_count += 1
             return False
+        self._last_can_run_reject = None
         self._save_tree_replay_plan(
             TreeReplayPlan(
                 graph_key=graph_key,

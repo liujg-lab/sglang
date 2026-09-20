@@ -92,12 +92,21 @@ class SRRoundMetrics:
         self.device_module = device_module
         self.rounds = 0
         self.host = Counter()
+        self.host_max = Counter()
         self.counts = Counter()
         self.paths = Counter()
         self.device_ms = Counter()
         self.device_samples = Counter()
         self.pending = deque()
         self.active = False
+
+    def add_host(self, name, seconds):
+        if not self.active:
+            return
+        self.host[name] += seconds
+        current = self.host_max[name]
+        if seconds > current:
+            self.host_max[name] = seconds
 
     def poll(self):
         # Query only completed events. Bound the queue by skipping new samples
@@ -121,17 +130,18 @@ class SRRoundMetrics:
             self.counts["failed_rounds"] += 1
             raise
         finally:
-            self.host["total"] += time.perf_counter() - start
+            self.add_host("total", time.perf_counter() - start)
             self.active = False
             self.rounds += 1
             if self.rounds % 32 == 0:
                 self.poll()
                 logger.info(
-                    "[SR %s round] rounds=32 host_mean_ms=%s "
+                    "[SR %s round] rounds=32 host_mean_ms=%s host_max_ms=%s "
                     "device_sample_mean_ms=%s device_samples=%s "
                     "device_pending=%s counters=%s tail_attention=%s accept_len_mean=%s",
                     self.role,
                     {k: round(v * 1000 / 32, 3) for k, v in self.host.items()},
+                    {k: round(v * 1000, 3) for k, v in self.host_max.items()},
                     {
                         k: round(v / self.device_samples[k], 3)
                         for k, v in self.device_ms.items()
@@ -151,6 +161,7 @@ class SRRoundMetrics:
                     ),
                 )
                 self.host.clear()
+                self.host_max.clear()
                 self.counts.clear()
                 self.paths.clear()
                 self.device_ms.clear()
@@ -178,7 +189,7 @@ class SRRoundMetrics:
             yield
             completed = True
         finally:
-            self.host[name] += time.perf_counter() - start_time
+            self.add_host(name, time.perf_counter() - start_time)
             # Do not submit instrumentation after a failed device operation or
             # replace its original exception with a timing-event error.
             if event_pair is not None and completed:

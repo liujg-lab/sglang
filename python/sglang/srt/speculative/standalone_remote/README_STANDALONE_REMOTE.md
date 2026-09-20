@@ -246,6 +246,20 @@ NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定
 启动前设置 `SGLANG_NPU_SR_TREE_PAGED=0` 可恢复 compact-FIA；该变量只在 Draft
 初始化时读取，不是运行时热切换。`ASCEND_USE_FIA` 决定 Draft 分页树走 ATB 还是 FIA，
 与 tail 的 FIA 开关是不同维度。该默认值不影响 Target、CUDA 和 tail EXTEND。
+eager 分页树能力不受草稿图捕获 batch 上限约束：`prepare_sr_tree_paged_eager`
+只绑定本轮新建的页表，图缓冲区归 `bind_sr_tree_paged_replay` 所有。
+`raw_bs` 超出草稿图已捕获 `capture_bs` 时走一次批量 eager，不再因图缓冲区
+行数不足抛裸 `RuntimeError` 并触发请求隔离。草稿图 `capture_bs` 默认跟随
+`--cuda-graph-bs`；仅当显式设置 `SGLANG_NPU_TREE_DRAFT_CAPTURE_BS` 时才按
+该环境变量求交集限制。分页树的容量类失败统一为可回退的
+`NpuGraphPreparationError`（`scope="graph"`）。草稿图的 `block_table` 与
+`active` 都按 `(rows, pages)` 分配独立连续缓冲，不再从一块
+`(max_q, max_pages)` 共享张量切片；replay 缺键或缓冲不连续同样回退 eager。
+`SGLANG_NPU_TREE_DRAFT_CAPTURE_BS=1,2` 只作显式收窄/兜底，不是默认规避。
+实机确认 bs=4 命中图：草稿启动日志含 `4_s2/4_s4/4_s8`；`[SR Draft round]
+counters` 中 `tree_eager_batches` 为 0；`tree_forward` host 回到约 11-13ms；
+无 `ACL stream synchronize failed, error code:507011`。rows=12 上若复现
+507011，用 `SGLANG_NPU_TREE_DRAFT_CAPTURE_BS=1,2` 收窄。
 
 合格 NPU Target（`STANDALONE_REMOTE`、`topk>1`、page size 128、普通可 view 的
 MHA/GQA、FP16/BF16）**默认**使用 `tree_paged_fia`：原始 paged KV + 每请求线性页表
@@ -674,6 +688,7 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | --- | --- |
 | `rounds=32` | 汇总 32 个被计量的调度轮次，不是 32 个 token |
 | `host_mean_ms` | 各阶段主机墙钟耗时累计除以 32；包括同步等待，不是纯 CPU 计算时间 |
+| `host_max_ms` | 窗口内各阶段的单轮最大值（毫秒，不除 32）；用来区分单轮尖峰和逐轮摊平，不能与均值相减 |
 | `device_sample_mean_ms` | 已完成设备事件样本的平均毫秒数，不是全部 32 轮的设备平均 |
 | `device_samples` | 每项有效设备样本数；例如 1 就只有一次采样 |
 | `device_pending` | 尚未完成或未读取的计时事件数量；0 不代表整台设备没有待执行任务 |
@@ -694,9 +709,12 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `prefix_recovery` | 可选恢复子阶段，不能再与包含它的规划阶段重复相加 |
 | `tail_prepare_allocate` | grammar 恢复、batch 构造、KV 分配及前向输入准备 |
 | `tail_forward_seed_commit` | tail EXTEND、末位置 seed 处理和成功后事务提交 |
+| `tree_make_batch` | `_expand_tree` 内构造 decode batch；不包含 KV 分配或 attention 元数据 |
+| `tree_alloc_kv` | 树 KV 租赁或普通 paged 分配，以及随后的 mapping 写入 |
+| `tree_prepare_meta` | `ForwardBatch.init_new` 与 paged 树元数据准备；原先只出现在 `prepare_host` 日志，现在进入 round 统计 |
 | `tree_forward` | 树前向或图 replay 的主机调用区间，通常主要是异步提交 |
 | `tree_result_wait_pack` | 等待树结果、**批量** D2H 到 host staging、再按行转列表；不是每个请求 3 次 `.to("cpu")` |
-| `tree_expand_pack` | 整个树展开及结果打包，包含 tree_forward、tree_result_wait_pack 和其他准备/清理 |
+| `tree_expand_pack` | 整个树展开及结果打包，包含 tree_make_batch、tree_alloc_kv、tree_prepare_meta、tree_forward、tree_result_wait_pack 和 finally 清理；残差现在应当很小 |
 | `reply_prepare` | 将生成窗口组织为带请求身份的回复记录 |
 | `reply_send` | 调用 transport 发送回复，包括打包、发送和相关主机开销 |
 | `total` | 调度层处理本轮到回复发送结束；不包含此前 socket 空闲等待收包 |
@@ -708,9 +726,10 @@ Draft total
 ├─ tail_prepare_allocate
 ├─ tail_forward_seed_commit
 ├─ tree_expand_pack
+│  ├─ tree_make_batch / tree_alloc_kv / tree_prepare_meta
 │  ├─ tree_forward：主机提交；设备可继续异步执行
 │  ├─ tree_result_wait_pack：可能等待设备完成
-│  └─ 其他准备与清理
+│  └─ finally 清理与其余准备
 └─ reply_prepare / reply_send / 其余调度开销
 ```
 
@@ -726,6 +745,11 @@ round 从调度处理开始，到发送调用完成结束。两者显示相同�
 | `seed_recaptured` | 空 tail 但 seed 无效，走末位置重算的请求实例数；0 不表示没有正常生成 seed |
 | `prefix_recovered` | 进入前缀恢复的请求实例数 |
 | `tail_failed_requests` | tail 事务失败涉及的请求实例数；请求/token 计数在前向前记录，出现失败时不能全视为成功 |
+| `tree_graph_batches` | 本窗口 admission 成功、准备走树图的 expand 次数；CUDA / NPU 草稿都会计 |
+| `tree_eager_batches` | 本窗口走 eager 树前向的 expand 次数，含 `can_run` 拒绝和 replay 准备失败后的降级 |
+| `tree_eager_<reason>` | eager 原因细分，例如 `tree_eager_bs_over_max_capture_bs`、`tree_eager_graph_unavailable`、`tree_eager_prep_failed`；CUDA runner 无拒绝原因时记 `graph_unavailable` |
+| `tree_graph_key_first_use` | 本窗口首次见到的树图键次数；进程内每个键只计一次 |
+| `tree_graph_first_<key>` | 对应图键的首次使用，例如 `tree_graph_first_4_s4`；CUDA 无 `_tree_replay_plan` 时不会计 |
 | `failed_rounds` | 整轮抛出异常的次数 |
 
 `tail_attention={'paged_atb': 32}` 表示 tail 前向使用 paged ATB 32 次，
@@ -796,7 +820,8 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
-| `eager_fallback` | 对应 runner 记录的 eager fallback 累计数；不覆盖所有独立降级入口 |
+| `eager_fallback` | runner 累计 eager 次数。草稿 `can_run` 在 `raw_bs` 大于已捕获 `max_bs` 时会计入该值并设置 `_last_can_run_reject`。轮次口径看 `[SR Draft round] counters` 的 `tree_graph_batches` / `tree_eager_batches` / `tree_eager_<reason>`，CUDA 草稿同样可用 |
+| `tree failure stage=expand_batch ... isolate_batches=...` | 多请求 expand 失败后按请求隔离重跑；eager 分页树不再因图捕获缓冲区行数不足进入这条路径 |
 | `key=1_s512` | Draft 图键，batch 1、长度容量 bucket 512；不是实际 prefix 恰好 512 |
 | `key=r15_1_s512` | Target 图键，每请求 15 个验证位置、batch 1、容量 bucket 512 |
 | `needed_len_max=None` | 部分路径不构造旧 FIA 的主机长度统计；不能单凭 None 判断长度错误 |
@@ -876,6 +901,8 @@ PYTHONPATH=python python test/registered/unit/spec/test_standalone_remote.py
 PYTHONPATH=python python test/registered/unit/spec/test_sr_tail_extend.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_shared_prefix.py
 PYTHONPATH=python python test/registered/unit/spec/test_sr_target_tree_fia.py
+PYTHONPATH=python python test/registered/unit/spec/test_sr_tree_paged_layout.py
+PYTHONPATH=python python test/registered/unit/spec/test_tree_replay_plan.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_draft_kv_slots.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_attn_fallback.py
 ```

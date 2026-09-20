@@ -148,6 +148,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         self.paused_reqs = self.draft_paused_reqs
         self.sr_tree_drafter: Optional[SRTreeDrafter] = None
         self.sr_tree_leases = SRTreeLeaseStore()
+        self._sr_device_poisoned = False
         topk = int(self.server_args.speculative_eagle_topk or 1)
         if topk > 1:
             self.sr_tree_drafter = SRTreeDrafter(self)
@@ -546,7 +547,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.finished_reason = FINISH_ABORT("Target request finished")
         if req.req_pool_idx is not None:
             self._sr_release_tree_lease(rid)
-            self.sr_kv.release_all_kv_for_finished_req(req)
+            if getattr(self, "_sr_device_poisoned", False):
+                logger.error(
+                    "[SR] NPU context already poisoned; skip KV release for %s",
+                    rid,
+                )
+            else:
+                self.sr_kv.release_all_kv_for_finished_req(req)
         if release_mm:
             release_mm_resources(req.multimodal_inputs)
         req.multimodal_inputs = None
@@ -922,6 +929,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 )
         except Exception as e:
             if _sr_is_device_context_error(e):
+                self._sr_device_poisoned = True
                 logger.error(
                     "[SR] cache tree seed device context error for %s: %s",
                     [r.rid for r in reqs],
@@ -1466,8 +1474,10 @@ class StandaloneRemoteDraftSchedulerMixin:
                 return True
         except Exception as e:
             copy_submitted = bool(getattr(transaction, "copy_submitted", False))
+            if _sr_is_device_context_error(e):
+                self._sr_device_poisoned = True
             if (
-                _sr_is_device_context_error(e)
+                getattr(self, "_sr_device_poisoned", False)
                 or isinstance(e, NpuGraphReplaySubmittedError)
                 or (self.tp_size > 1 and (transaction.submitted or copy_submitted))
             ):
@@ -1682,6 +1692,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             raise
         except Exception as e:
             if _sr_is_device_context_error(e):
+                self._sr_device_poisoned = True
                 logger.error(
                     "[SR] tree expand device context error for %s: %s",
                     [r.rid for r in ready],

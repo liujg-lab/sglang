@@ -17,7 +17,11 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRBatchRequest,
     SRDraftRequest,
 )
-from sglang.srt.speculative.standalone_remote.sr_round_metrics import SRCommMetrics
+from sglang.srt.speculative.standalone_remote import sr_round_metrics as round_metrics
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    SRCommMetrics,
+    SRRoundMetrics,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
@@ -474,6 +478,47 @@ class TestCommMetrics(unittest.TestCase):
             metrics.flush()
             self.assertEqual(emit.call_count, 3)
             self.assertFalse(metrics.windows)
+
+
+class TestSRRoundMetrics(unittest.TestCase):
+    def test_host_max_is_single_round_not_mean_and_clears(self):
+        metrics = SRRoundMetrics("Draft")
+        for _ in range(31):
+            with metrics.round():
+                metrics.add_host("tree_expand_pack", 0.001)
+        self.assertAlmostEqual(metrics.host_max["tree_expand_pack"], 0.001)
+        self.assertAlmostEqual(metrics.host["tree_expand_pack"], 0.031)
+
+        metrics.add_host("tree_expand_pack", 9.0)
+        self.assertAlmostEqual(metrics.host_max["tree_expand_pack"], 0.001)
+        self.assertAlmostEqual(metrics.host["tree_expand_pack"], 0.031)
+
+        logged = {}
+
+        def capture(fmt, *args, **kwargs):
+            logged["mean"] = args[1]
+            logged["max"] = args[2]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            with metrics.round():
+                metrics.add_host("tree_expand_pack", 0.100)
+
+        self.assertAlmostEqual(logged["max"]["tree_expand_pack"], 100.0)
+        self.assertLess(logged["mean"]["tree_expand_pack"], 10.0)
+        self.assertFalse(metrics.host_max)
+        self.assertFalse(metrics.host)
+
+    def test_add_host_ignores_inactive_and_phase_updates_max(self):
+        metrics = SRRoundMetrics("Draft")
+        metrics.add_host("tree_prepare_meta", 0.5)
+        self.assertFalse(metrics.host)
+        self.assertFalse(metrics.host_max)
+        with metrics.round():
+            with metrics.phase("tree_alloc_kv"):
+                pass
+            metrics.add_host("tree_alloc_kv", 0.02)
+        self.assertAlmostEqual(metrics.host_max["tree_alloc_kv"], 0.02)
+        self.assertGreater(metrics.host["tree_alloc_kv"], 0.02)
 
 
 if __name__ == "__main__":

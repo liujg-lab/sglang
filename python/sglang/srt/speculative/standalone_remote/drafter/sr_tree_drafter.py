@@ -73,6 +73,19 @@ logger = logging.getLogger(__name__)
 SRTreeWindow = Tuple[List[int], Optional[List[int]], Optional[List[int]]]
 
 
+def record_tree_expand_admission(metrics, can_cuda_graph, runner) -> bool:
+    """Record one tree expand graph/eager outcome. Returns True if counted eager."""
+    if metrics is None:
+        return False
+    if can_cuda_graph:
+        metrics.counts["tree_graph_batches"] += 1
+        return False
+    metrics.counts["tree_eager_batches"] += 1
+    reason = getattr(runner, "_last_can_run_reject", None) or "graph_unavailable"
+    metrics.counts[f"tree_eager_{str(reason).split()[0]}"] += 1
+    return True
+
+
 def _as_2d(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dim() == 0:
         return tensor.unsqueeze(0).unsqueeze(0)
@@ -158,6 +171,8 @@ class SRTreeDrafter:
         self.cuda_graph_runner = None
         self._tree_failure_counts = {}
         self._tree_batch_isolate_count = 0
+        self._tree_forward_calls = 0
+        self._seen_tree_graph_keys = set()
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
         # Two host stagings so a later replay cannot overwrite a D2H that has
@@ -628,7 +643,9 @@ class SRTreeDrafter:
         verified_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scheduler = self.scheduler
-        batch = scheduler._sr_make_decode_batch(reqs)
+        metrics = getattr(scheduler, "_sr_round_metrics", None)
+        with metrics.phase("tree_make_batch") if metrics else nullcontext():
+            batch = scheduler._sr_make_decode_batch(reqs)
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -668,7 +685,8 @@ class SRTreeDrafter:
                     return (not self.in_flight()) or self.completion_confirmed
 
         txn = txn_cls()
-        token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
+        with metrics.phase("tree_alloc_kv") if metrics else nullcontext():
+            token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
         txn.allocation_owned = True
         txn.lease_state = lease_state
         txn.allocator_backup = token_to_kv_pool_state_backup
@@ -678,7 +696,6 @@ class SRTreeDrafter:
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         graph_submitted = False
-        metrics = getattr(scheduler, "_sr_round_metrics", None)
         t_prep = time.perf_counter()
         try:
             if self.draft_attn_backend is not None:
@@ -692,6 +709,8 @@ class SRTreeDrafter:
                 if prepare is not None:
                     prepare(forward_batch, batch, lease_state is not None)
             prep_s = time.perf_counter() - t_prep
+            if metrics is not None:
+                metrics.add_host("tree_prepare_meta", prep_s)
             can_fn = getattr(self, "_can_run_tree_graph", None)
             if can_fn is not None:
                 can_cuda_graph = can_fn(forward_batch)
@@ -700,6 +719,21 @@ class SRTreeDrafter:
                 can_cuda_graph = bool(
                     runner is not None and runner.can_run(forward_batch)
                 )
+            runner = getattr(self, "cuda_graph_runner", None)
+            counted_eager = record_tree_expand_admission(
+                metrics, can_cuda_graph, runner
+            )
+            if metrics is not None and can_cuda_graph and runner is not None:
+                plan = getattr(runner, "_tree_replay_plan", None)
+                key = getattr(plan, "graph_key", None)
+                seen = getattr(self, "_seen_tree_graph_keys", None)
+                if seen is None:
+                    seen = set()
+                    self._seen_tree_graph_keys = seen
+                if key is not None and key not in seen:
+                    seen.add(key)
+                    metrics.counts["tree_graph_key_first_use"] += 1
+                    metrics.counts[f"tree_graph_first_{key}"] += 1
             t_exec = time.perf_counter()
             with (
                 metrics.phase("tree_forward", device=True) if metrics else nullcontext()
@@ -728,6 +762,11 @@ class SRTreeDrafter:
                                 runner.tree_eager_fallback_count = (
                                     getattr(runner, "tree_eager_fallback_count", 0) + 1
                                 )
+                                if hasattr(runner, "_last_can_run_reject"):
+                                    runner._last_can_run_reject = "prep_failed"
+                        if metrics is not None and not counted_eager:
+                            metrics.counts["tree_eager_batches"] += 1
+                            metrics.counts["tree_eager_prep_failed"] += 1
                         can_cuda_graph = False
                 if not can_cuda_graph:
                     if (
@@ -786,16 +825,22 @@ class SRTreeDrafter:
                 )
         runner = self.cuda_graph_runner
         replay_n = getattr(runner, "tree_graph_replay_count", 0) if runner else 0
-        if replay_n <= 1 or replay_n % 8 == 0:
+        self._tree_forward_calls = getattr(self, "_tree_forward_calls", 0) + 1
+        calls = self._tree_forward_calls
+        reason = None if can_cuda_graph else (
+            getattr(runner, "_last_can_run_reject", None) or "graph_unavailable"
+        )
+        if calls <= 1 or calls % 8 == 0:
             logger.info(
                 "[SR] tree draft timings: prepare_host=%.3fs "
                 "forward_call_host=%.3fs graph=%s "
-                "replay=%s eager_fallback=%s",
+                "replay=%s eager_fallback=%s reason=%s",
                 prep_s,
                 exec_s,
                 can_cuda_graph,
                 replay_n,
                 getattr(runner, "tree_eager_fallback_count", 0) if runner else 0,
+                reason,
             )
         return parent_list, top_scores_index, draft_tokens
 

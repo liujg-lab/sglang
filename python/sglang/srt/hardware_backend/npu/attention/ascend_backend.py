@@ -973,9 +973,10 @@ class AscendAttnBackend(AttentionBackend):
                 if buckets
                 else None
             )
-            dest = getattr(self, "cuda_graph_paged_block_tables", None)
-            if not page_buckets and dest is not None and dest.ndim == 2:
-                page_buckets = [int(dest.shape[1])]
+            if not page_buckets:
+                max_pages = getattr(self, "_paged_graph_max_pages", None)
+                if max_pages is not None:
+                    page_buckets = [max(int(max_pages), 1)]
             if not page_buckets:
                 self._replay_tree_s_cap = None
                 return False
@@ -1754,12 +1755,17 @@ class AscendAttnBackend(AttentionBackend):
             page = max(int(self.page_size), 1)
             max_pages = max((int(slot_max_kv) + page - 1) // page, 1)
             if self._paged_impl_selected():
-                self.cuda_graph_paged_block_tables = torch.zeros(
-                    (max_q, max_pages), dtype=torch.int32, device=self.device
-                )
-                self.cuda_graph_paged_active = torch.zeros(
-                    (max_q,), dtype=torch.bool, device=self.device
-                )
+                # One contiguous buffer per (rows, pages) in both maps.
+                # Sharing a max-shaped tensor and slicing dest[:rows, :pages]
+                # yields a strided view that ATB paged attention does not
+                # accept (ACL 507011). active contents depend only on
+                # rows/raw_bs, not pages, so sharing one active across page
+                # buckets used to be semantically safe; the maps still use
+                # the same (rows, pages) key so an operator that later
+                # reads active does not have to re-derive that invariant.
+                self.cuda_graph_paged_tables = {}
+                self.cuda_graph_paged_actives = {}
+                self._paged_graph_max_pages = max_pages
             self._tree_scratch_max_rows = 0
             self._tree_scratch_max_cols = 0
         else:
@@ -4078,19 +4084,8 @@ class AscendAttnMultiStepDraftBackend:
             self.speculative_num_steps,
             dummy_page=dummy_page,
         )
-        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
+        # Graph buffers belong to bind_sr_tree_paged_replay; eager binds fresh tables.
         dummy = int(dummy_page)
-        if dest is not None:
-            dest.fill_(dummy)
-            rows, cols = int(tables.shape[0]), int(tables.shape[1])
-            if dest.shape[0] < rows or dest.shape[1] < cols:
-                raise RuntimeError("paged tree block_tables exceed graph buffer")
-            dest[:rows, :cols].copy_(tables)
-            act = getattr(inner0, "cuda_graph_paged_active", None)
-            if act is not None:
-                act.zero_()
-                n_act = min(int(act.numel()), int(active.numel()))
-                act[:n_act].copy_(active[:n_act].to(device=act.device))
         self._paged_round_tables = tables
         self._paged_round_active = active
         self._paged_round_prefix = prefix_lens_cpu
@@ -4137,32 +4132,82 @@ class AscendAttnMultiStepDraftBackend:
             inner.forward_metadata.block_tables = tables
         return copied
 
-    def _paged_graph_table_view(self, capture_bs: int, max_pages: int, dummy_page: int):
+    def _paged_graph_table_view(
+        self,
+        capture_bs: int,
+        max_pages: int,
+        dummy_page: int,
+        allow_alloc: bool = False,
+    ):
+        """Return the exact-shape contiguous buffer for (rows, pages).
+
+        Capture may allocate. Replay must reuse the captured tensor so ATB
+        sees the same storage it captured; a slice of a larger buffer is a
+        strided view and is rejected.
+        """
+        del dummy_page
         rows = int(capture_bs) * int(self.topk)
         pages = max(int(max_pages), 1)
-        dummy = int(dummy_page)
         inner0 = self.attn_backends[0]
-        device = inner0.device
-        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
-        if dest is not None:
-            if dest.shape[0] < rows or dest.shape[1] < pages:
-                raise RuntimeError("paged tree capture view exceeds graph buffer")
-            tables = dest[:rows, :pages]
-            act = getattr(inner0, "cuda_graph_paged_active", None)
-            if act is not None:
-                active = act[:rows]
-            else:
+        tables_map = getattr(inner0, "cuda_graph_paged_tables", None)
+        actives_map = getattr(inner0, "cuda_graph_paged_actives", None)
+        if tables_map is None or actives_map is None:
+            if not allow_alloc:
+                raise NpuGraphPreparationError(
+                    f"paged tree graph buffer missing for ({rows}, {pages})",
+                    scope="graph",
+                )
+            tables_map = {}
+            actives_map = {}
+            inner0.cuda_graph_paged_tables = tables_map
+            inner0.cuda_graph_paged_actives = actives_map
+        key = (rows, pages)
+        tables = tables_map.get(key)
+        active = actives_map.get(key)
+        if tables is None or active is None:
+            if not allow_alloc:
+                raise NpuGraphPreparationError(
+                    f"paged tree graph buffer missing for ({rows}, {pages})",
+                    scope="graph",
+                )
+            device = getattr(inner0, "device", None)
+            if device is None:
+                raise NpuGraphPreparationError(
+                    "paged tree graph buffer device missing", scope="graph"
+                )
+            if tables is None:
+                tables = torch.zeros((rows, pages), dtype=torch.int32, device=device)
+                tables_map[key] = tables
+            if active is None:
                 active = torch.zeros((rows,), dtype=torch.bool, device=device)
-        else:
-            tables = make_dummy_block_tables(rows, pages, dummy, device=device)
-            active = torch.zeros((rows,), dtype=torch.bool, device=device)
+                actives_map[key] = active
+        if (
+            int(tables.ndim) != 2
+            or tuple(int(x) for x in tables.shape) != (rows, pages)
+            or (not tables.is_contiguous())
+            or tuple(int(x) for x in tables.stride()) != (pages, 1)
+        ):
+            raise NpuGraphPreparationError(
+                f"paged tree graph tables shape {tuple(tables.shape)} "
+                f"stride {tuple(tables.stride())} violate contiguous "
+                f"({rows}, {pages})",
+                scope="graph",
+            )
+        if int(active.numel()) != rows or (not active.is_contiguous()):
+            raise NpuGraphPreparationError(
+                f"paged tree graph active {int(active.numel())} "
+                f"contiguous={active.is_contiguous()} != {rows}",
+                scope="graph",
+            )
         return tables, active
 
     def bind_sr_tree_paged_capture(self, capture_bs: int, max_pages: int, dummy_page: int):
         if not self.paged_impl_selected():
             return
         dummy = int(dummy_page)
-        tables, active = self._paged_graph_table_view(capture_bs, max_pages, dummy)
+        tables, active = self._paged_graph_table_view(
+            capture_bs, max_pages, dummy, allow_alloc=True
+        )
         tables.fill_(dummy)
         active.zero_()
         impl = self.attn_backends[0].tree_attention_impl
@@ -4226,7 +4271,6 @@ class AscendAttnMultiStepDraftBackend:
                 "missing paged tree source tables", scope="graph"
             )
         need_src = raw_bs * topk
-        need_cap = capture_bs * topk
         if int(src.dim()) != 2 or int(src.shape[0]) != need_src:
             raise NpuGraphPreparationError(
                 f"paged tree source rows {tuple(src.shape)} != {need_src}",
@@ -4242,28 +4286,13 @@ class AscendAttnMultiStepDraftBackend:
                 f"paged tree source cols {int(src.shape[1])} > bucket {max_pages}",
                 scope="graph",
             )
-        inner0 = self.attn_backends[0]
-        dest = getattr(inner0, "cuda_graph_paged_block_tables", None)
-        dest_act = getattr(inner0, "cuda_graph_paged_active", None)
-        if dest is None or dest_act is None:
-            raise NpuGraphPreparationError(
-                "missing paged tree capture buffers", scope="graph"
-            )
-        if int(dest.shape[0]) < need_cap or int(dest.shape[1]) < max_pages:
-            raise NpuGraphPreparationError(
-                f"paged tree capture tables {tuple(dest.shape)} "
-                f"< ({need_cap}, {max_pages})",
-                scope="graph",
-            )
-        if int(dest_act.numel()) < need_cap:
-            raise NpuGraphPreparationError(
-                f"paged tree capture active {int(dest_act.numel())} < {need_cap}",
-                scope="graph",
-            )
         dummy = int(
             getattr(self, "_paged_round_dummy", getattr(self, "_paged_dummy_page", 0))
         )
-        return prefix, src, src_act, dest, dest_act, dummy, raw_bs, capture_bs, max_pages, topk
+        tables, active = self._paged_graph_table_view(
+            capture_bs, max_pages, dummy, allow_alloc=False
+        )
+        return prefix, src, src_act, tables, active, dummy, raw_bs, capture_bs, max_pages, topk
 
     def bind_sr_tree_paged_replay(self, capture_bs: int, max_pages: int):
         if not self.paged_impl_selected():
@@ -4272,8 +4301,8 @@ class AscendAttnMultiStepDraftBackend:
             prefix,
             src,
             src_act,
-            dest,
-            dest_act,
+            tables,
+            active,
             dummy,
             _raw_bs,
             capture_bs,
@@ -4281,10 +4310,7 @@ class AscendAttnMultiStepDraftBackend:
             topk,
         ) = self._validate_sr_tree_paged_replay(capture_bs, max_pages)
         need_src = int(src.shape[0])
-        need_cap = int(capture_bs) * int(topk)
         src_cols = int(src.shape[1])
-        tables = dest[:need_cap, :max_pages]
-        active = dest_act[:need_cap]
         tables.fill_(dummy)
         active.zero_()
         tables[:need_src, :src_cols].copy_(src)
