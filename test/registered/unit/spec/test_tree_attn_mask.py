@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.speculative.tree_attn_mask import (
     FIA_TREE_MASK_CONTRACT,
+    FIA_TREE_MASK_CONTRACT_BSND,
     custom_mask_to_ascend_masked,
     inplace_update_graph_tree_attn_mask,
     iter_full_mask_rows,
@@ -76,6 +77,11 @@ class TestTreeAttnMask(CustomTestCase):
         self.assertEqual(FIA_TREE_MASK_CONTRACT["ascend_true"], "masked")
         self.assertEqual(FIA_TREE_MASK_CONTRACT["sparse_mode"], 0)
         self.assertFalse(FIA_TREE_MASK_CONTRACT["fia_consumes_mask"])
+        self.assertEqual(FIA_TREE_MASK_CONTRACT["layout"], "TND")
+        self.assertEqual(FIA_TREE_MASK_CONTRACT_BSND["layout"], "BSND")
+        self.assertEqual(FIA_TREE_MASK_CONTRACT_BSND["sparse_mode"], 0)
+        self.assertTrue(FIA_TREE_MASK_CONTRACT_BSND["fia_consumes_mask"])
+        self.assertIn("[B, 1, Q, S]", FIA_TREE_MASK_CONTRACT_BSND["shape"])
         # seq_len=1, num_draft=2 → two rows of length 3.
         custom = torch.tensor(
             [True, True, True, True, True, True], dtype=torch.bool

@@ -49,6 +49,16 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     read_sr_tree_paged_env,
     select_page_bucket,
 )
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+    IMPL_TREE_PAGED_FIA,
+    SRTargetTreeFiaMetadata,
+    fill_target_tree_fia_metadata_,
+    maybe_select_target_tree_fia,
+    pages_for_s_cap,
+    prime_target_tree_fia_capture_,
+    read_sr_target_tree_fia_env,
+    target_tree_fia_blocked_extra_combos,
+)
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
@@ -125,6 +135,7 @@ class ForwardMetadata:
     tree_shared: Optional[SharedPrefixMetadata] = None
     sr_tail: Optional[SRTailAttentionMetadata] = None
     sr_tree_paged: Optional[SRTreePagedMetadata] = None
+    sr_target_tree_fia: Optional[SRTargetTreeFiaMetadata] = None
 
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
@@ -427,6 +438,8 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self._shared_graph_metadata = {}
+        self._target_fia_graph_metadata = {}
+        self._target_fia_dummy_page = 0
         self._init_tree_shared_prefix()
 
     def _paged_impl_selected(self) -> bool:
@@ -511,6 +524,17 @@ class AscendAttnBackend(AttentionBackend):
                 "paged_fia" if getattr(self, "use_fia", False) else "paged_atb"
             )
             reason = None
+        extra = target_tree_fia_blocked_extra_combos(args)
+        self.tree_attention_impl, reason = maybe_select_target_tree_fia(
+            self.tree_attention_impl,
+            reason,
+            requested=read_sr_target_tree_fia_env(),
+            capable=paged_capable,
+            extra_reason=extra,
+            page_size=self.page_size,
+            role=getattr(args, "standalone_remote_role", None),
+            verify_topk=self.verify_tree_topk,
+        )
         logger.info(
             "NPU SR tree attention implementation=%s fallback_reason=%s",
             self.tree_attention_impl,
@@ -519,6 +543,73 @@ class AscendAttnBackend(AttentionBackend):
 
     def _use_tree_shared_prefix(self):
         return getattr(self, "tree_attention_impl", None) == SHARED_PREFIX_IMPL
+
+    def _use_target_tree_paged_fia(self):
+        return getattr(self, "tree_attention_impl", None) == IMPL_TREE_PAGED_FIA
+
+    def _target_fia_metadata(self, bs, queries, pages, *, graph):
+        key = (int(bs), int(queries), int(pages))
+        cache = getattr(self, "_target_fia_graph_metadata", None)
+        if cache is None:
+            cache = {}
+            self._target_fia_graph_metadata = cache
+        if graph and key in cache:
+            return cache[key]
+        md = SRTargetTreeFiaMetadata.allocate(
+            bs, queries, pages, self.page_size, self.device
+        )
+        if graph:
+            cache[key] = md
+        return md
+
+    def _prepare_target_tree_fia_eager(self, batch) -> bool:
+        """Allocate page-aligned metadata for the real batch. Always succeeds."""
+        lengths, raw_bs = self._tree_verify_mask_layout(
+            batch.spec_info, batch.seq_lens_cpu
+        )
+        queries = int(batch.spec_info.draft_token_num)
+        prefixes = cpu_prefix_lengths(lengths, raw_bs)
+        needed = max((p + queries for p in prefixes), default=queries)
+        pages = pages_for_s_cap(needed, self.page_size)
+        md = self._target_fia_metadata(raw_bs, queries, pages, graph=False)
+        fill_target_tree_fia_metadata_(
+            md,
+            self.req_to_token,
+            batch.req_pool_indices,
+            batch.spec_info.custom_mask,
+            prefixes,
+            queries,
+            raw_bs,
+            dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
+        )
+        self.forward_metadata.sr_target_tree_fia = md
+        return True
+
+    def _run_sr_target_tree_fia(self, q, k_cache, v_cache, layer):
+        md = getattr(self.forward_metadata, "sr_target_tree_fia", None)
+        if md is None:
+            raise RuntimeError("target tree FIA metadata missing")
+        bs = int(md.block_tables.shape[0])
+        queries = int(md.blocked_mask.shape[2])
+        hq = layer.tp_q_head_num
+        hkv = layer.tp_k_head_num
+        query = q.reshape(bs, queries, hq, layer.qk_head_dim)
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            k_cache.view(-1, self.page_size, hkv * layer.qk_head_dim),
+            v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+            input_layout="BSND",
+            num_heads=hq,
+            num_key_value_heads=hkv,
+            scale=layer.scaling,
+            block_table=md.block_tables,
+            block_size=self.page_size,
+            atten_mask=md.blocked_mask,
+            actual_seq_lengths=md.q_lens_cpu,
+            actual_seq_lengths_kv=md.kv_lens_cpu,
+            sparse_mode=0,
+        )
+        return output.reshape(bs * queries, hq * layer.v_head_dim)
 
     def _shared_metadata(self, bs, queries, width, *, draft, graph):
         key = (bs, queries, width, draft)
@@ -801,7 +892,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def tree_slot_graph_width(self) -> Optional[int]:
         """Captured slot-table columns, or None before graph buffers exist."""
-        if self._use_tree_shared_prefix():
+        if self._use_tree_shared_prefix() or self._use_target_tree_paged_fia():
             return (
                 self._replay_tree_s_cap
                 or self._active_tree_s_cap
@@ -1047,7 +1138,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.tree_verify_kv_lens_t = lens
 
     def _sync_active_tree_s_cap(self) -> None:
-        if self._use_tree_shared_prefix():
+        if self._use_tree_shared_prefix() or self._use_target_tree_paged_fia():
             self._active_tree_s_cap = (
                 getattr(self, "_shared_capture_width", None) or self._replay_tree_s_cap
             )
@@ -1477,6 +1568,14 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        if (
+            self._use_target_tree_paged_fia()
+            and forward_batch.forward_mode.is_target_verify()
+            and self.verify_tree_topk > 1
+        ):
+            self._prepare_target_tree_fia_eager(forward_batch)
+            self.graph_mode = False
+            return
         if self._use_tree_shared_prefix() and (
             self._is_tree_draft(forward_batch)
             or (
@@ -1651,15 +1750,16 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.tree_kv_buckets:
             slot_max_kv = max(self.tree_kv_buckets)
-        if self._paged_impl_selected():
+        if self._paged_impl_selected() or self._use_target_tree_paged_fia():
             page = max(int(self.page_size), 1)
             max_pages = max((int(slot_max_kv) + page - 1) // page, 1)
-            self.cuda_graph_paged_block_tables = torch.zeros(
-                (max_q, max_pages), dtype=torch.int32, device=self.device
-            )
-            self.cuda_graph_paged_active = torch.zeros(
-                (max_q,), dtype=torch.bool, device=self.device
-            )
+            if self._paged_impl_selected():
+                self.cuda_graph_paged_block_tables = torch.zeros(
+                    (max_q, max_pages), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_paged_active = torch.zeros(
+                    (max_q,), dtype=torch.bool, device=self.device
+                )
             self._tree_scratch_max_rows = 0
             self._tree_scratch_max_cols = 0
         else:
@@ -1677,21 +1777,22 @@ class AscendAttnBackend(AttentionBackend):
         self.cuda_graph_verify_positions = torch.empty(
             (max_q,), dtype=torch.int64, device=self.device
         )
+        skip_slots = self._use_tree_shared_prefix() or self._use_target_tree_paged_fia()
         self.cuda_graph_kv_slots = (
             None
-            if self._use_tree_shared_prefix()
+            if skip_slots
             else torch.zeros(
                 (max_q, slot_max_kv), dtype=torch.int64, device=self.device
             )
         )
         self.cuda_graph_kv_lens = (
             None
-            if self._use_tree_shared_prefix()
+            if skip_slots
             else torch.zeros((max_q,), dtype=torch.int32, device=self.device)
         )
         self.cuda_graph_verify_workspace = (
             None
-            if self._use_tree_shared_prefix()
+            if skip_slots
             else torch.zeros(
                 (max_q, slot_max_kv + 1), dtype=torch.int64, device=self.device
             )
@@ -1741,6 +1842,27 @@ class AscendAttnBackend(AttentionBackend):
             and spec_info is not None
             and not forward_mode.is_target_verify()
         )
+        if self._use_target_tree_paged_fia() and (
+            forward_mode.is_target_verify() and self.verify_tree_topk > 1
+        ):
+            queries = num_tokens // bs
+            s_cap = int(
+                getattr(self, "_shared_capture_width", None)
+                or self._active_tree_s_cap
+                or max(self.tree_kv_buckets, default=self.tree_graph_max_kv)
+            )
+            pages = pages_for_s_cap(s_cap, self.page_size)
+            metadata.sr_target_tree_fia = self._target_fia_metadata(
+                bs, queries, pages, graph=True
+            )
+            prime_target_tree_fia_capture_(
+                metadata.sr_target_tree_fia,
+                dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
+            )
+            self.graph_metadata[bs] = metadata
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
         if self._use_tree_shared_prefix() and (
             draft or (forward_mode.is_target_verify() and self.verify_tree_topk > 1)
         ):
@@ -1889,6 +2011,35 @@ class AscendAttnBackend(AttentionBackend):
             and spec_info is not None
             and forward_mode.is_decode_or_idle()
         )
+        if self._use_target_tree_paged_fia() and (
+            forward_mode.is_target_verify() and self.verify_tree_topk > 1
+        ):
+            queries = int(spec_info.draft_token_num)
+            s_cap = int(self._replay_tree_s_cap or self._active_tree_s_cap)
+            pages = pages_for_s_cap(s_cap, self.page_size)
+            key = (int(bs), int(queries), int(pages))
+            cache = getattr(self, "_target_fia_graph_metadata", {})
+            if key not in cache:
+                raise NpuGraphPreparationError(
+                    "missing captured target tree FIA buffers", scope="graph"
+                )
+            md = cache[key]
+            lengths, raw_bs = self._tree_verify_mask_layout(spec_info, seq_lens_cpu)
+            prefixes = cpu_prefix_lengths(lengths, raw_bs)
+            fill_target_tree_fia_metadata_(
+                md,
+                self.req_to_token,
+                req_pool_indices,
+                spec_info.custom_mask,
+                prefixes,
+                queries,
+                raw_bs,
+                dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
+            )
+            metadata.sr_target_tree_fia = md
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
         if self._use_tree_shared_prefix() and (
             draft or (forward_mode.is_target_verify() and self.verify_tree_topk > 1)
         ):
@@ -3029,6 +3180,18 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
+
+        if (
+            self._use_target_tree_paged_fia()
+            and forward_batch.forward_mode.is_target_verify()
+            and getattr(self.forward_metadata, "sr_target_tree_fia", None) is not None
+        ):
+            return self._run_sr_target_tree_fia(
+                q,
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                layer,
+            )
 
         if (
             self._use_tree_shared_prefix()

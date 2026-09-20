@@ -350,7 +350,8 @@ class TestTreeReplayPlan(CustomTestCase):
             _NPU_GRAPH_RUNNER, "NPUGraphRunner", "replay"
         )
         self.assertIn("run_npu_graph_update_and_replay", target_replay)
-        self.assertNotIn("overlap=", target_replay)
+        self.assertIn("overlap=False", target_replay)
+        self.assertNotIn("overlap=True", target_replay)
         self.assertIn("_assert_tree_replay_graph", target_replay)
         self.assertIn("NpuGraphReplaySubmittedError", target_replay)
         self.assertIn("output_buffers[graph_key]", target_replay)

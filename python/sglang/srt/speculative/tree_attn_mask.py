@@ -3,11 +3,12 @@
 CUDA ``custom_mask`` is flattened FULL_MASK with True = can attend.
 Ascend ``atten_mask`` uses True = masked (see ``generate_mask_flag``).
 
-FIA currently cannot consume a tree mask: CheckFAIMask requires
-``sparse_mode=3`` whenever ``atten_mask`` is set, and mode 3 is linear
-causal only. TARGET_VERIFY with ``topk>1`` uses slot-gather fallback in
-``tree_attn_fallback`` instead of passing this mask to FIA. The conversion
-helpers remain for polarity tests and a future FIA tree path.
+The original TND helpers keep ``FIA_TREE_MASK_CONTRACT``:
+``sparse_mode=3`` is linear causal only, so that path still does not feed a
+tree mask to FIA. Target ``tree_paged_fia`` uses a separate BSND contract
+(``FIA_TREE_MASK_CONTRACT_BSND``): paged KV, per-request ``[B,1,Q,S]`` mask,
+and ``sparse_mode=0``. Do not change the old contract; old TND tests depend
+on ``fia_consumes_mask=False``.
 """
 
 from __future__ import annotations
@@ -24,6 +25,15 @@ FIA_TREE_MASK_CONTRACT = {
     "sparse_mode": 0,
     "fia_consumes_mask": False,
     "shape": "[T, S] = [bs * num_draft, max_kv]",
+}
+
+FIA_TREE_MASK_CONTRACT_BSND = {
+    "cuda_true": "attend",
+    "ascend_true": "masked",
+    "layout": "BSND",
+    "sparse_mode": 0,
+    "fia_consumes_mask": True,
+    "shape": "[B, 1, Q, S] = [bs, 1, num_draft, pages * page_size]",
 }
 
 SeqLens = Union[torch.Tensor, Sequence[int]]

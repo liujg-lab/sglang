@@ -38,7 +38,14 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
+    expand_fia_cpu_update_inputs,
+    fill_fia_cpu_update_payload,
     run_npu_graph_update_and_replay,
+)
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+    IMPL_TREE_PAGED_FIA,
+    TARGET_TREE_FIA_KV_ATTR,
+    validate_target_tree_fia_records,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
     TreeReplayPlan,
@@ -96,6 +103,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.update_attr_type = None
         self._fia_payloads = {}
         self._tree_attention_impls = {}
+        self._target_fia_maps = {}
         super().__init__(model_runner)
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
@@ -110,6 +118,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self._init_arch_map()
         if getattr(self, "_fia_payloads", None) is None:
             self._fia_payloads = {}
+        if getattr(self, "_target_fia_maps", None) is None:
+            self._target_fia_maps = {}
 
     def capture(self):
         self._ensure_capture_attrs()
@@ -245,6 +255,13 @@ class NPUGraphRunner(CudaGraphRunner):
             != self._current_tree_attention_impl()
         ):
             return False
+        if (
+            self._current_tree_attention_impl() == IMPL_TREE_PAGED_FIA
+            and getattr(self, "_target_fia_maps", {}).get(graph_key) is None
+        ):
+            if is_tree_verify:
+                self.tree_verify_eager_fallback_count += 1
+            return False
         self._save_tree_replay_plan(
             TreeReplayPlan(
                 graph_key=graph_key,
@@ -307,14 +324,15 @@ class NPUGraphRunner(CudaGraphRunner):
     ):
         backend = self.model_runner.attn_backend
         shared = getattr(backend, "_use_tree_shared_prefix", lambda: False)()
-        if shared:
+        target_fia = getattr(backend, "_use_target_tree_paged_fia", lambda: False)()
+        if shared or target_fia:
             backend._shared_capture_width = getattr(self, "_active_capture_extra", None)
         try:
             graph, out = super().capture_one_batch_size(
                 bs, forward, stream_idx, ntpb_override
             )
         finally:
-            if shared:
+            if shared or target_fia:
                 backend._shared_capture_width = None
         self._ensure_capture_attrs()
         self.update_attr_name = self._get_update_attr_name()
@@ -330,9 +348,76 @@ class NPUGraphRunner(CudaGraphRunner):
             self._tree_attention_impls[key] = self._current_tree_attention_impl()
             if shared:
                 return graph, out
+            if target_fia:
+                self._bind_target_tree_fia_payload(graph, key, bs)
+                return graph, out
         n_lens = int(bs) * int(ntpb) if extra is not None else int(bs)
         self._fia_payloads[key] = [{self.update_attr_name: [1] * n_lens}]
         return graph, out
+
+    def _iter_graph_dispatch_records(self, graph):
+        mode = getattr(graph, "graph_dispatch_mode", None)
+        records = (
+            getattr(mode, "graph_dispatch_records", None) if mode is not None else None
+        )
+        if records is None:
+            records = getattr(graph, "graph_dispatch_records", None)
+        return records
+
+    def _num_model_layers(self):
+        model = self.model_runner.model
+        start = getattr(model, "start_layer", None)
+        end = getattr(model, "end_layer", None)
+        if start is None or end is None:
+            inner = getattr(model, "model", None)
+            if start is None:
+                start = getattr(inner, "start_layer", 0)
+            if end is None:
+                end = getattr(inner, "end_layer", None)
+        if end is None:
+            raise NpuGraphPreparationError(
+                "model end_layer is unavailable for NPU tree graph update",
+                scope="format",
+            )
+        return int(end) - int(start or 0)
+
+    def _bind_target_tree_fia_payload(self, graph, key, bs):
+        self.update_attr_name = TARGET_TREE_FIA_KV_ATTR
+        try:
+            num_layers = self._num_model_layers()
+            records = self._iter_graph_dispatch_records(graph)
+            n_records, step_ids = validate_target_tree_fia_records(
+                records, num_layers, self.update_attr_name
+            )
+            placeholder = [1] * int(bs)
+            payload = expand_fia_cpu_update_inputs(
+                [placeholder], num_layers, self.update_attr_name
+            )
+            self._fia_payloads[key] = payload
+            self._target_fia_maps[key] = {
+                "n_records": n_records,
+                "num_layers": num_layers,
+                "step_ids": step_ids,
+                "bs": int(bs),
+                "payload": payload,
+                "attr_name": self.update_attr_name,
+            }
+        except NpuGraphPreparationError:
+            self._target_fia_maps[key] = None
+
+    def _update_target_tree_fia_inputs(self, info, kv_lens):
+        fill_fia_cpu_update_payload(
+            info["payload"],
+            [list(kv_lens)],
+            info["step_ids"],
+            info["attr_name"],
+        )
+        graph = self._tree_replay_graph
+        if graph is None:
+            raise NpuGraphPreparationError(
+                "target tree FIA replay graph missing", scope="graph"
+            )
+        graph.update(cpu_update_input=info["payload"])
 
     def _update_inputs(self, seq_lens, graph_key=None):
         if isinstance(self.update_attr_type, torch.Tensor):
@@ -456,17 +541,50 @@ class NPUGraphRunner(CudaGraphRunner):
 
             self.update_attr_name = self._get_update_attr_name()
             self.update_attr_type = self._get_update_attr_type()
+            target_fia = bool(
+                backend is not None
+                and getattr(backend, "_use_target_tree_paged_fia", lambda: False)()
+            )
             compact_fia = bool(
                 backend is not None
                 and getattr(backend, "_use_tree_compact_fia", lambda: False)()
                 and not getattr(backend, "_use_tree_shared_prefix", lambda: False)()
+                and not target_fia
             )
             skip_fia_update = is_deepseek_nsa(
                 self.model_runner.model_config.hf_config
-            ) or (is_tree_verify and not compact_fia)
+            ) or (is_tree_verify and not compact_fia and not target_fia)
             seq_lens = None
             if not skip_fia_update:
-                if is_tree_verify and compact_fia:
+                if is_tree_verify and target_fia:
+                    info = getattr(self, "_target_fia_maps", {}).get(graph_key)
+                    if info is None:
+                        raise NpuGraphPreparationError(
+                            "target tree FIA payload missing", scope="graph"
+                        )
+                    md = getattr(
+                        getattr(backend, "forward_metadata", None),
+                        "sr_target_tree_fia",
+                        None,
+                    )
+                    if md is None:
+                        raise NpuGraphPreparationError(
+                            "target tree FIA metadata missing", scope="graph"
+                        )
+                    kv_lens = list(md.kv_lens_cpu)
+                    if len(kv_lens) != int(self.bs):
+                        raise NpuGraphPreparationError(
+                            f"target tree FIA kv_lens {len(kv_lens)} != "
+                            f"capture_bs {self.bs}",
+                            scope="graph",
+                        )
+                    seq_lens = kv_lens
+                    run_npu_graph_update_and_replay(
+                        lambda: self._update_target_tree_fia_inputs(info, kv_lens),
+                        graph.replay,
+                        overlap=False,
+                    )
+                elif is_tree_verify and compact_fia:
                     ntpb = actual_ntpb
                     capture_rows = int(self.bs) * int(ntpb)
                     kv_lens = getattr(backend, "tree_fia_kv_lens_cpu", None)
@@ -485,18 +603,26 @@ class NPUGraphRunner(CudaGraphRunner):
                             kv_lens, capture_rows
                         )
                     seq_lens = kv_lens
+                    run_npu_graph_update_and_replay(
+                        lambda: self._update_inputs(seq_lens, graph_key),
+                        graph.replay,
+                    )
                 elif forward_batch.forward_mode.is_target_verify():
                     ntpb = actual_ntpb
                     seq_lens_cpu = forward_batch.seq_lens.cpu() + ntpb
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                    run_npu_graph_update_and_replay(
+                        lambda: self._update_inputs(seq_lens, graph_key),
+                        graph.replay,
+                    )
                 else:
                     seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                         self.bs - self.raw_bs
                     )
-                run_npu_graph_update_and_replay(
-                    lambda: self._update_inputs(seq_lens, graph_key),
-                    graph.replay,
-                )
+                    run_npu_graph_update_and_replay(
+                        lambda: self._update_inputs(seq_lens, graph_key),
+                        graph.replay,
+                    )
             else:
                 replay_error = None
                 try:
@@ -515,15 +641,20 @@ class NPUGraphRunner(CudaGraphRunner):
                 ):
                     logger.info(
                         "NPU tree verify graph replay count=%s bucket=%s key=%s "
-                        "needed_len_max=%s eager_fallback=%s implementation=%s",
+                        "needed_len_max=%s raw_bs=%s capture_bs=%s "
+                        "eager_fallback=%s implementation=%s",
                         self.tree_verify_replay_count,
                         kv_bucket,
                         graph_key,
                         (
                             max(seq_lens)
-                            if not skip_fia_update and is_tree_verify and compact_fia
+                            if not skip_fia_update
+                            and is_tree_verify
+                            and (compact_fia or target_fia)
                             else None
                         ),
+                        getattr(self, "raw_bs", None),
+                        getattr(self, "bs", None),
                         self.tree_verify_eager_fallback_count,
                         self._current_tree_attention_impl(),
                     )

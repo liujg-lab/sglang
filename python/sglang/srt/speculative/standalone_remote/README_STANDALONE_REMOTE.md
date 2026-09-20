@@ -244,18 +244,29 @@ NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定
 合格 NPU Draft（`topk>1` 且 `page_size>1`）**默认**使用原生分页树 attention
 （`paged_atb` / `paged_fia`），无需设置 `SGLANG_NPU_SR_TREE_PAGED=1`。
 启动前设置 `SGLANG_NPU_SR_TREE_PAGED=0` 可恢复 compact-FIA；该变量只在 Draft
-初始化时读取，不是运行时热切换。`ASCEND_USE_FIA` 决定分页树走 ATB 还是 FIA，
+初始化时读取，不是运行时热切换。`ASCEND_USE_FIA` 决定 Draft 分页树走 ATB 还是 FIA，
 与 tail 的 FIA 开关是不同维度。该默认值不影响 Target、CUDA 和 tail EXTEND。
-Target 可选 `shared_prefix_torch`，按请求分块共享 prefix KV，与祖先路径统一 softmax。
+
+合格 NPU Target（`STANDALONE_REMOTE`、`topk>1`、page size 128、普通可 view 的
+MHA/GQA、FP16/BF16）**默认**使用 `tree_paged_fia`：原始 paged KV + 每请求线性页表
++ `[B,1,Q,S]` 树 mask，每层一次 BSND FIA（`sparse_mode=0`）。这与旧 TND 路径
+（`FIA_TREE_MASK_CONTRACT`，`fia_consumes_mask=False`）不同，见
+`FIA_TREE_MASK_CONTRACT_BSND`。启动前设置 `SGLANG_NPU_SR_TARGET_TREE_FIA=0`
+可恢复 `shared_prefix_torch`；该变量只在 Target 初始化时读取，不依赖
+`ASCEND_USE_FIA`，也不是运行时热切换。能力不满足、或 DP attention / CP / PP /
+TBO / PDMux 等首版未覆盖组合，保留当前 Target 选择并记录原因。
+
+共享 prefix 仍按请求分块 gather prefix KV，与祖先路径统一 softmax。
 能力不满足时保留 compact-FIA / chunked 等原分派，不在已捕获图内部临时换算子。
 特殊布局不能套用这条选择规则。请以捕获和 replay 日志中的 `implementation`
 判断实际运行路径。
-共享 prefix 路径的首版能力范围包括 FP16/BF16、普通可 view 的 MHA/GQA cache、
+共享 prefix 与 Target FIA 的首版能力范围包括 FP16/BF16、普通可 view 的 MHA/GQA cache、
 同维 K/V、head dimension 64/128；实际是否启用还取决于所有相关层的能力检查。
 
 `ASCEND_USE_FIA` 未设置或为 `0` 时，当前 NPU 普通 MHA/GQA 的 tail 使用 paged ATB；
 为 `1` 时使用 paged FIA。**tail 的这个开关与树 attention 的实现选择是不同维度**。
-`shared_prefix_torch` replay 跳过 FIA 长度 update；compact-FIA 保留相应更新和 scratch。
+`shared_prefix_torch` replay 跳过 FIA 长度 update；`tree_paged_fia` 按层更新 B 个
+`P+Q` 长度；compact-FIA 保留相应更新和 scratch。
 两端 page size 是本地 KV/backend 配置，不在 SR 协议中交换；示例使用相同值便于排查，
 不把相同 page size 作为 wire 协议要求。
 
@@ -782,7 +793,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | 日志或字段 | 如何解释 |
 | --- | --- |
 | `Draft scheduler ready (tree_configured=..., tree_graph_captured=..., tree_graph_disabled_reason=...)` | 分开报告配置树模式、是否捕获图和禁用原因；配置开启不代表图可用 |
-| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。reason 可以是性能策略而非报错 |
+| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
 | `eager_fallback` | 对应 runner 记录的 eager fallback 累计数；不覆盖所有独立降级入口 |
@@ -864,6 +875,7 @@ PYTHONPATH=python python test/registered/unit/spec/test_sr_comm_metrics.py
 PYTHONPATH=python python test/registered/unit/spec/test_standalone_remote.py
 PYTHONPATH=python python test/registered/unit/spec/test_sr_tail_extend.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_shared_prefix.py
+PYTHONPATH=python python test/registered/unit/spec/test_sr_target_tree_fia.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_draft_kv_slots.py
 PYTHONPATH=python python test/registered/unit/spec/test_tree_attn_fallback.py
 ```
@@ -873,9 +885,30 @@ NPU 的独立 attention / graph 手工用例不需要模型权重，但需要 NP
 
 ```bash
 PYTHONPATH=python python test/manual/test_npu_tree_shared_prefix.py
+PYTHONPATH=python python test/manual/test_npu_target_tree_fia_gate.py
 ```
 
-该用例也不能替代完整服务的接受率与输出对照。CI 注册及 runner 约定见
+`test_npu_target_tree_fia_gate.py` 是 Target `tree_paged_fia` 的硬门槛：同一组
+q / paged KV / 树 mask 下比较 FP16/BF16 eager 与 FP32 dense 参考，并做最小图
+capture + 改 mask/页表/长度后 replay。此前最小证据覆盖 FP16/BF16 eager 和 BF16
+最小图；FP16 图及真实模型组合仍需实机验证。该用例也不能替代完整服务的接受率
+与输出对照。
+
+同一份已修复 Draft 上的 Target A/B 冒烟（10 条请求，客户端并发 2 不保证服务端
+每轮 batch 都是 2；上限仍受 Draft `rpc_wait` 约束）：
+
+```bash
+# A：当前 shared-prefix Target
+SGLANG_NPU_SR_TARGET_TREE_FIA=0
+# B：合格 Target 默认 tree_paged_fia（变量不设置）
+python test_sglang_liujg/evaluation/eval_spectre_rsteller.py \
+  --port 30000 --batch-size 2 --max-items 10
+```
+
+两组保持请求、采样、随机种子、并发、bucket 和预热一致，并记录实际实现、
+raw/capture batch、接受长度、验证整段耗时、整轮耗时及端到端吞吐。
+
+CI 注册及 runner 约定见
 [test/README.md](../../../../../test/README.md)。本文改写仅做静态文档校验，不启动这些模型服务。
 
 ### 代码导航

@@ -24,6 +24,13 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     context_lens_list,
     read_sr_tree_paged_env,
 )
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+    IMPL_TREE_PAGED_FIA,
+    SR_TARGET_TREE_FIA_ENV,
+    maybe_select_target_tree_fia,
+    read_sr_target_tree_fia_env,
+    target_tree_fia_blocked_extra_combos,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import SRRoundMetrics
 from sglang.srt.speculative.tree_attn_fallback import (
@@ -39,10 +46,18 @@ NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
 
 
 @contextmanager
-def isolated_sr_tree_paged_env(value=None):
-    """Isolate SGLANG_NPU_SR_TREE_PAGED. value=None unsets the variable."""
-    extra = {} if value is None else {SR_TREE_PAGED_ENV: value}
-    cleaned = {k: v for k, v in os.environ.items() if k != SR_TREE_PAGED_ENV}
+def isolated_sr_tree_paged_env(value=None, target_fia=None):
+    """Isolate Draft/Target tree env vars. value=None unsets the variable."""
+    extra = {}
+    cleaned = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in (SR_TREE_PAGED_ENV, SR_TARGET_TREE_FIA_ENV)
+    }
+    if value is not None:
+        extra[SR_TREE_PAGED_ENV] = value
+    if target_fia is not None:
+        extra[SR_TARGET_TREE_FIA_ENV] = target_fia
     cleaned.update(extra)
     with patch.dict(os.environ, cleaned, clear=True):
         yield
@@ -455,6 +470,9 @@ class TestSharedPrefix(unittest.TestCase):
                 torch_npu=NS(get_npu_format=lambda x: 0),
                 logger=logging.getLogger(__name__),
                 read_sr_tree_paged_env=read_sr_tree_paged_env,
+                read_sr_target_tree_fia_env=read_sr_target_tree_fia_env,
+                target_tree_fia_blocked_extra_combos=target_tree_fia_blocked_extra_combos,
+                maybe_select_target_tree_fia=maybe_select_target_tree_fia,
             ),
         )["_init_tree_shared_prefix"]
 
@@ -483,11 +501,11 @@ class TestSharedPrefix(unittest.TestCase):
         ):
             with isolated_sr_tree_paged_env(None):
                 fn(backend)
-                self.assertEqual(backend.tree_attention_impl, shared.SHARED_PREFIX_IMPL)
+                self.assertEqual(backend.tree_attention_impl, IMPL_TREE_PAGED_FIA)
                 for role, page, expected in (
                     ("draft", 128, "paged_atb"),
                     ("draft", 1, shared.SHARED_PREFIX_IMPL),
-                    ("target", 128, shared.SHARED_PREFIX_IMPL),
+                    ("target", 128, IMPL_TREE_PAGED_FIA),
                     ("target", 1, shared.SHARED_PREFIX_IMPL),
                 ):
                     runner.server_args.standalone_remote_role = role
@@ -516,6 +534,12 @@ class TestSharedPrefix(unittest.TestCase):
                 self.assertTrue(
                     all(b._central_tree_draft_fill for b in multi.attn_backends)
                 )
+            with isolated_sr_tree_paged_env(None, target_fia="0"):
+                runner.server_args.standalone_remote_role = "target"
+                backend.page_size = 128
+                backend.use_fia = False
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, shared.SHARED_PREFIX_IMPL)
             with isolated_sr_tree_paged_env("0"):
                 runner.server_args.standalone_remote_role = "draft"
                 backend.page_size = 128
@@ -1122,6 +1146,7 @@ class TestGraphDispatch(unittest.TestCase):
         )
         backend = NS(
             _use_tree_shared_prefix=lambda: True,
+            _use_target_tree_paged_fia=lambda: False,
             draft_topk=1,
             draft_num_steps=5,
             verify_tree_topk=3,
@@ -1209,6 +1234,7 @@ class TestGraphDispatch(unittest.TestCase):
                 _replay_tree_s_cap=256,
                 _use_tree_compact_fia=lambda: True,
                 _use_tree_shared_prefix=lambda: True,
+                _use_target_tree_paged_fia=lambda: False,
             )
             plan = NS(
                 graph_key="tree",
