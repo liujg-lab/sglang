@@ -136,7 +136,7 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
         self.assertTrue(sr.uses_spec_topk_cuda_graph_layout())
         self.assertFalse(sr.uses_dual_ntpb_cuda_graph(draft))
         self.assertIsNone(sr.dual_ntpb_cuda_graph_options(draft))
-        self.assertEqual(sr.decode_cuda_graph_hidden_mode(draft), 1)  # LAST
+        self.assertEqual(sr.decode_cuda_graph_hidden_mode(draft), 0)  # NULL
         self.assertEqual(
             sr.decode_cuda_graph_hidden_mode(draft, is_draft_worker=True),
             0,
@@ -178,7 +178,7 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
 
     def test_capture_keeps_last_when_draft_spec_info_is_none(self):
         null, last, full = 0, 1, 2
-        # SR draft DECODE graphs have no verify spec_info; keep LAST.
+        # Missing spec_info must not reset a captured mode.
         self.assertEqual(
             resolve_cuda_graph_capture_hidden_mode(last, None), last
         )
@@ -294,7 +294,7 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
 
 
 class TestSRTreeSeedHiddenCapture(CustomTestCase):
-    def test_enable_tree_seed_hidden_requests_last_not_full(self):
+    def test_enable_tree_seed_hidden_requests_null_not_full(self):
         try:
             from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
@@ -308,7 +308,7 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
         batch = SimpleNamespace(return_hidden_states=True, capture_hidden_mode=None)
         StandaloneRemoteDraftSchedulerMixin._sr_enable_tree_seed_hidden(mixin, batch)
         self.assertFalse(batch.return_hidden_states)
-        self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.LAST)
+        self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.NULL)
         self.assertEqual(batch.tree_seed_topk, 4)
 
     def test_schedule_batch_resolves_last_unless_http_full(self):
@@ -329,6 +329,36 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.LAST)
         batch.spec_info = None
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.NULL)
+
+    def test_explicit_full_stays_full_when_sr_decode_defaults_null(self):
+        try:
+            from sglang.srt.managers.schedule_batch import ScheduleBatch
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+            from sglang.srt.speculative.spec_info import (
+                SpeculativeAlgorithm,
+                resolve_cuda_graph_capture_hidden_mode,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        draft = SimpleNamespace(
+            standalone_remote_role="draft",
+            speculative_num_draft_tokens=5,
+            spectre_role=None,
+        )
+        captured = SpeculativeAlgorithm.STANDALONE_REMOTE.decode_cuda_graph_hidden_mode(
+            draft
+        )
+        self.assertEqual(captured, int(CaptureHiddenMode.NULL))
+        self.assertEqual(
+            resolve_cuda_graph_capture_hidden_mode(
+                captured, SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL)
+            ),
+            CaptureHiddenMode.FULL,
+        )
+        batch = ScheduleBatch()
+        batch.return_hidden_states = True
+        batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.FULL)
 
 
 class TestSRTargetHiddenSkip(CustomTestCase):
@@ -777,6 +807,10 @@ class TestSRTreeSeedSourceGuard(CustomTestCase):
         body = src[start : nxt if nxt > start else None]
         self.assertIn("tree_seed_topk_p", body)
         self.assertNotIn("softmax", body)
+        self.assertIn("None,\n                    verified_id", body)
+        self.assertNotIn("hidden.shape", body)
+        self.assertNotIn("row_hidden", body)
+        self.assertNotIn("kv_committed_len =", body)
 
     def test_enable_and_reprefill_use_sr_align_helpers(self):
         from pathlib import Path
@@ -792,6 +826,8 @@ class TestSRTreeSeedSourceGuard(CustomTestCase):
         enable = src[src.find("def _sr_enable_tree_seed_hidden") :]
         enable = enable[: enable.find("\n    def ")]
         self.assertIn("apply_tree_seed_topk", enable)
+        self.assertIn("CaptureHiddenMode.NULL", enable)
+        self.assertNotIn("CaptureHiddenMode.LAST", enable)
         reprefill = src[src.find("def _sr_reprefill_committed") :]
         reprefill = reprefill[: reprefill.find("\n    def ")]
         self.assertIn("snapshot_reprefill_fill_ids", reprefill)
@@ -2012,6 +2048,72 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertIn("EAGLEDraftCudaGraphRunner", init_src)
         self.assertIn("EAGLEDraftNpuGraphRunner", init_src)
         self.assertNotIn("EAGLEDraftExtendCudaGraphRunner", init_src)
+        self.assertLess(
+            init_src.find("self.need_draft_hidden = False"),
+            init_src.find("runner_cls(self)"),
+        )
+
+    def test_stack_seeds_ignores_mixed_old_hidden(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        import ast
+        from pathlib import Path
+
+        src_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        tree = ast.parse(src_path.read_text(encoding="utf-8"))
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "SRTreeDrafter"
+        )
+        fn = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_stack_seeds"
+        )
+        dummy = ast.ClassDef(
+            name="LoadedDrafter",
+            bases=[],
+            keywords=[],
+            body=[fn],
+            decorator_list=[],
+        )
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        mod = ast.fix_missing_locations(
+            ast.Module(body=[future, dummy], type_ignores=[])
+        )
+        ns = {"torch": torch, "List": list, "Optional": type(None), "Tuple": tuple}
+        exec(compile(mod, str(src_path), "exec"), ns)
+        drafter = ns["LoadedDrafter"]()
+        hidden = torch.ones(1, 4)
+        reqs = [
+            SimpleNamespace(
+                sr_tree_seed=(
+                    torch.ones(1, 2),
+                    torch.ones(1, 2, dtype=torch.int64),
+                    None,
+                    torch.tensor([1]),
+                )
+            ),
+            SimpleNamespace(
+                sr_tree_seed=(
+                    torch.ones(1, 2) * 2,
+                    torch.ones(1, 2, dtype=torch.int64) * 3,
+                    hidden,
+                    torch.tensor([2]),
+                )
+            ),
+        ]
+        p, ix, hs, vid = drafter._stack_seeds(reqs)
+        self.assertIsNone(hs)
+        self.assertEqual(tuple(p.shape), (2, 2))
+        self.assertEqual(tuple(ix.shape), (2, 2))
+        self.assertEqual(vid.tolist(), [1, 2])
 
     def test_tree_drafter_skips_cuda_graph_when_disabled(self):
         try:
@@ -2805,6 +2907,8 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertIn(req, mixin.draft_paused_reqs)
 
     def test_cache_tree_seed_reraises_cuda_ima(self):
+        if torch is None:
+            self.skipTest("torch not available")
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
                 StandaloneRemoteDraftSchedulerMixin,
@@ -2814,9 +2918,9 @@ class TestSRDraftBusyReject(CustomTestCase):
         mixin = self._make_draft_mixin()
         req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
         result = MagicMock()
-        result.logits_output.hidden_states = MagicMock()
-        result.logits_output.tree_seed_topk_p = MagicMock()
-        result.logits_output.tree_seed_topk_index = MagicMock()
+        result.logits_output.hidden_states = torch.ones(1, 4)
+        result.logits_output.tree_seed_topk_p = torch.ones(1, 2)
+        result.logits_output.tree_seed_topk_index = torch.ones(1, 2, dtype=torch.int64)
         with patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
             side_effect=RuntimeError(
@@ -2828,6 +2932,8 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertIn("illegal memory access", str(ctx.exception).lower())
 
     def test_cache_tree_seed_shape_error_stays_warning(self):
+        if torch is None:
+            self.skipTest("torch not available")
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
                 StandaloneRemoteDraftSchedulerMixin,
@@ -2837,14 +2943,124 @@ class TestSRDraftBusyReject(CustomTestCase):
         mixin = self._make_draft_mixin()
         req = SimpleNamespace(rid="r", output_ids=[7], origin_input_ids=[1])
         result = MagicMock()
-        result.logits_output.hidden_states = MagicMock()
-        result.logits_output.tree_seed_topk_p = MagicMock()
-        result.logits_output.tree_seed_topk_index = MagicMock()
+        result.logits_output.hidden_states = torch.ones(1, 4)
+        result.logits_output.tree_seed_topk_p = torch.ones(1, 2)
+        result.logits_output.tree_seed_topk_index = torch.ones(1, 2, dtype=torch.int64)
         with patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin.slice_decode_batch_row",
             side_effect=ValueError("shape mismatch"),
         ):
             mixin._sr_cache_tree_seeds([req], result, None)
+
+    def _load_cache_tree_seeds(self):
+        import ast
+        from pathlib import Path
+
+        def stamp_tree_seed(req, boundary):
+            req.sr_tree_seed_boundary = boundary
+            req.sr_tree_seed_revision = int(getattr(req, "sr_prefix_revision", 0))
+
+        def slice_decode_batch_row(tensor, i, n, token_lens=None):
+            del n, token_lens
+            return tensor[i : i + 1]
+
+        src_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/"
+            "sr_draft_scheduler_mixin.py"
+        )
+        tree = ast.parse(src_path.read_text(encoding="utf-8"))
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef)
+            and n.name == "StandaloneRemoteDraftSchedulerMixin"
+        )
+        fn = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_sr_cache_tree_seeds"
+        )
+        dummy = ast.ClassDef(
+            name="LoadedMixin",
+            bases=[],
+            keywords=[],
+            body=[fn],
+            decorator_list=[],
+        )
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        mod = ast.fix_missing_locations(
+            ast.Module(body=[future, dummy], type_ignores=[])
+        )
+        ns = {
+            "torch": torch,
+            "List": list,
+            "Optional": type(None),
+            "logger": SimpleNamespace(
+                warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None
+            ),
+            "slice_decode_batch_row": slice_decode_batch_row,
+            "stamp_tree_seed": stamp_tree_seed,
+            "_sr_is_device_context_error": lambda _e: False,
+        }
+        exec(compile(mod, str(src_path), "exec"), ns)
+        mixin = ns["LoadedMixin"]()
+        mixin.server_args = SimpleNamespace(speculative_eagle_topk=2)
+        return mixin
+
+    def test_cache_tree_seed_writes_none_hidden_without_advancing_kv(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        try:
+            mixin = self._load_cache_tree_seeds()
+        except ImportError as e:
+            self.skipTest(str(e))
+        req = SimpleNamespace(
+            rid="r",
+            output_ids=[7],
+            origin_input_ids=[1],
+            kv_committed_len=3,
+        )
+        hidden = torch.ones(1, 4)
+        result = SimpleNamespace(
+            logits_output=SimpleNamespace(
+                hidden_states=hidden,
+                tree_seed_topk_p=torch.tensor([[0.5, 0.5]]),
+                tree_seed_topk_index=torch.tensor([[3, 4]], dtype=torch.int64),
+            )
+        )
+        mixin._sr_cache_tree_seeds([req], result, None)
+        self.assertIsNone(req.sr_tree_seed[2])
+        self.assertEqual(req.sr_tree_seed[3].tolist(), [7])
+        self.assertEqual(req.sr_tree_seed[3].device, req.sr_tree_seed[1].device)
+        self.assertEqual(req.kv_committed_len, 3)
+        result.logits_output.tree_seed_topk_p.zero_()
+        self.assertEqual(req.sr_tree_seed[0].tolist(), [[0.5, 0.5]])
+
+    def test_cache_tree_seed_rejects_width_inferred_from_table(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        try:
+            mixin = self._load_cache_tree_seeds()
+        except ImportError as e:
+            self.skipTest(str(e))
+        req = SimpleNamespace(
+            rid="r",
+            output_ids=[7],
+            origin_input_ids=[1],
+            sr_tree_seed=None,
+        )
+        result = SimpleNamespace(
+            logits_output=SimpleNamespace(
+                hidden_states=torch.ones(1, 4),
+                tree_seed_topk_p=torch.ones(1, 3),
+                tree_seed_topk_index=torch.ones(1, 3, dtype=torch.int64),
+            )
+        )
+        mixin._sr_cache_tree_seeds([req], result, None)
+        self.assertIsNone(req.sr_tree_seed)
 
     def test_align_replace_tail_written_last_token_rollbacks_allocated(self):
         try:

@@ -34,7 +34,9 @@ def tree_seed_is_current(req: Req) -> bool:
     return (
         isinstance(seed, (tuple, list))
         and len(seed) == 4
-        and all(value is not None for value in seed)
+        and seed[0] is not None
+        and seed[1] is not None
+        and seed[3] is not None
         and getattr(req, "sr_tree_seed_boundary", None) == boundary
         and getattr(req, "sr_tree_seed_revision", None)
         == int(getattr(req, "sr_prefix_revision", 0))
@@ -539,36 +541,43 @@ class SRTailExtendTransaction:
 
     def commit(self, logits_output) -> None:
         count = len(self.plans)
-        tensors = (
-            logits_output.tree_seed_topk_p,
-            logits_output.tree_seed_topk_index,
-            logits_output.hidden_states,
-        )
-        if any(t is None or t.ndim != 2 or t.shape[0] != count for t in tensors):
+        topk = max(1, int(getattr(self.scheduler.server_args, "speculative_eagle_topk", 1) or 1))
+        p = getattr(logits_output, "tree_seed_topk_p", None)
+        ix = getattr(logits_output, "tree_seed_topk_index", None)
+        if (
+            p is None
+            or ix is None
+            or p.ndim != 2
+            or ix.ndim != 2
+            or p.shape != ix.shape
+            or p.shape != (count, topk)
+        ):
             raise RuntimeError("tail extend did not produce one seed per request")
         seeds = []
-        for i, p in enumerate(self.plans):
+        for i, plan in enumerate(self.plans):
             if (
-                int(getattr(p.req, "sr_prefix_revision", 0)) != p.revision
-                or int(p.req.kv_committed_len) != p.materialized_len
+                int(getattr(plan.req, "sr_prefix_revision", 0)) != plan.revision
+                or int(plan.req.kv_committed_len) != plan.materialized_len
             ):
                 raise RuntimeError("request changed during SR tail extend")
             seeds.append(
-                tuple(t[i : i + 1].detach().clone() for t in tensors)
-                + (
+                (
+                    p[i : i + 1].detach().clone(),
+                    ix[i : i + 1].detach().clone(),
+                    None,
                     torch.tensor(
-                        [p.tokens[-1]], dtype=torch.int64, device=tensors[2].device
+                        [plan.tokens[-1]], dtype=torch.int64, device=ix.device
                     ),
                 )
             )
         # All validation and tensor allocations precede publication.
-        for p, seed in zip(self.plans, seeds):
-            p.req.kv_committed_len = p.end
-            p.req.kv_allocated_len = p.end
-            p.req.fill_ids = p.tokens
-            p.req.sr_tree_seed = seed
-            stamp_tree_seed(p.req, p.end)
-            p.req.draft_generation_start_len = len(p.req.output_ids or [])
+        for plan, seed in zip(self.plans, seeds):
+            plan.req.kv_committed_len = plan.end
+            plan.req.kv_allocated_len = plan.end
+            plan.req.fill_ids = plan.tokens
+            plan.req.sr_tree_seed = seed
+            stamp_tree_seed(plan.req, plan.end)
+            plan.req.draft_generation_start_len = len(plan.req.output_ids or [])
         self.committed = True
 
     def _clear_installed_copy_markers(self) -> None:

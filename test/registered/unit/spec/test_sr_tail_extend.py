@@ -495,6 +495,7 @@ def transaction_fixture(reqs, page_size):
         req_to_token_pool=NS(req_to_token=mapping),
         tree_cache=object(),
         device_module=NS(synchronize=Mock()),
+        server_args=NS(speculative_eagle_topk=3),
     )
     plans = [
         tail.plan_tail_extend(r, vocab_size=32, model_is_mrope=False) for r in reqs
@@ -556,8 +557,9 @@ class TestTailTransaction(unittest.TestCase):
                         self.assertEqual(req.kv_committed_len, prefix + 2)
                         self.assertEqual(req.draft_tokens_target, 15)
                         self.assertTrue(tail.tree_seed_is_current(req))
-                        out.hidden_states.zero_()
-                        self.assertTrue(req.sr_tree_seed[2].any())
+                        self.assertIsNone(req.sr_tree_seed[2])
+                        out.tree_seed_topk_p.zero_()
+                        self.assertTrue(req.sr_tree_seed[0].any())
 
     def test_allocation_and_seed_failure_are_atomic(self):
         reqs = [request(slot=0), request(slot=1)]
@@ -572,6 +574,15 @@ class TestTailTransaction(unittest.TestCase):
         reqs[1].sr_prefix_revision = 1
         with self.assertRaises(RuntimeError):
             txn.commit(seed_output(2))
+        self.assertTrue(all(getattr(r, "sr_tree_seed", None) is None for r in reqs))
+        reqs[1].sr_prefix_revision = 0
+        wide = NS(
+            tree_seed_topk_p=torch.ones(2, 4),
+            tree_seed_topk_index=torch.ones(2, 4, dtype=torch.int64),
+            hidden_states=torch.ones(2, 4),
+        )
+        with self.assertRaises(RuntimeError):
+            txn.commit(wide)
         self.assertTrue(all(getattr(r, "sr_tree_seed", None) is None for r in reqs))
         txn.rollback()
         torch.testing.assert_close(txn.mapping, before)
@@ -1575,7 +1586,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(tuple(buffers.input_ids.shape), (6,))
         self.assertEqual(str(buffers.input_ids.device), "cpu")
         self.assertEqual(buffers.next_token_logits.dtype, torch.float32)
-        self.assertEqual(buffers.hidden_states.dtype, torch.bfloat16)
+        self.assertIsNone(buffers.hidden_states)
         self.assertEqual(str(buffers.extend_lens_cpu.device), "cpu")
         self.assertEqual(tuple(buffers.req_page_tables.shape), (2, 1))
         wide = ns["make_tail_graph_buffers"](

@@ -270,8 +270,10 @@ def make_tail_graph_buffers(
 
     ``seq_lens_cpu`` stays on CPU. ``next_token_logits`` is float32 because
     LogitsProcessor copies into ``next_token_logits_buffer`` only when
-    ``dtype == torch.float``. Hidden states keep the model dtype.
+    ``dtype == torch.float``. ``hidden`` / ``dtype`` stay for callers; SR
+    tail graphs do not allocate unused hidden buffers.
     """
+    del hidden, dtype
     return _TailGraphBuffers(
         input_ids=torch.zeros((token_cap,), dtype=torch.int64, device=device),
         positions=torch.zeros((token_cap,), dtype=torch.int64, device=device),
@@ -285,7 +287,7 @@ def make_tail_graph_buffers(
             (bs_cap, max(int(pages), 1)), dtype=torch.int32, device=device
         ),
         next_token_logits=torch.zeros((bs_cap, vocab), dtype=torch.float, device=device),
-        hidden_states=torch.zeros((bs_cap, hidden), dtype=dtype, device=device),
+        hidden_states=None,
         mrope_positions=torch.zeros((3, token_cap), dtype=torch.int64, device=device),
     )
 
@@ -585,7 +587,7 @@ class SRTailExtendGraphRunner:
             req_to_token_pool=runner.req_to_token_pool,
             token_to_kv_pool=runner.token_to_kv_pool,
             spec_algorithm=runner.spec_algorithm,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             attn_backend=runner.attn_backend,
             next_token_logits_buffer=buffers.next_token_logits,
         )
@@ -605,8 +607,6 @@ class SRTailExtendGraphRunner:
             )
             if getattr(out, "next_token_logits", None) is not None:
                 buffers.next_token_logits.copy_(out.next_token_logits[:bs_cap])
-            if getattr(out, "hidden_states", None) is not None:
-                buffers.hidden_states.copy_(out.hidden_states[:bs_cap])
             return out
 
         try:
@@ -653,10 +653,9 @@ class SRTailExtendGraphRunner:
         self.buffers[bucket] = buffers
         if captured is not None:
             self.attn_metadata[bucket] = captured
-        hidden = buffers.hidden_states
         self.output_buffers[bucket] = LogitsProcessorOutput(
             next_token_logits=buffers.next_token_logits,
-            hidden_states=hidden,
+            hidden_states=None,
         )
 
 

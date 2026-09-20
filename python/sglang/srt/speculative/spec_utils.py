@@ -1501,10 +1501,10 @@ def select_top_k_tokens(
         topk_index = topk_index.reshape(-1, topk**2)
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
-        if hidden_states.shape[0] > 0:
-            parent_rows = tree_reselect_parent_rows(
-                topk_cs_index, hidden_states.shape[0], topk
-            )
+        # Later-step topk_p is (B * K, K). Parent rows come from that layout so
+        # KV remap still runs when hidden_states is None.
+        parent_rows = tree_reselect_parent_rows(topk_cs_index, topk_p.shape[0], topk)
+        if hidden_states is not None and hidden_states.shape[0] > 0:
             hidden_states = hidden_states[parent_rows, :]
 
         tree_info = (

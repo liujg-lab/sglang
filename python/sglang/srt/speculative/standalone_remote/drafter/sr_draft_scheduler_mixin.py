@@ -167,9 +167,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         return getattr(self, "sr_tree_drafter", None) is not None
 
     def _sr_enable_tree_seed_hidden(self, batch: ScheduleBatch) -> None:
-        """Request last-token hidden for tree seed without HTTP FULL capture."""
+        """Request tree-seed top-k without recurrent hidden capture."""
         batch.return_hidden_states = False
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.capture_hidden_mode = CaptureHiddenMode.NULL
         apply_tree_seed_topk(
             batch,
             getattr(self.server_args, "speculative_eagle_topk", 1),
@@ -875,28 +875,34 @@ class StandaloneRemoteDraftSchedulerMixin:
         logits_output = getattr(result, "logits_output", None)
         if logits_output is None:
             return
-        hidden = getattr(logits_output, "hidden_states", None)
         topk_p_all = getattr(logits_output, "tree_seed_topk_p", None)
         topk_index_all = getattr(logits_output, "tree_seed_topk_index", None)
-        if hidden is None or topk_p_all is None or topk_index_all is None:
-            if hidden is not None:
-                logger.warning(
-                    "[SR] skip tree seed for %s: missing pre-sample top-k "
-                    "(hidden=%s topk_p=%s)",
-                    [r.rid for r in reqs],
-                    None if hidden is None else tuple(hidden.shape),
-                    None if topk_p_all is None else tuple(topk_p_all.shape),
-                )
-            return
+        topk = max(1, int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1))
         n = len(reqs)
-        token_lens = self._sr_token_lens_for_seed(reqs, batch)
+        if (
+            topk_p_all is None
+            or topk_index_all is None
+            or topk_p_all.ndim != 2
+            or topk_index_all.ndim != 2
+            or topk_p_all.shape != topk_index_all.shape
+            or topk_p_all.shape != (n, topk)
+        ):
+            logger.warning(
+                "[SR] skip tree seed for %s: missing pre-sample top-k "
+                "(topk_p=%s topk_index=%s want=(%s, %s))",
+                [r.rid for r in reqs],
+                None if topk_p_all is None else tuple(topk_p_all.shape),
+                None if topk_index_all is None else tuple(topk_index_all.shape),
+                n,
+                topk,
+            )
+            return
         try:
             skipped: List[str] = []
             for i, req in enumerate(reqs):
                 row_p = slice_decode_batch_row(topk_p_all, i, n, None)
                 row_ix = slice_decode_batch_row(topk_index_all, i, n, None)
-                row_hidden = slice_decode_batch_row(hidden, i, n, token_lens)
-                if row_p is None or row_ix is None or row_hidden is None:
+                if row_p is None or row_ix is None:
                     skipped.append(req.rid)
                     continue
                 token_id = (
@@ -905,12 +911,12 @@ class StandaloneRemoteDraftSchedulerMixin:
                     else req.origin_input_ids[-1]
                 )
                 verified_id = torch.tensor(
-                    [token_id], dtype=torch.int64, device=row_hidden.device
+                    [token_id], dtype=torch.int64, device=row_ix.device
                 )
                 req.sr_tree_seed = (
                     row_p.detach().clone(),
                     row_ix.detach().clone(),
-                    row_hidden.detach().clone(),
+                    None,
                     verified_id,
                 )
                 stamp_tree_seed(
@@ -918,14 +924,11 @@ class StandaloneRemoteDraftSchedulerMixin:
                 )
             if skipped:
                 logger.warning(
-                    "[SR] skip tree seed for %s: topk/hidden %s/%s/%s "
-                    "batch=%s extend_lens=%s",
+                    "[SR] skip tree seed for %s: topk %s/%s batch=%s",
                     skipped,
                     tuple(topk_p_all.shape),
                     tuple(topk_index_all.shape),
-                    tuple(hidden.shape),
                     n,
-                    token_lens,
                 )
         except Exception as e:
             if _sr_is_device_context_error(e):

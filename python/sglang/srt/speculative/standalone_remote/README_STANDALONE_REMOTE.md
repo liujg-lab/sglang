@@ -158,7 +158,8 @@ tail             = committed_tokens[materialized_len:committed_len]
 
 两个长度都是完整序列坐标；`kv_committed_len` 表示 Draft 已实际生成 KV 的连续前缀，
 不能用分配长度代替。tail 前向读取已有 prefix KV，只为缺失部分分配 KV，
-末位置产生下一层候选所需的 seed，不执行额外随机采样或追加生成 token。
+末位置产生下一层候选所需的 seed `(topk_p, topk_index, None, verified_id)`，
+不执行额外随机采样或追加生成 token，也不保存 recurrent hidden。
 成功后统一提交边界和 seed；失败按事务路径恢复，不能直接释放可能属于旧 prefix 页的 slots。
 
 空 tail 且 seed 边界、prefix revision 有效时直接复用；seed 失效时安全重算末位置或恢复前缀。
@@ -167,10 +168,14 @@ tail             = committed_tokens[materialized_len:committed_len]
 
 树展开流程见 [sr_tree_drafter.py](drafter/sr_tree_drafter.py)：
 
-1. 从 seed 取得第一层 `topk` 候选。
+1. 从 seed 取得第一层 `topk` 候选。seed 第三项固定为 `None`；旧 seed 若带 hidden 会被忽略。
 2. 后续深度对保留分支进行模型前向，每个分支得到新的 top-k；用累计路径概率评分，
    选择下一轮继续前向的 `topk` 个分支，同时保存候选与父子关系。
+   后续候选选择始终按 `(B*K, K)` 布局生成 `parent_rows`；需要继续模型前向时，
+   沿用现有条件 remap 父节点 KV，是否重排不再依赖 hidden。最后一次选择后不再前向，
+   也不新增一步 KV 搬运。
 3. 分支重排后搬运对应祖先 KV；分页布局保护共享 prefix 尾页，防止兄弟分支覆盖。
+   SR Draft 图不分配、不切片、不复制 unused hidden；普通 DECODE 默认 NULL。
 4. `organize_draft_results` 汇总各层候选，选择 `num_draft_tokens - 1` 个候选，
    返回 `draft_tokens`、`parent_list`、`top_scores_index`。Target 后续补入自己的根 token。
 

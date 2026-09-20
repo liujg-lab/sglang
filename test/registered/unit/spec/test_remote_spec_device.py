@@ -1,6 +1,7 @@
 """Device-agnostic helpers for SPECTRE / STANDALONE_REMOTE dual-backend."""
 
 import ast
+import copy
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -1155,6 +1156,98 @@ class TestRemoteSpecDevice(CustomTestCase):
         copy_paged_kv_buffer_by_slot(got, src, tgt)
         torch.testing.assert_close(got, gold)
 
+    def _select_top_k_tokens(self):
+        src_path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
+        tree = ast.parse(src_path.read_text())
+        keep = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in {
+                "tree_reselect_parent_rows",
+                "select_top_k_tokens",
+            }:
+                node = copy.deepcopy(node)
+                node.decorator_list = []
+                keep.append(node)
+        mod = ast.fix_missing_locations(ast.Module(body=keep, type_ignores=[]))
+        ns = {
+            "torch": torch,
+            "fast_topk": lambda x, k, dim=-1: torch.topk(x, k, dim=dim),
+            "_is_npu": True,
+        }
+        exec(compile(mod, str(src_path), "exec"), ns)
+        return ns["select_top_k_tokens"]
+
+    def test_select_top_k_tokens_parent_rows_without_hidden(self):
+        select_top_k_tokens = self._select_top_k_tokens()
+
+        cases = (
+            (1, 2, [[0.0, 3.0], [0.0, 4.0]], "swap"),
+            (1, 2, [[0.0, 0.0], [5.0, 4.0]], "dup"),
+            (2, 2, [[0.0, 3.0], [0.0, 4.0]] * 2, "swap"),
+            (2, 3, None, "offset"),
+            (2, 4, None, "offset"),
+        )
+        for bs, topk, topk_p_rows, kind in cases:
+            with self.subTest(bs=bs, topk=topk, kind=kind):
+                if topk_p_rows is None:
+                    block = torch.arange(topk * topk, dtype=torch.float32).reshape(
+                        topk, topk
+                    )
+                    topk_p = block.repeat(bs, 1)
+                else:
+                    topk_p = torch.tensor(topk_p_rows, dtype=torch.float32)
+                topk_index = torch.arange(
+                    bs * topk * topk, dtype=torch.int64
+                ).reshape(bs * topk, topk)
+                scores = torch.ones(bs, topk)
+                hidden = torch.arange(bs * topk * 2, dtype=torch.float32).reshape(
+                    bs * topk, 2
+                )
+                ids_h, hs, scores_h, info_h, rows_h = select_top_k_tokens(
+                    1, topk_p, topk_index, hidden, scores, topk
+                )
+                ids_n, hs_n, scores_n, info_n, rows_n = select_top_k_tokens(
+                    1, topk_p.clone(), topk_index.clone(), None, scores.clone(), topk
+                )
+                self.assertIsNone(hs_n)
+                self.assertIsNotNone(rows_n)
+                torch.testing.assert_close(ids_h, ids_n)
+                torch.testing.assert_close(scores_h, scores_n)
+                torch.testing.assert_close(rows_h, rows_n)
+                torch.testing.assert_close(info_h[0], info_n[0])
+                torch.testing.assert_close(hs, hidden[rows_h])
+                self.assertEqual(int(rows_n.numel()), bs * topk)
+                if bs == 2:
+                    first = rows_n[:topk]
+                    second = rows_n[topk:]
+                    self.assertEqual((second - first).tolist(), [topk] * topk)
+                if kind == "swap" and bs == 1 and topk == 2:
+                    self.assertEqual(rows_n.tolist(), [1, 0])
+                if kind == "dup" and bs == 1 and topk == 2:
+                    self.assertEqual(rows_n.tolist(), [1, 1])
+
+    def test_select_top_k_tokens_eagle_first_step_still_gathers_hidden(self):
+        select_top_k_tokens = self._select_top_k_tokens()
+
+        topk = 2
+        topk_p = torch.tensor([[0.2, 0.8]], dtype=torch.float32)
+        topk_index = torch.tensor([[4, 7]], dtype=torch.int64)
+        hidden = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+        ids, hs, scores, info, rows = select_top_k_tokens(
+            0, topk_p, topk_index, hidden, None, topk
+        )
+        self.assertIsNone(rows)
+        self.assertEqual(ids.tolist(), [4, 7])
+        self.assertEqual(hs.tolist(), [[1.0, 2.0], [1.0, 2.0]])
+        torch.testing.assert_close(scores, topk_p)
+        ids_n, hs_n, scores_n, _info_n, rows_n = select_top_k_tokens(
+            0, topk_p, topk_index, None, None, topk
+        )
+        self.assertIsNone(hs_n)
+        self.assertIsNone(rows_n)
+        torch.testing.assert_close(ids, ids_n)
+        torch.testing.assert_close(scores, scores_n)
+
     def test_copy_mha_kv_by_slot_matches_index_gold(self):
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
             copy_mha_kv_by_slot,
@@ -1226,6 +1319,15 @@ class TestRemoteSpecDevice(CustomTestCase):
         )
         self.assertIn("def _remap_tree_kv_to_parents", drafter_src)
         self.assertIn("parent_rows", drafter_src)
+        self.assertIn("self.need_draft_hidden = False", drafter_src)
+        draft_fwd = drafter_src[
+            drafter_src.index("def _draft_forward") : drafter_src.index(
+                "def _remap_tree_kv_to_parents"
+            )
+        ]
+        self.assertIn("hidden_states = None", draft_fwd)
+        self.assertIn("spec_info.hidden_states = None", draft_fwd)
+        self.assertNotIn("logits_output.hidden_states", draft_fwd)
         self.assertNotIn("for s in range(n_prev_steps)", drafter_src)
         self.assertNotIn("move_kv_cache", drafter_src)
         self.assertNotIn("torch.sum(batch.seq_lens)", drafter_src)
@@ -1238,6 +1340,19 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn(
             "return input_ids, hidden_states, scores, tree_info, parent_rows",
             spec_src,
+        )
+        select_src = spec_src[
+            spec_src.index("def select_top_k_tokens") : spec_src.index(
+                "def generate_simulated_accept_index"
+            )
+        ]
+        self.assertIn(
+            "tree_reselect_parent_rows(topk_cs_index, topk_p.shape[0], topk)",
+            select_src,
+        )
+        self.assertNotIn(
+            "tree_reselect_parent_rows(\n                topk_cs_index, hidden_states.shape[0], topk",
+            select_src,
         )
 
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
@@ -1357,6 +1472,198 @@ class TestRemoteSpecDevice(CustomTestCase):
             pool6.kv_buffer.view(2, 1, -1, 1, 2).index_select(2, tgt),
             flat.index_select(2, src),
         )
+
+
+class TestSRDraftGraphHiddenGate(CustomTestCase):
+    def _load_graph_methods(self):
+        src_path = (
+            _REPO / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+        )
+        tree = ast.parse(src_path.read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "EAGLEDraftCudaGraphRunner"
+        )
+        keep = []
+        for node in cls.body:
+            if isinstance(node, ast.FunctionDef) and node.name in {
+                "capture_one_batch_size",
+                "replay",
+                "_postprocess_output_to_raw_bs",
+            }:
+                keep.append(copy.deepcopy(node))
+        dummy = ast.ClassDef(
+            name="LoadedDraftGraph",
+            bases=[],
+            keywords=[],
+            body=keep,
+            decorator_list=[],
+        )
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        mod = ast.fix_missing_locations(
+            ast.Module(body=[future, dummy], type_ignores=[])
+        )
+
+        class CaptureHiddenMode:
+            NULL = 0
+            LAST = 1
+
+        class ForwardMode:
+            DECODE = "decode"
+
+        class DpPaddingMode:
+            @staticmethod
+            def get_default_mode_in_cuda_graph():
+                return SimpleNamespace(is_max_len=lambda: False)
+
+        class EagleDraftInput:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class ForwardBatch:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        ns = {
+            "torch": torch,
+            "Callable": callable,
+            "Optional": Optional,
+            "bisect": __import__("bisect"),
+            "CaptureHiddenMode": CaptureHiddenMode,
+            "ForwardMode": ForwardMode,
+            "ForwardBatch": ForwardBatch,
+            "EagleDraftInput": EagleDraftInput,
+            "DpPaddingMode": DpPaddingMode,
+            "set_dp_buffer_len": lambda *_a, **_k: None,
+            "set_is_extend_in_batch": lambda *_a, **_k: None,
+            "get_global_graph_memory_pool": lambda: None,
+            "set_global_graph_memory_pool": lambda *_a, **_k: None,
+        }
+        exec(compile(mod, str(src_path), "exec"), ns)
+        return ns["LoadedDraftGraph"], EagleDraftInput
+
+    def _buffers(self, hidden):
+        return SimpleNamespace(
+            input_ids=torch.zeros((4,), dtype=torch.int64),
+            req_pool_indices=torch.zeros((2,), dtype=torch.int64),
+            out_cache_loc=torch.zeros((8,), dtype=torch.int64),
+            positions=torch.zeros((4,), dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 4), dtype=torch.int64),
+            seq_lens=torch.ones((2,), dtype=torch.int32),
+            seq_lens_cpu=torch.ones((2,), dtype=torch.int32),
+            extend_seq_lens=torch.ones((2,), dtype=torch.int32),
+            topk_p=torch.zeros((2, 2), dtype=torch.float32),
+            topk_index=torch.zeros((2, 2), dtype=torch.int64),
+            hidden_states=hidden,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+        )
+
+    def _runner(self, need_hidden, hidden):
+        cls, spec_cls = self._load_graph_methods()
+        runner = cls()
+        runner.need_draft_hidden = need_hidden
+        runner.num_tokens_per_bs = 2
+        runner.speculative_num_steps = 2
+        runner.require_mlp_tp_gather = False
+        runner.require_attn_tp_gather = False
+        runner.require_gathered_buffer = False
+        runner.stream = None
+        runner.buffers = self._buffers(hidden)
+        runner.extend_seq_lens_cpu = [1, 1]
+        runner._create_graph = lambda: SimpleNamespace(pool=lambda: None)
+        runner._capture_init = lambda run_once: run_once()
+        runner._capture_graph = lambda _graph, _pool, _stream, run_once: run_once()
+        runner.deepep_adapter = SimpleNamespace(
+            capture=lambda **_k: None, replay=lambda: None
+        )
+        runner.model_runner = SimpleNamespace(
+            req_to_token_pool=None,
+            token_to_kv_pool=None,
+            spec_algorithm=None,
+            draft_attn_backend=SimpleNamespace(
+                init_forward_metadata_capture_cuda_graph=lambda _fb: None,
+                init_forward_metadata_replay_cuda_graph=lambda _fb, _bs: None,
+            ),
+        )
+        runner.eagle_worker = SimpleNamespace(draft_forward=lambda _fb: "fwd")
+        runner.capture_bs = [2]
+        runner.seq_len_fill_value = 1
+        runner._replay = lambda _fb: None
+        runner.output_buffers = {2: (torch.zeros(2), torch.zeros(2), torch.zeros(2))}
+        return runner, spec_cls
+
+    def test_sr_capture_and_replay_skip_hidden_buffer(self):
+        runner, spec_cls = self._runner(False, None)
+        runner.capture_one_batch_size(2, lambda *_a, **_k: None)
+        self.assertIsNone(runner.buffers.hidden_states)
+        spec = spec_cls(
+            topk_p=torch.ones(2, 2),
+            topk_index=torch.ones(2, 2, dtype=torch.int64),
+            hidden_states=torch.ones(2, 4),
+        )
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            batch_size=2,
+            global_num_tokens_cpu=None,
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            positions=torch.zeros(4, dtype=torch.int64),
+            mrope_positions=None,
+            spec_info=spec,
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens_cpu=None,
+        )
+        runner.replay(fb)
+        self.assertIsNone(runner.buffers.hidden_states)
+
+    def test_eagle_capture_and_replay_still_copy_hidden(self):
+        hidden = torch.zeros((2, 4), dtype=torch.float32)
+        runner, spec_cls = self._runner(True, hidden)
+        seen = {}
+
+        def draft_forward(fb):
+            seen["hidden"] = fb.spec_info.hidden_states
+            return "fwd"
+
+        runner.eagle_worker.draft_forward = draft_forward
+        runner.capture_one_batch_size(2, lambda *_a, **_k: None)
+        self.assertIsNotNone(seen["hidden"])
+        self.assertEqual(tuple(seen["hidden"].shape), (2, 4))
+        spec = spec_cls(
+            topk_p=torch.ones(2, 2),
+            topk_index=torch.ones(2, 2, dtype=torch.int64),
+            hidden_states=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        )
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            batch_size=2,
+            global_num_tokens_cpu=None,
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            positions=torch.zeros(4, dtype=torch.int64),
+            mrope_positions=None,
+            spec_info=spec,
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens_cpu=None,
+        )
+        runner.replay(fb)
+        torch.testing.assert_close(runner.buffers.hidden_states, spec.hidden_states)
+
+    def test_npu_runner_uses_production_cuda_hidden_gate(self):
+        npu_src = (
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
+        ).read_text()
+        replay_src = npu_src[npu_src.index("def replay") : npu_src.index("def can_run")]
+        self.assertIn("return super().replay(forward_batch)", replay_src)
+        cuda_src = (
+            _REPO / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+        ).read_text()
+        self.assertIn("if buffers.hidden_states is not None:", cuda_src)
+        self.assertIn("if buffers.hidden_states is None", cuda_src)
+        self.assertIn("need_draft_hidden", cuda_src)
 
 
 if __name__ == "__main__":

@@ -134,17 +134,11 @@ class SpeculativeAlgorithm(Enum):
         """Hidden mode value for ordinary DECODE CUDA graphs.
 
         Returns a ``CaptureHiddenMode`` integer (NULL=0, LAST=1). STANDALONE_REMOTE
-        Draft tree ingest needs last-token hidden for the tree seed. Capture LAST
-        at startup so ingest can replay without ``--enable-return-hidden-states``.
-        HTTP generate still requests NULL, which LAST graphs can emulate.
-        In-process EAGLE draft workers and other algorithms stay NULL.
+        Draft does not consume recurrent hidden for tree seeds, so ordinary
+        DECODE graphs stay NULL. HTTP ``--enable-return-hidden-states`` still
+        requests FULL through the resolver. In-process EAGLE draft workers and
+        other algorithms also stay NULL.
         """
-        if (
-            not is_draft_worker
-            and self.is_standalone_remote()
-            and getattr(server_args, "standalone_remote_role", None) == "draft"
-        ):
-            return 1  # CaptureHiddenMode.LAST
         return 0  # CaptureHiddenMode.NULL
 
     def supports_spec_v2(self) -> bool:
@@ -242,10 +236,8 @@ def resolve_cuda_graph_capture_hidden_mode(current, spec_info):
     """Hidden mode used while recording CUDA graphs.
 
     FULL is sticky (``--enable-return-hidden-states``). Otherwise keep
-    ``current`` (LAST from ``decode_cuda_graph_hidden_mode`` for SR draft)
-    and raise to ``spec_info.capture_hidden_mode`` when present. A missing
-    spec_info must not reset LAST to NULL — that made SR draft ingest miss
-    DECODE graphs after capture.
+    ``current`` and raise to ``spec_info.capture_hidden_mode`` when present.
+    A missing spec_info must not reset a captured mode to NULL.
     """
     full = 2  # CaptureHiddenMode.FULL
     if current is not None and int(current) >= full:

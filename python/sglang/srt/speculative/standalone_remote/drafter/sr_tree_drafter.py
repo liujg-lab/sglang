@@ -215,6 +215,8 @@ class SRTreeDrafter:
             if inners:
                 impl = getattr(inners[0], "tree_attention_impl", None)
                 self.sr_tree_paged = impl in (IMPL_PAGED_ATB, IMPL_PAGED_FIA)
+        # Graph runner captures in its constructor; set this first.
+        self.need_draft_hidden = False
         self._init_cuda_graphs()
 
     def _lease_supported(self) -> bool:
@@ -324,6 +326,7 @@ class SRTreeDrafter:
             else:
                 runner_cls = EAGLEDraftCudaGraphRunner
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            self.need_draft_hidden = False
             logger.info("[SR] Capture tree draft graph begin (backend=%s).", backend)
             self.cuda_graph_runner = runner_cls(self)
             reason = getattr(
@@ -880,31 +883,25 @@ class SRTreeDrafter:
 
     def _stack_seeds(
         self, reqs: List["Req"]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         ps: List[torch.Tensor] = []
         ixs: List[torch.Tensor] = []
-        hs: List[torch.Tensor] = []
         vs: List[torch.Tensor] = []
         for req in reqs:
-            topk_p, topk_index, hidden_states, verified_id = req.sr_tree_seed
+            topk_p, topk_index, _hidden_states, verified_id = req.sr_tree_seed
             if topk_p.dim() == 1:
                 topk_p = topk_p.unsqueeze(0)
             if topk_index.dim() == 1:
                 topk_index = topk_index.unsqueeze(0)
-            if hidden_states.dim() == 1:
-                hidden_states = hidden_states.unsqueeze(0)
-            elif hidden_states.dim() == 3:
-                hidden_states = hidden_states[:, -1, :]
             if verified_id.dim() == 0:
                 verified_id = verified_id.unsqueeze(0)
             ps.append(topk_p[:1])
             ixs.append(topk_index[:1])
-            hs.append(hidden_states[:1])
             vs.append(verified_id.reshape(-1)[:1])
         return (
             torch.cat(ps, dim=0),
             torch.cat(ixs, dim=0),
-            torch.cat(hs, dim=0),
+            None,
             torch.cat(vs, dim=0),
         )
 
@@ -913,9 +910,10 @@ class SRTreeDrafter:
         reqs: List["Req"],
         topk_p: torch.Tensor,
         topk_index: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         verified_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del hidden_states
         scheduler = self.scheduler
         metrics = getattr(scheduler, "_sr_round_metrics", None)
         with metrics.phase("tree_make_batch") if metrics else nullcontext():
@@ -923,9 +921,9 @@ class SRTreeDrafter:
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            hidden_states=hidden_states,
+            hidden_states=None,
             verified_id=verified_id,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
@@ -966,7 +964,7 @@ class SRTreeDrafter:
         txn.allocator_backup = token_to_kv_pool_state_backup
         self._pending_lease_state = lease_state
         self._lease_compact_slots = batch.out_cache_loc
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
         model_worker_batch = batch.get_model_worker_batch()
         prev_draft_backend = getattr(self.draft_model_runner, "draft_attn_backend", None)
         graph_submitted = False
@@ -1426,7 +1424,7 @@ class SRTreeDrafter:
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
-            spec_info.hidden_states,
+            None,
         )
         maybe_detect_nan(topk_p, "SR draft_forward: NaN in seed topk_p")
         out_cache_loc = out_cache_loc.reshape(
@@ -1470,7 +1468,7 @@ class SRTreeDrafter:
             )
             if self.draft_attn_backend is not None:
                 forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
+            spec_info.hidden_states = None
             # Tree steps are bs*topk, not 1-token AR. DECODE graphs must not replay
             # here (capture would hit unset raw_num_token; runtime layout is wrong).
             prev_graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
@@ -1490,7 +1488,7 @@ class SRTreeDrafter:
                 logits_output.next_token_logits.shape[-1],
                 f"SR draft_forward step {i}: topk_index OOB",
             )
-            hidden_states = logits_output.hidden_states
+            hidden_states = None
         self._last_out_cache_loc = out_cache_loc
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
