@@ -619,6 +619,25 @@ class TestGraphHostMetrics(unittest.TestCase):
         self.assertEqual(keys[(3, 4, 512)], 1)
         self.assertEqual(len(flushed["groups"]), 3)
 
+    def test_group_key_isolates_overlap(self):
+        metrics = SRRoundMetrics("Draft")
+        for overlap in (False, False, True):
+            sample = begin_graph_host_sample(_graph_ctx(overlap=overlap))
+            self._advance_call(sample, "update_call", 1)
+            record_graph_host_sample_safely(metrics, sample)
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["groups"] = args[0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        keys = {g["overlap"]: g["ok"] for g in flushed["groups"]}
+        self.assertEqual(keys[False], 2)
+        self.assertEqual(keys[True], 1)
+        self.assertEqual(len(flushed["groups"]), 2)
+
     def test_failed_call_keeps_update_out_of_success_stats(self):
         metrics = SRRoundMetrics("Draft")
         ok = begin_graph_host_sample(_graph_ctx())

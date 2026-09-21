@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import pathlib
 import sys
+import threading
 import time
 import types
 import unittest
@@ -19,6 +20,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
     SR_TREE_PAGED_ENV,
+    SR_TREE_UPDATE_OVERLAP_ENV,
     SR_TREE_WARMUP_ENV,
     SRTreeExpandTxn,
     SRTreePagedMetadata,
@@ -38,6 +40,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     quantize_page_width,
     query_page_count,
     read_sr_tree_paged_env,
+    read_sr_tree_update_overlap_env,
     read_sr_tree_warmup_env,
     remainder,
     resolve_eager_page_buckets,
@@ -134,6 +137,17 @@ class TestSrTreePagedEnv(CustomTestCase):
         self.assertTrue(read_sr_tree_warmup_env({}))
         self.assertFalse(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "0"}))
         self.assertTrue(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "1"}))
+
+    def test_update_overlap_env_default_off(self):
+        self.assertFalse(read_sr_tree_update_overlap_env({}))
+        self.assertFalse(read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "0"}))
+        self.assertFalse(
+            read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "false"})
+        )
+        for raw in ("1", "true", "YES", "on"):
+            self.assertTrue(
+                read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: raw})
+            )
 
 
 class TestPrefixTailCopyPlan(CustomTestCase):
@@ -352,6 +366,91 @@ class TestOncePerRoundAndTxn(CustomTestCase):
         restored.append("success-restore")
         self.assertEqual(restored, ["success-restore"])
         self.assertTrue(txn.may_rollback() or txn.completion_confirmed)
+
+    def test_thread_start_failure_after_copy_refuses_rollback_when_confirm_fails(self):
+        expand_src = _fn_source(_DRAFTER, "_expand_tree")
+        self.assertLess(expand_src.find("mark_copy_begin"), expand_src.find("replay"))
+        self.assertIn("_try_confirm_tree_completion", expand_src)
+        self.assertIn("tree expand in-flight; refuse rollback", expand_src)
+
+        path = (
+            _REPO / "python/sglang/srt/speculative/spec_utils.py"
+        )
+        tree = ast.parse(path.read_text())
+        names = {"NpuGraphReplaySubmittedError", "run_npu_graph_update_and_replay"}
+        nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in names
+        ]
+        ns = {"threading": threading}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
+        submitted_cls = ns["NpuGraphReplaySubmittedError"]
+        run = ns["run_npu_graph_update_and_replay"]
+
+        restored = []
+        lease_freed = []
+        retried = []
+        replayed = []
+        confirmed = []
+        pending = ["lease"]
+
+        class BoomThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self.daemon = daemon
+
+            def start(self):
+                raise RuntimeError("start boom")
+
+            def join(self):
+                raise AssertionError("must not join an unstarted thread")
+
+        orig = threading.Thread
+        threading.Thread = BoomThread
+        graph_submitted = False
+        try:
+            txn = SRTreeExpandTxn()
+            txn.allocation_owned = True
+            txn.lease_state = {"page_slots": [7]}
+            try:
+                txn.mark_copy_begin()
+                txn.mark_compute_begin()
+                run(lambda: None, lambda: replayed.append("replay"), overlap=True)
+            except submitted_cls:
+                graph_submitted = True
+                raise
+            except Exception as exc:
+                if txn.in_flight():
+                    ok = False
+                    confirmed.append(True)
+                    if not ok:
+                        graph_submitted = True
+                        raise submitted_cls(
+                            "tree expand in-flight; refuse rollback"
+                        ) from exc
+                    txn.completion_confirmed = True
+                if txn.may_rollback() and not graph_submitted:
+                    restored.append("allocator")
+                    lease_freed.append("lease")
+                    txn.rolled_back = True
+                raise
+            finally:
+                abandon = graph_submitted or (
+                    txn.in_flight() and not txn.completion_confirmed
+                )
+                if abandon:
+                    pending = None
+        except submitted_cls:
+            pass
+        finally:
+            threading.Thread = orig
+
+        self.assertEqual(replayed, [])
+        self.assertEqual(confirmed, [True])
+        self.assertEqual(restored, [])
+        self.assertEqual(lease_freed, [])
+        self.assertEqual(retried, [])
+        self.assertIsNone(pending)
 
 
 class TestPagedGraphRecords(CustomTestCase):
@@ -781,6 +880,8 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("fill_paged_cpu_update_payload", src)
         self.assertIn("if getattr(self, \"_tree_paged\", False)", src)
         self.assertIn("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE", src)
+        self.assertIn("sr_paged_overlap", src)
+        self.assertIn("_npu_sr_tree_update_overlap", src)
         skip_src = _fn_source(_RUNNER, "capture_one_batch_size")
         self.assertIn("not getattr(self, \"_tree_paged\", False)", skip_src)
         can_src = _fn_source(_RUNNER, "can_run")
@@ -838,6 +939,16 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", batch_src)
         one_src = _fn_source(_DRAFTER, "_expand_one")
         self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", one_src)
+        ctor_src = _fn_source(_DRAFTER, "__init__")
+        self.assertIn("read_sr_tree_update_overlap_env", ctor_src)
+        self.assertLess(
+            ctor_src.find("npu_sr_tree_update_overlap_requested"),
+            ctor_src.find("_init_cuda_graphs"),
+        )
+        expand_src = _fn_source(_DRAFTER, "_expand_tree")
+        self.assertIn("_try_confirm_tree_completion", expand_src)
+        confirm_src = _fn_source(_DRAFTER, "_try_confirm_tree_completion")
+        self.assertIn("synchronize()", confirm_src)
 
     def test_does_not_call_build_tree_draft_block_tables_for_paged(self):
         init_src = _fn_source(_BACKEND, "init_forward_metadata")

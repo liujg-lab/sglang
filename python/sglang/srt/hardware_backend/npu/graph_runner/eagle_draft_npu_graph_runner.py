@@ -38,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     validate_draft_graph_step_kv_lens,
     validate_tree_draft_fia_records,
 )
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     begin_graph_host_sample,
     measure_call,
@@ -95,6 +96,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.tree_eager_fallback_count = 0
         self._last_can_run_reject = None
         self.tree_graph_disabled_reason = None
+        self._npu_sr_tree_update_overlap = False
+        self._npu_graph_device_id = None
         self._init_arch_map()
         page_size = int(getattr(eagle_worker, "page_size", 1) or 1)
         topk = int(getattr(eagle_worker, "topk", 1) or 1)
@@ -135,8 +138,48 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 self._tree_compact_fia,
                 getattr(self, "_tree_paged", False),
             )
+        requested = bool(
+            getattr(eagle_worker, "npu_sr_tree_update_overlap_requested", False)
+        )
         super().__init__(eagle_worker)
         self._clear_tree_replay_plan()
+        self._maybe_enable_sr_tree_update_overlap(requested)
+
+    def _maybe_enable_sr_tree_update_overlap(self, requested: bool) -> None:
+        """Enable overlap only for SR paged trees after graphs and device id exist."""
+        graphs_ok = bool(getattr(self, "graphs", None)) and not getattr(
+            self, "tree_graph_disabled_reason", None
+        )
+        reason = None
+        if requested and getattr(self, "_tree_paged", False) and graphs_ok:
+            try:
+                device_id = int(torch.npu.current_device())
+            except Exception as exc:
+                if is_device_context_error(exc):
+                    raise
+                reason = f"current_device failed: {exc}"
+            else:
+                self._npu_graph_device_id = device_id
+                self._npu_sr_tree_update_overlap = True
+        elif requested and getattr(self, "_tree_paged", False):
+            reason = getattr(self, "tree_graph_disabled_reason", None) or "no graphs"
+        elif requested:
+            reason = "not paged tree"
+        worker = getattr(self, "eagle_worker", None)
+        if worker is None or not hasattr(
+            worker, "npu_sr_tree_update_overlap_requested"
+        ):
+            return
+        extra = f" reason={reason}" if reason else ""
+        logger.info(
+            "NPU SR tree update/replay overlap requested=%s effective=%s "
+            "implementation=%s device=%s%s",
+            bool(requested),
+            bool(self._npu_sr_tree_update_overlap),
+            self._current_tree_attention_impl(),
+            self._npu_graph_device_id,
+            extra,
+        )
 
     def filter_capture_batch_sizes(self, capture_bs, compile_bs):
         if not getattr(self, "_slot_gather_graph", False):
@@ -767,10 +810,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             and not getattr(self, "_tree_paged", False)
         )
         env_mod = globals().get("os")
+        sr_paged_overlap = bool(
+            getattr(self, "_tree_paged", False)
+            and getattr(self, "_npu_sr_tree_update_overlap", False)
+        )
         overlap = False
-        if (
+        if getattr(self, "_tree_paged", False):
+            overlap = sr_paged_overlap
+        elif (
             not skip_fia
-            and not getattr(self, "_tree_paged", False)
             and env_mod is not None
         ):
             overlap = not env_mod.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE")
@@ -967,22 +1015,36 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 )
                 self._logged_tree_fia_update_bs.add(log_key)
 
+            def _call_update():
+                if sr_paged_overlap:
+                    torch.npu.set_device(self._npu_graph_device_id)
+                if sample is None:
+                    graph.update(cpu_update_input=payload)
+                else:
+                    measure_call(
+                        sample,
+                        "update_call",
+                        lambda: graph.update(cpu_update_input=payload),
+                    )
+
+            def _call_replay():
+                if sample is None:
+                    graph.replay()
+                else:
+                    measure_call(sample, "replay_call", graph.replay)
+
             if sample is None:
                 run_npu_graph_update_and_replay(
-                    lambda: graph.update(cpu_update_input=payload),
-                    graph.replay,
+                    _call_update,
+                    _call_replay,
                     overlap=overlap,
                 )
             else:
                 _measure(
                     "submit_envelope",
                     lambda: run_npu_graph_update_and_replay(
-                        lambda: measure_call(
-                            sample,
-                            "update_call",
-                            lambda: graph.update(cpu_update_input=payload),
-                        ),
-                        lambda: measure_call(sample, "replay_call", graph.replay),
+                        _call_update,
+                        _call_replay,
                         overlap=overlap,
                     ),
                 )

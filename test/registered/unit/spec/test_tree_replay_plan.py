@@ -497,6 +497,8 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertLess(serial.index("update_fn()"), serial.index("replay_fn()"))
         overlap = helper.split("if not overlap:", 1)[1].split("return", 1)[1]
         self.assertIn("threading.Thread", overlap)
+        self.assertIn("daemon=False", overlap)
+        self.assertIn("except BaseException", overlap)
         self.assertIn("finally:", overlap)
         self.assertIn("thread.join()", overlap)
         self.assertLess(overlap.index("finally:"), overlap.index("thread.join()"))
@@ -603,6 +605,55 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertNotIsInstance(ctx.exception, _SubmittedError)
         self.assertEqual(finished, ["update"])
         self.assertTrue(_thread_idents() <= before)
+
+    def test_overlap_update_baseexception_is_submitted_after_join(self):
+        class Boom(BaseException):
+            pass
+
+        replayed = []
+        before = _thread_idents()
+
+        def update():
+            raise Boom()
+
+        def replay():
+            replayed.append("replay")
+
+        with self.assertRaises(_SubmittedError) as ctx:
+            _run_update_replay(update, replay, overlap=True)
+        self.assertIsInstance(ctx.exception.__cause__, Boom)
+        self.assertEqual(replayed, ["replay"])
+        self.assertTrue(_thread_idents() <= before)
+
+    def test_overlap_thread_start_failure_skips_replay_and_is_not_submitted(self):
+        replayed = []
+        before = _thread_idents()
+
+        class BoomThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self.daemon = daemon
+
+            def start(self):
+                raise RuntimeError("start boom")
+
+            def join(self):
+                raise AssertionError("must not join an unstarted thread")
+
+        orig = threading.Thread
+        threading.Thread = BoomThread
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_update_replay(
+                    lambda: None,
+                    lambda: replayed.append("replay"),
+                    overlap=True,
+                )
+            self.assertNotIsInstance(ctx.exception, _SubmittedError)
+            self.assertIn("start boom", str(ctx.exception))
+            self.assertEqual(replayed, [])
+            self.assertTrue(_thread_idents() <= before)
+        finally:
+            threading.Thread = orig
 
     def test_draft_restore_original_batch_fields(self):
         batch = SimpleNamespace(
@@ -714,6 +765,9 @@ class TestTreeReplayPlan(CustomTestCase):
         )
         self.assertIn("run_npu_graph_update_and_replay", draft_inner)
         self.assertIn("overlap=", draft_inner)
+        self.assertIn("sr_paged_overlap", draft_inner)
+        self.assertIn("if sr_paged_overlap:", draft_inner)
+        self.assertIn("torch.npu.set_device", draft_inner)
         self.assertIn("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE", draft_inner)
         self.assertIn("_assert_tree_replay_graph", draft_inner)
         self.assertIn("fill_fia_cpu_update_payload", draft_inner)
@@ -723,9 +777,29 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("record_graph_host_sample_safely", draft_inner)
         self.assertNotIn("get_sr_round_metrics", draft_inner)
         self.assertNotIn("synchronize(", draft_inner)
+        self.assertNotIn("current_device", draft_inner)
         self.assertNotIn(".cpu(", draft_inner)
         self.assertNotIn("Event(", draft_inner)
         self.assertNotIn("_tree_replay_graphs_id", draft_inner)
+
+        draft_init = _class_method_source(
+            _EAGLE_DRAFT_NPU, "EAGLEDraftNpuGraphRunner", "__init__"
+        )
+        before, after = draft_init.split("super().__init__", 1)
+        self.assertIn("self._npu_sr_tree_update_overlap = False", before)
+        self.assertIn("self._npu_graph_device_id = None", before)
+        self.assertNotIn("current_device", before)
+        self.assertIn("_maybe_enable_sr_tree_update_overlap", after)
+        self.assertNotIn("current_device", after)
+
+        enable_src = _class_method_source(
+            _EAGLE_DRAFT_NPU,
+            "EAGLEDraftNpuGraphRunner",
+            "_maybe_enable_sr_tree_update_overlap",
+        )
+        self.assertIn("torch.npu.current_device()", enable_src)
+        self.assertIn("is_device_context_error", enable_src)
+        self.assertIn("requested=%s effective=%s", enable_src)
 
         eager_src = _class_method_source(
             _ASCEND_BACKEND, "AscendAttnMultiStepDraftBackend", "prepare_sr_tree_paged_eager"
@@ -1145,6 +1219,10 @@ class TestTreeReplayPlan(CustomTestCase):
 
 def _extract_draft_replay(helper_fn):
     from sglang.srt.speculative.standalone_remote import sr_round_metrics as round_metrics
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+        IMPL_PAGED_ATB,
+        IMPL_PAGED_FIA,
+    )
     from sglang.srt.speculative.tree_attn_fallback import tree_fia_actual_seq_lengths_kv
 
     ns = {
@@ -1165,6 +1243,8 @@ def _extract_draft_replay(helper_fn):
         "begin_graph_host_sample": round_metrics.begin_graph_host_sample,
         "measure_call": round_metrics.measure_call,
         "record_graph_host_sample_safely": round_metrics.record_graph_host_sample_safely,
+        "IMPL_PAGED_ATB": IMPL_PAGED_ATB,
+        "IMPL_PAGED_FIA": IMPL_PAGED_FIA,
     }
     return _extract_class_methods(
         _EAGLE_DRAFT_NPU,
@@ -1254,6 +1334,8 @@ def _make_draft_replay_runner(
         _logged_tree_fia_update_bs=set(),
         tree_graph_replay_count=0,
         tree_eager_fallback_count=0,
+        _npu_sr_tree_update_overlap=False,
+        _npu_graph_device_id=None,
         update_attr_name="actual_seq_lengths_kv",
     )
     batch = SimpleNamespace(seq_lens_cpu=seq_lens_cpu)
@@ -1497,6 +1579,203 @@ class TestDraftGraphHostReplay(unittest.TestCase):
         sample = metrics._graph_host_samples[0]
         self.assertEqual(sample.outcome, "ok")
         self.assertTrue(sample.context["overlap"])
+
+    def test_paged_switch_off_does_not_call_set_device(self):
+        devices = []
+
+        def set_device(gpu_id):
+            devices.append(gpu_id)
+            raise AssertionError("paged overlap must not bind device when off")
+
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        methods["_replay"].__globals__["torch"] = SimpleNamespace(
+            npu=SimpleNamespace(set_device=set_device)
+        )
+        methods["_replay"].__globals__["os"] = SimpleNamespace(environ={})
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127])
+        )
+        runner._tree_paged = True
+        runner._npu_sr_tree_update_overlap = False
+        runner._npu_graph_device_id = None
+        runner._tree_fia_maps[runner._tree_replay_plan.graph_key][
+            "attr_name"
+        ] = "actual_seq_lengths_kv"
+        methods["_replay"](runner, batch)
+        self.assertEqual(helper.calls[0]["overlap"], False)
+        self.assertEqual(devices, [])
+        self.assertEqual(graph.replay_count, 1)
+
+    def test_compact_fia_overlap_does_not_call_set_device(self):
+        devices = []
+
+        def set_device(gpu_id):
+            devices.append(gpu_id)
+            raise AssertionError("compact-FIA overlap must not use paged set_device")
+
+        helper = _HelperBox()
+        helper.impl = _run_update_replay
+        methods = _extract_draft_replay(helper)
+        methods["_replay"].__globals__["torch"] = SimpleNamespace(
+            npu=SimpleNamespace(set_device=set_device)
+        )
+        methods["_replay"].__globals__["os"] = SimpleNamespace(environ={})
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127])
+        )
+        runner._tree_paged = False
+        runner._npu_sr_tree_update_overlap = False
+        methods["_replay"](runner, batch)
+        self.assertEqual(helper.calls[0]["overlap"], True)
+        self.assertEqual(devices, [])
+        self.assertEqual(graph.replay_count, 1)
+
+    def test_paged_overlap_binds_captured_device_before_update(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        devices = []
+        order = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def set_device(gpu_id):
+            order.append(("set_device", gpu_id))
+            devices.append(gpu_id)
+            started.set()
+            self.assertTrue(release.wait(timeout=2))
+
+        class SlowGraph(_FakeGraph):
+            def update(self, cpu_update_input=None):
+                order.append("update_start")
+                super().update(cpu_update_input=cpu_update_input)
+                order.append("update_end")
+
+            def replay(self):
+                if not started.wait(timeout=2):
+                    raise AssertionError("set_device did not start")
+                order.append("replay")
+                super().replay()
+                release.set()
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        helper.impl = _run_update_replay
+        methods = _extract_draft_replay(helper)
+        methods["_replay"].__globals__["torch"] = SimpleNamespace(
+            npu=SimpleNamespace(set_device=set_device)
+        )
+        graph = SlowGraph("2_s256")
+        runner, batch, _ = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            graph=graph,
+        )
+        runner._tree_paged = True
+        runner._npu_sr_tree_update_overlap = True
+        runner._npu_graph_device_id = 2
+        runner._tree_fia_maps[runner._tree_replay_plan.graph_key][
+            "attr_name"
+        ] = "actual_seq_lengths_kv"
+        methods["_replay"](runner, batch)
+        self.assertEqual(helper.calls[0]["overlap"], True)
+        self.assertEqual(devices, [2])
+        self.assertEqual(order[0], ("set_device", 2))
+        self.assertLess(order.index("replay"), order.index("update_end"))
+        sample = metrics._graph_host_samples[0]
+        self.assertTrue(sample.context["overlap"])
+        self.assertEqual(sample.outcome, "ok")
+
+
+class TestMaybeEnableSrTreeUpdateOverlap(CustomTestCase):
+    def _bind(self, npu, logs):
+        fn = _extract_class_methods(
+            _EAGLE_DRAFT_NPU,
+            "EAGLEDraftNpuGraphRunner",
+            ["_maybe_enable_sr_tree_update_overlap"],
+            {
+                "torch": SimpleNamespace(npu=npu),
+                "logger": SimpleNamespace(
+                    info=lambda msg, *args, **kwargs: logs.append((msg, args))
+                ),
+                "is_device_context_error": lambda exc: "npu error" in str(exc).lower(),
+            },
+        )["_maybe_enable_sr_tree_update_overlap"]
+        return fn
+
+    def _runner(self, **kwargs):
+        worker = SimpleNamespace(npu_sr_tree_update_overlap_requested=True)
+        state = dict(
+            graphs={1: object()},
+            tree_graph_disabled_reason=None,
+            _tree_paged=True,
+            _npu_sr_tree_update_overlap=False,
+            _npu_graph_device_id=None,
+            eagle_worker=worker,
+            _current_tree_attention_impl=lambda: "paged_atb",
+        )
+        state.update(kwargs)
+        return SimpleNamespace(**state)
+
+    def test_switch_off_does_not_call_current_device(self):
+        npu = SimpleNamespace(
+            current_device=lambda: (_ for _ in ()).throw(
+                AssertionError("new overlap path must not call current_device")
+            )
+        )
+        logs = []
+        runner = self._runner()
+        runner.eagle_worker.npu_sr_tree_update_overlap_requested = False
+        MethodType(self._bind(npu, logs), runner)(False)
+        self.assertFalse(runner._npu_sr_tree_update_overlap)
+        self.assertIsNone(runner._npu_graph_device_id)
+        self.assertEqual(logs[0][1][:2], (False, False))
+
+    def test_graphs_unavailable_keeps_effective_false(self):
+        calls = []
+        npu = SimpleNamespace(current_device=lambda: calls.append("current") or 2)
+        logs = []
+        runner = self._runner(graphs={}, tree_graph_disabled_reason="capture failed")
+        MethodType(self._bind(npu, logs), runner)(True)
+        self.assertFalse(runner._npu_sr_tree_update_overlap)
+        self.assertIsNone(runner._npu_graph_device_id)
+        self.assertEqual(calls, [])
+        self.assertEqual(logs[0][1][:2], (True, False))
+        self.assertIn("capture failed", logs[0][0] % logs[0][1])
+
+    def test_success_sets_device_and_effective(self):
+        npu = SimpleNamespace(current_device=lambda: 3)
+        logs = []
+        runner = self._runner()
+        MethodType(self._bind(npu, logs), runner)(True)
+        self.assertTrue(runner._npu_sr_tree_update_overlap)
+        self.assertEqual(runner._npu_graph_device_id, 3)
+        self.assertEqual(logs[0][1][:2], (True, True))
+
+    def test_device_context_error_reraises(self):
+        npu = SimpleNamespace(
+            current_device=lambda: (_ for _ in ()).throw(RuntimeError("npu error 5070"))
+        )
+        runner = self._runner()
+        with self.assertRaises(RuntimeError):
+            MethodType(self._bind(npu, []), runner)(True)
+        self.assertFalse(runner._npu_sr_tree_update_overlap)
+
+    def test_ordinary_current_device_failure_disables_feature(self):
+        npu = SimpleNamespace(
+            current_device=lambda: (_ for _ in ()).throw(RuntimeError("no npu"))
+        )
+        logs = []
+        runner = self._runner()
+        MethodType(self._bind(npu, logs), runner)(True)
+        self.assertFalse(runner._npu_sr_tree_update_overlap)
+        self.assertIsNone(runner._npu_graph_device_id)
+        self.assertEqual(logs[0][1][:2], (True, False))
+        self.assertIn("current_device failed", logs[0][0] % logs[0][1])
 
 
 if __name__ == "__main__":

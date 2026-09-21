@@ -276,6 +276,20 @@ req_to_token_rows, 非空的 max_running_requests / standalone_remote_max_batch_
 `cuda_graph_max_bs` **不单独**作为 upper。没有配置 capture 尺寸则跳过本组新增预热。
 本次实验 `capture_bs=[1,2,4]` 且容量 ≥4 时应得到 `1,2,3,4`。
 
+`SGLANG_NPU_SR_TREE_UPDATE_OVERLAP` 是 **默认关闭** 的 SR Draft 分页树实验开关：
+后台线程执行 `graph.update`，主线程同时 `graph.replay`，提交返回前 join。
+未设置或 `=0` 保持串行；`=1` 才请求启用。只在 Draft 初始化时读取，需重启 Draft，
+不是运行时热切换，也不是 CLI/协议字段。仅 `paged_atb` / `paged_fia` 在图可用且
+成功取得 `torch.npu.current_device()` 后 `effective=True`。图捕获失败仍按现有
+图初始化失败处理，不会被关掉 overlap 掩盖。设备绑定只走这条分页重叠路径，
+不影响 compact-FIA 的 `SGLANG_NPU_TREE_FIA_SERIAL_UPDATE`、Target tree-FIA、
+tail EXTEND、CUDA 和普通 EAGLE/STANDALONE。后台线程显式 `daemon=False`。
+join 只证明 `update()` 返回，不证明设备图已执行结束。线程启动失败不调用 replay，
+沿树展开已有 in-flight 路径：先 `_try_confirm_tree_completion()`，确认失败则按
+submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共用实现，但
+必须分别验收；正确性未通过前不做性能结论。开关继续默认关闭，直到实机 A/B
+证明 Draft 整轮耗时下降且输出/KV 一致。
+
 启动期 Draft `_sr_warm_tree_shapes` 先做 layout：对每个 raw_bs 枚举
 `shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与
 `rem ∈ {1, page_size - num_steps + 1, page_size - 1}`，
@@ -804,7 +818,7 @@ round 从调度处理开始，到发送调用完成结束。两者显示相同�
 
 `[SR Draft graph host]` 是 NPU SR Draft `_replay()` 的主机调用区间观测，按 32 轮窗口追加在原 `[SR Draft round]` 日志和计数器清理之后。不改 `host_mean_ms`、设备事件队列或推理路径。
 
-这些是主机调用墙钟，可能含 API 内部等待；`replay_call` 不是设备图执行时间。`submit_envelope` 已包含 update/replay，串行模式也不可再与两者相加。
+这些是主机调用墙钟，可能含 API 内部等待；`replay_call` 不是设备图执行时间。`submit_envelope` 已包含 update/replay，串行和重叠模式都不可再与两者相加。重叠时 `update_call` 只覆盖 `graph.update`；分页路径的 `set_device`、线程创建和 join 计入 `submit_envelope`。分组键含 `overlap`，serial 与 overlap 样本不得混组。
 
 整次口径按**被观测调用是否正常结束**划分：正常结束的阶段耗时进成功统计；失败或中断的调用，已采集的全部阶段耗时进失败统计，即使没有任何阶段耗时也计入失败次数。阶段完成状态只用于定位。窗口无这条日志表示该窗口完全没有调用样本，不是没有耗时数据。
 
@@ -909,7 +923,8 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | `Speculative greedy verify path` | greedy 核验实际路径：`npu_kernel` / `cpu_reference`（含 reason）/ CUDA 上的 `cuda_kernel`。与 RPD 路径日志独立 |
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
-| `[SR Draft graph host]` | NPU SR Draft `_replay()` 五段主机调用窗口。主机墙钟而非设备图时间；`submit_envelope` 不可与 update/replay 相加；失败调用的已采集耗时不进成功分位数 |
+| `[SR Draft graph host]` | NPU SR Draft `_replay()` 五段主机调用窗口。主机墙钟而非设备图时间；`submit_envelope` 不可与 update/replay 相加；失败调用的已采集耗时不进成功分位数。`overlap=True` 只表示 SR 分页实验重叠或原有 compact-FIA 重叠，不表示设备图已结束 |
+| `NPU SR tree update/replay overlap requested=... effective=...` | Draft NPU runner 初始化时各打一次。`requested` 是环境变量请求；`effective` 仅在分页树、图可用且拿到设备号后为 true。图不可用时不得把 effective 打成 true |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
 | `eager_fallback` | runner 累计 eager 次数。草稿 `can_run` 在 `raw_bs` 大于已捕获 `max_bs` 时会计入该值并设置 `_last_can_run_reject`。轮次口径看 `[SR Draft round] counters` 的 `tree_graph_batches` / `tree_eager_batches` / `tree_eager_<reason>`，CUDA 草稿同样可用 |
 | `tree failure stage=expand_batch ... isolate_batches=...` | 多请求 expand 失败后按请求隔离重跑；eager 分页树不再因图捕获缓冲区行数不足进入这条路径 |

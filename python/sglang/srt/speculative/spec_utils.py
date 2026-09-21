@@ -220,14 +220,17 @@ def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
     """Run graph.update then graph.replay.
 
     Default is serial. Plain AR DECODE enables overlap explicitly;
-    compact-FIA tree keeps the existing env-var policy. Draft paged tree,
-    Target tree-paged-FIA, and SR tail EXTEND keep their current serial calls.
+    compact-FIA tree keeps the existing env-var policy. Draft paged tree
+    stays serial unless ``SGLANG_NPU_SR_TREE_UPDATE_OVERLAP`` is enabled.
+    Target tree-paged-FIA and SR tail EXTEND keep serial calls.
 
     After replay has been invoked, or if update fails, wrap ordinary
     ``Exception`` as ``NpuGraphReplaySubmittedError`` so callers do not free
     in-flight graph slots. Replay ``BaseException`` (for example
     ``KeyboardInterrupt``) joins the update thread and then propagates the
     original interrupt. Overlap uses a non-daemon thread that must be joined.
+    Thread construct/start failure does not call replay and is not wrapped as
+    submitted; callers keep their in-flight confirmation path.
     """
     if not overlap:
         try:
@@ -244,10 +247,10 @@ def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
     def _run_update():
         try:
             update_fn()
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
 
-    thread = threading.Thread(target=_run_update)
+    thread = threading.Thread(target=_run_update, daemon=False)
     thread.start()
     replay_error = None
     try:

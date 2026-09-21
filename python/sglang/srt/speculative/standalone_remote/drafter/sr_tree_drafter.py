@@ -61,6 +61,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     materialize_prefix_tail_copy_slots,
     plan_prefix_tail_copy_indices,
     prepare_tree_paged_view,
+    read_sr_tree_update_overlap_env,
     read_sr_tree_warmup_env,
     resolve_eager_page_buckets,
     tree_paged_shape_key,
@@ -222,6 +223,7 @@ class SRTreeDrafter:
                 self.sr_tree_paged = impl in (IMPL_PAGED_ATB, IMPL_PAGED_FIA)
         # Graph runner captures in its constructor; set this first.
         self.need_draft_hidden = False
+        self.npu_sr_tree_update_overlap_requested = read_sr_tree_update_overlap_env()
         self._init_cuda_graphs()
 
     def _lease_supported(self) -> bool:

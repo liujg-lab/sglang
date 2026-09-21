@@ -18,6 +18,7 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 
 SR_TREE_PAGED_ENV = "SGLANG_NPU_SR_TREE_PAGED"
 SR_TREE_WARMUP_ENV = "SGLANG_NPU_SR_TREE_WARMUP"
+SR_TREE_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TREE_UPDATE_OVERLAP"
 ALLOC_ORDINARY = "ordinary"
 ALLOC_LEASE = "lease"
 IMPL_PAGED_ATB = "paged_atb"
@@ -56,6 +57,17 @@ def read_sr_tree_warmup_env(env=None) -> bool:
     """
     environ = os.environ if env is None else env
     raw = environ.get(SR_TREE_WARMUP_ENV, "1")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_tree_update_overlap_env(env=None) -> bool:
+    """Read once during SR Draft init; default off.
+
+    Gates paged-tree ``graph.update`` / ``graph.replay`` overlap on NPU Draft.
+    Not a runtime toggle. Compact-FIA keeps ``SGLANG_NPU_TREE_FIA_SERIAL_UPDATE``.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TREE_UPDATE_OVERLAP_ENV, "0")
     return str(raw).strip().lower() in _TRUTHY
 
 
