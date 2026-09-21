@@ -418,7 +418,12 @@ def tree_paged_shape_key(
 
 
 def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
-    """Copy independent per-step CPU lengths into captured update records."""
+    """Copy independent per-step CPU lengths into captured update records.
+
+    Two-pass: validate every record, then write. A late error leaves dests
+    unchanged. Source tensors are CPU and cached only for this call; captured
+    dest objects are mutated in place and never replaced.
+    """
     if not attr_name:
         raise ValueError("paged update attr_name must not be empty")
     if payload is None:
@@ -429,6 +434,10 @@ def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
             f"paged payload length {n} != step_ids length {len(step_ids)}"
         )
     n_steps = len(step_lens_list)
+    src_lists = [[int(x) for x in list(step_lens)] for step_lens in step_lens_list]
+
+    dests = []
+    steps = []
     for i, rec in enumerate(payload):
         step = int(step_ids[i])
         if step < 0 or step >= n_steps:
@@ -436,14 +445,25 @@ def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
                 f"paged step_ids[{i}]={step} out of range n_steps={n_steps}"
             )
         dest = rec[attr_name]
-        src = list(step_lens_list[step])
+        src = src_lists[step]
+        if torch.is_tensor(dest) and int(dest.numel()) != len(src):
+            raise ValueError(
+                f"paged payload[{i}] {attr_name} size {int(dest.numel())} "
+                f"!= step lens {len(src)}"
+            )
+        dests.append(dest)
+        steps.append(step)
+
+    src_tensors = {}
+    for dest, step in zip(dests, steps):
+        src = src_lists[step]
         if torch.is_tensor(dest):
-            if int(dest.numel()) != len(src):
-                raise ValueError(
-                    f"paged payload[{i}] {attr_name} size {int(dest.numel())} "
-                    f"!= step lens {len(src)}"
-                )
-            dest.copy_(torch.tensor(src, dtype=dest.dtype))
+            key = (step, dest.dtype, int(dest.numel()))
+            buf = src_tensors.get(key)
+            if buf is None:
+                buf = torch.tensor(src, dtype=dest.dtype, device="cpu")
+                src_tensors[key] = buf
+            dest.copy_(buf)
         else:
             dest[:] = src
     return payload

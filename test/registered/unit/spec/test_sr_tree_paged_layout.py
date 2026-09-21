@@ -403,9 +403,11 @@ class TestPagedGraphRecords(CustomTestCase):
         lens1 = build_step_context_lens([10, 12], topk=2, step_id=1, capture_rows=6)
         self.assertEqual(lens0.tolist(), [11, 11, 13, 13, 1, 1])
         self.assertEqual(lens1.tolist(), [12, 12, 14, 14, 1, 1])
+        list_dest = [1, 1, 1, 1, 1, 1]
+        tensor_dest = torch.ones(6, dtype=torch.int32)
         payload = [
-            {"actual_seq_lengths_kv": [1, 1, 1, 1, 1, 1]},
-            {"actual_seq_lengths_kv": torch.ones(6, dtype=torch.int32)},
+            {"actual_seq_lengths_kv": list_dest},
+            {"actual_seq_lengths_kv": tensor_dest},
         ]
         fill_paged_cpu_update_payload(
             payload,
@@ -413,8 +415,126 @@ class TestPagedGraphRecords(CustomTestCase):
             [0, 1],
             "actual_seq_lengths_kv",
         )
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], list_dest)
+        self.assertIs(payload[1]["actual_seq_lengths_kv"], tensor_dest)
         self.assertEqual(payload[0]["actual_seq_lengths_kv"], lens0.tolist())
         self.assertEqual(payload[1]["actual_seq_lengths_kv"].tolist(), lens1.tolist())
+        list_dest[0] = 99
+        tensor_dest[0] = 99
+        self.assertEqual(payload[0]["actual_seq_lengths_kv"][0], 99)
+        self.assertEqual(int(payload[1]["actual_seq_lengths_kv"][0]), 99)
+
+    def test_same_step_tensor_dests_are_independent(self):
+        src = [11, 12, 13, 14]
+        dests = [torch.ones(4, dtype=torch.int32) for _ in range(3)]
+        payload = [{"context_lens": dest} for dest in dests]
+        ids_before = [id(dest) for dest in dests]
+        ptrs_before = [int(dest.data_ptr()) for dest in dests]
+        fill_paged_cpu_update_payload(payload, [src], [0, 0, 0], "context_lens")
+        self.assertEqual([id(rec["context_lens"]) for rec in payload], ids_before)
+        self.assertEqual([int(d.data_ptr()) for d in dests], ptrs_before)
+        self.assertEqual(len(set(ptrs_before)), 3)
+        for dest in dests:
+            self.assertEqual(dest.tolist(), src)
+        dests[0].fill_(7)
+        self.assertEqual(dests[1].tolist(), src)
+        self.assertEqual(dests[2].tolist(), src)
+
+    def test_shuffled_step_ids_fill_by_id(self):
+        lens0 = [1, 1, 1, 1]
+        lens1 = [2, 2, 2, 2]
+        dests = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
+        payload = [{"context_lens": dest} for dest in dests]
+        fill_paged_cpu_update_payload(
+            payload, [lens0, lens1], [1, 0, 1], "context_lens"
+        )
+        self.assertEqual(dests[0].tolist(), lens1)
+        self.assertEqual(dests[1].tolist(), lens0)
+        self.assertEqual(dests[2].tolist(), lens1)
+
+    def test_list_dest_updated_in_place(self):
+        dest0 = [0, 0, 0]
+        dest1 = [0, 0, 0]
+        payload = [
+            {"actual_seq_lengths_kv": dest0},
+            {"actual_seq_lengths_kv": dest1},
+        ]
+        fill_paged_cpu_update_payload(
+            payload, [[4, 5, 6], [7, 8, 9]], [0, 1], "actual_seq_lengths_kv"
+        )
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], dest0)
+        self.assertIs(payload[1]["actual_seq_lengths_kv"], dest1)
+        self.assertEqual(dest0, [4, 5, 6])
+        self.assertEqual(dest1, [7, 8, 9])
+
+    def test_tensor_ctor_once_per_step_key_with_wraps(self):
+        from sglang.srt.speculative.standalone_remote.drafter import (
+            sr_tree_paged_layout as layout_mod,
+        )
+
+        dests = [torch.ones(4, dtype=torch.int32) for _ in range(4)]
+        payload = [{"context_lens": dest} for dest in dests]
+        real_tensor = torch.tensor
+        with mock.patch.object(
+            layout_mod.torch, "tensor", wraps=real_tensor
+        ) as tensor_ctor:
+            fill_paged_cpu_update_payload(
+                payload,
+                [[1, 1, 1, 1], [2, 2, 2, 2]],
+                [0, 0, 1, 1],
+                "context_lens",
+            )
+        self.assertEqual(tensor_ctor.call_count, 2)
+        for call in tensor_ctor.call_args_list:
+            self.assertEqual(call.kwargs.get("device"), "cpu")
+        self.assertEqual(dests[0].tolist(), [1, 1, 1, 1])
+        self.assertEqual(dests[2].tolist(), [2, 2, 2, 2])
+
+    def test_second_call_refreshes_values_same_dest_objects(self):
+        dests = [torch.ones(4, dtype=torch.int32) for _ in range(2)]
+        payload = [{"context_lens": dest} for dest in dests]
+        ids_before = [id(dest) for dest in dests]
+        fill_paged_cpu_update_payload(
+            payload, [[1, 1, 1, 1], [2, 2, 2, 2]], [0, 1], "context_lens"
+        )
+        fill_paged_cpu_update_payload(
+            payload, [[7, 7, 7, 7], [8, 8, 8, 8]], [0, 1], "context_lens"
+        )
+        self.assertEqual([id(rec["context_lens"]) for rec in payload], ids_before)
+        self.assertEqual(dests[0].tolist(), [7, 7, 7, 7])
+        self.assertEqual(dests[1].tolist(), [8, 8, 8, 8])
+
+    def test_late_illegal_record_leaves_earlier_dests_unchanged(self):
+        dest0 = torch.ones(4, dtype=torch.int32)
+        dest1 = torch.ones(4, dtype=torch.int32)
+        dest2 = torch.ones(3, dtype=torch.int32)
+        before0 = dest0.clone()
+        before1 = dest1.clone()
+        payload = [
+            {"context_lens": dest0},
+            {"context_lens": dest1},
+            {"context_lens": dest2},
+        ]
+        with self.assertRaises(ValueError):
+            fill_paged_cpu_update_payload(
+                payload, [[9, 9, 9, 9]], [0, 0, 0], "context_lens"
+            )
+        self.assertTrue(torch.equal(dest0, before0))
+        self.assertTrue(torch.equal(dest1, before1))
+
+        list0 = [1, 1, 1, 1]
+        list1 = [1, 1, 1, 1]
+        list_payload = [
+            {"context_lens": list0},
+            {"context_lens": list1},
+            {"context_lens": torch.ones(4, dtype=torch.int32)},
+        ]
+        with self.assertRaises(ValueError):
+            fill_paged_cpu_update_payload(
+                list_payload, [[3, 3, 3, 3]], [0, 0, 5], "context_lens"
+            )
+        self.assertEqual(list0, [1, 1, 1, 1])
+        self.assertEqual(list1, [1, 1, 1, 1])
 
     def test_select_page_bucket_smallest_fit(self):
         pages = kv_buckets_to_page_buckets([128, 256, 512], 128)
