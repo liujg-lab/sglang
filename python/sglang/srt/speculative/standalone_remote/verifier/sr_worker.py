@@ -158,6 +158,11 @@ class StandaloneRemoteWorker:
                 or getattr(runner, "hybrid_lightning_config", None) is not None
             )
         )
+        from sglang.srt.speculative.standalone_remote.verifier.sr_target_warmup import (
+            warm_sr_target_kernels,
+        )
+
+        warm_sr_target_kernels(self)
 
     @property
     def draft_model_runner(self):

@@ -690,10 +690,12 @@ class TestSourceGuards(CustomTestCase):
         warm_src = _fn_source(_DRAFTER, "_sr_warm_tree_shapes")
         self.assertIn("read_sr_tree_warmup_env", warm_src)
         self.assertIn("NpuGraphReplaySubmittedError", warm_src)
+        self.assertIn("SRWarmupFatalError", warm_src)
         self.assertIn("is_device_context_error", warm_src)
         self.assertIn("_sr_warm_layout_shapes", warm_src)
-        self.assertIn("_sr_warm_allocator_shapes", warm_src)
+        self.assertIn("warm_draft_alloc_mapping", warm_src)
         self.assertIn("_seen_tree_paged_shapes", warm_src)
+        self.assertIn("tree warmup layout=", warm_src)
         self.assertNotIn("prepare_sr_tree_paged_eager", warm_src)
         layout_src = _fn_source(_DRAFTER, "_sr_warm_layout_shapes")
         self.assertIn("prepare_sr_tree_paged_eager", layout_src)
@@ -1291,6 +1293,198 @@ class TestPagedGraphTableBuffers(CustomTestCase):
         with self.assertRaises(self.PrepError) as ctx:
             backend._paged_graph_table_view(1, 4, 0, allow_alloc=False)
         self.assertIn("contiguous", str(ctx.exception))
+
+
+class TestSRWarmup(CustomTestCase):
+    def test_raw_batch_sizes_include_three(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            sr_warmup_raw_batch_sizes,
+        )
+
+        sizes, skip = sr_warmup_raw_batch_sizes([1, 2, 4], 16, 8, None)
+        self.assertIsNone(skip)
+        self.assertEqual(sizes, (1, 2, 3, 4))
+        empty, reason = sr_warmup_raw_batch_sizes([], 16, 8, None)
+        self.assertEqual(empty, ())
+        self.assertIn("capture", reason)
+
+    def test_steps_over_page_jump_sides(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_nnp_jump_reachable,
+            warmup_prefix_remainders,
+        )
+
+        rems = warmup_prefix_remainders(128, 133)
+        self.assertIn(123, rems)
+        self.assertIn(124, rems)
+        self.assertEqual(pages_per_branch(123, 133, 128), 2)
+        self.assertEqual(pages_per_branch(124, 133, 128), 3)
+        self.assertTrue(warmup_nnp_jump_reachable(128, 133))
+        self.assertFalse(warmup_nnp_jump_reachable(128, 129))
+
+    def test_steps_le_page_prefixes(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_prefix_candidates,
+        )
+
+        cands = warmup_prefix_candidates(128, 5, 4096, 2)
+        self.assertEqual(cands, [128, 129, 252, 255])
+
+    def test_alloc_extend_does_not_reown_prefix_pages(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import SRWarmupFatalError
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            SRWarmupTrackingAllocator,
+            page_set,
+            slots_to_pages,
+        )
+
+        class Inner:
+            page_size = 4
+            device = "cpu"
+            evict_calls = 0
+
+            def __init__(self):
+                self.free_pages = torch.arange(1, 9, dtype=torch.int64)
+                self.release_pages = torch.empty((0,), dtype=torch.int64)
+                self.is_not_in_free_group = True
+                self.free_group = []
+
+            def available_size(self):
+                return int(self.free_pages.numel()) * self.page_size
+
+            def alloc(self, need):
+                n = need // self.page_size
+                pages = self.free_pages[:n]
+                self.free_pages = self.free_pages[n:]
+                return (
+                    pages.unsqueeze(1) * self.page_size
+                    + torch.arange(self.page_size)
+                ).reshape(-1)
+
+            def alloc_extend(self, *args, **kwargs):
+                prefix = args[-1] if args else kwargs.get("last_loc")
+                extra = self.alloc(self.page_size)
+                return torch.cat([prefix.reshape(-1)[:1], extra])
+
+            def free(self, idx):
+                if torch.is_tensor(idx) and int(idx.numel()) == 0:
+                    return
+                pages = torch.unique(idx // self.page_size)
+                self.free_pages = torch.cat([self.free_pages, pages])
+
+            def backup_state(self):
+                return (self.free_pages.clone(), self.release_pages.clone())
+
+            def restore_state(self, state):
+                self.free_pages, self.release_pages = state
+
+        inner = Inner()
+        before = page_set(inner)
+        adapter = SRWarmupTrackingAllocator(inner)
+        prefix = adapter.alloc(4)
+        prefix_pages = set(adapter.owned_pages)
+        extra = adapter.alloc_extend(prefix)
+        self.assertTrue(prefix_pages <= adapter.owned_pages)
+        self.assertEqual(len(adapter.owned_pages), len(prefix_pages) + 1)
+        backed = adapter.backup_state()
+        more = adapter.alloc(4)
+        self.assertTrue(adapter.owned_pages > prefix_pages)
+        adapter.restore_state(backed)
+        self.assertEqual(adapter.owned_pages, prefix_pages | slots_to_pages(extra, 4))
+        adapter.free(extra[1:])
+        adapter.free(more[:0])
+        self.assertEqual(adapter.owned_pages, prefix_pages)
+        empty = torch.empty((0,), dtype=torch.int64)
+        before_empty = page_set(inner)
+        adapter.free(empty)
+        self.assertEqual(page_set(inner), before_empty)
+        adapter.free(prefix)
+        self.assertEqual(adapter.owned_pages, set())
+        self.assertEqual(page_set(inner), before)
+        with self.assertRaises(SRWarmupFatalError):
+            adapter.free(prefix)
+        with self.assertRaises(SRWarmupFatalError):
+            adapter.restore_state(inner.backup_state())
+
+    def test_cache_adapter_never_evicts(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            SRWarmupCacheAdapter,
+        )
+
+        calls = []
+
+        class Prod:
+            def evict(self, *a, **k):
+                calls.append(1)
+
+        cache = SRWarmupCacheAdapter(SimpleNamespace())
+        cache.evict("anything")
+        self.assertFalse(cache.is_chunk_cache())
+        self.assertEqual(calls, [])
+        Prod().evict()
+        self.assertEqual(calls, [1])
+
+    def test_outer_fatal_not_swallowed(self):
+        import logging
+        import time
+        from types import MethodType
+
+        from sglang.srt.speculative.standalone_remote.sr_align import SRWarmupFatalError
+
+        src_path = _DRAFTER
+        tree = ast.parse(src_path.read_text())
+        fn = None
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter":
+                for child in node.body:
+                    if (
+                        isinstance(child, ast.FunctionDef)
+                        and child.name == "_sr_warm_tree_shapes"
+                    ):
+                        fn = child
+        self.assertIsNotNone(fn)
+        ns = {
+            "read_sr_tree_warmup_env": lambda: True,
+            "SR_TREE_WARMUP_ENV": "SGLANG_NPU_SR_TREE_WARMUP",
+            "warm_draft_alloc_mapping": lambda _d: (_ for _ in ()).throw(
+                SRWarmupFatalError("ledger unknown")
+            ),
+            "NpuGraphReplaySubmittedError": type(
+                "NpuGraphReplaySubmittedError", (Exception,), {}
+            ),
+            "SRWarmupFatalError": SRWarmupFatalError,
+            "is_device_context_error": lambda _e: False,
+            "logger": logging.getLogger("sr-warmup-fatal-test"),
+            "time": time,
+        }
+        ast.fix_missing_locations(fn)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(src_path), "exec"), ns)
+
+        class Dummy:
+            sr_tree_paged = True
+            _seen_tree_paged_shapes = None
+
+            def _sr_warm_layout_shapes(self):
+                return [(1, 0, 1, 2)]
+
+        dummy = Dummy()
+        dummy._sr_warm_tree_shapes = MethodType(ns["_sr_warm_tree_shapes"], dummy)
+        with self.assertRaises(SRWarmupFatalError):
+            dummy._sr_warm_tree_shapes()
+
+    def test_unreachable_jump_is_not_failure(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_nnp_jump_reachable,
+        )
+
+        self.assertFalse(warmup_nnp_jump_reachable(128, 129))
+        src = _fn_source(
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_warmup.py",
+            "warm_draft_alloc_mapping",
+        )
+        self.assertIn('coverage["unreachable_jump"] = True', src)
+        self.assertNotIn('coverage["skipped"] = "unreachable', src)
 
 
 if __name__ == "__main__":

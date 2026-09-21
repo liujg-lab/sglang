@@ -65,7 +65,12 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_eager_page_buckets,
     tree_paged_shape_key,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_warmup import (
+    draft_warmup_raw_batch_sizes,
+    warm_draft_alloc_mapping,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import (
+    SRWarmupFatalError,
     is_device_context_error,
     seq_lens_cpu_for_host,
     seq_lens_sum_from_batch,
@@ -395,6 +400,10 @@ class SRTreeDrafter:
             capture_bs = [int(b) for b in raw]
         return [b for b in capture_bs if b > 0]
 
+    def _sr_warmup_raw_batch_sizes(self) -> list[int]:
+        sizes, _skip = draft_warmup_raw_batch_sizes(self)
+        return list(sizes)
+
     def _sr_warmup_page_buckets(self) -> list[int]:
         backend = self.draft_attn_backend
         inners = getattr(backend, "attn_backends", None) if backend is not None else None
@@ -422,7 +431,7 @@ class SRTreeDrafter:
         rem_choices = sorted({1, max(page - steps + 1, 1), max(page - 1, 1)})
         combos = []
         seen = set()
-        for bs in self._sr_warmup_capture_bs():
+        for bs in self._sr_warmup_raw_batch_sizes() or self._sr_warmup_capture_bs():
             pool_rows = min(int(bs), int(req_to_token.shape[0]))
             pool = torch.arange(pool_rows, dtype=torch.int64, device=device)
             if pool_rows < int(bs):
@@ -512,7 +521,7 @@ class SRTreeDrafter:
         combos = []
         seen = set()
         try:
-            for bs in self._sr_warmup_capture_bs():
+            for bs in self._sr_warmup_raw_batch_sizes() or self._sr_warmup_capture_bs():
                 raw_bs = int(bs)
                 if raw_bs > pool_rows_max:
                     continue
@@ -571,7 +580,7 @@ class SRTreeDrafter:
         device = self.device
         req_to_token = self.req_to_token_pool.req_to_token
         warmed = []
-        for bs in self._sr_warmup_capture_bs():
+        for bs in self._sr_warmup_raw_batch_sizes() or self._sr_warmup_capture_bs():
             prefix = int(self.page_size)
             req_pool = torch.zeros((int(bs),), dtype=torch.int64, device=device)
             seq_lens = torch.full(
@@ -618,22 +627,34 @@ class SRTreeDrafter:
         return warmed
 
     def _sr_warm_tree_shapes(self) -> None:
-        """Prime eager table/context and allocator shapes before the first request."""
+        """Prime layout, alloc, and mapping before the first request."""
         if not read_sr_tree_warmup_env():
             logger.info("[SR] tree shape warmup skipped: %s=0", SR_TREE_WARMUP_ENV)
             return
         if not self.sr_tree_paged:
             return
         t0 = time.perf_counter()
+        combos = []
+        alloc_keys = []
+        mapping_keys = []
         try:
             combos = self._sr_warm_layout_shapes()
-            alloc_bs = self._sr_warm_allocator_shapes()
-        except NpuGraphReplaySubmittedError:
+            coverage = warm_draft_alloc_mapping(self)
+            alloc_keys = coverage.get("allocation") or []
+            mapping_keys = coverage.get("mapping") or []
+        except (NpuGraphReplaySubmittedError, SRWarmupFatalError):
             raise
         except Exception as e:
             if is_device_context_error(e):
                 raise
-            logger.warning("[SR] tree shape warmup failed: %s", e)
+            logger.warning(
+                "[SR] tree shape warmup failed: %s uncovered layout=%s "
+                "allocation=%s mapping=%s",
+                e,
+                combos,
+                alloc_keys,
+                mapping_keys,
+            )
             return
         seen = getattr(self, "_seen_tree_paged_shapes", None)
         if seen is None:
@@ -641,9 +662,10 @@ class SRTreeDrafter:
             self._seen_tree_paged_shapes = seen
         seen.update(combos)
         logger.info(
-            "[SR] tree shape warmup done combos=%s alloc_bs=%s elapsed=%.3fs",
+            "[SR] tree warmup layout=%s allocation=%s mapping=%s elapsed=%.3fs",
             combos,
-            alloc_bs,
+            alloc_keys,
+            mapping_keys,
             time.perf_counter() - t0,
         )
 

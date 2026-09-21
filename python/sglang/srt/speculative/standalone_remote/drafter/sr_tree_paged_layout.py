@@ -49,7 +49,11 @@ def read_sr_tree_paged_env(env=None) -> bool:
 
 
 def read_sr_tree_warmup_env(env=None) -> bool:
-    """Read once during Draft init; default on. Set 0 to skip shape warmup."""
+    """Read once during SR Draft/Target init; default on.
+
+    Gates extra-graph warmup on both ends (layout, alloc/mapping, Target
+    kernels). Set 0 to skip. Not a runtime toggle.
+    """
     environ = os.environ if env is None else env
     raw = environ.get(SR_TREE_WARMUP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY

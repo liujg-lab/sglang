@@ -267,7 +267,14 @@ eager，不再因图缓冲区行数不足抛裸 `RuntimeError` 并触发请求�
 `block_table` 与 `active` 都按 `(rows, pages)` 分配独立连续缓冲，不再从一块
 `(max_q, max_pages)` 共享张量切片；replay 缺键或缓冲不连续同样回退 eager。
 `SGLANG_NPU_TREE_DRAFT_CAPTURE_BS=1,2` 只作显式收窄/兜底，不是默认规避。
-启动期 `_sr_warm_tree_shapes` 对每个 `capture_bs` 枚举
+`SGLANG_NPU_SR_TREE_WARMUP` 控制 **SR 两端图外预热**（Draft layout / alloc /
+mapping 与 Target kernel）。默认开启；`=0` 跳过新增与已有预热。不新增 CLI。
+`raw_batch_sizes` 为 `range(1, upper+1)`，`upper = min(max(configured_capture_bs),
+req_to_token_rows, 非空的 max_running_requests / standalone_remote_max_batch_size)`。
+`cuda_graph_max_bs` **不单独**作为 upper。没有配置 capture 尺寸则跳过本组新增预热。
+本次实验 `capture_bs=[1,2,4]` 且容量 ≥4 时应得到 `1,2,3,4`。
+
+启动期 Draft `_sr_warm_tree_shapes` 先做 layout：对每个 raw_bs 枚举
 `shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与
 `rem ∈ {1, page_size - num_steps + 1, page_size - 1}`，
 `prefix = shared * page_size + rem`。枚举桶值是无效的：`n_query` 恒为
@@ -284,10 +291,27 @@ view / prefix-tail copy / 五个 step bind。全部 combo 结束后调用
 `prepare_tree_paged_view` / `build_step_context_lens`。`page_size=128` 时约 63 组。
 `test_warmup_rem_ladder_covers_every_reachable_shape` 锁住形状覆盖不变量。预热完
 成的 combos 写入 `_seen_tree_paged_shapes`，因此稳态 `tree_shape_first_use` 应为 0。
-并对每个 `capture_bs` 走一次 `alloc_paged_token_slots_extend(..., backup_state=True)`
-后立刻 `restore_state`。默认开启；启动前设置 `SGLANG_NPU_SR_TREE_WARMUP=0` 可关闭。
-设备上下文错误与 `NpuGraphReplaySubmittedError` 仍直接抛出，其余预热失败只
-warn，不阻止启动。
+
+随后 Draft 在独立 warmup host 上走真实 alloc/mapping（绑定生产方法，不改生产
+scheduler / lease store）。lease 场景 `sr_tree_leases is None`；ordinary 场景
+`_lease_supported()` 固定为 False。prefix 经 `paged_tree_mapping_fits`：
+`page=128, steps=5` 代表 `128/129/252/255`。`steps > page` 时 remainder 含跳变两侧
+（`page=128, steps=133` 为 `123→124`，nnp 2→3）；合法 remainder 内无跳变记不可达，
+不是预热失败。无驱逐 cache adapter 与 tracking allocator 覆盖 `alloc` /
+`alloc_extend` / `free`；`alloc_extend` 只把新增页记入账本。外层先快照
+`free_pages/release_pages`；同步失败或归属不明抛 `SRWarmupFatalError` 并中止
+init，不被 `_sr_warm_tree_shapes` 的 warning 吞掉。已确认恢复成功的普通失败才记
+未覆盖并继续。日志分别报告 `layout=` / `allocation=` / `mapping=`，不用单个
+`alloc_bs` 表示全覆盖。
+
+NPU Target（`page_size>1` 且 `topk>1`）在 `StandaloneRemoteWorker` 初始化末尾做
+图外 kernel 预热：`alloc_paged_token_slots_extend` + `assign_req_to_token_pool_func`、
+`get_src_tgt_cache_loc` / `get_target_cache_loc`、部分完成才
+`filter_finished_cache_loc_kernel`、`copy_paged_kv_buffer_by_slot`。跨页按验证宽度
+`speculative_num_draft_tokens` 生成 keep/free；零释放看空 slot 与页集合，不要求
+`free()` 调用次数为 0。不跑真实 `verify()`，不改 output token / 请求统计 / radix。
+AR 与 SR 图回放策略不变。本补丁只覆盖已枚举路径的首次编译/tiling，不承诺消除
+整个服务的所有首次开销。
 实机确认 bs=4 命中图：草稿启动日志含 `4_s2/4_s4/4_s8`；`[SR Draft round]
 counters` 中 `tree_eager_batches` 为 0；`tree_forward` host 回到约 11-13ms；
 无 `ACL stream synchronize failed, error code:507011`。rows=12 上若复现
@@ -857,7 +881,8 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | 日志或字段 | 如何解释 |
 | --- | --- |
 | `Draft scheduler ready (tree_configured=..., tree_graph_captured=..., tree_graph_disabled_reason=...)` | 分开报告配置树模式、是否捕获图和禁用原因；配置开启不代表图可用 |
-| `tree shape warmup done combos=... alloc_bs=... elapsed=...` | 启动期预热完成；`combos` 是量化后的 `(bs, shared_w, nnp_w, width)` 列表，`alloc_bs` 是分配器预热过的 batch。`elapsed` 若仍远小于 100ms，说明形状预热没有打到首次 tiling 代价。`tree shape warmup skipped` 表示 `SGLANG_NPU_SR_TREE_WARMUP=0`；`tree shape warmup failed` 只说明预热放弃，服务仍继续 |
+| `tree warmup layout=... allocation=... mapping=... elapsed=...` | SR Draft 图外预热完成。`layout` 是量化后的 `(bs, shared_w, nnp_w, width)`；`allocation` / `mapping` 是 host 实际打到的 `(lease\|ordinary, bs, prefixes)`，三者分别报告，不能用单个 `alloc_bs` 代表全覆盖。`elapsed` 若仍远小于 100ms，说明没有打到首次 tiling 代价。`tree shape warmup skipped` 表示 `SGLANG_NPU_SR_TREE_WARMUP=0`；普通失败只 warn，`SRWarmupFatalError` / 设备上下文 / `NpuGraphReplaySubmittedError` 中止 init |
+| `target warmup allocation=... mapping=... kernels=... filter=...` | SR Target 图外 kernel 预热覆盖。`filter` 只应出现 `partial`。`SGLANG_NPU_SR_TREE_WARMUP=0` 或非 NPU 树分页时 skip |
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |

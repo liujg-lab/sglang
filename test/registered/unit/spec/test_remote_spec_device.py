@@ -1666,5 +1666,103 @@ class TestSRDraftGraphHiddenGate(CustomTestCase):
         self.assertIn("need_draft_hidden", cuda_src)
 
 
+class TestSRTargetWarmup(CustomTestCase):
+    def test_raw_batch_sizes_match_draft_formula(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            sr_warmup_raw_batch_sizes,
+        )
+
+        sizes, skip = sr_warmup_raw_batch_sizes([1, 2, 4], 16, 8, None)
+        self.assertIsNone(skip)
+        self.assertEqual(sizes, (1, 2, 3, 4))
+
+    def test_filter_only_on_partial(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_should_run_finished_filter,
+        )
+
+        self.assertTrue(warmup_should_run_finished_filter("partial"))
+        self.assertFalse(warmup_should_run_finished_filter("continue"))
+        self.assertFalse(warmup_should_run_finished_filter("all_finished"))
+        src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_target_warmup.py"
+        ).read_text()
+        self.assertIn("warmup_should_run_finished_filter", src)
+        self.assertIn("all_finished", src)
+        init_src = ast.parse(
+            (
+                _REPO
+                / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+            ).read_text()
+        )
+        text = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        ).read_text()
+        init = None
+        for node in init_src.body:
+            if isinstance(node, ast.ClassDef) and node.name == "StandaloneRemoteWorker":
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == "__init__":
+                        init = ast.get_source_segment(text, child) or ast.unparse(child)
+        self.assertIsNotNone(init)
+        self.assertIn("warm_sr_target_kernels", init)
+        self.assertGreater(init.rfind("warm_sr_target_kernels"), init.find("get_memory_pool"))
+
+    def test_zero_free_and_keep_len_are_slot_vs_page(self):
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            SRWarmupTrackingAllocator,
+            page_set,
+            slots_to_pages,
+            target_keep_len,
+        )
+
+        page, draft, seq = 128, 15, 126
+        keep = target_keep_len(seq, draft - 1, draft, page)
+        free_keep = target_keep_len(seq, 0, draft, page)
+        self.assertEqual(keep, seq + draft)
+        self.assertLess(free_keep, seq + draft)
+        keep_slots = (seq + draft) - keep
+        free_slots = (seq + draft) - free_keep
+        self.assertEqual(keep_slots, 0)
+        self.assertGreater(free_slots, 0)
+        keep_pages = slots_to_pages(torch.empty(0, dtype=torch.int64), page)
+        free_pages = slots_to_pages(
+            torch.arange(free_keep, seq + draft, dtype=torch.int64), page
+        )
+        self.assertEqual(keep_pages, set())
+        self.assertNotEqual(len(free_pages), free_slots)
+
+        class Inner:
+            page_size = 4
+            device = "cpu"
+
+            def __init__(self):
+                self.free_pages = torch.arange(1, 5, dtype=torch.int64)
+                self.release_pages = torch.empty((0,), dtype=torch.int64)
+                self.is_not_in_free_group = True
+                self.free_group = []
+
+            def free(self, idx):
+                if torch.is_tensor(idx) and int(idx.numel()) == 0:
+                    return
+                pages = torch.unique(idx // self.page_size)
+                self.free_pages = torch.cat([self.free_pages, pages])
+
+            def backup_state(self):
+                return (self.free_pages.clone(), self.release_pages.clone())
+
+            def restore_state(self, state):
+                self.free_pages, self.release_pages = state
+
+        inner = Inner()
+        adapter = SRWarmupTrackingAllocator(inner)
+        before = page_set(inner)
+        adapter.free(torch.empty((0,), dtype=torch.int64))
+        self.assertEqual(page_set(inner), before)
+        self.assertEqual(adapter.owned_pages, set())
+
+
 if __name__ == "__main__":
     unittest.main()

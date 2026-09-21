@@ -10,6 +10,10 @@ import torch
 from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
 
+class SRWarmupFatalError(RuntimeError):
+    """Abort initialization: sync failed, ownership unknown, or restore failed."""
+
+
 class DraftDecision(Enum):
     DROP_OLD_SESSION = "drop_old_session"
     WIPE_NEW_SESSION = "wipe_new_session"
