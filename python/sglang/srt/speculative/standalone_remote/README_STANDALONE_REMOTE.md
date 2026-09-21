@@ -276,9 +276,9 @@ req_to_token_rows, 非空的 max_running_requests / standalone_remote_max_batch_
 `cuda_graph_max_bs` **不单独**作为 upper。没有配置 capture 尺寸则跳过本组新增预热。
 本次实验 `capture_bs=[1,2,4]` 且容量 ≥4 时应得到 `1,2,3,4`。
 
-`SGLANG_NPU_SR_TREE_UPDATE_OVERLAP` 是 **默认关闭** 的 SR Draft 分页树实验开关：
+`SGLANG_NPU_SR_TREE_UPDATE_OVERLAP` 是 **默认开启** 的 SR Draft 分页树开关：
 后台线程执行 `graph.update`，主线程同时 `graph.replay`，提交返回前 join。
-未设置或 `=0` 保持串行；`=1` 才请求启用。只在 Draft 初始化时读取，需重启 Draft，
+未设置或 `=1` 请求启用；`=0` 回退串行。只在 Draft 初始化时读取，需重启 Draft，
 不是运行时热切换，也不是 CLI/协议字段。仅 `paged_atb` / `paged_fia` 在图可用且
 成功取得 `torch.npu.current_device()` 后 `effective=True`。图捕获失败仍按现有
 图初始化失败处理，不会被关掉 overlap 掩盖。设备绑定只走这条分页重叠路径，
@@ -287,8 +287,7 @@ tail EXTEND、CUDA 和普通 EAGLE/STANDALONE。后台线程显式 `daemon=False
 join 只证明 `update()` 返回，不证明设备图已执行结束。线程启动失败不调用 replay，
 沿树展开已有 in-flight 路径：先 `_try_confirm_tree_completion()`，确认失败则按
 submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共用实现，但
-必须分别验收；正确性未通过前不做性能结论。开关继续默认关闭，直到实机 A/B
-证明 Draft 整轮耗时下降且输出/KV 一致。
+必须分别验收。
 
 启动期 Draft `_sr_warm_tree_shapes` 先做 layout：对每个 raw_bs 枚举
 `shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与

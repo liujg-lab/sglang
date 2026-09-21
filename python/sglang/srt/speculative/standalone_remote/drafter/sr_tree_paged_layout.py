@@ -61,13 +61,14 @@ def read_sr_tree_warmup_env(env=None) -> bool:
 
 
 def read_sr_tree_update_overlap_env(env=None) -> bool:
-    """Read once during SR Draft init; default off.
+    """Read once during SR Draft init; default on.
 
     Gates paged-tree ``graph.update`` / ``graph.replay`` overlap on NPU Draft.
-    Not a runtime toggle. Compact-FIA keeps ``SGLANG_NPU_TREE_FIA_SERIAL_UPDATE``.
+    Set 0 to keep serial. Not a runtime toggle. Compact-FIA keeps
+    ``SGLANG_NPU_TREE_FIA_SERIAL_UPDATE``.
     """
     environ = os.environ if env is None else env
-    raw = environ.get(SR_TREE_UPDATE_OVERLAP_ENV, "0")
+    raw = environ.get(SR_TREE_UPDATE_OVERLAP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 

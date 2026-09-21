@@ -138,8 +138,9 @@ class TestSrTreePagedEnv(CustomTestCase):
         self.assertFalse(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "0"}))
         self.assertTrue(read_sr_tree_warmup_env({SR_TREE_WARMUP_ENV: "1"}))
 
-    def test_update_overlap_env_default_off(self):
-        self.assertFalse(read_sr_tree_update_overlap_env({}))
+    def test_update_overlap_env_default_on(self):
+        self.assertTrue(read_sr_tree_update_overlap_env({}))
+        self.assertTrue(read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "1"}))
         self.assertFalse(read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "0"}))
         self.assertFalse(
             read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "false"})

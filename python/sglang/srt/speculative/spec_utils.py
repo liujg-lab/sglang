@@ -221,7 +221,7 @@ def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
 
     Default is serial. Plain AR DECODE enables overlap explicitly;
     compact-FIA tree keeps the existing env-var policy. Draft paged tree
-    stays serial unless ``SGLANG_NPU_SR_TREE_UPDATE_OVERLAP`` is enabled.
+    overlaps by default; set ``SGLANG_NPU_SR_TREE_UPDATE_OVERLAP=0`` for serial.
     Target tree-paged-FIA and SR tail EXTEND keep serial calls.
 
     After replay has been invoked, or if update fails, wrap ordinary
