@@ -255,6 +255,14 @@ class TestGreedyDispatch(CustomTestCase):
             _REPO / "python/sglang/srt/speculative/tree_verify_npu.py"
         ).read_text()
         self.assertNotIn("sgl_kernel_npu.sample.verify_tree_greedy", npu_src)
+        start = npu_src.index("_verify_tree_greedy_kernel[(bs,)]")
+        launch = npu_src[
+            start : npu_src.index(
+                "return predicts, accept_index, accept_token_num", start
+            )
+        ]
+        self.assertIn("PATH_CAP=path_cap", launch)
+        self.assertNotIn("num_warps", launch)
 
 
 if __name__ == "__main__":

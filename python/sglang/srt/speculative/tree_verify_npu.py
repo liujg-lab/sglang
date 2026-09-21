@@ -283,6 +283,7 @@ def verify_tree_greedy_npu(
 
     path_cap = accept_index.shape[1]
     target_flat = target_predict.reshape(-1)
+    # Triton-Ascend has no CUDA warps; passing num_warps only warns and is ignored.
     _verify_tree_greedy_kernel[(bs,)](
         predicts,
         accept_index,
@@ -295,6 +296,5 @@ def verify_tree_greedy_npu(
         predicts.numel(),
         WIDTH=width,
         PATH_CAP=path_cap,
-        num_warps=1,
     )
     return predicts, accept_index, accept_token_num
