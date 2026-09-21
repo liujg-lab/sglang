@@ -1365,6 +1365,7 @@ class TestRemoteSpecDevice(CustomTestCase):
     def test_npu_does_not_call_chain_sgl_kernel_npu_greedy(self):
         src = (_REPO / "python/sglang/srt/speculative/eagle_utils.py").read_text()
         self.assertIn("verify_tree_greedy_ref", src)
+        self.assertIn("tree_verify_npu", src)
         self.assertNotIn("sgl_kernel_npu", src)
 
     def test_copy_kv_pool_by_slot_validates_before_write(self):
@@ -1709,6 +1710,48 @@ class TestSRTargetWarmup(CustomTestCase):
         self.assertIsNotNone(init)
         self.assertIn("warm_sr_target_kernels", init)
         self.assertGreater(init.rfind("warm_sr_target_kernels"), init.find("get_memory_pool"))
+
+    def test_greedy_warmup_runs_before_paged_gate(self):
+        src = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_target_warmup.py"
+        ).read_text()
+        self.assertIn("warm_target_greedy_verify", src)
+        self.assertIn("verify_tree_greedy_func", src)
+        self.assertLess(
+            src.find("warm_target_greedy_verify(worker)"),
+            src.find("not npu tree-paged target"),
+        )
+        self.assertIn("target greedy verify warmup failed", src)
+        self.assertIn("SRWarmupFatalError", src)
+        self.assertIn('path == "npu_kernel"', src)
+        self.assertIn("cpu_reference", src)
+        self.assertIn("not_applicable", src)
+        self.assertIn("return (1,)", src)
+        self.assertNotIn("sgl_kernel_npu", src)
+        greedy_fn = src[src.index("def warm_target_greedy_verify") : src.index("def warm_sr_target_kernels")]
+        self.assertNotIn("token_to_kv_pool_allocator", greedy_fn)
+        self.assertNotIn("req_to_token_pool", greedy_fn)
+
+    def test_greedy_warmup_batch_sizes_without_capture(self):
+        src_path = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_target_warmup.py"
+        )
+        tree = ast.parse(src_path.read_text())
+        fn = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "greedy_verify_warmup_batch_sizes"
+            ):
+                fn = node
+        self.assertIsNotNone(fn)
+        ns = {"configured_target_capture_bs": lambda _w: []}
+        ast.fix_missing_locations(fn)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(src_path), "exec"), ns)
+        sizes = ns["greedy_verify_warmup_batch_sizes"](SimpleNamespace())
+        self.assertEqual(sizes, (1,))
 
     def test_zero_free_and_keep_len_are_slot_vs_page(self):
         from sglang.srt.speculative.standalone_remote.sr_warmup import (

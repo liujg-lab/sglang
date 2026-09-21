@@ -1,3 +1,4 @@
+import logging
 import math
 from enum import IntEnum
 from typing import List, Optional
@@ -9,6 +10,12 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
+
+_logged_greedy_paths: set[tuple[str, Optional[str]]] = set()
+_npu_greedy_deps: Optional[tuple[str, Optional[str]]] = None
+_last_greedy_verify_path: Optional[str] = None
+_last_greedy_verify_reason: Optional[str] = None
 
 if _is_cuda or _is_hip:
     from sgl_kernel import (
@@ -158,6 +165,65 @@ def build_tree_kernel_efficient(
     )
 
 
+def greedy_verify_path_info() -> tuple[Optional[str], Optional[str]]:
+    """Last greedy dispatch path and fallback reason for this process."""
+    return _last_greedy_verify_path, _last_greedy_verify_reason
+
+
+def npu_greedy_optional_deps() -> tuple[str, Optional[str]]:
+    """Cache whether optional Triton is importable. Does not cache layout."""
+    global _npu_greedy_deps
+    if _npu_greedy_deps is not None:
+        return _npu_greedy_deps
+    from sglang.srt.speculative.tree_verify_npu import npu_greedy_triton_status
+
+    _npu_greedy_deps = npu_greedy_triton_status()
+    return _npu_greedy_deps
+
+
+def _log_greedy_verify_path(path: str, reason: Optional[str] = None) -> None:
+    global _last_greedy_verify_path, _last_greedy_verify_reason
+    _last_greedy_verify_path = path
+    _last_greedy_verify_reason = reason
+    key = (path, reason)
+    if key in _logged_greedy_paths:
+        return
+    _logged_greedy_paths.add(key)
+    if reason:
+        logger.info("Speculative greedy verify path: %s reason=%s", path, reason)
+    else:
+        logger.info("Speculative greedy verify path: %s", path)
+
+
+def _run_greedy_reference(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+    topk,
+    reason: str,
+):
+    from sglang.srt.speculative.tree_verify import verify_tree_greedy_ref
+
+    _log_greedy_verify_path("cpu_reference", reason)
+    verify_tree_greedy_ref(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        target_predict=target_predict,
+        topk=topk,
+    )
+    return predicts, accept_index, accept_token_num
+
+
 def verify_tree_greedy_func(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -182,11 +248,67 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
         )
+        _log_greedy_verify_path("cuda_kernel")
+        return predicts, accept_index, accept_token_num
 
-    else:
-        from sglang.srt.speculative.tree_verify import verify_tree_greedy_ref
+    if _is_npu:
+        from sglang.srt.speculative.tree_verify_npu import (
+            inspect_greedy_npu_contract,
+            verify_tree_greedy_npu,
+        )
 
-        verify_tree_greedy_ref(
+        decision, reason = inspect_greedy_npu_contract(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict,
+        )
+        if decision == "cpu":
+            return _run_greedy_reference(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                target_predict,
+                topk,
+                reason or "cpu tensors",
+            )
+        if decision == "unsupported_layout":
+            return _run_greedy_reference(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                target_predict,
+                topk,
+                reason or "unsupported layout",
+            )
+        dep_status, dep_reason = npu_greedy_optional_deps()
+        if dep_status != "ok":
+            return _run_greedy_reference(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                target_predict,
+                topk,
+                dep_reason or "missing optional dependency",
+            )
+        _log_greedy_verify_path("npu_kernel")
+        verify_tree_greedy_npu(
             predicts=predicts,
             accept_index=accept_index,
             accept_token_num=accept_token_num,
@@ -197,4 +319,17 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
             topk=topk,
         )
-    return predicts, accept_index, accept_token_num
+        return predicts, accept_index, accept_token_num
+
+    return _run_greedy_reference(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        target_predict,
+        topk,
+        "non-npu host path",
+    )

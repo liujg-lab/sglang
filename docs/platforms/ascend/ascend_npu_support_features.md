@@ -232,7 +232,7 @@ SPECTRE / STANDALONE_REMOTE on Ascend:
 
 - Device pairs: NPU→NPU (CI), CUDA↔NPU (manual multi-host). Heterogeneous runs exchange tokens, tree structure, and CPU multimodal payloads only — not KV.
 - Text: Qwen3. Vision: Qwen3-VL. SPECTRE stays chain (`topk=1`); SR keeps real trees (`topk>1`).
-- Tree verify: sibling-walk greedy and portable `target_only`. `auto` + non-greedy must not fall back to greedy.
+- Tree verify: NPU greedy uses in-repo sibling-walk device kernel (`tree_verify_npu.py`) with CPU `verify_tree_greedy_ref` as the correctness baseline and pre-submit fallback. Portable `target_only` is unchanged. `auto` + non-greedy must not fall back to greedy. Do not import `sgl_kernel_npu.sample.verify_tree_greedy`. Greedy device path is the shared `verify_tree_greedy_func` entry (SR / SPECTRE / EAGLE / STANDALONE); SR Target extra-graph warmup is the only new startup coverage.
 - Default `page_size=128` is supported for SR trees (last-page fork copy). Mid-page rollback still re-prefills.
 - `--disable-cuda-graph` also disables NPU graphs. Tree mode is not considered compatible if it only runs with `topk=1` and graphs off.
 - Greedy accuracy is vs the same Target backend AR baseline, not CUDA vs NPU token identity.

@@ -1,7 +1,9 @@
 """Portable tree verification (greedy + target_only) for CUDA/NPU/CPU.
 
-CUDA keeps the existing sgl_kernel implementations. NPU and tests use these
-reference algorithms so sibling traversal, threshold accept, and relu(q-p)
+CUDA keeps the existing sgl_kernel implementations. The CPU greedy reference
+is the correctness baseline for NPU sibling-walk and the fallback when the
+NPU device kernel cannot be launched. target_only and tests still use these
+portable algorithms so sibling traversal, threshold accept, and relu(q-p)
 bonus sampling match the CUDA kernels given the same tensors and coins.
 """
 

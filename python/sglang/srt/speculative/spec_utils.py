@@ -900,7 +900,8 @@ def tree_verify_method_available(
 ) -> bool:
     """Capability table: backend × verify method.
 
-    greedy: CUDA/HIP kernels; NPU uses the portable sibling-walk implementation.
+    greedy: CUDA/HIP kernels; NPU uses tree_verify_npu sibling-walk, with
+    the portable CPU reference as fallback before device submit.
     target_only: CUDA kernel or portable NPU/CPU reference. Not HIP.
     rpd: CUDA kernel or CPU fallback on every backend.
     """

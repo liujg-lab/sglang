@@ -149,6 +149,147 @@ def _overlap_kv_check(kv_buffer, slots, page):
     return bool(torch.equal(after, before))
 
 
+def greedy_verify_warmup_batch_sizes(worker) -> tuple[int, ...]:
+    """BS coverage for greedy verify warmup; independent of graph capture success.
+
+    No capture BS still warms BS=1. Configured capture uses ``1..upper``.
+    """
+    capture = configured_target_capture_bs(worker)
+    if not capture:
+        return (1,)
+    args = getattr(worker, "server_args", None)
+    caps = [max(int(b) for b in capture)]
+    for optional in (
+        getattr(args, "max_running_requests", None),
+        getattr(args, "standalone_remote_max_batch_size", None),
+    ):
+        if optional is not None:
+            caps.append(int(optional))
+    upper = min(caps)
+    if upper <= 0:
+        return (1,)
+    return tuple(range(1, upper + 1))
+
+
+def _greedy_warmup_device(worker):
+    device = getattr(worker, "device", "cpu")
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(str(device))
+
+
+def _greedy_warmup_wl(worker) -> tuple[int, int]:
+    width = max(int(getattr(worker, "speculative_num_draft_tokens", 1) or 1), 1)
+    steps = int(getattr(worker, "speculative_num_steps", 0) or 0)
+    path_cap = max(steps + 1, 1)
+    return width, path_cap
+
+
+def _greedy_scratch_buffers(bs: int, width: int, path_cap: int, device, extra_predicts: int):
+    pred_len = bs * width + extra_predicts
+    predicts = torch.full((pred_len,), 777, dtype=torch.int32, device=device)
+    accept_index = torch.full((bs, path_cap), -1, dtype=torch.int32, device=device)
+    accept_token_num = torch.zeros((bs,), dtype=torch.int32, device=device)
+    candidates = torch.zeros((bs, width), dtype=torch.int64, device=device)
+    retrive_index = torch.arange(bs * width, device=device, dtype=torch.int64).reshape(bs, width)
+    retrive_next_token = torch.full((bs, width), -1, dtype=torch.int64, device=device)
+    retrive_next_sibling = torch.full((bs, width), -1, dtype=torch.int64, device=device)
+    target_predict = torch.zeros((bs, width), dtype=torch.int64, device=device)
+    return {
+        "predicts": predicts,
+        "accept_index": accept_index,
+        "accept_token_num": accept_token_num,
+        "candidates": candidates,
+        "retrive_index": retrive_index,
+        "retrive_next_token": retrive_next_token,
+        "retrive_next_sibling": retrive_next_sibling,
+        "target_predict": target_predict,
+    }
+
+
+def _fill_greedy_all_reject(bufs, width: int) -> None:
+    bufs["candidates"].fill_(1)
+    bufs["target_predict"].fill_(99)
+    if width > 1:
+        bufs["retrive_next_token"][:, 0] = 1
+        for node in range(1, width - 1):
+            bufs["retrive_next_sibling"][:, node] = node + 1
+
+
+def _fill_greedy_non_first_child(bufs, width: int) -> None:
+    if width < 3:
+        raise ValueError("non-first-child warmup needs W>=3")
+    bufs["candidates"].fill_(1)
+    bufs["candidates"][:, 1] = 10
+    bufs["candidates"][:, 2] = 20
+    bufs["target_predict"].fill_(3)
+    bufs["target_predict"][:, 0] = 20
+    bufs["retrive_next_token"][:, 0] = 1
+    bufs["retrive_next_sibling"][:, 1] = 2
+
+
+def warm_target_greedy_verify(worker) -> dict:
+    """Scratch greedy verify warmup through the production dispatch entry.
+
+    Does not touch requests, the KV allocator, or radix. Kernel errors propagate.
+    """
+    from sglang.srt.speculative.eagle_utils import (
+        greedy_verify_path_info,
+        verify_tree_greedy_func,
+    )
+
+    device = _greedy_warmup_device(worker)
+    width, path_cap = _greedy_warmup_wl(worker)
+    batch_sizes = greedy_verify_warmup_batch_sizes(worker)
+    cases = ["all_reject"]
+    if width >= 3 and path_cap >= 2:
+        cases.append("non_first_child")
+        non_first = "ran"
+    else:
+        non_first = "not_applicable"
+    compile_variant = {
+        "W": width,
+        "L": path_cap,
+        "predicts_dtype": "int32",
+        "index_dtype": "int64",
+    }
+    for bs in batch_sizes:
+        bufs = _greedy_scratch_buffers(int(bs), width, path_cap, device, extra_predicts=1)
+        _fill_greedy_all_reject(bufs, width)
+        verify_tree_greedy_func(**bufs, topk=int(getattr(worker, "topk", -1) or -1))
+        if non_first == "ran":
+            bufs = _greedy_scratch_buffers(int(bs), width, path_cap, device, extra_predicts=1)
+            _fill_greedy_non_first_child(bufs, width)
+            verify_tree_greedy_func(**bufs, topk=int(getattr(worker, "topk", -1) or -1))
+    warmup_synchronize(device)
+    path, reason = greedy_verify_path_info()
+    result = {
+        "path": path,
+        "reason": reason,
+        "compile": compile_variant,
+        "bs": list(batch_sizes),
+        "cases": cases,
+        "non_first_child": non_first,
+    }
+    if path == "npu_kernel":
+        logger.info(
+            "[SR] target greedy verify warmup path=npu_kernel compile=%s bs=%s cases=%s",
+            compile_variant,
+            list(batch_sizes),
+            cases,
+        )
+    elif path == "cpu_reference":
+        logger.info(
+            "[SR] target greedy verify warmup path=cpu_reference reason=%s compile=%s bs=%s",
+            reason,
+            compile_variant,
+            list(batch_sizes),
+        )
+    else:
+        logger.info("[SR] target greedy verify warmup path=%s reason=%s", path, reason)
+    return result
+
+
 def warm_sr_target_kernels(worker) -> dict:
     coverage = {
         "allocation": [],
@@ -156,11 +297,28 @@ def warm_sr_target_kernels(worker) -> dict:
         "kernels": [],
         "skipped": None,
         "filter": [],
+        "greedy": None,
     }
     if not read_sr_tree_warmup_env():
         coverage["skipped"] = f"{SR_TREE_WARMUP_ENV}=0"
+        coverage["greedy"] = {"skipped": f"{SR_TREE_WARMUP_ENV}=0"}
         logger.info("[SR] target kernel warmup skipped: %s=0", SR_TREE_WARMUP_ENV)
+        logger.info(
+            "[SR] target greedy verify warmup skipped: %s=0", SR_TREE_WARMUP_ENV
+        )
         return coverage
+    if is_npu():
+        try:
+            coverage["greedy"] = warm_target_greedy_verify(worker)
+        except SRWarmupFatalError:
+            raise
+        except Exception as exc:
+            raise SRWarmupFatalError(
+                f"target greedy verify warmup failed: {exc}"
+            ) from exc
+    else:
+        coverage["greedy"] = {"skipped": "not npu"}
+        logger.info("[SR] target greedy verify warmup skipped: not npu")
     if not is_npu() or int(worker.page_size) <= 1 or int(worker.topk) <= 1:
         coverage["skipped"] = "not npu tree-paged target"
         return coverage
@@ -274,10 +432,11 @@ def warm_sr_target_kernels(worker) -> dict:
         restore_page_lists(inner, snapshot)
         adapter.owned_pages = set()
     logger.info(
-        "[SR] target warmup allocation=%s mapping=%s kernels=%s filter=%s",
+        "[SR] target warmup allocation=%s mapping=%s kernels=%s filter=%s greedy=%s",
         coverage["allocation"],
         coverage["mapping"],
         coverage["kernels"],
         coverage["filter"],
+        coverage["greedy"],
     )
     return coverage

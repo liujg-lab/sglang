@@ -147,6 +147,83 @@ class TestTreeVerifyRef(CustomTestCase):
         self.assertEqual(int(accept_len[0]), 1)
         self.assertEqual(accept_index[0, :2].tolist(), [0, 1])
 
+    def test_greedy_last_sibling_hit_and_unwritten_sentinel(self):
+        candidates = torch.tensor([[7, 10, 11, 20]], dtype=torch.int64)
+        retrive_index = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+        retrive_next_token = torch.tensor([[1, -1, -1, -1]], dtype=torch.int64)
+        retrive_next_sibling = torch.tensor([[-1, 2, 3, -1]], dtype=torch.int64)
+        target_predict = torch.tensor([[20, 8, 8, 8]], dtype=torch.int64)
+        predicts = torch.full((4,), 777, dtype=torch.int32)
+        accept_index = torch.full((1, 3), -1, dtype=torch.int32)
+        accept_len = torch.zeros((1,), dtype=torch.int32)
+        verify_tree_greedy_ref(
+            predicts,
+            accept_index,
+            accept_len,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict,
+        )
+        self.assertEqual(int(accept_len[0]), 1)
+        self.assertEqual(accept_index[0].tolist(), [0, 3, -1])
+        self.assertEqual(int(predicts[0]), 20)
+        self.assertEqual(int(predicts[3]), 8)
+        self.assertEqual(int(predicts[1]), 777)
+        self.assertEqual(int(predicts[2]), 777)
+
+    def test_greedy_width_not_equal_path_cap(self):
+        # W=4 candidates, L=3 accept path (spec_steps+1).
+        candidates = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        retrive_index = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+        retrive_next_token = torch.tensor([[1, 3, -1, -1]], dtype=torch.int64)
+        retrive_next_sibling = torch.tensor([[-1, 2, -1, -1]], dtype=torch.int64)
+        target_predict = torch.tensor([[2, 4, 9, 9]], dtype=torch.int64)
+        predicts, accept_index, accept_len = _empty_io(1, 4, 3)
+        verify_tree_greedy_ref(
+            predicts,
+            accept_index,
+            accept_len,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict,
+        )
+        self.assertEqual(int(accept_len[0]), 2)
+        self.assertEqual(accept_index[0].tolist(), [0, 1, 3])
+        self.assertEqual(int(predicts[0]), 2)
+        self.assertEqual(int(predicts[1]), 4)
+
+    def test_greedy_nonlinear_retrive_index_and_extra_tail(self):
+        candidates = torch.tensor([[7, 10, 20]], dtype=torch.int64)
+        retrive_index = torch.tensor([[4, 1, 6]], dtype=torch.int64)
+        retrive_next_token = torch.tensor([[1, -1, -1]], dtype=torch.int64)
+        retrive_next_sibling = torch.tensor([[-1, 2, -1]], dtype=torch.int64)
+        target_predict = torch.full((8,), 3, dtype=torch.int64)
+        target_predict[4] = 20
+        target_predict[6] = 9
+        predicts = torch.full((8,), 777, dtype=torch.int32)
+        accept_index = torch.full((1, 2), -1, dtype=torch.int32)
+        accept_len = torch.zeros((1,), dtype=torch.int32)
+        verify_tree_greedy_ref(
+            predicts,
+            accept_index,
+            accept_len,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict,
+        )
+        self.assertEqual(int(accept_len[0]), 1)
+        self.assertEqual(accept_index[0].tolist(), [4, 6])
+        self.assertEqual(int(predicts[4]), 20)
+        self.assertEqual(int(predicts[6]), 9)
+        self.assertEqual(int(predicts[7]), 777)
+        self.assertEqual(int(predicts[0]), 777)
+
     def test_target_only_all_reject_uses_relu_bonus(self):
         vocab = 4
         candidates = torch.tensor([[0, 1, 2]], dtype=torch.int64)

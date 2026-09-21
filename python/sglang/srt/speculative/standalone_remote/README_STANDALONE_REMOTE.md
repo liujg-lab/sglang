@@ -222,6 +222,8 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 当前 RPD 有 CUDA kernel 与 CPU reference 分派；缺少 CUDA kernel 或非 CUDA 路径可使用 CPU reference。
 观察 `Speculative RPD verify path` 的实际值，不应把普通 greedy/target-only 验证的耗时套用于 RPD。
 
+NPU greedy 树核验走本仓库 [`tree_verify_npu.py`](../tree_verify_npu.py) 的 sibling-walk 设备 kernel，语义对齐 CPU [`verify_tree_greedy_ref`](../tree_verify.py) 与 CUDA `VerifyTreeGreedy`。共享入口是 `verify_tree_greedy_func`，因此 SR、SPECTRE、EAGLE/STANDALONE 中所有 greedy 调用都会走到该分派；启动 scratch 预热只接入 SR Target。CPU 张量、已识别的缺可选依赖（Triton）、或首版不支持的合法非连续布局在提交设备工作之前回退 reference；混合设备或非法 shape/dtype 报错；JIT/launch/执行失败原样上抛，不再跑 reference。不要接入 `sgl_kernel_npu.sample.verify_tree_greedy` 链入口。本优化减少 Target greedy 核验的主机往返与 Python 遍历，不解决 Draft 主瓶颈，也不能把 `accept_commit_including_wait` 整段当作可消除时间。核验之后现有结果处理仍可能读回主机。观察 `Speculative greedy verify path` 的实际值（`npu_kernel` 或 `cpu_reference` 及 reason）。设备路径依赖 Triton-Ascend JIT；具体可用版本以实机验收记录为准，当前编写环境未跑 NPU 数值对照。
+
 默认 `auto` 配合 `temperature=0` 时，用**相同 Target 后端**的普通 AR 作为正确性基线。
 不要要求 CUDA 与 NPU、不同采样种子或不同后端必然产生同样序列。
 结构化输出由 Target grammar mask 保证约束；Draft 会按 committed 前缀恢复 grammar，
@@ -882,7 +884,8 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | --- | --- |
 | `Draft scheduler ready (tree_configured=..., tree_graph_captured=..., tree_graph_disabled_reason=...)` | 分开报告配置树模式、是否捕获图和禁用原因；配置开启不代表图可用 |
 | `tree warmup layout=... allocation=... mapping=... elapsed=...` | SR Draft 图外预热完成。`layout` 是量化后的 `(bs, shared_w, nnp_w, width)`；`allocation` / `mapping` 是 host 实际打到的 `(lease\|ordinary, bs, prefixes)`，三者分别报告，不能用单个 `alloc_bs` 代表全覆盖。`elapsed` 若仍远小于 100ms，说明没有打到首次 tiling 代价。`tree shape warmup skipped` 表示 `SGLANG_NPU_SR_TREE_WARMUP=0`；普通失败只 warn，`SRWarmupFatalError` / 设备上下文 / `NpuGraphReplaySubmittedError` 中止 init |
-| `target warmup allocation=... mapping=... kernels=... filter=...` | SR Target 图外 kernel 预热覆盖。`filter` 只应出现 `partial`。`SGLANG_NPU_SR_TREE_WARMUP=0` 或非 NPU 树分页时 skip |
+| `target warmup allocation=... mapping=... kernels=... filter=... greedy=...` | SR Target 图外 kernel 预热覆盖。`filter` 只应出现 `partial`。`greedy` 是独立 greedy 核验 scratch 预热，不依赖图捕获或 `page_size>1 && topk>1`。`path=npu_kernel` 才表示设备 kernel 已预热；`path=cpu_reference` 只说明走了 reference，不能记成设备成功。`SGLANG_NPU_SR_TREE_WARMUP=0` 时 greedy 与 paged 预热一起 skip |
+| `Speculative greedy verify path` | greedy 核验实际路径：`npu_kernel` / `cpu_reference`（含 reason）/ CUDA 上的 `cuda_kernel`。与 RPD 路径日志独立 |
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
