@@ -19,8 +19,12 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
 )
 from sglang.srt.speculative.standalone_remote import sr_round_metrics as round_metrics
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    GRAPH_HOST_STAGES,
     SRCommMetrics,
     SRRoundMetrics,
+    begin_graph_host_sample,
+    measure_call,
+    record_graph_host_sample_safely,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -519,6 +523,269 @@ class TestSRRoundMetrics(unittest.TestCase):
             metrics.add_host("tree_alloc_kv", 0.02)
         self.assertAlmostEqual(metrics.host_max["tree_alloc_kv"], 0.02)
         self.assertGreater(metrics.host["tree_alloc_kv"], 0.02)
+
+
+def _graph_ctx(**overrides):
+    ctx = {
+        "round_id": 1,
+        "graph_key": "1_s256",
+        "implementation": "paged_atb",
+        "raw_bs": 1,
+        "capture_bs": 1,
+        "kv_bucket": 256,
+        "topk": 2,
+        "num_steps": 2,
+        "overlap": False,
+    }
+    ctx.update(overrides)
+    return ctx
+
+
+def _run_window(metrics, n=32, host_name="tree_forward"):
+    for _ in range(n):
+        with metrics.round():
+            metrics.add_host(host_name, 0.001)
+
+
+class TestGraphHostMetrics(unittest.TestCase):
+    def setUp(self):
+        round_metrics._graph_host_warns = 0
+        self.clock = Clock()
+        patcher = patch.object(round_metrics.time, "perf_counter_ns", self.clock.ns)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _advance_call(self, sample, stage, ms, *, error=None):
+        def body():
+            self.clock.advance(ms)
+            if error is not None:
+                raise error
+            return stage
+
+        return measure_call(sample, stage, body)
+
+    def test_five_stages_and_partial_window_use_actual_n(self):
+        metrics = SRRoundMetrics("Draft")
+        stages = GRAPH_HOST_STAGES
+        for i in range(32):
+            sample = begin_graph_host_sample(_graph_ctx(round_id=i + 1))
+            if i < 8:
+                for name in stages:
+                    self._advance_call(sample, name, i + 1)
+            else:
+                self._advance_call(sample, "replay_call", 2)
+                self._advance_call(sample, "submit_envelope", 3)
+            record_graph_host_sample_safely(metrics, sample)
+        captured = {}
+
+        def capture(fmt, *args, **kwargs):
+            captured.setdefault("lines", []).append((fmt, args))
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        host_line = next(args for fmt, args in captured["lines"] if "graph host" in fmt)
+        group = host_line[0][0]
+        self.assertEqual(group["ok"], 32)
+        self.assertEqual(group["failed"], 0)
+        self.assertEqual(group["ok_stats"]["lengths_host_ms"]["n"], 8)
+        self.assertEqual(group["ok_stats"]["replay_call_host_ms"]["n"], 32)
+        self.assertNotIn("lengths_host_ms", group["failed_stats"])
+
+    def test_group_key_isolates_shape_and_bucket_not_round_id(self):
+        metrics = SRRoundMetrics("Draft")
+        for ctx in (
+            _graph_ctx(round_id=1, raw_bs=3, capture_bs=4, kv_bucket=256),
+            _graph_ctx(round_id=2, raw_bs=3, capture_bs=4, kv_bucket=256),
+            _graph_ctx(round_id=3, raw_bs=4, capture_bs=4, kv_bucket=256),
+            _graph_ctx(round_id=4, raw_bs=3, capture_bs=4, kv_bucket=512),
+        ):
+            sample = begin_graph_host_sample(ctx)
+            self._advance_call(sample, "lengths", 1)
+            record_graph_host_sample_safely(metrics, sample)
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["groups"] = args[0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        keys = {
+            (g["raw_bs"], g["capture_bs"], g["kv_bucket"]): g["ok"]
+            for g in flushed["groups"]
+        }
+        self.assertEqual(keys[(3, 4, 256)], 2)
+        self.assertEqual(keys[(4, 4, 256)], 1)
+        self.assertEqual(keys[(3, 4, 512)], 1)
+        self.assertEqual(len(flushed["groups"]), 3)
+
+    def test_failed_call_keeps_update_out_of_success_stats(self):
+        metrics = SRRoundMetrics("Draft")
+        ok = begin_graph_host_sample(_graph_ctx())
+        self._advance_call(ok, "update_call", 10)
+        self._advance_call(ok, "replay_call", 20)
+        self._advance_call(ok, "submit_envelope", 30)
+        record_graph_host_sample_safely(metrics, ok)
+
+        failed = begin_graph_host_sample(_graph_ctx(round_id=2))
+        self._advance_call(failed, "update_call", 100)
+        with self.assertRaises(RuntimeError):
+            self._advance_call(failed, "replay_call", 5, error=RuntimeError("replay"))
+        failed.mark_failed_or_interrupted()
+        record_graph_host_sample_safely(metrics, failed)
+
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["group"] = args[0][0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        group = flushed["group"]
+        self.assertEqual(group["ok"], 1)
+        self.assertEqual(group["failed"], 1)
+        self.assertEqual(group["ok_stats"]["update_call_host_ms"]["n"], 1)
+        self.assertEqual(group["ok_stats"]["update_call_host_ms"]["max"], 10)
+        self.assertEqual(group["failed_stats"]["update_call_host_ms"]["n"], 1)
+        self.assertEqual(group["failed_stats"]["update_call_host_ms"]["max"], 100)
+        self.assertEqual(group["stage_status"]["replay_call_host_ms"]["failed"], 1)
+
+    def test_no_timing_failure_still_counts_and_logs(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        sample.mark_failed_or_interrupted()
+        record_graph_host_sample_safely(metrics, sample)
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["group"] = args[0][0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        self.assertEqual(flushed["group"]["ok"], 0)
+        self.assertEqual(flushed["group"]["failed"], 1)
+        self.assertFalse(flushed["group"]["ok_stats"])
+        self.assertFalse(flushed["group"]["failed_stats"])
+        self.assertFalse(sample.stages)
+
+    def test_payload_failure_keeps_lengths_and_omits_later_zeros(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        self._advance_call(sample, "lengths", 4)
+        sample.mark_failed_or_interrupted()
+        record_graph_host_sample_safely(metrics, sample)
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["group"] = args[0][0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        group = flushed["group"]
+        self.assertEqual(group["failed"], 1)
+        self.assertEqual(group["failed_stats"]["lengths_host_ms"]["n"], 1)
+        self.assertNotIn("payload_fill_host_ms", group["failed_stats"])
+        self.assertNotIn("update_call_host_ms", group["failed_stats"])
+        self.assertNotIn("lengths_host_ms", group["ok_stats"])
+
+    def test_record_once_including_early_return(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        self._advance_call(sample, "replay_call", 1)
+        record_graph_host_sample_safely(metrics, sample)
+        record_graph_host_sample_safely(metrics, sample)
+        self.assertEqual(len(metrics._graph_host_samples), 1)
+
+    def test_empty_samples_do_not_emit_graph_host_or_change_round_log(self):
+        metrics = SRRoundMetrics("Draft")
+        logged = {}
+
+        def capture(fmt, *args, **kwargs):
+            logged.setdefault("fmt", []).append(fmt)
+            if "round]" in fmt:
+                logged["mean"] = args[1]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            for _ in range(31):
+                with metrics.round():
+                    metrics.add_host("tree_expand_pack", 0.001)
+            with metrics.round():
+                metrics.add_host("tree_expand_pack", 0.100)
+        self.assertEqual(sum("graph host" in fmt for fmt in logged["fmt"]), 0)
+        self.assertEqual(sum("round]" in fmt for fmt in logged["fmt"]), 1)
+        self.assertLess(logged["mean"]["tree_expand_pack"], 10.0)
+        self.assertFalse(metrics.host)
+        self.assertFalse(metrics._graph_host_samples)
+
+    def test_record_error_does_not_change_call_result(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        with patch.object(
+            metrics, "record_graph_host_sample", side_effect=RuntimeError("record")
+        ):
+            record_graph_host_sample_safely(metrics, sample)
+        self.assertFalse(metrics._graph_host_samples)
+
+    def test_flush_failure_clears_new_samples_and_original_window(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        self._advance_call(sample, "lengths", 1)
+        record_graph_host_sample_safely(metrics, sample)
+        logs = []
+
+        def info(fmt, *args, **kwargs):
+            logs.append(fmt)
+            if "graph host" in fmt:
+                raise RuntimeError("flush boom")
+
+        with patch.object(round_metrics.logger, "info", side_effect=info):
+            _run_window(metrics)
+        self.assertTrue(any("round]" in fmt for fmt in logs))
+        self.assertFalse(metrics.host)
+        self.assertFalse(metrics.counts)
+        self.assertFalse(metrics._graph_host_samples)
+
+    def test_flush_failure_does_not_mask_inference_error(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        sample.mark_failed_or_interrupted()
+        record_graph_host_sample_safely(metrics, sample)
+
+        def info(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                raise RuntimeError("flush boom")
+
+        with patch.object(round_metrics.logger, "info", side_effect=info):
+            for _ in range(31):
+                with metrics.round():
+                    pass
+            with self.assertRaises(RuntimeError) as ctx:
+                with metrics.round():
+                    raise RuntimeError("infer")
+        self.assertEqual(str(ctx.exception), "infer")
+        self.assertFalse(metrics._graph_host_samples)
+        self.assertFalse(metrics.host)
+
+    def test_rate_limited_warning_does_not_raise(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        record_graph_host_sample_safely(metrics, sample)
+
+        def info(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                raise RuntimeError("flush boom")
+
+        def warning(*args, **kwargs):
+            raise RuntimeError("warn boom")
+
+        with patch.object(round_metrics.logger, "info", side_effect=info), patch.object(
+            round_metrics.logger, "warning", side_effect=warning
+        ):
+            _run_window(metrics)
+        self.assertFalse(metrics._graph_host_samples)
 
 
 if __name__ == "__main__":

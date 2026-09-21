@@ -800,6 +800,27 @@ Draft total
 `total` 与通信的 `draft_residence_ms` 起止不同：驻留从 socket 收包后开始，到回复打包前结束；
 round 从调度处理开始，到发送调用完成结束。两者显示相同均值只是数值恰巧一致，不是同一计时器。
 
+### Draft graph host 阶段
+
+`[SR Draft graph host]` 是 NPU SR Draft `_replay()` 的主机调用区间观测，按 32 轮窗口追加在原 `[SR Draft round]` 日志和计数器清理之后。不改 `host_mean_ms`、设备事件队列或推理路径。
+
+这些是主机调用墙钟，可能含 API 内部等待；`replay_call` 不是设备图执行时间。`submit_envelope` 已包含 update/replay，串行模式也不可再与两者相加。
+
+整次口径按**被观测调用是否正常结束**划分：正常结束的阶段耗时进成功统计；失败或中断的调用，已采集的全部阶段耗时进失败统计，即使没有任何阶段耗时也计入失败次数。阶段完成状态只用于定位。窗口无这条日志表示该窗口完全没有调用样本，不是没有耗时数据。
+
+分组键显式包含完整 `graph_key`、`raw_bs`、`capture_bs`、`implementation`、`overlap`、`kv_bucket`；`round_id` 只用于追踪，不进分组键。BS3 pad 到 BS4 不得与 BS4 混组。
+
+| 字段 | 含义 |
+| --- | --- |
+| `[SR Draft graph host]` | 每 32 个被计量调度轮次追加一行；无调用样本时不输出 |
+| `ok` / `failed` | 被观测调用正常结束 / 失败或中断的次数 |
+| `lengths_host_ms` | `seq_lens_cpu` 切片到 `step_lens_list` 构造/校验结束 |
+| `payload_fill_host_ms` | 仅 `fill_*_payload` 调用到返回；payload 缺失检查不计时 |
+| `update_call_host_ms` | `graph.update` 进入到返回或抛出 |
+| `replay_call_host_ms` | `graph.replay` 进入到返回或抛出 |
+| `submit_envelope_host_ms` | helper 或 skip_fia 实际提交区间，含 join/异常清理 |
+| `ok_stats` / `failed_stats` | 各阶段 nearest-rank `n/mean/p50/p95/max`；缺席阶段不填零 |
+
 | Draft counter | 含义 |
 | --- | --- |
 | `tail_requests` | 参与 tail 前向的请求实例数；一个用户请求可跨轮重复计数 |
@@ -888,6 +909,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | `Speculative greedy verify path` | greedy 核验实际路径：`npu_kernel` / `cpu_reference`（含 reason）/ CUDA 上的 `cuda_kernel`。与 RPD 路径日志独立 |
 | `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
+| `[SR Draft graph host]` | NPU SR Draft `_replay()` 五段主机调用窗口。主机墙钟而非设备图时间；`submit_envelope` 不可与 update/replay 相加；失败调用的已采集耗时不进成功分位数 |
 | `graph=True`、`replay` / `replay count` | 该次使用图及累计 replay 次数；计数增长比“捕获成功”更能说明实际路径 |
 | `eager_fallback` | runner 累计 eager 次数。草稿 `can_run` 在 `raw_bs` 大于已捕获 `max_bs` 时会计入该值并设置 `_last_can_run_reject`。轮次口径看 `[SR Draft round] counters` 的 `tree_graph_batches` / `tree_eager_batches` / `tree_eager_<reason>`，CUDA 草稿同样可用 |
 | `tree failure stage=expand_batch ... isolate_batches=...` | 多请求 expand 失败后按请求隔离重跑；eager 分页树不再因图捕获缓冲区行数不足进入这条路径 |

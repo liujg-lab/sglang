@@ -718,6 +718,13 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("_assert_tree_replay_graph", draft_inner)
         self.assertIn("fill_fia_cpu_update_payload", draft_inner)
         self.assertIn("NpuGraphReplaySubmittedError", draft_inner)
+        self.assertIn("begin_graph_host_sample", draft_inner)
+        self.assertIn("measure_call", draft_inner)
+        self.assertIn("record_graph_host_sample_safely", draft_inner)
+        self.assertNotIn("get_sr_round_metrics", draft_inner)
+        self.assertNotIn("synchronize(", draft_inner)
+        self.assertNotIn(".cpu(", draft_inner)
+        self.assertNotIn("Event(", draft_inner)
         self.assertNotIn("_tree_replay_graphs_id", draft_inner)
 
         eager_src = _class_method_source(
@@ -1134,6 +1141,362 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertEqual(payloads[4][0]["actual_seq_lengths_kv"], [30, 31, 32, 0])
         self.assertEqual(payloads[1][0]["actual_seq_lengths_kv"], [11])
         self.assertNotEqual(payloads[1][0]["actual_seq_lengths_kv"], [10])
+
+
+def _extract_draft_replay(helper_fn):
+    from sglang.srt.speculative.standalone_remote import sr_round_metrics as round_metrics
+    from sglang.srt.speculative.tree_attn_fallback import tree_fia_actual_seq_lengths_kv
+
+    ns = {
+        "torch": torch,
+        "logger": logging.getLogger("test.draft_replay"),
+        "TreeReplayPlan": TreeReplayPlan,
+        "NpuGraphPreparationError": _PrepError,
+        "NpuGraphReplaySubmittedError": _SubmittedError,
+        "run_npu_graph_update_and_replay": helper_fn,
+        "is_deepseek_nsa": lambda hf: False,
+        "tree_fia_actual_seq_lengths_kv": tree_fia_actual_seq_lengths_kv,
+        "fill_fia_cpu_update_payload": _fill_fia_stub,
+        "fill_paged_cpu_update_payload": _fill_fia_stub,
+        "build_draft_graph_step_kv_lens": lambda *a, **k: [1],
+        "validate_draft_graph_step_kv_lens": lambda *a, **k: None,
+        "build_step_context_lens": lambda *a, **k: [1],
+        "context_lens_list": lambda x: list(x),
+        "begin_graph_host_sample": round_metrics.begin_graph_host_sample,
+        "measure_call": round_metrics.measure_call,
+        "record_graph_host_sample_safely": round_metrics.record_graph_host_sample_safely,
+    }
+    return _extract_class_methods(
+        _EAGLE_DRAFT_NPU,
+        "EAGLEDraftNpuGraphRunner",
+        ["_replay", "_assert_tree_replay_graph"],
+        ns,
+    )
+
+
+def _bind_draft_replay(runner, methods):
+    for name, fn in methods.items():
+        setattr(runner, name, MethodType(fn, runner))
+
+
+def _make_draft_replay_runner(
+    methods,
+    *,
+    seq_lens_cpu,
+    skip_fia=False,
+    payload=None,
+    n_records=8,
+    metrics=None,
+    graph=None,
+    raw_bs=1,
+    capture_bs=2,
+    topk=3,
+    kv_bucket=256,
+    graph_key="2_s256",
+):
+    graph = graph or _FakeGraph(graph_key)
+    if payload is None:
+        payload = [{"actual_seq_lengths_kv": [1] * 6} for _ in range(n_records)]
+    inners = [
+        SimpleNamespace(
+            _replay_tree_s_cap=kv_bucket,
+            tree_fia_kv_lens_cpu=[128 + i] * 3 + [0] * 3,
+        )
+        for i in range(4)
+    ]
+    worker = SimpleNamespace()
+    scheduler = SimpleNamespace(
+        sr_tree_drafter=worker,
+        _sr_round_metrics=metrics,
+    )
+    worker.scheduler = scheduler
+    plan = TreeReplayPlan(
+        graph_key=graph_key,
+        raw_bs=raw_bs,
+        capture_bs=capture_bs,
+        tokens_per_req=topk,
+        kv_bucket=kv_bucket,
+    )
+    runner = SimpleNamespace(
+        eagle_worker=worker,
+        _tree_replay_plan=plan,
+        _tree_replay_graph=graph,
+        graphs={graph_key: graph},
+        _tree_attention_impls={graph_key: "compact_fia"},
+        _current_tree_attention_impl=lambda: "compact_fia",
+        model_runner=SimpleNamespace(
+            draft_attn_backend=SimpleNamespace(attn_backends=inners),
+            attn_backend=SimpleNamespace(
+                attn_backends=inners,
+                _replay_tree_s_cap=None,
+            ),
+            model_config=SimpleNamespace(hf_config=None),
+        ),
+        bs=capture_bs,
+        raw_bs=raw_bs,
+        num_tokens_per_bs=topk,
+        topk=topk,
+        _get_update_attr_name=lambda: "actual_seq_lengths_kv",
+        _get_update_attr_type=lambda: [],
+        output_buffers={graph_key: object()},
+        _slot_gather_graph=True,
+        _tree_compact_fia=not skip_fia,
+        _tree_paged=False,
+        _tree_fia_maps={
+            graph_key: dict(
+                n_steps=4,
+                n_records=n_records,
+                num_layers=2,
+                step_ids=[0, 0, 1, 1, 2, 2, 3, 3],
+                payload=payload,
+            )
+        },
+        _logged_tree_fia_update_bs=set(),
+        tree_graph_replay_count=0,
+        tree_eager_fallback_count=0,
+        update_attr_name="actual_seq_lengths_kv",
+    )
+    batch = SimpleNamespace(seq_lens_cpu=seq_lens_cpu)
+    runner._tree_replay_batch_id = id(batch)
+    _bind_draft_replay(runner, methods)
+    return runner, batch, graph
+
+
+class TestDraftGraphHostReplay(unittest.TestCase):
+    def test_success_records_stages_without_changing_calls(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+        )
+        methods["_replay"](runner, batch)
+        self.assertEqual(len(helper.calls), 1)
+        self.assertIs(helper.calls[0]["overlap"], False)
+        self.assertEqual(graph.replay_count, 1)
+        self.assertEqual(len(graph.updates), 1)
+        self.assertEqual(len(metrics._graph_host_samples), 1)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "ok")
+        self.assertEqual(
+            set(sample.stages),
+            {"lengths", "payload_fill", "update_call", "replay_call", "submit_envelope"},
+        )
+        self.assertNotIn("round_id", sample.group_key())
+        self.assertEqual(sample.context["kv_bucket"], 256)
+
+    def test_inactive_and_non_draft_and_missing_context_do_not_record(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127]), metrics=None
+        )
+        methods["_replay"](runner, batch)
+        self.assertEqual(graph.replay_count, 1)
+
+        metrics = SRRoundMetrics("Target")
+        metrics.active = True
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127]), metrics=metrics
+        )
+        methods["_replay"](runner, batch)
+        self.assertFalse(metrics._graph_host_samples)
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = False
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127]), metrics=metrics
+        )
+        methods["_replay"](runner, batch)
+        self.assertFalse(metrics._graph_host_samples)
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        runner, batch, _ = _make_draft_replay_runner(
+            methods, seq_lens_cpu=torch.tensor([127]), metrics=metrics
+        )
+        runner._tree_replay_plan = None
+        with self.assertRaises(_PrepError):
+            methods["_replay"](runner, batch)
+        self.assertFalse(metrics._graph_host_samples)
+
+    def test_seq_lens_cpu_missing_is_no_timing_failure(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods, seq_lens_cpu=None, metrics=metrics
+        )
+        with self.assertRaises(_PrepError) as ctx:
+            methods["_replay"](runner, batch)
+        self.assertIn("seq_lens_cpu", str(ctx.exception))
+        self.assertEqual(graph.replay_count, 0)
+        self.assertEqual(len(metrics._graph_host_samples), 1)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "failed")
+        self.assertFalse(sample.stages)
+
+    def test_payload_missing_keeps_lengths_timing(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            payload=[],
+            n_records=8,
+        )
+        with self.assertRaises(_PrepError) as ctx:
+            methods["_replay"](runner, batch)
+        self.assertIn("payload", str(ctx.exception))
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "failed")
+        self.assertIn("lengths", sample.stages)
+        self.assertNotIn("payload_fill", sample.stages)
+        self.assertNotIn("update_call", sample.stages)
+        self.assertEqual(graph.replay_count, 0)
+        self.assertFalse(helper.calls)
+
+    def test_skip_fia_records_only_replay_and_submit(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            skip_fia=True,
+        )
+        methods["_replay"](runner, batch)
+        self.assertFalse(helper.calls)
+        self.assertEqual(graph.replay_count, 1)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "ok")
+        self.assertEqual(set(sample.stages), {"replay_call", "submit_envelope"})
+
+    def test_update_error_keeps_helper_and_reraises_submitted(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        class BoomGraph(_FakeGraph):
+            def update(self, cpu_update_input=None):
+                raise RuntimeError("update boom")
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, graph = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            graph=BoomGraph("2_s256"),
+        )
+        with self.assertRaises(_SubmittedError) as ctx:
+            methods["_replay"](runner, batch)
+        self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "failed")
+        self.assertIn("update_call", sample.stages)
+        self.assertFalse(sample.stage_completed.get("update_call"))
+        self.assertEqual(graph.replay_count, 0)
+
+    def test_replay_keyboard_interrupt_is_not_wrapped(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        class IntrGraph(_FakeGraph):
+            def replay(self):
+                raise KeyboardInterrupt()
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        methods = _extract_draft_replay(helper)
+        runner, batch, _ = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            graph=IntrGraph("2_s256"),
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            methods["_replay"](runner, batch)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "failed")
+        self.assertIn("replay_call", sample.stages)
+
+    def test_overlap_replay_starts_before_update_finishes(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowGraph(_FakeGraph):
+            def update(self, cpu_update_input=None):
+                started.set()
+                if not release.wait(1):
+                    raise AssertionError("replay did not overlap update")
+                super().update(cpu_update_input=cpu_update_input)
+
+            def replay(self):
+                if not started.wait(1):
+                    raise AssertionError("update thread did not start")
+                super().replay()
+                release.set()
+
+        metrics = SRRoundMetrics("Draft")
+        metrics.active = True
+        helper = _HelperBox()
+        helper.impl = _run_update_replay
+        methods = _extract_draft_replay(helper)
+        graph = SlowGraph("2_s256")
+        runner, batch, _ = _make_draft_replay_runner(
+            methods,
+            seq_lens_cpu=torch.tensor([127]),
+            metrics=metrics,
+            graph=graph,
+        )
+        runner._tree_paged = False
+        # Force overlap by providing os in the extracted globals.
+        methods["_replay"].__globals__["os"] = SimpleNamespace(
+            environ={}
+        )
+        methods["_replay"](runner, batch)
+        self.assertEqual(helper.calls[0]["overlap"], True)
+        sample = metrics._graph_host_samples[0]
+        self.assertEqual(sample.outcome, "ok")
+        self.assertTrue(sample.context["overlap"])
 
 
 if __name__ == "__main__":

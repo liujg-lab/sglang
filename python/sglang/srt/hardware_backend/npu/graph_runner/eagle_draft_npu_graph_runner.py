@@ -38,6 +38,11 @@ from sglang.srt.speculative.spec_utils import (
     validate_draft_graph_step_kv_lens,
     validate_tree_draft_fia_records,
 )
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    begin_graph_host_sample,
+    measure_call,
+    record_graph_host_sample_safely,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
@@ -761,158 +766,246 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             and not self._tree_compact_fia
             and not getattr(self, "_tree_paged", False)
         )
-        if skip_fia:
-            replay_error = None
+        env_mod = globals().get("os")
+        overlap = False
+        if (
+            not skip_fia
+            and not getattr(self, "_tree_paged", False)
+            and env_mod is not None
+        ):
+            overlap = not env_mod.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE")
+
+        worker = getattr(self, "eagle_worker", None)
+        scheduler = getattr(worker, "scheduler", None)
+        metrics = getattr(scheduler, "_sr_round_metrics", None)
+        if (
+            metrics is None
+            or getattr(scheduler, "sr_tree_drafter", None) is not worker
+            or getattr(metrics, "role", None) != "Draft"
+            or not getattr(metrics, "active", False)
+        ):
+            metrics = None
+        sample = None
+        if metrics is not None:
             try:
-                graph.replay()
-            except Exception as exc:
-                replay_error = exc
-            if replay_error is not None:
-                raise NpuGraphReplaySubmittedError(
-                    "NPU graph update/replay failed"
-                ) from replay_error
-            self.tree_graph_replay_count += 1
-            if (
-                self.tree_graph_replay_count == 1
-                or self.tree_graph_replay_count % 32 == 0
-            ):
+                peek = fia_maps.get(graph_key) if fia_maps else None
+                num_steps = None
+                if isinstance(peek, dict) and peek.get("n_steps") is not None:
+                    try:
+                        num_steps = int(peek["n_steps"])
+                    except (TypeError, ValueError):
+                        num_steps = peek.get("n_steps")
+                sample = begin_graph_host_sample(
+                    {
+                        "round_id": int(metrics.rounds) + 1,
+                        "graph_key": graph_key,
+                        "implementation": self._current_tree_attention_impl(),
+                        "raw_bs": int(self.raw_bs),
+                        "capture_bs": int(self.bs),
+                        "kv_bucket": plan.kv_bucket,
+                        "topk": int(getattr(self, "topk", 0) or 0),
+                        "num_steps": num_steps,
+                        "overlap": overlap,
+                    }
+                )
+            except Exception:
+                sample = None
+
+        def _measure(stage, fn):
+            if sample is None:
+                return fn()
+            return measure_call(sample, stage, fn)
+
+        try:
+            if skip_fia:
+                def _direct_submit():
+                    replay_error = None
+                    try:
+                        _measure("replay_call", graph.replay)
+                    except Exception as exc:
+                        replay_error = exc
+                    if replay_error is not None:
+                        raise NpuGraphReplaySubmittedError(
+                            "NPU graph update/replay failed"
+                        ) from replay_error
+
+                _measure("submit_envelope", _direct_submit)
+                self.tree_graph_replay_count += 1
+                if (
+                    self.tree_graph_replay_count == 1
+                    or self.tree_graph_replay_count % 32 == 0
+                ):
+                    logger.info(
+                        "NPU tree draft graph replay count=%s key=%s "
+                        "raw_bs=%s capture_bs=%s implementation=%s eager_fallback=%s",
+                        self.tree_graph_replay_count,
+                        graph_key,
+                        getattr(self, "raw_bs", None),
+                        getattr(self, "bs", None),
+                        self._current_tree_attention_impl(),
+                        self.tree_eager_fallback_count,
+                    )
+                return
+
+            if forward_batch.seq_lens_cpu is None:
+                raise NpuGraphPreparationError(
+                    "tree draft graph replay requires seq_lens_cpu",
+                    scope="graph",
+                )
+
+            fia_map = fia_maps.get(graph_key)
+            if fia_map is None:
+                raise NpuGraphPreparationError(
+                    f"tree draft graph key={graph_key!r} has no FIA map",
+                    scope="graph",
+                )
+
+            def _build_lengths():
+                prefix_lens = forward_batch.seq_lens_cpu[: self.raw_bs]
+                step_lens_list = []
+                n_steps = int(fia_map["n_steps"])
+                step_backends = inner if inner else None
+                capture_rows = int(self.bs) * max(int(self.topk), 1)
+                try:
+                    for speculative_step_id in range(n_steps):
+                        seq_lens = None
+                        if getattr(self, "_tree_paged", False):
+                            meta = None
+                            if step_backends is not None and speculative_step_id < len(
+                                step_backends
+                            ):
+                                meta = getattr(
+                                    step_backends[speculative_step_id],
+                                    "_sr_tree_paged_meta",
+                                    None,
+                                )
+                            if meta is not None:
+                                seq_lens = list(meta.context_lens_list)
+                            else:
+                                seq_lens = context_lens_list(
+                                    build_step_context_lens(
+                                        prefix_lens,
+                                        self.topk,
+                                        speculative_step_id,
+                                        capture_rows,
+                                    )
+                                )
+                        elif self._tree_compact_fia and step_backends is not None:
+                            if speculative_step_id < len(step_backends):
+                                seq_lens = getattr(
+                                    step_backends[speculative_step_id],
+                                    "tree_fia_kv_lens_cpu",
+                                    None,
+                                )
+                        if seq_lens is None:
+                            seq_lens = build_draft_graph_step_kv_lens(
+                                prefix_lens, self.bs, self.topk, speculative_step_id
+                            )
+                            validate_draft_graph_step_kv_lens(
+                                seq_lens,
+                                self.bs,
+                                self.topk,
+                                self.raw_bs,
+                                prefix_lens,
+                                speculative_step_id,
+                            )
+                            if self._tree_compact_fia:
+                                seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens)
+                        elif (
+                            not getattr(self, "_tree_paged", False)
+                            and self._tree_compact_fia
+                        ):
+                            seq_lens = tree_fia_actual_seq_lengths_kv(
+                                seq_lens, capture_rows
+                            )
+                        step_lens_list.append(seq_lens)
+                except NpuGraphPreparationError:
+                    raise
+                except (TypeError, ValueError) as e:
+                    raise NpuGraphPreparationError(
+                        f"tree draft step KV lengths invalid: {e}",
+                        scope="graph",
+                    ) from e
+                return step_lens_list
+
+            step_lens_list = _measure("lengths", _build_lengths)
+
+            n_records = int(fia_map["n_records"])
+            num_layers = int(fia_map["num_layers"])
+            payload = fia_map.get("payload")
+            if payload is None or len(payload) != n_records:
+                raise NpuGraphPreparationError(
+                    f"tree draft graph key={graph_key!r} has no reusable FIA payload",
+                    scope="graph",
+                )
+            attr_name = fia_map.get("attr_name") or self.update_attr_name
+
+            def _fill_payload():
+                if getattr(self, "_tree_paged", False):
+                    fill_paged_cpu_update_payload(
+                        payload, step_lens_list, fia_map["step_ids"], attr_name
+                    )
+                else:
+                    fill_fia_cpu_update_payload(
+                        payload, step_lens_list, fia_map["step_ids"], attr_name
+                    )
+
+            _measure("payload_fill", _fill_payload)
+            log_key = graph_key
+            if log_key not in self._logged_tree_fia_update_bs:
                 logger.info(
-                    "NPU tree draft graph replay count=%s key=%s "
+                    "NPU tree draft graph FIA updates: key=%s bs=%s raw_bs=%s "
+                    "records=%s steps=%s layers=%s updates=%s bucket=%s",
+                    graph_key,
+                    self.bs,
+                    self.raw_bs,
+                    n_records,
+                    int(fia_map["n_steps"]),
+                    num_layers,
+                    len(payload),
+                    plan.kv_bucket,
+                )
+                self._logged_tree_fia_update_bs.add(log_key)
+
+            if sample is None:
+                run_npu_graph_update_and_replay(
+                    lambda: graph.update(cpu_update_input=payload),
+                    graph.replay,
+                    overlap=overlap,
+                )
+            else:
+                _measure(
+                    "submit_envelope",
+                    lambda: run_npu_graph_update_and_replay(
+                        lambda: measure_call(
+                            sample,
+                            "update_call",
+                            lambda: graph.update(cpu_update_input=payload),
+                        ),
+                        lambda: measure_call(sample, "replay_call", graph.replay),
+                        overlap=overlap,
+                    ),
+                )
+            self.tree_graph_replay_count += 1
+            if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
+                logger.info(
+                    "NPU tree draft graph replay count=%s key=%s bucket=%s "
                     "raw_bs=%s capture_bs=%s implementation=%s eager_fallback=%s",
                     self.tree_graph_replay_count,
                     graph_key,
-                    getattr(self, "raw_bs", None),
-                    getattr(self, "bs", None),
+                    plan.kv_bucket,
+                    plan.raw_bs,
+                    plan.capture_bs,
                     self._current_tree_attention_impl(),
                     self.tree_eager_fallback_count,
                 )
-            return
-
-        if forward_batch.seq_lens_cpu is None:
-            raise NpuGraphPreparationError(
-                "tree draft graph replay requires seq_lens_cpu",
-                scope="graph",
-            )
-
-        fia_map = fia_maps.get(graph_key)
-        if fia_map is None:
-            raise NpuGraphPreparationError(
-                f"tree draft graph key={graph_key!r} has no FIA map",
-                scope="graph",
-            )
-
-        prefix_lens = forward_batch.seq_lens_cpu[: self.raw_bs]
-        step_lens_list = []
-        n_steps = int(fia_map["n_steps"])
-        step_backends = inner if inner else None
-        capture_rows = int(self.bs) * max(int(self.topk), 1)
-        try:
-            for speculative_step_id in range(n_steps):
-                seq_lens = None
-                if getattr(self, "_tree_paged", False):
-                    meta = None
-                    if step_backends is not None and speculative_step_id < len(
-                        step_backends
-                    ):
-                        meta = getattr(step_backends[speculative_step_id], "_sr_tree_paged_meta", None)
-                    if meta is not None:
-                        seq_lens = list(meta.context_lens_list)
-                    else:
-                        seq_lens = context_lens_list(
-                            build_step_context_lens(
-                                prefix_lens,
-                                self.topk,
-                                speculative_step_id,
-                                capture_rows,
-                            )
-                        )
-                elif self._tree_compact_fia and step_backends is not None:
-                    if speculative_step_id < len(step_backends):
-                        seq_lens = getattr(
-                            step_backends[speculative_step_id],
-                            "tree_fia_kv_lens_cpu",
-                            None,
-                        )
-                if seq_lens is None:
-                    seq_lens = build_draft_graph_step_kv_lens(
-                        prefix_lens, self.bs, self.topk, speculative_step_id
-                    )
-                    validate_draft_graph_step_kv_lens(
-                        seq_lens,
-                        self.bs,
-                        self.topk,
-                        self.raw_bs,
-                        prefix_lens,
-                        speculative_step_id,
-                    )
-                    if self._tree_compact_fia:
-                        seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens)
-                elif not getattr(self, "_tree_paged", False) and self._tree_compact_fia:
-                    seq_lens = tree_fia_actual_seq_lengths_kv(seq_lens, capture_rows)
-                step_lens_list.append(seq_lens)
-        except NpuGraphPreparationError:
+        except BaseException:
+            if sample is not None:
+                sample.mark_failed_or_interrupted()
             raise
-        except (TypeError, ValueError) as e:
-            raise NpuGraphPreparationError(
-                f"tree draft step KV lengths invalid: {e}",
-                scope="graph",
-            ) from e
-
-        n_records = int(fia_map["n_records"])
-        num_layers = int(fia_map["num_layers"])
-        payload = fia_map.get("payload")
-        if payload is None or len(payload) != n_records:
-            raise NpuGraphPreparationError(
-                f"tree draft graph key={graph_key!r} has no reusable FIA payload",
-                scope="graph",
-            )
-        attr_name = fia_map.get("attr_name") or self.update_attr_name
-        if getattr(self, "_tree_paged", False):
-            fill_paged_cpu_update_payload(
-                payload, step_lens_list, fia_map["step_ids"], attr_name
-            )
-        else:
-            fill_fia_cpu_update_payload(
-                payload, step_lens_list, fia_map["step_ids"], attr_name
-            )
-        log_key = graph_key
-        if log_key not in self._logged_tree_fia_update_bs:
-            logger.info(
-                "NPU tree draft graph FIA updates: key=%s bs=%s raw_bs=%s "
-                "records=%s steps=%s layers=%s updates=%s bucket=%s",
-                graph_key,
-                self.bs,
-                self.raw_bs,
-                n_records,
-                n_steps,
-                num_layers,
-                len(payload),
-                plan.kv_bucket,
-            )
-            self._logged_tree_fia_update_bs.add(log_key)
-
-        env_mod = globals().get("os")
-        overlap = False
-        if not getattr(self, "_tree_paged", False) and env_mod is not None:
-            overlap = not env_mod.environ.get("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE")
-        run_npu_graph_update_and_replay(
-            lambda: graph.update(cpu_update_input=payload),
-            graph.replay,
-            overlap=overlap,
-        )
-        self.tree_graph_replay_count += 1
-        if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
-            logger.info(
-                "NPU tree draft graph replay count=%s key=%s bucket=%s "
-                "raw_bs=%s capture_bs=%s implementation=%s eager_fallback=%s",
-                self.tree_graph_replay_count,
-                graph_key,
-                plan.kv_bucket,
-                plan.raw_bs,
-                plan.capture_bs,
-                self._current_tree_attention_impl(),
-                self.tree_eager_fallback_count,
-            )
+        finally:
+            if sample is not None:
+                record_graph_host_sample_safely(metrics, sample)
 
     def _cache_loc_dtype(self):
         return torch.int32

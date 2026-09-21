@@ -3,10 +3,97 @@
 import logging
 import math
 import time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
+
+GRAPH_HOST_STAGES = (
+    "lengths",
+    "payload_fill",
+    "update_call",
+    "replay_call",
+    "submit_envelope",
+)
+GRAPH_HOST_STAGE_LOG = {
+    "lengths": "lengths_host_ms",
+    "payload_fill": "payload_fill_host_ms",
+    "update_call": "update_call_host_ms",
+    "replay_call": "replay_call_host_ms",
+    "submit_envelope": "submit_envelope_host_ms",
+}
+_GRAPH_HOST_WARN_MAX = 8
+_graph_host_warns = 0
+
+
+def _ns_to_ms(duration_ns):
+    return duration_ns / 1e6
+
+
+def _warn_graph_host(where, exc):
+    global _graph_host_warns
+    try:
+        if _graph_host_warns >= _GRAPH_HOST_WARN_MAX:
+            return
+        _graph_host_warns += 1
+        logger.warning("SR Draft graph host %s failed: %s", where, exc)
+    except Exception:
+        return
+
+
+def begin_graph_host_sample(context):
+    return GraphHostSample(context)
+
+
+def measure_call(sample, stage, fn):
+    if sample is None:
+        return fn()
+    start = time.perf_counter_ns()
+    try:
+        result = fn()
+    except BaseException:
+        sample.record_stage(stage, _ns_to_ms(time.perf_counter_ns() - start), completed=False)
+        raise
+    sample.record_stage(stage, _ns_to_ms(time.perf_counter_ns() - start), completed=True)
+    return result
+
+
+def record_graph_host_sample_safely(metrics, sample):
+    if sample is None:
+        return
+    try:
+        if metrics is None:
+            return
+        metrics.record_graph_host_sample(sample)
+    except Exception as exc:
+        _warn_graph_host("record", exc)
+
+
+class GraphHostSample:
+    def __init__(self, context):
+        self.context = dict(context)
+        self.stages = {}
+        self.stage_completed = {}
+        self.outcome = "ok"
+        self._recorded = False
+
+    def mark_failed_or_interrupted(self):
+        self.outcome = "failed"
+
+    def record_stage(self, name, duration_ms, completed=True):
+        self.stages[name] = duration_ms
+        self.stage_completed[name] = bool(completed)
+
+    def group_key(self):
+        ctx = self.context
+        return (
+            ctx.get("graph_key"),
+            ctx.get("raw_bs"),
+            ctx.get("capture_bs"),
+            ctx.get("implementation"),
+            ctx.get("overlap"),
+            ctx.get("kv_bucket"),
+        )
 
 
 class SRCommMetrics:
@@ -99,6 +186,7 @@ class SRRoundMetrics:
         self.device_samples = Counter()
         self.pending = deque()
         self.active = False
+        self._graph_host_samples = []
 
     def add_host(self, name, seconds):
         if not self.active:
@@ -135,37 +223,40 @@ class SRRoundMetrics:
             self.rounds += 1
             if self.rounds % 32 == 0:
                 self.poll()
-                logger.info(
-                    "[SR %s round] rounds=32 host_mean_ms=%s host_max_ms=%s "
-                    "device_sample_mean_ms=%s device_samples=%s "
-                    "device_pending=%s counters=%s tail_attention=%s accept_len_mean=%s",
-                    self.role,
-                    {k: round(v * 1000 / 32, 3) for k, v in self.host.items()},
-                    {k: round(v * 1000, 3) for k, v in self.host_max.items()},
-                    {
-                        k: round(v / self.device_samples[k], 3)
-                        for k, v in self.device_ms.items()
-                    },
-                    dict(self.device_samples),
-                    len(self.pending),
-                    dict(self.counts),
-                    dict(self.paths),
-                    (
-                        round(
-                            self.counts["accepted_tokens_including_bonus"]
-                            / self.counts["verify_requests"],
-                            3,
-                        )
-                        if self.counts["verify_requests"]
-                        else None
-                    ),
-                )
-                self.host.clear()
-                self.host_max.clear()
-                self.counts.clear()
-                self.paths.clear()
-                self.device_ms.clear()
-                self.device_samples.clear()
+                try:
+                    logger.info(
+                        "[SR %s round] rounds=32 host_mean_ms=%s host_max_ms=%s "
+                        "device_sample_mean_ms=%s device_samples=%s "
+                        "device_pending=%s counters=%s tail_attention=%s accept_len_mean=%s",
+                        self.role,
+                        {k: round(v * 1000 / 32, 3) for k, v in self.host.items()},
+                        {k: round(v * 1000, 3) for k, v in self.host_max.items()},
+                        {
+                            k: round(v / self.device_samples[k], 3)
+                            for k, v in self.device_ms.items()
+                        },
+                        dict(self.device_samples),
+                        len(self.pending),
+                        dict(self.counts),
+                        dict(self.paths),
+                        (
+                            round(
+                                self.counts["accepted_tokens_including_bonus"]
+                                / self.counts["verify_requests"],
+                                3,
+                            )
+                            if self.counts["verify_requests"]
+                            else None
+                        ),
+                    )
+                    self.host.clear()
+                    self.host_max.clear()
+                    self.counts.clear()
+                    self.paths.clear()
+                    self.device_ms.clear()
+                    self.device_samples.clear()
+                finally:
+                    self._flush_graph_host_safely()
 
     @contextmanager
     def phase(self, name, *, device=False):
@@ -196,6 +287,89 @@ class SRRoundMetrics:
                 start, end = event_pair
                 end.record()
                 self.pending.append((name, start, end))
+
+    def record_graph_host_sample(self, sample):
+        if sample is None or sample._recorded:
+            return
+        self._graph_host_samples.append(sample)
+        sample._recorded = True
+
+    def _flush_graph_host_safely(self):
+        samples = self._graph_host_samples
+        self._graph_host_samples = []
+        if not samples:
+            return
+        try:
+            self._emit_graph_host_window(samples)
+        except Exception as exc:
+            _warn_graph_host("flush", exc)
+
+    def _emit_graph_host_window(self, samples):
+        grouped = {}
+        for sample in samples:
+            key = sample.group_key()
+            bucket = grouped.get(key)
+            if bucket is None:
+                ctx = sample.context
+                bucket = {
+                    "graph_key": ctx.get("graph_key"),
+                    "raw_bs": ctx.get("raw_bs"),
+                    "capture_bs": ctx.get("capture_bs"),
+                    "implementation": ctx.get("implementation"),
+                    "overlap": ctx.get("overlap"),
+                    "kv_bucket": ctx.get("kv_bucket"),
+                    "ok": 0,
+                    "failed": 0,
+                    "ok_times": defaultdict(list),
+                    "failed_times": defaultdict(list),
+                    "stage_status": defaultdict(lambda: {"ok": 0, "failed": 0}),
+                }
+                grouped[key] = bucket
+            if sample.outcome == "ok":
+                bucket["ok"] += 1
+                times = bucket["ok_times"]
+            else:
+                bucket["failed"] += 1
+                times = bucket["failed_times"]
+            for name, duration_ms in sample.stages.items():
+                times[name].append(duration_ms)
+                status = "ok" if sample.stage_completed.get(name, False) else "failed"
+                bucket["stage_status"][name][status] += 1
+        groups = []
+        for key in sorted(grouped, key=lambda item: tuple(repr(part) for part in item)):
+            bucket = grouped[key]
+            groups.append(
+                {
+                    "graph_key": bucket["graph_key"],
+                    "raw_bs": bucket["raw_bs"],
+                    "capture_bs": bucket["capture_bs"],
+                    "implementation": bucket["implementation"],
+                    "overlap": bucket["overlap"],
+                    "kv_bucket": bucket["kv_bucket"],
+                    "ok": bucket["ok"],
+                    "failed": bucket["failed"],
+                    "ok_stats": {
+                        GRAPH_HOST_STAGE_LOG[name]: SRCommMetrics.summarize(
+                            bucket["ok_times"][name]
+                        )
+                        for name in GRAPH_HOST_STAGES
+                        if bucket["ok_times"].get(name)
+                    },
+                    "failed_stats": {
+                        GRAPH_HOST_STAGE_LOG[name]: SRCommMetrics.summarize(
+                            bucket["failed_times"][name]
+                        )
+                        for name in GRAPH_HOST_STAGES
+                        if bucket["failed_times"].get(name)
+                    },
+                    "stage_status": {
+                        GRAPH_HOST_STAGE_LOG[name]: dict(bucket["stage_status"][name])
+                        for name in GRAPH_HOST_STAGES
+                        if name in bucket["stage_status"]
+                    },
+                }
+            )
+        logger.info("[SR Draft graph host] window_rounds=32 groups=%s", groups)
 
 
 def get_sr_round_metrics(owner, role):
