@@ -28,6 +28,9 @@ from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_dete
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     is_health_check_req as _is_health_check,
 )
+from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+    conservative_mode_reason,
+)
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     bind_graph_host_metrics,
     restore_graph_host_metrics,
@@ -444,9 +447,29 @@ class StandaloneRemoteWorker:
             req.len_output_ids = len(req.output_ids)
             req.sr_step_id = int(getattr(req, "sr_step_id", 0) or 0) + 1
 
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
+        # Graph replay can attach a FULL hidden buffer this round does not
+        # consume. Drop the view before the discard check; the persistent
+        # capture buffer stays on the runner.
+        if not prepare_hidden:
+            logits_output.hidden_states = None
+
+        discard_logits = self._can_discard_verify_logits(
+            batch, logits_output, prepare_hidden=prepare_hidden
+        )
+        skipped_output_bytes = 0
+        if metrics is not None and discard_logits:
+            full_logits = logits_output.next_token_logits
+            skipped_output_bytes = (
+                int(res.accepted_indices.numel())
+                * int(full_logits.shape[-1])
+                * int(full_logits.element_size())
+            )
+        if discard_logits:
+            logits_output.next_token_logits = None
+        else:
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[
                 res.accepted_indices
@@ -480,7 +503,66 @@ class StandaloneRemoteWorker:
             metrics.counts["accepted_tokens_including_bonus"] += sum(lengths) + len(lengths)
             metrics.counts["first_level_hits"] += sum(n > 0 for n in lengths)
             metrics.counts["verify_graph_batches"] += int(can_run_cuda_graph)
+            if discard_logits:
+                metrics.counts["verify_logits_discard_batches"] += 1
+                metrics.counts["verify_logits_skipped_output_bytes"] += (
+                    skipped_output_bytes
+                )
+            else:
+                metrics.counts["verify_logits_gather_batches"] += 1
         return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+    def _can_discard_verify_logits(
+        self, batch, logits_output, *, prepare_hidden: bool
+    ) -> bool:
+        """Drop accepted-row logits when this round has no later consumer.
+
+        ``prepare_hidden`` is the decision captured before verify clears
+        ``batch.return_hidden_states``. Callers must not recompute it here.
+        Setting the field to None does not free a graph runner's persistent
+        logits buffer; replay wraps that buffer again on the next round.
+        """
+        if batch.forward_mode.is_idle():
+            return False
+        if prepare_hidden or logits_output.hidden_states is not None:
+            return False
+        if batch.return_logprob or batch.has_grammar:
+            return False
+        sampling_info = batch.sampling_info
+        if sampling_info.has_custom_logit_processor:
+            return False
+        if (
+            conservative_mode_reason(
+                getattr(self.server_args, "speculative_verify_mode", None),
+                bool(sampling_info.is_all_greedy),
+            )
+            is not None
+        ):
+            return False
+        for name in (
+            "next_token_logprobs",
+            "next_token_top_logprobs_val",
+            "next_token_top_logprobs_idx",
+            "next_token_token_ids_logprobs_val",
+            "next_token_token_ids_logprobs_idx",
+            "input_token_logprobs",
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "input_token_ids_logprobs_val",
+            "input_token_ids_logprobs_idx",
+        ):
+            if getattr(logits_output, name) is not None:
+                return False
+        for name in (
+            "customized_info",
+            "full_logits",
+            "mm_input_embeds",
+            "tree_seed_topk_p",
+            "tree_seed_topk_index",
+        ):
+            if getattr(logits_output, name) is not None:
+                return False
+        return True
 
     def _mamba_verify_update(
         self,

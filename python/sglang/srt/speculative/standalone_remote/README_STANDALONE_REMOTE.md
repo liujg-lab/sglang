@@ -222,7 +222,7 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 当前 RPD 有 CUDA kernel 与 CPU reference 分派；缺少 CUDA kernel 或非 CUDA 路径可使用 CPU reference。
 观察 `Speculative RPD verify path` 的实际值，不应把普通 greedy/target-only 验证的耗时套用于 RPD。
 
-NPU greedy 树核验走本仓库 [`tree_verify_npu.py`](../tree_verify_npu.py) 的 sibling-walk 设备 kernel，语义对齐 CPU [`verify_tree_greedy_ref`](../tree_verify.py) 与 CUDA `VerifyTreeGreedy`。共享入口是 `verify_tree_greedy_func`，因此 SR、SPECTRE、EAGLE/STANDALONE 中所有 greedy 调用都会走到该分派；启动 scratch 预热只接入 SR Target。CPU 张量、已识别的缺可选依赖（Triton）、或首版不支持的合法非连续布局在提交设备工作之前回退 reference；混合设备或非法 shape/dtype 报错；JIT/launch/执行失败原样上抛，不再跑 reference。不要接入 `sgl_kernel_npu.sample.verify_tree_greedy` 链入口。本优化减少 Target greedy 核验的主机往返与 Python 遍历，不解决 Draft 主瓶颈，也不能把 `accept_commit_including_wait` 整段当作可消除时间。核验之后现有结果处理仍可能读回主机。观察 `Speculative greedy verify path` 的实际值（`npu_kernel` 或 `cpu_reference` 及 reason）。设备路径依赖 Triton-Ascend JIT；具体可用版本以实机验收记录为准，当前编写环境未跑 NPU 数值对照。
+NPU greedy 树核验走本仓库 [`tree_verify_npu.py`](../tree_verify_npu.py) 的 sibling-walk 设备 kernel，语义对齐 CPU [`verify_tree_greedy_ref`](../tree_verify.py) 与 CUDA `VerifyTreeGreedy`。共享入口是 `verify_tree_greedy_func`，因此 SR、SPECTRE、EAGLE/STANDALONE 中所有 greedy 调用都会走到该分派；启动 scratch 预热只接入 SR Target。CPU 张量、已识别的缺可选依赖（Triton）、或首版不支持的合法非连续布局在提交设备工作之前回退 reference；混合设备或非法 shape/dtype 报错；JIT/launch/执行失败原样上抛，不再跑 reference。不要接入 `sgl_kernel_npu.sample.verify_tree_greedy` 链入口。本优化减少 Target greedy 核验的主机往返与 Python 遍历，不解决 Draft 主瓶颈，也不能把 `accept_commit_including_wait` 整段当作可消除时间。核验之后现有结果处理仍可能读回主机。观察 `Speculative greedy verify path` 的实际值（`npu_kernel` 或 `cpu_reference` 及 reason）。设备路径依赖 Triton-Ascend JIT；具体可用版本以实机验收记录为准，当前编写环境未跑 NPU 数值对照。普通 greedy 核验结束后，如果本轮没有 logprob、hidden、grammar、自定义 logit 处理或其他附加输出消费者，不再按接受行 gather 全词表 logits，`next_token_logits` 为 None。图回放可能附带本轮不消费的 hidden，判定前会丢掉该视图；持久 logits/hidden buffer 仍保留。
 
 默认 `auto` 配合 `temperature=0` 时，用**相同 Target 后端**的普通 AR 作为正确性基线。
 不要要求 CUDA 与 NPU、不同采样种子或不同后端必然产生同样序列。
@@ -957,6 +957,9 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `accepted_tokens_including_bonus` | 草稿接受数加每请求 bonus 的验证统计 |
 | `first_level_hits` | 至少接受一个草稿 token 的请求实例数；不是全部节点的命中数 |
 | `verify_graph_batches` | 实际使用图执行验证的 batch 数；不是图已捕获数量 |
+| `verify_logits_discard_batches` | 核验成功后确认没有后续消费者、因而不 gather 接受行 logits 的 batch 数 |
+| `verify_logits_gather_batches` | 核验成功后仍按接受行 gather logits 的 batch 数 |
+| `verify_logits_skipped_output_bytes` | 上述丢弃路径避免物化的接受行 logits 字节数，按 `accepted_count * vocab * element_size` 估算，不是实测带宽 |
 | `normal_decode_fallback_batches/normal_decode_fallback_requests` | 在受计量路径内进入普通单 token fallback 的 batch / 请求实例数 |
 | `failed_rounds` | 整轮抛出异常的次数 |
 

@@ -3529,5 +3529,964 @@ class TestComputeMropeWidthFallback(CustomTestCase):
         self.assertTrue(torch.equal(fb.mrope_positions.cpu(), cached[:, 3:8].cpu()))
 
 
+class _ForwardModeStub:
+    def __init__(self, *, idle=False, extend=False):
+        self._idle = idle
+        self._extend = extend
+
+    def is_idle(self):
+        return self._idle
+
+    def is_extend(self, include_draft_extend_v2=False):
+        return self._extend
+
+
+class _VerifyForwardMode:
+    """Names used by ``verify()`` without importing the model-executor module."""
+
+    IDLE = _ForwardModeStub(idle=True)
+    DECODE = _ForwardModeStub()
+    TARGET_VERIFY = _ForwardModeStub()
+
+
+class _LogitsProbe:
+    def __init__(self, data, *, forbid_get=False, forbid_meta=False):
+        self.data = data
+        self.forbid_get = forbid_get
+        self.forbid_meta = forbid_meta
+        self.gets = []
+
+    def __getitem__(self, index):
+        if self.forbid_get:
+            raise AssertionError("accepted-row gather ran")
+        self.gets.append(index)
+        return self.data[index]
+
+    @property
+    def shape(self):
+        if self.forbid_meta:
+            raise AssertionError("logits shape was read")
+        return self.data.shape
+
+    def element_size(self):
+        if self.forbid_meta:
+            raise AssertionError("logits element size was read")
+        return self.data.element_size()
+
+
+class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
+    def _load(self):
+        import ast
+        import importlib.util
+        import sys
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            conservative_mode_reason,
+        )
+
+        logprob_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/layers/utils/logprob.py"
+        )
+        logprob_spec = importlib.util.spec_from_file_location(
+            "sr_test_logprob", logprob_path
+        )
+        logprob_mod = importlib.util.module_from_spec(logprob_spec)
+        sys.modules[logprob_spec.name] = logprob_mod
+        logprob_spec.loader.exec_module(logprob_mod)
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        class_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "StandaloneRemoteWorker"
+        )
+        wanted = {
+            "verify",
+            "_can_discard_verify_logits",
+            "_need_target_hidden",
+            "forward_batch_generation",
+        }
+        nodes = [
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        self.assertEqual({node.name for node in nodes}, wanted)
+
+        class GenerationBatchResult:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        ns = {
+            "time": time,
+            "nullcontext": nullcontext,
+            "ForwardMode": _VerifyForwardMode,
+            "GenerationBatchResult": GenerationBatchResult,
+            "conservative_mode_reason": conservative_mode_reason,
+            "bind_graph_host_metrics": lambda runner, metrics: None,
+            "restore_graph_host_metrics": lambda token: None,
+            "generate_token_bitmask": lambda *args, **kwargs: None,
+            "maybe_detect_nan": lambda *args, **kwargs: None,
+            "_snapshot_seq_lens_cpu": lambda batch: batch.seq_lens,
+            "_sync_kv_from_cpu_lengths": lambda batch, seq_lens_cpu, lengths: None,
+            "_is_health_check": lambda req: False,
+            "add_output_logprobs_for_spec_v1": logprob_mod.add_output_logprobs_for_spec_v1,
+        }
+        module = ast.Module(
+            body=[ast.parse("from __future__ import annotations").body[0], *nodes],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+        return ns
+
+    def _blank_logits(self, next_token_logits, **overrides):
+        fields = {
+            "next_token_logits": next_token_logits,
+            "hidden_states": None,
+            "next_token_logprobs": None,
+            "next_token_top_logprobs_val": None,
+            "next_token_top_logprobs_idx": None,
+            "next_token_token_ids_logprobs_val": None,
+            "next_token_token_ids_logprobs_idx": None,
+            "input_token_logprobs": None,
+            "input_top_logprobs_val": None,
+            "input_top_logprobs_idx": None,
+            "input_token_ids_logprobs_val": None,
+            "input_token_ids_logprobs_idx": None,
+            "customized_info": None,
+            "full_logits": None,
+            "mm_input_embeds": None,
+            "tree_seed_topk_p": None,
+            "tree_seed_topk_index": None,
+        }
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    def _eligible_batch(self, **overrides):
+        batch = SimpleNamespace(
+            forward_mode=_ForwardModeStub(),
+            return_logprob=False,
+            has_grammar=False,
+            sampling_info=SimpleNamespace(
+                is_all_greedy=True,
+                has_custom_logit_processor=False,
+            ),
+        )
+        for key, value in overrides.items():
+            setattr(batch, key, value)
+        return batch
+
+    def test_admission_uses_real_mode_function_and_none_checks(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        seen = []
+        real = ns["conservative_mode_reason"]
+
+        def wrapped(mode, is_all_greedy):
+            seen.append((mode, is_all_greedy))
+            return real(mode, is_all_greedy)
+
+        ns["conservative_mode_reason"] = wrapped
+        discard = ns["_can_discard_verify_logits"]
+        worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_verify_mode="greedy")
+        )
+        logits = self._blank_logits(torch.zeros(2, 3))
+        batch = self._eligible_batch()
+        batch.sampling_info.is_all_greedy = False
+        self.assertTrue(discard(worker, batch, logits, prepare_hidden=False))
+        self.assertEqual(seen, [("greedy", False)])
+        with self.assertRaises(TypeError):
+            discard(worker, batch, logits, False)
+
+        ns["conservative_mode_reason"] = real
+        cases = [
+            ("auto", True, True),
+            ("auto", False, False),
+            (None, True, True),
+            ("", True, True),
+            (None, False, False),
+            ("target_only", True, False),
+            ("rpd", True, False),
+            ("other", True, False),
+        ]
+        for mode, greedy, expected in cases:
+            worker.server_args.speculative_verify_mode = mode
+            batch.sampling_info.is_all_greedy = greedy
+            self.assertEqual(
+                discard(worker, batch, logits, prepare_hidden=False),
+                expected,
+                msg=f"mode={mode!r} greedy={greedy}",
+            )
+
+        worker.server_args.speculative_verify_mode = "greedy"
+        batch.sampling_info.is_all_greedy = True
+        batch.return_logprob = True
+        self.assertFalse(discard(worker, batch, logits, prepare_hidden=False))
+        batch.return_logprob = False
+        batch.has_grammar = True
+        self.assertFalse(discard(worker, batch, logits, prepare_hidden=False))
+        batch.has_grammar = False
+        batch.sampling_info.has_custom_logit_processor = True
+        self.assertFalse(discard(worker, batch, logits, prepare_hidden=False))
+        batch.sampling_info.has_custom_logit_processor = False
+        self.assertFalse(discard(worker, batch, logits, prepare_hidden=True))
+        self.assertFalse(
+            discard(
+                worker,
+                batch,
+                self._blank_logits(logits.next_token_logits, hidden_states=torch.zeros(1)),
+                prepare_hidden=False,
+            )
+        )
+        self.assertFalse(
+            discard(worker, self._eligible_batch(forward_mode=_ForwardModeStub(idle=True)), logits, prepare_hidden=False)
+        )
+        for name in (
+            "next_token_logprobs",
+            "next_token_top_logprobs_val",
+            "next_token_top_logprobs_idx",
+            "next_token_token_ids_logprobs_val",
+            "next_token_token_ids_logprobs_idx",
+            "input_token_logprobs",
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "input_token_ids_logprobs_val",
+            "input_token_ids_logprobs_idx",
+            "full_logits",
+            "mm_input_embeds",
+            "tree_seed_topk_p",
+            "tree_seed_topk_index",
+        ):
+            self.assertFalse(
+                discard(
+                    worker,
+                    batch,
+                    self._blank_logits(logits.next_token_logits, **{name: []}),
+                    prepare_hidden=False,
+                ),
+                msg=name,
+            )
+        self.assertFalse(
+            discard(
+                worker,
+                batch,
+                self._blank_logits(logits.next_token_logits, customized_info={}),
+                prepare_hidden=False,
+            )
+        )
+        self.assertFalse(
+            discard(
+                worker,
+                batch,
+                self._blank_logits(logits.next_token_logits, customized_info=[]),
+                prepare_hidden=False,
+            )
+        )
+
+    def _run_verify(
+        self,
+        ns,
+        *,
+        logits_data,
+        accepted_indices,
+        accept_lengths,
+        reqs,
+        verify_mode="greedy",
+        is_all_greedy=True,
+        prepare_overrides=None,
+        logits_overrides=None,
+        return_logprob=False,
+        has_grammar=False,
+        has_custom=False,
+        idle=False,
+        metrics=None,
+        fixed_state=None,
+        hybrid=False,
+        forbid_get=False,
+        forbid_meta=False,
+        hidden=None,
+        mamba=None,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        temperatures=None,
+        verified_id=None,
+    ):
+        probe = _LogitsProbe(
+            logits_data, forbid_get=forbid_get, forbid_meta=forbid_meta
+        )
+        logits_output = self._blank_logits(probe, **(logits_overrides or {}))
+        if hidden is not None:
+            logits_output.hidden_states = hidden
+        seen = {}
+        seq_lens = torch.tensor(
+            [4 + index for index in range(len(reqs))], dtype=torch.int64
+        )
+        if not reqs:
+            seq_lens = torch.empty(0, dtype=torch.int64)
+
+        def stub_verify(batch, logits, allocator, page_size, vocab_mask, **kwargs):
+            seen["logits"] = logits.next_token_logits
+            seen["prepare_hidden"] = kwargs["prepare_local_draft_hidden"]
+            seen["state"] = kwargs["sr_accept_state"]
+            if verified_id is None:
+                ids = [
+                    req.output_ids[-1] if req.output_ids else 0 for req in reqs
+                ]
+                verified = torch.tensor(ids, dtype=torch.int64)
+            else:
+                verified = verified_id
+            return SimpleNamespace(
+                accepted_indices=accepted_indices,
+                accept_length_per_req_cpu=list(accept_lengths),
+                verified_id=verified,
+                draft_input="kept-draft",
+            )
+
+        spec_info = SimpleNamespace(
+            draft_token_num=4,
+            seq_lens_cpu=seq_lens,
+            capture_hidden_mode="capture",
+            hidden_states=None,
+            prepare_for_verify=lambda batch, page_size: None,
+            verify=stub_verify,
+        )
+        batch = SimpleNamespace(
+            forward_mode=_ForwardModeStub(idle=idle),
+            return_hidden_states=False,
+            reqs=reqs,
+            has_grammar=has_grammar,
+            return_logprob=return_logprob,
+            sampling_info=SimpleNamespace(
+                is_all_greedy=is_all_greedy,
+                has_custom_logit_processor=has_custom,
+                vocab_size=int(logits_data.shape[-1]),
+                temperatures=temperatures
+                if temperatures is not None
+                else torch.ones(max(len(reqs), 1)),
+                device=torch.device("cpu"),
+            ),
+            seq_lens=seq_lens.clone(),
+            seq_lens_cpu=seq_lens.clone(),
+            sr_round_metrics=metrics,
+            spec_info=None,
+            top_logprobs_nums=top_logprobs_nums or [0 for _ in reqs],
+            token_ids_logprobs=token_ids_logprobs or [None for _ in reqs],
+            get_model_worker_batch=lambda seq_lens_cpu_cache=None: SimpleNamespace(
+                capture_hidden_mode=spec_info.capture_hidden_mode
+            ),
+        )
+        runner = SimpleNamespace(
+            graph_runner=None,
+            hybrid_gdn_config=object() if hybrid else None,
+            mamba2_config=None,
+            hybrid_lightning_config=None,
+        )
+        worker = SimpleNamespace(
+            page_size=1,
+            enable_nan_detection=False,
+            _fixed_accept_state=fixed_state,
+            _hybrid_needs_hidden=hybrid,
+            server_args=SimpleNamespace(
+                speculative_verify_mode=verify_mode,
+                enable_return_hidden_states=False,
+            ),
+            target_worker=SimpleNamespace(
+                model_runner=runner,
+                forward_batch_generation=lambda model_batch, is_verify=False: SimpleNamespace(
+                    logits_output=logits_output,
+                    can_run_cuda_graph=False,
+                ),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            _mamba_verify_update=mamba
+            if mamba is not None
+            else lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("mamba update ran")
+            ),
+        )
+        if prepare_overrides:
+            if "enable_return_hidden_states" in prepare_overrides:
+                worker.server_args.enable_return_hidden_states = prepare_overrides[
+                    "enable_return_hidden_states"
+                ]
+            if prepare_overrides.get("return_hidden_states"):
+                batch.return_hidden_states = True
+            if prepare_overrides.get("req_hidden"):
+                for req in reqs:
+                    req.return_hidden_states = True
+        worker._need_target_hidden = lambda batch=None: ns["_need_target_hidden"](
+            worker, batch
+        )
+        worker._can_discard_verify_logits = (
+            lambda *args, **kwargs: ns["_can_discard_verify_logits"](
+                worker, *args, **kwargs
+            )
+        )
+        output_before = [list(req.output_ids) for req in reqs]
+        finish_before = [req.finished_reason for req in reqs]
+        seq_before = batch.seq_lens.clone()
+        logits_out, res, _, _ = ns["verify"](worker, batch, spec_info)
+        self.assertEqual([list(req.output_ids) for req in reqs], output_before)
+        self.assertEqual([req.finished_reason for req in reqs], finish_before)
+        self.assertTrue(torch.equal(batch.seq_lens, seq_before))
+        self.assertEqual(res.accept_length_per_req_cpu, list(accept_lengths))
+        self.assertIs(res.draft_input, "kept-draft")
+        self.assertIs(batch.spec_info, res.draft_input)
+        return logits_out, res, batch, seen, probe
+
+    def _req(self, output_ids, finished_reason=None):
+        return SimpleNamespace(
+            output_ids=list(output_ids),
+            finished_reason=finished_reason,
+            return_hidden_states=False,
+            return_logprob=False,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            spec_cnt=0,
+            len_output_ids=None,
+            sr_step_id=0,
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+            output_token_ids_logprobs_val=[],
+            output_token_ids_logprobs_idx=[],
+        )
+
+    def test_fast_path_leaves_tokens_and_skips_gather(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        data = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        cases = [
+            (
+                "partial",
+                [self._req([7, 8], None), self._req([9], "stop")],
+                torch.tensor([1, 0, 3]),
+                [2, 0],
+                None,
+            ),
+            (
+                "all-finished",
+                [self._req([1], "length"), self._req([2], "stop")],
+                torch.tensor([0, 2]),
+                [0, 0],
+                None,
+            ),
+            (
+                "bonus-only",
+                [self._req([4]), self._req([5])],
+                torch.tensor([2, 3]),
+                [0, 0],
+                None,
+            ),
+            ("empty", [], torch.empty(0, dtype=torch.int64), [], None),
+            (
+                "fixed-accept",
+                [self._req([7], None), self._req([8], "stop")],
+                torch.tensor([0, 1]),
+                [1, 0],
+                SimpleNamespace(metrics=None),
+            ),
+        ]
+        for name, reqs, indices, lengths, fixed_state in cases:
+            metrics = SRRoundMetrics("Target")
+            logits_out, _, _, seen, probe = self._run_verify(
+                ns,
+                logits_data=data,
+                accepted_indices=indices,
+                accept_lengths=lengths,
+                reqs=reqs,
+                metrics=metrics,
+                fixed_state=fixed_state,
+                forbid_get=True,
+            )
+            self.assertIsNone(logits_out.next_token_logits, msg=name)
+            self.assertIs(seen["logits"], probe)
+            self.assertEqual(probe.gets, [], msg=name)
+            self.assertEqual(seen["state"], fixed_state, msg=name)
+            self.assertFalse(seen["prepare_hidden"], msg=name)
+            self.assertEqual(metrics.counts["verify_logits_discard_batches"], 1, msg=name)
+            self.assertEqual(metrics.counts["verify_logits_gather_batches"], 0, msg=name)
+            expected_bytes = int(indices.numel()) * int(data.shape[-1]) * data.element_size()
+            self.assertEqual(
+                metrics.counts["verify_logits_skipped_output_bytes"],
+                expected_bytes,
+                msg=name,
+            )
+
+    def test_unused_replay_hidden_still_discards_logits(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        class UnusedHidden:
+            def __getitem__(self, index):
+                raise AssertionError("unused hidden was indexed")
+
+        data = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        indices = torch.tensor([1, 0, 3])
+        metrics = SRRoundMetrics("Target")
+        logits_out, _, _, seen, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[2, 0],
+            reqs=[self._req([7, 8], None), self._req([9], "stop")],
+            metrics=metrics,
+            forbid_get=True,
+            hidden=UnusedHidden(),
+        )
+        self.assertFalse(seen["prepare_hidden"])
+        self.assertIsNone(logits_out.next_token_logits)
+        self.assertIsNone(logits_out.hidden_states)
+        self.assertEqual(probe.gets, [])
+        self.assertEqual(metrics.counts["verify_logits_discard_batches"], 1)
+        self.assertEqual(metrics.counts["verify_logits_gather_batches"], 0)
+        self.assertEqual(
+            metrics.counts["verify_logits_skipped_output_bytes"],
+            int(indices.numel()) * int(data.shape[-1]) * data.element_size(),
+        )
+
+    def test_metrics_off_does_not_read_logits_metadata(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        data = torch.zeros(2, 4)
+        logits_out, _, _, _, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=torch.tensor([0]),
+            accept_lengths=[0],
+            reqs=[self._req([3])],
+            metrics=None,
+            forbid_get=True,
+            forbid_meta=True,
+        )
+        self.assertIsNone(logits_out.next_token_logits)
+        self.assertEqual(probe.gets, [])
+
+    def test_saved_hidden_decision_keeps_gather(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        data = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        indices = torch.tensor([3, 1])
+        hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        order = []
+
+        class HiddenProbe:
+            def __getitem__(self, index):
+                order.append("hidden")
+                return hidden[index]
+
+        def mamba(batch, res, logits_output, spec_info, seq_lens_pre):
+            order.append("mamba")
+            self.assertIsInstance(logits_output.next_token_logits, torch.Tensor)
+
+        logits_out, _, batch, seen, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[1],
+            reqs=[self._req([6])],
+            hybrid=True,
+            hidden=HiddenProbe(),
+            mamba=mamba,
+        )
+        self.assertTrue(seen["prepare_hidden"])
+        self.assertFalse(batch.return_hidden_states)
+        self.assertTrue(torch.equal(logits_out.next_token_logits, data[indices]))
+        self.assertTrue(torch.equal(logits_out.hidden_states, hidden[indices]))
+        self.assertEqual(order, ["hidden", "mamba"])
+        self.assertEqual(len(probe.gets), 1)
+
+        for label, overrides in (
+            ("server", {"enable_return_hidden_states": True}),
+            ("batch", {"return_hidden_states": True}),
+            ("req", {"req_hidden": True}),
+        ):
+            logits_out, _, batch, seen, _ = self._run_verify(
+                ns,
+                logits_data=data,
+                accepted_indices=indices,
+                accept_lengths=[0],
+                reqs=[self._req([6])],
+                prepare_overrides=overrides,
+                mamba=lambda *args, **kwargs: None,
+            )
+            self.assertTrue(seen["prepare_hidden"], msg=label)
+            self.assertFalse(batch.return_hidden_states, msg=label)
+            self.assertTrue(
+                torch.equal(logits_out.next_token_logits, data[indices]), msg=label
+            )
+
+    def test_keep_path_aligns_real_logprobs(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        data = torch.tensor(
+            [
+                [0.0, 8.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [9.0, 0.0, 0.0],
+                [0.0, 0.0, 3.0],
+            ]
+        )
+        base = torch.tensor([2, 9, 0, 9])
+        indices = base[::2]
+        self.assertFalse(indices.is_contiguous())
+        req = self._req([4, 5])
+        req.return_logprob = True
+        req.top_logprobs_num = 1
+        req.token_ids_logprob = [0]
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        metrics = SRRoundMetrics("Target")
+        logits_out, _, _, _, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[1],
+            reqs=[req],
+            verify_mode="auto",
+            is_all_greedy=False,
+            return_logprob=True,
+            metrics=metrics,
+            top_logprobs_nums=[1],
+            token_ids_logprobs=[[0]],
+            temperatures=torch.ones(1, 1),
+            verified_id=torch.tensor([0, 1]),
+        )
+        self.assertTrue(torch.equal(logits_out.next_token_logits, data[indices]))
+        self.assertEqual(len(probe.gets), 1)
+        self.assertEqual(req.output_token_logprobs_idx, [0, 1])
+        self.assertEqual(len(req.output_token_logprobs_val), 2)
+        self.assertEqual(req.output_top_logprobs_idx[0][0], 0)
+        self.assertEqual(req.output_top_logprobs_idx[1][0], 1)
+        self.assertEqual(req.output_token_ids_logprobs_idx, [[0], [0]])
+        self.assertEqual(len(req.output_token_ids_logprobs_val), 2)
+        self.assertEqual(metrics.counts["verify_logits_gather_batches"], 1)
+        self.assertEqual(metrics.counts["verify_logits_discard_batches"], 0)
+        self.assertEqual(metrics.counts["verify_logits_skipped_output_bytes"], 0)
+
+    def test_replay_clear_does_not_change_persistent_buffer(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        persistent = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        original = persistent.clone()
+        wrappers = []
+
+        def forward(model_batch, is_verify=False):
+            wrapper = self._blank_logits(persistent)
+            wrappers.append(wrapper)
+            return SimpleNamespace(logits_output=wrapper, can_run_cuda_graph=True)
+
+        indices = torch.tensor([1, 2])
+        for _ in range(2):
+            req = self._req([1])
+            seen = {}
+
+            def stub_verify(batch, logits, allocator, page_size, vocab_mask, **kwargs):
+                seen["logits"] = logits.next_token_logits
+                return SimpleNamespace(
+                    accepted_indices=indices,
+                    accept_length_per_req_cpu=[1],
+                    verified_id=torch.tensor([1]),
+                    draft_input="draft",
+                )
+
+            spec_info = SimpleNamespace(
+                draft_token_num=4,
+                seq_lens_cpu=torch.tensor([3]),
+                capture_hidden_mode="capture",
+                prepare_for_verify=lambda batch, page_size: None,
+                verify=stub_verify,
+            )
+            batch = SimpleNamespace(
+                forward_mode=_ForwardModeStub(),
+                return_hidden_states=False,
+                reqs=[req],
+                has_grammar=False,
+                return_logprob=False,
+                sampling_info=SimpleNamespace(
+                    is_all_greedy=True,
+                    has_custom_logit_processor=False,
+                ),
+                seq_lens=torch.tensor([3]),
+                sr_round_metrics=None,
+                top_logprobs_nums=[0],
+                token_ids_logprobs=[None],
+                get_model_worker_batch=lambda seq_lens_cpu_cache=None: SimpleNamespace(
+                    capture_hidden_mode="capture"
+                ),
+            )
+            worker = SimpleNamespace(
+                page_size=1,
+                enable_nan_detection=False,
+                _fixed_accept_state=None,
+                _hybrid_needs_hidden=False,
+                server_args=SimpleNamespace(
+                    speculative_verify_mode="greedy",
+                    enable_return_hidden_states=False,
+                ),
+                target_worker=SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        graph_runner=None,
+                        hybrid_gdn_config=None,
+                        mamba2_config=None,
+                        hybrid_lightning_config=None,
+                    ),
+                    forward_batch_generation=forward,
+                ),
+                token_to_kv_pool_allocator=SimpleNamespace(),
+                _mamba_verify_update=lambda *args, **kwargs: None,
+            )
+            worker._need_target_hidden = lambda batch=None: ns["_need_target_hidden"](
+                worker, batch
+            )
+            worker._can_discard_verify_logits = (
+                lambda *args, **kwargs: ns["_can_discard_verify_logits"](
+                    worker, *args, **kwargs
+                )
+            )
+            ns["verify"](worker, batch, spec_info)
+            self.assertIs(seen["logits"], persistent)
+
+        self.assertIsNone(wrappers[0].next_token_logits)
+        self.assertIsNone(wrappers[1].next_token_logits)
+        self.assertTrue(torch.equal(persistent, original))
+
+    def test_prefill_ar_and_idle_do_not_discard(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        calls = []
+        worker = SimpleNamespace(
+            speculative_num_draft_tokens=4,
+            speculative_num_steps=2,
+            forward_target_extend=lambda batch: ("extend-logits", torch.tensor([3]), None),
+            _forward_normal_decode=lambda batch: calls.append("ar") or "ar-result",
+            verify=lambda *args, **kwargs: calls.append("verify"),
+            construct_draft_input=lambda *args, **kwargs: calls.append("tree"),
+        )
+        extend_batch = SimpleNamespace(
+            forward_mode=_ForwardModeStub(extend=True),
+            is_extend_in_batch=False,
+        )
+        result = ns["forward_batch_generation"](worker, extend_batch)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.logits_output, "extend-logits")
+
+        ar_batch = SimpleNamespace(
+            forward_mode=_ForwardModeStub(),
+            is_extend_in_batch=False,
+            draft_num_tokens=1,
+        )
+        self.assertEqual(ns["forward_batch_generation"](worker, ar_batch), "ar-result")
+        self.assertEqual(calls, ["ar"])
+
+        data = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        indices = torch.tensor([2, 0])
+        logits_out, _, batch, _, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[1],
+            reqs=[self._req([8])],
+            idle=True,
+        )
+        self.assertTrue(batch.forward_mode.is_idle())
+        self.assertTrue(torch.equal(logits_out.next_token_logits, data[indices]))
+        self.assertEqual(len(probe.gets), 1)
+
+    def _load_methods(self, relative_path, class_name, names, extra_ns):
+        import ast
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[4] / relative_path
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        class_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        nodes = [
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        self.assertEqual({node.name for node in nodes}, set(names))
+        ns = dict(extra_ns)
+        module = ast.Module(
+            body=[ast.parse("from __future__ import annotations").body[0], *nodes],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+        return ns
+
+    def test_decode_spec_v1_consumes_none_logits(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        class ReqStub:
+            def __init__(self, output_ids, finished, grammar=None):
+                self.output_ids = list(output_ids)
+                self.origin_input_ids = [1, 2]
+                self._finished = finished
+                self.grammar = grammar
+                self.return_hidden_states = False
+                self.mamba_ping_pong_track_buffer = None
+                self.multimodal_inputs = None
+                self.session = None
+                self.time_stats = SimpleNamespace(
+                    set_last_decode_finish_time=lambda ts=None: events.append("decode"),
+                    set_completion_time=lambda ts=None: events.append("complete"),
+                )
+                self.routed_experts = "unset"
+                self.req_pool_idx = 0
+                self.seqlen = 4
+
+            def finished(self):
+                return self._finished
+
+        events = []
+        released = []
+        sent = []
+        stats = []
+        grammar = SimpleNamespace(finished=False)
+        running = ReqStub([7, 8], False)
+        finished = ReqStub([9], True, grammar)
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.STANDALONE_REMOTE,
+            is_spec_v2=False,
+            draft_num_tokens=15,
+            reqs=[running, finished],
+            return_logprob=False,
+            batch_size=lambda: 2,
+            dp_cooperation_info=None,
+        )
+
+        class TokenBoom:
+            def tolist(self):
+                raise AssertionError("spec v1 read next_token_ids")
+
+        result = SimpleNamespace(
+            copy_done=None,
+            logits_output=self._blank_logits(None),
+            next_token_ids=TokenBoom(),
+            num_accepted_tokens=3,
+            accept_length_per_req_cpu=[2, 0],
+            can_run_cuda_graph=True,
+        )
+        scheduler = SimpleNamespace(
+            is_remote_spec_draft=False,
+            enable_metrics=False,
+            enable_overlap=False,
+            enable_hisparse=False,
+            num_generated_tokens=0,
+            spec_num_accepted_tokens=0,
+            spec_num_forward_ct=0,
+            spec_num_draft_tokens=0,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=lambda: events.append("free-begin"),
+                free_group_end=lambda: events.append("free-end"),
+            ),
+            tree_cache=SimpleNamespace(),
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False,
+                decode_log_interval=50,
+            ),
+            current_scheduler_metrics_enabled=True,
+            enable_mfu_metrics=False,
+            scheduler_status_logger=None,
+            metrics_collector=SimpleNamespace(
+                increment_realtime_tokens=lambda **kwargs: stats.append(kwargs)
+            ),
+            forward_ct_decode=0,
+            req_to_token_pool=SimpleNamespace(),
+            stream_output=lambda reqs, return_logprob: sent.append((reqs, return_logprob)),
+            maybe_notify_remote_draft_finished=lambda req: events.append("notify"),
+        )
+        class _Capturer:
+            def get_routed_experts(self, req_pool_idx, seqlen, req_to_token_pool):
+                return None
+
+        output_ns = self._load_methods(
+            "python/sglang/srt/managers/scheduler_output_processor_mixin.py",
+            "SchedulerOutputProcessorMixin",
+            {
+                "process_batch_result_decode",
+                "_mamba_prefix_cache_update",
+                "_handle_finished_req",
+                "_is_spectre_draft_ar",
+                "maybe_collect_customized_info",
+                "maybe_collect_routed_experts",
+            },
+            {
+                "release_kv_cache": lambda req, tree_cache, is_insert=True: released.append(
+                    req
+                ),
+                "get_global_experts_capturer": lambda: _Capturer(),
+            },
+        )
+        metrics_ns = self._load_methods(
+            "python/sglang/srt/observability/scheduler_metrics_mixin.py",
+            "SchedulerMetricsMixin",
+            {"update_spec_metrics", "report_decode_stats"},
+            {},
+        )
+        for name, fn in {**output_ns, **metrics_ns}.items():
+            if name in {
+                "process_batch_result_decode",
+                "_mamba_prefix_cache_update",
+                "_handle_finished_req",
+                "_is_spectre_draft_ar",
+                "maybe_collect_customized_info",
+                "maybe_collect_routed_experts",
+                "update_spec_metrics",
+                "report_decode_stats",
+            }:
+                setattr(scheduler, name, fn.__get__(scheduler))
+        scheduler.process_batch_result_decode(batch, result)
+
+        self.assertEqual(running.output_ids, [7, 8])
+        self.assertEqual(finished.output_ids, [9])
+        self.assertIs(result.logits_output.next_token_logits, None)
+        self.assertTrue(grammar.finished)
+        self.assertEqual(released, [finished])
+        self.assertIsNone(finished.routed_experts)
+        self.assertEqual(running.routed_experts, "unset")
+        self.assertEqual(sent, [([running, finished], False)])
+        self.assertIn("free-begin", events)
+        self.assertIn("free-end", events)
+        self.assertIn("complete", events)
+        self.assertEqual(scheduler.spec_num_accepted_tokens, 5)
+        self.assertEqual(scheduler.spec_num_forward_ct, 2)
+        self.assertEqual(scheduler.spec_num_draft_tokens, 30)
+        self.assertEqual(scheduler.num_generated_tokens, 5)
+        self.assertEqual(stats, [{"decode_tokens": 5, "dp_cooperation_info": None}])
+
+
 if __name__ == "__main__":
     unittest.main()
