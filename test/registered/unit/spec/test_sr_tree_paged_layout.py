@@ -27,8 +27,10 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     SRTreePagedMetadata,
     build_step_context_lens,
     context_lens_list,
+    PrefixTailCopyBuffers,
     fill_active_rows,
     fill_paged_cpu_update_payload,
+    fill_prefix_tail_copy_slots,
     kv_buckets_to_page_buckets,
     make_dummy_block_tables,
     materialize_branch_pages,
@@ -214,6 +216,137 @@ class TestPrefixTailCopyPlan(CustomTestCase):
         self.assertEqual(int(dst[0]), int(branch[0, 0, 0]) * page)
         self.assertNotIn(".cpu()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots"))
         self.assertNotIn(".tolist()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots"))
+
+
+class TestFillPrefixTailCopySlots(CustomTestCase):
+    def _branch_ids(self, batch, topk, n_pages):
+        ids = []
+        nxt = 40
+        for _b in range(batch):
+            rows = []
+            for _k in range(topk):
+                rows.append([nxt + i for i in range(n_pages)])
+                nxt += n_pages
+            ids.append(rows)
+        return ids
+
+    def _layouts(self, prefixes):
+        page, topk, steps = 128, 3, 5
+        batch = len(prefixes)
+        page_ids = [[20 + 2 * b, 21 + 2 * b] for b in range(batch)]
+        req = _req_to_token(page_ids, page)
+        pool = torch.arange(batch, dtype=torch.int64)
+        slots = _draft_slots(
+            prefixes, page, topk, steps, self._branch_ids(batch, topk, 2)
+        )
+        branch = materialize_branch_pages(slots, prefixes, page, topk, steps)
+        seq_lens = torch.tensor(prefixes, dtype=torch.int64)
+        return page, topk, req, pool, branch, seq_lens
+
+    def _assert_matches(self, bufs, prefixes, kind):
+        page, topk, req, pool, branch, seq_lens = self._layouts(prefixes)
+        plan = plan_prefix_tail_copy_indices(prefixes, kind, topk, page)
+        ref_src, ref_dst = materialize_prefix_tail_copy_slots(
+            req, pool, branch, plan, page
+        )
+        src, dst = fill_prefix_tail_copy_slots(
+            seq_lens,
+            req,
+            pool,
+            branch,
+            prefixes,
+            kind,
+            topk,
+            page,
+            bufs,
+        )
+        self.assertTrue(torch.equal(src, ref_src))
+        self.assertTrue(torch.equal(dst, ref_dst))
+        self._assert_slot_rules(prefixes, kind, page, topk, branch, dst)
+        return req, pool, branch, seq_lens, ref_src, ref_dst
+
+    def _assert_slot_rules(self, prefixes, kind, page, topk, branch, dst):
+        start_k = 0 if kind == ALLOC_LEASE else 1
+        if int(dst.numel()) == 0:
+            for prefix in prefixes:
+                self.assertEqual(int(prefix) % page, 0)
+            return
+        for b, prefix in enumerate(prefixes):
+            rem = int(prefix) % page
+            if rem == 0:
+                continue
+            page0 = branch[b, 0, 0]
+            on_parent = dst // page == page0
+            if start_k == 1:
+                self.assertFalse(torch.any(on_parent))
+            else:
+                self.assertTrue(torch.any(on_parent))
+            for br in range(start_k, topk):
+                pid = branch[b, br, 0]
+                offs = (dst[dst // page == pid] % page).sort().values
+                self.assertTrue(torch.equal(offs, torch.arange(rem)))
+                self.assertFalse(torch.any(offs >= rem))
+
+    def test_matches_python_oracle(self):
+        bufs = PrefixTailCopyBuffers()
+        for prefixes in ([127], [200], [127, 128, 50]):
+            for kind in (ALLOC_ORDINARY, ALLOC_LEASE, ALLOC_ORDINARY):
+                self._assert_matches(bufs, prefixes, kind)
+
+    def test_int32_req_to_token_matches_oracle(self):
+        prefixes = [127]
+        bufs = PrefixTailCopyBuffers()
+        page, topk, req, pool, branch, seq_lens = self._layouts(prefixes)
+        kind = ALLOC_ORDINARY
+        plan = plan_prefix_tail_copy_indices(prefixes, kind, topk, page)
+        ref_src, ref_dst = materialize_prefix_tail_copy_slots(
+            req, pool, branch, plan, page
+        )
+        src, dst = fill_prefix_tail_copy_slots(
+            seq_lens,
+            req.to(dtype=torch.int32),
+            pool,
+            branch,
+            prefixes,
+            kind,
+            topk,
+            page,
+            bufs,
+        )
+        self.assertEqual(src.dtype, torch.int64)
+        self.assertTrue(torch.equal(src, ref_src))
+        self.assertTrue(torch.equal(dst, ref_dst))
+
+    def test_aligned_prefix_is_empty(self):
+        bufs = PrefixTailCopyBuffers()
+        for prefixes in ([0], [128], [256], [0, 128, 256]):
+            for kind in (ALLOC_ORDINARY, ALLOC_LEASE):
+                page, topk, req, pool, branch, seq_lens = self._layouts(prefixes)
+                src, dst = fill_prefix_tail_copy_slots(
+                    seq_lens,
+                    req,
+                    pool,
+                    branch,
+                    prefixes,
+                    kind,
+                    topk,
+                    page,
+                    bufs,
+                )
+                self.assertEqual(int(src.numel()), 0)
+                self.assertEqual(int(dst.numel()), 0)
+
+    def test_fill_source_has_no_host_readback_or_bool_index(self):
+        src = _fn_source(_LAYOUT, "fill_prefix_tail_copy_slots")
+        for banned in (
+            ".item()",
+            ".cpu()",
+            ".tolist()",
+            "[vmask]",
+            ".nonzero(",
+            "torch.bool",
+        ):
+            self.assertNotIn(banned, src)
 
 
 class TestQueryVsAllocPages(CustomTestCase):
@@ -854,7 +987,8 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("bind_sr_tree_paged_replay", _source(_BACKEND))
         prep_src = _fn_source(_BACKEND, "prepare_sr_tree_paged_eager")
         self.assertIn("_sr_tree_paged_prep_count += 1", prep_src)
-        self.assertIn("plan_prefix_tail_copy_indices", prep_src)
+        self.assertIn("fill_prefix_tail_copy_slots", prep_src)
+        self.assertNotIn("plan_prefix_tail_copy_indices", prep_src)
         self.assertIn("quantize_page_width", prep_src)
         self.assertIn("resolve_eager_page_buckets", prep_src)
         self.assertIn("max_pages=max_pages", prep_src)
@@ -1384,9 +1518,11 @@ class TestPagedEagerPrep(CustomTestCase):
                 prefix,
                 ALLOC_ORDINARY,
                 kv_pool=None,
+                seq_lens=prefix,
                 dummy_page=dummy,
             )
         self.assertFalse(copied)
+        self.assertEqual(backend._paged_copy_count, 0)
         self.assertEqual(writes, [])
         self.assertTrue(torch.equal(dest, torch.full_like(dest, 777)))
         self.assertTrue(torch.equal(dest_act, torch.full_like(dest_act, 9)))
@@ -1466,6 +1602,7 @@ class TestPagedEagerPrep(CustomTestCase):
             torch.tensor(prefixes, dtype=torch.int32),
             ALLOC_ORDINARY,
             kv_pool=None,
+            seq_lens=torch.tensor(prefixes, dtype=torch.int64),
             dummy_page=dummy,
         )
         tables = backend._paged_round_tables

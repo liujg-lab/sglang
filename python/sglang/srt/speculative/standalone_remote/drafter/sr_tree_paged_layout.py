@@ -196,6 +196,163 @@ def materialize_prefix_tail_copy_slots(
     return src, dst
 
 
+def _unit_stride_flat(tensor: torch.Tensor) -> torch.Tensor:
+    """1-stride view so a strided slot gather stays an ``index_select``."""
+    if tensor.is_contiguous():
+        return tensor.view(-1)
+    start = tensor.storage_offset()
+    total = tensor.untyped_storage().size() // tensor.element_size()
+    return torch.as_strided(tensor, (total - start,), (1,), storage_offset=start)
+
+
+def _prefix_ints(prefix_lens_cpu: SeqLens) -> list[int]:
+    if isinstance(prefix_lens_cpu, torch.Tensor):
+        if prefix_lens_cpu.device.type != "cpu":
+            raise RuntimeError("prefix_lens_cpu must stay on CPU")
+        return [int(x) for x in prefix_lens_cpu.reshape(-1)]
+    return [int(x) for x in prefix_lens_cpu]
+
+
+class PrefixTailCopyBuffers:
+    """Reused src/dst slots for one draft worker.
+
+    The next fill is queued on the same stream after this round's KV copy.
+    ``lin`` / ``once`` only cover one page tail (``rem < page``).
+    """
+
+    def __init__(self) -> None:
+        self.device = None
+        self.capacity = 0
+        self.page_cap = 0
+        self.pos = None
+        self.value_scratch: dict = {}
+
+    def ensure(self, device, n_copy: int, page: int) -> None:
+        device = torch.device(device)
+        n_copy = max(int(n_copy), 1)
+        page = max(int(page), 1)
+        if (
+            self.pos is not None
+            and self.device == device
+            and self.capacity >= n_copy
+            and self.page_cap >= page
+        ):
+            return
+        if self.device is not None and self.device != device:
+            cap, page_cap = n_copy, page
+        else:
+            cap = max(n_copy, self.capacity)
+            page_cap = max(page, self.page_cap)
+        self._alloc(device, cap, page_cap)
+
+    def _alloc(self, device, capacity: int, page: int) -> None:
+        self.device = device
+        self.capacity = int(capacity)
+        self.page_cap = int(page)
+        self.value_scratch = {}
+        self.pos = torch.arange(self.page_cap, dtype=torch.int64, device=device)
+        self.src_buf = torch.empty(self.capacity, dtype=torch.int64, device=device)
+        self.dst_buf = torch.empty(self.capacity, dtype=torch.int64, device=device)
+        self.lin = torch.empty(self.page_cap, dtype=torch.int64, device=device)
+        self.once = torch.empty(self.page_cap, dtype=torch.int64, device=device)
+        self.pool_i64 = torch.empty(1, dtype=torch.int64, device=device)
+
+    def _select_into(self, flat: torch.Tensor, index: torch.Tensor, out: torch.Tensor) -> None:
+        if flat.dtype == out.dtype:
+            torch.index_select(flat, 0, index, out=out)
+            return
+        scratch = self.value_scratch.get(flat.dtype)
+        need = int(out.shape[0])
+        if (
+            scratch is None
+            or scratch.device != self.device
+            or int(scratch.shape[0]) < need
+        ):
+            scratch = torch.empty(self.page_cap, dtype=flat.dtype, device=self.device)
+            self.value_scratch[flat.dtype] = scratch
+        picked = scratch[:need]
+        torch.index_select(flat, 0, index, out=picked)
+        out.copy_(picked)
+
+
+def fill_prefix_tail_copy_slots(
+    seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    branch_pages: torch.Tensor,
+    prefix_lens_cpu: SeqLens,
+    allocation_kind: str,
+    topk: int,
+    page_size: int,
+    buffers: PrefixTailCopyBuffers,
+):
+    """Dense src/dst slots for the prefix-tail KV copy.
+
+    Host ``prefix_lens_cpu`` supplies the column start ``prefix - rem``.
+    Each active request writes one ``[n_br, rem]`` block: one tail gather,
+    then a broadcast onto the copied branches. Order matches
+    ``plan_prefix_tail_copy_indices``: request, branch, tail offset.
+    """
+    device = req_to_token.device
+    prefixes = _prefix_ints(prefix_lens_cpu)
+    page = max(int(page_size), 1)
+    k = max(int(topk), 1)
+    start_k = 0 if str(allocation_kind) == ALLOC_LEASE else 1
+    n_br = k - start_k
+    raw_bs = len(prefixes)
+    n_copy = 0
+    if n_br > 0:
+        for prefix in prefixes:
+            rem = int(prefix) % page
+            if rem == 0:
+                continue
+            n_copy += rem * n_br
+    if n_br <= 0 or n_copy <= 0 or raw_bs == 0:
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return empty, empty
+    if seq_lens is None or int(seq_lens.shape[0]) < raw_bs:
+        raise RuntimeError("prefix tail copy requires device seq_lens")
+    if int(req_pool_indices.shape[0]) < raw_bs:
+        raise RuntimeError("req_pool_indices shorter than prefix_lens_cpu")
+    if (
+        branch_pages.dim() < 3
+        or int(branch_pages.shape[0]) < raw_bs
+        or int(branch_pages.shape[1]) < k
+        or int(branch_pages.shape[2]) < 1
+    ):
+        raise RuntimeError("branch_pages missing first-page column")
+
+    buffers.ensure(device, n_copy, page)
+    flat = _unit_stride_flat(req_to_token)
+    stride0 = int(req_to_token.stride(0))
+    stride1 = int(req_to_token.stride(1))
+    cursor = 0
+    for b, prefix in enumerate(prefixes):
+        rem = int(prefix) % page
+        if rem == 0:
+            continue
+        base = int(prefix) - rem
+        lin = buffers.lin[:rem]
+        lin.copy_(buffers.pos[:rem])
+        lin.add_(base)
+        lin.mul_(stride1)
+        buffers.pool_i64.copy_(req_pool_indices[b : b + 1])
+        buffers.pool_i64.mul_(stride0)
+        lin.add_(buffers.pool_i64)
+        once = buffers.once[:rem]
+        buffers._select_into(flat, lin, once)
+        span = rem * n_br
+        src_block = buffers.src_buf[cursor : cursor + span].view(n_br, rem)
+        src_block.copy_(once.view(1, rem))
+        page0 = branch_pages[b, start_k : start_k + n_br, 0]
+        dst_block = buffers.dst_buf[cursor : cursor + span].view(n_br, rem)
+        dst_block.copy_(page0.unsqueeze(1))
+        dst_block.mul_(page)
+        dst_block.add_(buffers.pos[:rem])
+        cursor += span
+    return buffers.src_buf[:n_copy], buffers.dst_buf[:n_copy]
+
+
 def materialize_branch_pages(
     draft_slots: torch.Tensor,
     prefix_lens_cpu: SeqLens,

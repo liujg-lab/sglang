@@ -4073,13 +4073,14 @@ class AscendAttnMultiStepDraftBackend:
         prefix_lens_cpu,
         allocation_kind: str,
         kv_pool,
+        seq_lens,
         dummy_page: int = 0,
         metrics=None,
     ) -> bool:
         """Build page tables once and optionally submit prefix-tail copy."""
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
-            materialize_prefix_tail_copy_slots,
-            plan_prefix_tail_copy_indices,
+            PrefixTailCopyBuffers,
+            fill_prefix_tail_copy_slots,
         )
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
             copy_kv_pool_by_slot,
@@ -4090,7 +4091,7 @@ class AscendAttnMultiStepDraftBackend:
         inner0 = self.attn_backends[0]
         inner0._sr_tree_paged_prep_count += 1
         self._paged_prep_count += 1
-        raw_bs = int(forward_batch.batch_size)
+        raw_bs = len(prefix_lens_cpu)
         topk = int(self.topk)
         slots = compact_slots.reshape(raw_bs, topk, self.speculative_num_steps)
         needed_pages = max(
@@ -4128,22 +4129,26 @@ class AscendAttnMultiStepDraftBackend:
         self._paged_round_impl = inner0.tree_attention_impl
         copied = False
         t_copy = time.perf_counter()
-        indices = plan_prefix_tail_copy_indices(
-            prefix_lens_cpu, allocation_kind, topk, self.page_size
+        buffers = getattr(self, "_prefix_tail_bufs", None)
+        if buffers is None:
+            buffers = PrefixTailCopyBuffers()
+            self._prefix_tail_bufs = buffers
+        src, dst = fill_prefix_tail_copy_slots(
+            seq_lens,
+            inner0.req_to_token,
+            forward_batch.req_pool_indices[:raw_bs],
+            branch,
+            prefix_lens_cpu,
+            allocation_kind,
+            topk,
+            self.page_size,
+            buffers,
         )
-        if len(indices):
-            src, dst = materialize_prefix_tail_copy_slots(
-                inner0.req_to_token,
-                forward_batch.req_pool_indices[:raw_bs],
-                branch,
-                indices,
-                self.page_size,
-            )
-            if int(src.numel()) > 0:
-                inner0._sr_tree_paged_copy_count += 1
-                self._paged_copy_count += 1
-                copy_kv_pool_by_slot(kv_pool, src, dst)
-                copied = True
+        if int(src.numel()) > 0:
+            inner0._sr_tree_paged_copy_count += 1
+            self._paged_copy_count += 1
+            copy_kv_pool_by_slot(kv_pool, src, dst)
+            copied = True
         if metrics is not None:
             metrics.add_host("tree_paged_copy", time.perf_counter() - t_copy)
         impl = inner0.tree_attention_impl

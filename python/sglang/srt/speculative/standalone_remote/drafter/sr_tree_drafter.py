@@ -550,12 +550,16 @@ class SRTreeDrafter:
                         if key in seen or prefix >= pool_cols:
                             continue
                         seen.add(key)
+                        seq_lens = torch.tensor(
+                            prefixes, dtype=torch.int64, device=device
+                        )
                         prepare(
                             dummy_fb,
                             slots,
                             prefixes,
                             ALLOC_ORDINARY,
                             kv_pool,
+                            seq_lens=seq_lens,
                             dummy_page=dummy,
                         )
                         prepare(
@@ -564,6 +568,7 @@ class SRTreeDrafter:
                             prefixes,
                             ALLOC_LEASE,
                             kv_pool,
+                            seq_lens=seq_lens,
                             dummy_page=dummy,
                         )
                         combos.append(key)
@@ -1219,6 +1224,7 @@ class SRTreeDrafter:
             prefix,
             kind,
             kv_pool,
+            batch.seq_lens,
             dummy_page=self._paged_dummy_page,
             metrics=metrics,
         )
