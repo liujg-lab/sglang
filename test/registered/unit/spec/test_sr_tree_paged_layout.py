@@ -20,6 +20,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
     SR_TREE_PAGED_ENV,
+    SR_TAIL_UPDATE_OVERLAP_ENV,
     SR_TREE_UPDATE_OVERLAP_ENV,
     SR_TREE_WARMUP_ENV,
     SRTreeExpandTxn,
@@ -40,6 +41,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     quantize_page_width,
     query_page_count,
     read_sr_tree_paged_env,
+    read_sr_tail_update_overlap_env,
     read_sr_tree_update_overlap_env,
     read_sr_tree_warmup_env,
     remainder,
@@ -148,6 +150,16 @@ class TestSrTreePagedEnv(CustomTestCase):
         for raw in ("1", "true", "YES", "on"):
             self.assertTrue(
                 read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: raw})
+            )
+
+    def test_tail_update_overlap_env_default_off(self):
+        self.assertFalse(read_sr_tail_update_overlap_env({}))
+        self.assertFalse(
+            read_sr_tail_update_overlap_env({SR_TAIL_UPDATE_OVERLAP_ENV: "0"})
+        )
+        for raw in ("1", "true", "YES", "on"):
+            self.assertTrue(
+                read_sr_tail_update_overlap_env({SR_TAIL_UPDATE_OVERLAP_ENV: raw})
             )
 
 

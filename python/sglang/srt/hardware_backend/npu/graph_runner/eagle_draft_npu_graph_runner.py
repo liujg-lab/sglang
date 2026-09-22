@@ -41,6 +41,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     begin_graph_host_sample,
+    mark_graph_host_failed,
     measure_call,
     record_graph_host_sample_safely,
 )
@@ -845,6 +846,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         num_steps = peek.get("n_steps")
                 sample = begin_graph_host_sample(
                     {
+                        "graph_phase": "draft_tree",
                         "round_id": int(metrics.rounds) + 1,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
@@ -1062,8 +1064,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                     self.tree_eager_fallback_count,
                 )
         except BaseException:
-            if sample is not None:
-                sample.mark_failed_or_interrupted()
+            mark_graph_host_failed(sample)
             raise
         finally:
             if sample is not None:

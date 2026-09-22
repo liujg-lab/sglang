@@ -13,9 +13,16 @@ import pathlib
 import threading
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    begin_graph_host_sample,
+    mark_graph_host_failed,
+    measure_call,
+    record_graph_host_sample_safely,
+)
 from sglang.srt.speculative.tree_attn_fallback import TreeReplayPlan
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -187,6 +194,10 @@ def _extract_npu_replay(helper_fn):
         "tree_fia_actual_seq_lengths_kv": lambda lens, rows: list(lens)
         + [0] * (int(rows) - len(list(lens))),
         "fill_fia_cpu_update_payload": _fill_fia_stub,
+        "begin_graph_host_sample": begin_graph_host_sample,
+        "mark_graph_host_failed": mark_graph_host_failed,
+        "measure_call": measure_call,
+        "record_graph_host_sample_safely": record_graph_host_sample_safely,
         "LogitsProcessorOutput": _FakeLogits,
         "PPProxyTensors": _FakePP,
         "AttentionArch": SimpleNamespace(MLA="mla"),
@@ -204,6 +215,9 @@ def _extract_npu_replay(helper_fn):
             "_update_inputs",
             "_update_decode_inputs",
             "_update_target_tree_fia_inputs",
+            "_target_graph_host_metrics",
+            "_log_sr_target_overlap_submit",
+            "_replay_target_tree_fia",
             "replay",
         ],
         ns,
@@ -272,6 +286,10 @@ def _make_replay_runner(
         is_dllm=False,
         tree_verify_replay_count=0,
         tree_verify_eager_fallback_count=0,
+        _npu_sr_target_update_overlap=False,
+        _npu_sr_target_update_overlap_requested=False,
+        _logged_sr_target_overlap_submit=False,
+        _npu_graph_device_id=None,
         bs=capture_bs,
         raw_bs=raw_bs,
         raw_num_token=raw_bs,
@@ -712,7 +730,7 @@ class TestTreeReplayPlan(CustomTestCase):
             _NPU_GRAPH_RUNNER, "NPUGraphRunner", "replay"
         )
         self.assertIn("run_npu_graph_update_and_replay", target_replay)
-        self.assertIn("overlap=False", target_replay)
+        self.assertIn("_replay_target_tree_fia", target_replay)
         self.assertIn("overlap_decode", target_replay)
         self.assertIn("overlap=overlap_decode", target_replay)
         self.assertIn("_plain_ar_update_overlap", target_replay)
@@ -1141,6 +1159,109 @@ class TestTreeReplayPlan(CustomTestCase):
             self.assertTrue(helper.calls, kwargs)
             self.assertIs(helper.calls[0]["overlap"], False, kwargs)
 
+    def test_target_fia_missing_map_fails_before_submit(self):
+        helper = _HelperBox()
+        methods = _extract_npu_replay(helper)
+        runner, batch, _graph = _make_replay_runner(
+            methods,
+            target_fia=True,
+            target_verify=True,
+            topk=2,
+            raw_bs=1,
+            capture_bs=1,
+            seq_lens=[8],
+        )
+        key = runner._tree_replay_plan.graph_key
+        runner._target_fia_maps[key] = None
+        runner._target_fia_maps["other"] = {"payload": []}
+        with self.assertRaises(_PrepError):
+            runner.replay(batch)
+        self.assertEqual(helper.calls, [])
+
+    def test_target_fia_overlap_replays_before_update_finishes(self):
+        devices = []
+        _install_fake_npu(devices)
+        helper = _HelperBox()
+        methods = _extract_npu_replay(helper)
+        runner, batch, graph = _make_replay_runner(
+            methods,
+            target_fia=True,
+            target_verify=True,
+            topk=2,
+            raw_bs=1,
+            capture_bs=1,
+            seq_lens=[8],
+            gpu_id=7,
+        )
+        runner._npu_sr_target_update_overlap = True
+        runner._npu_graph_device_id = 7
+        payload = runner._target_fia_maps[runner._tree_replay_plan.graph_key]["payload"]
+        payload_id = id(payload)
+        started = threading.Event()
+        release = threading.Event()
+        main = threading.get_ident()
+
+        def update(cpu_update_input=None):
+            self.assertEqual(threading.get_ident(), started_thread["id"])
+            self.assertIs(cpu_update_input, payload)
+            started.set()
+            self.assertTrue(release.wait(2))
+
+        started_thread = {}
+
+        def wrapped_update(cpu_update_input=None):
+            if "id" not in started_thread:
+                started_thread["id"] = threading.get_ident()
+            update(cpu_update_input=cpu_update_input)
+
+        graph.update = wrapped_update
+
+        def replay():
+            self.assertEqual(threading.get_ident(), main)
+            self.assertTrue(started.wait(2))
+            self.assertNotEqual(started_thread["id"], main)
+            self.assertEqual(devices, [7])
+            release.set()
+            graph.replay_count += 1
+
+        graph.replay = replay
+        before = _thread_idents()
+        runner.replay(batch)
+        self.assertTrue(helper.calls)
+        self.assertIs(helper.calls[0]["overlap"], True)
+        self.assertEqual(devices, [7])
+        self.assertEqual(id(payload), payload_id)
+        self.assertEqual(payload[0]["actual_seq_lengths_kv"], [8])
+        self.assertTrue(_thread_idents() <= before)
+        self.assertIsNone(runner._tree_replay_graph)
+
+    def test_target_fia_thread_start_failure_does_not_replay(self):
+        helper = _HelperBox()
+        methods = _extract_npu_replay(helper)
+        runner, batch, graph = _make_replay_runner(
+            methods,
+            target_fia=True,
+            target_verify=True,
+            topk=2,
+            raw_bs=1,
+            capture_bs=1,
+            seq_lens=[8],
+        )
+        runner._npu_sr_target_update_overlap = True
+        runner._npu_graph_device_id = 1
+
+        class BoomThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("start failed")
+
+        with patch.object(threading, "Thread", BoomThread):
+            with self.assertRaises(RuntimeError) as ctx:
+                runner.replay(batch)
+        self.assertEqual(str(ctx.exception), "start failed")
+        self.assertEqual(graph.replay_count, 0)
+        self.assertEqual(graph.updates, [])
+        self.assertEqual(len(helper.calls), 1)
+
     def test_decode_batch_sizes_select_key_pad_and_crop(self):
         helper = _HelperBox()
         graphs = {}
@@ -1241,6 +1362,7 @@ def _extract_draft_replay(helper_fn):
         "build_step_context_lens": lambda *a, **k: [1],
         "context_lens_list": lambda x: list(x),
         "begin_graph_host_sample": round_metrics.begin_graph_host_sample,
+        "mark_graph_host_failed": round_metrics.mark_graph_host_failed,
         "measure_call": round_metrics.measure_call,
         "record_graph_host_sample_safely": round_metrics.record_graph_host_sample_safely,
         "IMPL_PAGED_ATB": IMPL_PAGED_ATB,

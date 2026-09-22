@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     IMPL_TREE_PAGED_FIA,
     SR_TARGET_TREE_FIA_ENV,
@@ -24,7 +25,9 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     plan_target_tree_fia_lengths,
     prefix_columns_visible,
     prime_target_tree_fia_capture_,
+    SR_TARGET_UPDATE_OVERLAP_ENV,
     read_sr_target_tree_fia_env,
+    read_sr_target_update_overlap_env,
     target_tree_fia_blocked_extra_combos,
     validate_target_tree_fia_inputs,
     validate_target_tree_fia_records,
@@ -113,6 +116,19 @@ class TestTargetTreeFiaEnv(CustomTestCase):
     def test_explicit_on(self):
         for raw in ("1", "true", "YES", "On"):
             self.assertTrue(read_sr_target_tree_fia_env({SR_TARGET_TREE_FIA_ENV: raw}))
+
+    def test_update_overlap_env_default_off(self):
+        self.assertFalse(read_sr_target_update_overlap_env({}))
+        self.assertFalse(
+            read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: "0"})
+        )
+        self.assertFalse(
+            read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: "false"})
+        )
+        for raw in ("1", "true", "YES", "on"):
+            self.assertTrue(
+                read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: raw})
+            )
 
 
 class TestTargetTreeFiaSelection(CustomTestCase):
@@ -529,15 +545,30 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         self.assertIn("expand_fia_cpu_update_inputs", _fn_source(_RUNNER, "NPUGraphRunner", "_bind_target_tree_fia_payload"))
         replay = _fn_source(_RUNNER, "NPUGraphRunner", "replay")
         self.assertIn("not compact_fia and not target_fia", replay)
-        self.assertIn("overlap=False", replay)
+        self.assertIn("_replay_target_tree_fia", replay)
         target_call = replay.split("if is_tree_verify and target_fia:", 1)[1]
         target_call = target_call.split("elif is_tree_verify and compact_fia:", 1)[0]
-        self.assertIn("overlap=False", target_call)
+        self.assertIn("_replay_target_tree_fia", target_call)
         self.assertNotIn("overlap=True", target_call)
         self.assertNotIn("overlap=True", replay)
+        self.assertLess(
+            target_call.find("target tree FIA payload missing"),
+            target_call.find("_replay_target_tree_fia"),
+        )
+        submit = _fn_source(_RUNNER, "NPUGraphRunner", "_replay_target_tree_fia")
+        self.assertIn("_update_target_tree_fia_inputs", submit)
+        self.assertIn("overlap=False", submit)
+        self.assertIn("overlap=True", submit)
+        self.assertIn("torch.npu.set_device", submit)
+        self.assertIn("prepare_submit", submit)
+        init = _fn_source(_RUNNER, "NPUGraphRunner", "__init__")
+        self.assertLess(
+            init.find("_npu_sr_target_update_overlap = False"),
+            init.find("super().__init__"),
+        )
         self.assertIn("raw_bs", replay)
         self.assertIn("capture_bs", replay)
-        self.assertIn("_update_target_tree_fia_inputs", replay)
+        self.assertIn("_replay_target_tree_fia", replay)
         can = _fn_source(_RUNNER, "NPUGraphRunner", "can_run")
         self.assertIn("_target_fia_maps", can)
 
@@ -585,6 +616,12 @@ class TestTargetTreeFiaWiring(CustomTestCase):
                 return None
 
         graph = _Graph()
+
+        class _Prep(Exception):
+            def __init__(self, message, scope=None):
+                super().__init__(message)
+                self.scope = scope
+
         loc = {
             "self": SimpleNamespace(
                 _target_fia_maps={1: {"payload": []}},
@@ -596,12 +633,13 @@ class TestTargetTreeFiaWiring(CustomTestCase):
             "target_fia": True,
             "graph_key": 1,
             "graph": graph,
+            "kv_bucket": None,
             "backend": SimpleNamespace(
                 forward_metadata=SimpleNamespace(
                     sr_target_tree_fia=SimpleNamespace(kv_lens_cpu=[4])
                 )
             ),
-            "NpuGraphPreparationError": RuntimeError,
+            "NpuGraphPreparationError": _Prep,
         }
         tree = ast.parse(replay)
         fn = tree.body[0]
@@ -614,6 +652,12 @@ class TestTargetTreeFiaWiring(CustomTestCase):
                 target_if = node
                 break
         self.assertIsNotNone(target_if)
+        seen = []
+
+        def _replay_target_tree_fia(info, kv_lens, graph_arg, key, bucket):
+            seen.append((list(kv_lens), graph_arg, key))
+
+        loc["self"]._replay_target_tree_fia = _replay_target_tree_fia
         exec(
             compile(
                 ast.Module(body=list(target_if.body), type_ignores=[]),
@@ -623,9 +667,149 @@ class TestTargetTreeFiaWiring(CustomTestCase):
             loc,
             loc,
         )
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["overlap"], False)
-        self.assertIs(calls[0]["replay_fn"].__self__, graph)
+        self.assertEqual(calls, [])
+        self.assertEqual(seen, [([4], graph, 1)])
+
+        loc["self"]._target_fia_maps = {1: {"payload": []}, 2: None}
+        loc["graph_key"] = 2
+        seen.clear()
+        with self.assertRaises(_Prep):
+            exec(
+                compile(
+                    ast.Module(body=list(target_if.body), type_ignores=[]),
+                    str(_RUNNER),
+                    "exec",
+                ),
+                loc,
+                loc,
+            )
+        self.assertEqual(seen, [])
+        self.assertEqual(calls, [])
+
+
+class _NPUError(Exception):
+    pass
+
+
+_NPUError.__name__ = "NPUError"
+
+
+def _load_runner_methods(names, ns):
+    tree = ast.parse(_RUNNER.read_text())
+    klass = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUGraphRunner"
+    )
+    nodes = [
+        node
+        for node in klass.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    if {node.name for node in nodes} != set(names):
+        raise AssertionError("missing runner methods")
+    module = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__",
+                    names=[ast.alias(name="annotations")],
+                    level=0,
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+    )
+    exec(compile(module, str(_RUNNER), "exec"), ns)
+    return {name: ns[name] for name in names}
+
+
+class TestTargetUpdateOverlapGate(CustomTestCase):
+    def _runner(self, *, role="target", remote=True, fia=True, graphs=True, mapped=True):
+        backend = SimpleNamespace(
+            _use_target_tree_paged_fia=lambda: fia,
+            tree_attention_impl="tree_paged_fia" if fia else "compact_fia",
+        )
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(standalone_remote_role=role),
+                spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: remote),
+                attn_backend=backend,
+            ),
+            graphs={1: object()} if graphs else {},
+            _target_fia_maps={1: {"payload": [1]} if mapped else None} if graphs or mapped else {},
+            _npu_sr_target_update_overlap=False,
+            _npu_graph_device_id=None,
+            _current_tree_attention_impl=lambda: backend.tree_attention_impl,
+        )
+        if not graphs and not mapped:
+            runner._target_fia_maps = {}
+        return runner
+
+    def _enable(self, runner, requested, current_device):
+        logs = []
+
+        class _Logger:
+            def info(self, msg, *args):
+                logs.append(msg % args if args else msg)
+
+        ns = {
+            "torch": SimpleNamespace(
+                npu=SimpleNamespace(current_device=current_device)
+            ),
+            "is_device_context_error": is_device_context_error,
+            "logger": _Logger(),
+        }
+        fn = _load_runner_methods(["_maybe_enable_sr_target_update_overlap"], ns)[
+            "_maybe_enable_sr_target_update_overlap"
+        ]
+        fn(runner, requested)
+        return logs
+
+    def test_requested_sr_target_with_map_enables(self):
+        runner = self._runner()
+        logs = self._enable(runner, True, lambda: 3)
+        self.assertTrue(runner._npu_sr_target_update_overlap)
+        self.assertEqual(runner._npu_graph_device_id, 3)
+        self.assertIn("effective=True", logs[0])
+        self.assertIn("device=3", logs[0])
+
+    def test_unrequested_stays_off_without_log(self):
+        runner = self._runner()
+        logs = self._enable(runner, False, lambda: 3)
+        self.assertFalse(runner._npu_sr_target_update_overlap)
+        self.assertEqual(logs, [])
+
+    def test_gate_failures_stay_off(self):
+        cases = [
+            self._runner(role="draft"),
+            self._runner(remote=False),
+            self._runner(fia=False),
+            self._runner(graphs=False, mapped=False),
+            self._runner(mapped=False),
+        ]
+        for runner in cases:
+            logs = self._enable(runner, True, lambda: 1)
+            self.assertFalse(runner._npu_sr_target_update_overlap, logs)
+            self.assertIn("effective=False", logs[0])
+            self.assertIn("reason=", logs[0])
+
+    def test_current_device_failure_disables_context_error_raises(self):
+        runner = self._runner()
+
+        def boom():
+            raise RuntimeError("no device")
+
+        logs = self._enable(runner, True, boom)
+        self.assertFalse(runner._npu_sr_target_update_overlap)
+        self.assertIn("current_device failed", logs[0])
+
+        def poisoned():
+            raise _NPUError("poison")
+
+        with self.assertRaises(_NPUError):
+            self._enable(runner, True, poisoned)
 
 
 class TestPrimeCapture(CustomTestCase):

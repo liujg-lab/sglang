@@ -9,6 +9,7 @@ import copy
 import math
 import os
 import logging
+import threading
 import time
 from dataclasses import dataclass, replace
 from types import MethodType
@@ -1018,7 +1019,24 @@ class TestTailGraphBuckets(unittest.TestCase):
             update_fn()
             replay_fn()
 
-        ns = {"torch": torch, "run_npu_graph_update_and_replay": helper}
+        def measure_call(sample, stage, fn):
+            return fn()
+
+        def record_graph_host_sample_safely(metrics, sample):
+            return None
+
+        def mark_graph_host_failed(sample):
+            return None
+
+        ns = {
+            "torch": torch,
+            "run_npu_graph_update_and_replay": helper,
+            "measure_call": measure_call,
+            "record_graph_host_sample_safely": record_graph_host_sample_safely,
+            "mark_graph_host_failed": mark_graph_host_failed,
+            "begin_graph_host_sample": lambda context: None,
+            "logger": logging.getLogger("test.tail_graph"),
+        }
         fns = load_functions(
             runner_path,
             [
@@ -1049,10 +1067,223 @@ class TestTailGraphBuckets(unittest.TestCase):
         MethodType(fns["_replay_graph"], runner)(graph, [3, 4], bucket=(1, 2))
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0]["overlap"], False)
-        self.assertIs(calls[0]["replay_fn"].__self__, graph)
         self.assertEqual((graph.n_upd, graph.n_rep), (1, 1))
 
-    def test_wait_copy_event_before_replay_only_when_copy(self):
+    def test_tail_overlap_gate_payload_and_join(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+
+        helper_tree = ast.parse(
+            (
+                ROOT / "python/sglang/srt/speculative/spec_utils.py"
+            ).read_text(encoding="utf-8")
+        )
+        helper_nodes = [
+            node
+            for node in helper_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+            and node.name
+            in {"run_npu_graph_update_and_replay", "NpuGraphReplaySubmittedError"}
+        ]
+        helper_ns = {"threading": threading}
+        exec(
+            compile(
+                ast.Module(body=helper_nodes, type_ignores=[]),
+                "spec_utils.py",
+                "exec",
+            ),
+            helper_ns,
+        )
+        run_npu_graph_update_and_replay = helper_ns["run_npu_graph_update_and_replay"]
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            begin_graph_host_sample,
+            mark_graph_host_failed,
+            measure_call,
+            record_graph_host_sample_safely,
+        )
+
+        class NPUError(Exception):
+            pass
+
+        NPUError.__name__ = "NPUError"
+        logs = []
+        devices = []
+        state = {"current": lambda: 5}
+        previous_npu = getattr(torch, "npu", None)
+        torch.npu = NS(
+            current_device=lambda: state["current"](),
+            set_device=lambda index: devices.append(index),
+        )
+
+        def _restore_npu():
+            if previous_npu is None:
+                if hasattr(torch, "npu"):
+                    del torch.npu
+            else:
+                torch.npu = previous_npu
+
+        self.addCleanup(_restore_npu)
+
+        class _Logger:
+            def info(self, msg, *args):
+                logs.append(msg % args if args else msg)
+
+        fns = load_functions(
+            ROOT
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/sr_tail_extend_npu_graph_runner.py",
+            [
+                "_tail_graph_uses_fia",
+                "make_tail_graph_cpu_update_payload",
+                "fill_tail_graph_cpu_update_payload",
+                "_maybe_enable_sr_tail_update_overlap",
+                "_replay_graph",
+            ],
+            {
+                "torch": torch,
+                "logger": _Logger(),
+                "is_device_context_error": is_device_context_error,
+                "run_npu_graph_update_and_replay": run_npu_graph_update_and_replay,
+                "measure_call": measure_call,
+                "mark_graph_host_failed": mark_graph_host_failed,
+                "begin_graph_host_sample": begin_graph_host_sample,
+                "record_graph_host_sample_safely": record_graph_host_sample_safely,
+            },
+        )
+
+        def enable(runner):
+            logs.clear()
+            MethodType(fns["_maybe_enable_sr_tail_update_overlap"], runner)()
+            return list(logs)
+
+        off = NS(
+            _npu_sr_tail_update_overlap=False,
+            _npu_graph_device_id=None,
+            _npu_sr_tail_update_overlap_requested=False,
+            graphs={(1, 2): object()},
+            disabled_reason=None,
+            model_runner=NS(attn_backend=NS(use_fia=False)),
+        )
+        self.assertEqual(enable(off), [])
+        self.assertFalse(off._npu_sr_tail_update_overlap)
+
+        disabled = NS(
+            _npu_sr_tail_update_overlap=False,
+            _npu_graph_device_id=None,
+            _npu_sr_tail_update_overlap_requested=True,
+            graphs={},
+            disabled_reason="capture failed",
+            model_runner=NS(attn_backend=NS(use_fia=True)),
+        )
+        self.assertIn("reason=capture failed", enable(disabled)[0])
+        self.assertFalse(disabled._npu_sr_tail_update_overlap)
+
+        state["current"] = lambda: (_ for _ in ()).throw(RuntimeError("no device"))
+        plain = NS(
+            _npu_sr_tail_update_overlap=False,
+            _npu_graph_device_id=None,
+            _npu_sr_tail_update_overlap_requested=True,
+            graphs={(1, 2): object()},
+            disabled_reason=None,
+            model_runner=NS(attn_backend=NS(use_fia=False)),
+        )
+        self.assertIn("current_device failed", enable(plain)[0])
+        self.assertFalse(plain._npu_sr_tail_update_overlap)
+
+        state["current"] = lambda: (_ for _ in ()).throw(NPUError("poison"))
+        with self.assertRaises(NPUError):
+            enable(plain)
+
+        state["current"] = lambda: 5
+        ready = NS(
+            _npu_sr_tail_update_overlap=False,
+            _npu_graph_device_id=None,
+            _npu_sr_tail_update_overlap_requested=True,
+            graphs={(1, 2): object()},
+            disabled_reason=None,
+            model_runner=NS(attn_backend=NS(use_fia=False)),
+        )
+        self.assertIn("effective=True", enable(ready)[0])
+        self.assertEqual(ready._npu_graph_device_id, 5)
+        self.assertTrue(ready._npu_sr_tail_update_overlap)
+
+        for use_fia in (False, True):
+            devices.clear()
+            payload = fns["make_tail_graph_cpu_update_payload"](2, use_fia=use_fia)
+            stored = payload[0][
+                "actual_seq_lengths_kv" if use_fia else "context_lens"
+            ]
+            stored_id = id(stored)
+            runner = NS(
+                model_runner=NS(attn_backend=NS(use_fia=use_fia)),
+                update_payloads={(1, 2): payload},
+                _npu_sr_tail_update_overlap=False,
+                _npu_graph_device_id=5,
+                _npu_sr_tail_update_overlap_requested=False,
+                _logged_sr_tail_overlap_submit=False,
+            )
+            graph = NS(update=lambda cpu_update_input=None: None, replay=lambda: None)
+            MethodType(fns["_replay_graph"], runner)(graph, [3, 4], bucket=(1, 2))
+            self.assertEqual(devices, [])
+            self.assertEqual(id(stored), stored_id)
+            self.assertEqual(
+                list(stored),
+                [3, 4],
+            )
+
+        devices.clear()
+        payload = fns["make_tail_graph_cpu_update_payload"](2, use_fia=False)
+        stored = payload[0]["context_lens"]
+        order = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def set_device(index):
+            order.append(("set", index))
+            devices.append(index)
+
+        torch.npu.set_device = set_device
+
+        def update(cpu_update_input=None):
+            order.append("update")
+            self.assertIs(cpu_update_input, payload)
+            started.set()
+            self.assertTrue(release.wait(2))
+
+        def replay():
+            self.assertTrue(started.wait(2))
+            self.assertEqual(order[:2], [("set", 5), "update"])
+            release.set()
+
+        graph = NS(update=update, replay=replay)
+        runner = NS(
+            model_runner=NS(attn_backend=NS(use_fia=False)),
+            update_payloads={(1, 2): payload},
+            _npu_sr_tail_update_overlap=True,
+            _npu_graph_device_id=5,
+            _npu_sr_tail_update_overlap_requested=True,
+            _logged_sr_tail_overlap_submit=False,
+        )
+        before = {thread.ident for thread in threading.enumerate()}
+        MethodType(fns["_replay_graph"], runner)(graph, [9, 8], bucket=(1, 2))
+        self.assertEqual(list(stored), [9, 8])
+        self.assertEqual(devices, [5])
+        self.assertTrue({thread.ident for thread in threading.enumerate()} <= before)
+
+        class BoomThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("start failed")
+
+        graph = NS(
+            update=lambda cpu_update_input=None: order.append("update-again"),
+            replay=lambda: order.append("replay-again"),
+        )
+        with patch.object(threading, "Thread", BoomThread):
+            with self.assertRaises(RuntimeError) as ctx:
+                MethodType(fns["_replay_graph"], runner)(graph, [1, 1], bucket=(1, 2))
+        self.assertEqual(str(ctx.exception), "start failed")
+        self.assertNotIn("update-again", order)
+        self.assertNotIn("replay-again", order)
         class Event:
             def __init__(self):
                 self.syncs = 0

@@ -23,8 +23,10 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     SRCommMetrics,
     SRRoundMetrics,
     begin_graph_host_sample,
+    bind_graph_host_metrics,
     measure_call,
     record_graph_host_sample_safely,
+    restore_graph_host_metrics,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -584,7 +586,8 @@ class TestGraphHostMetrics(unittest.TestCase):
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
         host_line = next(args for fmt, args in captured["lines"] if "graph host" in fmt)
-        group = host_line[0][0]
+        group = host_line[-1][0]
+        self.assertEqual(host_line[0], "Draft")
         self.assertEqual(group["ok"], 32)
         self.assertEqual(group["failed"], 0)
         self.assertEqual(group["ok_stats"]["lengths_host_ms"]["n"], 8)
@@ -606,7 +609,7 @@ class TestGraphHostMetrics(unittest.TestCase):
 
         def capture(fmt, *args, **kwargs):
             if "graph host" in fmt:
-                flushed["groups"] = args[0]
+                flushed["groups"] = args[-1]
 
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
@@ -629,7 +632,7 @@ class TestGraphHostMetrics(unittest.TestCase):
 
         def capture(fmt, *args, **kwargs):
             if "graph host" in fmt:
-                flushed["groups"] = args[0]
+                flushed["groups"] = args[-1]
 
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
@@ -657,7 +660,7 @@ class TestGraphHostMetrics(unittest.TestCase):
 
         def capture(fmt, *args, **kwargs):
             if "graph host" in fmt:
-                flushed["group"] = args[0][0]
+                flushed["group"] = args[-1][0]
 
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
@@ -679,7 +682,7 @@ class TestGraphHostMetrics(unittest.TestCase):
 
         def capture(fmt, *args, **kwargs):
             if "graph host" in fmt:
-                flushed["group"] = args[0][0]
+                flushed["group"] = args[-1][0]
 
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
@@ -699,7 +702,7 @@ class TestGraphHostMetrics(unittest.TestCase):
 
         def capture(fmt, *args, **kwargs):
             if "graph host" in fmt:
-                flushed["group"] = args[0][0]
+                flushed["group"] = args[-1][0]
 
         with patch.object(round_metrics.logger, "info", side_effect=capture):
             _run_window(metrics)
@@ -805,6 +808,132 @@ class TestGraphHostMetrics(unittest.TestCase):
         ):
             _run_window(metrics)
         self.assertFalse(metrics._graph_host_samples)
+
+    def test_graph_phase_defaults_to_draft_tree_and_splits_phases(self):
+        metrics = SRRoundMetrics("Target")
+        for ctx in (
+            _graph_ctx(),
+            _graph_ctx(round_id=2, graph_phase="draft_tree"),
+            _graph_ctx(round_id=3, graph_phase="target_verify"),
+            _graph_ctx(round_id=4, graph_phase="tail_extend"),
+        ):
+            sample = begin_graph_host_sample(ctx)
+            self._advance_call(sample, "replay_call", 1)
+            record_graph_host_sample_safely(metrics, sample)
+        flushed = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                flushed["groups"] = args[-1]
+                flushed["role"] = args[0]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            _run_window(metrics)
+        phases = {g["graph_phase"]: g["ok"] for g in flushed["groups"]}
+        self.assertEqual(flushed["role"], "Target")
+        self.assertEqual(phases["draft_tree"], 2)
+        self.assertEqual(phases["target_verify"], 1)
+        self.assertEqual(phases["tail_extend"], 1)
+
+    def test_prepare_submit_covers_fill_and_envelope(self):
+        sample = begin_graph_host_sample(_graph_ctx(graph_phase="target_verify"))
+
+        def body():
+            measure_call(sample, "payload_fill", lambda: self.clock.advance(4))
+            measure_call(sample, "submit_envelope", lambda: self.clock.advance(6))
+
+        measure_call(sample, "prepare_submit", body)
+        self.assertAlmostEqual(sample.stages["payload_fill"], 4)
+        self.assertAlmostEqual(sample.stages["submit_envelope"], 6)
+        self.assertAlmostEqual(sample.stages["prepare_submit"], 10)
+
+    def test_stage_record_failure_runs_fn_once_and_keeps_result(self):
+        sample = begin_graph_host_sample(_graph_ctx())
+        calls = []
+
+        def succeed():
+            calls.append("ok")
+            return 7
+
+        with patch.object(
+            round_metrics.GraphHostSample,
+            "record_stage",
+            side_effect=RuntimeError("stat"),
+        ):
+            self.assertEqual(measure_call(sample, "update_call", succeed), 7)
+        self.assertEqual(calls, ["ok"])
+        self.assertFalse(sample.stages)
+
+    def test_stage_record_failure_does_not_mask_inference_or_interrupt(self):
+        sample = begin_graph_host_sample(_graph_ctx())
+        calls = []
+
+        def fail(exc):
+            calls.append(type(exc).__name__)
+            raise exc
+
+        with patch.object(
+            round_metrics.GraphHostSample,
+            "record_stage",
+            side_effect=RuntimeError("stat"),
+        ):
+            with self.assertRaises(ValueError):
+                measure_call(sample, "update_call", lambda: fail(ValueError("infer")))
+            with self.assertRaises(KeyboardInterrupt):
+                measure_call(
+                    sample, "replay_call", lambda: fail(KeyboardInterrupt())
+                )
+        self.assertEqual(calls, ["ValueError", "KeyboardInterrupt"])
+
+    def test_clock_failure_still_runs_fn_once(self):
+        sample = begin_graph_host_sample(_graph_ctx())
+        calls = []
+
+        def succeed():
+            calls.append("ok")
+            return 3
+
+        with patch.object(
+            round_metrics.time, "perf_counter_ns", side_effect=RuntimeError("clock")
+        ):
+            self.assertEqual(measure_call(sample, "update_call", succeed), 3)
+        self.assertEqual(calls, ["ok"])
+        self.assertFalse(sample.stages)
+
+    def test_bind_restores_previous_metrics_and_deletes_new_attribute(self):
+        runner = SimpleNamespace()
+        metrics = SRRoundMetrics("Target")
+        token = bind_graph_host_metrics(runner, metrics)
+        self.assertIs(runner._sr_graph_host_metrics, metrics)
+        try:
+            raise RuntimeError("verify")
+        except RuntimeError:
+            restore_graph_host_metrics(token)
+        self.assertFalse(hasattr(runner, "_sr_graph_host_metrics"))
+
+        previous = SRRoundMetrics("Draft")
+        runner._sr_graph_host_metrics = previous
+        token = bind_graph_host_metrics(runner, metrics)
+        restore_graph_host_metrics(token)
+        self.assertIs(runner._sr_graph_host_metrics, previous)
+        self.assertIsNone(bind_graph_host_metrics(None, metrics))
+        restore_graph_host_metrics(None)
+
+    def test_verify_binds_metrics_around_forward(self):
+        src = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        verify = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "verify"
+        )
+        body = ast.get_source_segment(src, verify)
+        self.assertLess(body.find("bind_graph_host_metrics"), body.find("is_verify=True"))
+        self.assertLess(body.find("is_verify=True"), body.find("finally:"))
+        self.assertLess(body.find("finally:"), body.find("restore_graph_host_metrics"))
 
 
 if __name__ == "__main__":

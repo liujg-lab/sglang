@@ -19,6 +19,7 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 SR_TREE_PAGED_ENV = "SGLANG_NPU_SR_TREE_PAGED"
 SR_TREE_WARMUP_ENV = "SGLANG_NPU_SR_TREE_WARMUP"
 SR_TREE_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TREE_UPDATE_OVERLAP"
+SR_TAIL_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TAIL_UPDATE_OVERLAP"
 ALLOC_ORDINARY = "ordinary"
 ALLOC_LEASE = "lease"
 IMPL_PAGED_ATB = "paged_atb"
@@ -69,6 +70,17 @@ def read_sr_tree_update_overlap_env(env=None) -> bool:
     """
     environ = os.environ if env is None else env
     raw = environ.get(SR_TREE_UPDATE_OVERLAP_ENV, "1")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_tail_update_overlap_env(env=None) -> bool:
+    """Read once during SR tail graph init; default off.
+
+    Requests overlap of tail ``graph.update`` and ``graph.replay``. Set 1 to
+    enable after capture succeeds. Not a runtime toggle.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TAIL_UPDATE_OVERLAP_ENV, "0")
     return str(raw).strip().lower() in _TRUTHY
 
 

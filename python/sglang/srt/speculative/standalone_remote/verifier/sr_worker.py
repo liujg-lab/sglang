@@ -28,6 +28,10 @@ from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_dete
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     is_health_check_req as _is_health_check,
 )
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    bind_graph_host_metrics,
+    restore_graph_host_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,10 +373,17 @@ class StandaloneRemoteWorker:
 
         if metrics:
             metrics.host["verify_prepare"] += time.perf_counter() - prepare_start
-        with metrics.phase("verify_forward", device=True) if metrics else nullcontext():
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
+        graph_runner = getattr(
+            getattr(self.target_worker, "model_runner", None), "graph_runner", None
+        )
+        metrics_token = bind_graph_host_metrics(graph_runner, metrics)
+        try:
+            with metrics.phase("verify_forward", device=True) if metrics else nullcontext():
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, is_verify=True
+                )
+        finally:
+            restore_graph_host_metrics(metrics_token)
         accept_start = time.perf_counter()
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,

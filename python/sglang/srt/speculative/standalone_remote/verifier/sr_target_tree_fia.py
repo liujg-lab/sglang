@@ -25,6 +25,7 @@ from sglang.srt.speculative.tree_shared_prefix import cpu_prefix_lengths
 SeqLens = Union[torch.Tensor, Sequence[int]]
 
 SR_TARGET_TREE_FIA_ENV = "SGLANG_NPU_SR_TARGET_TREE_FIA"
+SR_TARGET_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP"
 IMPL_TREE_PAGED_FIA = "tree_paged_fia"
 TARGET_TREE_FIA_PAGE_SIZE = 128
 TARGET_TREE_FIA_HEAD_DIMS = (64, 128)
@@ -37,6 +38,17 @@ def read_sr_target_tree_fia_env(env=None) -> bool:
     """Read once during initialization; default eligible Targets to FIA."""
     environ = os.environ if env is None else env
     raw = environ.get(SR_TARGET_TREE_FIA_ENV, "1")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_target_update_overlap_env(env=None) -> bool:
+    """Read once during NPU graph runner init; default off.
+
+    Requests SR Target ``tree_paged_fia`` update/replay overlap. Set 1 to
+    enable after the runner's own gate. Not a runtime toggle.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TARGET_UPDATE_OVERLAP_ENV, "0")
     return str(raw).strip().lower() in _TRUTHY
 
 

@@ -14,6 +14,7 @@ GRAPH_HOST_STAGES = (
     "update_call",
     "replay_call",
     "submit_envelope",
+    "prepare_submit",
 )
 GRAPH_HOST_STAGE_LOG = {
     "lengths": "lengths_host_ms",
@@ -21,6 +22,7 @@ GRAPH_HOST_STAGE_LOG = {
     "update_call": "update_call_host_ms",
     "replay_call": "replay_call_host_ms",
     "submit_envelope": "submit_envelope_host_ms",
+    "prepare_submit": "prepare_submit_total_host_ms",
 }
 _GRAPH_HOST_WARN_MAX = 8
 _graph_host_warns = 0
@@ -36,7 +38,7 @@ def _warn_graph_host(where, exc):
         if _graph_host_warns >= _GRAPH_HOST_WARN_MAX:
             return
         _graph_host_warns += 1
-        logger.warning("SR Draft graph host %s failed: %s", where, exc)
+        logger.warning("SR graph host %s failed: %s", where, exc)
     except Exception:
         return
 
@@ -45,17 +47,69 @@ def begin_graph_host_sample(context):
     return GraphHostSample(context)
 
 
+def _diag(where, fn):
+    """Run a diagnostics callback. Ordinary failures drop the stat only."""
+    try:
+        return fn()
+    except Exception as exc:
+        _warn_graph_host(where, exc)
+        return None
+
+
 def measure_call(sample, stage, fn):
+    """Time ``fn`` once.
+
+    Sample creation, clock reads, and stage records are diagnostics. Their
+    ordinary exceptions are discarded. ``fn`` still runs exactly once, and its
+    return value, original exception, and interrupt propagate unchanged.
+    """
     if sample is None:
         return fn()
-    start = time.perf_counter_ns()
+    start = _diag("clock", time.perf_counter_ns)
     try:
         result = fn()
     except BaseException:
-        sample.record_stage(stage, _ns_to_ms(time.perf_counter_ns() - start), completed=False)
+        if start is not None:
+            _record_stage_safely(sample, stage, start, completed=False)
         raise
-    sample.record_stage(stage, _ns_to_ms(time.perf_counter_ns() - start), completed=True)
+    if start is not None:
+        _record_stage_safely(sample, stage, start, completed=True)
     return result
+
+
+def _record_stage_safely(sample, stage, start_ns, completed):
+    def _record():
+        duration = _ns_to_ms(time.perf_counter_ns() - start_ns)
+        sample.record_stage(stage, duration, completed=completed)
+
+    _diag("stage", _record)
+
+
+def mark_graph_host_failed(sample):
+    if sample is None:
+        return
+    _diag("mark_failed", sample.mark_failed_or_interrupted)
+
+
+def bind_graph_host_metrics(runner, metrics):
+    """Attach metrics for one forward. ``None`` when there is nothing to restore."""
+    if runner is None or metrics is None:
+        return None
+    had = hasattr(runner, "_sr_graph_host_metrics")
+    previous = getattr(runner, "_sr_graph_host_metrics", None) if had else None
+    runner._sr_graph_host_metrics = metrics
+    return (runner, had, previous)
+
+
+def restore_graph_host_metrics(token):
+    """Restore the previous attribute, or delete one this bind created."""
+    if token is None:
+        return
+    runner, had, previous = token
+    if had:
+        runner._sr_graph_host_metrics = previous
+    elif hasattr(runner, "_sr_graph_host_metrics"):
+        del runner._sr_graph_host_metrics
 
 
 def record_graph_host_sample_safely(metrics, sample):
@@ -87,6 +141,7 @@ class GraphHostSample:
     def group_key(self):
         ctx = self.context
         return (
+            ctx.get("graph_phase", "draft_tree"),
             ctx.get("graph_key"),
             ctx.get("raw_bs"),
             ctx.get("capture_bs"),
@@ -312,6 +367,7 @@ class SRRoundMetrics:
             if bucket is None:
                 ctx = sample.context
                 bucket = {
+                    "graph_phase": ctx.get("graph_phase", "draft_tree"),
                     "graph_key": ctx.get("graph_key"),
                     "raw_bs": ctx.get("raw_bs"),
                     "capture_bs": ctx.get("capture_bs"),
@@ -340,6 +396,7 @@ class SRRoundMetrics:
             bucket = grouped[key]
             groups.append(
                 {
+                    "graph_phase": bucket["graph_phase"],
                     "graph_key": bucket["graph_key"],
                     "raw_bs": bucket["raw_bs"],
                     "capture_bs": bucket["capture_bs"],
@@ -369,7 +426,9 @@ class SRRoundMetrics:
                     },
                 }
             )
-        logger.info("[SR Draft graph host] window_rounds=32 groups=%s", groups)
+        logger.info(
+            "[SR %s graph host] window_rounds=32 groups=%s", self.role, groups
+        )
 
 
 def get_sr_round_metrics(owner, role):
