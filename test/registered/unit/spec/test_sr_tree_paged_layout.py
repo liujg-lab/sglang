@@ -152,10 +152,16 @@ class TestSrTreePagedEnv(CustomTestCase):
                 read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: raw})
             )
 
-    def test_tail_update_overlap_env_default_off(self):
-        self.assertFalse(read_sr_tail_update_overlap_env({}))
+    def test_tail_update_overlap_env_default_on(self):
+        self.assertTrue(read_sr_tail_update_overlap_env({}))
+        self.assertTrue(
+            read_sr_tail_update_overlap_env({SR_TAIL_UPDATE_OVERLAP_ENV: "1"})
+        )
         self.assertFalse(
             read_sr_tail_update_overlap_env({SR_TAIL_UPDATE_OVERLAP_ENV: "0"})
+        )
+        self.assertFalse(
+            read_sr_tail_update_overlap_env({SR_TAIL_UPDATE_OVERLAP_ENV: "false"})
         )
         for raw in ("1", "true", "YES", "on"):
             self.assertTrue(

@@ -74,13 +74,13 @@ def read_sr_tree_update_overlap_env(env=None) -> bool:
 
 
 def read_sr_tail_update_overlap_env(env=None) -> bool:
-    """Read once during SR tail graph init; default off.
+    """Read once during SR tail graph init; default on.
 
-    Requests overlap of tail ``graph.update`` and ``graph.replay``. Set 1 to
-    enable after capture succeeds. Not a runtime toggle.
+    Requests overlap of tail ``graph.update`` and ``graph.replay``. Set 0 to
+    keep serial after capture succeeds. Not a runtime toggle.
     """
     environ = os.environ if env is None else env
-    raw = environ.get(SR_TAIL_UPDATE_OVERLAP_ENV, "0")
+    raw = environ.get(SR_TAIL_UPDATE_OVERLAP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 

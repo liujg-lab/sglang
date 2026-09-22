@@ -42,13 +42,13 @@ def read_sr_target_tree_fia_env(env=None) -> bool:
 
 
 def read_sr_target_update_overlap_env(env=None) -> bool:
-    """Read once during NPU graph runner init; default off.
+    """Read once during NPU graph runner init; default on.
 
-    Requests SR Target ``tree_paged_fia`` update/replay overlap. Set 1 to
-    enable after the runner's own gate. Not a runtime toggle.
+    Requests SR Target ``tree_paged_fia`` update/replay overlap. Set 0 to
+    keep serial after the runner's own gate. Not a runtime toggle.
     """
     environ = os.environ if env is None else env
-    raw = environ.get(SR_TARGET_UPDATE_OVERLAP_ENV, "0")
+    raw = environ.get(SR_TARGET_UPDATE_OVERLAP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 

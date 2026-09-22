@@ -117,8 +117,11 @@ class TestTargetTreeFiaEnv(CustomTestCase):
         for raw in ("1", "true", "YES", "On"):
             self.assertTrue(read_sr_target_tree_fia_env({SR_TARGET_TREE_FIA_ENV: raw}))
 
-    def test_update_overlap_env_default_off(self):
-        self.assertFalse(read_sr_target_update_overlap_env({}))
+    def test_update_overlap_env_default_on(self):
+        self.assertTrue(read_sr_target_update_overlap_env({}))
+        self.assertTrue(
+            read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: "1"})
+        )
         self.assertFalse(
             read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: "0"})
         )

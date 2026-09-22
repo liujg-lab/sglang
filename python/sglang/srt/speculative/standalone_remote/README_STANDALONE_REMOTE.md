@@ -283,15 +283,16 @@ req_to_token_rows, 非空的 max_running_requests / standalone_remote_max_batch_
 成功取得 `torch.npu.current_device()` 后 `effective=True`。图捕获失败仍按现有
 图初始化失败处理，不会被关掉 overlap 掩盖。设备绑定只走这条分页重叠路径，
 不影响 compact-FIA 的 `SGLANG_NPU_TREE_FIA_SERIAL_UPDATE`、CUDA 和普通
-EAGLE/STANDALONE。Target `tree_paged_fia` 与 tail EXTEND 默认仍串行，只有各自的
-开关打开并通过门控后才重叠。后台线程显式 `daemon=False`。
+EAGLE/STANDALONE。Target `tree_paged_fia` 与 tail EXTEND 同样默认重叠，各自设
+`0` 才回退串行，并通过各自门控后 `effective=True`。后台线程显式 `daemon=False`。
 join 只证明 `update()` 返回，不证明设备图已执行结束。线程启动失败不调用 replay，
 沿树展开已有 in-flight 路径：先 `_try_confirm_tree_completion()`，确认失败则按
 submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共用实现，但
 必须分别验收。
 
 `SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP` 与 `SGLANG_NPU_SR_TAIL_UPDATE_OVERLAP`
-默认关闭，解析方式与 Draft 树开关相同（`1/true/yes/on`）。只在对应进程的 runner
+默认开启，解析方式与 Draft 树开关相同（未设置或 `1/true/yes/on` 请求启用，
+`0/false/no/off` 回退串行）。只在对应进程的 runner
 初始化时读取一次，改值后需重启该进程，不是运行时热切换，也不是 CLI/协议字段。
 Target 开关只作用于 SR Target 的 `tree_paged_fia` 验证图：图已捕获、至少一个
 FIA 映射有效，且 `torch.npu.current_device()` 成功后 `effective=True`。当前轮
@@ -308,11 +309,12 @@ helper 返回或抛错）。`submit_envelope` 接近 `max(update, replay)` 不�
 重叠，也不能证明隐藏了设备时间。join 只证明更新线程结束。线程启动失败不补一次
 串行提交；tail 仍按现有 TP、rollback 和 KV lease 条件处理。
 
-四组实机验收固定当前 Draft 树重叠配置，只切换这两个开关：基线 `0/0`、只开
-Target、只开 Tail、两者都开。每组先预热，至少重复三次，每次至少 500 个稳态轮次，
-基线与实验交替。正确性比较 greedy 输出、接受路径、提交长度和已提交 KV。收益看
-整轮和端到端，不看单独的 replay 提交变快。出现正确性差异或没有稳定收益时，把
-对应开关设回 `0` 并重启该进程。测量数字在实跑后补记。
+四组实机验收固定当前 Draft 树重叠配置，显式切换这两个开关：基线两个都设
+`0`、只关 Tail、只关 Target、以及默认两者都不设置（都开）。未设置不再等于
+基线。每组先预热，至少重复三次，每次至少 500 个稳态轮次，基线与实验交替。
+正确性比较 greedy 输出、接受路径、提交长度和已提交 KV。收益看整轮和端到端，
+不看单独的 replay 提交变快。出现正确性差异或没有稳定收益时，把对应开关设为
+`0` 并重启该进程。测量数字在实跑后补记。
 
 启动期 Draft `_sr_warm_tree_shapes` 先做 layout：对每个 raw_bs 枚举
 `shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与
