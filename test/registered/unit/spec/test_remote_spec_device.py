@@ -3,6 +3,7 @@
 import ast
 import copy
 import unittest
+import unittest.mock
 from collections.abc import Mapping
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -220,8 +221,18 @@ def _load_sr_tree_expand_methods():
                     "_pack_tree_windows",
                     "_d2h_tree_outputs",
                     "_acquire_host_staging",
+                    "_tree_phase",
+                    "_count_tree",
+                    "_tree_result_slots",
+                    "_acquire_tree_slot",
+                    "_mark_tree_slot",
+                    "_release_tree_slot",
+                    "_abort_tree_pack",
+                    "_views_from_tree_slot",
                 }:
                     methods[item.name] = item
+    from contextlib import nullcontext
+
     future = ast.parse("from __future__ import annotations").body
     ns = {
         "NpuGraphReplaySubmittedError": draft_helpers.NpuGraphReplaySubmittedError,
@@ -230,17 +241,17 @@ def _load_sr_tree_expand_methods():
         "List": list,
         "SRTreeWindow": tuple,
         "torch": __import__("torch"),
+        "nullcontext": nullcontext,
     }
     mod = ast.Module(
         body=future + helper_nodes + list(methods.values()), type_ignores=[]
     )
     ast.fix_missing_locations(mod)
     exec(compile(mod, str(src_path), "exec"), ns)
-    return SimpleNamespace(
-        expand_batch=ns["expand_batch"],
-        expand_one=ns["_expand_one"],
-        NpuGraphReplaySubmittedError=draft_helpers.NpuGraphReplaySubmittedError,
-    )
+    loaded = {name: ns[name] for name in methods}
+    loaded["NpuGraphReplaySubmittedError"] = draft_helpers.NpuGraphReplaySubmittedError
+    loaded["expand_one"] = ns["_expand_one"]
+    return SimpleNamespace(**loaded)
 
 
 class TestRemoteSpecDevice(CustomTestCase):
@@ -834,6 +845,139 @@ class TestRemoteSpecDevice(CustomTestCase):
         drafter._expand_tree = boom_one
         with self.assertRaises(NPUError):
             methods.expand_one(drafter, req)
+
+    def test_tree_result_cross_device_d2h_is_one(self):
+        device = None
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            npu = getattr(torch, "npu", None)
+            if npu is not None and npu.is_available():
+                device = torch.device("npu")
+        if device is None:
+            self.skipTest("no CUDA or NPU device")
+        loaded = _load_sr_tree_expand_methods()
+        drafter = SimpleNamespace(_pending_lease_state=None)
+        for name in (
+            "expand_batch",
+            "_pack_tree_windows",
+            "_d2h_tree_outputs",
+            "_tree_phase",
+            "_count_tree",
+            "_tree_result_slots",
+            "_acquire_tree_slot",
+            "_mark_tree_slot",
+            "_release_tree_slot",
+            "_abort_tree_pack",
+            "_views_from_tree_slot",
+        ):
+            setattr(drafter, name, MethodType(getattr(loaded, name), drafter))
+        parent = torch.tensor([[-1, 0], [-1, 1]], dtype=torch.int64, device=device)
+        index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64, device=device)
+        tokens = torch.tensor(
+            [[10, 11, 12], [20, 21, 22]], dtype=torch.int64, device=device
+        )
+        drafter._stack_seeds = lambda reqs: (None, None, None, None)
+        drafter._expand_tree = lambda reqs, *seed: (parent, index, tokens)
+        drafter._publish_tree_leases = lambda *args, **kwargs: None
+        drafter._free_lease_alloc = lambda *args, **kwargs: None
+        req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
+        copies = {"cross": 0, "device": 0}
+        orig = torch.Tensor.copy_
+
+        def counting_copy(self, src, *args, **kwargs):
+            if src.device.type != "cpu" and self.device.type == "cpu":
+                copies["cross"] += 1
+            elif src.device.type == self.device.type and src.device.type != "cpu":
+                copies["device"] += 1
+            return orig(self, src, *args, **kwargs)
+
+        with unittest.mock.patch.object(torch.Tensor, "copy_", counting_copy):
+            windows = drafter.expand_batch([req, req])
+        self.assertEqual(windows[0][0], [10, 11, 12])
+        self.assertEqual(windows[1][0], [20, 21, 22])
+        self.assertEqual(copies["cross"], 1)
+        self.assertGreaterEqual(copies["device"], 3)
+        self.assertEqual(drafter._tree_host_payload_submits, 1)
+        self.assertEqual(drafter._tree_cross_device_d2h, 1)
+        self.assertGreaterEqual(drafter._tree_device_pack_copies, 3)
+
+    def test_scheduler_reraises_unresolved_transfer(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        src_path = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
+        )
+        tree = ast.parse(src_path.read_text())
+        fn = None
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "StandaloneRemoteDraftSchedulerMixin":
+                for item in node.body:
+                    if (
+                        isinstance(item, ast.FunctionDef)
+                        and item.name == "_sr_tree_expand_batch"
+                    ):
+                        fn = item
+        self.assertIsNotNone(fn)
+        future = ast.parse("from __future__ import annotations").body
+        ns = {
+            "nullcontext": nullcontext,
+            "logger": __import__("logging").getLogger("sr_scheduler_expand"),
+            "get_sr_round_metrics": lambda *args: SimpleNamespace(
+                phase=lambda *a, **k: nullcontext()
+            ),
+            "committed_tail_not_in_kv": lambda *args: [],
+            "NpuGraphReplaySubmittedError": type("Submitted", (Exception,), {}),
+            "_sr_is_device_context_error": is_device_context_error,
+            "SRWindow": tuple,
+            "List": list,
+            "Req": object,
+        }
+        mod = ast.Module(body=future + [fn], type_ignores=[])
+        ast.fix_missing_locations(mod)
+        exec(compile(mod, str(src_path), "exec"), ns)
+        expand = ns["_sr_tree_expand_batch"]
+        mixin = SimpleNamespace()
+        mixin._sr_tree_expand_batch = MethodType(expand, mixin)
+
+        class FakeDrafter:
+            def expand_batch(self, _reqs):
+                raise SRTransferUnresolved("d2h")
+
+        mixin.sr_tree_drafter = FakeDrafter()
+        mixin._sr_materialize_prefix_batch = lambda _reqs: None
+        mixin._sr_run_tree_ingest = lambda _reqs: True
+        mixin._sr_ensure_tree_seeds = lambda _reqs: None
+        mixin._sr_is_degraded = lambda _rid: False
+        mixin._sr_replay_grammars = lambda _reqs: None
+        mixin._sr_resume_req = lambda _req: None
+        mixin._sr_park_in_running_many = lambda _reqs: None
+        mixin._sr_pause_req = lambda _req: None
+        mixin._sr_is_finished = lambda _req: False
+        mixin._sr_kv_len = lambda req: len(req.origin_input_ids) + len(
+            req.output_ids or []
+        )
+        mixin._sr_mark_degraded = lambda *_a, **_k: None
+        mixin.last_batch = object()
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            sr_tree_seed=object(),
+            rid="r0",
+            origin_input_ids=[1],
+            output_ids=[],
+            finished_reason=None,
+            kv_committed_len=1,
+        )
+        with self.assertRaises(SRTransferUnresolved):
+            mixin._sr_tree_expand_batch([req])
 
     def test_scheduler_reraises_graph_submitted(self):
         try:

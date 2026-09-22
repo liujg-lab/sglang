@@ -16,6 +16,12 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    alloc_host,
+    submit_copy,
+    wait_event,
+)
+
 logger = logging.getLogger(__name__)
 
 SR_FIXED_ACCEPT_ENV = "SGLANG_NPU_SR_FIXED_ACCEPT"
@@ -442,6 +448,57 @@ def _load_kernels():
 
 
 @dataclass
+class CommitPacketLayout:
+    """Python offsets into one int64 commit packet. The header is not uploaded."""
+
+    n: int
+    f: int
+    b: int
+    u: int
+
+    @property
+    def src(self) -> int:
+        return 0
+
+    @property
+    def tgt(self) -> int:
+        return self.n
+
+    @property
+    def page(self) -> int:
+        return 2 * self.n
+
+    @property
+    def tokens(self) -> int:
+        return 2 * self.n + self.f
+
+    @property
+    def counts(self) -> int:
+        return 3 * self.n + self.f
+
+    @property
+    def unfinished(self) -> int:
+        return 3 * self.n + self.f + self.b
+
+    @property
+    def used(self) -> int:
+        return 3 * self.n + self.f + self.b + self.u
+
+
+def commit_capacity(batch_cap: int, path_cap: int, width: int, page_size: int) -> Tuple[int, int, int]:
+    """Shared page and packet bounds.
+
+    ``F_cap`` is ``B * (ceil(W / page_size) + 1)``. It is not the older
+    left-associative ``B * (W + page - 1) // page + B`` expression.
+    """
+    pages_per_req = (int(width) + int(page_size) - 1) // int(page_size)
+    n_cap = int(batch_cap) * int(path_cap)
+    f_cap = int(batch_cap) * (pages_per_req + 1)
+    packet_cap = 3 * n_cap + f_cap + 2 * int(batch_cap)
+    return n_cap, f_cap, packet_cap
+
+
+@dataclass
 class FixedAcceptResult:
     """Stable accept result. Tensors do not alias the reusable workspace."""
 
@@ -484,15 +541,35 @@ class SRFixedAcceptState:
         self.pack_buf = torch.empty(
             (self.B_cap, self.L * 2 + 2), dtype=torch.int64, device=self.device
         )
+        self.accept_host, self.accept_pinned = alloc_host(
+            (self.B_cap, self.L * 2 + 2), torch.int64, self.device
+        )
+        self.accept_d2h_event = None
         self.control_buf = torch.empty(
             (self.B_cap, 6), dtype=torch.int64, device=self.device
         )
-        max_out = self.B_cap * self.L
-        max_free = self.B_cap * (self.W + self.page_size - 1) // self.page_size + self.B_cap
-        self.src_buf = torch.empty((max_out,), dtype=torch.int64, device=self.device)
-        self.tgt_buf = torch.empty((max_out,), dtype=torch.int64, device=self.device)
-        self.page_buf = torch.empty((max(max_free, 1),), dtype=torch.int64, device=self.device)
-        self.index_buf = torch.empty((max_out,), dtype=torch.int64, device=self.device)
+        self.N_cap, self.F_cap, self.packet_cap = commit_capacity(
+            self.B_cap, self.L, self.W, self.page_size
+        )
+        self.commit_host, self.commit_pinned = alloc_host(
+            (self.packet_cap,), torch.int64, self.device
+        )
+        # Device packet consumers stay on this allocation's stream. The H2D
+        # event only releases the host source; it does not authorize a
+        # cross-stream overwrite of commit_device.
+        self.commit_device = torch.empty(
+            (self.packet_cap,), dtype=torch.int64, device=self.device
+        )
+        self.commit_h2d_event = None
+        self.src_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
+        self.tgt_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
+        self.page_buf = torch.empty(
+            (max(self.F_cap, 1),), dtype=torch.int64, device=self.device
+        )
+        self.index_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
+        self._staging_noted = False
+        self._d2h_count = 0
+        self._h2d_count = 0
 
     def note_path(self, name: str) -> None:
         metrics = self.metrics
@@ -631,6 +708,7 @@ class SRFixedAcceptState:
     ):
         del prepare_local_draft_hidden  # fast path never gathers target hidden
         bs = int(accept_index.shape[0])
+        self._note_staging()
         try:
             if self.inject_error == "pack":
                 raise RuntimeError("fixed accept pack failed")
@@ -640,22 +718,41 @@ class SRFixedAcceptState:
                 lambda: self._pack(bs, accept_index, predict, accept_length),
                 device=True,
             )
-            if self.inject_error == "readback":
-                raise RuntimeError("fixed accept readback failed")
-            cpu_pack = _timed(
+            if bs > 0:
+                _timed(
+                    self.metrics,
+                    "fixed_accept_d2h_submit",
+                    lambda: self._submit_accept_readback(packed),
+                    device=False,
+                )
+            prefixes = _prefix_lengths(batch, bs) if bs > 0 else []
+            think_end_id = getattr(
+                getattr(batch, "model_config", None), "think_end_id", None
+            )
+            _timed(
                 self.metrics,
-                "fixed_accept_readback",
-                lambda: self._readback(packed),
+                "fixed_accept_d2h_wait",
+                self._wait_accept_readback,
                 device=False,
             )
-            rows, token_rows, pre_lengths, errors = _parse_pack(cpu_pack, bs, self.L)
-            validate_packed_rows(rows, pre_lengths, errors)
+            _timed(
+                self.metrics,
+                "fixed_accept_staging_wait",
+                self._wait_previous_h2d,
+                device=False,
+            )
+            if bs > 0:
+                rows, token_rows, pre_lengths, errors = _parse_pack(
+                    self.accept_host[:bs], bs, self.L
+                )
+                validate_packed_rows(rows, pre_lengths, errors)
+            else:
+                rows, token_rows = [], []
         except Exception:
             self.note_path("fixed_accept_error")
             raise
 
         try:
-            think_end_id = getattr(getattr(batch, "model_config", None), "think_end_id", None)
             accepted, finished, truncated = _timed(
                 self.metrics,
                 "fixed_accept_cpu",
@@ -678,6 +775,7 @@ class SRFixedAcceptState:
                     finished,
                     truncated,
                     token_rows,
+                    prefixes,
                 ),
                 device=True,
             )
@@ -697,10 +795,50 @@ class SRFixedAcceptState:
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
         return packed
 
+    def _note_staging(self) -> None:
+        if self._staging_noted:
+            return
+        self._staging_noted = True
+        metrics = self.metrics
+        if metrics is None or not hasattr(metrics, "counts"):
+            return
+        metrics.counts["fixed_accept_staging_alloc"] += 2
+        if self.accept_pinned and self.commit_pinned:
+            metrics.counts["fixed_accept_pinned"] = 1
+
+    def _count(self, name: str, value: int = 1) -> None:
+        metrics = self.metrics
+        if metrics is None or not hasattr(metrics, "counts"):
+            return
+        metrics.counts[name] += value
+
+    def _submit_accept_readback(self, packed: torch.Tensor) -> None:
+        if self.inject_error in ("readback", "d2h_submit"):
+            raise RuntimeError("fixed accept readback failed")
+        dst = self.accept_host[: int(packed.shape[0])]
+        self.accept_d2h_event = submit_copy(dst, packed)
+        self._d2h_count += 1
+        self._count("fixed_accept_d2h_count")
+        self._count("fixed_accept_d2h_bytes", int(packed.numel()) * 8)
+
+    def _wait_accept_readback(self) -> None:
+        if self.inject_error == "d2h_wait":
+            raise RuntimeError("fixed accept d2h wait failed")
+        wait_event(self.accept_d2h_event)
+        self.accept_d2h_event = None
+
+    def _wait_previous_h2d(self) -> None:
+        """Reuse wait for the previous packet. Runs before this round appends."""
+        if self.inject_error == "h2d_reuse_wait":
+            raise RuntimeError("fixed accept h2d reuse wait failed")
+        wait_event(self.commit_h2d_event)
+        self.commit_h2d_event = None
+
     def _readback(self, packed: torch.Tensor) -> torch.Tensor:
-        cpu = torch.empty(packed.shape, dtype=packed.dtype, device="cpu")
-        cpu.copy_(packed)
-        return cpu
+        """Compatibility wrapper. Prefer submit then wait around host metadata."""
+        self._submit_accept_readback(packed)
+        self._wait_accept_readback()
+        return self.accept_host[: int(packed.shape[0])]
 
     def _export_paths(self, batch, truncated) -> None:
         """Record this round's paths.
@@ -743,6 +881,7 @@ class SRFixedAcceptState:
         finished,
         truncated,
         token_rows,
+        prefixes,
     ):
         if int(page_size) != self.page_size or int(topk) <= 1:
             raise RuntimeError("fixed accept commit saw an unsupported layout")
@@ -751,16 +890,23 @@ class SRFixedAcceptState:
         bs = len(accepted)
         if any(int(count) > self.W for count in accepted):
             raise RuntimeError("fixed accept output longer than the verify width")
-        prefixes = _prefix_lengths(batch, bs)
+        if len(prefixes) != bs:
+            raise RuntimeError("fixed accept prefix snapshot does not match the batch")
         src_index: List[int] = []
         tgt_index: List[int] = []
         page_index: List[int] = []
+        verified_values: List[int] = []
         compact = 0
-        for i, (count, row, prefix) in enumerate(zip(accepted, truncated, prefixes)):
+        for i, (count, row, prefix, tokens) in enumerate(
+            zip(accepted, truncated, prefixes, token_rows)
+        ):
+            kept = 0
             for idx in row:
                 if int(idx) < 0:
                     break
                 src_index.append(int(idx))
+                verified_values.append(int(tokens[kept]))
+                kept += 1
             for j in range(int(count)):
                 tgt_index.append(i * self.W + j)
             for offset in free_page_row_offsets(prefix, count, self.W, self.page_size):
@@ -768,6 +914,8 @@ class SRFixedAcceptState:
             compact += int(count)
         if compact != len(src_index) or compact != len(tgt_index):
             raise RuntimeError("fixed accept compact length mismatch")
+        if compact != len(verified_values):
+            raise RuntimeError("fixed accept token length mismatch")
         n_free = len(page_index)
         cache = batch.out_cache_loc.reshape(-1)
         limit = int(cache.numel())
@@ -775,11 +923,43 @@ class SRFixedAcceptState:
             raise RuntimeError("fixed accept slot index outside out_cache_loc")
         if self.inject_error == "move":
             raise RuntimeError("fixed accept kv move failed")
+        unfinished = [i for i, flag in enumerate(finished) if not flag]
+        layout = CommitPacketLayout(compact, n_free, bs, len(unfinished))
+        if layout.used > self.packet_cap:
+            raise RuntimeError("fixed accept commit packet exceeds capacity")
+
+        def _fill_packet():
+            flat = (
+                src_index
+                + tgt_index
+                + page_index
+                + verified_values
+                + [int(count) for count in accepted]
+                + unfinished
+            )
+            if len(flat) != layout.used:
+                raise RuntimeError("fixed accept packet length mismatch")
+            if flat:
+                self.commit_host[: layout.used].copy_(
+                    torch.tensor(flat, dtype=torch.int64)
+                )
+
+        _timed(self.metrics, "fixed_accept_packet_cpu", _fill_packet, device=False)
+        if self.inject_error == "h2d_submit":
+            raise RuntimeError("fixed accept h2d submit failed")
+        if bs > 0:
+            _timed(
+                self.metrics,
+                "fixed_accept_h2d_submit",
+                lambda: self._submit_commit_packet(layout.used),
+                device=False,
+            )
+        packet = self.commit_device
         src, tgt, pages = self.kernels.gather_commit_slots(
             cache,
-            torch.tensor(src_index, dtype=torch.int64),
-            torch.tensor(tgt_index, dtype=torch.int64),
-            torch.tensor(page_index, dtype=torch.int64),
+            packet[layout.src : layout.tgt],
+            packet[layout.tgt : layout.page],
+            packet[layout.page : layout.tokens],
             self.page_size,
             self.src_buf,
             self.tgt_buf,
@@ -794,10 +974,13 @@ class SRFixedAcceptState:
             logits_output,
             accepted,
             finished,
-            truncated,
-            token_rows,
             tgt,
-            int(topk),
+            packet[layout.tokens : layout.counts],
+            packet[layout.counts : layout.unfinished],
+            self.commit_host[layout.counts : layout.unfinished],
+            packet[layout.unfinished : layout.used],
+            self.commit_host[layout.unfinished : layout.used],
+            packet[layout.src : layout.tgt],
         )
         kv = allocator.get_kvcache().kv_buffer
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -808,6 +991,18 @@ class SRFixedAcceptState:
             copy_paged_kv_buffer_by_slot(kv, src, tgt)
         allocator.free_unique_pages(pages)
         return result
+
+    def _submit_commit_packet(self, used: int) -> None:
+        if used <= 0:
+            self.commit_h2d_event = None
+            return
+        # Queued on the current stream, ahead of gather, publish, and KV copy.
+        self.commit_h2d_event = submit_copy(
+            self.commit_device[:used], self.commit_host[:used]
+        )
+        self._h2d_count += 1
+        self._count("fixed_accept_h2d_count")
+        self._count("fixed_accept_h2d_bytes", int(used) * 8)
 
     def _copy_control(self, bs, accepted, finished, prefixes) -> None:
         """Device control rows. The hot path does not call this."""
@@ -831,24 +1026,27 @@ class SRFixedAcceptState:
         self.control_buf[:bs].copy_(control.to(self.device))
 
     def _publish(
-        self, batch, logits_output, accepted, finished, truncated, token_rows, tgt, topk
+        self,
+        batch,
+        logits_output,
+        accepted,
+        finished,
+        tgt,
+        token_dev,
+        counts_dev,
+        counts_host,
+        unfinished_dev,
+        unfinished_host,
+        src_index_dev,
     ):
-        del topk
         mode = length_update_mode(finished)
         accept_length_list = [int(count) - 1 for count in accepted]
-        device = tgt.device
-        length_tensor = torch.tensor(
-            accept_length_list, dtype=torch.int32, device=device
-        )
+        length_tensor = (counts_dev - 1).to(dtype=torch.int32)
         if mode == "all":
-            delta = torch.tensor(
-                accepted, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
-            )
-            batch.seq_lens.add_(delta)
-            cpu_delta = torch.tensor(accepted, dtype=batch.seq_lens_cpu.dtype)
-            batch.seq_lens_cpu.add_(cpu_delta)
-        verified = _compact_tokens(token_rows, truncated, device)
-        flat_index = _compact_indices(truncated, device)
+            batch.seq_lens.add_(counts_dev.to(dtype=batch.seq_lens.dtype))
+            batch.seq_lens_cpu.add_(counts_host.to(dtype=batch.seq_lens_cpu.dtype))
+        verified = token_dev.to(dtype=torch.int32)
+        flat_index = src_index_dev.clone()
         unfinished = [i for i, flag in enumerate(finished) if not flag]
         idle = not unfinished
         if idle:
@@ -877,15 +1075,12 @@ class SRFixedAcceptState:
                     pieces.append(tgt[cursor : cursor + int(count)])
                 cursor += int(count)
             batch.out_cache_loc = torch.cat(pieces) if pieces else tgt[:0]
-            index = torch.tensor(unfinished, dtype=torch.int64, device=device)
-            draft_verified = _select_rows(verified, accepted, unfinished, device)
-            draft_length = length_tensor.index_select(0, index)
+            draft_verified = _select_rows(verified, accepted, unfinished, verified.device)
+            draft_length = length_tensor.index_select(0, unfinished_dev)
             draft_length_cpu = [accept_length_list[i] for i in unfinished]
-            draft_seq = batch.seq_lens.index_select(0, index)
-            draft_seq_cpu = batch.seq_lens_cpu.index_select(
-                0, torch.tensor(unfinished, dtype=torch.int64)
-            )
-            draft_req = batch.req_pool_indices.index_select(0, index)
+            draft_seq = batch.seq_lens.index_select(0, unfinished_dev)
+            draft_seq_cpu = batch.seq_lens_cpu.index_select(0, unfinished_host)
+            draft_req = batch.req_pool_indices.index_select(0, unfinished_dev)
             returned_cpu = list(accept_length_list)
         tree_paths = [list(path) for path in self._tree_paths]
         return FixedAcceptResult(

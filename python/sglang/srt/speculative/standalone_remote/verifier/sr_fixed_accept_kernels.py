@@ -55,11 +55,10 @@ def gather_commit_slots(
 ):
     """Gather source slots, destination slots, and page ids of known lengths.
 
-    ``src_index``, ``tgt_index``, and ``page_index`` are CPU index lists whose
-    lengths are already known. An empty page list does not read cache slots.
+    Indexes are already on ``out_cache_loc``'s device. An empty page list does
+    not read cache slots. Returned tensors do not alias the reusable buffers.
     """
     cache = out_cache_loc.reshape(-1)
-    device = cache.device
     n_out = int(src_index.numel())
     n_tgt = int(tgt_index.numel())
     n_free = int(page_index.numel())
@@ -67,19 +66,25 @@ def gather_commit_slots(
         raise RuntimeError("fixed accept source and destination lengths differ")
     if n_out > src_buf.numel() or n_free > page_buf.numel():
         raise RuntimeError("fixed accept commit buffer is smaller than the batch")
+    for name, index in (
+        ("src_index", src_index),
+        ("tgt_index", tgt_index),
+        ("page_index", page_index),
+    ):
+        if index.device != cache.device or index.dtype != torch.int64:
+            raise RuntimeError(
+                f"fixed accept {name} must be int64 on the cache device"
+            )
     if n_out:
-        src_i = src_index.to(device=device, dtype=torch.int64)
-        tgt_i = tgt_index.to(device=device, dtype=torch.int64)
-        src_buf[:n_out].copy_(cache.index_select(0, src_i).to(torch.int64))
-        tgt_buf[:n_tgt].copy_(cache.index_select(0, tgt_i).to(torch.int64))
+        src_buf[:n_out].copy_(cache.index_select(0, src_index).to(torch.int64))
+        tgt_buf[:n_tgt].copy_(cache.index_select(0, tgt_index).to(torch.int64))
         src = src_buf[:n_out]
         tgt = tgt_buf[:n_tgt]
     else:
         src = src_buf[:0]
         tgt = tgt_buf[:0]
     if n_free:
-        page_i = page_index.to(device=device, dtype=torch.int64)
-        slots = cache.index_select(0, page_i).to(torch.int64)
+        slots = cache.index_select(0, page_index).to(torch.int64)
         page_buf[:n_free].copy_(slots // int(page_size))
         pages = page_buf[:n_free]
     else:

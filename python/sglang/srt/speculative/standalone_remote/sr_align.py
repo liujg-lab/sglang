@@ -370,6 +370,8 @@ def unwrap_tp_broadcast(wrapped: Sequence[Any]) -> Any:
 def is_device_context_error(exc: BaseException) -> bool:
     """True when the accelerator context is already poisoned (do not keep running)."""
     name = type(exc).__name__
+    if name == "SRTransferUnresolved":
+        return True
     if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
         return True
     try:

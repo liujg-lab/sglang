@@ -543,6 +543,18 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             page_buf,
         )
         self.assertEqual(pages.numel(), 0)
+        self.assertEqual(src_buf.device, cache.device)
+        with self.assertRaises(RuntimeError):
+            gather_commit_slots(
+                cache,
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([0, 1, 2]),
+                torch.tensor([], dtype=torch.int64),
+                128,
+                src_buf,
+                tgt_buf,
+                page_buf,
+            )
         self.assertEqual(free_page_row_offsets(100, 3, 15, 128), [])
         self.assertTrue(all(28 not in group for group in reads))
 
@@ -606,14 +618,15 @@ class FixedAcceptFinalizeTest(CustomTestCase):
                 )
             return req, alloc
 
-        for inject in ("pack", "readback"):
+        for inject in ("pack", "readback", "d2h_submit", "d2h_wait", "h2d_reuse_wait"):
             req, alloc = once(inject)
             self.assertEqual(req.output_ids, [])
             self.assertEqual(alloc.freed, [])
-        req, alloc = once("move")
-        self.assertEqual(req.output_ids, [5])
-        self.assertEqual(alloc.freed, [])
-        self.assertEqual(req.spec_verify_ct, 1)
+        for inject in ("move", "h2d_submit"):
+            req, alloc = once(inject)
+            self.assertEqual(req.output_ids, [5])
+            self.assertEqual(alloc.freed, [])
+            self.assertEqual(req.spec_verify_ct, 1)
 
     def test_two_rounds_do_not_overwrite_returned_storage(self):
         def run(token):
@@ -672,6 +685,84 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(int(output.draft_input.accept_length[0]), 7)
         self.assertEqual(int(output.draft_input.seq_lens_for_draft_extend[0]), 7)
         self.assertEqual(int(output.draft_input.req_pool_indices_for_draft_extend[0]), 7)
+
+    def test_page_capacity_matches_new_bound(self):
+        state = SRFixedAcceptState(2, 4, 128, 128, "cpu")
+        self.assertEqual(state.F_cap, 4)
+        self.assertEqual(state.page_buf.numel(), 4)
+        self.assertEqual(state.N_cap, 8)
+        self.assertEqual(state.packet_cap, 3 * 8 + 4 + 4)
+
+    def test_rounds_keep_storage_when_batch_shrinks_and_grows(self):
+        state = SRFixedAcceptState(2, 2, 4, 4, "cpu")
+        held = []
+
+        def run(bs, token):
+            predict, accept_index, accept_length = state.bind_verify_buffers(bs)
+            accept_index.fill_(-1)
+            accept_length.zero_()
+            predict.zero_()
+            for i in range(bs):
+                accept_index[i, 0] = i * 4
+                predict[i * 4] = token + i
+            alloc = NPUPagedTokenToKVPoolAllocator(4)
+            alloc.kv_buffer = torch.zeros((2, 1, 4, 4, 1, 1))
+            batch = SimpleNamespace(
+                reqs=[_Req() for _ in range(bs)],
+                seq_lens=torch.ones(bs, dtype=torch.int64),
+                seq_lens_cpu=torch.ones(bs, dtype=torch.int64),
+                out_cache_loc=torch.arange(bs * 4),
+                req_pool_indices=torch.arange(bs),
+                device=torch.device("cpu"),
+                spec_algorithm=None,
+                model_config=SimpleNamespace(
+                    think_end_id=None, hidden_size=1, dtype=torch.float32
+                ),
+            )
+            result = state.finalize(
+                batch, None, 4, 2, alloc, accept_index, predict, accept_length
+            )
+            held.append((result, batch.out_cache_loc.clone(), [r.output_ids[:] for r in batch.reqs]))
+            return result
+
+        run(2, 10)
+        run(1, 30)
+        run(2, 50)
+        self.assertEqual(state._d2h_count, 3)
+        self.assertEqual(state._h2d_count, 3)
+        state.commit_device.fill_(-1)
+        state.commit_host.fill_(-1)
+        state.accept_host.fill_(-1)
+        self.assertEqual(held[0][0].verified_id.tolist(), [10, 11])
+        self.assertEqual(held[0][0].accepted_indices.tolist(), [0, 4])
+        self.assertEqual(held[0][1].tolist(), [0, 4])
+        self.assertEqual(held[1][0].verified_id.tolist(), [30])
+        self.assertEqual(held[2][0].verified_id.tolist(), [50, 51])
+        self.assertEqual(held[0][2], [[10], [11]])
+
+    def test_empty_batch_submits_no_transfer(self):
+        state = SRFixedAcceptState(1, 2, 4, 4, "cpu")
+        predict, accept_index, accept_length = state.bind_verify_buffers(0)
+        alloc = NPUPagedTokenToKVPoolAllocator(4)
+        batch = SimpleNamespace(
+            reqs=[],
+            seq_lens=torch.zeros(0, dtype=torch.int64),
+            seq_lens_cpu=torch.zeros(0, dtype=torch.int64),
+            out_cache_loc=torch.arange(4),
+            req_pool_indices=torch.zeros(0, dtype=torch.int64),
+            device=torch.device("cpu"),
+            spec_algorithm=None,
+            model_config=SimpleNamespace(
+                think_end_id=None, hidden_size=1, dtype=torch.float32
+            ),
+        )
+        result = state.finalize(
+            batch, None, 4, 2, alloc, accept_index, predict, accept_length
+        )
+        self.assertEqual(state._d2h_count, 0)
+        self.assertEqual(state._h2d_count, 0)
+        self.assertEqual(result.verified_id.numel(), 0)
+        self.assertTrue(result.idle)
 
     def test_publish_runs_before_kv_move(self):
         state = SRFixedAcceptState(1, 2, 4, 4, "cpu")

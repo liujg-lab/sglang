@@ -2019,16 +2019,98 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(windows[1][1], [-1, 1])
 
-        copies = {"n": 0}
+        drafter._tree_slot_trace = []
+        drafter._tree_device_pack_copies = 0
+        drafter._tree_host_payload_submits = 0
+        drafter._tree_cross_device_d2h = 0
+        copies = {"cpu": 0, "cross": 0}
         orig_copy = torch.Tensor.copy_
+        order = []
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            submit_copy,
+            wait_event,
+        )
 
-        def counting_copy(self, *args, **kwargs):
-            copies["n"] += 1
-            return orig_copy(self, *args, **kwargs)
+        def counting_copy(self, src, *args, **kwargs):
+            if src.device.type != "cpu" and self.device.type == "cpu":
+                copies["cross"] += 1
+            else:
+                copies["cpu"] += 1
+            return orig_copy(self, src, *args, **kwargs)
 
-        with patch.object(torch.Tensor, "copy_", counting_copy):
+        def traced_submit(dst, src):
+            order.append("submit")
+            return submit_copy(dst, src)
+
+        def traced_wait(event):
+            order.append("wait")
+            return wait_event(event)
+
+        with patch.object(torch.Tensor, "copy_", counting_copy), patch(
+            "sglang.srt.speculative.standalone_remote.sr_transfer_staging.submit_copy",
+            traced_submit,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.sr_transfer_staging.wait_event",
+            traced_wait,
+        ):
             drafter.expand_batch([r0, r1])
-        self.assertEqual(copies["n"], 3)
+        self.assertEqual(order, ["submit", "wait"])
+        self.assertEqual(drafter._tree_host_payload_submits, 1)
+        self.assertEqual(drafter._tree_device_pack_copies, 3)
+        self.assertEqual(drafter._tree_cross_device_d2h, 0)
+        self.assertEqual(copies["cross"], 0)
+        self.assertEqual(copies["cpu"], 4)
+        self.assertEqual(
+            drafter._tree_slot_trace, ["free", "in_flight", "consuming", "free"]
+        )
+
+    def test_unresolved_tree_transfer_keeps_lease(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+                SRTransferUnresolved,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        if torch is None:
+            self.skipTest("torch not available")
+
+        parent = torch.tensor([[-1, 0]], dtype=torch.int64)
+        index = torch.tensor([[0, 1]], dtype=torch.int64)
+        tokens = torch.tensor([[10, 11]], dtype=torch.int64)
+        req = MagicMock()
+        req.rid = "a"
+        req.req_pool_idx = 0
+        req.sr_tree_seed = (None, None, None, None)
+
+        def call(drafter, name):
+            if name == "expand_batch":
+                drafter.expand_batch([req])
+            else:
+                drafter._expand_one(req)
+
+        for name in ("expand_batch", "_expand_one"):
+            drafter = SRTreeDrafter.__new__(SRTreeDrafter)
+            drafter._stack_seeds = lambda reqs: (None, None, None, None)
+            drafter._expand_tree = lambda reqs, *seed: (parent, index, tokens)
+            freed = {"n": 0}
+            drafter._free_lease_alloc = lambda state: freed.__setitem__(
+                "n", freed["n"] + 1
+            )
+            drafter._pending_lease_state = {"page_slots": [torch.tensor([7])]}
+            with patch(
+                "sglang.srt.speculative.standalone_remote.sr_transfer_staging.submit_copy",
+                side_effect=SRTransferUnresolved("d2h"),
+            ):
+                with self.assertRaises(SRTransferUnresolved):
+                    call(drafter, name)
+            self.assertEqual(freed["n"], 0)
+            self.assertIsNotNone(drafter._pending_lease_state)
+            slot = drafter._active_tree_slot
+            self.assertEqual(slot.state, "unresolved")
+            self.assertTrue(slot.src_hold)
 
     def test_tree_drafter_exposes_eagle_draft_graph_aliases(self):
         try:

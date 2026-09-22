@@ -715,17 +715,17 @@ class SRTreeDrafter:
             for j, req in enumerate(keep):
                 windows[keep_idx[j]] = self._expand_one(req)
             return windows
-        metrics = getattr(self.scheduler, "_sr_round_metrics", None)
+        scheduler = getattr(self, "scheduler", None)
+        metrics = (
+            getattr(scheduler, "_sr_round_metrics", None) if scheduler is not None else None
+        )
         try:
             with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
                 self._pack_tree_windows(
                     parent_list, top_scores_index, draft_tokens, keep_idx, windows, keep
                 )
-        except Exception:
-            lease_state = getattr(self, "_pending_lease_state", None)
-            self._pending_lease_state = None
-            self._free_lease_alloc(lease_state)
-            raise
+        except Exception as exc:
+            self._abort_tree_pack(exc)
         return windows
 
     def _expand_one(self, req: "Req") -> SRTreeWindow:
@@ -745,17 +745,17 @@ class SRTreeDrafter:
             self._log_tree_failure("expand_one", e)
             return empty
         windows: List[SRTreeWindow] = [empty]
-        metrics = getattr(self.scheduler, "_sr_round_metrics", None)
+        scheduler = getattr(self, "scheduler", None)
+        metrics = (
+            getattr(scheduler, "_sr_round_metrics", None) if scheduler is not None else None
+        )
         try:
             with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
                 self._pack_tree_windows(
                     parent_list, top_scores_index, draft_tokens, [0], windows, [req]
                 )
-        except Exception:
-            lease_state = getattr(self, "_pending_lease_state", None)
-            self._pending_lease_state = None
-            self._free_lease_alloc(lease_state)
-            raise
+        except Exception as exc:
+            self._abort_tree_pack(exc)
         return windows[0]
 
     def _pack_tree_windows(
@@ -767,7 +767,7 @@ class SRTreeDrafter:
         windows: List[SRTreeWindow],
         reqs: Optional[List["Req"]] = None,
     ) -> None:
-        """One D2H per tree tensor, then CPU row splits into RPC lists."""
+        """Pack tree tensors on device, one D2H, then CPU row splits into RPC lists."""
         tokens_cpu, parents_cpu, indices_cpu, slots_cpu = self._d2h_tree_outputs(
             draft_tokens, parent_list, top_scores_index
         )
@@ -781,6 +781,7 @@ class SRTreeDrafter:
             windows[idx] = window
             packed.append(window)
         self._publish_tree_leases(reqs or [], packed, slots_cpu)
+        self._release_tree_slot()
 
     def _publish_tree_leases(self, reqs, windows, slots_cpu) -> None:
         lease_state = getattr(self, "_pending_lease_state", None)
@@ -840,52 +841,199 @@ class SRTreeDrafter:
                 self.token_to_kv_pool_allocator.free(lease_state["page_slots"][j])
             raise
 
+    def _tree_phase(self, name, device=False):
+        from contextlib import nullcontext
+
+        metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
+        if metrics is None or not hasattr(metrics, "phase"):
+            return nullcontext()
+        return metrics.phase(name, device=device)
+
+    def _count_tree(self, name: str, value: int = 1) -> None:
+        current = int(getattr(self, "_" + name, 0) or 0)
+        setattr(self, "_" + name, current + int(value))
+        metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
+        if metrics is not None and hasattr(metrics, "counts"):
+            metrics.counts[name] += int(value)
+
+    def _tree_result_slots(self):
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            ResultSlot,
+        )
+
+        slots = getattr(self, "_tree_slots", None)
+        if not slots:
+            self._tree_slots = [ResultSlot(), ResultSlot()]
+        return self._tree_slots
+
+    def _acquire_tree_slot(self):
+        for slot in self._tree_result_slots():
+            if slot.state == "free":
+                self._active_tree_slot = slot
+                return slot
+        raise RuntimeError("no free tree staging slot")
+
+    def _mark_tree_slot(self, slot, state: str) -> None:
+        slot.state = state
+        trace = getattr(self, "_tree_slot_trace", None)
+        if trace is None:
+            trace = []
+            self._tree_slot_trace = trace
+        trace.append(state)
+
+    def _release_tree_slot(self) -> None:
+        """Return a consumed slot to FREE. Does not run from ``finally``."""
+        slot = getattr(self, "_active_tree_slot", None)
+        if slot is None or slot.state != "consuming":
+            return
+        slot.event = None
+        slot.src_hold = None
+        slot.segments = []
+        slot.used = 0
+        self._mark_tree_slot(slot, "free")
+        self._active_tree_slot = None
+
+    def _abort_tree_pack(self, exc: BaseException) -> None:
+        """Keep the lease when completion is unknown. Confirmed work may clean up."""
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+
+        slot = getattr(self, "_active_tree_slot", None)
+        state = getattr(slot, "state", None)
+        if state == "unresolved" or is_device_context_error(exc):
+            raise exc
+        if state == "consuming":
+            self._release_tree_slot()
+        lease_state = getattr(self, "_pending_lease_state", None)
+        self._pending_lease_state = None
+        self._free_lease_alloc(lease_state)
+        raise exc
+
     def _d2h_tree_outputs(self, draft_tokens, parent_list, top_scores_index):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+            cross_device_d2h,
+            submit_copy,
+            wait_event,
+        )
+
         tensors = (draft_tokens, parent_list, top_scores_index)
-        if all(isinstance(t, torch.Tensor) for t in tensors):
-            tokens = _as_2d(draft_tokens.detach())
-            parents = _as_2d(parent_list.detach())
-            indices = _as_2d(top_scores_index.detach())
-            n = int(tokens.shape[0])
-            token_w = int(tokens.shape[1]) if tokens.dim() > 1 else 1
-            parent_w = int(parents.shape[1]) if parents.dim() > 1 else 1
-            index_w = int(indices.shape[1]) if indices.dim() > 1 else 1
-            slot_w = index_w
-            slots_dev = None
-            lease_state = getattr(self, "_pending_lease_state", None)
-            if lease_state is not None:
-                compact = getattr(self, "_lease_compact_slots", None)
-                if compact is not None and self._slot_node_ids is not None:
-                    phys = compact.reshape(
-                        n, self.topk, self.speculative_num_steps
-                    ).permute(2, 0, 1).reshape(self.speculative_num_steps, -1)
-                    slots_dev = lookup_candidate_slots(
-                        self._slot_node_ids, phys, indices, n, self.topk
-                    ).clone()
-                    slot_w = int(slots_dev.shape[1])
-            host = self._acquire_host_staging(n, token_w, parent_w, index_w, slot_w)
-            non_blocking = tokens.device.type != "cpu"
-            host["tokens"][:n, :token_w].copy_(tokens, non_blocking=non_blocking)
-            host["parents"][:n, :parent_w].copy_(parents, non_blocking=non_blocking)
-            host["indices"][:n, :index_w].copy_(indices, non_blocking=non_blocking)
-            if slots_dev is not None:
-                host["slots"][:n, :slot_w].copy_(slots_dev, non_blocking=non_blocking)
-            else:
-                host["slots"][:n].fill_(-1)
-            _wait_d2h_event(tokens.device, host)
-            host["in_use"] = False
-            slots_cpu = host["slots"][:n, :slot_w] if slots_dev is not None else None
+        if not all(isinstance(t, torch.Tensor) for t in tensors):
+            self._active_tree_slot = None
             return (
-                host["tokens"][:n, :token_w],
-                host["parents"][:n, :parent_w],
-                host["indices"][:n, :index_w],
-                slots_cpu,
+                draft_tokens.detach().to("cpu"),
+                parent_list.detach().to("cpu"),
+                top_scores_index.detach().to("cpu"),
+                None,
             )
+        tokens = _as_2d(draft_tokens.detach())
+        parents = _as_2d(parent_list.detach())
+        indices = _as_2d(top_scores_index.detach())
+        n = int(tokens.shape[0])
+        pieces = [("tokens", tokens), ("parents", parents), ("indices", indices)]
+        lease_state = getattr(self, "_pending_lease_state", None)
+        if lease_state is not None:
+            compact = getattr(self, "_lease_compact_slots", None)
+            node_ids = getattr(self, "_slot_node_ids", None)
+            if compact is not None and node_ids is not None:
+                from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+                    lookup_candidate_slots,
+                )
+
+                phys = (
+                    compact.reshape(n, self.topk, self.speculative_num_steps)
+                    .permute(2, 0, 1)
+                    .reshape(self.speculative_num_steps, -1)
+                )
+                slots_dev = lookup_candidate_slots(
+                    node_ids, phys, indices, n, self.topk
+                ).clone()
+                if int(slots_dev.numel()) > 0:
+                    pieces.append(("candidate_slots", slots_dev))
+        slot = self._acquire_tree_slot()
+        self._mark_tree_slot(slot, "free")
+        needed = 0
+        flats = []
+        for name, tensor in pieces:
+            flat = tensor.reshape(-1)
+            if flat.dtype != torch.int64:
+                flat = flat.to(dtype=torch.int64)
+            if int(flat.numel()) == 0:
+                continue
+            flats.append((name, tensor.shape, tensor, flat))
+            needed += int(flat.numel())
+        if slot.grow(needed, tokens.device):
+            self._count_tree("tree_staging_grow")
+        if slot.pinned:
+            metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
+            if metrics is not None and hasattr(metrics, "counts"):
+                metrics.counts["tree_pinned"] = 1
+        holds = []
+        segments = []
+        offset = 0
+        try:
+            with self._tree_phase("tree_pack_device", device=True):
+                for name, shape, tensor, flat in flats:
+                    length = int(flat.numel())
+                    slot.device_buf[offset : offset + length].copy_(flat)
+                    self._count_tree("tree_device_pack_copies")
+                    segments.append((name, tuple(int(v) for v in shape), offset, length))
+                    holds.append(tensor)
+                    offset += length
+        except Exception as exc:
+            if is_device_context_error(exc):
+                slot.src_hold = holds
+                slot.segments = segments
+                slot.used = offset
+                self._mark_tree_slot(slot, "unresolved")
+                raise SRTransferUnresolved("device pack copy failed") from exc
+            raise
+        slot.src_hold = holds
+        slot.segments = segments
+        slot.used = offset
+        if offset <= 0:
+            self._mark_tree_slot(slot, "consuming")
+            return tokens[:0], parents[:0], indices[:0], None
+        host = slot.host_buf[:offset]
+        device_src = slot.device_buf[:offset]
+        self._mark_tree_slot(slot, "in_flight")
+        try:
+            with self._tree_phase("tree_d2h_submit"):
+                event = submit_copy(host, device_src)
+        except Exception:
+            self._mark_tree_slot(slot, "unresolved")
+            raise
+        self._count_tree("tree_host_payload_submits")
+        self._count_tree("tree_d2h_count")
+        self._count_tree("tree_d2h_bytes", offset * 8)
+        if cross_device_d2h(device_src, host):
+            self._count_tree("tree_cross_device_d2h")
+        slot.event = event
+        try:
+            with self._tree_phase("tree_d2h_wait"):
+                wait_event(event)
+        except Exception:
+            self._mark_tree_slot(slot, "unresolved")
+            raise
+        self._mark_tree_slot(slot, "consuming")
+        with self._tree_phase("tree_unpack_cpu"):
+            return self._views_from_tree_slot(slot)
+
+    def _views_from_tree_slot(self, slot):
+        views = {}
+        host = slot.host_buf
+        for name, shape, start, length in slot.segments:
+            views[name] = host[start : start + length].reshape(shape)
+        empty = host[:0].reshape(0, 0)
         return (
-            draft_tokens.detach().to("cpu"),
-            parent_list.detach().to("cpu"),
-            top_scores_index.detach().to("cpu"),
-            None,
+            views.get("tokens", empty),
+            views.get("parents", empty),
+            views.get("indices", empty),
+            views.get("candidate_slots"),
         )
 
     def _acquire_host_staging(

@@ -676,6 +676,14 @@ class TestTreeFailureHandling(unittest.TestCase):
             "_pack_tree_windows",
             "_d2h_tree_outputs",
             "_acquire_host_staging",
+            "_tree_phase",
+            "_count_tree",
+            "_tree_result_slots",
+            "_acquire_tree_slot",
+            "_mark_tree_slot",
+            "_release_tree_slot",
+            "_abort_tree_pack",
+            "_views_from_tree_slot",
         ]
         src_path = (
             ROOT
@@ -766,20 +774,76 @@ class TestTreeFailureHandling(unittest.TestCase):
         expand_one = Mock(side_effect=AssertionError("isolate"))
         self.drafter._expand_one = expand_one
         self.drafter.scheduler = NS(_sr_round_metrics=None)
-        copies = {"n": 0}
+        self.drafter._tree_slot_trace = []
+        self.drafter._tree_device_pack_copies = 0
+        self.drafter._tree_host_payload_submits = 0
+        self.drafter._tree_cross_device_d2h = 0
+        copies = {"cpu": 0, "cross": 0}
         orig = torch.Tensor.copy_
 
-        def counting_copy(self, *args, **kwargs):
-            copies["n"] += 1
-            return orig(self, *args, **kwargs)
+        def counting_copy(self, src, *args, **kwargs):
+            if src.device.type != "cpu" and self.device.type == "cpu":
+                copies["cross"] += 1
+            else:
+                copies["cpu"] += 1
+            return orig(self, src, *args, **kwargs)
 
         with patch.object(torch.Tensor, "copy_", counting_copy):
             windows = self.drafter.expand_batch([self.req, self.req])
         self.assertEqual(windows[0][0], [10, 11, 12])
         self.assertEqual(windows[1][0], [20, 21, 22])
-        self.assertEqual(copies["n"], 3)
+        self.assertEqual(windows[0][1], [-1, 0])
+        self.assertEqual(windows[1][2], [3, 4, 5])
+        self.assertEqual(self.drafter._tree_host_payload_submits, 1)
+        self.assertEqual(self.drafter._tree_device_pack_copies, 3)
+        self.assertEqual(self.drafter._tree_cross_device_d2h, 0)
+        self.assertEqual(copies["cross"], 0)
+        self.assertEqual(
+            copies["cpu"],
+            self.drafter._tree_device_pack_copies
+            + self.drafter._tree_host_payload_submits,
+        )
+        self.assertEqual(
+            self.drafter._tree_slot_trace,
+            ["free", "in_flight", "consuming", "free"],
+        )
+        self.assertEqual(self.drafter._active_tree_slot, None)
         self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
         self.drafter._expand_one.assert_not_called()
+
+    def test_unresolved_transfer_keeps_lease_and_staging(self):
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        parent = torch.tensor([[-1, 0]], dtype=torch.int64)
+        index = torch.tensor([[0, 1]], dtype=torch.int64)
+        tokens = torch.tensor([[10, 11]], dtype=torch.int64)
+        self.drafter._expand_tree = Mock(return_value=(parent, index, tokens))
+        for name in ("expand_batch", "_expand_one"):
+            freed = {"n": 0}
+            self.drafter._free_lease_alloc = lambda state: freed.__setitem__(
+                "n", freed["n"] + 1
+            )
+            self.drafter._pending_lease_state = {"page_slots": [torch.tensor([7])]}
+            self.drafter._active_tree_slot = None
+            self.drafter._tree_slots = None
+            with patch(
+                "sglang.srt.speculative.standalone_remote.sr_transfer_staging.submit_copy",
+                side_effect=SRTransferUnresolved("d2h"),
+            ):
+                with self.assertRaises(SRTransferUnresolved):
+                    if name == "expand_batch":
+                        self.drafter.expand_batch([self.req])
+                    else:
+                        self.drafter._expand_one(self.req)
+            self.assertEqual(freed["n"], 0)
+            self.assertEqual(
+                self.drafter._pending_lease_state["page_slots"][0].tolist(), [7]
+            )
+            slot = self.drafter._active_tree_slot
+            self.assertEqual(slot.state, "unresolved")
+            self.assertTrue(slot.src_hold)
 
     def test_submitted_and_device_errors_propagate(self):
         for exc in (
@@ -970,7 +1034,7 @@ class TestTreeFailureHandling(unittest.TestCase):
                     nullcontext=nullcontext,
                     logger=self.logger,
                     EagleDraftInput=NS,
-                    CaptureHiddenMode=NS(LAST="last"),
+                    CaptureHiddenMode=NS(LAST="last", NULL="null"),
                     ForwardBatch=NS(
                         init_new=lambda *args: NS(
                             forward_mode=NS(is_idle=lambda: False)
@@ -1212,6 +1276,11 @@ class TestGraphDispatch(unittest.TestCase):
         class Output(NS):
             pass
 
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            mark_graph_host_failed,
+            record_graph_host_sample_safely,
+        )
+
         for draft in (True, False):
             file = "eagle_draft_npu_graph_runner.py" if draft else "npu_graph_runner.py"
             klass = "EAGLEDraftNpuGraphRunner" if draft else "NPUGraphRunner"
@@ -1225,6 +1294,8 @@ class TestGraphDispatch(unittest.TestCase):
                 "LogitsProcessorOutput": Output,
                 "tree_fia_actual_seq_lengths_kv": fail,
                 "run_npu_graph_update_and_replay": fail,
+                "mark_graph_host_failed": mark_graph_host_failed,
+                "record_graph_host_sample_safely": record_graph_host_sample_safely,
             }
             fn = methods(
                 NPU / "graph_runner" / file,

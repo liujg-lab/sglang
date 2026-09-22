@@ -836,7 +836,11 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `tree_paged_copy` | prefix-tail `plan/materialize` 与 `copy_kv_pool_by_slot` |
 | `tree_paged_bind` | 给各 step backend 绑定 `SRTreePagedMetadata` |
 | `tree_forward` | 树前向或图 replay 的主机调用区间，通常主要是异步提交 |
-| `tree_result_wait_pack` | 等待树结果、**批量** D2H 到 host staging、再按行转列表；不是每个请求 3 次 `.to("cpu")` |
+| `tree_result_wait_pack` | 等待树结果、设备内打包、一次连续 D2H、再按行转列表。外层时间含此前已提交的树计算，不是纯传输 |
+| `tree_pack_device` | 树结果在设备侧写入连续缓冲；与跨设备 D2H 分开计时 |
+| `tree_d2h_submit` | 提交这一次连续 D2H |
+| `tree_d2h_wait` | 等待该 D2H；仍包含此前已提交的树计算，不能当成纯传输 |
+| `tree_unpack_cpu` | D2H 完成后把行转成 RPC 列表并复制 lease 字段 |
 | `tree_expand_pack` | 整个树展开及结果打包，包含 tree_make_batch、tree_alloc_kv、tree_prepare_meta、tree_forward、tree_result_wait_pack 和 finally 清理；残差现在应当很小 |
 | `reply_prepare` | 将生成窗口组织为带请求身份的回复记录 |
 | `reply_send` | 调用 transport 发送回复，包括打包、发送和相关主机开销 |
@@ -914,7 +918,7 @@ Draft total              112.407ms
 ```
 
 树展开约占整轮 80.8%，tail 前向约 17.5%。不能把 90.827、12.259、76.305 三项相加。
-批量 D2H（三个树张量各一次 `copy_` 到 host staging）会等待之前异步提交的设备执行，所以 76.305ms 不是纯传输或 Python 打包时间。
+树结果先在设备内打包，再做一次连续 D2H。设备内打包另计（`tree_pack_device`），不能并进这次 D2H。`tree_d2h_wait` / `tree_result_wait_pack` 会等待之前异步提交的设备执行，所以 76.305ms 不是纯传输或 Python 打包时间。减少传输次数也不等于端到端变快；要同时看打包、等待和整轮耗时。
 设备 `tree_forward=89.975ms`、`device_samples.tree_forward=1` 支持设备树展开较重的判断，
 但它仅是一个样本，不能当成 32 轮均值或与其他阶段重复相加。
 
@@ -942,6 +946,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 
 `rpc_wait` 与通信的 `rpc_elapsed_ms` 有包含/重叠关系，不能相加。
 `accept_commit_including_wait=30ms` 不等于 CPU 接受算法算了 30ms；可能主要在等待设备。
+fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wait`、`fixed_accept_packet_cpu`、`fixed_accept_h2d_submit`、`fixed_accept_staging_wait`。这些是主机墙钟，包含同步等待。计数 `fixed_accept_d2h_count` / `fixed_accept_h2d_count` 和对应字节只说明提交了几次，不说明端到端变快。
 `verify_forward` 设备事件结束于前向区间，不能把 host 均值与 device 样本拼成整轮总和。
 
 | Target counter | 含义 |
