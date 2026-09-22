@@ -90,11 +90,11 @@ def select_hidden_states_for_draft(
 
 
 def _eagle_output_from_fixed(raw, batch, topk: int):
-    """Wrap a workspace-stable fixed-accept result in the V1 output types."""
-    from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
-        detach_verify_output,
-    )
+    """Wrap a workspace-stable fixed-accept result in the V1 output types.
 
+    ``finalize`` already detached these tensors before the KV move. Cloning
+    again here would queue device work behind that move.
+    """
     if raw.idle:
         draft = EagleDraftInput.create_idle_input(
             device=batch.device,
@@ -113,15 +113,13 @@ def _eagle_output_from_fixed(raw, batch, topk: int):
             seq_lens_for_draft_extend_cpu=raw.seq_lens_for_draft_cpu,
             req_pool_indices_for_draft_extend=raw.req_pool_indices,
         )
-    return detach_verify_output(
-        EagleVerifyOutput(
-            draft_input=draft,
-            logits_output=raw.logits_output,
-            verified_id=raw.verified_id,
-            accept_length_per_req_cpu=list(raw.accept_length_per_req_cpu),
-            accepted_indices=raw.accepted_indices,
-            accepted_tree_candidate_indices=raw.tree_paths,
-        )
+    return EagleVerifyOutput(
+        draft_input=draft,
+        logits_output=raw.logits_output,
+        verified_id=raw.verified_id,
+        accept_length_per_req_cpu=list(raw.accept_length_per_req_cpu),
+        accepted_indices=raw.accepted_indices,
+        accepted_tree_candidate_indices=raw.tree_paths,
     )
 
 
@@ -354,6 +352,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
                 accept_control_decision,
                 detach_verify_output,
+                multimodal_accept_reject_reason,
             )
 
             fixed_detach = detach_verify_output
@@ -376,9 +375,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 has_custom_logit_processor=bool(
                     sampling_info.has_custom_logit_processor
                 ),
-                has_multimodal=any(
-                    getattr(req, "multimodal_inputs", None) is not None
-                    for req in batch.reqs
+                multimodal_reject_reason=multimodal_accept_reject_reason(
+                    batch, bs=bs
                 ),
                 simulate_acc_len=float(SIMULATE_ACC_LEN),
                 sampling_rows=len(sampling_info),

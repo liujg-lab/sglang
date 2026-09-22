@@ -115,6 +115,83 @@ def length_update_mode(finished: Sequence[bool]) -> str:
     return "all"
 
 
+_QWEN3_VL_ARCHS = frozenset(
+    {
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    }
+)
+_INTEGER_DTYPES = (
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint8,
+)
+
+
+def _integer_delta_layout(delta) -> bool:
+    """Metadata only: shape ``[1, 1]`` and an integer dtype. No value read."""
+    if not torch.is_tensor(delta) or delta.dtype not in _INTEGER_DTYPES:
+        return False
+    shape = delta.shape
+    return len(shape) == 2 and int(shape[0]) == 1 and int(shape[1]) == 1
+
+
+def multimodal_accept_reject_reason(batch, *, bs: int) -> Optional[str]:
+    """只读取元数据及已有 CPU 长度；不修改请求，不回读设备张量。"""
+    reqs = getattr(batch, "reqs", None)
+    if reqs is None:
+        reqs = []
+    if all(getattr(req, "multimodal_inputs", None) is None for req in reqs):
+        return None
+
+    hf_config = getattr(getattr(batch, "model_config", None), "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None)
+    if (
+        not architectures
+        or architectures[0] not in _QWEN3_VL_ARCHS
+    ):
+        return "multimodal_model"
+
+    forward_mode = getattr(batch, "forward_mode", None)
+    is_target_verify = getattr(forward_mode, "is_target_verify", None)
+    if not callable(is_target_verify) or not is_target_verify():
+        return "multimodal_phase"
+
+    rows = getattr(batch, "multimodal_inputs", None)
+    if (
+        rows is None
+        or len(reqs) != int(bs)
+        or len(rows) != int(bs)
+    ):
+        return "multimodal_rows"
+    for req, row in zip(reqs, rows):
+        if getattr(req, "multimodal_inputs", None) is not row:
+            return "multimodal_rows"
+
+    seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+    if (
+        not torch.is_tensor(seq_lens_cpu)
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.dim() != 1
+        or int(seq_lens_cpu.shape[0]) != int(bs)
+        or seq_lens_cpu.dtype not in _INTEGER_DTYPES
+    ):
+        return "multimodal_prefix"
+
+    for index, req in enumerate(reqs):
+        mm_input = rows[index]
+        if mm_input is None:
+            continue
+        origin = getattr(req, "origin_input_ids", None)
+        if origin is None or int(seq_lens_cpu[index]) < len(origin):
+            return "multimodal_prefill"
+        if not _integer_delta_layout(getattr(mm_input, "mrope_position_delta", None)):
+            return "multimodal_mrope"
+    return None
+
+
 def conservative_mode_reason(verify_mode: Optional[str], is_all_greedy: bool) -> Optional[str]:
     mode = verify_mode or "auto"
     if mode == "greedy":
@@ -437,7 +514,7 @@ class SRFixedAcceptState:
         return_logprob: bool,
         prepare_hidden: bool,
         has_custom_logit_processor: bool,
-        has_multimodal: bool,
+        multimodal_reject_reason: Optional[str],
         simulate_acc_len: float,
         sampling_rows: int,
         seq_lens_cpu,
@@ -458,8 +535,8 @@ class SRFixedAcceptState:
             return "hidden"
         if has_custom_logit_processor:
             return "logit_processor"
-        if has_multimodal:
-            return "multimodal"
+        if multimodal_reject_reason is not None:
+            return multimodal_reject_reason
         if float(simulate_acc_len) > 0.0:
             return "simulate"
         if int(sampling_rows) != int(bs):
@@ -608,6 +685,11 @@ class SRFixedAcceptState:
             self.note_path("fixed_accept_error")
             raise
         self.note_path("fixed_accept_hit")
+        if any(
+            getattr(req, "multimodal_inputs", None) is not None
+            for req in (getattr(batch, "reqs", None) or ())
+        ):
+            self.note_path("fixed_accept_multimodal_hit")
         return output
 
     def _pack(self, bs, accept_index, predict, accept_length):
@@ -705,16 +787,9 @@ class SRFixedAcceptState:
         )
         if int(pages.numel()) != n_free:
             raise RuntimeError("fixed accept page count mismatch")
-        self._copy_control(bs, accepted, finished, prefixes)
-        kv = allocator.get_kvcache().kv_buffer
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_paged_kv_buffer_by_slot,
-        )
-
-        if src.numel() > 0:
-            copy_paged_kv_buffer_by_slot(kv, src, tgt)
-        allocator.free_unique_pages(pages)
-        return self._publish(
+        # Assemble host-visible results while the stream is idle after readback.
+        # The KV move is last so a later host sync does not wait for it.
+        result = self._publish(
             batch,
             logits_output,
             accepted,
@@ -724,8 +799,18 @@ class SRFixedAcceptState:
             tgt,
             int(topk),
         )
+        kv = allocator.get_kvcache().kv_buffer
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            copy_paged_kv_buffer_by_slot,
+        )
+
+        if src.numel() > 0:
+            copy_paged_kv_buffer_by_slot(kv, src, tgt)
+        allocator.free_unique_pages(pages)
+        return result
 
     def _copy_control(self, bs, accepted, finished, prefixes) -> None:
+        """Device control rows. The hot path does not call this."""
         rows = []
         compact = 0
         for i, count in enumerate(accepted):
@@ -767,17 +852,17 @@ class SRFixedAcceptState:
         unfinished = [i for i, flag in enumerate(finished) if not flag]
         idle = not unfinished
         if idle:
-            draft_verified = verified[:0].clone()
-            draft_length = length_tensor[:0].clone()
+            draft_verified = verified[:0]
+            draft_length = length_tensor[:0]
             draft_length_cpu: List[int] = []
             draft_seq = None
             draft_seq_cpu = None
             draft_req = None
             returned_cpu = list(accept_length_list)
         elif len(unfinished) == len(finished):
-            batch.out_cache_loc = tgt.clone()
-            draft_verified = verified.clone()
-            draft_length = length_tensor.clone()
+            batch.out_cache_loc = tgt
+            draft_verified = verified
+            draft_length = length_tensor
             draft_length_cpu = list(accept_length_list)
             draft_seq = batch.seq_lens.clone()
             draft_seq_cpu = batch.seq_lens_cpu.clone()
@@ -786,25 +871,26 @@ class SRFixedAcceptState:
         else:
             pieces = []
             cursor = 0
+            unfinished_set = set(unfinished)
             for i, count in enumerate(accepted):
-                if i in unfinished:
+                if i in unfinished_set:
                     pieces.append(tgt[cursor : cursor + int(count)])
                 cursor += int(count)
-            batch.out_cache_loc = torch.cat(pieces) if pieces else tgt[:0].clone()
+            batch.out_cache_loc = torch.cat(pieces) if pieces else tgt[:0]
             index = torch.tensor(unfinished, dtype=torch.int64, device=device)
             draft_verified = _select_rows(verified, accepted, unfinished, device)
-            draft_length = length_tensor.index_select(0, index).clone()
+            draft_length = length_tensor.index_select(0, index)
             draft_length_cpu = [accept_length_list[i] for i in unfinished]
-            draft_seq = batch.seq_lens.index_select(0, index).clone()
+            draft_seq = batch.seq_lens.index_select(0, index)
             draft_seq_cpu = batch.seq_lens_cpu.index_select(
                 0, torch.tensor(unfinished, dtype=torch.int64)
-            ).clone()
-            draft_req = batch.req_pool_indices.index_select(0, index).clone()
+            )
+            draft_req = batch.req_pool_indices.index_select(0, index)
             returned_cpu = list(accept_length_list)
         tree_paths = [list(path) for path in self._tree_paths]
         return FixedAcceptResult(
-            verified_id=verified.clone(),
-            accepted_indices=flat_index.clone(),
+            verified_id=verified,
+            accepted_indices=flat_index,
             accept_length_per_req_cpu=returned_cpu,
             draft_verified_id=draft_verified,
             draft_accept_length=draft_length,
@@ -875,7 +961,7 @@ def _select_rows(verified, accepted, unfinished, device) -> torch.Tensor:
         cursor += int(count)
     if not pieces:
         return torch.empty((0,), dtype=verified.dtype, device=device)
-    return torch.cat(pieces).clone()
+    return torch.cat(pieces)
 
 
 def build_fixed_accept_state(worker, env=None):
