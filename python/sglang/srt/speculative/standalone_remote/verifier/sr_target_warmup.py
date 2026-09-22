@@ -307,6 +307,19 @@ def warm_sr_target_kernels(worker) -> dict:
             "[SR] target greedy verify warmup skipped: %s=0", SR_TREE_WARMUP_ENV
         )
         return coverage
+    fixed_state = getattr(worker, "_fixed_accept_state", None)
+    if fixed_state is not None:
+        try:
+            fixed_state.warmup_scratch()
+            coverage["fixed_accept"] = {"scratch": True}
+        except SRWarmupFatalError:
+            raise
+        except Exception as exc:
+            raise SRWarmupFatalError(
+                f"fixed accept scratch warmup failed: {exc}"
+            ) from exc
+    else:
+        coverage["fixed_accept"] = {"skipped": "state not constructed"}
     if is_npu():
         try:
             coverage["greedy"] = warm_target_greedy_verify(worker)

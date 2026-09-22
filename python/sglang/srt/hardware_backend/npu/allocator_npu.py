@@ -149,3 +149,14 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    def free_unique_pages(self, page_ids: torch.Tensor):
+        """Prepend already-unique page ids. Does not read them back or dedup.
+
+        ``free`` is unchanged. Calling this inside a free group is rejected.
+        """
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            apply_free_unique_pages,
+        )
+
+        apply_free_unique_pages(self, page_ids)

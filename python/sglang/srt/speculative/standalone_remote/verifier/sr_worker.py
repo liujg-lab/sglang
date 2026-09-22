@@ -162,10 +162,14 @@ class StandaloneRemoteWorker:
                 or getattr(runner, "hybrid_lightning_config", None) is not None
             )
         )
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            build_fixed_accept_state,
+        )
         from sglang.srt.speculative.standalone_remote.verifier.sr_target_warmup import (
             warm_sr_target_kernels,
         )
 
+        self._fixed_accept_state = build_fixed_accept_state(self)
         warm_sr_target_kernels(self)
 
     @property
@@ -412,14 +416,22 @@ class StandaloneRemoteWorker:
             )
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
-            batch,
-            logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask,
-            prepare_local_draft_hidden=prepare_hidden,
-        )
+        fixed_state = self._fixed_accept_state
+        if fixed_state is not None:
+            fixed_state.metrics = metrics
+        try:
+            res: EagleVerifyOutput = spec_info.verify(
+                batch,
+                logits_output,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+                vocab_mask,
+                prepare_local_draft_hidden=prepare_hidden,
+                sr_accept_state=fixed_state,
+            )
+        finally:
+            if fixed_state is not None:
+                fixed_state.metrics = None
         if not batch.forward_mode.is_idle():
             _sync_kv_from_cpu_lengths(
                 batch, seq_lens_cpu_pre, res.accept_length_per_req_cpu

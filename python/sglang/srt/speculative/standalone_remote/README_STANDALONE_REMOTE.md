@@ -290,6 +290,20 @@ join 只证明 `update()` 返回，不证明设备图已执行结束。线程启
 submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共用实现，但
 必须分别验收。
 
+`SGLANG_NPU_SR_FIXED_ACCEPT` 默认开启 SR Target 的固定容量接受后处理。
+未设置或 `1/true/yes/on` 请求启用；`0/false/no/off` 使用原来的 V1 接受后处理。
+只在 Target 初始化时读取一次，改值后需重启 Target，不是运行时热切换，也没有
+执行中自动回退。首版只覆盖 NPU、普通 MHA 六维分页 KV、`topk>1`、greedy、
+`page_size>1`。采样、RPD、grammar、logprob、hidden 返回、混合状态、多模态、
+自定义 logit processor、CUDA、单链、非分页、模拟接受长度，以及宽度或
+allocator 不匹配的批次在写工作区之前走 V1。penalty 与 logit bias 仍在验证前
+处理。进入快路径后出错直接上抛，不重跑验证。实际输出和 KV 边界增量是含
+bonus 的 `A`；返回的 `accept_length_per_req_cpu` 仍是 `A-1`。本机尚未做
+实机对照：`=0`、未设置、显式 `1` 应各自预热后交替至少 3 次、每次至少 500
+个稳态轮次，先 TP=1 再实际 TP。正确性看输出、接受路径、已提交 KV 和 Draft
+下一轮 seed。性能要分开看接受后处理、Target 本地、整轮和端到端，不要把
+原来等待前向的时间算成收益。
+
 `SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP` 与 `SGLANG_NPU_SR_TAIL_UPDATE_OVERLAP`
 默认开启，解析方式与 Draft 树开关相同（未设置或 `1/true/yes/on` 请求启用，
 `0/false/no/off` 回退串行）。只在对应进程的 runner

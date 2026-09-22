@@ -89,6 +89,42 @@ def select_hidden_states_for_draft(
     return hidden_states[index]
 
 
+def _eagle_output_from_fixed(raw, batch, topk: int):
+    """Wrap a workspace-stable fixed-accept result in the V1 output types."""
+    from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+        detach_verify_output,
+    )
+
+    if raw.idle:
+        draft = EagleDraftInput.create_idle_input(
+            device=batch.device,
+            hidden_size=batch.model_config.hidden_size,
+            dtype=batch.model_config.dtype,
+            topk=int(topk),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+    else:
+        draft = EagleDraftInput(
+            hidden_states=None,
+            verified_id=raw.draft_verified_id,
+            accept_length=raw.draft_accept_length,
+            accept_length_cpu=list(raw.draft_accept_length_cpu),
+            seq_lens_for_draft_extend=raw.seq_lens_for_draft,
+            seq_lens_for_draft_extend_cpu=raw.seq_lens_for_draft_cpu,
+            req_pool_indices_for_draft_extend=raw.req_pool_indices,
+        )
+    return detach_verify_output(
+        EagleVerifyOutput(
+            draft_input=draft,
+            logits_output=raw.logits_output,
+            verified_id=raw.verified_id,
+            accept_length_per_req_cpu=list(raw.accept_length_per_req_cpu),
+            accepted_indices=raw.accepted_indices,
+            accepted_tree_candidate_indices=raw.tree_paths,
+        )
+    )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -271,6 +307,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
         prepare_local_draft_hidden: bool = True,
+        sr_accept_state=None,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -310,14 +347,66 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
+        fixed_bound = False
+        fixed_detach = None
+        fixed_decision = None
+        if sr_accept_state is not None:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+                accept_control_decision,
+                detach_verify_output,
+            )
 
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
-        )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device=batch.device)
+            fixed_detach = detach_verify_output
+            fixed_decision = accept_control_decision
+            try:
+                early_args = get_global_server_args()
+            except ValueError:
+                early_args = None
+            early_mode = (
+                getattr(early_args, "speculative_verify_mode", "auto") or "auto"
+            )
+            reject_reason = sr_accept_state.reject_before_alloc(
+                bs=bs,
+                verify_mode=early_mode,
+                is_all_greedy=bool(sampling_info.is_all_greedy),
+                has_grammar=bool(getattr(batch, "has_grammar", False)),
+                vocab_mask=vocab_mask,
+                return_logprob=bool(getattr(batch, "return_logprob", False)),
+                prepare_hidden=bool(prepare_local_draft_hidden),
+                has_custom_logit_processor=bool(
+                    sampling_info.has_custom_logit_processor
+                ),
+                has_multimodal=any(
+                    getattr(req, "multimodal_inputs", None) is not None
+                    for req in batch.reqs
+                ),
+                simulate_acc_len=float(SIMULATE_ACC_LEN),
+                sampling_rows=len(sampling_info),
+                seq_lens_cpu=getattr(batch, "seq_lens_cpu", None),
+                allocator=token_to_kv_pool_allocator,
+                draft_token_num=int(self.draft_token_num),
+                spec_steps=int(self.spec_steps),
+                logits=logits_output.next_token_logits,
+                out_cache_loc=batch.out_cache_loc,
+            )
+            if reject_reason is None:
+                try:
+                    predict, accept_index, accept_length = (
+                        sr_accept_state.bind_verify_buffers(bs)
+                    )
+                    fixed_bound = True
+                except RuntimeError:
+                    sr_accept_state.note_path("fixed_accept_noncontiguous")
+            else:
+                sr_accept_state.note_path("fixed_accept_" + reject_reason)
+        if not fixed_bound:
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+            predict_shape[-1] += 1
+            predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
+            accept_index = torch.full(
+                (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
+            )
+            accept_length = torch.empty((bs,), dtype=torch.int32, device=batch.device)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -496,6 +585,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+
+        if fixed_bound:
+            decision = fixed_decision(
+                True, resolved_verify, SIMULATE_ACC_LEN > 0.0
+            )
+            if decision == "finalizer":
+                raw = sr_accept_state.finalize(
+                    batch,
+                    logits_output,
+                    page_size,
+                    self.topk,
+                    token_to_kv_pool_allocator,
+                    accept_index,
+                    predict,
+                    accept_length,
+                    prepare_local_draft_hidden=prepare_local_draft_hidden,
+                )
+                return _eagle_output_from_fixed(raw, batch, self.topk)
 
         unfinished_index = []
         unfinished_accept_index = []
@@ -685,7 +792,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
             )
 
-            return EagleVerifyOutput(
+            result = EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
                 verified_id=verified_id,
@@ -693,6 +800,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accepted_indices=accept_index,
                 accepted_tree_candidate_indices=accepted_tree_candidate_indices,
             )
+            if fixed_bound:
+                result = fixed_detach(result)
+            return result
         else:
             if page_size == 1 or self.topk == 1:
                 assign_req_to_token_pool_func(
@@ -761,7 +871,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
-            return EagleVerifyOutput(
+            result = EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
                 verified_id=verified_id,
@@ -769,6 +879,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accepted_indices=accept_index,
                 accepted_tree_candidate_indices=accepted_tree_candidate_indices,
             )
+            if fixed_bound:
+                result = fixed_detach(result)
+            return result
 
 
 @dataclass
