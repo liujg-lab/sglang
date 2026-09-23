@@ -4,6 +4,11 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from sglang.srt.speculative.standalone_remote.sr_commit import (
+    LocalPrefixStamp,
+    PendingCommit,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -39,6 +44,8 @@ class SRDraftState:
     last_commit_fingerprint: Optional[Tuple] = None
     last_reply: Optional[dict] = None
     last_num_draft_tokens: int = 0
+    local_prefix_stamp: Optional[LocalPrefixStamp] = None
+    pending_commit: Optional[PendingCommit] = None
 
 
 class SRDraftStateManager:

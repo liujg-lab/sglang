@@ -123,7 +123,7 @@ sequenceDiagram
     Draft->>Draft: 释放该请求状态与 KV
 ```
 
-协议版本 2 的正常 STEP 只发送已确认版本、新增 token 和可选候选路径。版本或基长度对不上时，Target 只为失败请求补发一次完整 snapshot。Draft 仍把完整输出历史重建出来再走现有对齐，所以全历史 CPU 遍历还在。KV 状态不可信时不能停在 token 相同的对齐分支，可恢复的故障走 re-prefill。
+协议版本 2 的正常 STEP 只发送已确认版本、新增 token 和可选候选路径。版本或基长度对不上时，Target 只为失败请求补发一次完整 snapshot。本地前缀 stamp 仍有效时，Draft 只追加本轮 delta，提交准备、确认和 lease 前置检查不扫描整段历史。stamp 无效、chain 上还有未接受草稿，或协议需要恢复时，仍重建完整历史并走现有对齐。KV 状态不可信时不能停在 token 相同的对齐分支，可恢复的故障走 re-prefill。
 
 稳态通常是“验证已有窗口 → 提交 → 请求下一窗”。刚开始或草稿失效时，
 同一调度轮还可能在验证前额外请求一次。因此 `rounds` 与通信 `calls` 不必一一对应。
@@ -453,7 +453,7 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | batch `protocol_version` | 缺失表示旧协议。当前增量提交是 2。旧回复或显式 `protocol_mismatch` 会停止该 session 的投机；旧 session/rpc 仍先按 stale 丢弃 |
 | request `commit_mode` | `snapshot` 带完整输出历史；`delta` 只带自上次 ACK 以来的新增 token。FINISH/ABORT 不带提交内容 |
 | request `committed_ids` | 仅 snapshot：不含 prompt 的完整 `output_ids`。delta 不带这个字段 |
-| request `delta_ids` | 仅 delta：从 `base_output_len` 起新增的已提交输出，允许空列表。正常包不随历史变长；Draft 仍在本地重建完整历史后再对齐 |
+| request `delta_ids` | 仅 delta：从 `base_output_len` 起新增的已提交输出，允许空列表。正常包不随历史变长。stamp 有效时 Draft 原地追加；否则再重建完整历史并对齐 |
 | request `commit_version` / `base_commit_version` | 提交版本。同版本重发先比原始内容；更旧版本拒绝；只有新 delta 才检查基版本。snapshot 改查总长度 |
 | request `num_draft_tokens` | 本次窗口预算；FINISH 使用 0，FINISH/ABORT 均按控制动作处理 |
 | request `padded_input_ids` | 完整上下文发送时携带的 prompt；VL 时已 pad |

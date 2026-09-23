@@ -40,7 +40,8 @@ class SRAlignResult:
     kind: str
     old_kv_committed_len: int
     old_prefix_revision: int
-    old_committed_tokens: Tuple[int, ...]
+    old_local_len: int
+    old_prefix_window: Tuple[int, ...]
     fork: int
 
 
@@ -180,8 +181,12 @@ def lease_budget_ok(
 
 
 def snapshot_sr_align(req, dreq, prefix_len: int) -> SRAlignResult:
-    padded = list(getattr(req, "sr_padded_ids", None) or req.origin_input_ids)
-    local = list(req.origin_input_ids or []) + list(req.output_ids or [])
+    origin = req.origin_input_ids or []
+    output = req.output_ids or []
+    kv_len = int(getattr(req, "kv_committed_len", 0) or 0)
+    window = prefix_window_tokens(origin, output, base=kv_len)
+    padded = list(getattr(req, "sr_padded_ids", None) or origin)
+    local = list(origin) + list(output)
     target = list(padded) + list(dreq.committed_ids or [])
     _, fork = find_fork_point(local, target)
     kind = "equal" if local == target else classify_prefix_alignment(
@@ -189,11 +194,30 @@ def snapshot_sr_align(req, dreq, prefix_len: int) -> SRAlignResult:
     )
     return SRAlignResult(
         kind=kind,
-        old_kv_committed_len=int(getattr(req, "kv_committed_len", 0) or 0),
+        old_kv_committed_len=kv_len,
         old_prefix_revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
-        old_committed_tokens=tuple(local),
+        old_local_len=len(local),
+        old_prefix_window=window,
         fork=int(fork),
     )
+
+
+def read_token_span(origin, output, start: int, count: int) -> List[int]:
+    """Read ``count`` logical tokens starting at ``start``. Do not concat the lists."""
+    origin = origin or ()
+    output = output or ()
+    n_origin = len(origin)
+    out: List[int] = []
+    begin = int(start)
+    for i in range(begin, begin + int(count)):
+        if i < n_origin:
+            out.append(int(origin[i]))
+            continue
+        j = i - n_origin
+        if j < 0 or j >= len(output):
+            break
+        out.append(int(output[j]))
+    return out
 
 
 def first_forward_node_ids(topk: int, batch_size: int, device=None) -> torch.Tensor:
@@ -328,9 +352,7 @@ def validate_lease_commit(
         return MISS_BASE
     if int(align.old_prefix_revision) != int(lease.revision):
         return MISS_REVISION
-    actual = prefix_window_from_committed(
-        align.old_committed_tokens, lease.base_committed_len
-    )
+    actual = tuple(align.old_prefix_window)
     stored = tuple(int(x) for x in lease.prefix_tokens)
     stored_window = stored[max(0, len(stored) - LEASE_PREFIX_WINDOW) :]
     if stored_window != actual:

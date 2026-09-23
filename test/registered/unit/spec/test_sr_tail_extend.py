@@ -2339,6 +2339,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
     def _bind(self, scheduler, *, plan_tail_extend=None, execute=None):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             live_accept_prefix,
+            read_token_span,
             validate_lease_commit,
         )
         from sglang.srt.speculative.standalone_remote.sr_align import (
@@ -2380,6 +2381,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
                 draft_needed_max_new_tokens=draft_needed_max_new_tokens,
                 validate_lease_commit=validate_lease_commit,
                 live_accept_prefix=live_accept_prefix,
+                read_token_span=read_token_span,
             ),
             class_name="StandaloneRemoteDraftSchedulerMixin",
         )

@@ -21,9 +21,12 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRWindow,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    SRAlignResult,
     SRTreeKVLease,
     SRTreeLeaseStore,
     live_accept_prefix,
+    prefix_window_tokens,
+    read_token_span,
     snapshot_sr_align,
     validate_lease_commit,
 )
@@ -67,12 +70,19 @@ from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
     CommitOutcome,
+    CommittedPrefixView,
+    PendingCommit,
     RecoveryRoute,
+    candidate_stamp_current,
     commit_fingerprint,
+    delta_fast_allowed,
     grammar_committed_ids,
     inspect_commit,
+    make_prefix_stamp,
     mm_items_complete,
     note_commit_result,
+    rebuild_committed_output,
+    retarget_stamp_version,
     route_snapshot_recovery,
 )
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
@@ -599,6 +609,8 @@ class StandaloneRemoteDraftSchedulerMixin:
         """
         state = self.sr_state.get(rid)
         if state is not None:
+            state.local_prefix_stamp = None
+            state.pending_commit = None
             if state.degraded:
                 return
             state.degraded = True
@@ -805,17 +817,39 @@ class StandaloneRemoteDraftSchedulerMixin:
                 logger.warning("[SR] grammar replay failed for %s: %s", req.rid, e)
                 req.grammar = None
 
+    def _sr_clear_stamps_after_poison(self) -> None:
+        manager = getattr(self, "sr_state", None)
+        active = getattr(manager, "active", None)
+        if not isinstance(active, dict):
+            return
+        for state in active.values():
+            state.local_prefix_stamp = None
+            state.pending_commit = None
+
+    def _sr_clear_prefix_stamp(self, state: Optional[SRDraftState]) -> None:
+        if state is not None:
+            state.local_prefix_stamp = None
+
+    def _sr_drop_unconfirmed_commit(self, state: Optional[SRDraftState]) -> None:
+        """Forget a commit that never reached finalize. Do not extend history."""
+        if state is None or state.pending_commit is None:
+            return
+        state.pending_commit = None
+        state.local_prefix_stamp = None
+
     def _sr_align(
         self, req: Req, dreq: SRDraftRequest, state: SRDraftState
     ) -> None:
         prefix_len = self.sr_kv.get_prefix_len(req)
         result = snapshot_sr_align(req, dreq, prefix_len)
         req.sr_align_result = result
+        req.sr_prefix_proven = False
         req.sr_pending_dreq = dreq
         padded = list(getattr(req, "sr_padded_ids", None) or req.origin_input_ids)
         local = list(req.origin_input_ids) + list(req.output_ids or [])
         target = list(padded) + list(dreq.committed_ids or [])
         if result.kind == "equal":
+            req.sr_prefix_proven = True
             req.draft_generation_start_len = len(req.output_ids or [])
             req.draft_tokens_target = dreq.num_draft_tokens
             return
@@ -830,6 +864,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         fork = result.fork
 
         if kind == "replace_tail":
+            self._sr_clear_prefix_stamp(state)
             req.output_ids[-1] = target[-1]
             req.sr_tree_seed = None
             req.draft_generation_start_len = len(req.output_ids)
@@ -840,6 +875,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             return
         if kind in ("append_one", "append_n"):
             req.output_ids.extend(target[len(local) :])
+            req.sr_prefix_proven = True
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
@@ -850,10 +886,12 @@ class StandaloneRemoteDraftSchedulerMixin:
             if extra > 0 and req.output_ids:
                 keep = max(0, len(req.output_ids) - extra)
                 req.output_ids = req.output_ids[:keep]
+            self._sr_clear_prefix_stamp(state)
             req.sr_tree_seed = None
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
+        self._sr_clear_prefix_stamp(state)
         self._sr_reprefill(req, target, dreq, state)
 
     def _sr_run_window_batch(
@@ -943,6 +981,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         except Exception as e:
             if _sr_is_device_context_error(e):
                 self._sr_device_poisoned = True
+                self._sr_clear_stamps_after_poison()
                 logger.error(
                     "[SR] cache tree seed device context error for %s: %s",
                     [r.rid for r in reqs],
@@ -977,6 +1016,7 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_reset_linear_kv_state(self, req: Req, fill_ids: List[int]) -> None:
         """Drop linear KV bookkeeping and rebuild fill/origin for a full re-prefill."""
         invalidate_tree_seed(req)
+        self._sr_clear_prefix_stamp(self.sr_state.get(req.rid))
         self._sr_remove_req(req)
         if req.req_pool_idx is not None:
             kv = getattr(self, "sr_kv", None)
@@ -1168,10 +1208,11 @@ class StandaloneRemoteDraftSchedulerMixin:
         if align is None or align.kind not in ("append_one", "append_n"):
             return _SRTreePlanDraft(req, "ordinary", lease=lease, miss="fields")
         dreq = getattr(req, "sr_pending_dreq", None)
-        tokens = list(req.origin_input_ids or []) + list(req.output_ids or [])
         indices = list(getattr(dreq, "commit_candidate_indices", None) or [])
-        old_len = len(align.old_committed_tokens)
-        path_tokens = tokens[old_len : old_len + len(indices)]
+        old_len = int(align.old_local_len)
+        path_tokens = read_token_span(
+            req.origin_input_ids, req.output_ids, old_len, len(indices)
+        )
         miss = validate_lease_commit(
             lease,
             commit_tree_version=getattr(dreq, "commit_tree_version", None),
@@ -1489,6 +1530,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             copy_submitted = bool(getattr(transaction, "copy_submitted", False))
             if _sr_is_device_context_error(e):
                 self._sr_device_poisoned = True
+                self._sr_clear_stamps_after_poison()
             if (
                 getattr(self, "_sr_device_poisoned", False)
                 or isinstance(e, NpuGraphReplaySubmittedError)
@@ -1706,6 +1748,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         except Exception as e:
             if _sr_is_device_context_error(e):
                 self._sr_device_poisoned = True
+                self._sr_clear_stamps_after_poison()
                 logger.error(
                     "[SR] tree expand device context error for %s: %s",
                     [r.rid for r in ready],
@@ -1924,14 +1967,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         self,
         state: SRDraftState,
         dreq: SRDraftRequest,
-        output_ids: List[int],
         reply: SRDraftReply,
+        fingerprint: Tuple,
     ) -> None:
-        state.acked_output_ids = list(output_ids)
         state.acked_version = int(dreq.commit_version)
         state.commit_trusted = True
         state.completion_unknown = False
-        state.last_commit_fingerprint = commit_fingerprint(dreq)
+        state.last_commit_fingerprint = fingerprint
         state.last_num_draft_tokens = int(dreq.num_draft_tokens or 0)
         state.last_step_id = dreq.step_id
         state.last_base_committed_len = dreq.base_committed_len
@@ -1963,6 +2005,130 @@ class StandaloneRemoteDraftSchedulerMixin:
             items = list(getattr(mm, "mm_items", None) or [])
         return mm_items_complete(items)
 
+    def _sr_reuse_zero_delta(self, dreq, req, state, verdict) -> bool:
+        if verdict.outcome != CommitOutcome.APPLY or verdict.delta_ids != ():
+            return False
+        if state is None or state.last_window is None or state.pending_commit is not None:
+            return False
+        if (
+            not state.commit_trusted
+            or state.completion_unknown
+            or state.degraded
+            or getattr(self, "_sr_device_poisoned", False)
+        ):
+            return False
+        return (
+            state.last_step_id == dreq.step_id
+            and state.last_base_committed_len == dreq.base_committed_len
+            and state.last_num_draft_tokens == int(dreq.num_draft_tokens or 0)
+        )
+
+    def _sr_confirm_zero_delta(self, dreq, req, state, reply) -> None:
+        fingerprint = commit_fingerprint(dreq)
+        state.acked_version = int(dreq.commit_version)
+        if req is None:
+            state.local_prefix_stamp = None
+        else:
+            state.local_prefix_stamp = retarget_stamp_version(
+                state.local_prefix_stamp,
+                int(dreq.commit_version),
+                req=req,
+                origin=req.origin_input_ids,
+                output=req.output_ids,
+                revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
+            )
+            req.sr_commit_output_ids = CommittedPrefixView(
+                state.acked_output_ids, len(state.acked_output_ids), ()
+            )
+        self._sr_remember_commit(state, dreq, reply, fingerprint)
+
+    def _sr_prepare_delta_fast(self, dreq, req, state, verdict, metrics) -> None:
+        delta = verdict.delta_ids or ()
+        fingerprint = commit_fingerprint(dreq)
+        origin = req.origin_input_ids
+        output = req.output_ids
+        old_kv = int(getattr(req, "kv_committed_len", 0) or 0)
+        old_revision = int(getattr(req, "sr_prefix_revision", 0) or 0)
+        window = prefix_window_tokens(origin or [], output or [], base=old_kv)
+        old_local_len = len(origin or []) + len(output or [])
+        if delta:
+            invalidate_tree_seed(req)
+            if req.output_ids is None:
+                req.output_ids = []
+            req.output_ids.extend(delta)
+        kind = (
+            "equal"
+            if not delta
+            else "append_one"
+            if len(delta) == 1
+            else "append_n"
+        )
+        req.sr_align_result = SRAlignResult(
+            kind=kind,
+            old_kv_committed_len=old_kv,
+            old_prefix_revision=old_revision,
+            old_local_len=old_local_len,
+            old_prefix_window=window,
+            fork=old_local_len,
+        )
+        req.sr_prefix_proven = True
+        req.sr_pending_dreq = dreq
+        req.sr_pending_wire_request = dreq
+        req.draft_generation_start_len = len(req.output_ids or [])
+        req.draft_tokens_target = int(dreq.num_draft_tokens or 0)
+        base_len = len(state.acked_output_ids)
+        req.sr_commit_output_ids = CommittedPrefixView(
+            state.acked_output_ids, base_len, delta
+        )
+        state.pending_commit = PendingCommit(
+            old_version=state.acked_version,
+            old_output_len=base_len,
+            delta_ids=delta,
+            expected_len=base_len + len(delta),
+            fingerprint=fingerprint,
+            candidate_stamp=make_prefix_stamp(req, int(dreq.commit_version)),
+        )
+        note_commit_result(metrics, "commit_fast_apply")
+
+    def _sr_stage_slow_commit(
+        self, dreq, req, state, verdict, output_ids, fingerprint
+    ) -> None:
+        proven = bool(getattr(req, "sr_prefix_proven", False))
+        candidate = (
+            make_prefix_stamp(req, int(dreq.commit_version)) if proven else None
+        )
+        if not proven:
+            self._sr_clear_prefix_stamp(state)
+        if verdict.delta_ids is not None:
+            base = [] if state is None else state.acked_output_ids
+            base_len = 0 if state is None else len(state.acked_output_ids)
+            pending = PendingCommit(
+                old_version=None if state is None else state.acked_version,
+                old_output_len=base_len,
+                delta_ids=verdict.delta_ids,
+                expected_len=base_len + len(verdict.delta_ids),
+                fingerprint=fingerprint,
+                candidate_stamp=candidate,
+            )
+            req.sr_commit_output_ids = CommittedPrefixView(
+                base, base_len, verdict.delta_ids
+            )
+        else:
+            snap = tuple(int(x) for x in output_ids)
+            pending = PendingCommit(
+                old_version=None if state is None else state.acked_version,
+                old_output_len=0 if state is None else len(state.acked_output_ids),
+                delta_ids=(),
+                expected_len=len(snap),
+                fingerprint=fingerprint,
+                candidate_stamp=candidate,
+                snapshot_ids=snap,
+            )
+            req.sr_commit_output_ids = list(snap)
+        if state is not None:
+            state.pending_commit = pending
+        req.sr_pending_wire_request = dreq
+
     def _sr_prepare_v2(
         self,
         dreq: SRDraftRequest,
@@ -1980,6 +2146,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 None,
                 None,
             )
+        self._sr_drop_unconfirmed_commit(state)
         req = state.req_object if state is not None else None
         if state is not None and state.completion_unknown:
             return (
@@ -1999,6 +2166,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             has_state=state is not None and req is not None,
             state_trusted=True if state is None else state.commit_trusted,
         )
+        poisoned = bool(getattr(self, "_sr_device_poisoned", False))
+        if poisoned and verdict.outcome in (CommitOutcome.APPLY, CommitOutcome.CACHE):
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
+                None,
+                None,
+            )
         if verdict.outcome == CommitOutcome.CONTROL:
             if action in (SRAction.FINISH, SRAction.ABORT):
                 self._sr_finish_rid(dreq.rid)
@@ -2029,8 +2203,37 @@ class StandaloneRemoteDraftSchedulerMixin:
                 None,
             )
 
-        output_ids = list(verdict.output_ids or [])
-        prompt = list(getattr(req, "sr_padded_ids", None) or dreq.padded_input_ids or [])
+        if self._sr_reuse_zero_delta(dreq, req, state, verdict):
+            reply = self._sr_v2_reply(
+                dreq,
+                SRReplyStatus.OK if state.last_window[0] else SRReplyStatus.EMPTY,
+                window=state.last_window,
+                tree_version=(state.last_reply or {}).get("tree_version"),
+                ack_version=int(dreq.commit_version),
+                ack_len=len(state.acked_output_ids),
+            )
+            self._sr_confirm_zero_delta(dreq, req, state, reply)
+            return reply, None, None
+        if delta_fast_allowed(
+            verdict,
+            req=req,
+            state=state,
+            base_output_len=int(dreq.base_output_len or 0),
+            poisoned=poisoned,
+        ):
+            self._sr_prepare_delta_fast(dreq, req, state, verdict, metrics)
+            return None, req, dreq
+
+        output_ids = (
+            rebuild_committed_output(
+                [] if state is None else state.acked_output_ids,
+                verdict.delta_ids,
+            )
+            if verdict.delta_ids is not None
+            else list(verdict.output_ids or [])
+        )
+        padded = getattr(req, "sr_padded_ids", None) if req is not None else None
+        prompt = list(padded or dreq.padded_input_ids or [])
         if dreq.commit_mode == "snapshot":
             prompt = list(dreq.padded_input_ids or prompt)
         local = replace(dreq, committed_ids=list(output_ids))
@@ -2039,7 +2242,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             route = route_snapshot_recovery(
                 kv_trusted=False,
                 degraded=bool(state is not None and state.degraded),
-                poisoned=bool(getattr(self, "_sr_device_poisoned", False)),
+                poisoned=poisoned,
                 completion_unknown=bool(
                     state is not None and state.completion_unknown
                 ),
@@ -2060,36 +2263,16 @@ class StandaloneRemoteDraftSchedulerMixin:
                 None,
                 None,
             )
-        if (
-            verdict.outcome == CommitOutcome.APPLY
-            and dreq.commit_mode == "delta"
-            and dreq.delta_ids == []
-            and state is not None
-            and state.last_window is not None
-            and state.last_step_id == dreq.step_id
-            and state.last_base_committed_len == dreq.base_committed_len
-            and state.last_num_draft_tokens == int(dreq.num_draft_tokens or 0)
-        ):
-            reply = self._sr_v2_reply(
-                dreq,
-                SRReplyStatus.OK if state.last_window[0] else SRReplyStatus.EMPTY,
-                window=state.last_window,
-                tree_version=(state.last_reply or {}).get("tree_version"),
-                ack_version=int(dreq.commit_version),
-                ack_len=len(output_ids),
+        if req is None and dreq.commit_mode != "snapshot":
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.NEED_SNAPSHOT, reason="no_req"),
+                None,
+                None,
             )
-            self._sr_remember_commit(state, dreq, output_ids, reply)
-            if req is not None:
-                req.sr_commit_output_ids = list(output_ids)
-            return reply, None, None
+        note_commit_result(metrics, "commit_slow_apply")
+        fingerprint = commit_fingerprint(dreq)
 
         if req is None:
-            if dreq.commit_mode != "snapshot":
-                return (
-                    self._sr_v2_reply(dreq, SRReplyStatus.NEED_SNAPSHOT, reason="no_req"),
-                    None,
-                    None,
-                )
             req = self._sr_create_req(dreq, mm, session_id)
             if req is None:
                 return self._sr_v2_reply(dreq, SRReplyStatus.EMPTY), None, None
@@ -2099,8 +2282,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_reprefill(req, fill, local, state)
         else:
             self._sr_align(req, local, state)
-        req.sr_commit_output_ids = list(output_ids)
-        req.sr_pending_wire_request = dreq
+        self._sr_stage_slow_commit(
+            dreq, req, state, verdict, output_ids, fingerprint
+        )
         if state is not None and dreq.commit_mode == "snapshot":
             state.prompt_len = len(prompt)
         return None, req, local
@@ -2112,23 +2296,48 @@ class StandaloneRemoteDraftSchedulerMixin:
         reply: SRDraftReply,
     ) -> SRDraftReply:
         state = self.sr_state.get(dreq.rid)
-        output_ids = list(getattr(req, "sr_commit_output_ids", []) or [])
+        pending = None if state is None else state.pending_commit
         if getattr(req, "sr_commit_incomplete", False) or (
             state is not None and state.completion_unknown
         ):
             if state is not None:
                 state.commit_trusted = False
                 state.completion_unknown = True
+                state.pending_commit = None
+                state.local_prefix_stamp = None
             reply.ack_commit_version = None
             reply.ack_output_len = None
             reply.status = SRReplyStatus.EMPTY
             reply.reason = "commit_incomplete"
             reply.draft_tokens = []
             return reply
+        if state is None or pending is None or (
+            state.acked_version != pending.old_version
+            or len(state.acked_output_ids) != pending.old_output_len
+        ):
+            if state is not None:
+                state.pending_commit = None
+                state.local_prefix_stamp = None
+            reply.ack_commit_version = None
+            reply.ack_output_len = None
+            reply.status = SRReplyStatus.EMPTY
+            reply.reason = "commit_incomplete"
+            reply.draft_tokens = []
+            return reply
+        if pending.snapshot_ids is not None:
+            state.acked_output_ids = list(pending.snapshot_ids)
+        else:
+            state.acked_output_ids.extend(pending.delta_ids)
+        if candidate_stamp_current(pending.candidate_stamp, req):
+            state.local_prefix_stamp = pending.candidate_stamp
+        else:
+            state.local_prefix_stamp = None
+        fingerprint = pending.fingerprint
+        ack_len = pending.expected_len
+        state.pending_commit = None
         reply.ack_commit_version = int(dreq.commit_version)
-        reply.ack_output_len = len(output_ids)
-        if state is not None:
-            self._sr_remember_commit(state, dreq, output_ids, reply)
+        reply.ack_output_len = ack_len
+        self._sr_remember_commit(state, dreq, reply, fingerprint)
         return reply
 
     def _sr_protocol_mismatch_reply(self, batch: SRBatchRequest) -> SRBatchReply:

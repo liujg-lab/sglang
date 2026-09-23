@@ -26,6 +26,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     prefix_window_tokens,
     record_device_event,
     remap_slot_node_ids,
+    prefix_window_from_committed,
     snapshot_sr_align,
     tree_raw_span_len,
     validate_lease_commit,
@@ -213,6 +214,9 @@ class TestLeaseLifecycle(unittest.TestCase):
         self.assertEqual(result.kind, "append_one")
         self.assertEqual(result.old_prefix_revision, 4)
         self.assertEqual(result.old_kv_committed_len, 3)
+        self.assertEqual(result.old_local_len, 3)
+        self.assertEqual(result.old_prefix_window, (1, 2, 3))
+        self.assertFalse(hasattr(result, "old_committed_tokens"))
         req.sr_prefix_revision = 5
         self.assertNotEqual(result.old_prefix_revision, req.sr_prefix_revision)
 
@@ -234,7 +238,8 @@ class TestLeaseLifecycle(unittest.TestCase):
             kind="append_n",
             old_kv_committed_len=3,
             old_prefix_revision=4,
-            old_committed_tokens=(1, 2, 3),
+            old_local_len=3,
+            old_prefix_window=(1, 2, 3),
             fork=3,
         )
         miss = validate_lease_commit(
@@ -250,7 +255,8 @@ class TestLeaseLifecycle(unittest.TestCase):
             kind="append_n",
             old_kv_committed_len=3,
             old_prefix_revision=5,
-            old_committed_tokens=(1, 2, 3),
+            old_local_len=3,
+            old_prefix_window=(1, 2, 3),
             fork=3,
         )
         self.assertEqual(
@@ -279,7 +285,7 @@ class TestLeaseLifecycle(unittest.TestCase):
             top_scores_index=[0],
             draft_tokens=[4],
         )
-        align = SRAlignResult("append_one", 1, 0, (9,), 1)
+        align = SRAlignResult("append_one", 1, 0, 1, (9,), 1)
         self.assertEqual(
             validate_lease_commit(
                 lease,
@@ -549,7 +555,7 @@ class TestLeaseLifecycle(unittest.TestCase):
             top_scores_index=[0, 1],
             draft_tokens=[4, 5],
         )
-        align = SRAlignResult("append_n", 1, 0, (9,), 1)
+        align = SRAlignResult("append_n", 1, 0, 1, (9,), 1)
         self.assertEqual(
             validate_lease_commit(
                 lease,
@@ -618,7 +624,9 @@ class TestLeaseLifecycle(unittest.TestCase):
             draft_tokens=[7, 8],
             page_count=1,
         )
-        hit = SRAlignResult("append_n", base, 0, committed, base)
+        hit = SRAlignResult(
+            "append_n", base, 0, base, prefix_window_from_committed(committed, base), base
+        )
         self.assertIsNone(
             validate_lease_commit(
                 lease,
@@ -636,7 +644,14 @@ class TestLeaseLifecycle(unittest.TestCase):
                 commit_tree_version=2,
                 commit_tree_base_committed_len=base,
                 commit_candidate_indices=[0, 1],
-                align=SRAlignResult("append_n", base, 0, outside, base),
+                align=SRAlignResult(
+                    "append_n",
+                    base,
+                    0,
+                    base,
+                    prefix_window_from_committed(outside, base),
+                    base,
+                ),
                 path_tokens=[7, 8],
             )
         )
@@ -647,7 +662,14 @@ class TestLeaseLifecycle(unittest.TestCase):
                 commit_tree_version=2,
                 commit_tree_base_committed_len=base,
                 commit_candidate_indices=[0, 1],
-                align=SRAlignResult("append_n", base, 0, inside, base),
+                align=SRAlignResult(
+                    "append_n",
+                    base,
+                    0,
+                    base,
+                    prefix_window_from_committed(inside, base),
+                    base,
+                ),
                 path_tokens=[7, 8],
             ),
             "token",

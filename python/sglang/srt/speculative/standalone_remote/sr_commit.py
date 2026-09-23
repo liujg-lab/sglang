@@ -1,13 +1,14 @@
 """CPU commit cursor for STANDALONE_REMOTE incremental STEP.
 
-The wire delta is the suffix appended since the last ACK. Draft rebuilds the
-full output history in memory and then uses the existing align path. A missing
-protocol version is the historical protocol and must not be read as version 2.
+The wire delta is the suffix appended since the last ACK. A trusted delta whose
+local prefix stamp matches appends in place. Every other legal commit still
+rebuilds history and uses the existing align path. A missing protocol version
+is the historical protocol and must not be read as version 2.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -43,6 +44,71 @@ class CommitVerdict:
     outcome: CommitOutcome
     reason: Optional[str] = None
     output_ids: Optional[List[int]] = None
+    delta_ids: Optional[Tuple[int, ...]] = None
+
+
+@dataclass(frozen=True)
+class LocalPrefixStamp:
+    """Proof that a Req list pair is exactly one confirmed output prefix.
+
+    Identity is compared with ``is``. Matching lengths alone are not a proof.
+    """
+
+    acked_version: int
+    req: Any
+    origin: Any
+    origin_len: int
+    output: Any
+    output_len: int
+    revision: int
+
+
+@dataclass
+class PendingCommit:
+    """Commit accepted by the protocol and not yet written into authoritative history."""
+
+    old_version: Optional[int]
+    old_output_len: int
+    delta_ids: Tuple[int, ...]
+    expected_len: int
+    fingerprint: Tuple
+    candidate_stamp: Optional[LocalPrefixStamp] = None
+    snapshot_ids: Optional[Tuple[int, ...]] = None
+
+
+class CommittedPrefixView:
+    """Read-only history of a fixed length: an append-only prefix plus one delta.
+
+    ``len`` does not scan. Indexing and iteration touch only the requested
+    range. Extending the base list in place does not change this view's length
+    or its fixed prefix. A snapshot must replace the authoritative list with a
+    new object instead of clearing or rewriting the old one.
+    """
+
+    def __init__(self, base: Sequence[int], base_len: int, delta: Sequence[int]):
+        self._base = base
+        self._base_len = int(base_len)
+        self._delta = tuple(delta)
+
+    def __len__(self) -> int:
+        return self._base_len + len(self._delta)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        n = len(self)
+        if index < 0:
+            index += n
+        if index < 0 or index >= n:
+            raise IndexError(index)
+        if index < self._base_len:
+            return self._base[index]
+        return self._delta[index - self._base_len]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
 
 
 def supported_protocol(version: Optional[int]) -> bool:
@@ -167,6 +233,123 @@ def structural_error(req, action: SRAction) -> Optional[str]:
     return None
 
 
+def rebuild_committed_output(
+    current: Sequence[int], delta: Sequence[int]
+) -> List[int]:
+    """Full history for the slow path. Fast commits must not call this."""
+    return [int(x) for x in current] + [int(x) for x in delta]
+
+
+def stamp_matches(
+    stamp: Optional[LocalPrefixStamp],
+    *,
+    version,
+    req,
+    origin,
+    output,
+    revision,
+) -> bool:
+    """Identity proof. Do not compare list contents."""
+    if stamp is None:
+        return False
+    return (
+        stamp.req is req
+        and stamp.origin is origin
+        and stamp.output is output
+        and stamp.acked_version == version
+        and stamp.origin_len == len(origin or [])
+        and stamp.output_len == len(output or [])
+        and stamp.revision == int(revision)
+    )
+
+
+def retarget_stamp_version(
+    stamp: Optional[LocalPrefixStamp],
+    new_version: int,
+    *,
+    req,
+    origin,
+    output,
+    revision,
+) -> Optional[LocalPrefixStamp]:
+    """Move a still-valid stamp to a new confirmed version. Never create one."""
+    if stamp is None or not stamp_matches(
+        stamp,
+        version=stamp.acked_version,
+        req=req,
+        origin=origin,
+        output=output,
+        revision=revision,
+    ):
+        return None
+    return replace(stamp, acked_version=int(new_version))
+
+
+def candidate_stamp_current(stamp: Optional[LocalPrefixStamp], req) -> bool:
+    if stamp is None or req is None:
+        return False
+    return stamp_matches(
+        stamp,
+        version=stamp.acked_version,
+        req=req,
+        origin=getattr(req, "origin_input_ids", None),
+        output=getattr(req, "output_ids", None),
+        revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
+    )
+
+
+def make_prefix_stamp(req, version: int) -> LocalPrefixStamp:
+    origin = getattr(req, "origin_input_ids", None)
+    output = getattr(req, "output_ids", None)
+    return LocalPrefixStamp(
+        acked_version=int(version),
+        req=req,
+        origin=origin,
+        origin_len=len(origin or []),
+        output=output,
+        output_len=len(output or []),
+        revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
+    )
+
+
+def delta_fast_allowed(
+    verdict: CommitVerdict,
+    *,
+    req,
+    state,
+    base_output_len: int,
+    poisoned: bool,
+) -> bool:
+    """Local proof that a protocol-legal delta may append without a full scan.
+
+    A missing stamp only refuses the fast path. It does not make the slow path
+    safe; trust and recovery rules still decide that.
+    """
+    if verdict.outcome != CommitOutcome.APPLY or verdict.delta_ids is None:
+        return False
+    if state is None or req is None:
+        return False
+    if poisoned or state.degraded or state.completion_unknown or not state.commit_trusted:
+        return False
+    if state.pending_commit is not None:
+        return False
+    if state.acked_version is None:
+        return False
+    origin = getattr(req, "origin_input_ids", None)
+    output = getattr(req, "output_ids", None)
+    if not stamp_matches(
+        state.local_prefix_stamp,
+        version=state.acked_version,
+        req=req,
+        origin=origin,
+        output=output,
+        revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
+    ):
+        return False
+    local_len = len(origin or []) + len(output or [])
+    return local_len == int(state.prompt_len) + int(base_output_len)
+
+
 def route_snapshot_recovery(
     *,
     kv_trusted: bool,
@@ -201,8 +384,8 @@ def inspect_commit(
         return CommitVerdict(CommitOutcome.CONTROL)
 
     version = int(req.commit_version)
-    fingerprint = commit_fingerprint(req)
     if current_version is not None and version == int(current_version):
+        fingerprint = commit_fingerprint(req)
         if cached_fingerprint is not None and fingerprint == cached_fingerprint:
             if not state_trusted:
                 if getattr(req, "commit_mode", None) == "snapshot":
@@ -212,10 +395,7 @@ def inspect_commit(
                         list(req.committed_ids or []),
                     )
                 return CommitVerdict(CommitOutcome.NEED_SNAPSHOT, "untrusted_resend")
-            return CommitVerdict(
-                CommitOutcome.CACHE,
-                output_ids=list(current_output or []),
-            )
+            return CommitVerdict(CommitOutcome.CACHE)
         return CommitVerdict(CommitOutcome.REJECT, "commit_mismatch")
     if current_version is not None and version < int(current_version):
         return CommitVerdict(CommitOutcome.REJECT, "stale_version")
@@ -238,8 +418,9 @@ def inspect_commit(
     expected = int(prompt_len) + int(req.base_output_len) + len(req.delta_ids)
     if int(req.base_committed_len) != expected:
         return CommitVerdict(CommitOutcome.REJECT, "delta_length")
-    output = list(current_output) + [int(x) for x in req.delta_ids]
-    return CommitVerdict(CommitOutcome.APPLY, output_ids=output)
+    return CommitVerdict(
+        CommitOutcome.APPLY, delta_ids=tuple(int(x) for x in req.delta_ids)
+    )
 
 
 def note_commit_send(metrics, mode: str, n_tokens: int) -> None:
