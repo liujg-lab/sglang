@@ -562,6 +562,56 @@ class TestTailTransaction(unittest.TestCase):
                         out.tree_seed_topk_p.zero_()
                         self.assertTrue(req.sr_tree_seed[0].any())
 
+    def test_staged_root_token_skips_sync_ctor(self):
+        reqs = [
+            request(prefix=3, output=(7, 8), slot=0),
+            request(prefix=3, output=(9, 10), slot=1),
+        ]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.stage_root_tokens("cpu")
+        root = txn._root_tokens
+        out = seed_output(2)
+        with patch.object(
+            tail.torch, "tensor", side_effect=AssertionError("host to device ctor")
+        ):
+            txn.commit(out)
+        out.tree_seed_topk_p.zero_()
+        out.tree_seed_topk_index.zero_()
+        for req, plan in zip(reqs, plans):
+            verified = req.sr_tree_seed[3]
+            self.assertEqual(tuple(verified.shape), (1,))
+            self.assertEqual(int(verified), plan.last_token)
+            self.assertEqual(
+                verified.untyped_storage().data_ptr(),
+                root.untyped_storage().data_ptr(),
+            )
+            self.assertTrue(req.sr_tree_seed[0].any())
+            self.assertTrue(req.sr_tree_seed[1].any())
+
+    def test_root_device_match_treats_missing_index_as_current(self):
+        self.assertTrue(tail._root_device_matches("cpu", torch.device("cpu")))
+        self.assertTrue(
+            tail._root_device_matches(torch.device("cuda"), torch.device("cuda:0"))
+        )
+        self.assertTrue(
+            tail._root_device_matches(torch.device("cuda:0"), torch.device("cuda"))
+        )
+        self.assertFalse(
+            tail._root_device_matches(torch.device("cuda:0"), torch.device("cuda:1"))
+        )
+        self.assertFalse(
+            tail._root_device_matches(torch.device("cpu"), torch.device("cuda:0"))
+        )
+
+    def test_unstaged_commit_still_publishes_root_token(self):
+        req = request(prefix=3, output=(7, 8))
+        scheduler, plans = transaction_fixture([req], 128)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.commit(seed_output(1))
+        self.assertEqual(int(req.sr_tree_seed[3]), plans[0].last_token)
+        self.assertEqual(tuple(req.sr_tree_seed[3].shape), (1,))
+
     def test_allocation_and_seed_failure_are_atomic(self):
         reqs = [request(slot=0), request(slot=1)]
         scheduler, plans = transaction_fixture(reqs, 128)
@@ -3257,6 +3307,9 @@ class TestBatchedKvCopy(unittest.TestCase):
             def allocate(self, batch):
                 return None
 
+            def stage_root_tokens(self, device):
+                return None
+
             def wait_copy_done(self):
                 raise AssertionError("should not wait after copy failure")
 
@@ -3337,7 +3390,8 @@ class TestBatchedKvCopy(unittest.TestCase):
         scheduler._sr_pause_req = Mock()
         scheduler._sr_mark_degraded = Mock()
         scheduler._sr_make_tail_extend_batch = lambda plans: NS(
-            get_model_worker_batch=lambda: NS()
+            device="cpu",
+            get_model_worker_batch=lambda: NS(),
         )
         scheduler.sr_tree_drafter = None
         scheduler.tp_worker = NS(

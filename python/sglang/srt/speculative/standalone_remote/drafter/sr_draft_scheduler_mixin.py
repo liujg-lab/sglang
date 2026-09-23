@@ -1464,6 +1464,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             with metrics.phase("tail_prepare_allocate"):
                 self._sr_replay_grammars(active, strict=True)
                 batch = self._sr_make_tail_extend_batch(plans)
+                transaction.stage_root_tokens(batch.device)
                 transaction.allocate(batch)
                 transaction.copy_reused_tree_kv()
                 worker_batch = batch.get_model_worker_batch()

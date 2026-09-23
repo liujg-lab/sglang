@@ -74,6 +74,21 @@ def _device_type(device):
     return getattr(device, "type", None) or str(device)
 
 
+def _root_device_matches(stored, requested) -> bool:
+    """True when the staged root tensor can be read as this seed's device.
+
+    A missing index means the current device of that type. ``npu`` and
+    ``npu:0`` therefore match; ``npu:0`` does not match ``npu:1``.
+    """
+    stored = torch.device(stored)
+    requested = torch.device(requested)
+    if stored.type != requested.type:
+        return False
+    if stored.index is None or requested.index is None:
+        return True
+    return stored.index == requested.index
+
+
 def _is_cpu_device(device) -> bool:
     dev_type = _device_type(device)
     return device is None or dev_type is None or "cpu" in str(dev_type)
@@ -604,6 +619,35 @@ class SRTailExtendTransaction:
         self._copy_stream = None
         self._copy_hold = None
         self._copy_leases = []
+        self._root_tokens = None
+
+    def stage_root_tokens(self, device) -> None:
+        """Copy root token ids onto ``device`` before tail kernels are queued.
+
+        ``last_token`` is already known. A host-to-device ``torch.tensor``
+        after softmax drains the NPU stream, so the copy belongs here, while
+        that stream is still idle.
+        """
+        self._root_tokens = torch.tensor(
+            [int(plan.last_token) for plan in self.plans],
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def _root_token_view(self, index: int, device) -> torch.Tensor:
+        root = self._root_tokens
+        if (
+            isinstance(root, torch.Tensor)
+            and root.ndim == 1
+            and int(root.shape[0]) == len(self.plans)
+            and _root_device_matches(root.device, device)
+        ):
+            return root[index : index + 1]
+        return torch.tensor(
+            [int(self.plans[index].last_token)],
+            dtype=torch.int64,
+            device=device,
+        )
 
     def allocate(self, batch: ScheduleBatch) -> None:
         if any(p.end > self.mapping.shape[1] for p in self.plans):
@@ -805,7 +849,7 @@ class SRTailExtendTransaction:
                 p[i : i + 1].detach().clone(),
                 ix[i : i + 1].detach().clone(),
                 None,
-                torch.tensor([plan.last_token], dtype=torch.int64, device=ix.device),
+                self._root_token_view(i, ix.device),
             )
             if plan.rebuild_fill is not None:
                 replacement = list(plan.rebuild_fill)
