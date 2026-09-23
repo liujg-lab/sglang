@@ -221,8 +221,13 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 候选 token 与 Target argmax token 相等的条件，而不只是比较 logit 数值相等，从而对齐 greedy。
 `tau>0` 允许近邻候选，不保证输出逐 token 等于普通 Target greedy。
 
-当前 RPD 有 CUDA kernel 与 CPU reference 分派；缺少 CUDA kernel 或非 CUDA 路径可使用 CPU reference。
-观察 `Speculative RPD verify path` 的实际值，不应把普通 greedy/target-only 验证的耗时套用于 RPD。
+当前 RPD 按 logits 的 `device.type` 分派，不新增启动参数。`npu` 判断在 `is_cuda` 之前，因此 `transfer_to_npu` 把 `is_cuda` 变成真也不会进入 CUDA kernel，更不会整张 logits 回传。
+
+- `npu`：紧凑回读。词表 `max` 和每条边上的一对 logit 留在设备上，最长路径仍在 CPU 上选择。树指针先回读，再与 `max` 同流取边，argmax 和边标量只等待一次。传输量与词表大小无关：树 `32*B*W` 字节、边下标 `16*E` 字节、argmax `8*B*W` 字节、边标量 `2*E*element_size` 字节，结果写回 `O(B*S+K)`。没有边时不做边下标上传，也没有边标量。日志值是 `npu_compact_cpu_path`，这不是全设备核验。
+- `cuda`：现有 kernel。只有 `ImportError` / `AttributeError` 回退 CPU reference。
+- 其他设备，包括 CPU：CPU reference。
+
+观察 `Speculative RPD verify path` 的实际值，不应把普通 greedy/target-only 验证的耗时套用于 RPD。NPU 上的分段耗时、跨设备字节和临时显存用 `python3 test/manual/test_npu_rpd_verify.py --bench` 单独记录，不进 `verify_tree_rpd()`。CPU 单测只证明接受结果和传输形状，不能代替 TPOT 结论。
 
 NPU greedy 树核验走本仓库 [`tree_verify_npu.py`](../tree_verify_npu.py) 的 sibling-walk 设备 kernel，语义对齐 CPU [`verify_tree_greedy_ref`](../tree_verify.py) 与 CUDA `VerifyTreeGreedy`。共享入口是 `verify_tree_greedy_func`，因此 SR、SPECTRE、EAGLE/STANDALONE 中所有 greedy 调用都会走到该分派；启动 scratch 预热只接入 SR Target。CPU 张量、已识别的缺可选依赖（Triton）、或首版不支持的合法非连续布局在提交设备工作之前回退 reference；混合设备或非法 shape/dtype 报错；JIT/launch/执行失败原样上抛，不再跑 reference。不要接入 `sgl_kernel_npu.sample.verify_tree_greedy` 链入口。本优化减少 Target greedy 核验的主机往返与 Python 遍历，不解决 Draft 主瓶颈，也不能把 `accept_commit_including_wait` 整段当作可消除时间。核验之后现有结果处理仍可能读回主机。观察 `Speculative greedy verify path` 的实际值（`npu_kernel` 或 `cpu_reference` 及 reason）。设备路径依赖 Triton-Ascend JIT；具体可用版本以实机验收记录为准，当前编写环境未跑 NPU 数值对照。普通 greedy 核验结束后，如果本轮没有 logprob、hidden、grammar、自定义 logit 处理或其他附加输出消费者，不再按接受行 gather 全词表 logits，`next_token_logits` 为 None。图回放可能附带本轮不消费的 hidden，判定前会丢掉该视图；持久 logits/hidden buffer 仍保留。
 
@@ -991,7 +996,7 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `key=1_s512` | Draft 图键，batch 1、长度容量 bucket 512；不是实际 prefix 恰好 512 |
 | `key=r15_1_s512` | Target 图键，每请求 15 个验证位置、batch 1、容量 bucket 512 |
 | `needed_len_max=None` | 部分路径不构造旧 FIA 的主机长度统计；不能单凭 None 判断长度错误 |
-| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径；关注 cuda_kernel 或 cpu_reference，不只看启动参数 |
+| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径。RPD 路径是 `cuda_kernel`、`npu_compact_cpu_path` 或 `cpu_reference`。`npu_compact_cpu_path` 表示词表统计留在 NPU、最长路径仍由 CPU 选择，不是全设备核验 |
 | `Prefill batch` | `#new-seq/#new-token/#cached-token` 为本批新请求、输入及缓存复用量；`npu graph: False` 对普通 tail/prefill 不等于树图失效 |
 | `Decode batch #running-req/#queue-req` | 当前运行/排队请求数 |
 | `#token/token usage` | KV 池占用相关统计，不是本轮生成的 token 数 |

@@ -909,7 +909,8 @@ def tree_verify_method_available(
     greedy: CUDA/HIP kernels; NPU uses tree_verify_npu sibling-walk, with
     the portable CPU reference as fallback before device submit.
     target_only: CUDA kernel or portable NPU/CPU reference. Not HIP.
-    rpd: CUDA kernel or CPU fallback on every backend.
+    rpd: CUDA kernel, NPU compact readback with CPU path selection, or the
+    CPU reference. Available on every backend.
     """
     backend = backend or tree_verify_backend()
     method = (method or "").lower()
