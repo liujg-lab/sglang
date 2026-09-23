@@ -30,6 +30,15 @@ class SRDraftState:
     degraded: bool = False
     last_updated_time: float = field(default_factory=time.time)
     created_time: float = field(default_factory=time.time)
+    # Authoritative committed output, without prompt and without draft tokens.
+    acked_output_ids: List[int] = field(default_factory=list)
+    acked_version: Optional[int] = None
+    prompt_len: int = 0
+    commit_trusted: bool = True
+    completion_unknown: bool = False
+    last_commit_fingerprint: Optional[Tuple] = None
+    last_reply: Optional[dict] = None
+    last_num_draft_tokens: int = 0
 
 
 class SRDraftStateManager:

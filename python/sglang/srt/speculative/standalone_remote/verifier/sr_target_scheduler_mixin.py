@@ -12,6 +12,14 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     shift_overlapped_prefill_drafts,
     drop_duplicate_root_draft,
 )
+from sglang.srt.speculative.standalone_remote.sr_commit import (
+    SR_PROTOCOL_VERSION,
+    ack_matches,
+    note_commit_result,
+    note_commit_send,
+    reply_stops_speculation,
+    status_advances_cursor,
+)
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
@@ -164,6 +172,8 @@ class SchedulerStandaloneRemoteTargetMixin:
         self.sr_rpc_seq = 0
         self.sr_pending = {}
         self._sr_inflight = None
+        self.sr_speculation_stopped = False
+        self.sr_seen_generation = None
         client = getattr(self, "sr_client", None)
         if client is not None:
             client._drain()
@@ -191,6 +201,73 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_committed_ids(self, req: Req) -> List[int]:
         return list(req.output_ids or [])
 
+    def _sr_ensure_cursor(self, req: Req) -> None:
+        if not isinstance(getattr(req, "sr_next_commit_version", None), int):
+            req.sr_next_commit_version = 1
+            req.sr_ack_commit_version = None
+            req.sr_ack_output_len = 0
+            req.sr_force_snapshot = True
+            req.sr_stop_spec = False
+
+    def _sr_active_reqs(self) -> List[Req]:
+        found = []
+        for batch in (
+            getattr(self, "running_batch", None),
+            getattr(self, "cur_batch", None),
+            getattr(self, "last_batch", None),
+        ):
+            if batch is None:
+                continue
+            for req in getattr(batch, "reqs", None) or []:
+                if req is not None and not _is_health_check(req):
+                    found.append(req)
+        return found
+
+    def _sr_sync_connection(self) -> None:
+        generation = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            client = getattr(self, "sr_client", None)
+            generation = getattr(client, "connection_generation", None)
+        if self.tp_size > 1:
+            generation = self._sr_broadcast_obj(generation)
+        if generation is None:
+            return
+        seen = getattr(self, "sr_seen_generation", None)
+        self.sr_seen_generation = generation
+        if seen is None or seen == generation:
+            return
+        for req in self._sr_active_reqs():
+            self._sr_ensure_cursor(req)
+            req.sr_force_snapshot = True
+
+    def _sr_stop_speculation(self, reason: str) -> None:
+        if getattr(self, "sr_speculation_stopped", False):
+            return
+        self.sr_speculation_stopped = True
+        logger.warning("[SR] stop speculation for session: %s", reason)
+        for req in self._sr_active_reqs():
+            self._sr_ensure_cursor(req)
+            req.sr_stop_spec = True
+            _clear_draft(req)
+
+    def _sr_candidate_path(self, req: Req, delta_ids: Optional[List[int]]):
+        if not delta_ids:
+            return None, None, None
+        base = getattr(req, "sr_draft_tree_base_committed_len", None)
+        version = getattr(req, "sr_draft_tree_version", None)
+        path = list(getattr(req, "sr_accepted_tree_candidate_indices", None) or [])
+        prompt_len = len(req.origin_input_ids or [])
+        acked = int(getattr(req, "sr_ack_output_len", 0) or 0)
+        delta_start = prompt_len + acked
+        if (
+            version is None
+            or base != delta_start
+            or not path
+            or len(path) > len(delta_ids)
+        ):
+            return None, None, None
+        return version, base, path
+
     def _sr_base_committed_len(self, req: Req) -> int:
         return len(req.origin_input_ids) + len(req.output_ids or [])
 
@@ -200,42 +277,79 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _build_sr_request(
         self, req: Req, action: SRAction, include_full_context: bool
     ) -> Tuple[SRDraftRequest, Optional[SRMMPayload]]:
-        mm_payload = None
-        has_mm = False
-        if (
+        self._sr_ensure_cursor(req)
+        metrics = get_sr_round_metrics(self, "Target")
+        num_draft = (
+            int(self.server_args.speculative_num_draft_tokens or 0)
+            or int(self.server_args.speculative_num_steps or 0) + 1
+        )
+        if action in (SRAction.FINISH, SRAction.ABORT):
+            return (
+                SRDraftRequest(
+                    rid=req.rid,
+                    step_id=self._sr_step_id(req),
+                    base_committed_len=self._sr_base_committed_len(req),
+                    num_draft_tokens=0,
+                ),
+                None,
+            )
+        snapshot = (
             include_full_context
-            and req.multimodal_inputs is not None
-            and _mm_features_alive(req)
-        ):
-            has_mm = True
-            mm_payload = SRMMPayload.from_req(req)
+            or bool(req.sr_force_snapshot)
+            or req.sr_ack_commit_version is None
+        )
+        version = int(req.sr_next_commit_version)
+        req.sr_next_commit_version = version + 1
+        sent_len = len(req.output_ids or [])
+        req.sr_sent_commit_version = version
+        req.sr_sent_output_len = sent_len
+        mm_items = getattr(getattr(req, "multimodal_inputs", None), "mm_items", None)
+        requires_mm = isinstance(mm_items, list) and len(mm_items) > 0
+        if snapshot:
+            committed = list(req.output_ids or [])
+            mm_payload = None
+            has_mm = False
+            if requires_mm and _mm_features_alive(req):
+                has_mm = True
+                mm_payload = SRMMPayload.from_req(req)
+            note_commit_send(metrics, "snapshot", len(committed))
+            return (
+                SRDraftRequest(
+                    rid=req.rid,
+                    step_id=self._sr_step_id(req),
+                    base_committed_len=self._sr_base_committed_len(req),
+                    committed_ids=committed,
+                    num_draft_tokens=num_draft,
+                    padded_input_ids=list(req.origin_input_ids),
+                    sampling_params=req.sampling_params,
+                    has_mm=has_mm,
+                    commit_mode="snapshot",
+                    commit_version=version,
+                    requires_mm=requires_mm,
+                ),
+                mm_payload,
+            )
+        acked = int(req.sr_ack_output_len or 0)
+        delta_ids = list((req.output_ids or [])[acked:sent_len])
+        tree_version, tree_base, path = self._sr_candidate_path(req, delta_ids)
+        note_commit_send(metrics, "delta", len(delta_ids))
         return (
             SRDraftRequest(
                 rid=req.rid,
                 step_id=self._sr_step_id(req),
                 base_committed_len=self._sr_base_committed_len(req),
-                committed_ids=self._sr_committed_ids(req),
-                num_draft_tokens=(
-                    int(self.server_args.speculative_num_draft_tokens or 0)
-                    or int(self.server_args.speculative_num_steps or 0) + 1
-                )
-                if action != SRAction.FINISH
-                else 0,
-                padded_input_ids=(
-                    list(req.origin_input_ids) if include_full_context else None
-                ),
-                sampling_params=req.sampling_params if include_full_context else None,
-                has_mm=has_mm,
-                commit_tree_version=getattr(req, "sr_draft_tree_version", None),
-                commit_tree_base_committed_len=getattr(
-                    req, "sr_draft_tree_base_committed_len", None
-                ),
-                commit_candidate_indices=list(
-                    getattr(req, "sr_accepted_tree_candidate_indices", None) or []
-                )
-                or None,
+                num_draft_tokens=num_draft,
+                commit_mode="delta",
+                commit_version=version,
+                base_commit_version=req.sr_ack_commit_version,
+                base_output_len=acked,
+                delta_ids=delta_ids,
+                requires_mm=requires_mm,
+                commit_tree_version=tree_version,
+                commit_tree_base_committed_len=tree_base,
+                commit_candidate_indices=path,
             ),
-            mm_payload,
+            None,
         )
 
     def _sr_send(
@@ -246,6 +360,9 @@ class SchedulerStandaloneRemoteTargetMixin:
     ) -> Optional[SRInflight]:
         if not reqs:
             return None
+        if getattr(self, "sr_speculation_stopped", False) and action == SRAction.STEP:
+            return None
+        self._sr_sync_connection()
 
         pending: Dict[str, SRPendingEntry] = {}
         draft_reqs: List[SRDraftRequest] = []
@@ -256,7 +373,11 @@ class SchedulerStandaloneRemoteTargetMixin:
             dreq, mm = self._build_sr_request(req, action, include_full_context)
             draft_reqs.append(dreq)
             pending[req.rid] = SRPendingEntry(
-                step_id=dreq.step_id, base_committed_len=dreq.base_committed_len
+                step_id=dreq.step_id,
+                base_committed_len=dreq.base_committed_len,
+                commit_version=dreq.commit_version,
+                sent_output_len=getattr(req, "sr_sent_output_len", None),
+                protocol_version=SR_PROTOCOL_VERSION,
             )
             if mm is not None:
                 mm_by_rid[req.rid] = mm
@@ -273,6 +394,7 @@ class SchedulerStandaloneRemoteTargetMixin:
             rpc_seq=rpc_seq,
             action=action,
             reqs=draft_reqs,
+            protocol_version=SR_PROTOCOL_VERSION,
         )
 
         send_ok = True
@@ -303,6 +425,7 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_recv(self, inflight: Optional[SRInflight]) -> Dict[str, SRDraftReply]:
         if inflight is None:
             return {}
+        self._sr_ack_pending = inflight.pending
         if getattr(self, "_sr_inflight", None) is inflight:
             self._sr_inflight = None
 
@@ -334,6 +457,18 @@ class SchedulerStandaloneRemoteTargetMixin:
             return result
         if reply.rpc_seq != inflight.rpc_seq:
             self._sr_note_stale("rpc_seq")
+            self._sr_observe_rpc(inflight, got_packet=True)
+            return result
+        if reply_stops_speculation(
+            reply.protocol_version, session_rpc_matched=True
+        ) or any(
+            item.reason == "protocol_mismatch" for item in reply.reqs
+        ):
+            self._sr_stop_speculation(
+                "protocol_mismatch"
+                if any(item.reason == "protocol_mismatch" for item in reply.reqs)
+                else "protocol_version"
+            )
             self._sr_observe_rpc(inflight, got_packet=True)
             return result
         pending = inflight.pending
@@ -369,11 +504,76 @@ class SchedulerStandaloneRemoteTargetMixin:
         inflight = self._sr_send(action, reqs, include_full_context)
         return self._sr_recv(inflight)
 
+    def _sr_apply_commit_acks(
+        self, reqs: List[Req], replies: Dict[str, SRDraftReply]
+    ) -> List[Req]:
+        """Advance cursors. Returns rids that asked for one snapshot retry."""
+        pending = getattr(self, "_sr_ack_pending", {}) or {}
+        metrics = get_sr_round_metrics(self, "Target")
+        retry: List[Req] = []
+        for req in reqs:
+            self._sr_ensure_cursor(req)
+            item = replies.get(req.rid)
+            entry = pending.get(req.rid)
+            if item is None or entry is None:
+                req.sr_force_snapshot = True
+                continue
+            if item.status == SRReplyStatus.NEED_SNAPSHOT:
+                note_commit_result(metrics, "commit_recover_" + (item.reason or "snapshot"))
+                retry.append(req)
+                req.sr_force_snapshot = True
+                continue
+            if item.status == SRReplyStatus.REJECT and item.reason in (
+                "unrecoverable_mm",
+                "completion_unknown",
+                "untrusted_kv",
+            ):
+                req.sr_stop_spec = True
+                _clear_draft(req)
+                continue
+            if item.status == SRReplyStatus.REJECT:
+                continue
+            if status_advances_cursor(item.status):
+                ok, _reason = ack_matches(item, entry)
+                if ok:
+                    req.sr_ack_commit_version = entry.commit_version
+                    req.sr_ack_output_len = entry.sent_output_len
+                    req.sr_force_snapshot = False
+                    if item.status == SRReplyStatus.IDEMPOTENT:
+                        note_commit_result(metrics, "commit_idempotent_hits")
+                    continue
+            req.sr_force_snapshot = True
+        return retry
+
     def rpc_next_draft(self, reqs: List[Req]) -> Dict[str, SRDraftReply]:
         breaker = getattr(self, "sr_breaker", None)
         if breaker is not None and not breaker.should_send():
             return {}
-        return self._sr_rpc(SRAction.STEP, reqs, include_full_context=False)
+        if getattr(self, "sr_speculation_stopped", False):
+            return {}
+        live = [req for req in reqs if not getattr(req, "sr_stop_spec", False)]
+        if not live:
+            return {}
+        replies = self._sr_rpc(SRAction.STEP, live, include_full_context=False)
+        if getattr(self, "sr_speculation_stopped", False):
+            return {}
+        retry = self._sr_apply_commit_acks(live, replies)
+        if not retry:
+            return replies
+        for req in retry:
+            req.sr_force_snapshot = True
+        snap = self._sr_rpc(SRAction.STEP, retry, include_full_context=True)
+        if getattr(self, "sr_speculation_stopped", False):
+            return replies
+        again = self._sr_apply_commit_acks(retry, snap)
+        metrics = get_sr_round_metrics(self, "Target")
+        note_commit_result(metrics, "commit_resend_ok", len(retry) - len(again))
+        note_commit_result(metrics, "commit_resend_fail", len(again))
+        for req in again:
+            req.sr_force_snapshot = True
+            _clear_draft(req)
+        replies.update(snap)
+        return replies
 
     def notify_sr_draft_finished(self, req: Req, action: SRAction = SRAction.FINISH) -> None:
         if _is_health_check(req):
@@ -508,6 +708,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                         if inflight is not None:
                             replies = self._sr_recv(inflight)
                             still = [r for r in live if not r.finished()]
+                            self._sr_apply_commit_acks(still, replies)
                             self._sr_maybe_align_chain_replies(
                                 still, replies, prefill=True
                             )

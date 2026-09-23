@@ -64,6 +64,17 @@ from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
     release_mm_resources,
     reset_mm_mrope,
 )
+from sglang.srt.speculative.standalone_remote.sr_commit import (
+    SR_PROTOCOL_VERSION,
+    CommitOutcome,
+    RecoveryRoute,
+    commit_fingerprint,
+    grammar_committed_ids,
+    inspect_commit,
+    mm_items_complete,
+    note_commit_result,
+    route_snapshot_recovery,
+)
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
     SRBatchReply,
@@ -778,14 +789,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             if template is None:
                 continue
             try:
-                committed_ids = req.output_ids or []
-                if self._sr_tree_mode():
-                    # Recovery may have folded committed output into origin.
-                    # Grammar history starts after the original padded prompt.
-                    prompt = getattr(req, "sr_padded_ids", req.origin_input_ids)
-                    committed_ids = (
-                        list(req.origin_input_ids or []) + list(req.output_ids or [])
-                    )[len(prompt) :]
+                committed_ids = grammar_committed_ids(
+                    getattr(req, "sr_commit_output_ids", None),
+                    req.output_ids,
+                    req.origin_input_ids,
+                    getattr(req, "sr_padded_ids", None),
+                    tree_mode=self._sr_tree_mode(),
+                )
                 req.grammar = replay_grammar_from_committed(
                     template, committed_ids
                 )
@@ -1707,6 +1717,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                 [r.rid for r in ready],
                 e,
             )
+            # An empty window is not a completed commit. The KV may be partial.
+            for req in ready:
+                req.sr_commit_incomplete = True
             got = [empty] * len(ready)
         finally:
             for req in ready:
@@ -1863,6 +1876,278 @@ class StandaloneRemoteDraftSchedulerMixin:
         if lease is None:
             return None
         return lease.version
+
+    def _sr_v2_reply(
+        self,
+        dreq: SRDraftRequest,
+        status: SRReplyStatus,
+        *,
+        reason: Optional[str] = None,
+        window: Optional[SRWindow] = None,
+        tree_version: Optional[int] = None,
+        ack_version: Optional[int] = None,
+        ack_len: Optional[int] = None,
+    ) -> SRDraftReply:
+        tokens, parent_list, top_index = window or ([], None, None)
+        return SRDraftReply(
+            rid=dreq.rid,
+            step_id=dreq.step_id,
+            base_committed_len=dreq.base_committed_len,
+            draft_tokens=list(tokens),
+            status=status,
+            parent_list=parent_list,
+            top_scores_index=top_index,
+            tree_version=tree_version,
+            ack_commit_version=ack_version,
+            ack_output_len=ack_len,
+            reason=reason,
+        )
+
+    def _sr_cached_reply(self, dreq: SRDraftRequest, state: SRDraftState) -> Optional[SRDraftReply]:
+        cached = state.last_reply
+        if not cached:
+            return None
+        return SRDraftReply(
+            rid=dreq.rid,
+            step_id=dreq.step_id,
+            base_committed_len=dreq.base_committed_len,
+            draft_tokens=list(cached.get("draft_tokens") or []),
+            status=SRReplyStatus.IDEMPOTENT,
+            parent_list=cached.get("parent_list"),
+            top_scores_index=cached.get("top_scores_index"),
+            tree_version=cached.get("tree_version"),
+            ack_commit_version=cached.get("ack_commit_version"),
+            ack_output_len=cached.get("ack_output_len"),
+        )
+
+    def _sr_remember_commit(
+        self,
+        state: SRDraftState,
+        dreq: SRDraftRequest,
+        output_ids: List[int],
+        reply: SRDraftReply,
+    ) -> None:
+        state.acked_output_ids = list(output_ids)
+        state.acked_version = int(dreq.commit_version)
+        state.commit_trusted = True
+        state.completion_unknown = False
+        state.last_commit_fingerprint = commit_fingerprint(dreq)
+        state.last_num_draft_tokens = int(dreq.num_draft_tokens or 0)
+        state.last_step_id = dreq.step_id
+        state.last_base_committed_len = dreq.base_committed_len
+        state.last_reply = {
+            "draft_tokens": list(reply.draft_tokens or []),
+            "parent_list": reply.parent_list,
+            "top_scores_index": reply.top_scores_index,
+            "tree_version": reply.tree_version,
+            "ack_commit_version": reply.ack_commit_version,
+            "ack_output_len": reply.ack_output_len,
+        }
+        state.last_window = (
+            list(reply.draft_tokens or []),
+            reply.parent_list,
+            reply.top_scores_index,
+        )
+
+    def _sr_mm_can_restore(self, req: Optional[Req], dreq: SRDraftRequest, mm) -> bool:
+        if not getattr(dreq, "requires_mm", False):
+            return True
+        if (
+            req is not None
+            and getattr(req, "multimodal_inputs", None) is not None
+            and getattr(req, "sr_commit_kv_trusted", True)
+        ):
+            return True
+        items = []
+        if mm is not None:
+            items = list(getattr(mm, "mm_items", None) or [])
+        return mm_items_complete(items)
+
+    def _sr_prepare_v2(
+        self,
+        dreq: SRDraftRequest,
+        action: SRAction,
+        session_id: str,
+        mm: Optional[SRMMPayload],
+    ) -> Tuple[Optional[SRDraftReply], Optional[Req], Optional[SRDraftRequest]]:
+        """Returns (early_reply, live_req, local_request)."""
+        metrics = get_sr_round_metrics(self, "Draft")
+        state = self.sr_state.get(dreq.rid)
+        current_session = self.sr_state.session_id
+        if current_session is not None and session_id < current_session:
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="stale_session"),
+                None,
+                None,
+            )
+        req = state.req_object if state is not None else None
+        if state is not None and state.completion_unknown:
+            return (
+                self._sr_v2_reply(
+                    dreq, SRReplyStatus.REJECT, reason="completion_unknown"
+                ),
+                None,
+                None,
+            )
+        verdict = inspect_commit(
+            dreq,
+            action=action,
+            current_version=None if state is None else state.acked_version,
+            current_output=None if state is None else state.acked_output_ids,
+            prompt_len=0 if state is None else state.prompt_len,
+            cached_fingerprint=None if state is None else state.last_commit_fingerprint,
+            has_state=state is not None and req is not None,
+            state_trusted=True if state is None else state.commit_trusted,
+        )
+        if verdict.outcome == CommitOutcome.CONTROL:
+            if action in (SRAction.FINISH, SRAction.ABORT):
+                self._sr_finish_rid(dreq.rid)
+            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None, None
+        if verdict.outcome == CommitOutcome.CACHE:
+            cached = self._sr_cached_reply(dreq, state)
+            note_commit_result(metrics, "commit_idempotent_hits")
+            if cached is None:
+                return (
+                    self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="missing_cache"),
+                    None,
+                    None,
+                )
+            return cached, None, None
+        if verdict.outcome == CommitOutcome.REJECT:
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason=verdict.reason),
+                None,
+                None,
+            )
+        if verdict.outcome == CommitOutcome.NEED_SNAPSHOT:
+            note_commit_result(metrics, "commit_need_snapshot")
+            return (
+                self._sr_v2_reply(
+                    dreq, SRReplyStatus.NEED_SNAPSHOT, reason=verdict.reason
+                ),
+                None,
+                None,
+            )
+
+        output_ids = list(verdict.output_ids or [])
+        prompt = list(getattr(req, "sr_padded_ids", None) or dreq.padded_input_ids or [])
+        if dreq.commit_mode == "snapshot":
+            prompt = list(dreq.padded_input_ids or prompt)
+        local = replace(dreq, committed_ids=list(output_ids))
+        route = RecoveryRoute.ALIGN
+        if verdict.outcome == CommitOutcome.FORCE_RESET:
+            route = route_snapshot_recovery(
+                kv_trusted=False,
+                degraded=bool(state is not None and state.degraded),
+                poisoned=bool(getattr(self, "_sr_device_poisoned", False)),
+                completion_unknown=bool(
+                    state is not None and state.completion_unknown
+                ),
+            )
+        if route == RecoveryRoute.BLOCKED:
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
+                None,
+                None,
+            )
+        if not self._sr_mm_can_restore(req, dreq, mm) and (
+            req is None or route == RecoveryRoute.REPREFILL
+        ):
+            return (
+                self._sr_v2_reply(
+                    dreq, SRReplyStatus.REJECT, reason="unrecoverable_mm"
+                ),
+                None,
+                None,
+            )
+        if (
+            verdict.outcome == CommitOutcome.APPLY
+            and dreq.commit_mode == "delta"
+            and dreq.delta_ids == []
+            and state is not None
+            and state.last_window is not None
+            and state.last_step_id == dreq.step_id
+            and state.last_base_committed_len == dreq.base_committed_len
+            and state.last_num_draft_tokens == int(dreq.num_draft_tokens or 0)
+        ):
+            reply = self._sr_v2_reply(
+                dreq,
+                SRReplyStatus.OK if state.last_window[0] else SRReplyStatus.EMPTY,
+                window=state.last_window,
+                tree_version=(state.last_reply or {}).get("tree_version"),
+                ack_version=int(dreq.commit_version),
+                ack_len=len(output_ids),
+            )
+            self._sr_remember_commit(state, dreq, output_ids, reply)
+            if req is not None:
+                req.sr_commit_output_ids = list(output_ids)
+            return reply, None, None
+
+        if req is None:
+            if dreq.commit_mode != "snapshot":
+                return (
+                    self._sr_v2_reply(dreq, SRReplyStatus.NEED_SNAPSHOT, reason="no_req"),
+                    None,
+                    None,
+                )
+            req = self._sr_create_req(dreq, mm, session_id)
+            if req is None:
+                return self._sr_v2_reply(dreq, SRReplyStatus.EMPTY), None, None
+            state = self.sr_state.get(dreq.rid)
+        elif route == RecoveryRoute.REPREFILL:
+            fill = list(prompt) + list(output_ids)
+            self._sr_reprefill(req, fill, local, state)
+        else:
+            self._sr_align(req, local, state)
+        req.sr_commit_output_ids = list(output_ids)
+        req.sr_pending_wire_request = dreq
+        if state is not None and dreq.commit_mode == "snapshot":
+            state.prompt_len = len(prompt)
+        return None, req, local
+
+    def _sr_finalize_v2_commit(
+        self,
+        dreq: SRDraftRequest,
+        req: Req,
+        reply: SRDraftReply,
+    ) -> SRDraftReply:
+        state = self.sr_state.get(dreq.rid)
+        output_ids = list(getattr(req, "sr_commit_output_ids", []) or [])
+        if getattr(req, "sr_commit_incomplete", False) or (
+            state is not None and state.completion_unknown
+        ):
+            if state is not None:
+                state.commit_trusted = False
+                state.completion_unknown = True
+            reply.ack_commit_version = None
+            reply.ack_output_len = None
+            reply.status = SRReplyStatus.EMPTY
+            reply.reason = "commit_incomplete"
+            reply.draft_tokens = []
+            return reply
+        reply.ack_commit_version = int(dreq.commit_version)
+        reply.ack_output_len = len(output_ids)
+        if state is not None:
+            self._sr_remember_commit(state, dreq, output_ids, reply)
+        return reply
+
+    def _sr_protocol_mismatch_reply(self, batch: SRBatchRequest) -> SRBatchReply:
+        return SRBatchReply(
+            session_id=batch.session_id,
+            rpc_seq=batch.rpc_seq,
+            protocol_version=SR_PROTOCOL_VERSION,
+            reqs=[
+                SRDraftReply(
+                    rid=dreq.rid,
+                    step_id=dreq.step_id,
+                    base_committed_len=dreq.base_committed_len,
+                    draft_tokens=[],
+                    status=SRReplyStatus.REJECT,
+                    reason="protocol_mismatch",
+                )
+                for dreq in batch.reqs
+            ],
+        )
 
     def _sr_prepare_one(
         self,
@@ -2027,6 +2312,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         n = len(batch.reqs)
         replies: List[Optional[SRDraftReply]] = [None] * n
         gpu_pairs: List[Tuple[int, SRDraftRequest, Req]] = []
+        use_v2 = batch.protocol_version == SR_PROTOCOL_VERSION
         # After a batch-level wipe, later rids must see the new session so
         # decide_draft_action does not WIPE_NEW_SESSION again and drop siblings.
         prepare_last_session = (
@@ -2034,15 +2320,20 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
         prepare_last_rpc = -1 if wiped_this_batch else last_rpc
         for i, dreq in enumerate(batch.reqs):
-            reply, req = self._sr_prepare_one(
-                dreq,
-                batch.action,
-                batch.session_id,
-                batch.rpc_seq,
-                mm_by_rid.get(dreq.rid),
-                prepare_last_session,
-                prepare_last_rpc,
-            )
+            if use_v2:
+                reply, req, _local = self._sr_prepare_v2(
+                    dreq, batch.action, batch.session_id, mm_by_rid.get(dreq.rid)
+                )
+            else:
+                reply, req = self._sr_prepare_one(
+                    dreq,
+                    batch.action,
+                    batch.session_id,
+                    batch.rpc_seq,
+                    mm_by_rid.get(dreq.rid),
+                    prepare_last_session,
+                    prepare_last_rpc,
+                )
             if reply is not None:
                 replies[i] = reply
             else:
@@ -2054,19 +2345,39 @@ class StandaloneRemoteDraftSchedulerMixin:
                 batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
             )
             reply_start = time.perf_counter()
-            for (i, dreq, _req), window in zip(gpu_pairs, windows):
-                replies[i] = self._sr_stamp_window(
-                    dreq, window, batch.rpc_seq, batch.session_id
+            for (i, dreq, req), window in zip(gpu_pairs, windows):
+                wire = getattr(req, "sr_pending_wire_request", None) or dreq
+                reply = self._sr_stamp_window(
+                    wire, window, batch.rpc_seq, batch.session_id
                 )
+                if use_v2:
+                    reply = self._sr_finalize_v2_commit(wire, req, reply)
+                replies[i] = reply
             if metrics.active:
                 metrics.host["reply_prepare"] += time.perf_counter() - reply_start
         if self.sr_server is not None:
             self.sr_server.remember(batch)
+        self._sr_note_handled(batch)
         return SRBatchReply(
             session_id=batch.session_id,
             rpc_seq=batch.rpc_seq,
+            protocol_version=SR_PROTOCOL_VERSION if use_v2 else None,
             reqs=[r if r is not None else self._sr_empty_reply(d) for r, d in zip(replies, batch.reqs)],
         )
+
+    def _sr_note_handled(self, batch: SRBatchRequest) -> None:
+        self.sr_handled_session = batch.session_id
+        self.sr_handled_rpc = int(batch.rpc_seq)
+
+    def _sr_batch_is_stale(self, batch: SRBatchRequest) -> bool:
+        """Same decision on every TP rank. Do not read rank 0's server cursor."""
+        last_session = getattr(self, "sr_handled_session", None)
+        last_rpc = int(getattr(self, "sr_handled_rpc", -1) or -1)
+        if last_session is not None and batch.session_id < last_session:
+            return True
+        if last_session == batch.session_id and int(batch.rpc_seq) <= last_rpc:
+            return True
+        return False
 
     def _sr_recv_packet(self):
         packet = None
@@ -2105,7 +2416,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             packet = self._sr_recv_packet()
             if packet is not None:
                 batch, mm = packet
-                if self.sr_server is not None and self.sr_server.is_stale(batch):
+                if self._sr_batch_is_stale(batch):
                     if self.tp_rank == 0:
                         logger.info(
                             "[SR] Draft drop stale session=%s rpc_seq=%s",
@@ -2116,7 +2427,14 @@ class StandaloneRemoteDraftSchedulerMixin:
                     metrics = get_sr_round_metrics(self, "Draft")
                     measure = self._sr_tree_mode() and batch.action == SRAction.STEP
                     with metrics.round() if measure else nullcontext():
-                        reply = self._sr_handle_batch(batch, mm)
+                        if (
+                            batch.protocol_version is not None
+                            and batch.protocol_version != SR_PROTOCOL_VERSION
+                        ):
+                            reply = self._sr_protocol_mismatch_reply(batch)
+                            self._sr_note_handled(batch)
+                        else:
+                            reply = self._sr_handle_batch(batch, mm)
                         if (
                             (self.tp_size == 1 or self.tp_rank == 0)
                             and self.sr_server is not None

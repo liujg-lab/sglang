@@ -183,11 +183,13 @@ class SRTargetClient(_CommEndpoint):
         self._url, transport = sr_endpoint(addr, port, bind=False)
         self.comm_metrics = SRCommMetrics("Target", transport)
         self._comm_pending = None
+        self.connection_generation = 0
         self._open()
 
     def _open(self) -> None:
         import zmq
 
+        self.connection_generation = int(self.connection_generation) + 1
         self._finish_comm("connection_reset")
         if self._socket is not None:
             try:

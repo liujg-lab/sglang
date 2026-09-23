@@ -26,6 +26,7 @@ class SRReplyStatus(Enum):
     EMPTY = "empty"
     IDEMPOTENT = "idempotent"
     REJECT = "reject"
+    NEED_SNAPSHOT = "need_snapshot"
 
 
 def _sampling_params_to_dict(sampling_params: SamplingParams) -> Dict[str, Any]:
@@ -77,6 +78,9 @@ def _sampling_params_from_dict(val: Dict[str, Any]) -> SamplingParams:
 class SRPendingEntry:
     step_id: int
     base_committed_len: int
+    commit_version: Optional[int] = None
+    sent_output_len: Optional[int] = None
+    protocol_version: Optional[int] = None
 
 
 @dataclass
@@ -92,6 +96,14 @@ class SRDraftRequest:
     commit_tree_version: Optional[int] = None
     commit_tree_base_committed_len: Optional[int] = None
     commit_candidate_indices: Optional[List[int]] = None
+    # Incremental commit. Absent on v1 requests. ``commit_mode`` is "snapshot"
+    # or "delta"; missing protocol_version on the batch stays v1.
+    commit_mode: Optional[str] = None
+    commit_version: Optional[int] = None
+    base_commit_version: Optional[int] = None
+    base_output_len: Optional[int] = None
+    delta_ids: Optional[List[int]] = None
+    requires_mm: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -135,6 +147,9 @@ class SRDraftReply:
     parent_list: Optional[List[int]] = None
     top_scores_index: Optional[List[int]] = None
     tree_version: Optional[int] = None
+    ack_commit_version: Optional[int] = None
+    ack_output_len: Optional[int] = None
+    reason: Optional[str] = None
 
     def matches(self, pending: SRPendingEntry) -> Tuple[bool, Optional[str]]:
         if self.step_id != pending.step_id:
@@ -175,14 +190,19 @@ class SRBatchRequest:
     rpc_seq: int
     action: SRAction
     reqs: List[SRDraftRequest] = field(default_factory=list)
+    # Missing means the historical protocol. Do not default this to 2.
+    protocol_version: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "session_id": self.session_id,
             "rpc_seq": self.rpc_seq,
             "action": self.action.value,
             "reqs": [r.to_dict() for r in self.reqs],
         }
+        if self.protocol_version is not None:
+            result["protocol_version"] = self.protocol_version
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SRBatchRequest":
@@ -193,11 +213,13 @@ class SRBatchRequest:
             SRDraftRequest.from_dict(x) if isinstance(x, dict) else x
             for x in (d.get("reqs") or [])
         ]
+        version = d.get("protocol_version", None)
         return cls(
             session_id=d["session_id"],
             rpc_seq=int(d["rpc_seq"]),
             action=action,
             reqs=reqs,
+            protocol_version=None if version is None else int(version),
         )
 
 
@@ -207,6 +229,7 @@ class SRBatchReply:
     rpc_seq: int
     reqs: List[SRDraftReply] = field(default_factory=list)
     draft_residence_ns: Optional[int] = None
+    protocol_version: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -214,6 +237,8 @@ class SRBatchReply:
             "rpc_seq": self.rpc_seq,
             "reqs": [r.to_dict() for r in self.reqs],
         }
+        if self.protocol_version is not None:
+            result["protocol_version"] = self.protocol_version
         if type(self.draft_residence_ns) is int and self.draft_residence_ns >= 0:
             result["draft_residence_ns"] = self.draft_residence_ns
         return result
@@ -224,6 +249,7 @@ class SRBatchReply:
             SRDraftReply.from_dict(x) if isinstance(x, dict) else x
             for x in (d.get("reqs") or [])
         ]
+        version = d.get("protocol_version", None)
         return cls(
             session_id=d["session_id"],
             rpc_seq=int(d["rpc_seq"]),
@@ -231,6 +257,7 @@ class SRBatchReply:
             # Preserve malformed optional telemetry for transport validation;
             # it must never prevent an otherwise valid reply from being used.
             draft_residence_ns=d.get("draft_residence_ns"),
+            protocol_version=None if version is None else int(version),
         )
 
 
