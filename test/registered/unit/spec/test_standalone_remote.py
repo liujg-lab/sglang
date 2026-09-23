@@ -2289,6 +2289,473 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(parents[0, :2].tolist(), [-1, 0])
         self.assertEqual(indices[1, :3].tolist(), [3, 4, 5])
 
+    def test_assemble_chain_tree_and_empty_list_expected(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            assemble_draft_rows,
+            cached_chain_template,
+        )
+
+        parents, indices, tokens = assemble_draft_rows(
+            [[11, 12, 13]],
+            [None],
+            [None],
+            topk=2,
+            spec_steps=3,
+            num_draft_tokens=4,
+        )
+        self.assertEqual(tokens.tolist(), [[11, 12, 13]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2]])
+
+        parents, indices, tokens = assemble_draft_rows(
+            [[11, 12, 13]],
+            [[9, 9, 9, 9]],
+            [[7, 7, 7]],
+            topk=1,
+            spec_steps=3,
+            num_draft_tokens=4,
+        )
+        self.assertEqual(tokens.tolist(), [[11, 12, 13]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2]])
+
+        parents, indices, tokens = assemble_draft_rows(
+            [[11, 12]],
+            [[]],
+            [[]],
+            topk=2,
+            spec_steps=3,
+            num_draft_tokens=4,
+        )
+        self.assertEqual(tokens.tolist(), [[11, 12, 0]])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 0, 0]])
+
+        parents, indices, tokens = assemble_draft_rows(
+            [[11, 12, 13], [21]],
+            [[-1, 4, 5, 6], None],
+            [[8, 7, 6, 5], [1]],
+            topk=2,
+            spec_steps=3,
+            num_draft_tokens=4,
+        )
+        self.assertEqual(tokens.tolist(), [[11, 12, 13], [21, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, 4, 5, 6], [-1, 0, 1, -1]])
+        self.assertEqual(indices.tolist(), [[8, 7, 6, 5], [0, 1, 2, 0]])
+
+        first_parents, first_indices = cached_chain_template(4, 3)
+        parent_ptr = first_parents.data_ptr()
+        index_ptr = first_indices.data_ptr()
+        parent_snapshot = first_parents.clone()
+        index_snapshot = first_indices.clone()
+        again_parents, again_indices = cached_chain_template(4, 3)
+        self.assertEqual(again_parents.data_ptr(), parent_ptr)
+        self.assertEqual(again_indices.data_ptr(), index_ptr)
+        self.assertEqual(again_parents.tolist(), parent_snapshot.tolist())
+        self.assertEqual(again_indices.tolist(), index_snapshot.tolist())
+
+    def test_packet_width_changes_do_not_reuse_old_stride(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            packet_segment_views,
+            plan_draft_rows,
+            write_draft_regions,
+        )
+
+        storage = torch.full((64,), 99, dtype=torch.int64)
+
+        def fill(tokens, parents, indices):
+            plan = plan_draft_rows([tokens], [parents], [indices], 2, 3, 4)
+            verified, tok, par, idx = packet_segment_views(storage, plan)
+            verified[0] = 5
+            write_draft_regions(tok, par, idx, plan)
+            return plan, verified, tok, par, idx
+
+        wide, verified, tokens, parents, indices = fill(
+            [11, 12, 13],
+            [-1, 0, 1, 2, 3, 4],
+            [9, 8, 7, 6, 5, 4, 3, 2],
+        )
+        self.assertEqual(wide.used, 18)
+        self.assertEqual(wide.parent_w, 6)
+        self.assertEqual(wide.index_w, 8)
+        self.assertEqual(verified.tolist(), [5])
+        self.assertEqual(tokens.tolist(), [[11, 12, 13]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3, 4]])
+        self.assertEqual(indices.tolist(), [[9, 8, 7, 6, 5, 4, 3, 2]])
+
+        chain, verified, tokens, parents, indices = fill([21, 22], None, None)
+        self.assertEqual(chain.used, 10)
+        self.assertEqual(chain.parent_w, 3)
+        self.assertEqual(chain.index_w, 3)
+        self.assertEqual(list(parents.shape), [1, 3])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2]])
+        self.assertEqual(tokens.tolist(), [[21, 22, 0]])
+        self.assertNotIn(4, parents.reshape(-1).tolist())
+        self.assertNotIn(9, indices.reshape(-1).tolist())
+
+        wide, verified, tokens, parents, indices = fill(
+            [31, 32, 33],
+            [-1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+        )
+        self.assertEqual(wide.used, 18)
+        self.assertEqual(storage.numel(), 64)
+        self.assertEqual(parents.tolist(), [[-1, 1, 1, 1, 1, 1]])
+        self.assertEqual(indices.tolist(), [[1, 1, 1, 1, 1, 1, 1, 1]])
+        self.assertEqual(tokens.tolist(), [[31, 32, 33]])
+
+    def _packet_worker(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            VerifyInputPacket,
+        )
+
+        return VerifyInputPacket()
+
+    def _packet_batch(self, rows, metrics=None):
+        reqs = []
+        for verified, tokens, parents, indices in rows:
+            req = SimpleNamespace(
+                origin_input_ids=[verified],
+                output_ids=[],
+                draft_tokens_and_logits={
+                    "draft_tokens": tokens,
+                    "parent_list": parents,
+                    "top_scores_index": indices,
+                },
+            )
+            reqs.append(req)
+        return SimpleNamespace(
+            reqs=reqs,
+            device=torch.device("cpu"),
+            sr_round_metrics=metrics,
+        )
+
+    def _assemble(self, packet, batch, topk=2):
+        verified_ids = []
+        token_rows = []
+        parent_rows = []
+        index_rows = []
+        for req in batch.reqs:
+            verified_ids.append(
+                req.output_ids[-1]
+                if len(req.output_ids) > 0
+                else req.origin_input_ids[-1]
+            )
+            draft = req.draft_tokens_and_logits
+            token_rows.append(None if draft is None else draft.get("draft_tokens"))
+            parent_rows.append(None if draft is None else draft.get("parent_list"))
+            index_rows.append(None if draft is None else draft.get("top_scores_index"))
+        return packet.load(
+            verified_ids,
+            token_rows,
+            parent_rows,
+            index_rows,
+            topk,
+            3,
+            4,
+            batch.device,
+            batch.sr_round_metrics,
+        )
+
+    def test_cpu_packet_skips_submit_and_drops_stale_rows(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from collections import Counter
+
+        packet = self._packet_worker()
+        from sglang.srt.speculative.standalone_remote import sr_verify_layout as layout_mod
+
+        def fail_submit(*_args, **_kwargs):
+            raise AssertionError("cpu path called submit_copy")
+
+        metrics = SimpleNamespace(host=Counter(), counts=Counter())
+        with patch.object(layout_mod, "submit_copy", fail_submit):
+            verified, parents, indices, tokens = self._assemble(
+                packet,
+                self._packet_batch(
+                    [
+                        (10, [11, 12, 13], [-1, 4, 5, 6], [8, 7, 6, 5]),
+                        (20, [21, 22], None, None),
+                    ],
+                    metrics,
+                ),
+            )
+            self.assertEqual(verified.tolist(), [10, 20])
+            self.assertEqual(tokens.tolist(), [[11, 12, 13], [21, 22, 0]])
+            self.assertEqual(parents.tolist(), [[-1, 4, 5, 6], [-1, 0, 1, -1]])
+            self.assertEqual(indices.tolist(), [[8, 7, 6, 5], [0, 1, 2, 0]])
+            host_ptr = packet.host_packet.data_ptr()
+            capacity = packet.capacity
+
+            verified, parents, indices, tokens = self._assemble(
+                packet,
+                self._packet_batch([(30, [7], None, None)], metrics),
+            )
+            self.assertEqual(verified.tolist(), [30])
+            self.assertEqual(tokens.tolist(), [[7, 0, 0]])
+            self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+            self.assertNotIn(20, verified.tolist())
+            self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
+            self.assertEqual(packet.capacity, capacity)
+
+            verified, parents, indices, tokens = self._assemble(
+                packet,
+                self._packet_batch(
+                    [
+                        (40, [8, 9], None, None),
+                        (50, [6], None, None),
+                    ],
+                    metrics,
+                ),
+            )
+        self.assertEqual(verified.tolist(), [40, 50])
+        self.assertEqual(tokens.tolist(), [[8, 9, 0], [6, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1], [-1, 0, 1]])
+        self.assertEqual(metrics.counts["verify_packet_upload"], 0)
+        self.assertGreaterEqual(metrics.counts["verify_packet_grow"], 1)
+        self.assertGreater(metrics.host["verify_packet_fill"], 0)
+        self.assertEqual(metrics.host["verify_packet_wait"], 0)
+
+    def test_packet_upload_once_and_unresolved_blocks_reuse(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from collections import Counter
+
+        packet = self._packet_worker()
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+        from sglang.srt.speculative.standalone_remote import sr_verify_layout as layout_mod
+
+        packet.on_accelerator = lambda device: True
+        uploads = []
+        waits = []
+
+        def fake_submit(dst, src):
+            uploads.append((int(dst.numel()), int(src[0].item())))
+            dst.copy_(src)
+            return SimpleNamespace(name="event")
+
+        def fake_wait(event):
+            waits.append(int(packet.host_packet[0].item()))
+            self.assertEqual(event.name, "event")
+
+        metrics = SimpleNamespace(host=Counter(), counts=Counter())
+        batch = self._packet_batch([(11, [1, 2, 3], None, None)], metrics)
+        with patch.object(layout_mod, "submit_copy", fake_submit), patch.object(
+            layout_mod, "wait_event", fake_wait
+        ):
+            verified, parents, indices, tokens = self._assemble(packet, batch)
+            self.assertEqual(uploads, [(10, 11)])
+            self.assertEqual(metrics.counts["verify_packet_upload"], 1)
+            self.assertEqual(verified.tolist(), [11])
+            self.assertEqual(tokens.tolist(), [[1, 2, 3]])
+            self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+            self.assertEqual(indices.tolist(), [[0, 1, 2]])
+            self.assertEqual(waits, [])
+
+            empty = self._packet_batch([], metrics)
+            empty_views = self._assemble(packet, empty)
+            self.assertEqual([view.shape[0] for view in empty_views], [0, 0, 0, 0])
+            self.assertEqual(len(uploads), 1)
+
+            second = self._packet_batch([(22, [4], None, None)], metrics)
+            verified, _parents, _indices, tokens = self._assemble(packet, second)
+            self.assertEqual(waits, [11])
+            self.assertEqual(verified.tolist(), [22])
+            self.assertEqual(tokens.tolist(), [[4, 0, 0]])
+            self.assertEqual(len(uploads), 2)
+            self.assertGreater(metrics.host["verify_packet_wait"], 0)
+
+        host = packet.host_packet
+        device = packet.device_packet
+        capacity = packet.capacity
+        host_ptr = host.data_ptr()
+        device_ptr = device.data_ptr()
+
+        def wait_ok(_event):
+            return None
+
+        def record_fails(dst, src):
+            dst.copy_(src)
+            raise SRTransferUnresolved("record failed")
+
+        with patch.object(layout_mod, "wait_event", wait_ok), patch.object(
+            layout_mod, "submit_copy", record_fails
+        ):
+            with self.assertRaises(SRTransferUnresolved):
+                self._assemble(
+                    packet, self._packet_batch([(33, [5, 5, 5], None, None)], metrics)
+                )
+        self.assertTrue(packet.unresolved)
+        self.assertEqual(int(host[0].item()), 33)
+        filled = host.clone()
+        self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
+        self.assertEqual(packet.device_packet.data_ptr(), device_ptr)
+        self.assertEqual(packet.capacity, capacity)
+        with self.assertRaises(RuntimeError):
+            self._assemble(
+                packet,
+                self._packet_batch(
+                    [
+                        (44, [1], [-1, 0, 1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7, 8]),
+                        (45, [2], None, None),
+                    ],
+                    metrics,
+                ),
+            )
+        self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
+        self.assertEqual(packet.capacity, capacity)
+        self.assertEqual(host.tolist(), filled.tolist())
+
+        packet = self._packet_worker()
+        packet.on_accelerator = lambda device: True
+        packet.event = SimpleNamespace(name="event")
+        packet.host_packet = torch.full((16,), 7, dtype=torch.int64)
+        packet.device_packet = torch.full((16,), 7, dtype=torch.int64)
+        packet.capacity = 16
+        host_ptr = packet.host_packet.data_ptr()
+        snapshot = packet.host_packet.clone()
+
+        def wait_fails(_event):
+            raise SRTransferUnresolved("wait failed")
+
+        def fail_submit(*_args, **_kwargs):
+            raise AssertionError("wait failure still uploaded")
+
+        with patch.object(layout_mod, "wait_event", wait_fails), patch.object(
+            layout_mod, "submit_copy", fail_submit
+        ):
+            with self.assertRaises(SRTransferUnresolved):
+                self._assemble(
+                    packet, self._packet_batch([(99, [8, 8, 8], None, None)], metrics)
+                )
+        self.assertTrue(packet.unresolved)
+        self.assertEqual(packet.host_packet.tolist(), snapshot.tolist())
+        self.assertEqual(packet.capacity, 16)
+        with self.assertRaises(RuntimeError):
+            packet.ensure(128, torch.device("cpu"), metrics)
+        self.assertEqual(packet.capacity, 16)
+        self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
+
+    def test_unindexed_device_matches_indexed_buffer(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            devices_compatible,
+        )
+
+        self.assertTrue(
+            devices_compatible(torch.device("cuda:0"), torch.device("cuda"))
+        )
+        self.assertFalse(
+            devices_compatible(torch.device("cuda:0"), torch.device("cuda:1"))
+        )
+        self.assertTrue(devices_compatible(torch.device("cpu"), torch.device("cpu")))
+        self.assertFalse(
+            devices_compatible(torch.device("cpu"), torch.device("cuda"))
+        )
+        self.assertFalse(
+            devices_compatible(torch.device("cuda"), torch.device("cuda:0"))
+        )
+
+    def test_ensure_reuses_packet_for_unindexed_device(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        npu = getattr(torch, "npu", None)
+        has_npu = bool(npu is not None and npu.is_available())
+        if not (torch.cuda.is_available() or has_npu):
+            self.skipTest("no accelerator for packet allocation reuse")
+        from collections import Counter
+
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            VerifyInputPacket,
+        )
+
+        device_type = "npu" if has_npu else "cuda"
+        packet = VerifyInputPacket()
+        metrics = SimpleNamespace(host=Counter(), counts=Counter())
+        packet.ensure(8, device_type, metrics)
+        self.assertEqual(metrics.counts["verify_packet_grow"], 1)
+        pointer = packet.device_packet.data_ptr()
+        packet.ensure(8, device_type, metrics)
+        self.assertEqual(metrics.counts["verify_packet_grow"], 1)
+        self.assertEqual(packet.device_packet.data_ptr(), pointer)
+
+    def test_packet_build_tree_matches_and_keeps_graph_buffers(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        npu = getattr(torch, "npu", None)
+        has_npu = bool(npu is not None and npu.is_available())
+        if not (torch.cuda.is_available() or has_npu):
+            self.skipTest("no accelerator for build_tree")
+        try:
+            from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
+            from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+                packet_segment_views,
+                plan_draft_rows,
+                write_draft_regions,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        device = torch.device("npu") if has_npu else torch.device("cuda")
+        plan = plan_draft_rows(
+            [[11, 12, 13]],
+            [None],
+            [None],
+            1,
+            3,
+            4,
+        )
+        host = torch.empty((plan.used,), dtype=torch.int64)
+        verified, tokens, parents, indices = packet_segment_views(host, plan)
+        verified[0] = 5
+        write_draft_regions(tokens, parents, indices, plan)
+        seq_lens = torch.tensor([4], dtype=torch.int64, device=device)
+        mask = torch.empty((4 * 4 + 4 * 4,), dtype=torch.bool, device=device)
+        positions = torch.empty((4,), dtype=torch.int64, device=device)
+        mask_ptr = mask.data_ptr()
+        pos_ptr = positions.data_ptr()
+        try:
+            packet_out = build_tree_kernel_efficient(
+                verified.to(device),
+                parents.to(device),
+                indices.to(device),
+                tokens.to(device),
+                seq_lens,
+                4,
+                1,
+                3,
+                4,
+                tree_mask_buf=mask,
+                position_buf=positions,
+            )
+            separate_out = build_tree_kernel_efficient(
+                verified.to(device),
+                parents.to(device).clone(),
+                indices.to(device).clone(),
+                tokens.to(device).clone(),
+                seq_lens,
+                4,
+                1,
+                3,
+                4,
+                tree_mask_buf=torch.empty_like(mask),
+                position_buf=torch.empty_like(positions),
+            )
+        except Exception as exc:
+            self.skipTest(f"build_tree unavailable: {exc}")
+        self.assertEqual(packet_out[0].data_ptr(), mask_ptr)
+        self.assertEqual(packet_out[1].data_ptr(), pos_ptr)
+        for left, right in zip(packet_out, separate_out):
+            self.assertEqual(left.detach().cpu().tolist(), right.detach().cpu().tolist())
+
     def test_sync_kv_from_cpu_lengths_sets_bonus_and_finished(self):
         if torch is None:
             self.skipTest("torch not available")

@@ -21,7 +21,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    assemble_draft_rows,
+    VerifyInputPacket,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
@@ -150,10 +150,7 @@ class StandaloneRemoteWorker:
             int(getattr(server_args, "standalone_remote_max_batch_size", 0) or 0),
             1,
         )
-        self._verify_tokens_buf = None
-        self._verify_parents_buf = None
-        self._verify_indices_buf = None
-        self._verify_id_buf = None
+        self._verify_packet = VerifyInputPacket()
         self._verify_mask_buf = None
         self._verify_pos_buf = None
         runner = getattr(target_worker, "model_runner", None)
@@ -740,40 +737,6 @@ class StandaloneRemoteWorker:
         runner = getattr(self.target_worker, "model_runner", None)
         return getattr(runner, "attn_backend", None)
 
-    def _grow_int64_buf(self, name: str, rows: int, cols: int, device):
-        buf = getattr(self, name, None)
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
-        cols = max(int(cols), 1)
-        rows = max(int(rows), 1)
-        if (
-            buf is None
-            or buf.device != dev
-            or buf.dtype != torch.int64
-            or buf.dim() != 2
-            or buf.shape[0] < rows
-            or buf.shape[1] < cols
-        ):
-            buf = torch.zeros((rows, cols), dtype=torch.int64, device=dev)
-            setattr(self, name, buf)
-        return buf
-
-    def _verify_input_bufs(self, bs: int, token_width: int, parent_w: int, index_w: int, device):
-        cap = max(int(getattr(self, "_verify_max_bs", 1) or 1), bs)
-        tokens = self._grow_int64_buf("_verify_tokens_buf", cap, token_width, device)
-        parents = self._grow_int64_buf("_verify_parents_buf", cap, max(parent_w, 1), device)
-        indices = self._grow_int64_buf("_verify_indices_buf", cap, max(index_w, 1), device)
-        verified = getattr(self, "_verify_id_buf", None)
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if (
-            verified is None
-            or verified.device != dev
-            or verified.dtype != torch.int64
-            or verified.numel() < cap
-        ):
-            verified = torch.empty((cap,), dtype=torch.int64, device=dev)
-            self._verify_id_buf = verified
-        return verified[:bs], parents[:bs], indices[:bs], tokens[:bs]
-
     def _verify_mask_position_bufs(self, needed_mask: int, needed_pos: int, device):
         backend = self._attn_backend()
         graph_mask = graph_pos = None
@@ -839,54 +802,50 @@ class StandaloneRemoteWorker:
         topk: int,
         spec_steps: int,
         num_draft_tokens: int,
-        token_width: int,
+        _token_width: int,
     ):
-        """Build verify tensors. Never synthesizes a SPECTRE-style fake bush."""
-        verified_cpu = torch.empty(bs, dtype=torch.int64)
+        """Borrow verify views for this round. Never synthesizes a fake bush.
+
+        Synchronous SR keeps one stream ordered as this round's H2D, then
+        every consumer of these inputs, then the next round's H2D. Consumers
+        include penalty accumulation on ``verified_id`` and ``build_tree``,
+        not ``build_tree`` alone. The completion event only protects
+        rewriting the host packet. It does not prove the device packet has
+        been read. Another stream or overlap needs its own consume-complete
+        dependency.
+
+        Returned views are invalidated by the next upload. Stable across
+        rounds are the tree built from them and the existing graph
+        mask/position buffers. ``_token_width`` is accepted for callers that
+        already derived ``max(num_draft_tokens - 1, 1)``; the packet layout
+        recomputes widths from the draft rows.
+        """
+        metrics = getattr(batch, "sr_round_metrics", None)
+        verified_ids = []
         token_rows = []
         parent_rows: List[Optional[list]] = []
         index_rows: List[Optional[list]] = []
-
-        for i, req in enumerate(batch.reqs):
-            verified_cpu[i] = (
+        for req in list(batch.reqs)[:bs]:
+            verified_ids.append(
                 req.output_ids[-1]
                 if len(req.output_ids) > 0
                 else req.origin_input_ids[-1]
             )
             dtl = req.draft_tokens_and_logits
-            dt = None if dtl is None else dtl.get("draft_tokens")
-            pl = None if dtl is None else dtl.get("parent_list")
-            ix = None if dtl is None else dtl.get("top_scores_index")
-            token_rows.append(dt)
-            parent_rows.append(pl)
-            index_rows.append(ix)
-
-        parent_w = max(spec_steps, 1)
-        index_w = token_width
-        verified_id, out_parents, out_indices, out_tokens = self._verify_input_bufs(
-            bs, token_width, parent_w, index_w, device
-        )
-        verified_id.copy_(verified_cpu, non_blocking=True)
-        parents, indices, draft_tokens = assemble_draft_rows(
+            token_rows.append(None if dtl is None else dtl.get("draft_tokens"))
+            parent_rows.append(None if dtl is None else dtl.get("parent_list"))
+            index_rows.append(None if dtl is None else dtl.get("top_scores_index"))
+        return self._verify_packet.load(
+            verified_ids,
             token_rows,
             parent_rows,
             index_rows,
-            topk=topk,
-            spec_steps=spec_steps,
-            num_draft_tokens=num_draft_tokens,
-            device=device,
-            out_tokens=out_tokens,
-            out_parents=out_parents,
-            out_indices=out_indices,
+            topk,
+            spec_steps,
+            num_draft_tokens,
+            device,
+            metrics,
         )
-        if draft_tokens.shape[1] != token_width:
-            if draft_tokens.shape[1] > token_width:
-                draft_tokens = draft_tokens[:, :token_width]
-            else:
-                out_tokens[:, : draft_tokens.shape[1]].copy_(draft_tokens)
-                out_tokens[:, draft_tokens.shape[1] : token_width].zero_()
-                draft_tokens = out_tokens[:, :token_width]
-        return verified_id, parents, indices, draft_tokens
 
 
 def _row_to_list(container, i):

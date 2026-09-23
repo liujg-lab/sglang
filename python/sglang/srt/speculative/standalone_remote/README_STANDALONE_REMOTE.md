@@ -947,7 +947,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | `host_mean_ms` 阶段 | 范围 |
 | --- | --- |
 | `rpc_wait` | 调度层 RPC 调用，包括请求准备、transport、TP 广播等；一轮可能调用两次，累计计入 |
-| `construct_tree` | 草稿列表、根 token、拓扑转换为验证输入 |
+| `construct_tree` | 草稿列表、根 token、拓扑转换为验证输入。其中 `verify_packet_fill` / `verify_packet_wait` 是填写 host packet 和等待上一轮上传的主机时间，不能与 `construct_tree` 相加 |
 | `verify_prepare` | 验证 batch、KV、metadata 等准备 |
 | `verify_forward` | Target 验证前向的主机调用区间；设备可异步执行 |
 | `accept_commit_including_wait` | 接受路径选择、KV/状态提交及相关处理，包含等待验证结果 |
@@ -962,6 +962,8 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 
 | Target counter | 含义 |
 | --- | --- |
+| `verify_packet_upload` | 非空加速器路径提交整包 H2D 的次数。四段都有数据时一轮一次，空 batch 不上传。不是端到端加速结论 |
+| `verify_packet_grow` | host/device packet 扩容或首次分配的次数。容量只增不减，本轮偏移仍按实际宽度重算 |
 | `verify_batches` | 进入树/链验证的 batch 数 |
 | `verify_requests` | 这些 batch 中的请求实例数，不是唯一 rid 数 |
 | `accepted_draft_tokens` | 接受的草稿 token 总数，不含 bonus |
