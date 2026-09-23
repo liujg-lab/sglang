@@ -528,13 +528,10 @@ class StandaloneRemoteWorker:
         sampling_info = batch.sampling_info
         if sampling_info.has_custom_logit_processor:
             return False
-        if (
-            conservative_mode_reason(
-                getattr(self.server_args, "speculative_verify_mode", None),
-                bool(sampling_info.is_all_greedy),
-            )
-            is not None
-        ):
+        mode = getattr(self.server_args, "speculative_verify_mode", None) or "auto"
+        if mode != "rpd" and conservative_mode_reason(
+            mode, bool(sampling_info.is_all_greedy)
+        ) is not None:
             return False
         for name in (
             "next_token_logprobs",

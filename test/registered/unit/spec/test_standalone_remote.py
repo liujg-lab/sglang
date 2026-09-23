@@ -4182,7 +4182,8 @@ class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
             ("", True, True),
             (None, False, False),
             ("target_only", True, False),
-            ("rpd", True, False),
+            ("rpd", True, True),
+            ("rpd", False, True),
             ("other", True, False),
         ]
         for mode, greedy, expected in cases:
@@ -4494,6 +4495,104 @@ class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
                 expected_bytes,
                 msg=name,
             )
+
+    def test_rpd_without_consumers_skips_gather(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        data = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        indices = torch.tensor([1, 0, 3])
+        reqs = [self._req([7, 8], None), self._req([9], "stop")]
+        metrics = SRRoundMetrics("Target")
+        logits_out, res, _, seen, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[2, 0],
+            reqs=reqs,
+            verify_mode="rpd",
+            is_all_greedy=False,
+            metrics=metrics,
+            forbid_get=True,
+        )
+        self.assertIs(seen["logits"], probe)
+        self.assertIsNone(logits_out.next_token_logits)
+        self.assertEqual(probe.gets, [])
+        self.assertEqual(res.accept_length_per_req_cpu, [2, 0])
+        self.assertEqual([list(req.output_ids) for req in reqs], [[7, 8], [9]])
+        self.assertEqual([req.spec_cnt for req in reqs], [1, 1])
+        self.assertEqual([req.sr_step_id for req in reqs], [1, 1])
+        self.assertEqual(metrics.counts["verify_logits_discard_batches"], 1)
+        self.assertEqual(metrics.counts["verify_logits_gather_batches"], 0)
+        self.assertEqual(
+            metrics.counts["verify_logits_skipped_output_bytes"],
+            int(indices.numel()) * int(data.shape[-1]) * data.element_size(),
+        )
+
+    def test_rpd_consumers_keep_gather(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        ns = self._load()
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        data = torch.tensor(
+            [
+                [0.0, 8.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [9.0, 0.0, 0.0],
+                [0.0, 0.0, 3.0],
+            ]
+        )
+        indices = torch.tensor([2, 0])
+        req = self._req([4, 5])
+        req.return_logprob = True
+        req.top_logprobs_num = 1
+        req.token_ids_logprob = [0]
+        metrics = SRRoundMetrics("Target")
+        logits_out, _, _, seen, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[1],
+            reqs=[req],
+            verify_mode="rpd",
+            is_all_greedy=False,
+            return_logprob=True,
+            metrics=metrics,
+            top_logprobs_nums=[1],
+            token_ids_logprobs=[[0]],
+            temperatures=torch.ones(1, 1),
+            verified_id=torch.tensor([0, 1]),
+        )
+        self.assertIs(seen["logits"], probe)
+        self.assertTrue(torch.equal(logits_out.next_token_logits, data[indices]))
+        self.assertEqual(len(probe.gets), 1)
+        self.assertEqual(metrics.counts["verify_logits_gather_batches"], 1)
+        self.assertEqual(metrics.counts["verify_logits_discard_batches"], 0)
+
+        metrics = SRRoundMetrics("Target")
+        logits_out, _, _, _, probe = self._run_verify(
+            ns,
+            logits_data=data,
+            accepted_indices=indices,
+            accept_lengths=[2, 0],
+            reqs=[self._req([7, 8]), self._req([9], "stop")],
+            verify_mode="rpd",
+            is_all_greedy=False,
+            metrics=metrics,
+            logits_overrides={"full_logits": torch.zeros(1)},
+        )
+        self.assertTrue(torch.equal(logits_out.next_token_logits, data[indices]))
+        self.assertEqual(len(probe.gets), 1)
+        self.assertIsNotNone(logits_out.full_logits)
+        self.assertEqual(metrics.counts["verify_logits_gather_batches"], 1)
+        self.assertEqual(metrics.counts["verify_logits_discard_batches"], 0)
 
     def test_unused_replay_hidden_still_discards_logits(self):
         if torch is None:
