@@ -976,50 +976,52 @@ class TestRpdCompactTransfers(CustomTestCase):
             rpd._verify_tree_rpd_compact = original
         self.assertEqual(called, [])
 
+    def test_cuda_backend_uses_compact_not_reference(self):
+        called = []
+        original_name = rpd._rpd_backend_name
+        original_compact = rpd._verify_tree_rpd_compact
+        original_cpu = rpd._verify_tree_rpd_cpu
+
+        def fake_name(device_type, is_cuda):
+            return "cuda"
+
+        def watch_compact(**kwargs):
+            called.append("compact")
+            original_compact(**kwargs)
+
+        def forbid_cpu(**kwargs):
+            raise AssertionError("cuda dispatch entered cpu reference")
+
+        rpd._rpd_backend_name = fake_name
+        rpd._verify_tree_rpd_compact = watch_compact
+        rpd._verify_tree_rpd_cpu = forbid_cpu
+        try:
+            case = TestRpdLongestPath()._branching_tree()
+            got = _run_rpd(*case, tau=0.2)
+        finally:
+            rpd._rpd_backend_name = original_name
+            rpd._verify_tree_rpd_compact = original_compact
+            rpd._verify_tree_rpd_cpu = original_cpu
+        self.assertEqual(called, ["compact"])
+        ref = _run_rpd(*TestRpdLongestPath()._branching_tree(), tau=0.2)
+        self.assertEqual(got[2].tolist(), ref[2].tolist())
+        self.assertEqual(got[1].tolist(), ref[1].tolist())
+        self.assertEqual(got[0].tolist(), ref[0].tolist())
+
     @unittest.skipUnless(torch.cuda.is_available(), "cuda not available")
-    def test_cuda_dispatch_uses_kernel_and_import_error_falls_back(self):
-        case = [t.cuda() for t in TestRpdLongestPath()._branching_tree()]
+    def test_cuda_compact_matches_cpu_reference(self):
+        cpu_case = TestRpdLongestPath()._branching_tree()
+        cpu_predicts, cpu_index, cpu_length = _run_rpd(*cpu_case, tau=0.2)
+        case = [tensor.cuda() for tensor in cpu_case]
         batch, width = case[0].shape
         total = int(case[1].max().item()) + 1
         predicts = torch.full((total,), -1, dtype=torch.int32, device="cuda")
         accept_index = torch.full((batch, width), -1, dtype=torch.int32, device="cuda")
         accept_length = torch.zeros((batch,), dtype=torch.int32, device="cuda")
-        entered = []
-        original_cuda = rpd._verify_tree_rpd_cuda
-        original_compact = rpd._verify_tree_rpd_compact
-
-        def fake_cuda(**kwargs):
-            entered.append(kwargs["logits"].device.type)
-
-        def forbid_compact(**kwargs):
-            raise AssertionError("cuda dispatch entered compact")
-
-        rpd._verify_tree_rpd_cuda = fake_cuda
-        rpd._verify_tree_rpd_compact = forbid_compact
-        try:
-            verify_tree_rpd(
-                predicts, accept_index, accept_length, *case, 0.2
-            )
-            self.assertEqual(entered, ["cuda"])
-            entered.clear()
-
-            def missing(**kwargs):
-                raise ImportError("kernel missing")
-
-            rpd._verify_tree_rpd_cuda = missing
-            verify_tree_rpd(
-                predicts, accept_index, accept_length, *case, 0.2
-            )
-        finally:
-            rpd._verify_tree_rpd_cuda = original_cuda
-            rpd._verify_tree_rpd_compact = original_compact
-        self.assertEqual(entered, [])
-        cpu_predicts, cpu_index, cpu_length = _run_rpd(
-            *[t.cpu() for t in TestRpdLongestPath()._branching_tree()], tau=0.2
-        )
+        verify_tree_rpd(predicts, accept_index, accept_length, *case, 0.2)
         self.assertEqual(accept_length.tolist(), cpu_length.tolist())
-        self.assertEqual(accept_index[0, :4].tolist(), cpu_index[0, :4].tolist())
-        self.assertEqual(int(predicts[0].item()), int(cpu_predicts[0].item()))
+        self.assertEqual(accept_index.tolist(), cpu_index.tolist())
+        self.assertEqual(predicts.tolist(), cpu_predicts.tolist())
 
 
 if __name__ == "__main__":

@@ -57,36 +57,6 @@ def verify_tree_greedy(
     )
 
 
-def verify_tree_rpd(
-    predicts: torch.Tensor,  # mutable
-    accept_index: torch.Tensor,  # mutable
-    accept_token_num: torch.Tensor,  # mutable
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    logits: torch.Tensor,
-    z_star: torch.Tensor,
-    target_predict: torch.Tensor,
-    gap_max: float,
-    use_equality: bool,
-) -> None:
-    torch.ops.sgl_kernel.verify_tree_rpd.default(
-        predicts,
-        accept_index,
-        accept_token_num,
-        candidates,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        logits,
-        z_star,
-        target_predict,
-        gap_max,
-        use_equality,
-    )
-
-
 def build_tree_kernel_efficient(
     parent_list: torch.Tensor,
     selected_index: torch.Tensor,

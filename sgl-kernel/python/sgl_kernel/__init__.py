@@ -99,7 +99,6 @@ from sgl_kernel.speculative import (
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
-    verify_tree_rpd,
 )
 from sgl_kernel.top_k import (
     fast_topk,
@@ -176,7 +175,6 @@ _DEBUG_EXPORT_NAMES = [
     "transfer_kv_per_layer_mla",
     "tree_speculative_sampling_target_only",
     "verify_tree_greedy",
-    "verify_tree_rpd",
     "weak_ref_tensor",
 ]
 

@@ -7,9 +7,9 @@ non-root edge is valid, the longest path is committed. Ties break by
 smaller sum of gaps, then leftmost sibling order.
 
 Torch-only so CPU unit tests can import it without the rest of sglang.srt.
-NPU keeps the vocab reduction and paired edge logits on device and still
-chooses the longest path on CPU. CUDA uses the existing kernel. Every other
-device, including CPU, uses the reference.
+NPU and CUDA keep the vocab reduction and paired edge logits on device and
+still choose the longest path on CPU. Every other device, including CPU,
+uses the reference.
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 
 logger = logging.getLogger(__name__)
-_logged_rpd_cpu_fallback = False
 _logged_rpd_path = False
 _logged_rpd_npu_path = False
+_logged_rpd_cuda_path = False
 _compact_cross_device_bytes = 0
 _compact_stat_waits = 0
 _COMPACT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -113,46 +113,6 @@ def _prepare_logits(logits: torch.Tensor) -> torch.Tensor:
     if logits.dim() == 3:
         return logits.reshape(-1, logits.shape[-1])
     return logits
-
-
-def _verify_tree_rpd_cuda(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    logits: torch.Tensor,
-    gap_max: float,
-    use_equality: bool,
-) -> None:
-    from sgl_kernel import verify_tree_rpd as verify_tree_rpd_cuda
-
-    logits = _prepare_logits(logits)
-    if not logits.is_contiguous():
-        logits = logits.contiguous()
-    candidates = candidates.contiguous()
-    retrive_index = retrive_index.contiguous()
-    retrive_next_token = retrive_next_token.contiguous()
-    retrive_next_sibling = retrive_next_sibling.contiguous()
-    z_star = logits.amax(dim=-1).contiguous()
-    target_predict = logits.argmax(dim=-1).to(torch.int64).contiguous()
-    accept_index.fill_(-1)
-    verify_tree_rpd_cuda(
-        predicts,
-        accept_index,
-        accept_token_num,
-        candidates,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        logits,
-        z_star,
-        target_predict,
-        float(gap_max),
-        bool(use_equality),
-    )
 
 
 def _verify_tree_rpd_cpu(
@@ -689,7 +649,7 @@ def verify_tree_rpd(
         logits: ``[tot, vocab]`` target logits, rows indexed by retrive_index.
         tau: RPD threshold in ``[0, 1)``.
     """
-    global _logged_rpd_path, _logged_rpd_cpu_fallback, _logged_rpd_npu_path
+    global _logged_rpd_path, _logged_rpd_npu_path, _logged_rpd_cuda_path
     gap_max = rpd_gap_max(tau)
     use_equality = float(tau) == 0.0
     kwargs = dict(
@@ -712,20 +672,11 @@ def verify_tree_rpd(
             logger.info("Speculative RPD verify path: npu_compact_cpu_path")
         return predicts, accept_index, accept_token_num
     if backend == "cuda":
-        try:
-            _verify_tree_rpd_cuda(**kwargs)
-            if not _logged_rpd_path:
-                _logged_rpd_path = True
-                logger.info("Speculative RPD verify path: cuda_kernel")
-            return predicts, accept_index, accept_token_num
-        except (ImportError, AttributeError) as e:
-            if not _logged_rpd_cpu_fallback:
-                _logged_rpd_cpu_fallback = True
-                logger.warning(
-                    "RPD CUDA kernel unavailable (%s); falling back to CPU. "
-                    "Rebuild sgl-kernel so sgl_kernel.verify_tree_rpd is installed.",
-                    e,
-                )
+        _verify_tree_rpd_compact(**kwargs)
+        if not _logged_rpd_cuda_path:
+            _logged_rpd_cuda_path = True
+            logger.info("Speculative RPD verify path: cuda_compact_cpu_path")
+        return predicts, accept_index, accept_token_num
     if not _logged_rpd_path:
         _logged_rpd_path = True
         logger.info(

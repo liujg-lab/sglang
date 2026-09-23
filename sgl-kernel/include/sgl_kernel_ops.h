@@ -400,20 +400,6 @@ void verify_tree_greedy(
     at::Tensor retrive_next_sibling,
     at::Tensor target_predict);
 
-void verify_tree_rpd(
-    at::Tensor predicts,          // mutable
-    at::Tensor accept_index,      // mutable
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor logits,
-    at::Tensor z_star,
-    at::Tensor target_predict,
-    double gap_max,
-    bool use_equality);
-
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
     at::Tensor verified_seq_len,
