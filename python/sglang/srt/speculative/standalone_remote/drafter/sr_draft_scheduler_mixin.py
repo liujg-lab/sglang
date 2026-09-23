@@ -33,6 +33,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
 from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     SRTailExtendTransaction,
     TailExtendRecoveryRequired,
+    clear_fill_credential,
     invalidate_tree_seed,
     make_tail_extend_batch,
     plan_tail_extend,
@@ -864,6 +865,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         fork = result.fork
 
         if kind == "replace_tail":
+            clear_fill_credential(req)
             self._sr_clear_prefix_stamp(state)
             req.output_ids[-1] = target[-1]
             req.sr_tree_seed = None
@@ -882,6 +884,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         if kind == "local_rollback" and fork == len(target) and self.sr_kv.rollback(
             req, fork, allocated
         ):
+            clear_fill_credential(req)
             extra = len(local) - fork
             if extra > 0 and req.output_ids:
                 keep = max(0, len(req.output_ids) - extra)
@@ -1015,6 +1018,7 @@ class StandaloneRemoteDraftSchedulerMixin:
 
     def _sr_reset_linear_kv_state(self, req: Req, fill_ids: List[int]) -> None:
         """Drop linear KV bookkeeping and rebuild fill/origin for a full re-prefill."""
+        clear_fill_credential(req)
         invalidate_tree_seed(req)
         self._sr_clear_prefix_stamp(self.sr_state.get(req.rid))
         self._sr_remove_req(req)
@@ -1583,6 +1587,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         snapshots = []
         long_tail: List[Req] = []
         for req in reqs:
+            clear_fill_credential(req)
             committed = list(req.output_ids or [])
             mode, tail = plan_committed_ingest(
                 len(req.origin_input_ids),

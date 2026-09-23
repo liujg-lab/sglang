@@ -681,6 +681,7 @@ class TestSRDeltaFastPath(unittest.TestCase):
             "SRAlignResult": lease.SRAlignResult,
             "prefix_window_tokens": lease.prefix_window_tokens,
             "snapshot_sr_align": lease.snapshot_sr_align,
+            "clear_fill_credential": lambda req: setattr(req, "sr_fill_credential", None),
             "invalidate_tree_seed": lambda req: (
                 setattr(
                     req,

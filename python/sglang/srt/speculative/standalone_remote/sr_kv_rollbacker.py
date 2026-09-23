@@ -109,6 +109,11 @@ class SRKVRollbacker:
         allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
         kv_len = kv_release_len(committed, allocated)
         req.kv_allocated_len = kv_len
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+            clear_fill_credential,
+        )
+
+        clear_fill_credential(req)
         ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
         req.fill_ids = ids[:kv_len]
         release_kv_cache(req, self.tree_cache, is_insert=False)

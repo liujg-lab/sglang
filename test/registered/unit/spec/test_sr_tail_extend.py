@@ -3380,5 +3380,585 @@ class TestBatchedKvCopy(unittest.TestCase):
         return scheduler, txn, plan, req
 
 
+class CountingList(list):
+    def __init__(self, items):
+        super().__init__(items)
+        self.gets = 0
+        self.iters = 0
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            self.gets += 1
+        else:
+            self.iters += 1
+        return super().__getitem__(item)
+
+    def __iter__(self):
+        self.iters += 1
+        return super().__iter__()
+
+    def reset(self):
+        self.gets = 0
+        self.iters = 0
+
+
+class PartialExtendList(list):
+    """Append part of the payload, then raise, until ``fail`` is cleared."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.fail = True
+
+    def extend(self, other):
+        if self.fail:
+            payload = list(other)
+            if payload:
+                super().extend(payload[:1])
+            raise RuntimeError("partial append")
+        super().extend(other)
+
+
+def _bare_scheduler():
+    return NS(
+        server_args=NS(speculative_eagle_topk=3),
+        token_to_kv_pool_allocator=NS(),
+        req_to_token_pool=NS(req_to_token=torch.zeros((2, 8), dtype=torch.int64)),
+        device_module=NS(synchronize=Mock()),
+    )
+
+
+def _neutral_sampling():
+    return NS(
+        repetition_penalty=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        min_new_tokens=0,
+        stop_token_ids=set(),
+    )
+
+
+def _prove_append(req, delta, *, old_kv):
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+        SRAlignResult,
+    )
+
+    published = list(req.origin_input_ids) + list(req.output_ids)
+    req.fill_ids = published
+    old_len = len(published)
+    old_rev = int(getattr(req, "sr_prefix_revision", 0) or 0)
+    req.sr_fill_credential = tail.SRFillCredential(id(published), old_len, old_rev)
+    req.output_ids.extend(delta)
+    req.sr_prefix_revision = old_rev + 1
+    req.sr_prefix_proven = True
+    req.sr_align_result = SRAlignResult(
+        kind="append_one" if len(delta) == 1 else "append_n",
+        old_kv_committed_len=old_kv,
+        old_prefix_revision=old_rev,
+        old_local_len=old_len,
+        old_prefix_window=(),
+        fork=old_len,
+    )
+    req.sampling_params = _neutral_sampling()
+    req.grammar = None
+    req.sr_grammar_template = None
+    req.custom_logit_processor = None
+    req.kv_committed_len = old_kv
+    req.kv_allocated_len = old_kv
+    return published
+
+
+class TestIncrementalTailFill(unittest.TestCase):
+    def _lease_req(self):
+        origin = CountingList([1] * 100)
+        output = CountingList([7, 8, 9])
+        req = NS(
+            origin_input_ids=origin,
+            output_ids=output,
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="lease",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+        )
+        output.reset()
+        # Publish the prefix before the three new output tokens exist.
+        req.output_ids = CountingList([])
+        published = _prove_append(req, [7, 8, 9], old_kv=100)
+        req.origin_input_ids = origin
+        req.output_ids.gets = 0
+        req.output_ids.iters = 0
+        origin.reset()
+        return req, published, origin
+
+    def test_lease_compute_is_bonus_and_fill_includes_reused_path(self):
+        req, published, origin = self._lease_req()
+        plan = tail.plan_tail_extend(
+            req, vocab_size=32, model_is_mrope=False, materialized_len=102
+        )
+        plan = replace(
+            plan,
+            materialized_len=100,
+            original_len=100,
+            copy_src_slots=[4, 5],
+        )
+        self.assertEqual(plan.prefix_len, 102)
+        self.assertEqual(list(plan.compute_tokens), [9])
+        self.assertEqual(list(plan.fill_append_tokens), [7, 8, 9])
+        self.assertIsNone(plan.rebuild_fill)
+        self.assertIsNone(plan.replay_tokens)
+        self.assertEqual(origin.iters, 0)
+        self.assertEqual(req.output_ids.iters, 0)
+        self.assertEqual(origin.gets, 0)
+        self.assertLess(req.output_ids.gets, 100)
+        scheduler = _bare_scheduler()
+        txn = tail.SRTailExtendTransaction(scheduler, [plan])
+        txn.commit(seed_output(1))
+        self.assertIs(req.fill_ids, published)
+        self.assertEqual(req.fill_ids, [1] * 100 + [7, 8, 9])
+        self.assertEqual(req.sr_fill_credential.published_len, 103)
+        self.assertEqual(req.sr_fill_credential.revision, 1)
+        self.assertEqual(req.kv_committed_len, 103)
+
+        req.output_ids.reset()
+        origin.reset()
+        old = list(req.fill_ids)
+        req.sr_align_result = type(req.sr_align_result)(
+            kind="append_n",
+            old_kv_committed_len=103,
+            old_prefix_revision=1,
+            old_local_len=103,
+            old_prefix_window=(),
+            fork=103,
+        )
+        req.output_ids.extend([10, 11, 12])
+        req.sr_prefix_revision = 2
+        req.output_ids.reset()
+        origin.reset()
+        again = tail.plan_tail_extend(
+            req, vocab_size=32, model_is_mrope=False, materialized_len=105
+        )
+        self.assertIsNone(again.rebuild_fill)
+        self.assertEqual(list(again.compute_tokens), [12])
+        self.assertEqual(list(again.fill_append_tokens), [10, 11, 12])
+        self.assertEqual(origin.gets, 0)
+        self.assertEqual(origin.iters, 0)
+        self.assertEqual(req.output_ids.iters, 0)
+        self.assertLess(req.output_ids.gets, len(req.output_ids))
+        again = replace(
+            again,
+            materialized_len=103,
+            original_len=103,
+            copy_src_slots=[6, 7],
+        )
+        txn = tail.SRTailExtendTransaction(_bare_scheduler(), [again])
+        txn.commit(seed_output(1))
+        self.assertIs(req.fill_ids, published)
+        self.assertEqual(req.fill_ids, old + [10, 11, 12])
+
+    def test_align_mismatch_rebuilds_instead_of_extending(self):
+        origin = CountingList([1, 2, 3])
+        req = NS(
+            origin_input_ids=origin,
+            output_ids=CountingList([4]),
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="mismatch",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+        )
+        published = _prove_append(req, [5], old_kv=4)
+        req.sr_fill_credential = tail.SRFillCredential(
+            id(published), len(published) - 1, 9
+        )
+        origin.reset()
+        req.output_ids.reset()
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        self.assertIsNotNone(plan.rebuild_fill)
+        self.assertEqual(plan.fill_append_tokens, ())
+        self.assertGreater(origin.gets + req.output_ids.gets, 1)
+
+    def test_replaced_history_with_same_length_and_last_token_rebuilds(self):
+        req = NS(
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="stale",
+            sr_prefix_revision=1,
+            sr_tree_seed=None,
+            kv_committed_len=3,
+            kv_allocated_len=3,
+            sampling_params=_neutral_sampling(),
+            grammar=None,
+            sr_grammar_template=None,
+            custom_logit_processor=None,
+            sr_prefix_proven=True,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRAlignResult,
+        )
+
+        owned = [1, 2, 3, 4]
+        req.sr_fill_credential = tail.SRFillCredential(id(owned), 4, 1)
+        stale = [1, 9, 3, 4]
+        req.fill_ids = stale
+        req.sr_align_result = SRAlignResult(
+            kind="equal",
+            old_kv_committed_len=3,
+            old_prefix_revision=1,
+            old_local_len=4,
+            old_prefix_window=(),
+            fork=4,
+        )
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        self.assertIsNotNone(plan.rebuild_fill)
+        self.assertEqual(list(plan.rebuild_fill), [1, 2, 3, 4])
+        txn = tail.SRTailExtendTransaction(_bare_scheduler(), [plan])
+        txn.commit(seed_output(1))
+        self.assertEqual(req.fill_ids, [1, 2, 3, 4])
+        self.assertEqual(stale, [1, 9, 3, 4])
+        self.assertIsNot(req.fill_ids, stale)
+
+    def test_rollback_clears_credential_and_does_not_extend_stale_fill(self):
+        stale = [1, 2, 3, 4, 5, 6]
+        req = NS(
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[5],
+            fill_ids=stale,
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="rollback",
+            sr_prefix_revision=2,
+            sr_tree_seed=None,
+            kv_committed_len=4,
+            kv_allocated_len=4,
+            sampling_params=_neutral_sampling(),
+            grammar=None,
+            sr_grammar_template=None,
+            custom_logit_processor=None,
+            sr_fill_credential=tail.SRFillCredential(id(stale), 6, 2),
+        )
+        tail.clear_fill_credential(req)
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        self.assertIsNotNone(plan.rebuild_fill)
+        txn = tail.SRTailExtendTransaction(_bare_scheduler(), [plan])
+        txn.commit(seed_output(1))
+        self.assertEqual(stale, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(list(req.fill_ids), [1, 2, 3, 4, 5])
+        self.assertIsNot(req.fill_ids, stale)
+
+    def test_alias_with_output_ids_is_not_extended(self):
+        output = [4, 5]
+        req = NS(
+            origin_input_ids=[1, 2, 3],
+            output_ids=output,
+            fill_ids=output,
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="alias",
+            sr_prefix_revision=1,
+            sr_tree_seed=None,
+            kv_committed_len=4,
+            kv_allocated_len=4,
+            sampling_params=_neutral_sampling(),
+            grammar=None,
+            sr_grammar_template=None,
+            custom_logit_processor=None,
+            sr_prefix_proven=True,
+            sr_fill_credential=tail.SRFillCredential(id(output), 4, 0),
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            SRAlignResult,
+        )
+
+        req.sr_align_result = SRAlignResult(
+            kind="append_one",
+            old_kv_committed_len=4,
+            old_prefix_revision=0,
+            old_local_len=4,
+            old_prefix_window=(),
+            fork=4,
+        )
+        before = list(output)
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        self.assertIsNotNone(plan.rebuild_fill)
+        txn = tail.SRTailExtendTransaction(_bare_scheduler(), [plan])
+        txn.commit(seed_output(1))
+        self.assertEqual(output, before)
+        self.assertIsNot(req.fill_ids, output)
+        self.assertEqual(list(req.fill_ids), [1, 2, 3, 4, 5])
+
+    def test_commit_rejects_plan_when_request_changes(self):
+        req = NS(
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="changed",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+        )
+        published = _prove_append(req, [5], old_kv=4)
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        req.origin_input_ids = [1, 2, 3]
+        txn = tail.SRTailExtendTransaction(_bare_scheduler(), [plan])
+        with self.assertRaises(RuntimeError):
+            txn.commit(seed_output(1))
+        self.assertIs(req.fill_ids, published)
+        self.assertEqual(list(req.fill_ids), [1, 2, 3, 4])
+        self.assertEqual(req.kv_committed_len, 4)
+        self.assertEqual(req.sr_fill_credential.published_len, 4)
+        self.assertFalse(txn.committed)
+
+    def test_partial_extend_failure_restores_and_retry_appends_once(self):
+        def make_req(rid, fill):
+            req = NS(
+                origin_input_ids=[1, 2, 3],
+                output_ids=[4],
+                req_pool_idx=0 if rid == "a" else 1,
+                prefix_indices=[],
+                cache_protected_len=0,
+                multimodal_inputs=None,
+                rid=rid,
+                sr_prefix_revision=0,
+                sr_tree_seed=None,
+            )
+            published = _prove_append(req, [5], old_kv=4)
+            req.fill_ids = fill
+            # _prove_append installed its own list; point the credential at ``fill``.
+            fill[:] = published
+            req.sr_fill_credential = tail.SRFillCredential(
+                id(fill), len(fill), req.sr_fill_credential.revision
+            )
+            return req
+
+        first = [1, 2, 3, 4]
+        second = PartialExtendList([1, 2, 3, 4])
+        second.fail = False
+        reqs = [make_req("a", first), make_req("b", second)]
+        # _prove_append already appended the delta onto output and grew a temporary
+        # fill. ``fill[:] = published`` copied that longer list into a length-4
+        # target only when the lengths match. Rebuild the rows explicitly.
+        for req, fill in zip(reqs, (first, second)):
+            req.origin_input_ids = [1, 2, 3]
+            req.output_ids = [4, 5]
+            fill.clear()
+            fill.extend([1, 2, 3, 4])
+            req.fill_ids = fill
+            req.sr_prefix_revision = 1
+            req.sr_prefix_proven = True
+            req.kv_committed_len = 4
+            req.kv_allocated_len = 4
+            req.sr_fill_credential = tail.SRFillCredential(id(fill), 4, 0)
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+                SRAlignResult,
+            )
+
+            req.sr_align_result = SRAlignResult(
+                kind="append_one",
+                old_kv_committed_len=4,
+                old_prefix_revision=0,
+                old_local_len=4,
+                old_prefix_window=(),
+                fork=4,
+            )
+            req.sampling_params = _neutral_sampling()
+        second.fail = True
+        plans = [
+            tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+            for req in reqs
+        ]
+        self.assertTrue(all(plan.rebuild_fill is None for plan in plans))
+        scheduler, _plans = transaction_fixture(reqs, 128)
+        # transaction_fixture replans without preserving the prepared rows.
+        evict = patch.object(tail, "_evict_tail_capacity")
+        evict.start()
+        self.addCleanup(evict.stop)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        before_map = scheduler.req_to_token_pool.req_to_token.clone()
+        txn.allocate(NS(device="cpu"))
+        with self.assertRaises(RuntimeError):
+            txn.commit(seed_output(2))
+        self.assertEqual(list(first), [1, 2, 3, 4])
+        self.assertEqual(list(second), [1, 2, 3, 4])
+        self.assertEqual(reqs[0].kv_committed_len, 4)
+        self.assertEqual(reqs[1].kv_committed_len, 4)
+        self.assertEqual(reqs[0].sr_fill_credential.published_len, 4)
+        self.assertFalse(txn.committed)
+        txn.rollback()
+        torch.testing.assert_close(
+            scheduler.req_to_token_pool.req_to_token, before_map
+        )
+        second.fail = False
+        txn.commit(seed_output(2))
+        self.assertEqual(list(first), [1, 2, 3, 4, 5])
+        self.assertEqual(list(second), [1, 2, 3, 4, 5])
+        self.assertEqual(reqs[0].kv_committed_len, 5)
+        self.assertEqual(reqs[1].sr_fill_credential.published_len, 5)
+
+    def test_grammar_template_keeps_replay_tokens(self):
+        req = NS(
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="grammar",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+        )
+        _prove_append(req, [5], old_kv=4)
+        req.sr_grammar_template = object()
+        plan = tail.plan_tail_extend(req, vocab_size=32, model_is_mrope=False)
+        self.assertEqual(list(plan.replay_tokens), [1, 2, 3, 4, 5])
+
+    def test_mixed_penalty_leaves_incremental_row_neutral(self):
+        import sys
+        import types
+
+        if "torchvision" not in sys.modules:
+            import importlib.machinery
+
+            io = types.ModuleType("torchvision.io")
+            io.decode_jpeg = lambda *args, **kwargs: None
+            io.__spec__ = importlib.machinery.ModuleSpec("torchvision.io", loader=None)
+            vision = types.ModuleType("torchvision")
+            vision.io = io
+            vision.__spec__ = importlib.machinery.ModuleSpec("torchvision", loader=None)
+            sys.modules["torchvision"] = vision
+            sys.modules["torchvision.io"] = io
+        from sglang.srt.sampling.penaltylib.frequency_penalty import (
+            BatchedFrequencyPenalizer,
+        )
+        from sglang.srt.sampling.penaltylib.min_new_tokens import (
+            BatchedMinNewTokensPenalizer,
+        )
+        from sglang.srt.sampling.penaltylib.orchestrator import (
+            BatchedPenalizerOrchestrator,
+        )
+        from sglang.srt.sampling.penaltylib.presence_penalty import (
+            BatchedPresencePenalizer,
+        )
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        inc = NS(
+            origin_input_ids=CountingList([1, 2, 3]),
+            output_ids=CountingList([4, 5]),
+            req_pool_idx=0,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="inc",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+            tokenizer=NS(additional_stop_token_ids=set(), eos_token_id=2),
+        )
+        _prove_append(inc, [6], old_kv=5)
+        inc.origin_input_ids.reset()
+        inc.output_ids.reset()
+        pen = NS(
+            origin_input_ids=[1, 2, 3],
+            output_ids=[8, 8],
+            fill_ids=[1, 2, 3, 8, 8],
+            req_pool_idx=1,
+            prefix_indices=[],
+            cache_protected_len=0,
+            multimodal_inputs=None,
+            rid="pen",
+            sr_prefix_revision=0,
+            sr_tree_seed=None,
+            kv_committed_len=3,
+            kv_allocated_len=3,
+            grammar=None,
+            sr_grammar_template=None,
+            custom_logit_processor=None,
+            sampling_params=NS(
+                repetition_penalty=1.5,
+                frequency_penalty=0.5,
+                presence_penalty=0.0,
+                min_new_tokens=1,
+                stop_token_ids=set(),
+            ),
+            tokenizer=NS(additional_stop_token_ids=set(), eos_token_id=2),
+        )
+        plans = [
+            tail.plan_tail_extend(inc, vocab_size=32, model_is_mrope=False),
+            tail.plan_tail_extend(pen, vocab_size=32, model_is_mrope=False),
+        ]
+        self.assertIsNone(plans[0].replay_tokens)
+        self.assertIsNotNone(plans[1].replay_tokens)
+        gets_before = (
+            inc.origin_input_ids.gets,
+            inc.output_ids.gets,
+            inc.origin_input_ids.iters,
+            inc.output_ids.iters,
+        )
+
+        class _Batch:
+            def __init__(self, reqs):
+                self.reqs = reqs
+                self.device = "cpu"
+
+        batch = _Batch([inc, pen])
+        batch.sampling_info = NS(
+            penalizer_orchestrator=BatchedPenalizerOrchestrator(
+                vocab_size=32,
+                batch=batch,
+                penalizers={
+                    BatchedFrequencyPenalizer,
+                    BatchedPresencePenalizer,
+                    BatchedRepetitionPenalizer,
+                    BatchedMinNewTokensPenalizer,
+                },
+            )
+        )
+        tail._restore_committed_penalties(batch, plans)
+        self.assertEqual(
+            (
+                inc.origin_input_ids.gets,
+                inc.output_ids.gets,
+                inc.origin_input_ids.iters,
+                inc.output_ids.iters,
+            ),
+            gets_before,
+        )
+        freq = batch.sampling_info.penalizer_orchestrator.penalizers[
+            BatchedFrequencyPenalizer
+        ]
+        self.assertEqual(float(freq.cumulated_frequency_penalties[0].sum()), 0.0)
+        self.assertGreater(float(freq.cumulated_frequency_penalties[1].sum()), 0.0)
+        rep = batch.sampling_info.penalizer_orchestrator.penalizers[
+            BatchedRepetitionPenalizer
+        ]
+        self.assertTrue(
+            torch.equal(
+                rep.cumulated_repetition_penalties[0],
+                torch.ones_like(rep.cumulated_repetition_penalties[0]),
+            )
+        )
+        lengths = batch.sampling_info.penalizer_orchestrator.penalizers[
+            BatchedMinNewTokensPenalizer
+        ].len_output_tokens
+        self.assertEqual(int(lengths[0]), tail._penalty_output_len(plans[0]))
+        self.assertEqual(int(lengths[1]), tail._penalty_output_len(plans[1]))
+        self.assertEqual(int(lengths[0]), 3)
+        self.assertEqual(int(lengths[1]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
