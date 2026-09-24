@@ -1248,6 +1248,68 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
         self.assertIn("_capture_extra_keys(ntpb)", capture_src)
         self.assertIn("_active_capture_extra", capture_src)
 
+    def test_draft_cuda_graph_runners_default_extra_keys(self):
+        runners = (
+            (
+                _REPO_ROOT
+                / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py",
+                "EAGLEDraftCudaGraphRunner",
+            ),
+            (
+                _REPO_ROOT
+                / "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+                "EAGLEDraftExtendCudaGraphRunner",
+            ),
+            (
+                _REPO_ROOT
+                / "python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py",
+                "MultiLayerEagleDraftExtendCudaGraphRunner",
+            ),
+        )
+        base_ns = {
+            "_uses_dual_ntpb": lambda runner: getattr(runner, "dual_ntpb", False),
+        }
+        exec(
+            "from __future__ import annotations\n"
+            + _class_method_source(_CUDA_GRAPH_RUNNER, "CudaGraphRunner", "_make_graph_key"),
+            base_ns,
+        )
+        cuda_graph_runner = types.SimpleNamespace(
+            _make_graph_key=base_ns["_make_graph_key"]
+        )
+        for path, class_name in runners:
+            src = _class_method_source(path, class_name, "_capture_extra_keys")
+            ns = {}
+            exec(src, ns)
+            self.assertEqual(ns["_capture_extra_keys"](object(), 3), [None])
+            self.assertEqual(ns["_capture_extra_keys"](object()), [None])
+            key_ns = {"CudaGraphRunner": cuda_graph_runner}
+            exec(
+                _class_method_source(path, class_name, "_make_graph_key"),
+                key_ns,
+            )
+            key = key_ns["_make_graph_key"](object(), 24, None, extra=None)
+            self.assertEqual(key, 24)
+            self.assertIsInstance(key, int)
+        npu_runner = (
+            _REPO_ROOT
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
+        )
+        npu_src = _class_method_source(
+            npu_runner,
+            "EAGLEDraftNpuGraphRunner",
+            "_capture_extra_keys",
+        )
+        self.assertIn("tree_kv_buckets", npu_src)
+        self.assertIn("return list(reversed(list(buckets)))", npu_src)
+        npu_key_src = _class_method_source(
+            npu_runner,
+            "EAGLEDraftNpuGraphRunner",
+            "_make_graph_key",
+        )
+        self.assertIn("_s{int(extra)}", npu_key_src)
+        self.assertNotIn("CudaGraphRunner._make_graph_key", npu_key_src)
+
     def test_compact_fia_backend_wiring(self):
         compact_src = _function_source(_ASCEND_BACKEND, "_run_tree_compact_fia")
         self.assertIn("gather_kv_into", compact_src)

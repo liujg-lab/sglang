@@ -862,6 +862,264 @@ class TestTailGraphBuckets(unittest.TestCase):
         exec(compile(module, str(GRAPH), "exec"), ns)
         return ns
 
+    def _load_tail_capture(self):
+        """Load production capture/replay helpers without the server import chain."""
+        graph = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tail_extend_graph.py"
+        )
+        tree = ast.parse(graph.read_text(encoding="utf-8"))
+        wanted = {
+            "make_tail_graph_buffers",
+            "cuda_tail_capture_extend_lens",
+            "tail_max_per_request",
+            "tail_kv_index_capacity",
+            "widen_tail_kv_indices",
+            "build_cuda_tail_attention_metadata",
+            "_write_indptr_",
+            "refresh_tail_triton_metadata",
+        }
+        methods = {"_capture_bucket", "_refresh_captured_triton_metadata"}
+        body = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "_TailGraphBuffers":
+                body.append(copy.deepcopy(node))
+            elif isinstance(node, ast.FunctionDef) and node.name in wanted:
+                body.append(copy.deepcopy(node))
+            elif isinstance(node, ast.ClassDef) and node.name == "SRTailExtendGraphRunner":
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name in methods:
+                        fn = copy.deepcopy(child)
+                        fn.body = [
+                            stmt
+                            for stmt in fn.body
+                            if not isinstance(stmt, (ast.Import, ast.ImportFrom))
+                        ]
+                        body.append(fn)
+
+        class _PrepError(RuntimeError):
+            def __init__(self, message, scope="graph"):
+                super().__init__(message)
+                self.scope = scope
+
+        class ForwardBatch:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class LogitsProcessorOutput:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[future] + body, type_ignores=[])
+        )
+        ns = dict(
+            torch=torch,
+            dataclass=dataclass,
+            Optional=Optional,
+            Sequence=Sequence,
+            List=List,
+            Tuple=Tuple,
+            TAIL_DUMMY_SLOT=0,
+            device_backend_key=lambda device: str(device).split(":", 1)[0].lower(),
+            build_tail_attention_metadata=build_tail_attention_metadata,
+            pad_tail_attention_metadata=pad_tail_attention_metadata,
+            widen_tail_block_tables=widen_tail_block_tables,
+            SRTailAttentionMetadata=SRTailAttentionMetadata,
+            NpuGraphPreparationError=_PrepError,
+            ForwardBatch=ForwardBatch,
+            ForwardMode=NS(EXTEND="extend"),
+            CaptureHiddenMode=NS(NULL=None),
+            LogitsProcessorOutput=LogitsProcessorOutput,
+        )
+        exec(compile(module, str(graph), "exec"), ns)
+        ns["PrepError"] = _PrepError
+        return ns
+
+    def test_capture_bucket_sets_zero_extend_prefix_lens(self):
+        """Run production ``_capture_bucket`` up to attention metadata init.
+
+        The method is loaded from source so this CPU test does not import the
+        server stack. ``init_forward_metadata`` stops the call before graph capture.
+        """
+        ns = self._load_tail_capture()
+
+        class StopBeforeGraph(Exception):
+            pass
+
+        seen = []
+
+        def init_forward_metadata(batch):
+            seen.append(batch)
+            raise StopBeforeGraph()
+
+        model_runner = NS(
+            device="cpu",
+            model_config=NS(vocab_size=8, hidden_size=4, dtype=torch.float32),
+            req_to_token_pool=object(),
+            token_to_kv_pool=object(),
+            spec_algorithm=object(),
+            attn_backend=NS(init_forward_metadata=init_forward_metadata),
+        )
+        runner = NS(
+            model_runner=model_runner,
+            server_args=NS(speculative_num_steps=5),
+            dummy_req_idx=0,
+            captured_pages=1,
+            page_size=1,
+        )
+        with self.assertRaises(StopBeforeGraph):
+            ns["_capture_bucket"](runner, (2, 4, None))
+
+        self.assertEqual(len(seen), 1)
+        batch = seen[0]
+        self.assertEqual(list(batch.extend_prefix_lens_cpu), [0, 0])
+        self.assertEqual(tuple(batch.extend_prefix_lens.shape), (2,))
+        self.assertEqual(batch.extend_prefix_lens.dtype, torch.int64)
+        self.assertEqual(batch.extend_prefix_lens.device.type, "cpu")
+        self.assertTrue(
+            torch.equal(batch.extend_prefix_lens, torch.zeros(2, dtype=torch.int64))
+        )
+
+    def test_cuda_capture_extend_lens_cover_longest_tail(self):
+        layout = self._load_tail_capture()["cuda_tail_capture_extend_lens"]
+        for bs_cap, token_cap, max_per in ((2, 8, 6), (5, 10, 6), (1, 4, 6)):
+            extend = layout(bs_cap, token_cap, max_per)
+            self.assertEqual(sum(extend), token_cap)
+            self.assertEqual(len(extend), bs_cap)
+            self.assertGreaterEqual(max(extend), min(token_cap, max_per))
+            self.assertTrue(all(length > 0 for length in extend))
+
+    def test_cuda_capture_builds_sr_tail_when_backend_omits_it(self):
+        ns = self._load_tail_capture()
+        seen = []
+
+        class Backend:
+            def init_forward_metadata(self, batch):
+                seen.append(batch)
+                self.forward_metadata = NS(
+                    kv_indices=torch.empty(0, dtype=torch.int64),
+                    kv_indptr=torch.zeros(3, dtype=torch.int32),
+                    qo_indptr=torch.zeros(3, dtype=torch.int64),
+                    sr_tail=None,
+                )
+
+        class _Ctx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        backend = Backend()
+        bucket = (2, 8, None)
+        runner = NS(
+            model_runner=NS(
+                device="cpu",
+                model_config=NS(vocab_size=8, hidden_size=4, dtype=torch.float32),
+                req_to_token_pool=object(),
+                token_to_kv_pool=object(),
+                spec_algorithm=object(),
+                attn_backend=backend,
+                model=NS(
+                    forward=lambda *_args, **_kwargs: NS(
+                        next_token_logits=torch.zeros((2, 8), dtype=torch.float32)
+                    )
+                ),
+                stream=None,
+            ),
+            server_args=NS(speculative_num_steps=5),
+            dummy_req_idx=0,
+            captured_pages=3,
+            page_size=2,
+            graphs={},
+            buffers={},
+            attn_metadata={},
+            output_buffers={},
+            triton_metadata={},
+            _bind_capture_sr_tail=lambda *_args, **_kwargs: None,
+            _device_synchronize=lambda: None,
+            _create_graph=lambda: NS(),
+            _capture_context=lambda *_args, **_kwargs: _Ctx(),
+        )
+        ns["_capture_bucket"](runner, bucket)
+
+        captured = runner.attn_metadata[bucket]
+        self.assertEqual(captured.block_tables.shape[0], 8)
+        self.assertEqual(len(captured.context_lens_list), 8)
+        self.assertIs(backend.forward_metadata.sr_tail, captured)
+        self.assertEqual(int(backend.forward_metadata.kv_indices.numel()), 2 * 3 * 2)
+        self.assertIs(runner.triton_metadata[bucket], backend.forward_metadata)
+        extend = list(seen[0].extend_seq_lens_cpu)
+        self.assertEqual(sum(extend), 8)
+        self.assertGreaterEqual(max(extend), min(8, 6))
+
+    def test_refresh_rewrites_captured_indptr_and_rejects_overflow(self):
+        ns = self._load_tail_capture()
+        kv_indptr = torch.tensor([9, 9, 9], dtype=torch.int32)
+        qo_indptr = torch.tensor([9, 9, 9], dtype=torch.int64)
+        meta = NS(
+            kv_indptr=kv_indptr,
+            qo_indptr=qo_indptr,
+            kv_indices=torch.zeros(8, dtype=torch.int64),
+        )
+        bucket = (2, 4, None)
+        runner = NS(triton_metadata={bucket: meta})
+        buffers = NS(
+            extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+        )
+        forward_batch = NS(
+            req_to_token_pool=NS(req_to_token=torch.zeros((1, 4), dtype=torch.int32))
+        )
+        ns["_refresh_captured_triton_metadata"](
+            runner,
+            forward_batch,
+            NS(bucket=bucket, prefix_lens=[0]),
+            buffers,
+        )
+        self.assertEqual(meta.kv_indptr.data_ptr(), kv_indptr.data_ptr())
+        self.assertEqual(meta.qo_indptr.data_ptr(), qo_indptr.data_ptr())
+        self.assertEqual(kv_indptr.tolist(), [0, 0, 0])
+        self.assertEqual(qo_indptr.tolist(), [0, 3, 4])
+
+        overflow = NS(
+            kv_indptr=torch.zeros(2, dtype=torch.int32),
+            qo_indptr=torch.zeros(2, dtype=torch.int64),
+            kv_indices=torch.zeros(4, dtype=torch.int64),
+        )
+        with self.assertRaises(ns["PrepError"]) as caught:
+            ns["refresh_tail_triton_metadata"](
+                overflow,
+                [3, 2],
+                torch.tensor([1, 1], dtype=torch.int64),
+                torch.zeros((1, 4), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int64),
+            )
+        self.assertEqual(caught.exception.scope, "graph")
+        self.assertIn("kv_indices", str(caught.exception))
+
+    def test_npu_sr_tail_still_builds_attention_metadata(self):
+        source = BACKEND.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        segments = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "init_forward_metadata"
+            ):
+                segments.append(ast.get_source_segment(source, node) or "")
+        self.assertTrue(
+            any(
+                "elif is_sr_tail:" in segment
+                and "build_tail_attention_metadata(" in segment
+                for segment in segments
+            )
+        )
+
     def test_select_bucket_requires_dummy_request_for_token_padding(self):
         helpers = self._helpers()
         buckets = helpers["default_tail_graph_buckets"]([1, 2], [2, 4], (None,))

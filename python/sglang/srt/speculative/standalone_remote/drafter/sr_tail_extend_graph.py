@@ -22,6 +22,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
+    build_tail_attention_metadata,
     copy_tail_attention_metadata_,
     fill_tail_attention_metadata_,
     pad_tail_attention_metadata,
@@ -47,6 +48,142 @@ def default_tail_token_caps(speculative_num_steps: int) -> Tuple[int, ...]:
 
 def tail_max_per_request(speculative_num_steps: int) -> int:
     return max(int(speculative_num_steps or 0), 0) + 1
+
+
+def cuda_tail_capture_extend_lens(
+    bs_cap: int, token_cap: int, max_per_req: int
+) -> Optional[List[int]]:
+    """Extend layout whose longest row covers any real tail in the bucket.
+
+    Triton freezes ``max_extend_len`` into the captured kernel grid. The first
+    row takes every token that is not required to keep the other rows nonempty,
+    which is at least ``min(token_cap, max_per_req)`` whenever that fits.
+    """
+    bs_cap = int(bs_cap)
+    token_cap = int(token_cap)
+    if bs_cap <= 0 or token_cap < bs_cap or int(max_per_req) < 0:
+        return None
+    if bs_cap == 1:
+        return [token_cap]
+    first = token_cap - (bs_cap - 1)
+    rest = token_cap - first
+    base, extra = divmod(rest, bs_cap - 1)
+    return [first] + [base + (1 if i < extra else 0) for i in range(bs_cap - 1)]
+
+
+def tail_kv_index_capacity(bs_cap: int, captured_pages: int, page_size: int) -> int:
+    """Prefix-token slots a captured tail graph must be able to index."""
+    return max(int(bs_cap), 0) * max(int(captured_pages), 1) * max(int(page_size), 1)
+
+
+def widen_tail_kv_indices(metadata, capacity: int, device) -> torch.Tensor:
+    """Point ``metadata.kv_indices`` at a buffer of at least ``capacity`` slots.
+
+    Call this before CUDA graph capture. Replacing the tensor afterwards would
+    leave the graph pointing at the old storage.
+    """
+    capacity = max(int(capacity), 0)
+    current = getattr(metadata, "kv_indices", None)
+    target = torch.device(device)
+    if (
+        torch.is_tensor(current)
+        and int(current.numel()) >= capacity
+        and current.device == target
+    ):
+        return current
+    buf = torch.zeros(capacity, dtype=torch.int64, device=target)
+    if torch.is_tensor(current) and int(current.numel()) > 0 and capacity > 0:
+        n = min(int(current.numel()), capacity)
+        buf[:n].copy_(current[:n].to(device=buf.device, dtype=buf.dtype))
+    metadata.kv_indices = buf
+    return buf
+
+
+def build_cuda_tail_attention_metadata(
+    prefix_lens,
+    extend_lens,
+    block_tables: torch.Tensor,
+    token_cap: int,
+    captured_pages: int,
+) -> SRTailAttentionMetadata:
+    """SR tail buffers for a backend that does not publish ``forward_metadata.sr_tail``."""
+    metadata = build_tail_attention_metadata(prefix_lens, extend_lens, block_tables)
+    padded = pad_tail_attention_metadata(
+        metadata, int(token_cap), dummy_slot=TAIL_DUMMY_SLOT
+    )
+    return SRTailAttentionMetadata(
+        widen_tail_block_tables(padded.block_tables, max(int(captured_pages), 1)),
+        padded.context_lens_cpu,
+        list(padded.context_lens_list),
+    )
+
+
+def _write_indptr_(indptr: torch.Tensor, lengths: torch.Tensor) -> None:
+    n = int(lengths.shape[0])
+    if int(indptr.numel()) < n + 1:
+        raise NpuGraphPreparationError(
+            "captured SR tail indptr is shorter than the bucket",
+            scope="graph",
+        )
+    values = lengths.to(dtype=indptr.dtype, device=indptr.device)
+    indptr.zero_()
+    if n:
+        indptr[1 : n + 1].copy_(torch.cumsum(values, dim=0))
+
+
+def refresh_tail_triton_metadata(
+    metadata,
+    prefix_lens: Sequence[int],
+    extend_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+) -> None:
+    """Update the Triton extend buffers captured for one tail bucket, in place."""
+    kv_indices = getattr(metadata, "kv_indices", None)
+    kv_indptr = getattr(metadata, "kv_indptr", None)
+    qo_indptr = getattr(metadata, "qo_indptr", None)
+    if not (
+        torch.is_tensor(kv_indices)
+        and torch.is_tensor(kv_indptr)
+        and torch.is_tensor(qo_indptr)
+    ):
+        raise NpuGraphPreparationError(
+            "captured SR tail triton metadata is incomplete",
+            scope="graph",
+        )
+    prefix = [int(v) for v in prefix_lens]
+    if any(v < 0 for v in prefix):
+        raise NpuGraphPreparationError(
+            "SR tail prefix length is negative",
+            scope="graph",
+        )
+    if int(extend_lens.shape[0]) != len(prefix):
+        raise NpuGraphPreparationError(
+            "SR tail extend rows do not match the bucket",
+            scope="graph",
+        )
+    prefix_tokens = sum(prefix)
+    if prefix_tokens > int(kv_indices.numel()):
+        raise NpuGraphPreparationError(
+            "SR tail prefix exceeds captured kv_indices",
+            scope="graph",
+        )
+    prefix_t = torch.tensor(prefix, dtype=kv_indptr.dtype, device=kv_indptr.device)
+    _write_indptr_(kv_indptr, prefix_t)
+    _write_indptr_(qo_indptr, extend_lens)
+    if prefix_tokens <= 0:
+        return
+    from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+
+    create_flashinfer_kv_indices_triton[(len(prefix),)](
+        req_to_token,
+        req_pool_indices,
+        prefix_t,
+        kv_indptr,
+        None,
+        kv_indices,
+        req_to_token.stride(0),
+    )
 
 
 def trim_capture_batch_sizes(capture_bs: Sequence[int], limit: int = 6) -> List[int]:
@@ -311,6 +448,7 @@ class SRTailExtendGraphRunner:
         self.eager_fallback_count = 0
         self.page_size = 1
         self.captured_pages = 0
+        self.triton_metadata = {}
         self._capture()
 
     def _create_graph(self):
@@ -374,6 +512,7 @@ class SRTailExtendGraphRunner:
         buffers.extend_seq_lens.copy_(cpu_extend)
         self._fill_mrope_positions(buffers, forward_batch, raw_tokens)
         self._fill_attention_metadata(forward_batch, plan, buffers)
+        self._refresh_captured_triton_metadata(forward_batch, plan, buffers)
 
     def replay_filled(self, plan: TailGraphPlan):
         graph = self.graphs[plan.bucket]
@@ -455,6 +594,24 @@ class SRTailExtendGraphRunner:
         backend.forward_metadata.sr_tail = captured
         self._padded_context_lens = captured.context_lens_list
 
+    def _refresh_captured_triton_metadata(self, forward_batch, plan, buffers) -> None:
+        meta = getattr(self, "triton_metadata", {}).get(plan.bucket)
+        if meta is None:
+            return
+        bs_cap = int(plan.bucket[0])
+        prefix = [int(v) for v in plan.prefix_lens]
+        if len(prefix) < bs_cap:
+            prefix.extend([0] * (bs_cap - len(prefix)))
+        else:
+            prefix = prefix[:bs_cap]
+        refresh_tail_triton_metadata(
+            meta,
+            prefix,
+            buffers.extend_seq_lens[:bs_cap],
+            forward_batch.req_to_token_pool.req_to_token,
+            buffers.req_pool_indices[:bs_cap],
+        )
+
     def _capture(self) -> None:
         if getattr(self.server_args, "disable_cuda_graph", False):
             self.disabled_reason = "disabled by configuration"
@@ -477,6 +634,7 @@ class SRTailExtendGraphRunner:
                 self.disabled_reason = self.disabled_reason or "no graphs"
                 self.buckets = []
                 self.attn_metadata = {}
+                self.triton_metadata = {}
         except NpuGraphReplaySubmittedError:
             raise
         except Exception as e:
@@ -488,6 +646,7 @@ class SRTailExtendGraphRunner:
             self.buffers = {}
             self.output_buffers = {}
             self.attn_metadata = {}
+            self.triton_metadata = {}
             self.buckets = []
 
     def _build_buckets(self) -> List[TailGraphBucket]:
@@ -549,11 +708,23 @@ class SRTailExtendGraphRunner:
         dummy = int(self.dummy_req_idx or 0)
         buffers.req_pool_indices.fill_(dummy)
         buffers.out_cache_loc.fill_(TAIL_DUMMY_SLOT)
-        per = max(token_cap // bs_cap, 1)
-        leftover = token_cap - per * (bs_cap - 1)
-        extend = [per] * (bs_cap - 1) + [leftover]
-        if leftover <= 0:
-            return
+        is_npu = device_backend_key(device) == "npu"
+        if is_npu:
+            per = max(token_cap // bs_cap, 1)
+            leftover = token_cap - per * (bs_cap - 1)
+            extend = [per] * (bs_cap - 1) + [leftover]
+            if leftover <= 0:
+                return
+        else:
+            extend = cuda_tail_capture_extend_lens(
+                bs_cap,
+                token_cap,
+                tail_max_per_request(
+                    int(getattr(self.server_args, "speculative_num_steps", 0) or 0)
+                ),
+            )
+            if not extend:
+                return
         buffers.extend_seq_lens.copy_(
             torch.tensor(extend, dtype=torch.int64, device=buffers.extend_seq_lens.device)
         )
@@ -582,6 +753,9 @@ class SRTailExtendGraphRunner:
             mrope_positions=buffers.mrope_positions,
             extend_seq_lens=buffers.extend_seq_lens,
             extend_seq_lens_cpu=extend,
+            extend_prefix_lens=torch.zeros(
+                (bs_cap,), dtype=buffers.seq_lens.dtype, device=buffers.seq_lens.device
+            ),
             extend_prefix_lens_cpu=[0] * bs_cap,
             extend_num_tokens=token_cap,
             req_to_token_pool=runner.req_to_token_pool,
@@ -595,9 +769,34 @@ class SRTailExtendGraphRunner:
         backend = runner.attn_backend
         if backend is not None and hasattr(backend, "init_forward_metadata"):
             backend.init_forward_metadata(forward_batch)
+            if not is_npu:
+                meta = getattr(backend, "forward_metadata", None)
+                if meta is not None and hasattr(meta, "kv_indices"):
+                    widen_tail_kv_indices(
+                        meta,
+                        tail_kv_index_capacity(
+                            bs_cap, self.captured_pages, self.page_size
+                        ),
+                        device,
+                    )
             captured = self._bind_capture_sr_tail(backend, token_cap)
         else:
             captured = None
+        if captured is None and not is_npu:
+            captured = build_cuda_tail_attention_metadata(
+                [0] * bs_cap,
+                extend,
+                buffers.req_page_tables,
+                token_cap,
+                self.captured_pages,
+            )
+            meta = (
+                getattr(backend, "forward_metadata", None)
+                if backend is not None
+                else None
+            )
+            if meta is not None:
+                meta.sr_tail = captured
 
         def run_once():
             out = runner.model.forward(
@@ -653,6 +852,15 @@ class SRTailExtendGraphRunner:
         self.buffers[bucket] = buffers
         if captured is not None:
             self.attn_metadata[bucket] = captured
+        if not is_npu and backend is not None:
+            meta = getattr(backend, "forward_metadata", None)
+            if (
+                meta is not None
+                and torch.is_tensor(getattr(meta, "kv_indptr", None))
+                and torch.is_tensor(getattr(meta, "kv_indices", None))
+                and torch.is_tensor(getattr(meta, "qo_indptr", None))
+            ):
+                self.triton_metadata[bucket] = meta
         self.output_buffers[bucket] = LogitsProcessorOutput(
             next_token_logits=buffers.next_token_logits,
             hidden_states=None,

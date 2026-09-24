@@ -227,6 +227,13 @@ class EAGLEDraftCudaGraphRunner:
     def _replay(self, forward_batch: ForwardBatch):
         self.graphs[self.bs].replay()
 
+    def _capture_extra_keys(self, ntpb=None):
+        del ntpb
+        return [None]
+
+    def _make_graph_key(self, bs, stream_idx=None, ntpb=None, extra=None):
+        return CudaGraphRunner._make_graph_key(self, bs, stream_idx, ntpb, extra)
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
