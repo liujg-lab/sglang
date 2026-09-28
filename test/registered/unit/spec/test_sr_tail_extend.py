@@ -1199,7 +1199,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                     attn_backend=NS(tree_kv_buckets=None),
                 )
             ),
-            1024,
+            4096,
         )
 
     def test_seed_rows_are_last_real_tokens(self):

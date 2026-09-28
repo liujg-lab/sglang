@@ -988,7 +988,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.tree_capacity_fallback_count += 1
                 self._log_tree_fallback_once(
                     "capacity",
-                    f"needed_pages={needed_pages} page_buckets={page_buckets}",
+                    f"needed_pages>{max(page_buckets)} page_buckets={page_buckets}",
                 )
                 self._replay_tree_s_cap = None
                 return False
@@ -1008,18 +1008,9 @@ class AscendAttnBackend(AttentionBackend):
         )
         if not ok:
             self.tree_capacity_fallback_count += 1
-            needed = tree_slot_graph_needed_kv(
-                is_target_verify=is_verify,
-                is_tree_draft=is_draft,
-                spec_info=spec_info,
-                fallback_seq_lens=fallback if fallback is not None else [],
-                draft_token_num_fallback=int(self.speculative_num_draft_tokens or 1),
-                draft_num_steps=self.draft_num_steps,
-                seq_lens=seq if seq is not None else [],
-            )
             self._log_tree_fallback_once(
                 "capacity",
-                f"needed_kv={needed} buckets={buckets}",
+                f"needed_kv>{max(buckets) if buckets else 0} buckets={buckets}",
             )
             self._replay_tree_s_cap = None
             return False

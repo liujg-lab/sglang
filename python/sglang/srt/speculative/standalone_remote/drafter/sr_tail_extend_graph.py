@@ -384,11 +384,11 @@ def tail_graph_kv_tokens(runner) -> int:
 
 
 def tail_graph_page_kv_tokens(runner) -> int:
-    """Cap captured page-table width to the tree KV bucket, default 1024 tokens."""
+    """Cap captured page-table width to the tree KV bucket, default 4096 tokens."""
     kv = tail_graph_kv_tokens(runner)
     backend = getattr(runner, "attn_backend", None)
     buckets = getattr(backend, "tree_kv_buckets", None) if backend is not None else None
-    tree_max = max(int(v) for v in buckets) if buckets else 1024
+    tree_max = max(int(v) for v in buckets) if buckets else 4096
     return min(max(int(kv), 1), max(int(tree_max), 1))
 
 

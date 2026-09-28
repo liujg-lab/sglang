@@ -276,3 +276,14 @@ sgl-kernel/csrc/**/*_musa/
 
 # liujg
 test_sglang_liujg/result/
+.cursor
+
+# sgl-kernel FetchContent local mirrors (do not commit)
+/3rdparty/cutlass/
+/3rdparty/DeepGEMM/
+/3rdparty/fmt/
+/3rdparty/triton/
+/3rdparty/flashinfer/
+/3rdparty/sgl-attn/
+/3rdparty/mscclpp/
+/3rdparty/FlashMLA/

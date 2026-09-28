@@ -352,6 +352,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             keep = [i for i, r in enumerate(running.reqs) if r is not req]
             if len(keep) != len(running.reqs):
                 running.filter_batch(keep_indices=keep)
+        # A chunked prefill still points here after KV release. Stashing it
+        # later indexes req_to_token with req_pool_idx=None.
+        if getattr(self, "chunked_req", None) is req:
+            self.chunked_req = None
+        last = getattr(self, "last_batch", None)
+        if last is not None and getattr(last, "chunked_req", None) is req:
+            last.chunked_req = None
 
     def _sr_pause_req(self, req: Req) -> None:
         req.draft_is_paused = True
@@ -1079,8 +1086,22 @@ class StandaloneRemoteDraftSchedulerMixin:
             waiting.append(req)
         return True
 
+    def _sr_prefix_pending(self, req: Req) -> bool:
+        """True while this reprefill still owes KV for origin_input_ids.
+
+        A chunked prefill assigns req_pool_idx on the first chunk. The rest of
+        the prefix stays pending until kv_committed_len covers origin.
+        """
+        if req.req_pool_idx is None:
+            return True
+        if getattr(self, "chunked_req", None) is req:
+            return True
+        target = len(getattr(req, "origin_input_ids", None) or [])
+        committed = int(getattr(req, "kv_committed_len", 0) or 0)
+        return committed < target
+
     def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
-        """Prefill until every req has a pool slot; drop any sampled extras."""
+        """Prefill until committed KV covers origin_input_ids; drop sampled extras."""
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
             return
@@ -1104,7 +1125,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         need_rids = {r.rid for r in need}
         self._sr_isolate_need(need_rids)
         for _ in range(8):
-            still = [r for r in need if r.req_pool_idx is None]
+            still = [r for r in need if self._sr_prefix_pending(r)]
             if not still:
                 break
             still_rids = {r.rid for r in still}
@@ -1128,7 +1149,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             is_extend = (
                 batch.forward_mode is not None and batch.forward_mode.is_extend()
             ) or getattr(batch, "is_extend_in_batch", False)
-            if is_extend and len(keep) == len(still):
+            if is_extend and not any(self._sr_prefix_pending(r) for r in still):
                 break
         for req in need:
             req.output_ids = []

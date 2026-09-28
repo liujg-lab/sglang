@@ -1372,11 +1372,23 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         req = MagicMock()
+        other = MagicMock()
         mixin.waiting_queue = [req]
         mixin.running_batch = MagicMock()
         mixin.running_batch.is_empty.return_value = True
+        mixin.chunked_req = req
+        mixin.last_batch = MagicMock()
+        mixin.last_batch.chunked_req = req
         mixin._sr_remove_req(req)
         self.assertEqual(mixin.waiting_queue, [])
+        self.assertIsNone(mixin.chunked_req)
+        self.assertIsNone(mixin.last_batch.chunked_req)
+
+        mixin.chunked_req = other
+        mixin.last_batch.chunked_req = other
+        mixin._sr_remove_req(req)
+        self.assertIs(mixin.chunked_req, other)
+        self.assertIs(mixin.last_batch.chunked_req, other)
 
     def test_isolate_need_pauses_other_running_reqs(self):
         try:
@@ -3454,6 +3466,100 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertEqual(req.output_ids, [])
         self.assertEqual(tuple(req.multimodal_inputs.mrope_positions.shape), (3, 5))
         self.assertIn(req, mixin.draft_paused_reqs)
+
+    def _extend_batch(self, req):
+        class _Extend:
+            def is_extend(self):
+                return True
+
+        return SimpleNamespace(
+            reqs=[req], forward_mode=_Extend(), is_extend_in_batch=False
+        )
+
+    def test_materialize_continues_chunked_prefill(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        origin = list(range(2057))
+        req = SimpleNamespace(
+            rid="chunk-2057",
+            is_sr_draft=True,
+            origin_input_ids=origin,
+            output_ids=[],
+            fill_ids=list(origin),
+            req_pool_idx=None,
+            kv_committed_len=0,
+            draft_is_paused=False,
+            draft_generation_start_len=0,
+            finished=lambda: False,
+        )
+        calls = []
+
+        def next_batch():
+            n = len(calls)
+            if n == 0:
+                req.req_pool_idx = 1
+                req.kv_committed_len = 2048
+                mixin.chunked_req = req
+            elif n == 1:
+                req.kv_committed_len = 2057
+                mixin.chunked_req = None
+            else:
+                raise AssertionError("decode batch must not run")
+            calls.append(n)
+            return self._extend_batch(req)
+
+        mixin.get_next_batch_to_run = next_batch
+        mixin.run_batch = lambda batch: SimpleNamespace()
+        mixin.process_batch_result = lambda *_a, **_k: None
+        mixin._sr_materialize_prefix_batch([req])
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(req.kv_committed_len, 2057)
+        self.assertIsNone(mixin.chunked_req)
+        self.assertEqual(req.output_ids, [])
+
+    def test_materialize_stops_when_prefix_fits_one_extend(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        mixin = self._make_draft_mixin()
+        origin = list(range(8))
+        req = SimpleNamespace(
+            rid="short",
+            is_sr_draft=True,
+            origin_input_ids=origin,
+            output_ids=[],
+            fill_ids=list(origin),
+            req_pool_idx=None,
+            kv_committed_len=0,
+            draft_is_paused=False,
+            draft_generation_start_len=0,
+            finished=lambda: False,
+        )
+        calls = []
+
+        def next_batch():
+            if calls:
+                raise AssertionError("decode batch must not run")
+            req.req_pool_idx = 1
+            req.kv_committed_len = len(origin)
+            mixin.chunked_req = None
+            calls.append(1)
+            return self._extend_batch(req)
+
+        mixin.get_next_batch_to_run = next_batch
+        mixin.run_batch = lambda batch: SimpleNamespace()
+        mixin.process_batch_result = lambda *_a, **_k: None
+        mixin._sr_materialize_prefix_batch([req])
+        self.assertEqual(calls, [1])
+        self.assertEqual(req.kv_committed_len, 8)
 
     def test_cache_tree_seed_reraises_cuda_ima(self):
         if torch is None:

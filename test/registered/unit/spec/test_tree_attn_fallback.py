@@ -831,7 +831,7 @@ class TestTreeGraphSlotCap(CustomTestCase):
     def test_parse_tree_graph_max_kv(self):
         from sglang.srt.speculative.tree_attn_fallback import parse_tree_graph_max_kv
 
-        self.assertEqual(parse_tree_graph_max_kv(None), 1024)
+        self.assertEqual(parse_tree_graph_max_kv(None), 4096)
         self.assertEqual(parse_tree_graph_max_kv("2048"), 2048)
         for bad in ("0", "-1", "abc", "", "  ", "1.5"):
             with self.assertRaises(ValueError):
@@ -1199,6 +1199,9 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
             parse_tree_graph_kv_buckets(None, orig_max_kv=1024),
             [256, 512, 1024],
         )
+        default_wide = parse_tree_graph_kv_buckets(None, orig_max_kv=4096)
+        self.assertIn(4096, default_wide)
+        self.assertEqual(select_tree_kv_bucket(2083, default_wide), 4096)
         self.assertEqual(
             parse_tree_graph_kv_buckets("256,512,1024,2048", orig_max_kv=300),
             [256, 300],

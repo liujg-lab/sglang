@@ -38,10 +38,10 @@ ATTN_CHUNK_ALIGN = 128
 MAX_ATTN_CHUNK_WIDTH = 512
 
 # Graph slot-table width cap. Attention walks kv_slots.shape[1]; this does not
-# size custom_mask. Default 1024 → tree_attn_chunk_width 128 → 8 chunks.
-TREE_GRAPH_MAX_KV = 1024
+# size custom_mask. Default 4096 → tree_attn_chunk_width 512 → 8 chunks.
+TREE_GRAPH_MAX_KV = 4096
 TREE_GRAPH_MAX_KV_ENV = "SGLANG_NPU_TREE_GRAPH_MAX_KV"
-TREE_GRAPH_KV_BUCKETS = (256, 512, 1024, 2048)
+TREE_GRAPH_KV_BUCKETS = (256, 512, 1024, 2048, 4096)
 TREE_GRAPH_KV_BUCKETS_ENV = "SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"
 TREE_DRAFT_CAPTURE_BS = (1, 2)
 TREE_DRAFT_CAPTURE_BS_ENV = "SGLANG_NPU_TREE_DRAFT_CAPTURE_BS"
