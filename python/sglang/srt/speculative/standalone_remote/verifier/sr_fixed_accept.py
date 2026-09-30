@@ -17,6 +17,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    SRTransferUnresolved,
     alloc_host,
     submit_copy,
     wait_event,
@@ -561,6 +562,7 @@ class SRFixedAcceptState:
             (self.packet_cap,), dtype=torch.int64, device=self.device
         )
         self.commit_h2d_event = None
+        self._commit_unresolved = False
         self.src_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
         self.tgt_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
         self.page_buf = torch.empty(
@@ -570,6 +572,14 @@ class SRFixedAcceptState:
         self._staging_noted = False
         self._d2h_count = 0
         self._h2d_count = 0
+        self.rpd_workspace = None
+        self._rpd_fallback_logged = set()
+
+    def note_rpd_fallback(self, reason: str) -> None:
+        self.note_path("rpd_host_fallback_" + reason)
+        if reason not in self._rpd_fallback_logged:
+            self._rpd_fallback_logged.add(reason)
+            logger.info("[SR] RPD host plan fallback reason=%s", reason)
 
     def note_path(self, name: str) -> None:
         metrics = self.metrics
@@ -600,9 +610,11 @@ class SRFixedAcceptState:
         spec_steps: int,
         logits,
         out_cache_loc,
+        rpd_host_input=None,
+        rpd_live_batch_key=None,
     ) -> Optional[str]:
         reason = conservative_mode_reason(verify_mode, is_all_greedy)
-        if reason:
+        if reason and verify_mode != "rpd":
             return reason
         if has_grammar or vocab_mask is not None:
             return "grammar"
@@ -647,6 +659,21 @@ class SRFixedAcceptState:
             return "device"
         if not logits.is_contiguous() or not out_cache_loc.is_contiguous():
             return "noncontiguous"
+        if verify_mode == "rpd":
+            from sglang.srt.speculative.standalone_remote.sr_rpd import SRRPDWorkspace
+
+            if rpd_host_input is None:
+                return "rpd_context"
+            if (
+                rpd_live_batch_key is not None
+                and rpd_host_input.batch_key != rpd_live_batch_key
+            ):
+                return "rpd_batch_key"
+            if self.rpd_workspace is None:
+                self.rpd_workspace = SRRPDWorkspace()
+            reason = self.rpd_workspace.prepare(logits, rpd_host_input, self.metrics)
+            if reason:
+                return "rpd_" + reason
         return None
 
     def bind_verify_buffers(self, bs: int):
@@ -752,6 +779,85 @@ class SRFixedAcceptState:
             self.note_path("fixed_accept_error")
             raise
 
+        return self._finalize_cpu_rows(
+            batch,
+            logits_output,
+            page_size,
+            topk,
+            allocator,
+            rows,
+            token_rows,
+            prefixes,
+            think_end_id,
+        )
+
+    def finalize_from_host(
+        self, batch, logits_output, page_size, topk, allocator, plan
+    ):
+        """RPD already owns CPU tokens. Never pack or read device accept results."""
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDHostPlan,
+            rpd_batch_key,
+        )
+
+        bs = len(batch.reqs)
+        if not isinstance(plan, SRRPDHostPlan) or plan.consumed:
+            raise RuntimeError("invalid or consumed RPD host plan")
+        if plan.batch_key != rpd_batch_key(batch.reqs):
+            raise RuntimeError("RPD host plan request order or generation changed")
+        if not (len(plan.rows) == len(plan.tokens) == len(plan.pre_lengths) == bs):
+            raise RuntimeError("RPD host plan batch mismatch")
+        if bs > self.B_cap or int(page_size) != self.page_size or int(topk) <= 1:
+            raise RuntimeError("RPD host plan capacity or layout mismatch")
+        if batch.out_cache_loc.numel() != bs * self.W:
+            raise RuntimeError("RPD host plan cache slots mismatch")
+        for b, (row, tokens) in enumerate(zip(plan.rows, plan.tokens)):
+            if len(row) != self.L or len(tokens) != self.L:
+                raise RuntimeError("RPD host plan path capacity mismatch")
+            for idx, tok in zip(row, tokens):
+                if idx != -1 and not b * self.W <= idx < (b + 1) * self.W:
+                    raise RuntimeError("RPD host plan index outside request slots")
+                if idx >= 0 and not 0 <= tok < plan.vocab:
+                    raise RuntimeError("RPD host plan token outside vocabulary")
+        validate_packed_rows(plan.rows, plan.pre_lengths, [0] * bs)
+        if any(not row or row[0] == -1 for row in plan.rows):
+            raise RuntimeError("RPD host plan missing root")
+        if not bool(getattr(allocator, "is_not_in_free_group", False)):
+            raise RuntimeError("RPD host plan allocator entered a free group")
+        prefixes = _prefix_lengths(batch, bs) if bs else []
+        think_end_id = getattr(
+            getattr(batch, "model_config", None), "think_end_id", None
+        )
+        self._note_staging()
+        _timed(self.metrics, "fixed_accept_staging_wait", self._wait_previous_h2d)
+        # Consume before any request mutation, including failures during stop
+        # checking. Such a failure must not become a second append on retry.
+        plan.consumed = True
+        self.note_path("rpd_host_finalize")
+        return self._finalize_cpu_rows(
+            batch,
+            logits_output,
+            page_size,
+            topk,
+            allocator,
+            plan.rows,
+            plan.tokens,
+            prefixes,
+            think_end_id,
+        )
+
+    def _finalize_cpu_rows(
+        self,
+        batch,
+        logits_output,
+        page_size,
+        topk,
+        allocator,
+        rows,
+        token_rows,
+        prefixes,
+        think_end_id,
+    ):
         try:
             accepted, finished, truncated = _timed(
                 self.metrics,
@@ -829,9 +935,15 @@ class SRFixedAcceptState:
 
     def _wait_previous_h2d(self) -> None:
         """Reuse wait for the previous packet. Runs before this round appends."""
+        if self._commit_unresolved:
+            raise SRTransferUnresolved("fixed accept commit completion is unresolved")
         if self.inject_error == "h2d_reuse_wait":
             raise RuntimeError("fixed accept h2d reuse wait failed")
-        wait_event(self.commit_h2d_event)
+        try:
+            wait_event(self.commit_h2d_event)
+        except SRTransferUnresolved:
+            self._commit_unresolved = True
+            raise
         self.commit_h2d_event = None
 
     def _readback(self, packed: torch.Tensor) -> torch.Tensor:
@@ -997,9 +1109,16 @@ class SRFixedAcceptState:
             self.commit_h2d_event = None
             return
         # Queued on the current stream, ahead of gather, publish, and KV copy.
-        self.commit_h2d_event = submit_copy(
-            self.commit_device[:used], self.commit_host[:used]
-        )
+        try:
+            self.commit_h2d_event = submit_copy(
+                self.commit_device[:used], self.commit_host[:used]
+            )
+        except SRTransferUnresolved:
+            # submit_copy can queue H2D and then fail to record its event.
+            # Keep both packet allocations, and prohibit another round from
+            # treating a missing event as proof that the source is reusable.
+            self._commit_unresolved = True
+            raise
         self._h2d_count += 1
         self._count("fixed_accept_h2d_count")
         self._count("fixed_accept_h2d_bytes", int(used) * 8)

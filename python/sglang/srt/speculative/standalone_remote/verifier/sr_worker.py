@@ -20,20 +20,20 @@ from sglang.srt.speculative.eagle_info import EagleVerifyInput, EagleVerifyOutpu
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
 )
-from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    VerifyInputPacket,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     is_health_check_req as _is_health_check,
 )
-from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
-    conservative_mode_reason,
-)
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     bind_graph_host_metrics,
     restore_graph_host_metrics,
+)
+from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+    VerifyInputPacket,
+)
+from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+    conservative_mode_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,6 +343,7 @@ class StandaloneRemoteWorker:
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        spec_info.sr_rpd_input = self._verify_packet.rpd_input
         if not wrote_graph_mask or not wrote_graph_pos:
             self._maybe_update_graph_verify_buffers(spec_info)
         return spec_info
@@ -832,6 +833,17 @@ class StandaloneRemoteWorker:
             token_rows.append(None if dtl is None else dtl.get("draft_tokens"))
             parent_rows.append(None if dtl is None else dtl.get("parent_list"))
             index_rows.append(None if dtl is None else dtl.get("top_scores_index"))
+        rpd_kwargs = {}
+        if (
+            getattr(self, "_fixed_accept_state", None) is not None
+            and getattr(self.server_args, "speculative_verify_mode", None) == "rpd"
+        ):
+            from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
+
+            rpd_kwargs = dict(
+                rpd_vocab=int(batch.sampling_info.vocab_size),
+                rpd_batch_key=rpd_batch_key(list(batch.reqs)[:bs]),
+            )
         return self._verify_packet.load(
             verified_ids,
             token_rows,
@@ -842,6 +854,7 @@ class StandaloneRemoteWorker:
             num_draft_tokens,
             device,
             metrics,
+            **rpd_kwargs,
         )
 
 

@@ -1,6 +1,6 @@
 """NPU checks for the RPD compact readback.
 
-Numerical checks and the profiler run only when Torch NPU is configured.
+Numerical and transfer contract checks run only when Torch NPU is configured.
 ``--bench`` records segmented compact cost against the current reference
 path. CPU timings from that command are structural only and are not a TPOT
 result.
@@ -15,13 +15,17 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 import sglang.srt.speculative.rpd_verify as rpd
 from sglang.srt.speculative.rpd_verify import (
-    _rpd_compact_apply,
     _compact_await_stats,
+    _rpd_compact_apply,
     _rpd_compact_edge_values,
     _rpd_compact_edges,
     _rpd_compact_reduce,
@@ -206,40 +210,130 @@ class TestNpuRpdCompact(unittest.TestCase):
         self.assertLess(small, small_full)
         self.assertLess(large, large_full)
 
-    def test_profiler_has_no_full_logits_host_copy(self):
-        from torch_npu.profiler import ProfilerActivity, profile
-
-        device = self._device()
-        vocab = 4096
-        tensors = _chain(1, 8, vocab, 2, torch.float16, device)
-        logits = tensors[-1]
-        full_bytes = int(logits.numel()) * int(logits.element_size())
-        buffers = _buffers(tensors[0], tensors[1])
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
-            record_shapes=True,
-            profile_memory=True,
-        ) as prof:
-            _verify_tree_rpd_compact(*buffers, *tensors, rpd_gap_max(0.0), True)
-            _sync(device)
-        offenders = []
-        for evt in prof.key_averages():
-            name = str(getattr(evt, "key", "")).lower()
-            mem = max(
-                int(getattr(evt, "self_cpu_memory_usage", 0) or 0),
-                int(getattr(evt, "cpu_memory_usage", 0) or 0),
-            )
-            host_copy = any(
-                token in name
-                for token in ("copy", "to_copy", "clone", "contiguous", "memcpy")
-            )
-            if host_copy and mem >= full_bytes:
-                offenders.append(f"{evt.key} cpu_mem={mem}")
-        self.assertEqual(
-            offenders,
-            [],
-            "NPU compact moved a full logits tensor to the host",
+    def test_sr_host_input_statistics_and_commit(self):
+        """Actual NPU tree, typed D2H and KV commit, without profiler APIs."""
+        from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDWorkspace,
+            rpd_batch_key,
+            verify_sr_rpd_host,
         )
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            VerifyInputPacket,
+        )
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            SRFixedAcceptState,
+        )
+
+        # Reuse CPU request/allocator contracts, but put all live tensors on
+        # NPU and execute the production packing/commit kernels.
+        sys.path.insert(
+            0, str(Path(__file__).resolve().parents[1] / "registered/unit/spec")
+        )
+        try:
+            import test_sr_fixed_accept as fixtures
+        finally:
+            sys.path.pop(0)
+        device = self._device()
+        workspace, packet = SRRPDWorkspace(), VerifyInputPacket()
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for bs in (1, 2, 3, 4, 2, 1):
+                for tau in (0.0, 0.2, 0.5):
+                    reqs = [
+                        fixtures._Req(finish_at=1 if b % 2 else None) for b in range(bs)
+                    ]
+                    verified, parents, selected, tokens = packet.load(
+                        [0] * bs,
+                        [[1, 2, 3]] * bs,
+                        [None] * bs,
+                        [None] * bs,
+                        2,
+                        3,
+                        4,
+                        device,
+                        rpd_vocab=32,
+                        rpd_batch_key=rpd_batch_key(reqs),
+                    )
+                    context = packet.rpd_input
+                    seq = torch.ones(bs, dtype=torch.int64, device=device)
+                    built = build_tree_kernel_efficient(
+                        verified, parents, selected, tokens, seq, bs, 2, 3, 4
+                    )
+                    for actual, expected in zip(built[2:5], context.tree[1:]):
+                        torch.testing.assert_close(actual.cpu(), expected)
+                    logits = torch.randn(bs * 4, 32, dtype=dtype, device=device)
+                    predict = torch.zeros(bs * 4 + 1, dtype=torch.int32, device=device)
+                    index = torch.full((bs, 4), -1, dtype=torch.int32, device=device)
+                    length = torch.zeros(bs, dtype=torch.int32, device=device)
+                    _verify_tree_rpd_compact(
+                        predict,
+                        index,
+                        length,
+                        context.tree[0].to(device),
+                        *built[2:5],
+                        logits,
+                        rpd_gap_max(tau),
+                        tau == 0,
+                    )
+                    metrics = SimpleNamespace(counts=Counter())
+                    self.assertIsNone(workspace.prepare(logits, context, metrics))
+                    with patch.object(
+                        rpd, "_rpd_compact_tree", side_effect=AssertionError("tree D2H")
+                    ), patch.object(
+                        rpd,
+                        "_rpd_compact_apply",
+                        side_effect=AssertionError("result H2D"),
+                    ):
+                        plan = verify_sr_rpd_host(logits, context, workspace, tau, 4)
+                    self.assertEqual(plan.rows, index.cpu().tolist())
+                    self.assertEqual(plan.pre_lengths, length.cpu().tolist())
+                    self.assertEqual(metrics.counts["rpd_host_stats_waits"], 1)
+                    self.assertEqual(
+                        metrics.counts["rpd_host_stats_d2h_bytes"],
+                        bs * 4 * 8 + 2 * len(context.edges) * logits.element_size(),
+                    )
+                    alloc = fixtures.NPUPagedTokenToKVPoolAllocator(4)
+                    alloc.kv_buffer = torch.arange(
+                        2 * (bs + 1) * 4, dtype=torch.float32, device=device
+                    ).reshape(2, 1, bs + 1, 4, 1, 1)
+                    alloc.free_pages = alloc.free_pages.to(device)
+                    alloc.release_pages = alloc.release_pages.to(device)
+                    batch, _ = fixtures.FixedAcceptFinalizeTest()._batch(
+                        reqs,
+                        [1] * bs,
+                        torch.arange(bs * 4, device=device),
+                        alloc.kv_buffer,
+                    )
+                    batch.device = device
+                    batch.seq_lens = batch.seq_lens.to(device)
+                    batch.req_pool_indices = batch.req_pool_indices.to(device)
+                    state = SRFixedAcceptState(bs, 4, 4, 4, device)
+                    expected = fixtures.FixedAcceptFinalizeTest()._run(
+                        plan.rows,
+                        plan.tokens,
+                        plan.pre_lengths,
+                        [1] * bs,
+                        [1 if b % 2 else None for b in range(bs)],
+                    )
+                    with patch.object(
+                        state, "_pack", side_effect=AssertionError("greedy pack")
+                    ), patch.object(
+                        state,
+                        "_submit_accept_readback",
+                        side_effect=AssertionError("accept D2H"),
+                    ):
+                        result = state.finalize_from_host(
+                            batch, SimpleNamespace(), 4, 2, alloc, plan
+                        )
+                    self.assertEqual(state._h2d_count, 1)
+                    self.assertEqual(
+                        [req.output_ids for req in reqs],
+                        [req.output_ids for req in expected[3]],
+                    )
+                    torch.testing.assert_close(
+                        result.verified_id.cpu(), expected[4].verified_id
+                    )
+                    torch.testing.assert_close(alloc.kv_buffer.cpu(), expected[5])
 
 
 def benchmark_rpd_compact_stages(device: torch.device | None = None) -> None:

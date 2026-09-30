@@ -221,7 +221,11 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 候选 token 与 Target argmax token 相等的条件，而不只是比较 logit 数值相等，从而对齐 greedy。
 `tau>0` 允许近邻候选，不保证输出逐 token 等于普通 Target greedy。
 
-当前 RPD 按 logits 的 `device.type` 分派，不新增启动参数。`npu` 判断在 `is_cuda` 之前，因此 `transfer_to_npu` 把 `is_cuda` 变成真也仍走 NPU 紧凑回读，日志仍是 `npu_compact_cpu_path`。
+SR 的合格 NPU 分支优先使用 [RPD 主机计划](RPD_HOST_PLAN.md)，日志为
+`npu_sr_host_plan`：输入包携带边下标，统计一次等待，CPU 选路直接进入接受提交。
+其他调用方和回退批次仍通过 `verify_tree_rpd()` 按 logits 的 `device.type` 分派，
+不新增启动参数。该共享入口中 `npu` 判断在 `is_cuda` 之前，因此
+`transfer_to_npu` 把 `is_cuda` 变成真也仍走 `npu_compact_cpu_path`。
 
 - `npu`：紧凑回读。词表 `max` 和每条边上的一对 logit 留在设备上，最长路径仍在 CPU 上选择。树指针先回读，再与 `max` 同流取边，argmax 和边标量只等待一次。传输量与词表大小无关：树 `32*B*W` 字节、边下标 `16*E` 字节、argmax `8*B*W` 字节、边标量 `2*E*element_size` 字节，结果写回 `O(B*S+K)`。没有边时不做边下标上传，也没有边标量。日志值是 `npu_compact_cpu_path`，这不是全设备核验。
 - `cuda`：同一套紧凑回读。词表归约和边标量留在设备上，最长路径在 CPU 上选择。日志值是 `cuda_compact_cpu_path`。compact 失败原样抛出，不回退整词表 CPU reference。
@@ -300,8 +304,9 @@ submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共
 `SGLANG_NPU_SR_FIXED_ACCEPT` 默认开启 SR Target 的固定容量接受后处理。
 未设置或 `1/true/yes/on` 请求启用；`0/false/no/off` 使用原来的 V1 接受后处理。
 只在 Target 初始化时读取一次，改值后需重启 Target，不是运行时热切换，也没有
-执行中自动回退。首版只覆盖 NPU、普通 MHA 六维分页 KV、`topk>1`、greedy、
-`page_size>1`。采样、RPD、grammar、logprob、hidden 返回、混合状态、
+执行中自动回退。覆盖 NPU、普通 MHA/GQA 六维分页 KV、`topk>1`、greedy 或
+具有本轮主机上下文的 RPD、`page_size>1`。RPD 主机计划的具体门控、传输与
+验收边界见 [专项说明](RPD_HOST_PLAN.md)。采样、grammar、logprob、hidden 返回、混合状态、
 自定义 logit processor、CUDA、单链、非分页、模拟接受长度，以及宽度或
 allocator 不匹配的批次在写工作区之前走 V1。Qwen3-VL dense
 （`Qwen3VLForConditionalGeneration`）和 MoE
@@ -998,7 +1003,7 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `key=1_s512` | Draft 图键，batch 1、长度容量 bucket 512；不是实际 prefix 恰好 512 |
 | `key=r15_1_s512` | Target 图键，每请求 15 个验证位置、batch 1、容量 bucket 512 |
 | `needed_len_max=None` | 部分路径不构造旧 FIA 的主机长度统计；不能单凭 None 判断长度错误 |
-| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径。RPD 路径是 `cuda_compact_cpu_path`、`npu_compact_cpu_path` 或 `cpu_reference`。前两者都表示词表统计留在设备上、最长路径仍由 CPU 选择，不是全设备核验 |
+| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径。SR 合格 NPU 批次为 `npu_sr_host_plan`；共享入口为 `cuda_compact_cpu_path`、`npu_compact_cpu_path` 或 `cpu_reference`。主机计划和 compact 都把词表统计留在设备上、最长路径留在 CPU，不是全设备核验 |
 | `Prefill batch` | `#new-seq/#new-token/#cached-token` 为本批新请求、输入及缓存复用量；`npu graph: False` 对普通 tail/prefill 不等于树图失效 |
 | `Decode batch #running-req/#queue-req` | 当前运行/排队请求数 |
 | `#token/token usage` | KV 池占用相关统计，不是本轮生成的 token 数 |

@@ -594,6 +594,8 @@ class VerifyInputPacket:
         self.capacity = 0
         self.event = None
         self.unresolved = False
+        self.generation = 0
+        self.rpd_input = None
 
     def _raise_if_unresolved(self) -> None:
         if self.unresolved:
@@ -681,6 +683,9 @@ class VerifyInputPacket:
         num_draft_tokens: int,
         device,
         metrics=None,
+        *,
+        rpd_vocab=None,
+        rpd_batch_key=(),
     ):
         """Fill this round and upload ``[:used]`` once on an accelerator.
 
@@ -689,6 +694,8 @@ class VerifyInputPacket:
         leaves the existing buffers in place and blocks later fills or growth.
         """
         self._raise_if_unresolved()
+        self.generation += 1
+        self.rpd_input = None
         plan = plan_draft_rows(
             token_rows,
             parent_rows,
@@ -706,18 +713,64 @@ class VerifyInputPacket:
         for i, value in enumerate(verified_ids):
             verified[i] = int(value)
         write_draft_regions(tokens, parents, indices, plan)
+        used = plan.used
+        if rpd_vocab is not None:
+            from sglang.srt.speculative.standalone_remote.sr_rpd import (
+                build_sr_rpd_input,
+            )
+
+            context = build_sr_rpd_input(
+                verified,
+                tokens,
+                parents,
+                indices,
+                topk=topk,
+                steps=spec_steps,
+                width=num_draft_tokens,
+                vocab=rpd_vocab,
+                owner=self,
+                generation=self.generation,
+                batch_key=rpd_batch_key,
+            )
+            if context is not None:
+                used += int(context.edge_index_cpu.numel())
+                # Growing storage replaces it. Preserve only this round's
+                # initialized input region, then append the edge indices.
+                if used > self.capacity:
+                    saved = self.host_packet[: plan.used].clone()
+                    self.ensure(used, device, metrics)
+                    self.host_packet[: plan.used].copy_(saved)
+                    verified, tokens, parents, indices = packet_segment_views(
+                        self.host_packet, plan
+                    )
+                self.host_packet[plan.used : used].copy_(
+                    context.edge_index_cpu.reshape(-1)
+                )
+                self.rpd_input = context
+                self._note(
+                    metrics,
+                    "counts",
+                    "rpd_input_edge_bytes",
+                    context.edge_index_cpu.numel() * 8,
+                )
         self._note(metrics, "host", "verify_packet_fill", time.perf_counter() - fill_start)
         if not self.on_accelerator(device):
+            if self.rpd_input is not None:
+                self.rpd_input.edge_index = self.host_packet[plan.used : used].view(
+                    2, -1
+                )
             return verified, parents, indices, tokens
         host = self.host_packet
         device_buf = self.device_packet
         try:
-            event = submit_copy(device_buf[: plan.used], host[: plan.used])
+            event = submit_copy(device_buf[:used], host[:used])
         except SRTransferUnresolved:
             self.unresolved = True
             raise
         self.event = event
         self._note(metrics, "counts", "verify_packet_upload", 1)
+        if self.rpd_input is not None:
+            self.rpd_input.edge_index = device_buf[plan.used : used].view(2, -1)
         verified, tokens, parents, indices = packet_segment_views(device_buf, plan)
         return verified, parents, indices, tokens
 

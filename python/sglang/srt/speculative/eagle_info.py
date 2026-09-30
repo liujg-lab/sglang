@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +56,8 @@ else:
     tree_speculative_sampling_target_only = None
 
 logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from sglang.srt.speculative.standalone_remote.sr_rpd import SRRPDHostInput
 _logged_verify_method = False
 
 
@@ -139,6 +141,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    sr_rpd_input: Optional["SRRPDHostInput"] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1
@@ -346,6 +349,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
         fixed_bound = False
+        rpd_host_bound = False
         fixed_detach = None
         fixed_decision = None
         if sr_accept_state is not None:
@@ -364,6 +368,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             early_mode = (
                 getattr(early_args, "speculative_verify_mode", "auto") or "auto"
             )
+            rpd_context = getattr(self, "sr_rpd_input", None)
+            rpd_live_batch_key = None
+            if early_mode == "rpd":
+                from sglang.srt.speculative.standalone_remote.sr_rpd import (
+                    rpd_batch_key,
+                )
+
+                rpd_live_batch_key = rpd_batch_key(batch.reqs)
             reject_reason = sr_accept_state.reject_before_alloc(
                 bs=bs,
                 verify_mode=early_mode,
@@ -375,9 +387,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 has_custom_logit_processor=bool(
                     sampling_info.has_custom_logit_processor
                 ),
-                multimodal_reject_reason=multimodal_accept_reject_reason(
-                    batch, bs=bs
-                ),
+                multimodal_reject_reason=multimodal_accept_reject_reason(batch, bs=bs),
                 simulate_acc_len=float(SIMULATE_ACC_LEN),
                 sampling_rows=len(sampling_info),
                 seq_lens_cpu=getattr(batch, "seq_lens_cpu", None),
@@ -386,8 +396,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=int(self.spec_steps),
                 logits=logits_output.next_token_logits,
                 out_cache_loc=batch.out_cache_loc,
+                rpd_host_input=rpd_context,
+                rpd_live_batch_key=rpd_live_batch_key,
             )
-            if reject_reason is None:
+            if reject_reason is None and early_mode == "rpd":
+                rpd_host_bound = True
+            elif reject_reason is None:
                 try:
                     predict, accept_index, accept_length = (
                         sr_accept_state.bind_verify_buffers(bs)
@@ -397,7 +411,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sr_accept_state.note_path("fixed_accept_noncontiguous")
             else:
                 sr_accept_state.note_path("fixed_accept_" + reject_reason)
-        if not fixed_bound:
+                if early_mode == "rpd":
+                    sr_accept_state.note_rpd_fallback(reject_reason)
+        if not fixed_bound and not rpd_host_bound:
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
             predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
@@ -482,6 +498,27 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
         if resolved_verify == "rpd":
+            if rpd_host_bound:
+                from sglang.srt.speculative.standalone_remote.sr_rpd import (
+                    verify_sr_rpd_host,
+                )
+
+                host_plan = verify_sr_rpd_host(
+                    logits_output.next_token_logits,
+                    rpd_context,
+                    sr_accept_state.rpd_workspace,
+                    rpd_tau,
+                    self.spec_steps + 1,
+                )
+                raw = sr_accept_state.finalize_from_host(
+                    batch,
+                    logits_output,
+                    page_size,
+                    self.topk,
+                    token_to_kv_pool_allocator,
+                    host_plan,
+                )
+                return _eagle_output_from_fixed(raw, batch, self.topk)
             predict, accept_index, accept_length = verify_tree_rpd(
                 predicts=predict,
                 accept_index=accept_index,

@@ -247,7 +247,7 @@ class FixedAcceptRouteTest(CustomTestCase):
         self.assertIsNone(state.reject_before_alloc(**_admit_kwargs(state)))
         self.assertEqual(
             state.reject_before_alloc(**_admit_kwargs(state, verify_mode="rpd")),
-            "mode",
+            "rpd_context",
         )
         self.assertEqual(
             state.reject_before_alloc(**_admit_kwargs(state, verify_mode="target_only")),
