@@ -381,7 +381,7 @@ init，不被 `_sr_warm_tree_shapes` 的 warning 吞掉。已确认恢复成功�
 NPU Target（`page_size>1` 且 `topk>1`）在 `StandaloneRemoteWorker` 初始化末尾做
 图外 kernel 预热：`alloc_paged_token_slots_extend` + `assign_req_to_token_pool_func`、
 `get_src_tgt_cache_loc` / `get_target_cache_loc`、部分完成才
-`filter_finished_cache_loc_kernel`、`copy_paged_kv_buffer_by_slot`。跨页按验证宽度
+`filter_finished_cache_loc_kernel`、`move_kv_slots_`。跨页按验证宽度
 `speculative_num_draft_tokens` 生成 keep/free；零释放看空 slot 与页集合，不要求
 `free()` 调用次数为 0。不跑真实 `verify()`，不改 output token / 请求统计 / radix。
 AR 与 SR 图回放策略不变。本补丁只覆盖已枚举路径的首次编译/tiling，不承诺消除
@@ -849,7 +849,7 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | `tree_init_forward_batch` | 仅 `ForwardBatch.init_new`；与 `tree_paged_eager` 之和等于 `tree_prepare_meta` |
 | `tree_paged_eager` | 仅 `_prepare_paged_tree_round` / `prepare_sr_tree_paged_eager`，等于下面三段之和 |
 | `tree_paged_view` | `prepare_tree_paged_view` 建共享/分支页与 block table |
-| `tree_paged_copy` | prefix-tail `plan/materialize` 与 `copy_kv_pool_by_slot` |
+| `tree_paged_copy` | prefix-tail `plan/materialize` 与 `move_kv_slots_` |
 | `tree_paged_bind` | 给各 step backend 绑定 `SRTreePagedMetadata` |
 | `tree_forward` | 树前向或图 replay 的主机调用区间，通常主要是异步提交 |
 | `tree_result_wait_pack` | 等待树结果、设备内打包、一次连续 D2H、再按行转列表。外层时间含此前已提交的树计算，不是纯传输 |
@@ -1134,3 +1134,8 @@ CI 注册及 runner 约定见
 实验脚本 [run_cloude.sh](../../../../../run_cloude.sh) 和 [run_edge.sh](../../../../../run_edge.sh)
 包含本地配置与历史注释，只用于参考。遇到文档与行为不一致时，以当前实现和邻近测试为准，
 更新文档时同时核对 Target/Draft、CUDA/NPU、fallback 及计时边界。
+
+
+### Shared KV movement
+
+Draft parent remap, prefix-tail and lease copies, Target fixed accept, and the NPU pool move API use pool-owned reusable scratch. The NPU paged path performs two gather/scatter launches; other layouts use fixed `out` staging. There is no runtime legacy switch. See [SR_KV_COPY.md](SR_KV_COPY.md) for ownership, tests and hardware validation boundaries.

@@ -6,8 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.speculative.standalone_remote.sr_round_metrics import get_sr_round_metrics
-
 from sglang.srt.layers.sampler import SamplingBatchInfo
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -15,20 +13,14 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
+    NpuGraphReplaySubmittedError,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftState,
     SRDraftStateManager,
     SRWindow,
-)
-from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
-    SRAlignResult,
-    SRTreeKVLease,
-    SRTreeLeaseStore,
-    live_accept_prefix,
-    prefix_window_tokens,
-    read_token_span,
-    snapshot_sr_align,
-    validate_lease_commit,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     SRTailExtendTransaction,
@@ -39,6 +31,19 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     plan_tail_extend,
     stamp_tree_seed,
     tree_seed_is_current,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+    SRTreeDrafter,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    SRAlignResult,
+    SRTreeKVLease,
+    SRTreeLeaseStore,
+    live_accept_prefix,
+    prefix_window_tokens,
+    read_token_span,
+    snapshot_sr_align,
+    validate_lease_commit,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DEFAULT_MAX_INGEST_DECODE_STEPS,
@@ -59,15 +64,6 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     sr_decode_seq_len,
     tree_seed_matches_prefix,
 )
-from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    slice_decode_batch_row,
-)
-from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import SRKVRollbacker
-from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
-    SRMMPayload,
-    release_mm_resources,
-    reset_mm_mrope,
-)
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
     CommitOutcome,
@@ -86,6 +82,13 @@ from sglang.srt.speculative.standalone_remote.sr_commit import (
     retarget_stamp_version,
     route_snapshot_recovery,
 )
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
+from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import SRKVRollbacker
+from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
+    SRMMPayload,
+    release_mm_resources,
+    reset_mm_mrope,
+)
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
     SRBatchReply,
@@ -94,16 +97,18 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftRequest,
     SRReplyStatus,
 )
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    get_sr_round_metrics,
+)
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    SRTransferUnresolved,
+)
 from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRDraftServer,
     make_transport_from_server_args,
 )
-from sglang.srt.speculative.spec_utils import (
-    NpuGraphPreparationError,
-    NpuGraphReplaySubmittedError,
-)
-from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
-    SRTreeDrafter,
+from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+    slice_decode_batch_row,
 )
 from sglang.srt.utils import DynamicGradMode
 
@@ -1559,7 +1564,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_clear_stamps_after_poison()
             if (
                 getattr(self, "_sr_device_poisoned", False)
-                or isinstance(e, NpuGraphReplaySubmittedError)
+                or isinstance(e, (NpuGraphReplaySubmittedError, KVMoveSubmittedError))
                 or (self.tp_size > 1 and (transaction.submitted or copy_submitted))
             ):
                 if copy_submitted:
@@ -1770,7 +1775,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         try:
             with metrics.phase("tree_expand_pack"):
                 got = self.sr_tree_drafter.expand_batch(ready)
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             raise
         except Exception as e:
             if _sr_is_device_context_error(e):

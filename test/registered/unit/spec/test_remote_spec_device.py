@@ -5,6 +5,7 @@ import copy
 import unittest
 import unittest.mock
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Optional
@@ -12,6 +13,10 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    SRTransferUnresolved,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 try:
@@ -123,9 +128,9 @@ def _load_tree_draft_helpers():
     assign_names = {"TREE_DRAFT_FIA_OP_NAMES", "_dumped_unreadable_dispatch_record"}
     try:
         from sglang.srt.speculative.spec_utils import (
+            TREE_DRAFT_FIA_OP_NAMES,
             NpuGraphPreparationError,
             NpuGraphReplaySubmittedError,
-            TREE_DRAFT_FIA_OP_NAMES,
             build_draft_graph_step_kv_lens,
             build_tree_draft_block_tables,
             expand_fia_cpu_update_inputs,
@@ -173,6 +178,9 @@ def _load_tree_draft_helpers():
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
     ns = {"torch": torch, "Optional": Optional, "Mapping": __import__("collections.abc", fromlist=["Mapping"]).Mapping, "logging": __import__("logging"), "logger": __import__("logging").getLogger("tree_draft_helpers")}
+    ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+    ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+    ns.setdefault("nullcontext", nullcontext)
     exec(compile(mod, str(src_path), "exec"), ns)
     return SimpleNamespace(
         build_tree_draft_block_tables=ns["build_tree_draft_block_tables"],
@@ -247,6 +255,9 @@ def _load_sr_tree_expand_methods():
         body=future + helper_nodes + list(methods.values()), type_ignores=[]
     )
     ast.fix_missing_locations(mod)
+    ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+    ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+    ns.setdefault("nullcontext", nullcontext)
     exec(compile(mod, str(src_path), "exec"), ns)
     loaded = {name: ns[name] for name in methods}
     loaded["NpuGraphReplaySubmittedError"] = draft_helpers.NpuGraphReplaySubmittedError
@@ -466,9 +477,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertNotIn("NPU graph miss", src)
 
     def test_page_physical_kv_copy_matches_slot_to_page_offset(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_paged_kv_buffer_by_slot,
-        )
+        from kv_move_test_utils import move_paged
 
         def _gold_6d(buf, src, tgt, page_size):
             src_page = torch.div(src, page_size, rounding_mode="floor")
@@ -486,7 +495,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         disjoint_src = torch.tensor([5, 6], dtype=torch.int32)
         disjoint_tgt = torch.tensor([9, 10], dtype=torch.int32)
         got = buf.clone()
-        copy_paged_kv_buffer_by_slot(got, disjoint_src, disjoint_tgt)
+        move_paged(got, disjoint_src, disjoint_tgt)
         torch.testing.assert_close(
             got, _gold_6d(buf, disjoint_src, disjoint_tgt, page_size)
         )
@@ -494,7 +503,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         overlap_src = torch.tensor([5, 6], dtype=torch.int32)
         overlap_tgt = torch.tensor([4, 5], dtype=torch.int32)
         got_overlap = buf.clone()
-        copy_paged_kv_buffer_by_slot(got_overlap, overlap_src, overlap_tgt)
+        move_paged(got_overlap, overlap_src, overlap_tgt)
         torch.testing.assert_close(
             got_overlap, _gold_6d(buf, overlap_src, overlap_tgt, page_size)
         )
@@ -503,23 +512,22 @@ class TestRemoteSpecDevice(CustomTestCase):
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/sr_verify_layout.py"
         ).read_text()
-        self.assertIn("def copy_paged_kv_buffer_by_slot", layout_src)
-        self.assertIn("kv_buffer.view(kv2, layer, -1, head, dim)", layout_src)
-        self.assertIn("flat.index_select(2, src)", layout_src)
-        self.assertIn("flat.index_copy_(2, tgt, staged)", layout_src)
-        self.assertNotIn("src_loc.reshape(-1).tolist()", layout_src)
-        self.assertNotIn("for i, s in enumerate", layout_src)
-        self.assertNotIn("[:, :, tgt_page, tgt_off", layout_src)
+        self.assertNotIn("def move_paged", layout_src)
+        copy_src = (
+            _REPO / "python/sglang/srt/speculative/standalone_remote/sr_kv_copy.py"
+        ).read_text()
+        self.assertIn("out=out", copy_src)
+        self.assertIn("def move_kv_slots_", copy_src)
 
         npu_src = (
             _REPO / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
         ).read_text()
         self.assertIn("def move_kv_cache", npu_src)
         self.assertIn(
-            "copy_paged_kv_buffer_by_slot(self.kv_buffer, src_loc, tgt_loc)",
+            "move_kv_slots_(workspace, src_loc, tgt_loc)",
             npu_src,
         )
-        self.assertNotIn("def copy_paged_kv_buffer_by_slot", npu_src)
+        self.assertNotIn("def move_paged", npu_src)
         self.assertNotIn("copy_all_layer_kv_cache_tiled", npu_src)
         self.assertIn("enable_kv_cache_copy=False", npu_src)
         self.assertNotIn("enable_kv_cache_copy=enable_kv_cache_copy", npu_src)
@@ -943,6 +951,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         }
         mod = ast.Module(body=future + [fn], type_ignores=[])
         ast.fix_missing_locations(mod)
+        ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+        ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+        ns.setdefault("nullcontext", nullcontext)
         exec(compile(mod, str(src_path), "exec"), ns)
         expand = ns["_sr_tree_expand_batch"]
         mixin = SimpleNamespace()
@@ -1227,7 +1238,10 @@ class TestRemoteSpecDevice(CustomTestCase):
         ).read_text()
         self.assertIn("NpuGraphReplaySubmittedError", drafter_src)
         self.assertIn("NpuGraphPreparationError", drafter_src)
-        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", drafter_src)
+        self.assertIn(
+            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
+            drafter_src,
+        )
         self.assertNotIn("skipping per-req retry", drafter_src)
         self.assertIn("falling back to eager", drafter_src)
         self.assertIn("graph_submitted", drafter_src)
@@ -1239,7 +1253,10 @@ class TestRemoteSpecDevice(CustomTestCase):
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
         ).read_text()
-        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", mixin_src)
+        self.assertIn(
+            "except (NpuGraphReplaySubmittedError, SRTransferUnresolved):\n            raise",
+            mixin_src,
+        )
         self.assertIn("self._sr_device_poisoned = True", mixin_src)
         self.assertIn("NPU context already poisoned; skip KV release", mixin_src)
 
@@ -1271,9 +1288,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(positions.tolist(), [5, 6, 7])
 
     def test_tree_reselect_parent_rows_and_kv_remap(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_paged_kv_buffer_by_slot,
-        )
+        from kv_move_test_utils import move_paged
 
         tree_reselect_parent_rows = (
             _load_tree_draft_helpers().tree_reselect_parent_rows
@@ -1297,7 +1312,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         tgt_off = tgt % page_size
         gold[:, :, tgt_page, tgt_off, :, :] = buf[:, :, src_page, src_off, :, :]
         got = buf.clone()
-        copy_paged_kv_buffer_by_slot(got, src, tgt)
+        move_paged(got, src, tgt)
         torch.testing.assert_close(got, gold)
 
     def _select_top_k_tokens(self):
@@ -1318,6 +1333,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             "fast_topk": lambda x, k, dim=-1: torch.topk(x, k, dim=dim),
             "_is_npu": True,
         }
+        ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+        ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+        ns.setdefault("nullcontext", nullcontext)
         exec(compile(mod, str(src_path), "exec"), ns)
         return ns["select_top_k_tokens"]
 
@@ -1392,10 +1410,8 @@ class TestRemoteSpecDevice(CustomTestCase):
         torch.testing.assert_close(ids, ids_n)
         torch.testing.assert_close(scores, scores_n)
 
-    def test_copy_mha_kv_by_slot_matches_index_gold(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_mha_kv_by_slot,
-        )
+    def test_move_buffers_matches_index_gold(self):
+        from kv_move_test_utils import move_buffers
 
         parent_rows = torch.tensor([1, 0], dtype=torch.int64)
         out_cache_loc = torch.tensor([5, 6], dtype=torch.int64)
@@ -1418,7 +1434,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             v_gold.append(vg)
         k_got = [b.clone() for b in k_buf]
         v_got = [b.clone() for b in v_buf]
-        copy_mha_kv_by_slot(k_got, v_got, src, tgt)
+        move_buffers(k_got, v_got, src, tgt)
         for got, gold in zip(k_got, k_gold):
             torch.testing.assert_close(got, gold)
         for got, gold in zip(v_got, v_gold):
@@ -1428,7 +1444,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         v5 = k5.clone() + 7
         k5_got = k5.clone()
         v5_got = v5.clone()
-        copy_mha_kv_by_slot(k5_got, v5_got, src, tgt)
+        move_buffers(k5_got, v5_got, src, tgt)
         k5_gold = k5.clone()
         v5_gold = v5.clone()
         k_flat = k5_gold.view(1, -1, 1, 2)
@@ -1444,7 +1460,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
         ).read_text()
         self.assertIn("advance_tree_draft_positions_for_step", drafter_src)
-        self.assertIn("copy_kv_pool_by_slot", drafter_src)
+        self.assertIn("remap_tree_kv_", drafter_src)
         self.assertIn("seq_lens_sum_from_batch", drafter_src)
         self.assertIn("seq_lens_cpu_for_host", drafter_src)
         alloc_src = drafter_src[
@@ -1512,39 +1528,41 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("tree_verify_npu", src)
         self.assertNotIn("sgl_kernel_npu", src)
 
-    def test_copy_kv_pool_by_slot_validates_before_write(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            UnsupportedTreeKVLayout,
-            copy_kv_pool_by_slot,
+    def test_move_pool_validates_before_write(self):
+        from kv_move_test_utils import move_pool
+
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            UnsupportedKVMoveLayout,
         )
 
         src = torch.tensor([1, 2], dtype=torch.int64)
         tgt = torch.tensor([3, 4], dtype=torch.int64)
-        with self.assertRaises(UnsupportedTreeKVLayout):
-            copy_kv_pool_by_slot(SimpleNamespace(), src, tgt)
+        with self.assertRaises(UnsupportedKVMoveLayout):
+            move_pool(SimpleNamespace(), src, tgt)
         k = torch.arange(8, dtype=torch.float32).reshape(8, 1)
         pool = SimpleNamespace(k_buffer=k.clone(), v_buffer=None)
-        with self.assertRaises(UnsupportedTreeKVLayout):
-            copy_kv_pool_by_slot(pool, src, tgt)
+        with self.assertRaises(UnsupportedKVMoveLayout):
+            move_pool(pool, src, tgt)
         torch.testing.assert_close(pool.k_buffer, k)
         with self.assertRaisesRegex(RuntimeError, "length mismatch"):
-            copy_kv_pool_by_slot(
+            move_pool(
                 SimpleNamespace(k_buffer=k.clone(), v_buffer=k.clone()),
                 torch.tensor([1]),
                 tgt,
             )
-        copy_kv_pool_by_slot(SimpleNamespace(), torch.tensor([]), torch.tensor([]))
+        move_pool(SimpleNamespace(), torch.tensor([]), torch.tensor([]))
         with self.assertRaisesRegex(RuntimeError, "length mismatch"):
-            copy_kv_pool_by_slot(
+            move_pool(
                 SimpleNamespace(k_buffer=k.clone(), v_buffer=k.clone()),
                 torch.tensor([]),
                 tgt,
             )
 
-    def test_copy_kv_pool_by_slot_rejects_incomplete_index_before_write(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            UnsupportedTreeKVLayout,
-            copy_kv_pool_by_slot,
+    def test_move_pool_rejects_incomplete_index_before_write(self):
+        from kv_move_test_utils import move_pool
+
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            UnsupportedKVMoveLayout,
         )
 
         src = torch.tensor([1, 0], dtype=torch.int64)
@@ -1557,15 +1575,13 @@ class TestRemoteSpecDevice(CustomTestCase):
             v_buffer=v5.clone(),
             index_k_buffer=torch.arange(4, dtype=torch.float32),
         )
-        with self.assertRaises(UnsupportedTreeKVLayout):
-            copy_kv_pool_by_slot(pool, src, tgt)
+        with self.assertRaises(UnsupportedKVMoveLayout):
+            move_pool(pool, src, tgt)
         torch.testing.assert_close(pool.k_buffer, k5)
         torch.testing.assert_close(pool.v_buffer, v5)
 
-    def test_copy_kv_pool_by_slot_copies_list_and_mla5(self):
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_kv_pool_by_slot,
-        )
+    def test_move_pool_copies_list_and_mla5(self):
+        from kv_move_test_utils import move_pool
 
         src = torch.tensor([1, 0], dtype=torch.int64)
         tgt = torch.tensor([0, 1], dtype=torch.int64)
@@ -1580,7 +1596,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             v_buffer=[b.clone() for b in v_list],
             index_k_buffer=None,
         )
-        copy_kv_pool_by_slot(pool, src, tgt)
+        move_pool(pool, src, tgt)
         torch.testing.assert_close(pool.k_buffer[0][0], k_list[0][1])
         torch.testing.assert_close(pool.k_buffer[0][1], k_list[0][0])
         k5 = torch.arange(1 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(1, 2, 2, 1, 2)
@@ -1592,7 +1608,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             v_buffer=v5.clone(),
             index_k_buffer=idx.clone(),
         )
-        copy_kv_pool_by_slot(pool5, src, tgt)
+        move_pool(pool5, src, tgt)
         flat_k = k5.view(1, -1, 1, 2)
         gold = flat_k.index_select(1, src)
         got = pool5.k_buffer.view(1, -1, 1, 2)
@@ -1604,14 +1620,14 @@ class TestRemoteSpecDevice(CustomTestCase):
 
         kv_list = [b.clone() for b in k_list]
         pool_kv = SimpleNamespace(kv_buffer=kv_list, k_buffer=None, v_buffer=None)
-        copy_kv_pool_by_slot(pool_kv, src, tgt)
+        move_pool(pool_kv, src, tgt)
         torch.testing.assert_close(pool_kv.kv_buffer[0][0], k_list[0][1])
 
         paged = torch.arange(2 * 1 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(
             2, 1, 2, 2, 1, 2
         )
         pool6 = SimpleNamespace(kv_buffer=paged.clone(), k_buffer=None, v_buffer=None)
-        copy_kv_pool_by_slot(pool6, src, tgt)
+        move_pool(pool6, src, tgt)
         flat = paged.view(2, 1, -1, 1, 2)
         torch.testing.assert_close(
             pool6.kv_buffer.view(2, 1, -1, 1, 2).index_select(2, tgt),
@@ -1687,6 +1703,9 @@ class TestSRDraftGraphHiddenGate(CustomTestCase):
             "get_global_graph_memory_pool": lambda: None,
             "set_global_graph_memory_pool": lambda *_a, **_k: None,
         }
+        ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+        ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+        ns.setdefault("nullcontext", nullcontext)
         exec(compile(mod, str(src_path), "exec"), ns)
         return ns["LoadedDraftGraph"], EagleDraftInput
 

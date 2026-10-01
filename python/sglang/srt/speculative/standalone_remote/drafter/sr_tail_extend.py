@@ -619,6 +619,8 @@ class SRTailExtendTransaction:
         self._copy_stream = None
         self._copy_hold = None
         self._copy_leases = []
+        self.copy_workspace = None
+        self.copy_unresolved = False
         self._root_tokens = None
 
     def stage_root_tokens(self, device) -> None:
@@ -726,15 +728,22 @@ class SRTailExtendTransaction:
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             record_device_event,
         )
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_kv_pool_by_slot,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            move_kv_slots_,
+            prepare_kv_move,
         )
 
+        if self.copy_unresolved or (
+            self.copy_workspace is not None and self.copy_workspace.unresolved
+        ):
+            self._fail_copy_completion(RuntimeError("cannot repeat unresolved KV copy"))
         self.copy_done_event = None
         self._copy_stream = None
         self._copy_hold = None
         self._copy_leases = []
         self.copy_submitted = False
+        self.copy_workspace = None
+        self.copy_unresolved = False
         kv_pool = getattr(
             getattr(self.scheduler, "tp_worker", None), "model_runner", None
         )
@@ -783,6 +792,17 @@ class SRTailExtendTransaction:
         copy_stream = get_kv_copy_stream(self.scheduler, device)
         self._copy_stream = copy_stream
         use_device_event = not _is_cpu_device(device)
+        metrics = getattr(self.scheduler, "_sr_round_metrics", None)
+
+        def finish_copy(workspace):
+            try:
+                event = record_device_event(device, required=True)
+                if event is None:
+                    raise RuntimeError("KV copy completion event is missing")
+                return event
+            except BaseException as exc:
+                self._fail_copy_completion(exc)
+
         if copy_stream is not None:
             ready = record_device_event(device, required=True)
             wait = getattr(copy_stream, "wait_event", None)
@@ -794,34 +814,93 @@ class SRTailExtendTransaction:
             ctx_fn = getattr(self.scheduler, "_sr_kv_copy_ctx", None)
             if not callable(ctx_fn):
                 raise RuntimeError("copy stream context missing after probe")
-            _bind_copy_event(_UnfinishedCopyEvent())
-            self.copy_submitted = True
             with ctx_fn(copy_stream):
-                copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
-                event = record_device_event(device, required=True)
+                workspace = prepare_kv_move(
+                    kv_pool, merged_src.numel(), domain="lease_copy", metrics=metrics
+                )
+                self.copy_workspace = workspace
+                self._copy_hold = (merged_src, merged_dst, workspace)
+                _bind_copy_event(_UnfinishedCopyEvent())
+                self.copy_submitted = True
+                move_kv_slots_(workspace, merged_src, merged_dst)
+                event = finish_copy(workspace)
         elif use_device_event:
+            workspace = prepare_kv_move(
+                kv_pool, merged_src.numel(), domain="lease_copy", metrics=metrics
+            )
+            self.copy_workspace = workspace
+            self._copy_hold = (merged_src, merged_dst, workspace)
             _bind_copy_event(_UnfinishedCopyEvent())
             self.copy_submitted = True
-            copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
-            event = record_device_event(device, required=True)
+            move_kv_slots_(workspace, merged_src, merged_dst)
+            event = finish_copy(workspace)
         else:
+            workspace = prepare_kv_move(
+                kv_pool, merged_src.numel(), domain="lease_copy", metrics=metrics
+            )
+            self.copy_workspace = workspace
+            self._copy_hold = (merged_src, merged_dst, workspace)
             self.copy_submitted = True
-            copy_kv_pool_by_slot(kv_pool, merged_src, merged_dst)
+            move_kv_slots_(workspace, merged_src, merged_dst)
             event = None
         if store is not None:
             store.counts["tree_kv_copy_submit_ms"] += int(
                 (time.perf_counter() - t0) * 1000
             )
         if (use_device_event or copy_stream is not None) and event is None:
-            raise RuntimeError("KV copy submitted without a completion event")
+            self._fail_copy_completion(
+                RuntimeError("KV copy submitted without a completion event")
+            )
         self.copy_done_event = event
         _bind_copy_event(event)
 
+    def _fail_copy_completion(self, exc):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+
+        self.copy_unresolved = True
+        if self.copy_workspace is not None:
+            self.copy_workspace._poison()
+        for lease in self._copy_leases:
+            lease.copy_unresolved = True
+            lease.pending_free_event = _UnfinishedCopyEvent()
+        raise KVMoveSubmittedError(
+            f"KV copy completion failed: {exc}; retain lease and scratch"
+        ) from exc
+
     def wait_copy_done(self) -> None:
-        wait_copy_event(self.copy_done_event)
+        if self.copy_unresolved or (self.copy_workspace is not None and self.copy_workspace.unresolved):
+            self._fail_copy_completion(
+                RuntimeError("previous KV copy completion is unresolved")
+            )
+        try:
+            if (
+                self.copy_submitted
+                and self.copy_workspace is not None
+                and (
+                    not _is_cpu_device(self.copy_workspace.layout.device)
+                    and (
+                        self.copy_done_event is None
+                        or getattr(self.copy_done_event, "device", None) is None
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    "KV copy completion event is missing device metadata"
+                )
+            wait_copy_event(self.copy_done_event)
+        except BaseException as exc:
+            if self.copy_submitted:
+                self._fail_copy_completion(exc)
+            raise
         self._copy_hold = None
 
     def commit(self, logits_output) -> None:
+        if self.copy_unresolved or (
+            self.copy_workspace is not None and self.copy_workspace.unresolved
+        ):
+            self._fail_copy_completion(RuntimeError("cannot commit unresolved KV copy"))
         count = len(self.plans)
         topk = max(1, int(getattr(self.scheduler.server_args, "speculative_eagle_topk", 1) or 1))
         p = getattr(logits_output, "tree_seed_topk_p", None)
@@ -896,6 +975,12 @@ class SRTailExtendTransaction:
                 lease.pending_free_event = None
 
     def rollback(self) -> None:
+        if self.copy_unresolved or (
+            self.copy_workspace is not None and self.copy_workspace.unresolved
+        ):
+            self._fail_copy_completion(
+                RuntimeError("cannot rollback unresolved KV copy")
+            )
         if self.committed:
             return
         # Exceptional path only: do not recycle slots while kernels can write them.

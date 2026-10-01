@@ -690,12 +690,8 @@ class SRFixedAcceptState:
         accept_length.zero_()
         return predict, accept_index, accept_length
 
-    def warmup_scratch(self) -> None:
-        """Compile pack/commit against private tensors. Does not touch requests or live KV."""
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_paged_kv_buffer_by_slot,
-        )
-
+    def warmup_scratch(self, kv_pool=None) -> None:
+        """Warm accept packing and production KV geometry using private storage."""
         bs = 1
         predict, accept_index, accept_length = self.bind_verify_buffers(bs)
         accept_index.fill_(-1)
@@ -707,16 +703,12 @@ class SRFixedAcceptState:
         packed = self.pack_buf[:bs]
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
         packed.detach().to("cpu")
-        width = self.W
-        cache = torch.arange(width, device=self.device, dtype=torch.int64)
-        pages = width // self.page_size + 2
-        kv = torch.zeros(
-            (2, 1, pages, self.page_size, 1, 1),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        if width > 0:
-            copy_paged_kv_buffer_by_slot(kv, cache[:1], cache[:1])
+        if kv_pool is not None:
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+                warm_private_slot_move,
+            )
+
+            warm_private_slot_move(kv_pool)
         self.accept_index.fill_(-1)
         self.accept_length.zero_()
         self.predict.zero_()
@@ -779,6 +771,14 @@ class SRFixedAcceptState:
             self.note_path("fixed_accept_error")
             raise
 
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import prepare_kv_move
+
+        workspace = prepare_kv_move(
+            allocator.get_kvcache(),
+            self.B_cap * self.W,
+            domain="fixed_accept",
+            metrics=self.metrics,
+        )
         return self._finalize_cpu_rows(
             batch,
             logits_output,
@@ -789,6 +789,7 @@ class SRFixedAcceptState:
             token_rows,
             prefixes,
             think_end_id,
+            workspace,
         )
 
     def finalize_from_host(
@@ -830,8 +831,16 @@ class SRFixedAcceptState:
         )
         self._note_staging()
         _timed(self.metrics, "fixed_accept_staging_wait", self._wait_previous_h2d)
-        # Consume before any request mutation, including failures during stop
-        # checking. Such a failure must not become a second append on retry.
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import prepare_kv_move
+
+        # Layout and capacity failures stay before plan consumption and token
+        # append. A later stop-check failure still must not append twice.
+        self.kv_move_workspace = prepare_kv_move(
+            allocator.get_kvcache(),
+            self.B_cap * self.W,
+            domain="fixed_accept",
+            metrics=self.metrics,
+        )
         plan.consumed = True
         self.note_path("rpd_host_finalize")
         return self._finalize_cpu_rows(
@@ -844,6 +853,7 @@ class SRFixedAcceptState:
             plan.tokens,
             prefixes,
             think_end_id,
+            self.kv_move_workspace,
         )
 
     def _finalize_cpu_rows(
@@ -857,7 +867,9 @@ class SRFixedAcceptState:
         token_rows,
         prefixes,
         think_end_id,
+        workspace,
     ):
+        self.kv_move_workspace = workspace
         try:
             accepted, finished, truncated = _timed(
                 self.metrics,
@@ -882,6 +894,7 @@ class SRFixedAcceptState:
                     truncated,
                     token_rows,
                     prefixes,
+                    workspace,
                 ),
                 device=True,
             )
@@ -994,6 +1007,7 @@ class SRFixedAcceptState:
         truncated,
         token_rows,
         prefixes,
+        workspace,
     ):
         if int(page_size) != self.page_size or int(topk) <= 1:
             raise RuntimeError("fixed accept commit saw an unsupported layout")
@@ -1094,13 +1108,10 @@ class SRFixedAcceptState:
             self.commit_host[layout.unfinished : layout.used],
             packet[layout.src : layout.tgt],
         )
-        kv = allocator.get_kvcache().kv_buffer
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_paged_kv_buffer_by_slot,
-        )
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import move_kv_slots_
 
         if src.numel() > 0:
-            copy_paged_kv_buffer_by_slot(kv, src, tgt)
+            move_kv_slots_(workspace, src, tgt)
         allocator.free_unique_pages(pages)
         return result
 

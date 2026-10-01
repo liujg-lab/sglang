@@ -9,10 +9,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
-from sglang.srt.utils import get_bool_env_var
-from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    copy_paged_kv_buffer_by_slot,
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+    move_kv_slots_,
+    prepare_kv_move,
 )
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -191,7 +192,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         and must not be used here. Do not 6D-index ``kv_buffer``: torch_npu
         materializes a temporary the size of the whole pool.
         """
-        copy_paged_kv_buffer_by_slot(self.kv_buffer, src_loc, tgt_loc)
+        workspace = prepare_kv_move(self, src_loc.numel())
+        move_kv_slots_(workspace, src_loc, tgt_loc)
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):

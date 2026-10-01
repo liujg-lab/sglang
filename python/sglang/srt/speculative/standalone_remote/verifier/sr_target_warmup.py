@@ -7,16 +7,27 @@ requests or mutate radix / output tokens.
 from __future__ import annotations
 
 import logging
+
 import torch
 
-from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend, get_last_loc_torch
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    get_last_loc_torch,
+)
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    create_accept_length_filter,
+    filter_finished_cache_loc_kernel,
+    get_src_tgt_cache_loc,
+    get_target_cache_loc,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     SR_TREE_WARMUP_ENV,
     read_sr_tree_warmup_env,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import SRWarmupFatalError
-from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    copy_paged_kv_buffer_by_slot,
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+    warm_private_slot_move,
 )
 from sglang.srt.speculative.standalone_remote.sr_warmup import (
     SRWarmupCacheAdapter,
@@ -26,20 +37,13 @@ from sglang.srt.speculative.standalone_remote.sr_warmup import (
     clone_page_lists,
     fill_prefix_slots,
     make_scratch_req_pool,
+    page_set,
     restore_page_lists,
     slots_to_pages,
     sr_warmup_raw_batch_sizes,
-    page_set,
     target_keep_len,
     warmup_should_run_finished_filter,
     warmup_synchronize,
-)
-from sglang.srt.speculative.spec_utils import (
-    assign_req_to_token_pool_func,
-    create_accept_length_filter,
-    filter_finished_cache_loc_kernel,
-    get_src_tgt_cache_loc,
-    get_target_cache_loc,
 )
 from sglang.srt.utils import is_npu, next_power_of_2
 
@@ -133,20 +137,6 @@ def _maybe_filter(kind, bs, draft_num, tgt, accept, device):
         next_power_of_2(draft_num),
     )
     return True
-
-
-def _overlap_kv_check(kv_buffer, slots, page):
-    if kv_buffer is None or not torch.is_tensor(kv_buffer) or kv_buffer.dim() != 6:
-        return False
-    if int(slots.numel()) < 2:
-        return False
-    src = slots[:2].to(dtype=torch.int64)
-    tgt = torch.stack((slots[1], slots[0])).to(dtype=torch.int64)
-    flat = kv_buffer.view(kv_buffer.shape[0], kv_buffer.shape[1], -1, kv_buffer.shape[4], kv_buffer.shape[5])
-    before = flat[:, :, src].clone()
-    copy_paged_kv_buffer_by_slot(kv_buffer, src, tgt)
-    after = flat[:, :, tgt]
-    return bool(torch.equal(after, before))
 
 
 def greedy_verify_warmup_batch_sizes(worker) -> tuple[int, ...]:
@@ -310,7 +300,10 @@ def warm_sr_target_kernels(worker) -> dict:
     fixed_state = getattr(worker, "_fixed_accept_state", None)
     if fixed_state is not None:
         try:
-            fixed_state.warmup_scratch()
+            runner = getattr(
+                getattr(worker, "target_worker", None), "model_runner", None
+            )
+            fixed_state.warmup_scratch(getattr(runner, "token_to_kv_pool", None))
             coverage["fixed_accept"] = {"scratch": True}
         except SRWarmupFatalError:
             raise
@@ -421,9 +414,8 @@ def warm_sr_target_kernels(worker) -> dict:
                     coverage["kernels"].append(
                         (int(bs), cross_kind, slot_count, sorted(freed_pages))
                     )
-                    kv = getattr(inner.get_kvcache(), "kv_buffer", None)
-                    if kv is not None and int(out_loc.numel()) >= 2:
-                        _overlap_kv_check(kv, out_loc[:2], page)
+                    if int(out_loc.numel()) >= 2:
+                        warm_private_slot_move(inner.get_kvcache())
                     for kind in ("continue", "partial", "all_finished"):
                         if kind == "all_finished":
                             _ = torch.empty((0,), dtype=torch.int64, device=device)

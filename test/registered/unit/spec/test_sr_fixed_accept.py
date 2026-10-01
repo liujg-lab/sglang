@@ -8,14 +8,15 @@ import pathlib
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+from kv_move_test_utils import move_paged
 
 from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     tail_mrope_positions,
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-    copy_paged_kv_buffer_by_slot,
     export_accepted_tree_candidate_indices,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
@@ -201,7 +202,20 @@ class FixedAcceptEnvTest(CustomTestCase):
 
     def test_warmup_scratch_resets_private_buffers(self):
         state = SRFixedAcceptState(2, 3, 4, 4, "cpu")
-        state.warmup_scratch()
+        from sglang.srt.speculative.standalone_remote import sr_kv_copy
+
+        pool = SimpleNamespace(
+            kv_buffer=torch.randn(2, 3, 4, 4, 1, 259, dtype=torch.bfloat16)
+        )
+        before = pool.kv_buffer.clone()
+        with patch.object(
+            sr_kv_copy,
+            "warm_private_slot_move",
+            wraps=sr_kv_copy.warm_private_slot_move,
+        ) as warm:
+            state.warmup_scratch(pool)
+            warm.assert_called_once_with(pool)
+        self.assertTrue(torch.equal(before, pool.kv_buffer))
         self.assertTrue(torch.all(state.accept_index == -1))
         self.assertTrue(torch.all(state.accept_length == 0))
         self.assertTrue(torch.all(state.predict == 0))
@@ -420,9 +434,15 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         reqs = [_Req(finish_at=item) for item in finish_at]
         batch, kv = self._batch(reqs, prefixes, cache, kv)
         logits = SimpleNamespace()
-        result = state.finalize(
-            batch, logits, 4, 2, alloc, accept_index, predict, accept_length
-        )
+        from sglang.srt.speculative.standalone_remote import sr_kv_copy
+
+        with patch.object(
+            sr_kv_copy, "prepare_kv_move", wraps=sr_kv_copy.prepare_kv_move
+        ) as prepare:
+            result = state.finalize(
+                batch, logits, 4, 2, alloc, accept_index, predict, accept_length
+            )
+            self.assertEqual(prepare.call_count, 1)
         return state, batch, alloc, reqs, result, kv
 
     def test_continue_partial_and_all_finished_lengths(self):
@@ -501,7 +521,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         overlap = torch.zeros((2, 1, 2, 4, 1, 1))
         token = overlap.view(2, 1, -1, 1, 1)
         token[0, 0, :, 0, 0] = torch.arange(8)
-        copy_paged_kv_buffer_by_slot(
+        move_paged(
             overlap,
             torch.tensor([0, 1], dtype=torch.int64),
             torch.tensor([1, 2], dtype=torch.int64),
@@ -789,13 +809,17 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         )
         seen = {}
 
-        def wrapped(kv_buffer, src, tgt):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            move_kv_slots_ as real_move,
+        )
+
+        def wrapped(workspace, src, tgt):
             seen["seq"] = batch.seq_lens.tolist()
             seen["cache"] = batch.out_cache_loc.tolist()
-            return copy_paged_kv_buffer_by_slot(kv_buffer, src, tgt)
+            return real_move(workspace, src, tgt)
 
         with unittest.mock.patch(
-            "sglang.srt.speculative.standalone_remote.sr_verify_layout.copy_paged_kv_buffer_by_slot",
+            "sglang.srt.speculative.standalone_remote.sr_kv_copy.move_kv_slots_",
             wrapped,
         ):
             result = state.finalize(

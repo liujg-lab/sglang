@@ -243,6 +243,16 @@ class SRRoundMetrics:
         self.active = False
         self._graph_host_samples = []
 
+    def _timing_failure(self, where, exc):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+
+        if is_device_context_error(exc):
+            raise exc
+        self.counts["device_timing_dropped_" + where] += 1
+        _warn_graph_host("device timing " + where, exc)
+
     def add_host(self, name, seconds):
         if not self.active:
             return
@@ -256,11 +266,21 @@ class SRRoundMetrics:
         # when a device has not caught up, rather than forcing synchronization.
         for _ in range(len(self.pending)):
             name, start, end = self.pending.popleft()
-            if end.query():
-                self.device_ms[name] += start.elapsed_time(end)
-                self.device_samples[name] += 1
-            else:
+            try:
+                ready = end.query()
+            except Exception as exc:
+                self._timing_failure("query", exc)
+                continue
+            if not ready:
                 self.pending.append((name, start, end))
+                continue
+            try:
+                duration = start.elapsed_time(end)
+            except Exception as exc:
+                self._timing_failure("elapsed", exc)
+                continue
+            self.device_ms[name] += duration
+            self.device_samples[name] += 1
 
     @contextmanager
     def round(self):
@@ -277,7 +297,11 @@ class SRRoundMetrics:
             self.active = False
             self.rounds += 1
             if self.rounds % 32 == 0:
-                self.poll()
+                # A diagnostics error must not replace a business exception.
+                import sys
+
+                if sys.exc_info()[0] is None:
+                    self.poll()
                 try:
                     logger.info(
                         "[SR %s round] rounds=32 host_mean_ms=%s host_max_ms=%s "
@@ -314,7 +338,7 @@ class SRRoundMetrics:
                     self._flush_graph_host_safely()
 
     @contextmanager
-    def phase(self, name, *, device=False):
+    def phase(self, name, *, device=False, stream=None):
         if not self.active:
             yield
             return
@@ -327,9 +351,15 @@ class SRRoundMetrics:
             and self.rounds % 32 == 0
             and len(self.pending) < 16
         ):
-            start, end = factory(enable_timing=True), factory(enable_timing=True)
-            start.record()
-            event_pair = (start, end)
+            try:
+                start, end = factory(enable_timing=True), factory(enable_timing=True)
+                if stream is None:
+                    start.record()
+                else:
+                    start.record(stream)
+                event_pair = (start, end)
+            except Exception as exc:
+                self._timing_failure("start", exc)
         completed = False
         try:
             yield
@@ -340,8 +370,15 @@ class SRRoundMetrics:
             # replace its original exception with a timing-event error.
             if event_pair is not None and completed:
                 start, end = event_pair
-                end.record()
-                self.pending.append((name, start, end))
+                try:
+                    if stream is None:
+                        end.record()
+                    else:
+                        end.record(stream)
+                except Exception as exc:
+                    self._timing_failure("end", exc)
+                else:
+                    self.pending.append((name, start, end))
 
     def record_graph_host_sample(self, sample):
         if sample is None or sample._recorded:

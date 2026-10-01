@@ -8,7 +8,7 @@ import unittest
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.speculative.standalone_remote import sr_transport as transport
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
@@ -487,6 +487,111 @@ class TestCommMetrics(unittest.TestCase):
 
 
 class TestSRRoundMetrics(unittest.TestCase):
+
+    def test_timing_failures_drop_samples_and_execute_business_once(self):
+        for failure in ("create", "start", "end", "query", "elapsed"):
+            with self.subTest(failure=failure):
+                start, end = Mock(), Mock()
+                end.query.return_value = True
+                start.elapsed_time.return_value = 1.25
+                factory = Mock(side_effect=[start, end])
+                error = RuntimeError("ordinary timing error")
+                if failure == "create":
+                    factory.side_effect = error
+                elif failure == "start":
+                    start.record.side_effect = error
+                elif failure == "end":
+                    end.record.side_effect = error
+                elif failure == "query":
+                    end.query.side_effect = error
+                else:
+                    start.elapsed_time.side_effect = error
+                metrics = SRRoundMetrics("Draft", SimpleNamespace(Event=factory))
+                body = Mock()
+                stream = object()
+                with metrics.round():
+                    with metrics.phase("kv_move_eager", device=True, stream=stream):
+                        body()
+                metrics.poll()
+                body.assert_called_once()
+                self.assertFalse(metrics.pending)
+                self.assertFalse(metrics.device_samples)
+                stage = "start" if failure == "create" else failure
+                self.assertEqual(metrics.counts["device_timing_dropped_" + stage], 1)
+                if failure != "create":
+                    start.record.assert_called_once_with(stream)
+                if failure in ("end", "query", "elapsed"):
+                    end.record.assert_called_once_with(stream)
+
+    def test_business_exception_is_preserved_and_no_end_event_submitted(self):
+        start, end = Mock(), Mock()
+        original = ValueError("business")
+        end.record.side_effect = RuntimeError("end timing failure")
+        metrics = SRRoundMetrics(
+            "Target", SimpleNamespace(Event=Mock(side_effect=[start, end]))
+        )
+        with self.assertRaises(ValueError) as raised:
+            with metrics.round():
+                with metrics.phase("kv_move_eager", device=True):
+                    raise original
+        self.assertIs(raised.exception, original)
+        end.record.assert_not_called()
+        self.assertFalse(metrics.pending)
+        # The 32-round flush must not replace the original business exception.
+        metrics.rounds = 31
+        metrics.pending.append(
+            (
+                "old",
+                Mock(),
+                Mock(
+                    query=Mock(
+                        side_effect=[
+                            False,
+                            RuntimeError("device-side assert triggered"),
+                        ]
+                    )
+                ),
+            )
+        )
+        with self.assertRaises(ValueError) as raised:
+            with metrics.round():
+                raise original
+        self.assertIs(raised.exception, original)
+        self.assertEqual(len(metrics.pending), 1)
+
+    def test_real_device_context_error_still_propagates(self):
+        error = RuntimeError("device-side assert triggered")
+        body = Mock()
+        metrics = SRRoundMetrics(
+            "Draft", SimpleNamespace(Event=Mock(side_effect=error))
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            with metrics.round():
+                with metrics.phase("copy", device=True):
+                    body()
+        self.assertIs(raised.exception, error)
+        body.assert_not_called()
+
+    def test_successful_timing_uses_copy_stream_without_waiting(self):
+        start, end = Mock(), Mock()
+        end.query.side_effect = [False, True]
+        start.elapsed_time.return_value = 2.5
+        stream = object()
+        metrics = SRRoundMetrics(
+            "Draft", SimpleNamespace(Event=Mock(side_effect=[start, end]))
+        )
+        with metrics.round():
+            with metrics.phase("kv_move_eager", device=True, stream=stream):
+                pass
+        metrics.poll()
+        self.assertEqual(len(metrics.pending), 1)
+        metrics.poll()
+        self.assertEqual(metrics.device_samples["kv_move_eager"], 1)
+        self.assertEqual(metrics.device_ms["kv_move_eager"], 2.5)
+        start.record.assert_called_once_with(stream)
+        end.record.assert_called_once_with(stream)
+        end.synchronize.assert_not_called()
+
     def test_host_max_is_single_round_not_mean_and_clears(self):
         metrics = SRRoundMetrics("Draft")
         for _ in range(31):

@@ -411,6 +411,38 @@ class TestLeaseLifecycle(unittest.TestCase):
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [4])
 
+    def test_query_failure_keeps_all_pages_and_marks_unknown_completion(self):
+        from types import SimpleNamespace as NS
+        from unittest.mock import Mock
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        store = SRTreeLeaseStore()
+        alloc = NS(free=Mock())
+        leases = []
+        for rid in ("ready", "unknown"):
+            lease = SRTreeKVLease(
+                rid, 1, 0, 1, (1,), [1], torch.arange(4), [0], [], [], []
+            )
+            store.register(lease)
+            event = NS(query=Mock(return_value=True))
+            if rid == "unknown":
+                event.query.side_effect = RuntimeError("event query failed")
+            store.release(lease, allocator=alloc, event=event)
+            leases.append(lease)
+        with self.assertRaises(SRTransferUnresolved):
+            store.poll_pending_frees(alloc)
+        alloc.free.assert_not_called()
+        self.assertEqual(len(store._pending_frees(alloc)), 2)
+        self.assertTrue(leases[1].copy_unresolved)
+        leases[1].pending_free_event = None
+        store.poll_pending_frees(alloc)
+        alloc.free.assert_called_once()
+        self.assertEqual(store._pending_frees(alloc), [leases[1]])
+        store.poll_pending_frees(alloc)
+        alloc.free.assert_called_once()
+
     def test_pin_lease_requires_same_object_and_version(self):
         store = SRTreeLeaseStore()
         first = SRTreeKVLease(

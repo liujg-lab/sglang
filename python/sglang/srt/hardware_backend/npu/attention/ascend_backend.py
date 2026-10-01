@@ -27,15 +27,13 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.speculative.tree_shared_prefix import (
-    SHARED_PREFIX_IMPL,
-    SharedPrefixMetadata,
-    cache_view,
-    cpu_prefix_lengths,
-    fill_shared_draft_,
-    fill_shared_verify_,
-    shared_prefix_attention,
-    shared_prefix_layer_supported,
+from sglang.srt.speculative.spec_utils import (
+    NpuGraphPreparationError,
+    build_tree_draft_block_tables,
+    build_tree_draft_kv_slots,
+    expand_seq_lens_for_spec_topk,
+    fill_tree_draft_metadata_,
+    normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     IMPL_PAGED_ATB,
@@ -52,6 +50,10 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_eager_page_buckets,
     select_page_bucket,
 )
+from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
+    SRTailAttentionMetadata,
+    build_tail_attention_metadata,
+)
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     IMPL_TREE_PAGED_FIA,
     SRTargetTreeFiaMetadata,
@@ -61,18 +63,6 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     prime_target_tree_fia_capture_,
     read_sr_target_tree_fia_env,
     target_tree_fia_blocked_extra_combos,
-)
-from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
-    SRTailAttentionMetadata,
-    build_tail_attention_metadata,
-)
-from sglang.srt.speculative.spec_utils import (
-    NpuGraphPreparationError,
-    build_tree_draft_block_tables,
-    build_tree_draft_kv_slots,
-    expand_seq_lens_for_spec_topk,
-    fill_tree_draft_metadata_,
-    normalize_tree_draft_kv_lens,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
     TREE_GRAPH_KV_BUCKETS_ENV,
@@ -104,6 +94,16 @@ from sglang.srt.speculative.tree_attn_mask import (
     full_mask_numel,
     inplace_update_graph_tree_attn_mask,
     resolve_tree_verify_mask_seq_lens,
+)
+from sglang.srt.speculative.tree_shared_prefix import (
+    SHARED_PREFIX_IMPL,
+    SharedPrefixMetadata,
+    cache_view,
+    cpu_prefix_lengths,
+    fill_shared_draft_,
+    fill_shared_verify_,
+    shared_prefix_attention,
+    shared_prefix_layer_supported,
 )
 from sglang.srt.utils import get_bool_env_var
 
@@ -4067,14 +4067,17 @@ class AscendAttnMultiStepDraftBackend:
         seq_lens,
         dummy_page: int = 0,
         metrics=None,
+        commit_kv: bool = True,
     ) -> bool:
         """Build page tables once and optionally submit prefix-tail copy."""
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
             PrefixTailCopyBuffers,
             fill_prefix_tail_copy_slots,
         )
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_kv_pool_by_slot,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            move_kv_slots_,
+            prepare_kv_move,
+            warm_private_slot_move,
         )
 
         if not self.paged_impl_selected():
@@ -4135,11 +4138,26 @@ class AscendAttnMultiStepDraftBackend:
             self.page_size,
             buffers,
         )
-        if int(src.numel()) > 0:
+        if int(src.numel()) > 0 and commit_kv:
             inner0._sr_tree_paged_copy_count += 1
             self._paged_copy_count += 1
-            copy_kv_pool_by_slot(kv_pool, src, dst)
+            move_kv_slots_(
+                prepare_kv_move(
+                    kv_pool, src.numel(), domain="prefix_tail", metrics=metrics
+                ),
+                src,
+                dst,
+            )
             copied = True
+        elif int(src.numel()) > 0:
+            warm_private_slot_move(
+                kv_pool,
+                int(src.numel()),
+                index_dtype=src.dtype,
+                dst_index_dtype=dst.dtype,
+                src_stride=src.stride(0),
+                dst_stride=dst.stride(0),
+            )
         if metrics is not None:
             metrics.add_host("tree_paged_copy", time.perf_counter() - t_copy)
         impl = inner0.tree_attention_impl

@@ -19,15 +19,15 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     ALLOC_ORDINARY,
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
-    SR_TREE_PAGED_ENV,
     SR_TAIL_UPDATE_OVERLAP_ENV,
+    SR_TREE_PAGED_ENV,
     SR_TREE_UPDATE_OVERLAP_ENV,
     SR_TREE_WARMUP_ENV,
+    PrefixTailCopyBuffers,
     SRTreeExpandTxn,
     SRTreePagedMetadata,
     build_step_context_lens,
     context_lens_list,
-    PrefixTailCopyBuffers,
     fill_active_rows,
     fill_paged_cpu_update_payload,
     fill_prefix_tail_copy_slots,
@@ -42,8 +42,8 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     prepare_tree_paged_view,
     quantize_page_width,
     query_page_count,
-    read_sr_tree_paged_env,
     read_sr_tail_update_overlap_env,
+    read_sr_tree_paged_env,
     read_sr_tree_update_overlap_env,
     read_sr_tree_warmup_env,
     remainder,
@@ -54,6 +54,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     validate_tree_draft_paged_records,
     visible_token_slots_from_pages,
 )
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.test.ci.ci_register import register_cpu_ci
 
 try:
@@ -1089,9 +1090,15 @@ class TestSourceGuards(CustomTestCase):
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
         self.assertIn("not getattr(runner, \"_tree_paged\", False)", can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
-        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", batch_src)
+        self.assertIn(
+            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
+            batch_src,
+        )
         one_src = _fn_source(_DRAFTER, "_expand_one")
-        self.assertIn("except NpuGraphReplaySubmittedError:\n            raise", one_src)
+        self.assertIn(
+            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
+            one_src,
+        )
         ctor_src = _fn_source(_DRAFTER, "__init__")
         self.assertIn("read_sr_tree_update_overlap_env", ctor_src)
         self.assertLess(
@@ -1836,10 +1843,13 @@ class TestSRWarmup(CustomTestCase):
             "warm_draft_alloc_mapping": lambda _d: (_ for _ in ()).throw(
                 SRWarmupFatalError("ledger unknown")
             ),
+            "warm_private_slot_move": mock.Mock(),
+            "torch": torch,
             "NpuGraphReplaySubmittedError": type(
                 "NpuGraphReplaySubmittedError", (Exception,), {}
             ),
             "SRWarmupFatalError": SRWarmupFatalError,
+            "KVMoveSubmittedError": KVMoveSubmittedError,
             "is_device_context_error": lambda _e: False,
             "logger": logging.getLogger("sr-warmup-fatal-test"),
             "time": time,
@@ -1850,6 +1860,10 @@ class TestSRWarmup(CustomTestCase):
         class Dummy:
             sr_tree_paged = True
             _seen_tree_paged_shapes = None
+            draft_model_runner = SimpleNamespace(token_to_kv_pool=object())
+            req_to_token_pool = SimpleNamespace(
+                req_to_token=torch.zeros(1, 1, dtype=torch.int32)
+            )
 
             def _sr_warm_layout_shapes(self):
                 return [(1, 0, 1, 2)]
@@ -1858,6 +1872,11 @@ class TestSRWarmup(CustomTestCase):
         dummy._sr_warm_tree_shapes = MethodType(ns["_sr_warm_tree_shapes"], dummy)
         with self.assertRaises(SRWarmupFatalError):
             dummy._sr_warm_tree_shapes()
+        ns["warm_private_slot_move"].assert_called_once_with(
+            dummy.draft_model_runner.token_to_kv_pool,
+            index_dtype=torch.int64,
+            dst_index_dtype=torch.int32,
+        )
 
     def test_unreachable_jump_is_not_failure(self):
         from sglang.srt.speculative.standalone_remote.sr_warmup import (

@@ -369,9 +369,9 @@ def unwrap_tp_broadcast(wrapped: Sequence[Any]) -> Any:
 
 def is_device_context_error(exc: BaseException) -> bool:
     """True when the accelerator context is already poisoned (do not keep running)."""
-    name = type(exc).__name__
-    if name == "SRTransferUnresolved":
+    if any(cls.__name__ == "SRTransferUnresolved" for cls in type(exc).__mro__):
         return True
+    name = type(exc).__name__
     if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
         return True
     try:
@@ -385,6 +385,7 @@ def is_device_context_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return (
         "illegal memory access" in msg
+        or "device-side assert" in msg
         or "cudaerrorillegaladdress" in msg
         or "npu error" in msg
         or ("ascend" in msg and "illegal" in msg)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -235,6 +236,8 @@ class EAGLEDraftCudaGraphRunner:
         return CudaGraphRunner._make_graph_key(self, bs, stream_idx, ntpb, extra)
 
     def capture(self):
+        prepare = getattr(self.eagle_worker, "prepare_tree_kv_graph", None)
+        self._sr_kv_workspace = prepare(self.max_bs) if callable(prepare) else None
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(
@@ -362,7 +365,18 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            workspace = getattr(self, "_sr_kv_workspace", None)
+            scope = (
+                workspace.capture_scope() if workspace is not None else nullcontext()
+            )
+            with scope:
+                if workspace is not None:
+                    self.eagle_worker._capture_tree_kv_workspace = workspace
+                try:
+                    ret = self.eagle_worker.draft_forward(forward_batch)
+                finally:
+                    if workspace is not None:
+                        self.eagle_worker._capture_tree_kv_workspace = None
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -386,6 +400,12 @@ class EAGLEDraftCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        workspace = getattr(self, "_sr_kv_workspace", None)
+        if workspace is not None:
+            workspace.check()
+            workspace.metrics = getattr(
+                getattr(self.eagle_worker, "scheduler", None), "_sr_round_metrics", None
+            )
         self.deepep_adapter.replay()
         buffers = self.buffers
 
@@ -457,7 +477,31 @@ class EAGLEDraftCudaGraphRunner:
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
-        self._replay(forward_batch)
+        try:
+            self._replay(forward_batch)
+        except BaseException as exc:
+            from sglang.srt.speculative.spec_utils import NpuGraphPreparationError
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+                KVMoveSubmittedError,
+            )
+
+            if isinstance(exc, NpuGraphPreparationError) or workspace is None:
+                raise
+            workspace._poison()
+            if isinstance(exc, KVMoveSubmittedError):
+                raise
+            raise KVMoveSubmittedError(
+                "tree KV graph replay failed after submission"
+            ) from exc
+        if workspace is not None:
+            workspace.account(
+                raw_bs
+                * self.topk
+                * (self.speculative_num_steps - 2)
+                * (self.speculative_num_steps - 1)
+                // 2,
+                calls=self.speculative_num_steps - 2,
+            )
         out = self.output_buffers[bs]
 
         if bs != raw_bs:

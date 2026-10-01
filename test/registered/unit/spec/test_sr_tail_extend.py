@@ -6,24 +6,25 @@ the methods themselves execute, rather than being checked as source strings.
 
 import ast
 import copy
+import logging
 import math
 import os
-import logging
 import threading
 import time
+import unittest
 from dataclasses import dataclass, replace
-from types import MethodType
 from pathlib import Path
+from types import MethodType
 from types import SimpleNamespace as NS
 from typing import List, Optional, Sequence, Tuple
-import unittest
 from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.speculative.standalone_remote.drafter import sr_tail_extend as tail
-from sglang.srt.speculative.standalone_remote.sr_round_metrics import SRRoundMetrics
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    SRRoundMetrics,
     get_sr_round_metrics,
 )
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
@@ -36,6 +37,9 @@ from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     tail_graph_max_pages,
     validate_tail_forward_batch,
     widen_tail_block_tables,
+)
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    SRTransferUnresolved,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -73,6 +77,8 @@ def load_functions(path, names, namespace, *, strip_imports=False, class_name=No
     module = ast.fix_missing_locations(
         ast.Module(body=[future] + functions, type_ignores=[])
     )
+    namespace.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+    namespace.setdefault("SRTransferUnresolved", SRTransferUnresolved)
     exec(compile(module, str(path), "exec"), namespace)
     return {name: namespace[name] for name in names}
 
@@ -748,6 +754,7 @@ class TestTailTransaction(unittest.TestCase):
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
         )["_sr_execute_tree_tails"]
@@ -1752,14 +1759,14 @@ class TestTailGraphBuckets(unittest.TestCase):
             _kv_copy_config=None,
         )
         scheduler.tp_worker = NS(model_runner=NS(token_to_kv_pool=pool))
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
 
         empty = replace(
             plan, materialized_len=10, original_len=10, copy_src_slots=None
         )
         txn = tail.SRTailExtendTransaction(scheduler, [empty])
         txn.allocate(NS(device="cpu"))
-        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+        with patch(layout + ".move_kv_slots_", spy_mha):
             txn.copy_reused_tree_kv()
         self.assertEqual(copies, [])
         self.assertIsNone(txn.copy_done_event)
@@ -1771,7 +1778,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         txn.allocate(NS(device="cpu"))
         mapping = scheduler.req_to_token_pool.req_to_token
         mapping[0, ident.alloc_start : ident.alloc_start + 2] = torch.tensor([99, 100])
-        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+        with patch(layout + ".move_kv_slots_", spy_mha):
             txn.copy_reused_tree_kv()
         self.assertEqual(copies, ["mha"])
 
@@ -1780,7 +1787,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         txn = tail.SRTailExtendTransaction(scheduler, [real])
         txn.allocate(NS(device="cpu"))
-        with patch(layout + ".copy_mha_kv_by_slot", spy_mha):
+        with patch(layout + ".move_kv_slots_", spy_mha):
             txn.copy_reused_tree_kv()
         self.assertEqual(copies, ["mha", "mha"])
         copy_src = (
@@ -1876,14 +1883,14 @@ class TestTailGraphBuckets(unittest.TestCase):
         def spy_mha(*args, **kwargs):
             order.append("copy")
 
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
-        with patch.object(tail, "get_kv_copy_stream", return_value=copy_stream), patch.object(
-            tail, "_is_cpu_device", return_value=False
-        ), patch(
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
+        with patch.object(
+            tail, "get_kv_copy_stream", return_value=copy_stream
+        ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_mha_kv_by_slot", spy_mha
+            layout + ".move_kv_slots_", spy_mha
         ):
             txn.copy_reused_tree_kv()
 
@@ -1897,7 +1904,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIs(txn.copy_done_event, events[1])
         self.assertIs(lease.pending_free_event, events[1])
         self.assertIsNotNone(txn._copy_hold)
-        self.assertEqual(len(txn._copy_hold), 2)
+        self.assertEqual(len(txn._copy_hold), 3)
         self.assertTrue(torch.is_tensor(txn._copy_hold[0]))
         self.assertTrue(torch.is_tensor(txn._copy_hold[1]))
         compute = NS(seen=[])
@@ -1923,14 +1930,14 @@ class TestTailGraphBuckets(unittest.TestCase):
         def spy_mha(*args, **kwargs):
             order.append("copy")
 
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
         with patch.object(tail, "get_kv_copy_stream", return_value=None), patch.object(
             tail, "_is_cpu_device", return_value=False
         ), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_mha_kv_by_slot", spy_mha
+            layout + ".move_kv_slots_", spy_mha
         ):
             txn.copy_reused_tree_kv()
         self.assertEqual(order, ["copy", ("record", True)])
@@ -1983,14 +1990,14 @@ class TestTailGraphBuckets(unittest.TestCase):
                 return False
 
         scheduler._sr_kv_copy_ctx = lambda s: Ctx()
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
-        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
-            tail, "_is_cpu_device", return_value=False
-        ), patch(
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
+        with patch.object(
+            tail, "get_kv_copy_stream", return_value=CopyStream()
+        ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_mha_kv_by_slot", lambda *a, **k: None
+            layout + ".move_kv_slots_", lambda *a, **k: None
         ):
             with self.assertRaisesRegex(RuntimeError, "record failed"):
                 txn.copy_reused_tree_kv()
@@ -2009,7 +2016,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [])
 
-    def _record_fail_copy_txn(self):
+    def _record_fail_copy_txn(self, missing=False):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             SRTreeKVLease,
             SRTreeLeaseStore,
@@ -2041,6 +2048,8 @@ class TestTailGraphBuckets(unittest.TestCase):
             records.append(required)
             if len(records) == 1:
                 return NS(device=NS(type="npu"))
+            if missing:
+                return None
             raise RuntimeError("record failed")
 
         class CopyStream:
@@ -2055,27 +2064,51 @@ class TestTailGraphBuckets(unittest.TestCase):
                 return False
 
         scheduler._sr_kv_copy_ctx = lambda s: Ctx()
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
-        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
-            tail, "_is_cpu_device", return_value=False
-        ), patch(
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
+        with patch.object(
+            tail, "get_kv_copy_stream", return_value=CopyStream()
+        ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_kv_pool_by_slot", lambda *a, **k: None
+            layout + ".move_kv_slots_", lambda *a, **k: None
         ):
-            with self.assertRaisesRegex(RuntimeError, "record failed"):
+            with self.assertRaisesRegex(
+                KVMoveSubmittedError,
+                "completion event is missing" if missing else "record failed",
+            ):
                 txn.copy_reused_tree_kv()
         return scheduler, txn, lease, store
 
-    def test_rollback_after_record_failure_frees_lease_pages_once(self):
+    def test_missing_completion_event_keeps_workspace_indices_and_lease(self):
+        scheduler, txn, lease, _ = self._record_fail_copy_txn(missing=True)
+        self.assertTrue(txn.copy_unresolved)
+        self.assertTrue(txn.copy_workspace.unresolved)
+        self.assertTrue(lease.copy_unresolved)
+        self.assertIs(txn._copy_hold[2], txn.copy_workspace)
+        with self.assertRaises(KVMoveSubmittedError):
+            txn.wait_copy_done()
+        scheduler.device_module.synchronize.assert_not_called()
+
+    def test_record_failure_is_fatal_and_cleanup_retains_lease_pages(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+
         scheduler, txn, lease, store = self._record_fail_copy_txn()
         self.assertIsInstance(lease.pending_free_event, tail._UnfinishedCopyEvent)
         self.assertTrue(txn.copy_submitted)
-        txn.rollback()
-        self.assertIsNone(lease.pending_free_event)
-        self.assertIsNone(txn._copy_hold)
-        scheduler.device_module.synchronize.assert_called()
+        hold = txn._copy_hold
+        with self.assertRaises(KVMoveSubmittedError):
+            txn.copy_reused_tree_kv()
+        with self.assertRaises(KVMoveSubmittedError):
+            txn.rollback()
+        with self.assertRaises(KVMoveSubmittedError):
+            txn.commit(None)
+        self.assertIs(txn._copy_hold, hold)
+        self.assertTrue(txn.copy_workspace.unresolved)
+        self.assertTrue(lease.copy_unresolved)
+        scheduler.device_module.synchronize.assert_not_called()
 
         class Alloc:
             def __init__(self):
@@ -2090,18 +2123,19 @@ class TestTailGraphBuckets(unittest.TestCase):
             "_sr_release_held_leases"
         ]
         MethodType(release, scheduler)([lease])
-        self.assertEqual(alloc.freed, [4])
+        self.assertEqual(alloc.freed, [])
         store.poll_pending_frees(alloc)
-        self.assertEqual(alloc.freed, [4])
+        self.assertEqual(alloc.freed, [])
 
-    def test_rollback_sync_failure_keeps_unfinished_lease_pages(self):
+    def test_unresolved_copy_does_not_try_sync_recovery(self):
         scheduler, txn, lease, store = self._record_fail_copy_txn()
         hold = txn._copy_hold
         scheduler.device_module.synchronize = Mock(
             side_effect=RuntimeError("synchronize failed")
         )
-        with self.assertRaisesRegex(RuntimeError, "synchronize failed"):
+        with self.assertRaisesRegex(RuntimeError, "cannot rollback unresolved KV copy"):
             txn.rollback()
+        scheduler.device_module.synchronize.assert_not_called()
         self.assertIsInstance(lease.pending_free_event, tail._UnfinishedCopyEvent)
         self.assertIs(txn._copy_hold, hold)
 
@@ -2113,14 +2147,24 @@ class TestTailGraphBuckets(unittest.TestCase):
                 self.freed.append(int(slots.numel()))
 
         alloc = Alloc()
-        store.release(lease, allocator=alloc, event=lease.pending_free_event)
+        # Even a stale caller-supplied completed event cannot clear the marker.
+        store.release(lease, allocator=alloc, event=NS(query=lambda: True))
         self.assertEqual(alloc.freed, [])
         store.poll_pending_frees(alloc)
         self.assertEqual(alloc.freed, [])
 
     def test_wait_copy_done_keeps_hold_when_wait_fails(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+            prepare_kv_move,
+        )
+
         scheduler, txn, _, _ = self._copy_job_txn()
         txn._copy_hold = [("src", "dst")]
+        txn.copy_submitted = True
+        txn.copy_workspace = prepare_kv_move(
+            NS(kv_buffer=torch.zeros(2, 1, 2, 4, 1, 1)), 2
+        )
         txn.copy_done_event = NS(device=NS(type="npu"))
 
         class Stream:
@@ -2132,9 +2176,11 @@ class TestTailGraphBuckets(unittest.TestCase):
                 return Stream()
 
         with patch.object(torch, "get_device_module", return_value=Mod()):
-            with self.assertRaisesRegex(RuntimeError, "wait failed"):
+            with self.assertRaisesRegex(KVMoveSubmittedError, "wait failed"):
                 txn.wait_copy_done()
         self.assertEqual(txn._copy_hold, [("src", "dst")])
+        self.assertTrue(txn.copy_unresolved)
+        self.assertTrue(txn.copy_workspace.unresolved)
 
     def test_capture_buffers_keep_cpu_seq_lens_and_mrope_shape(self):
         GRAPH = (
@@ -2330,6 +2376,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
         )["_sr_execute_tree_tails"]
@@ -2395,6 +2442,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
         )["_sr_execute_tree_tails"]
@@ -2683,6 +2731,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
                 _SRTreePlanDraft=_SRTreePlanDraft,
                 replace=replace,
@@ -3149,6 +3198,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
             class_name="StandaloneRemoteDraftSchedulerMixin",
@@ -3166,24 +3216,29 @@ class TestBatchedKvCopy(unittest.TestCase):
         self.addCleanup(self.evict.stop)
 
     def _drafter(self, pool, copies, node_ids=None):
+        from sglang.srt.speculative.standalone_remote import sr_kv_copy as kv_copy
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             remap_slot_node_ids,
         )
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            copy_kv_pool_by_slot,
-        )
+
+        def spy_remap(workspace, loc, parents, depth, active=None):
+            copies.append(
+                (
+                    loc[:depth, parents].reshape(-1).clone(),
+                    loc[:depth].reshape(-1).clone(),
+                )
+            )
+            return kv_copy.remap_tree_kv_(workspace, loc, parents, depth, active)
 
         fns = load_functions(
             ROOT
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
-            ["_remap_tree_kv_to_parents", "_copy_tree_kv_slots"],
+            ["_remap_tree_kv_to_parents"],
             dict(
                 torch=torch,
                 remap_slot_node_ids=remap_slot_node_ids,
-                copy_kv_pool_by_slot=lambda *a, **k: copies.append(
-                    (a[1].detach().clone(), a[2].detach().clone())
-                )
-                or copy_kv_pool_by_slot(*a, **k),
+                prepare_kv_move=kv_copy.prepare_kv_move,
+                remap_tree_kv_=spy_remap,
             ),
             class_name="SRTreeDrafter",
         )
@@ -3196,7 +3251,6 @@ class TestBatchedKvCopy(unittest.TestCase):
             ),
             _slot_node_id_tmp=torch.empty(8, dtype=torch.int64),
         )
-        obj._copy_tree_kv_slots = MethodType(fns["_copy_tree_kv_slots"], obj)
         obj._remap_tree_kv_to_parents = MethodType(
             fns["_remap_tree_kv_to_parents"], obj
         )
@@ -3448,6 +3502,7 @@ class TestBatchedKvCopy(unittest.TestCase):
             )
         scheduler, _ = transaction_fixture(reqs, 128)
         scheduler.sr_tree_leases = store
+        scheduler._sr_round_metrics = SRRoundMetrics("Draft")
         pool = NS(
             kv_buffer=None,
             k_buffer=torch.zeros(128, 1, 2),
@@ -3471,7 +3526,7 @@ class TestBatchedKvCopy(unittest.TestCase):
 
         def fake_record(device, stream=None, *, required=False):
             self.assertIsNotNone(txn._copy_hold)
-            self.assertEqual(len(txn._copy_hold), 2)
+            self.assertEqual(len(txn._copy_hold), 3 if calls else 2)
             ev = NS(device=NS(type="npu"), required=required)
             order.append(("record", required))
             return ev
@@ -3490,20 +3545,22 @@ class TestBatchedKvCopy(unittest.TestCase):
                 return False
 
         scheduler._sr_kv_copy_ctx = lambda s: Ctx()
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
         with patch.object(torch, "as_tensor", spy_as), patch.object(
             tail, "get_kv_copy_stream", return_value=CopyStream()
         ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_kv_pool_by_slot", spy_copy
+            layout + ".move_kv_slots_", spy_copy
         ):
             txn.copy_reused_tree_kv()
         host_lists = [item for item in as_calls if isinstance(item, list)]
         self.assertEqual(host_lists, [[99, 100, 101]])
         self.assertEqual(len(calls), 1)
         self.assertEqual(int(calls[0][1].numel()), 3)
+        self.assertIs(calls[0][0].metrics, scheduler._sr_round_metrics)
+        self.assertIs(txn.copy_workspace, calls[0][0])
         self.assertIs(txn._copy_hold[0], calls[0][1])
         self.assertIs(txn._copy_hold[1], calls[0][2])
         self.assertTrue(txn.copy_submitted)
@@ -3536,20 +3593,20 @@ class TestBatchedKvCopy(unittest.TestCase):
                 return False
 
         scheduler._sr_kv_copy_ctx = lambda s: Ctx()
-        layout = "sglang.srt.speculative.standalone_remote.sr_verify_layout"
-        with patch.object(tail, "get_kv_copy_stream", return_value=CopyStream()), patch.object(
-            tail, "_is_cpu_device", return_value=False
-        ), patch(
+        layout = "sglang.srt.speculative.standalone_remote.sr_kv_copy"
+        with patch.object(
+            tail, "get_kv_copy_stream", return_value=CopyStream()
+        ), patch.object(tail, "_is_cpu_device", return_value=False), patch(
             "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.record_device_event",
             fake_record,
         ), patch(
-            layout + ".copy_kv_pool_by_slot", lambda *a, **k: None
+            layout + ".move_kv_slots_", lambda *a, **k: None
         ):
             with self.assertRaisesRegex(RuntimeError, "record failed"):
                 txn.copy_reused_tree_kv()
         self.assertTrue(txn.copy_submitted)
         self.assertIsNotNone(txn._copy_hold)
-        self.assertEqual(len(txn._copy_hold), 2)
+        self.assertEqual(len(txn._copy_hold), 3)
 
     def test_execute_copy_failure_classes(self):
         hold = (torch.tensor([1]), torch.tensor([2]))
@@ -3621,6 +3678,49 @@ class TestBatchedKvCopy(unittest.TestCase):
                     )
                 self.assertEqual(bool(submitted), txn_cls is not NotSubmitted)
 
+    def test_submitted_completion_error_is_fatal_on_tp1_and_tp2(self):
+        for tp_size in (1, 2):
+            for failing_stage in ("record", "wait"):
+                with self.subTest(tp_size=tp_size, stage=failing_stage):
+
+                    class Txn:
+                        def __init__(self, scheduler, plans):
+                            scheduler._last_txn = self
+                            self.submitted = False
+                            self.copy_submitted = False
+                            self.committed = False
+                            self._copy_hold = (object(), object(), object())
+                            self.rollback = Mock()
+                            self.commit = Mock()
+
+                        def allocate(self, batch):
+                            pass
+
+                        def stage_root_tokens(self, device):
+                            pass
+
+                        def copy_reused_tree_kv(self):
+                            self.copy_submitted = True
+                            if failing_stage == "record":
+                                raise KVMoveSubmittedError("completion record failed")
+
+                        def wait_copy_done(self):
+                            raise KVMoveSubmittedError("completion wait failed")
+
+                    execute, scheduler, reqs, _ = self._execute(Txn)
+                    scheduler.tp_size = tp_size
+                    before = [list(req.output_ids) for req in reqs]
+                    with self.assertRaises(KVMoveSubmittedError):
+                        execute(scheduler, _tail_plans_for(reqs))
+                    txn = scheduler._last_txn
+                    txn.rollback.assert_not_called()
+                    txn.commit.assert_not_called()
+                    self.assertEqual(scheduler._sr_pending_copy_holds, [txn._copy_hold])
+                    scheduler._sr_mark_degraded.assert_not_called()
+                    scheduler._sr_pause_req.assert_not_called()
+                    scheduler.device_module.synchronize.assert_not_called()
+                    self.assertEqual([req.output_ids for req in reqs], before)
+
     def _execute(self, txn_cls):
         fns = load_functions(
             SCHEDULER,
@@ -3635,6 +3735,7 @@ class TestBatchedKvCopy(unittest.TestCase):
                 SRTailExtendTransaction=txn_cls,
                 _sr_is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
+                KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
         )

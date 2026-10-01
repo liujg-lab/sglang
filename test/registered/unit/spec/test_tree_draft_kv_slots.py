@@ -576,7 +576,10 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         warm_src = _function_source(_SR_TREE, "_sr_warm_tree_shapes")
         self.assertIn("read_sr_tree_warmup_env", warm_src)
         self.assertIn("SR_TREE_WARMUP_ENV", warm_src)
-        self.assertIn("except (NpuGraphReplaySubmittedError, SRWarmupFatalError)", warm_src)
+        self.assertIn(
+            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError, SRWarmupFatalError)",
+            warm_src,
+        )
         self.assertIn("is_device_context_error", warm_src)
         self.assertIn("tree shape warmup failed", warm_src)
         self.assertIn("tree warmup layout=", warm_src)

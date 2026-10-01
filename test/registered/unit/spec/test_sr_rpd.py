@@ -482,6 +482,7 @@ class SRRPDTest(unittest.TestCase):
 
     def test_host_finalizer_matches_device_finalizer_and_never_reads_back(self):
         import test_sr_fixed_accept as fixed
+        from sglang.srt.speculative.standalone_remote import sr_kv_copy
 
         rows = [[0, 2, -1, -1], [4, 5, 6, -1]]
         tokens = [[10, 12, 0, 0], [20, 21, 22, 0]]
@@ -511,11 +512,14 @@ class SRRPDTest(unittest.TestCase):
                 state, "_wait_accept_readback", side_effect=AssertionError("readback")
             ), patch.object(
                 state, "_submit_commit_packet", wraps=state._submit_commit_packet
-            ) as submit:
+            ) as submit, patch.object(
+                sr_kv_copy, "prepare_kv_move", wraps=sr_kv_copy.prepare_kv_move
+            ) as prepare:
                 result = state.finalize_from_host(
                     batch, SimpleNamespace(), 4, 2, alloc, plan
                 )
                 self.assertEqual(submit.call_count, 1)
+                self.assertEqual(prepare.call_count, 1)
             self.assertEqual(
                 [q.output_ids for q in reqs], [q.output_ids for q in expected[3]]
             )
@@ -559,6 +563,62 @@ class SRRPDTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 state.finalize_from_host(batch, SimpleNamespace(), 4, 2, alloc, plan)
             self.assertEqual([r.output_ids for r in reqs], [[], []])
+            self.assertEqual(alloc.freed, [])
+
+    def test_kv_scratch_preflight_and_submitted_failure(self):
+        import test_sr_fixed_accept as fixed
+
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+            UnsupportedKVMoveLayout,
+        )
+
+        for preflight in (True, False):
+            reqs = [fixed._Req(), fixed._Req()]
+            state = SRFixedAcceptState(2, 4, 4, 4, "cpu")
+            alloc = fixed.NPUPagedTokenToKVPoolAllocator(4)
+            batch, _ = fixed.FixedAcceptFinalizeTest()._batch(
+                reqs, [1, 1], torch.arange(8), alloc.kv_buffer
+            )
+
+            def plan():
+                return SRRPDHostPlan(
+                    [[0, -1, -1, -1], [4, -1, -1, -1]],
+                    [[1, 0, 0, 0], [2, 0, 0, 0]],
+                    [0, 0],
+                    32,
+                    rpd_batch_key(reqs),
+                )
+
+            if preflight:
+                alloc.kv_buffer = torch.zeros(8)
+                host_plan = plan()
+                with self.assertRaises(UnsupportedKVMoveLayout):
+                    state.finalize_from_host(
+                        batch, SimpleNamespace(), 4, 2, alloc, host_plan
+                    )
+                self.assertFalse(host_plan.consumed)
+                self.assertEqual([r.output_ids for r in reqs], [[], []])
+            else:
+                with patch.object(
+                    torch,
+                    "index_select",
+                    side_effect=RuntimeError("gather launch failed"),
+                ):
+                    with self.assertRaises(KVMoveSubmittedError):
+                        state.finalize_from_host(
+                            batch, SimpleNamespace(), 4, 2, alloc, plan()
+                        )
+                once = [list(r.output_ids) for r in reqs]
+                # A later forward would provide a fresh full verification
+                # window. Do not let the prior publish's compact view hide
+                # the pool poison behind an unrelated capacity rejection.
+                batch.out_cache_loc = torch.arange(8)
+                with self.assertRaises(KVMoveSubmittedError):
+                    state.finalize_from_host(
+                        batch, SimpleNamespace(), 4, 2, alloc, plan()
+                    )
+                self.assertEqual([r.output_ids for r in reqs], once)
             self.assertEqual(alloc.freed, [])
 
     def test_commit_failure_does_not_append_twice_or_free(self):

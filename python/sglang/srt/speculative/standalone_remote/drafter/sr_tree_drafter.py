@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend, alloc_token_slots
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -76,9 +79,14 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     seq_lens_cpu_for_host,
     seq_lens_sum_from_batch,
 )
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+    KVMoveSubmittedError,
+    prepare_kv_move,
+    remap_tree_kv_,
+    warm_private_slot_move,
+)
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     advance_tree_draft_positions_for_step,
-    copy_kv_pool_by_slot,
 )
 from sglang.srt.utils import next_power_of_2
 
@@ -353,7 +361,7 @@ class SRTreeDrafter:
             else:
                 self.tree_graph_capture_succeeded = True
             logger.info("[SR] Capture tree draft graph end.")
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -386,7 +394,7 @@ class SRTreeDrafter:
                 "[SR] tail EXTEND graphs captured: buckets=%s",
                 list(runner.graphs),
             )
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -493,7 +501,14 @@ class SRTreeDrafter:
                                 page,
                             )
                             if int(src.numel()) > 0:
-                                copy_kv_pool_by_slot(kv_pool, src, dst)
+                                warm_private_slot_move(
+                                    kv_pool,
+                                    int(src.numel()),
+                                    index_dtype=src.dtype,
+                                    dst_index_dtype=dst.dtype,
+                                    src_stride=src.stride(0),
+                                    dst_stride=dst.stride(0),
+                                )
                     combos.append(key)
         return combos
 
@@ -561,6 +576,7 @@ class SRTreeDrafter:
                             kv_pool,
                             seq_lens=seq_lens,
                             dummy_page=dummy,
+                            commit_kv=False,
                         )
                         prepare(
                             dummy_fb,
@@ -570,6 +586,7 @@ class SRTreeDrafter:
                             kv_pool,
                             seq_lens=seq_lens,
                             dummy_page=dummy,
+                            commit_kv=False,
                         )
                         combos.append(key)
         finally:
@@ -645,11 +662,18 @@ class SRTreeDrafter:
         alloc_keys = []
         mapping_keys = []
         try:
+            # Lease sources are assembled as int64, while destinations retain
+            # the request mapping dtype. Warm that distinct pointer signature.
+            warm_private_slot_move(
+                self.draft_model_runner.token_to_kv_pool,
+                index_dtype=torch.int64,
+                dst_index_dtype=self.req_to_token_pool.req_to_token.dtype,
+            )
             combos = self._sr_warm_layout_shapes()
             coverage = warm_draft_alloc_mapping(self)
             alloc_keys = coverage.get("allocation") or []
             mapping_keys = coverage.get("mapping") or []
-        except (NpuGraphReplaySubmittedError, SRWarmupFatalError):
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError, SRWarmupFatalError):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -697,7 +721,7 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 keep, *self._stack_seeds(keep)
             )
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -737,7 +761,7 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 [req], *self._stack_seeds([req])
             )
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -1200,7 +1224,7 @@ class SRTreeDrafter:
                         parent_list, top_scores_index, draft_tokens = (
                             self.cuda_graph_runner.replay(forward_batch)
                         )
-                    except NpuGraphReplaySubmittedError:
+                    except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
                         self.cuda_graph_runner = None
                         graph_submitted = True
                         raise
@@ -1236,7 +1260,7 @@ class SRTreeDrafter:
                     )
             exec_s = time.perf_counter() - t_exec
             txn.completion_confirmed = True
-        except NpuGraphReplaySubmittedError:
+        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             graph_submitted = True
             raise
         except Exception as e:
@@ -1612,6 +1636,20 @@ class SRTreeDrafter:
             self.speculative_num_steps, -1
         )
         rows = int(out_cache_loc.shape[1])
+        kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        self._active_tree_kv_workspace = getattr(
+            self, "_capture_tree_kv_workspace", None
+        )
+        if kv_pool is not None and self.topk > 1 and self.speculative_num_steps > 2:
+            if self._active_tree_kv_workspace is None:
+                self._active_tree_kv_workspace = prepare_kv_move(
+                    kv_pool,
+                    rows * (self.speculative_num_steps - 2),
+                    domain="tree_eager",
+                    metrics=getattr(
+                        getattr(self, "scheduler", None), "_sr_round_metrics", None
+                    ),
+                )
         self._ensure_identity_capacity(rows)
         self._slot_node_ids.fill_(-1)
         score_list: List[torch.Tensor] = []
@@ -1672,6 +1710,17 @@ class SRTreeDrafter:
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
+    def prepare_tree_kv_graph(self, batch_cap):
+        if self.topk <= 1 or self.speculative_num_steps <= 2:
+            return None
+        pool = self.draft_model_runner.token_to_kv_pool
+        return prepare_kv_move(
+            pool,
+            int(batch_cap) * self.topk * (self.speculative_num_steps - 2),
+            domain="tree_graph",
+            graph=True,
+        )
+
     def _remap_tree_kv_to_parents(
         self,
         out_cache_loc: torch.Tensor,
@@ -1689,10 +1738,22 @@ class SRTreeDrafter:
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         if kv_pool is None:
             return
-        hist = out_cache_loc[:n_prev_steps]
-        src = hist[:, parent_rows.to(dtype=torch.int64)].reshape(-1)
-        tgt = hist.reshape(-1)
-        self._copy_tree_kv_slots(kv_pool, src, tgt)
-
-    def _copy_tree_kv_slots(self, kv_pool, src: torch.Tensor, tgt: torch.Tensor) -> None:
-        copy_kv_pool_by_slot(kv_pool, src, tgt)
+        workspace = getattr(self, "_active_tree_kv_workspace", None)
+        if workspace is None:
+            workspace = prepare_kv_move(
+                kv_pool, rows * n_prev_steps, domain="tree_eager"
+            )
+        active = None
+        if getattr(self, "sr_tree_paged", False):
+            inners = getattr(self.draft_attn_backend, "attn_backends", ())
+            meta = (
+                getattr(
+                    getattr(inners[0], "forward_metadata", None), "sr_tree_paged", None
+                )
+                if inners
+                else None
+            )
+            active = getattr(meta, "active_rows", None)
+            if active is None:
+                raise RuntimeError("paged tree KV remap requires live active_rows")
+        remap_tree_kv_(workspace, out_cache_loc, parent_rows, n_prev_steps, active)

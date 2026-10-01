@@ -72,6 +72,7 @@ class SRTreeKVLease:
     in_use: bool = False
     pending_free_event: Any = None
     released: bool = False
+    copy_unresolved: bool = False
 
     def __post_init__(self) -> None:
         if not self.page_count:
@@ -468,7 +469,9 @@ class SRTreeLeaseStore:
         )
         if allocator is None:
             return
-        if event is not None:
+        if event is None or lease.copy_unresolved:
+            event = lease.pending_free_event
+        if event is not None or lease.copy_unresolved:
             lease.pending_free_event = event
             self._pending_frees(allocator).append(lease)
             return
@@ -503,15 +506,34 @@ class SRTreeLeaseStore:
     def poll_pending_frees(self, allocator) -> None:
         pending = self._pending_frees(allocator)
         keep = []
+        ready = []
         for lease in pending:
-            event = lease.pending_free_event
-            if event is None:
-                _free_lease_pages(allocator, lease)
-                continue
-            query = getattr(event, "query", None)
-            if not callable(query) or not query():
+            if lease.copy_unresolved:
                 keep.append(lease)
                 continue
+            event = lease.pending_free_event
+            if event is None:
+                ready.append(lease)
+                continue
+            query = getattr(event, "query", None)
+            try:
+                done = callable(query) and query()
+            except Exception as exc:
+                from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+                    SRTransferUnresolved,
+                )
+
+                lease.copy_unresolved = True
+                raise SRTransferUnresolved(
+                    "tree lease completion query failed; retain pages"
+                ) from exc
+            if not done:
+                keep.append(lease)
+                continue
+            ready.append(lease)
+        # Query the complete set before freeing anything. A failed query must
+        # not leave an already freed lease in the pending list for a retry.
+        for lease in ready:
             _free_lease_pages(allocator, lease)
         pending[:] = keep
 
