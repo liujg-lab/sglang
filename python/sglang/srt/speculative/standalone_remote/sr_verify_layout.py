@@ -418,6 +418,9 @@ class VerifyInputPacket:
     def _note(self, metrics, kind: str, name: str, value) -> None:
         if metrics is None:
             return
+        if kind == "host":
+            metrics.add_host(name, value)
+            return
         bucket = getattr(metrics, kind, None)
         if bucket is None:
             return

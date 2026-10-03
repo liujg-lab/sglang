@@ -235,6 +235,7 @@ class SRRoundMetrics:
         self.rounds = 0
         self.host = Counter()
         self.host_max = Counter()
+        self._round_host = Counter()
         self.counts = Counter()
         self.paths = Counter()
         self.device_ms = Counter()
@@ -257,9 +258,10 @@ class SRRoundMetrics:
         if not self.active:
             return
         self.host[name] += seconds
-        current = self.host_max[name]
-        if seconds > current:
-            self.host_max[name] = seconds
+        self._round_host[name] += seconds
+        # A phase may execute several times in one round (e.g. KV moves).
+        # Both mean and max describe the sum of those calls per round.
+        self.host_max[name] = max(self.host_max[name], self._round_host[name])
 
     def poll(self):
         # Query only completed events. Bound the queue by skipping new samples
@@ -285,6 +287,7 @@ class SRRoundMetrics:
     @contextmanager
     def round(self):
         self.poll()
+        self._round_host.clear()
         self.active = True
         start = time.perf_counter()
         try:
@@ -295,6 +298,7 @@ class SRRoundMetrics:
         finally:
             self.add_host("total", time.perf_counter() - start)
             self.active = False
+            self._round_host.clear()
             self.rounds += 1
             if self.rounds % 32 == 0:
                 # A diagnostics error must not replace a business exception.
@@ -463,9 +467,7 @@ class SRRoundMetrics:
                     },
                 }
             )
-        logger.info(
-            "[SR %s graph host] window_rounds=32 groups=%s", self.role, groups
-        )
+        logger.info("[SR %s graph host] window_rounds=32 groups=%s", self.role, groups)
 
 
 def get_sr_round_metrics(owner, role):

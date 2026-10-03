@@ -1449,8 +1449,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             drafts = self._sr_inspect_tree_plans(prepared)
         self._sr_record_inspect_misses(drafts)
         if metrics.active:
-            metrics.host["tail_plan_including_recovery"] += (
-                time.perf_counter() - plan_start
+            metrics.add_host(
+                "tail_plan_including_recovery", time.perf_counter() - plan_start
             )
         held: List[SRTreeKVLease] = []
         try:
@@ -2580,7 +2580,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             else:
                 gpu_pairs.append((i, dreq, req))
         if metrics.active:
-            metrics.host["align_prepare"] += time.perf_counter() - prepare_start
+            metrics.add_host("align_prepare", time.perf_counter() - prepare_start)
         if gpu_pairs:
             windows = self._sr_produce_windows(
                 batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
@@ -2595,7 +2595,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                     reply = self._sr_finalize_v2_commit(wire, req, reply)
                 replies[i] = reply
             if metrics.active:
-                metrics.host["reply_prepare"] += time.perf_counter() - reply_start
+                metrics.add_host("reply_prepare", time.perf_counter() - reply_start)
         if self.sr_server is not None:
             self.sr_server.remember(batch)
         self._sr_note_handled(batch)

@@ -332,7 +332,9 @@ class TestCommTransport(unittest.TestCase):
         )
         self.assertEqual(self.server.drain(), 1)
         self.assertIs(self.server._comm_pending, pending)
-        self.assertEqual(self.window(self.server, "unknown")["counts"]["stale_request"], 1)
+        self.assertEqual(
+            self.window(self.server, "unknown")["counts"]["stale_request"], 1
+        )
 
     def test_new_session_prefill_reset_preserves_received_request_timing(self):
         # Execute the production reset method without importing GPU scheduler
@@ -340,12 +342,14 @@ class TestCommTransport(unittest.TestCase):
         path = Path(transport.__file__).parent / "drafter/sr_draft_scheduler_mixin.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
         cls = next(
-            n for n in tree.body
+            n
+            for n in tree.body
             if isinstance(n, ast.ClassDef)
             and n.name == "StandaloneRemoteDraftSchedulerMixin"
         )
         method = next(
-            n for n in cls.body
+            n
+            for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "_sr_wipe_all"
         )
         namespace = {"logger": logging.getLogger(__name__)}
@@ -385,7 +389,9 @@ class TestCommTransport(unittest.TestCase):
                 self.assertEqual(self.server.last_rpc_seq, -1)
                 self.assertFalse(self.server._socket.incoming)
                 self.clock.advance(170)
-                self.server.send_batch(SRBatchReply(request.session_id, request.rpc_seq))
+                self.server.send_batch(
+                    SRBatchReply(request.session_id, request.rpc_seq)
+                )
                 frames = self.server._socket.sent[-1]
                 self.assertEqual(frames[0], b"current")
                 self.assertEqual(
@@ -402,7 +408,9 @@ class TestCommTransport(unittest.TestCase):
                 self.assertEqual(values["non_draft_elapsed_ms"][-1], 4)
         self.assertEqual(self.window(self.server, "prefill")["counts"], {"success": 2})
         self.assertEqual(self.window(self.client, "prefill")["counts"], {"success": 2})
-        self.assertEqual(self.window(self.server, "unknown")["counts"]["stale_request"], 1)
+        self.assertEqual(
+            self.window(self.server, "unknown")["counts"]["stale_request"], 1
+        )
 
     def test_next_receive_abandons_unanswered_request_after_drain(self):
         for seq in (1, 2):
@@ -628,8 +636,71 @@ class TestSRRoundMetrics(unittest.TestCase):
             with metrics.phase("tree_alloc_kv"):
                 pass
             metrics.add_host("tree_alloc_kv", 0.02)
-        self.assertAlmostEqual(metrics.host_max["tree_alloc_kv"], 0.02)
+        self.assertAlmostEqual(
+            metrics.host_max["tree_alloc_kv"], metrics.host["tree_alloc_kv"]
+        )
         self.assertGreater(metrics.host["tree_alloc_kv"], 0.02)
+
+    def test_repeated_calls_missing_phase_and_window_reset(self):
+        metrics = SRRoundMetrics("Draft")
+        windows = []
+
+        def capture(fmt, *args, **kwargs):
+            windows.append((args[1], args[2]))
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            for _ in range(32):
+                with metrics.round():
+                    metrics.add_host("kv_move_eager", 0.0002)
+                    metrics.add_host("kv_move_eager", 0.0002)
+            for i in range(32):
+                with metrics.round():
+                    if i == 0:
+                        metrics.add_host("kv_move_eager", 0.0001)
+        self.assertEqual(windows[0][0]["kv_move_eager"], 0.4)
+        self.assertEqual(windows[0][1]["kv_move_eager"], 0.4)
+        self.assertEqual(windows[1][0]["kv_move_eager"], 0.003)
+        self.assertEqual(windows[1][1]["kv_move_eager"], 0.1)
+        self.assertFalse(metrics._round_host)
+        self.assertFalse(metrics.host)
+        self.assertFalse(metrics.host_max)
+
+    def test_failed_round_keeps_totals_and_original_exception(self):
+        metrics = SRRoundMetrics("Draft")
+        failure = RuntimeError("business failure")
+        with self.assertRaises(RuntimeError) as raised:
+            with metrics.round():
+                metrics.add_host("kv_move_eager", 0.001)
+                metrics.add_host("kv_move_eager", 0.002)
+                raise failure
+        self.assertIs(raised.exception, failure)
+        self.assertFalse(metrics.active)
+        self.assertFalse(metrics._round_host)
+        self.assertEqual(metrics.counts["failed_rounds"], 1)
+        with metrics.round():
+            metrics.add_host("kv_move_eager", 0.002)
+        self.assertAlmostEqual(metrics.host["kv_move_eager"], 0.005)
+        self.assertAlmostEqual(metrics.host_max["kv_move_eager"], 0.003)
+
+    def test_failed_round_at_window_boundary_is_reported_and_cleared(self):
+        metrics = SRRoundMetrics("Draft")
+        for _ in range(31):
+            with metrics.round():
+                pass
+        failure = RuntimeError("last round failed")
+        with patch.object(round_metrics.logger, "info") as log:
+            with self.assertRaises(RuntimeError) as raised:
+                with metrics.round():
+                    metrics.add_host("kv_move_eager", 0.001)
+                    metrics.add_host("kv_move_eager", 0.002)
+                    raise failure
+        self.assertIs(raised.exception, failure)
+        args = log.call_args.args[1:]
+        self.assertEqual(args[2]["kv_move_eager"], 3.0)
+        self.assertEqual(args[6]["failed_rounds"], 1)
+        self.assertFalse(metrics._round_host)
+        self.assertFalse(metrics.host)
+        self.assertFalse(metrics.host_max)
 
 
 def _graph_ctx(**overrides):
@@ -985,9 +1056,7 @@ class TestGraphHostMetrics(unittest.TestCase):
             with self.assertRaises(ValueError):
                 measure_call(sample, "update_call", lambda: fail(ValueError("infer")))
             with self.assertRaises(KeyboardInterrupt):
-                measure_call(
-                    sample, "replay_call", lambda: fail(KeyboardInterrupt())
-                )
+                measure_call(sample, "replay_call", lambda: fail(KeyboardInterrupt()))
         self.assertEqual(calls, ["ValueError", "KeyboardInterrupt"])
 
     def test_clock_failure_still_runs_fn_once(self):
@@ -1036,7 +1105,9 @@ class TestGraphHostMetrics(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "verify"
         )
         body = ast.get_source_segment(src, verify)
-        self.assertLess(body.find("bind_graph_host_metrics"), body.find("is_verify=True"))
+        self.assertLess(
+            body.find("bind_graph_host_metrics"), body.find("is_verify=True")
+        )
         self.assertLess(body.find("is_verify=True"), body.find("finally:"))
         self.assertLess(body.find("finally:"), body.find("restore_graph_host_metrics"))
 

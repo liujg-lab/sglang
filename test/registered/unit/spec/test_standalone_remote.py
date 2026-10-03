@@ -2477,16 +2477,20 @@ class TestStandaloneRemoteTree(CustomTestCase):
     def test_cpu_packet_skips_submit_and_drops_stale_rows(self):
         if torch is None:
             self.skipTest("torch not available")
-        from collections import Counter
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
 
         packet = self._packet_worker()
-        from sglang.srt.speculative.standalone_remote import sr_verify_layout as layout_mod
+        from sglang.srt.speculative.standalone_remote import (
+            sr_verify_layout as layout_mod,
+        )
 
         def fail_submit(*_args, **_kwargs):
             raise AssertionError("cpu path called submit_copy")
 
-        metrics = SimpleNamespace(host=Counter(), counts=Counter())
-        with patch.object(layout_mod, "submit_copy", fail_submit):
+        metrics = SRRoundMetrics("Target")
+        with metrics.round(), patch.object(layout_mod, "submit_copy", fail_submit):
             verified, parents, indices, tokens = self._assemble(
                 packet,
                 self._packet_batch(
@@ -2531,18 +2535,25 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(metrics.counts["verify_packet_upload"], 0)
         self.assertGreaterEqual(metrics.counts["verify_packet_grow"], 1)
         self.assertGreater(metrics.host["verify_packet_fill"], 0)
+        self.assertEqual(
+            metrics.host_max["verify_packet_fill"], metrics.host["verify_packet_fill"]
+        )
         self.assertEqual(metrics.host["verify_packet_wait"], 0)
 
     def test_packet_upload_once_and_unresolved_blocks_reuse(self):
         if torch is None:
             self.skipTest("torch not available")
-        from collections import Counter
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
 
         packet = self._packet_worker()
         from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
             SRTransferUnresolved,
         )
-        from sglang.srt.speculative.standalone_remote import sr_verify_layout as layout_mod
+        from sglang.srt.speculative.standalone_remote import (
+            sr_verify_layout as layout_mod,
+        )
 
         packet.on_accelerator = lambda device: True
         uploads = []
@@ -2557,11 +2568,11 @@ class TestStandaloneRemoteTree(CustomTestCase):
             waits.append(int(packet.host_packet[0].item()))
             self.assertEqual(event.name, "event")
 
-        metrics = SimpleNamespace(host=Counter(), counts=Counter())
+        metrics = SRRoundMetrics("Target")
         batch = self._packet_batch([(11, [1, 2, 3], None, None)], metrics)
-        with patch.object(layout_mod, "submit_copy", fake_submit), patch.object(
-            layout_mod, "wait_event", fake_wait
-        ):
+        with metrics.round(), patch.object(
+            layout_mod, "submit_copy", fake_submit
+        ), patch.object(layout_mod, "wait_event", fake_wait):
             verified, parents, indices, tokens = self._assemble(packet, batch)
             self.assertEqual(uploads, [(10, 11)])
             self.assertEqual(metrics.counts["verify_packet_upload"], 1)
@@ -2597,9 +2608,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
             dst.copy_(src)
             raise SRTransferUnresolved("record failed")
 
-        with patch.object(layout_mod, "wait_event", wait_ok), patch.object(
-            layout_mod, "submit_copy", record_fails
-        ):
+        with metrics.round(), patch.object(
+            layout_mod, "wait_event", wait_ok
+        ), patch.object(layout_mod, "submit_copy", record_fails):
             with self.assertRaises(SRTransferUnresolved):
                 self._assemble(
                     packet, self._packet_batch([(33, [5, 5, 5], None, None)], metrics)
@@ -2640,9 +2651,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         def fail_submit(*_args, **_kwargs):
             raise AssertionError("wait failure still uploaded")
 
-        with patch.object(layout_mod, "wait_event", wait_fails), patch.object(
-            layout_mod, "submit_copy", fail_submit
-        ):
+        with metrics.round(), patch.object(
+            layout_mod, "wait_event", wait_fails
+        ), patch.object(layout_mod, "submit_copy", fail_submit):
             with self.assertRaises(SRTransferUnresolved):
                 self._assemble(
                     packet, self._packet_batch([(99, [8, 8, 8], None, None)], metrics)
@@ -2654,6 +2665,127 @@ class TestStandaloneRemoteTree(CustomTestCase):
             packet.ensure(128, torch.device("cpu"), metrics)
         self.assertEqual(packet.capacity, 16)
         self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
+
+    def test_packet_host_times_accumulate_per_round_and_ignore_inactive(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from itertools import count
+
+        from sglang.srt.speculative.standalone_remote import (
+            sr_verify_layout as layout_mod,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        packet = self._packet_worker()
+        metrics = SRRoundMetrics("Target")
+        batch = self._packet_batch([(11, [1, 2, 3], None, None)], metrics)
+        ticks = count()
+        with patch.object(
+            layout_mod.time, "perf_counter", side_effect=lambda: next(ticks) / 1000
+        ), patch.object(layout_mod, "wait_event") as wait:
+            with metrics.round():
+                for _ in range(2):
+                    packet.event = object()
+                    self._assemble(packet, batch)
+            for name in ("verify_packet_fill", "verify_packet_wait"):
+                self.assertAlmostEqual(metrics.host[name], 0.002)
+                self.assertAlmostEqual(metrics.host_max[name], 0.002)
+            with metrics.round():
+                packet.event = object()
+                self._assemble(packet, batch)
+            for name in ("verify_packet_fill", "verify_packet_wait"):
+                self.assertAlmostEqual(metrics.host[name], 0.003)
+                self.assertAlmostEqual(metrics.host_max[name], 0.002)
+            before, maxima = dict(metrics.host), dict(metrics.host_max)
+            packet.event = object()
+            self._assemble(packet, batch)
+            self.assertEqual(dict(metrics.host), before)
+            self.assertEqual(dict(metrics.host_max), maxima)
+            self.assertEqual(wait.call_count, 4)
+        self.assertFalse(metrics._round_host)
+        self.assertEqual(metrics.counts["verify_packet_grow"], 1)
+        self.assertEqual(metrics.counts["verify_packet_upload"], 0)
+        packet._note(metrics, "counts", "rpd_input_edge_bytes", 224)
+        self.assertEqual(metrics.counts["rpd_input_edge_bytes"], 224)
+        packet._note(None, "host", "verify_packet_fill", 1)
+
+    def test_packet_host_times_clear_between_windows(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from itertools import count
+
+        from sglang.srt.speculative.standalone_remote import (
+            sr_round_metrics as metrics_mod,
+        )
+        from sglang.srt.speculative.standalone_remote import (
+            sr_verify_layout as layout_mod,
+        )
+
+        packet = self._packet_worker()
+        metrics = metrics_mod.SRRoundMetrics("Target")
+        batch = self._packet_batch([(11, [1], None, None)], metrics)
+        ticks = count()
+        with patch.object(
+            layout_mod.time, "perf_counter", side_effect=lambda: next(ticks) / 1000
+        ), patch.object(metrics_mod.logger, "info") as log:
+            for calls_per_round in (2, 1):
+                for _ in range(32):
+                    with metrics.round():
+                        for _ in range(calls_per_round):
+                            self._assemble(packet, batch)
+                self.assertFalse(metrics.host)
+                self.assertFalse(metrics.host_max)
+                self.assertFalse(metrics._round_host)
+        self.assertEqual(log.call_count, 2)
+        for call, expected_ms in zip(log.call_args_list, (2.0, 1.0)):
+            self.assertEqual(call.args[2]["verify_packet_fill"], expected_ms)
+            self.assertEqual(call.args[3]["verify_packet_fill"], expected_ms)
+
+    def test_packet_failed_wait_records_time_and_preserves_unresolved_state(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote import (
+            sr_verify_layout as layout_mod,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        packet = self._packet_worker()
+        metrics = SRRoundMetrics("Target")
+        batch = self._packet_batch([(11, [1], None, None)], metrics)
+        self._assemble(packet, batch)
+        snapshot = packet.host_packet.clone()
+        event = packet.event = object()
+        failure = SRTransferUnresolved("wait completion unknown")
+        with patch.object(
+            layout_mod, "wait_event", side_effect=failure
+        ) as wait, patch.object(layout_mod, "submit_copy") as submit:
+            with self.assertRaises(SRTransferUnresolved) as raised:
+                with metrics.round():
+                    self._assemble(packet, batch)
+            self.assertIs(raised.exception, failure)
+            self.assertTrue(packet.unresolved)
+            self.assertIs(packet.event, event)
+            self.assertEqual(packet.host_packet.tolist(), snapshot.tolist())
+            self.assertGreater(metrics.host["verify_packet_wait"], 0)
+            self.assertEqual(
+                metrics.host_max["verify_packet_wait"],
+                metrics.host["verify_packet_wait"],
+            )
+            self.assertNotIn("verify_packet_fill", metrics.host)
+            self.assertFalse(metrics._round_host)
+            self.assertFalse(metrics.active)
+            self.assertEqual(metrics.counts["failed_rounds"], 1)
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                self._assemble(packet, batch)
+            wait.assert_called_once_with(event)
+            submit.assert_not_called()
 
     def test_unindexed_device_matches_indexed_buffer(self):
         if torch is None:
@@ -2669,9 +2801,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
             devices_compatible(torch.device("cuda:0"), torch.device("cuda:1"))
         )
         self.assertTrue(devices_compatible(torch.device("cpu"), torch.device("cpu")))
-        self.assertFalse(
-            devices_compatible(torch.device("cpu"), torch.device("cuda"))
-        )
+        self.assertFalse(devices_compatible(torch.device("cpu"), torch.device("cuda")))
         self.assertFalse(
             devices_compatible(torch.device("cuda"), torch.device("cuda:0"))
         )
@@ -2683,7 +2813,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         has_npu = bool(npu is not None and npu.is_available())
         if not (torch.cuda.is_available() or has_npu):
             self.skipTest("no accelerator for packet allocation reuse")
-        from collections import Counter
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
 
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
             VerifyInputPacket,
@@ -2691,13 +2823,14 @@ class TestStandaloneRemoteTree(CustomTestCase):
 
         device_type = "npu" if has_npu else "cuda"
         packet = VerifyInputPacket()
-        metrics = SimpleNamespace(host=Counter(), counts=Counter())
-        packet.ensure(8, device_type, metrics)
-        self.assertEqual(metrics.counts["verify_packet_grow"], 1)
-        pointer = packet.device_packet.data_ptr()
-        packet.ensure(8, device_type, metrics)
-        self.assertEqual(metrics.counts["verify_packet_grow"], 1)
-        self.assertEqual(packet.device_packet.data_ptr(), pointer)
+        metrics = SRRoundMetrics("Target")
+        with metrics.round():
+            packet.ensure(8, device_type, metrics)
+            self.assertEqual(metrics.counts["verify_packet_grow"], 1)
+            pointer = packet.device_packet.data_ptr()
+            packet.ensure(8, device_type, metrics)
+            self.assertEqual(metrics.counts["verify_packet_grow"], 1)
+            self.assertEqual(packet.device_packet.data_ptr(), pointer)
 
     def test_packet_build_tree_matches_and_keeps_graph_buffers(self):
         if torch is None:

@@ -649,37 +649,53 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(alloc.freed, [])
 
     def test_non_rpd_packet_has_no_edge_tail(self):
-        plain_metrics = SimpleNamespace(counts=Counter(), host=Counter())
-        edged_metrics = SimpleNamespace(counts=Counter(), host=Counter())
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+
+        plain_metrics = SRRoundMetrics("Target")
+        edged_metrics = SRRoundMetrics("Target")
         plain = VerifyInputPacket()
-        plain.load(
-            [2],
-            [[1, 2, 3, 4, 5]],
-            [[-1, 0, 1, 2, 3]],
-            [list(range(5))],
-            2,
-            3,
-            6,
-            "cpu",
-            metrics=plain_metrics,
-        )
+        with plain_metrics.round():
+            plain.load(
+                [2],
+                [[1, 2, 3, 4, 5]],
+                [[-1, 0, 1, 2, 3]],
+                [list(range(5))],
+                2,
+                3,
+                6,
+                "cpu",
+                metrics=plain_metrics,
+            )
         edged = VerifyInputPacket()
-        edged.load(
-            [2],
-            [[1, 2, 3, 4, 5]],
-            [[-1, 0, 1, 2, 3]],
-            [list(range(5))],
-            2,
-            3,
-            6,
-            "cpu",
-            metrics=edged_metrics,
-            rpd_vocab=32,
-        )
+        with edged_metrics.round():
+            edged.load(
+                [2],
+                [[1, 2, 3, 4, 5]],
+                [[-1, 0, 1, 2, 3]],
+                [list(range(5))],
+                2,
+                3,
+                6,
+                "cpu",
+                metrics=edged_metrics,
+                rpd_vocab=32,
+            )
         self.assertIsNone(plain.rpd_input)
         self.assertNotIn("rpd_input_edge_bytes", plain_metrics.counts)
         self.assertIsNotNone(edged.rpd_input)
         self.assertGreater(edged_metrics.counts["rpd_input_edge_bytes"], 0)
+        self.assertEqual(
+            edged_metrics.counts["rpd_input_edge_bytes"],
+            edged.rpd_input.edge_index_cpu.numel() * 8,
+        )
+        for metrics in (plain_metrics, edged_metrics):
+            self.assertGreater(metrics.host["verify_packet_fill"], 0)
+            self.assertEqual(
+                metrics.host_max["verify_packet_fill"],
+                metrics.host["verify_packet_fill"],
+            )
 
     def test_logged_layout_reordering_and_capacity_changes(self):
         # The pasted NPU run uses K=3, S=5, W=15. Select complete ancestors

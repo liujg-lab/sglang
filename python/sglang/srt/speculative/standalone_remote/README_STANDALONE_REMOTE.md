@@ -822,7 +822,7 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 | --- | --- |
 | `rounds=32` | 汇总 32 个被计量的调度轮次，不是 32 个 token |
 | `host_mean_ms` | 各阶段主机墙钟耗时累计除以 32；包括同步等待，不是纯 CPU 计算时间 |
-| `host_max_ms` | 窗口内各阶段的单轮最大值（毫秒，不除 32）；用来区分单轮尖峰和逐轮摊平，不能与均值相减 |
+| `host_max_ms` | 窗口内各阶段的单轮累计耗时最大值（毫秒，不除 32）；同轮多次调用先求和，与 `host_mean_ms` 使用相同口径；不能与均值相减 |
 | `device_sample_mean_ms` | 已完成设备事件样本的平均毫秒数，不是全部 32 轮的设备平均 |
 | `device_samples` | 每项有效设备样本数；例如 1 就只有一次采样 |
 | `device_pending` | 尚未完成或未读取的计时事件数量；0 不代表整台设备没有待执行任务 |
@@ -953,6 +953,7 @@ tail_tokens = 1*4 + 2*2 + 3*4 + 4*5 + 5*5 + 6*12 = 137
 | --- | --- |
 | `rpc_wait` | 调度层 RPC 调用，包括请求准备、transport、TP 广播等；一轮可能调用两次，累计计入 |
 | `construct_tree` | 草稿列表、根 token、拓扑转换为验证输入。其中 `verify_packet_fill` / `verify_packet_wait` 是填写 host packet 和等待上一轮上传的主机时间，不能与 `construct_tree` 相加 |
+| `verify_packet_fill` / `verify_packet_wait` | 统一经 `add_host()` 计入均值和单轮累计最大值；同轮多次调用先求和，轮外调用不计入耗时窗口。等待失败仍计入已耗时间并保留原异常及不可复用状态 |
 | `verify_prepare` | 验证 batch、KV、metadata 等准备 |
 | `verify_forward` | Target 验证前向的主机调用区间；设备可异步执行 |
 | `accept_commit_including_wait` | 接受路径选择、KV/状态提交及相关处理，包含等待验证结果 |

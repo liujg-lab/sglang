@@ -377,7 +377,7 @@ class StandaloneRemoteWorker:
             ).cpu()
 
         if metrics:
-            metrics.host["verify_prepare"] += time.perf_counter() - prepare_start
+            metrics.add_host("verify_prepare", time.perf_counter() - prepare_start)
         graph_runner = getattr(
             getattr(self.target_worker, "model_runner", None), "graph_runner", None
         )
@@ -491,8 +491,8 @@ class StandaloneRemoteWorker:
         batch.spec_info = res.draft_input
         if metrics:
             # Verification is asynchronous; acceptance can wait on its results.
-            metrics.host["accept_commit_including_wait"] += (
-                time.perf_counter() - accept_start
+            metrics.add_host(
+                "accept_commit_including_wait", time.perf_counter() - accept_start
             )
             lengths = res.accept_length_per_req_cpu
             metrics.counts["verify_batches"] += 1
