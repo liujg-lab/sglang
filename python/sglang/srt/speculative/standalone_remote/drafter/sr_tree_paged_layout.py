@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -165,10 +166,26 @@ def plan_prefix_tail_copy_indices(
     empty = not reqs
     dtype = torch.int64
     return PrefixTailCopyIndices(
-        req_index=torch.tensor(reqs, dtype=dtype) if not empty else torch.empty(0, dtype=dtype),
-        branch=torch.tensor(branches, dtype=dtype) if not empty else torch.empty(0, dtype=dtype),
-        tail_off=torch.tensor(tails, dtype=dtype) if not empty else torch.empty(0, dtype=dtype),
-        prefix_col=torch.tensor(cols, dtype=dtype) if not empty else torch.empty(0, dtype=dtype),
+        req_index=(
+            torch.tensor(reqs, dtype=dtype)
+            if not empty
+            else torch.empty(0, dtype=dtype)
+        ),
+        branch=(
+            torch.tensor(branches, dtype=dtype)
+            if not empty
+            else torch.empty(0, dtype=dtype)
+        ),
+        tail_off=(
+            torch.tensor(tails, dtype=dtype)
+            if not empty
+            else torch.empty(0, dtype=dtype)
+        ),
+        prefix_col=(
+            torch.tensor(cols, dtype=dtype)
+            if not empty
+            else torch.empty(0, dtype=dtype)
+        ),
     )
 
 
@@ -226,6 +243,152 @@ class PrefixTailCopyBuffers:
         self.page_cap = 0
         self.pos = None
         self.value_scratch: dict = {}
+        self.meta_host = None
+        self.meta_device = None
+        self.meta_event = None
+        self.meta_capacity = 0
+        self.stream = None
+        self.unresolved = False
+        self.retired = []
+        self.hold = None
+
+    def fill_npu(self, req, pool, branch, prefixes, start, k, page, n_copy, metrics):
+        """One metadata upload and one launch, outside the tree graph.
+
+        This worker owns one stream. Returned slots remain borrowed until the
+        next fill on that same stream, after the caller queues its KV consumer.
+        """
+        from sglang.srt.speculative.standalone_remote import sr_small_kernels_npu
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            alloc_host,
+            submit_copy,
+            wait_event,
+        )
+
+        if self.unresolved:
+            raise KVMoveSubmittedError("prefix-tail completion is unresolved")
+        device = req.device
+        module = torch.get_device_module(device.type)
+        stream = module.current_stream(device)
+        if self.stream is not None and (self.stream != stream or self.device != device):
+            raise RuntimeError(
+                "prefix-tail buffers cannot be shared across streams/devices"
+            )
+        capturing = getattr(module, "is_current_stream_capturing", None)
+        if capturing is not None and capturing():
+            raise RuntimeError(
+                "prefix-tail CPU preparation must run outside graph capture"
+            )
+
+        def phase(name, device=False):
+            return (
+                metrics.phase(name, device=device, stream=stream)
+                if metrics is not None
+                else nullcontext()
+            )
+
+        try:
+            # Host source reuse only. Device consumers are ordered on stream.
+            with phase("prefix_tail_metadata_reuse_wait"):
+                wait_event(self.meta_event)
+            self.meta_event = None
+            self.retired = [(e, refs) for e, refs in self.retired if not e.query()]
+        except Exception as exc:
+            self.unresolved = True
+            raise KVMoveSubmittedError(
+                "prefix-tail staging completion unknown"
+            ) from exc
+
+        bs = len(prefixes)
+        if self.capacity < n_copy or self.meta_capacity < bs:
+            cap = max(n_copy, 2 * self.capacity, 1)
+            bcap = max(bs, 2 * self.meta_capacity, 1)
+            # Validate every new allocation before replacing live references.
+            src = torch.empty(cap, dtype=torch.int64, device=device)
+            dst = torch.empty_like(src)
+            host, _ = alloc_host((bcap, 3), torch.int64, device)
+            meta = torch.empty(bcap * 3, dtype=torch.int64, device=device).view(bcap, 3)
+            if self.meta_device is not None:
+                try:
+                    event = module.Event()
+                    event.record(stream)
+                except Exception as exc:
+                    self.unresolved = True
+                    raise KVMoveSubmittedError(
+                        "prefix-tail retirement record failed"
+                    ) from exc
+                self.retired.append(
+                    (
+                        event,
+                        (
+                            self.src_buf,
+                            self.dst_buf,
+                            self.meta_device,
+                            self.meta_host,
+                            self.hold,
+                        ),
+                    )
+                )
+            self.src_buf, self.dst_buf = src, dst
+            self.meta_host, self.meta_device = host, meta
+            self.capacity, self.meta_capacity = cap, bcap
+            self.device = device
+            if metrics is not None:
+                metrics.counts["prefix_tail_workspace_grow"] += 1
+        self.stream = stream
+        with phase("prefix_tail_plan_cpu"):
+            offset = 0
+            for b, prefix in enumerate(prefixes):
+                rem = prefix % page
+                self.meta_host[b, 0] = prefix - rem
+                self.meta_host[b, 1] = rem
+                self.meta_host[b, 2] = offset
+                offset += rem * (k - start)
+        self.hold = (
+            req,
+            pool,
+            branch,
+            self.src_buf,
+            self.dst_buf,
+            self.meta_host,
+            self.meta_device,
+        )
+        # Mappings may originate on a producer stream. Caller events order
+        # writes; record_stream also prevents allocator reuse after refs drop.
+        if device.type == "npu":
+            for tensor in (req, pool, branch):
+                tensor.record_stream(stream)
+        try:
+            with phase("prefix_tail_metadata_h2d"):
+                self.meta_event = submit_copy(
+                    self.meta_device[:bs], self.meta_host[:bs]
+                )
+            with phase("prefix_tail_slot_kernel", device=True):
+                sr_small_kernels_npu.prefix_tail(
+                    req,
+                    pool,
+                    branch,
+                    self.meta_device,
+                    self.src_buf,
+                    self.dst_buf,
+                    bs,
+                    start,
+                    k,
+                    page,
+                )
+        except Exception as exc:
+            self.unresolved = True
+            raise KVMoveSubmittedError(
+                "prefix-tail submission completion unknown"
+            ) from exc
+        if metrics is not None:
+            metrics.counts["prefix_tail_metadata_h2d_count"] += 1
+            metrics.counts["prefix_tail_metadata_h2d_bytes"] += bs * 3 * 8
+            metrics.counts["prefix_tail_slot_kernel_calls"] += 1
+        return self.src_buf[:n_copy], self.dst_buf[:n_copy]
 
     def ensure(self, device, n_copy: int, page: int) -> None:
         device = torch.device(device)
@@ -257,7 +420,9 @@ class PrefixTailCopyBuffers:
         self.once = torch.empty(self.page_cap, dtype=torch.int64, device=device)
         self.pool_i64 = torch.empty(1, dtype=torch.int64, device=device)
 
-    def _select_into(self, flat: torch.Tensor, index: torch.Tensor, out: torch.Tensor) -> None:
+    def _select_into(
+        self, flat: torch.Tensor, index: torch.Tensor, out: torch.Tensor
+    ) -> None:
         if flat.dtype == out.dtype:
             torch.index_select(flat, 0, index, out=out)
             return
@@ -285,6 +450,7 @@ def fill_prefix_tail_copy_slots(
     topk: int,
     page_size: int,
     buffers: PrefixTailCopyBuffers,
+    metrics=None,
 ):
     """Dense src/dst slots for the prefix-tail KV copy.
 
@@ -295,6 +461,12 @@ def fill_prefix_tail_copy_slots(
     """
     device = req_to_token.device
     prefixes = _prefix_ints(prefix_lens_cpu)
+    if buffers.unresolved:
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+
+        raise KVMoveSubmittedError("prefix-tail completion is unresolved")
     page = max(int(page_size), 1)
     k = max(int(topk), 1)
     start_k = 0 if str(allocation_kind) == ALLOC_LEASE else 1
@@ -322,6 +494,27 @@ def fill_prefix_tail_copy_slots(
     ):
         raise RuntimeError("branch_pages missing first-page column")
 
+    if req_to_token.ndim != 2 or req_pool_indices.ndim != 1 or branch_pages.ndim != 3:
+        raise RuntimeError("prefix-tail mapping ranks must be 2, 1, 3")
+    if any(
+        t.device != device or t.dtype not in (torch.int32, torch.int64)
+        for t in (req_to_token, req_pool_indices, branch_pages)
+    ):
+        raise RuntimeError("prefix-tail mappings must be integer tensors on one device")
+    if any(p < 0 or p > req_to_token.shape[1] for p in prefixes):
+        raise RuntimeError("prefix-tail prefix outside request mapping")
+    if device.type == "npu":
+        return buffers.fill_npu(
+            req_to_token,
+            req_pool_indices,
+            branch_pages,
+            prefixes,
+            start_k,
+            k,
+            page,
+            n_copy,
+            metrics,
+        )
     buffers.ensure(device, n_copy, page)
     flat = _unit_stride_flat(req_to_token)
     stride0 = int(req_to_token.stride(0))
@@ -366,7 +559,11 @@ def materialize_branch_pages(
     slots = draft_slots
     if slots.dim() != 3:
         raise ValueError(f"draft_slots must be (B,K,S), got {tuple(slots.shape)}")
-    batch, k_dim, steps_dim = (int(slots.shape[0]), int(slots.shape[1]), int(slots.shape[2]))
+    batch, k_dim, steps_dim = (
+        int(slots.shape[0]),
+        int(slots.shape[1]),
+        int(slots.shape[2]),
+    )
     prefixes = _as_int_list(prefix_lens_cpu)
     if len(prefixes) != batch:
         raise ValueError(
@@ -412,15 +609,21 @@ def materialize_shared_prefix_pages(
     device = req_to_token.device
     if batch == 0 or width <= 0:
         return torch.zeros((batch, width), dtype=torch.int64, device=device)
-    cols = (torch.arange(width, dtype=torch.int64) * page).unsqueeze(0).expand(batch, width)
+    cols = (
+        (torch.arange(width, dtype=torch.int64) * page)
+        .unsqueeze(0)
+        .expand(batch, width)
+    )
     valid = torch.zeros((batch, width), dtype=torch.bool)
     for b, n in enumerate(n_shared):
         if n:
             valid[b, :n] = True
     cols = cols.to(device=device)
     valid = valid.to(device=device)
-    pool = req_pool_indices.to(device=device, dtype=torch.int64).reshape(batch, 1).expand(
-        batch, width
+    pool = (
+        req_pool_indices.to(device=device, dtype=torch.int64)
+        .reshape(batch, 1)
+        .expand(batch, width)
     )
     token = req_to_token.to(device=device)[pool, cols]
     pages = token.to(dtype=torch.int64) // page
@@ -438,7 +641,9 @@ def assemble_block_tables(
 ) -> torch.Tensor:
     """One row per (seq, branch). Query page counts, not reserved alloc pages."""
     if branch_pages.dim() != 3:
-        raise ValueError(f"branch_pages must be (B,K,nnp), got {tuple(branch_pages.shape)}")
+        raise ValueError(
+            f"branch_pages must be (B,K,nnp), got {tuple(branch_pages.shape)}"
+        )
     batch, topk, _nnp = (
         int(branch_pages.shape[0]),
         int(branch_pages.shape[1]),
@@ -490,7 +695,9 @@ def assemble_block_tables(
     return pages.reshape(batch * topk, cols).to(torch.int32)
 
 
-def fill_active_rows(raw_bs: int, topk: int, capture_rows: int, device=None) -> torch.Tensor:
+def fill_active_rows(
+    raw_bs: int, topk: int, capture_rows: int, device=None
+) -> torch.Tensor:
     rows = max(int(capture_rows), 0)
     live = max(int(raw_bs), 0) * max(int(topk), 1)
     active = torch.zeros((rows,), dtype=torch.bool, device=device)
@@ -612,9 +819,7 @@ def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
         raise ValueError("paged update payload must not be None")
     n = len(payload)
     if n != len(step_ids):
-        raise ValueError(
-            f"paged payload length {n} != step_ids length {len(step_ids)}"
-        )
+        raise ValueError(f"paged payload length {n} != step_ids length {len(step_ids)}")
     n_steps = len(step_lens_list)
     src_lists = [[int(x) for x in list(step_lens)] for step_lens in step_lens_list]
 
@@ -673,7 +878,9 @@ class SRTreePagedMetadata:
     impl: str
 
 
-def max_query_pages_for_tree(prefix_lens_cpu: SeqLens, num_steps: int, page_size: int) -> list[int]:
+def max_query_pages_for_tree(
+    prefix_lens_cpu: SeqLens, num_steps: int, page_size: int
+) -> list[int]:
     """Pages needed by the last real forward, not reserved alloc slots."""
     prefixes = _as_int_list(prefix_lens_cpu)
     last_step = max(int(num_steps) - 2, 0)
@@ -786,7 +993,11 @@ def visible_token_slots_from_pages(
                     page_id = int(shared[b, t // page])
                 else:
                     bj = (t // page) - n_sh
-                    page_id = int(branch[b, k, bj]) if bj < int(branch.shape[2]) else int(dummy_page)
+                    page_id = (
+                        int(branch[b, k, bj])
+                        if bj < int(branch.shape[2])
+                        else int(dummy_page)
+                    )
                 slots.append(page_id * page + (t % page))
             rows.append(slots)
     return rows

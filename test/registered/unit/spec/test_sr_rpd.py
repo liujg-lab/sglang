@@ -648,6 +648,43 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual([list(req.output_ids) for req in reqs], once)
         self.assertEqual(alloc.freed, [])
 
+    def test_page_sort_failure_after_host_commit_is_not_retried(self):
+        import test_sr_fixed_accept as fixed
+
+        reqs = [fixed._Req()]
+        state = SRFixedAcceptState(1, 6, 15, 128, "cpu")
+        state.metrics = SimpleNamespace(counts=Counter(), paths=Counter(), active=False)
+        alloc = fixed.NPUPagedTokenToKVPoolAllocator(128)
+        batch, _ = fixed.FixedAcceptFinalizeTest()._batch(
+            reqs, [248], torch.arange(15) + 248, alloc.kv_buffer
+        )
+        plan = SRRPDHostPlan(
+            [list(range(6))], [list(range(10, 16))], [5], 32, rpd_batch_key(reqs)
+        )
+        before = alloc.free_pages.clone()
+        failure = RuntimeError("aclnnSort failed")
+        with patch.object(
+            alloc,
+            "free_unique_pages",
+            side_effect=lambda pages: fixed.apply_free_unique_pages(alloc, pages),
+        ) as release, patch("torch.sort", side_effect=failure) as sort:
+            with self.assertRaises(RuntimeError) as caught:
+                state.finalize_from_host(batch, SimpleNamespace(), 128, 3, alloc, plan)
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(plan.consumed)
+            self.assertEqual(reqs[0].output_ids, list(range(10, 16)))
+            self.assertTrue(torch.equal(alloc.free_pages, before))
+            self.assertEqual(state.metrics.counts["fixed_accept_slot_output_alloc"], 3)
+            self.assertEqual(
+                state.metrics.counts["fixed_accept_slot_output_bytes"], 104
+            )
+            with self.assertRaisesRegex(RuntimeError, "consumed"):
+                state.finalize_from_host(batch, SimpleNamespace(), 128, 3, alloc, plan)
+            sort.assert_called_once()
+            release.assert_called_once()
+            self.assertEqual(reqs[0].output_ids, list(range(10, 16)))
+            self.assertTrue(torch.equal(alloc.free_pages, before))
+
     def test_non_rpd_packet_has_no_edge_tail(self):
         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
             SRRoundMetrics,

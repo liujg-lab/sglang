@@ -25,6 +25,22 @@ def pack_accept(
     bs, path_cap = accept_index.shape
     if out.shape[0] < bs or out.shape[1] < path_cap * 2 + 2:
         raise RuntimeError("fixed accept pack buffer is smaller than the batch")
+    if out.dtype != torch.int64 or any(
+        t.device != out.device or t.dtype not in (torch.int32, torch.int64)
+        for t in (accept_index, predict, accept_length)
+    ):
+        raise RuntimeError("fixed accept pack requires integer tensors on one device")
+    if accept_length.numel() != bs:
+        raise RuntimeError("fixed accept length batch mismatch")
+    if out.device.type == "npu":
+        from sglang.srt.speculative.standalone_remote import sr_small_kernels_npu
+
+        if not predict.is_contiguous() or accept_length.ndim != 1:
+            raise RuntimeError(
+                "NPU accept pack requires flat lengths and contiguous predict"
+            )
+        sr_small_kernels_npu.pack_accept(accept_index, predict, accept_length, out)
+        return
     idx = accept_index.to(dtype=torch.int64)
     pred = predict.reshape(-1)
     npred = int(pred.shape[0])
@@ -49,14 +65,13 @@ def gather_commit_slots(
     tgt_index: torch.Tensor,
     page_index: torch.Tensor,
     page_size: int,
-    src_buf: torch.Tensor,
-    tgt_buf: torch.Tensor,
-    page_buf: torch.Tensor,
 ):
     """Gather source slots, destination slots, and page ids of known lengths.
 
     Indexes are already on ``out_cache_loc``'s device. An empty page list does
-    not read cache slots. Returned tensors do not alias the reusable buffers.
+    not read cache slots. Each output owns independent, zero-offset storage.
+    Besides preserving results across rounds, this avoids passing a small tail
+    view of a larger allocation to NPU sort during page release.
     """
     cache = out_cache_loc.reshape(-1)
     n_out = int(src_index.numel())
@@ -64,29 +79,36 @@ def gather_commit_slots(
     n_free = int(page_index.numel())
     if n_out != n_tgt:
         raise RuntimeError("fixed accept source and destination lengths differ")
-    if n_out > src_buf.numel() or n_free > page_buf.numel():
-        raise RuntimeError("fixed accept commit buffer is smaller than the batch")
+    if page_size <= 0 or cache.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError("fixed accept requires positive page size and integer cache")
     for name, index in (
         ("src_index", src_index),
         ("tgt_index", tgt_index),
         ("page_index", page_index),
     ):
-        if index.device != cache.device or index.dtype != torch.int64:
-            raise RuntimeError(
-                f"fixed accept {name} must be int64 on the cache device"
+        if (
+            index.device != cache.device
+            or index.dtype != torch.int64
+            or index.ndim != 1
+        ):
+            raise RuntimeError(f"fixed accept {name} must be int64 on the cache device")
+    src = torch.empty(n_out, dtype=torch.int64, device=cache.device)
+    tgt = torch.empty(n_tgt, dtype=torch.int64, device=cache.device)
+    pages = torch.empty(n_free, dtype=torch.int64, device=cache.device)
+    if cache.device.type == "npu":
+        from sglang.srt.speculative.standalone_remote import sr_small_kernels_npu
+
+        # Logical indexes are range-checked on CPU while constructing the
+        # commit packet; the device kernel never discovers output lengths.
+        sr_small_kernels_npu.gather_commit_slots(
+            cache, src_index, tgt_index, page_index, int(page_size), src, tgt, pages
+        )
+    else:
+        if n_out:
+            src.copy_(cache.index_select(0, src_index))
+            tgt.copy_(cache.index_select(0, tgt_index))
+        if n_free:
+            pages.copy_(
+                cache.index_select(0, page_index).to(torch.int64) // int(page_size)
             )
-    if n_out:
-        src_buf[:n_out].copy_(cache.index_select(0, src_index).to(torch.int64))
-        tgt_buf[:n_tgt].copy_(cache.index_select(0, tgt_index).to(torch.int64))
-        src = src_buf[:n_out]
-        tgt = tgt_buf[:n_tgt]
-    else:
-        src = src_buf[:0]
-        tgt = tgt_buf[:0]
-    if n_free:
-        slots = cache.index_select(0, page_index).to(torch.int64)
-        page_buf[:n_free].copy_(slots // int(page_size))
-        pages = page_buf[:n_free]
-    else:
-        pages = page_buf[:0]
-    return src.clone(), tgt.clone(), pages.clone()
+    return src, tgt, pages

@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
@@ -39,7 +40,9 @@ def read_sr_fixed_accept_env(env=None) -> bool:
     return str(raw).strip().lower() in _TRUTHY
 
 
-def accept_control_decision(admitted: bool, resolved_verify: str, simulate: bool) -> str:
+def accept_control_decision(
+    admitted: bool, resolved_verify: str, simulate: bool
+) -> str:
     """Route after penalty and verify have already run once.
 
     ``fresh_v1``: workspace was not bound.
@@ -155,10 +158,7 @@ def multimodal_accept_reject_reason(batch, *, bs: int) -> Optional[str]:
 
     hf_config = getattr(getattr(batch, "model_config", None), "hf_config", None)
     architectures = getattr(hf_config, "architectures", None)
-    if (
-        not architectures
-        or architectures[0] not in _QWEN3_VL_ARCHS
-    ):
+    if not architectures or architectures[0] not in _QWEN3_VL_ARCHS:
         return "multimodal_model"
 
     forward_mode = getattr(batch, "forward_mode", None)
@@ -167,11 +167,7 @@ def multimodal_accept_reject_reason(batch, *, bs: int) -> Optional[str]:
         return "multimodal_phase"
 
     rows = getattr(batch, "multimodal_inputs", None)
-    if (
-        rows is None
-        or len(reqs) != int(bs)
-        or len(rows) != int(bs)
-    ):
+    if rows is None or len(reqs) != int(bs) or len(rows) != int(bs):
         return "multimodal_rows"
     for req, row in zip(reqs, rows):
         if getattr(req, "multimodal_inputs", None) is not row:
@@ -199,7 +195,9 @@ def multimodal_accept_reject_reason(batch, *, bs: int) -> Optional[str]:
     return None
 
 
-def conservative_mode_reason(verify_mode: Optional[str], is_all_greedy: bool) -> Optional[str]:
+def conservative_mode_reason(
+    verify_mode: Optional[str], is_all_greedy: bool
+) -> Optional[str]:
     mode = verify_mode or "auto"
     if mode == "greedy":
         return None
@@ -275,9 +273,7 @@ def validate_packed_rows(
                 raise RuntimeError(f"packed accept index {idx} on request {row_i}")
             if seen_end:
                 if idx != -1:
-                    raise RuntimeError(
-                        f"packed accept hole on request {row_i}"
-                    )
+                    raise RuntimeError(f"packed accept hole on request {row_i}")
                 continue
             if idx == -1:
                 seen_end = True
@@ -290,9 +286,7 @@ def validate_packed_rows(
                     f"packed accept length {pre} disagrees with empty row {row_i}"
                 )
         elif pre != valid - 1:
-            raise RuntimeError(
-                f"packed accept length {pre} disagrees with row {row_i}"
-            )
+            raise RuntimeError(f"packed accept length {pre} disagrees with row {row_i}")
 
 
 def apply_cpu_acceptance(
@@ -332,7 +326,9 @@ def apply_cpu_acceptance(
         req.kv_allocated_len = req.kv_committed_len
         req.spec_verify_ct = int(getattr(req, "spec_verify_ct", 0) or 0) + 1
         raw_draft = sum(1 for idx in original if idx != -1) - 1
-        req.spec_accepted_tokens = int(getattr(req, "spec_accepted_tokens", 0) or 0) + raw_draft
+        req.spec_accepted_tokens = (
+            int(getattr(req, "spec_accepted_tokens", 0) or 0) + raw_draft
+        )
         req.update_spec_acceptance_histogram(raw_draft)
         copied = list(original)
         if cut is not None:
@@ -486,7 +482,9 @@ class CommitPacketLayout:
         return 3 * self.n + self.f + self.b + self.u
 
 
-def commit_capacity(batch_cap: int, path_cap: int, width: int, page_size: int) -> Tuple[int, int, int]:
+def commit_capacity(
+    batch_cap: int, path_cap: int, width: int, page_size: int
+) -> Tuple[int, int, int]:
     """Shared page and packet bounds.
 
     ``F_cap`` is ``B * (ceil(W / page_size) + 1)``. It is not the older
@@ -520,7 +518,9 @@ class FixedAcceptResult:
 class SRFixedAcceptState:
     """Per-target workspace. Views passed to greedy stay contiguous."""
 
-    def __init__(self, batch_cap: int, path_cap: int, width: int, page_size: int, device):
+    def __init__(
+        self, batch_cap: int, path_cap: int, width: int, page_size: int, device
+    ):
         self.B_cap = int(batch_cap)
         self.L = int(path_cap)
         self.W = int(width)
@@ -563,12 +563,9 @@ class SRFixedAcceptState:
         )
         self.commit_h2d_event = None
         self._commit_unresolved = False
-        self.src_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
-        self.tgt_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
-        self.page_buf = torch.empty(
-            (max(self.F_cap, 1),), dtype=torch.int64, device=self.device
+        self.index_buf = torch.empty(
+            (self.N_cap,), dtype=torch.int64, device=self.device
         )
-        self.index_buf = torch.empty((self.N_cap,), dtype=torch.int64, device=self.device)
         self._staging_noted = False
         self._d2h_count = 0
         self._h2d_count = 0
@@ -637,7 +634,9 @@ class SRFixedAcceptState:
             or int(seq_lens_cpu.shape[0]) != int(bs)
         ):
             return "seq_lens_cpu"
-        if allocator is None or not bool(getattr(allocator, "is_not_in_free_group", False)):
+        if allocator is None or not bool(
+            getattr(allocator, "is_not_in_free_group", False)
+        ):
             return "free_group"
         if int(bs) > self.B_cap or int(bs) < 0:
             return "batch_cap"
@@ -651,7 +650,10 @@ class SRFixedAcceptState:
             or int(logits.shape[0]) != int(bs) * self.W
         ):
             return "logits_rows"
-        if not torch.is_tensor(out_cache_loc) or int(out_cache_loc.numel()) != int(bs) * self.W:
+        if (
+            not torch.is_tensor(out_cache_loc)
+            or int(out_cache_loc.numel()) != int(bs) * self.W
+        ):
             return "cache_loc"
         if out_cache_loc.dtype not in (torch.int32, torch.int64):
             return "dtype"
@@ -703,6 +705,7 @@ class SRFixedAcceptState:
         packed = self.pack_buf[:bs]
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
         packed.detach().to("cpu")
+        coverage = self._warmup_commit_slots()
         if kv_pool is not None:
             from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
                 warm_private_slot_move,
@@ -712,6 +715,64 @@ class SRFixedAcceptState:
         self.accept_index.fill_(-1)
         self.accept_length.zero_()
         self.predict.zero_()
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_synchronize,
+        )
+
+        warmup_synchronize(self.device)
+        logger.info(
+            "[SR] fixed accept gather/release warmup completed cases=%s", coverage
+        )
+
+    def _warmup_commit_slots(self):
+        """Exercise native sort/cat consumers of fused outputs, on private lists."""
+        from sglang.srt.speculative.standalone_remote.sr_warmup import (
+            warmup_synchronize,
+        )
+
+        coverage = []
+        for dtype in (torch.int32, torch.int64):
+            cache = torch.arange(8, dtype=dtype, device=self.device) * self.page_size
+            for n, f in ((0, 0), (1, 0), (6, 1), (6, 3)):
+                index = torch.arange(n, dtype=torch.int64, device=self.device)
+                page_index = torch.tensor(
+                    [7, 1, 4][:f], dtype=torch.int64, device=self.device
+                )
+                src, dst, pages = self.kernels.gather_commit_slots(
+                    cache, index, index, page_index, self.page_size
+                )
+                for need_sort in (False, True):
+                    # Never borrow the live allocator's free/release lists.
+                    private = SimpleNamespace(
+                        is_not_in_free_group=True,
+                        need_sort=need_sort,
+                        debug_mode=False,
+                        free_pages=torch.tensor(
+                            [11], dtype=torch.int64, device=self.device
+                        ),
+                        release_pages=torch.tensor(
+                            [13], dtype=torch.int64, device=self.device
+                        ),
+                    )
+                    apply_free_unique_pages(private, pages)
+                    warmup_synchronize(self.device)
+                    expected = sorted([7, 1, 4][:f])
+                    if private.free_pages.cpu().tolist() != (
+                        expected + [11] if not need_sort else [11]
+                    ) or private.release_pages.cpu().tolist() != (
+                        expected + [13] if need_sort else [13]
+                    ):
+                        raise RuntimeError(
+                            "fixed accept private page-release warmup mismatch"
+                        )
+                    coverage.append((str(dtype), n, f, need_sort))
+                expected_slots = [i * self.page_size for i in range(n)]
+                if (
+                    src.cpu().tolist() != expected_slots
+                    or dst.cpu().tolist() != expected_slots
+                ):
+                    raise RuntimeError("fixed accept private slot warmup mismatch")
+        return coverage
 
     def finalize(
         self,
@@ -912,6 +973,8 @@ class SRFixedAcceptState:
     def _pack(self, bs, accept_index, predict, accept_length):
         packed = self.pack_buf[:bs]
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
+        if bs and self.device.type == "npu":
+            self._count("fixed_accept_pack_kernel_calls")
         return packed
 
     def _note_staging(self) -> None:
@@ -1081,18 +1144,26 @@ class SRFixedAcceptState:
                 device=False,
             )
         packet = self.commit_device
-        src, tgt, pages = self.kernels.gather_commit_slots(
-            cache,
-            packet[layout.src : layout.tgt],
-            packet[layout.tgt : layout.page],
-            packet[layout.page : layout.tokens],
-            self.page_size,
-            self.src_buf,
-            self.tgt_buf,
-            self.page_buf,
+        src, tgt, pages = _timed(
+            self.metrics,
+            "fixed_accept_slot_gather",
+            lambda: self.kernels.gather_commit_slots(
+                cache,
+                packet[layout.src : layout.tgt],
+                packet[layout.tgt : layout.page],
+                packet[layout.page : layout.tokens],
+                self.page_size,
+            ),
+            device=True,
         )
         if int(pages.numel()) != n_free:
             raise RuntimeError("fixed accept page count mismatch")
+        self._count(
+            "fixed_accept_slot_output_alloc", 2 * int(compact > 0) + int(n_free > 0)
+        )
+        self._count("fixed_accept_slot_output_bytes", (2 * compact + n_free) * 8)
+        if self.device.type == "npu" and compact + n_free:
+            self._count("fixed_accept_slot_kernel_calls")
         # Assemble host-visible results while the stream is idle after readback.
         # The KV move is last so a later host sync does not wait for it.
         result = self._publish(
@@ -1205,7 +1276,9 @@ class SRFixedAcceptState:
                     pieces.append(tgt[cursor : cursor + int(count)])
                 cursor += int(count)
             batch.out_cache_loc = torch.cat(pieces) if pieces else tgt[:0]
-            draft_verified = _select_rows(verified, accepted, unfinished, verified.device)
+            draft_verified = _select_rows(
+                verified, accepted, unfinished, verified.device
+            )
             draft_length = length_tensor.index_select(0, unfinished_dev)
             draft_length_cpu = [accept_length_list[i] for i in unfinished]
             draft_seq = batch.seq_lens.index_select(0, unfinished_dev)

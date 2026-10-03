@@ -69,16 +69,13 @@ _LAYOUT = (
     _REPO
     / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_paged_layout.py"
 )
-_BACKEND = (
-    _REPO / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
-)
+_BACKEND = _REPO / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
 _RUNNER = (
     _REPO
     / "python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py"
 )
 _DRAFTER = (
-    _REPO
-    / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+    _REPO / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
 )
 
 
@@ -145,8 +142,12 @@ class TestSrTreePagedEnv(CustomTestCase):
 
     def test_update_overlap_env_default_on(self):
         self.assertTrue(read_sr_tree_update_overlap_env({}))
-        self.assertTrue(read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "1"}))
-        self.assertFalse(read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "0"}))
+        self.assertTrue(
+            read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "1"})
+        )
+        self.assertFalse(
+            read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "0"})
+        )
         self.assertFalse(
             read_sr_tree_update_overlap_env({SR_TREE_UPDATE_OVERLAP_ENV: "false"})
         )
@@ -181,9 +182,7 @@ class TestPrefixTailCopyPlan(CustomTestCase):
                 ordinary = plan_prefix_tail_copy_indices(
                     [prefix], ALLOC_ORDINARY, topk, page
                 )
-                lease = plan_prefix_tail_copy_indices(
-                    [prefix], ALLOC_LEASE, topk, page
-                )
+                lease = plan_prefix_tail_copy_indices([prefix], ALLOC_LEASE, topk, page)
                 if rem == 0:
                     self.assertEqual(len(ordinary), 0)
                     self.assertEqual(len(lease), 0)
@@ -209,17 +208,143 @@ class TestPrefixTailCopyPlan(CustomTestCase):
         slots = _draft_slots(prefixes, page, topk, steps, branch_ids)
         branch = materialize_branch_pages(slots, prefixes, page, topk, steps)
         plan = plan_prefix_tail_copy_indices(prefixes, ALLOC_LEASE, topk, page)
-        src, dst = materialize_prefix_tail_copy_slots(
-            req, pool, branch, plan, page
-        )
+        src, dst = materialize_prefix_tail_copy_slots(req, pool, branch, plan, page)
         self.assertEqual(int(src.numel()), 127 * topk)
         self.assertTrue(torch.equal(src[:127], req[0, :127]))
         self.assertEqual(int(dst[0]), int(branch[0, 0, 0]) * page)
-        self.assertNotIn(".cpu()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots"))
-        self.assertNotIn(".tolist()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots"))
+        self.assertNotIn(
+            ".cpu()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots")
+        )
+        self.assertNotIn(
+            ".tolist()", _fn_source(_LAYOUT, "materialize_prefix_tail_copy_slots")
+        )
 
 
 class TestFillPrefixTailCopySlots(CustomTestCase):
+    def test_npu_preflight_and_submission_failure_contracts(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+
+        name = "sglang.srt.speculative.standalone_remote.sr_small_kernels_npu"
+        staging = "sglang.srt.speculative.standalone_remote.sr_transfer_staging"
+        kernel = types.ModuleType(name)
+        kernel.prefix_tail = mock.Mock()
+        event = mock.Mock()
+        event.query.return_value = True
+        module = SimpleNamespace(
+            current_stream=lambda device: 7,
+            is_current_stream_capturing=lambda: False,
+            Event=lambda: event,
+        )
+        req, pool, branch = (
+            torch.arange(64).view(2, 32),
+            torch.arange(2),
+            torch.ones(2, 3, 1, dtype=torch.int64),
+        )
+        args = (req, pool, branch, [7], 1, 3, 8, 14, None)
+        with mock.patch.dict(sys.modules, {name: kernel}), mock.patch(
+            "torch.get_device_module", return_value=module
+        ), mock.patch(
+            staging + ".alloc_host",
+            side_effect=lambda shape, dtype, dev: (
+                torch.empty(shape, dtype=dtype),
+                False,
+            ),
+        ), mock.patch(
+            staging + ".submit_copy", return_value=event
+        ) as submit:
+            bufs = PrefixTailCopyBuffers()
+            with mock.patch(
+                "torch.empty", side_effect=RuntimeError("allocation failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                    bufs.fill_npu(*args)
+            self.assertIsNone(bufs.stream)
+            self.assertEqual(bufs.capacity, 0)
+            bufs.fill_npu(*args)
+            module.current_stream = lambda device: 8
+            count = kernel.prefix_tail.call_count
+            with self.assertRaisesRegex(RuntimeError, "across streams"):
+                bufs.fill_npu(*args)
+            self.assertEqual(kernel.prefix_tail.call_count, count)
+            module.current_stream = lambda device: 7
+            event.record.side_effect = RuntimeError("record failed")
+            old = bufs.src_buf
+            with self.assertRaises(KVMoveSubmittedError):
+                bufs.fill_npu(req, pool, branch, [7, 15], 0, 3, 8, 42, None)
+            self.assertIs(bufs.src_buf, old)
+            self.assertTrue(bufs.unresolved)
+            self.assertEqual(kernel.prefix_tail.call_count, count)
+            event.record.side_effect = None
+            for operation in (submit, kernel.prefix_tail):
+                broken = PrefixTailCopyBuffers()
+                operation.side_effect = RuntimeError("submission failed")
+                with self.assertRaises(KVMoveSubmittedError):
+                    broken.fill_npu(*args)
+                operation.side_effect = None
+                submitted = submit.call_count
+                with self.assertRaises(KVMoveSubmittedError):
+                    broken.fill_npu(*args)
+                self.assertEqual(submit.call_count, submitted)
+                self.assertIsNotNone(broken.hold)
+
+    def test_npu_staging_lifetime_without_hardware(self):
+        """Test orchestration with CPU storage; does not validate the kernel."""
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+
+        name = "sglang.srt.speculative.standalone_remote.sr_small_kernels_npu"
+        staging = "sglang.srt.speculative.standalone_remote.sr_transfer_staging"
+        kernel = types.ModuleType(name)
+        kernel.prefix_tail = mock.Mock()
+        event = mock.Mock()
+        event.query.return_value = False
+        module = SimpleNamespace(
+            current_stream=lambda device: 7,
+            is_current_stream_capturing=lambda: False,
+            Event=lambda: event,
+        )
+        bufs = PrefixTailCopyBuffers()
+        req, pool, branch = (
+            torch.arange(64).view(2, 32),
+            torch.arange(2),
+            torch.ones(2, 3, 1, dtype=torch.int64),
+        )
+        with mock.patch.dict(sys.modules, {name: kernel}), mock.patch(
+            "torch.get_device_module", return_value=module
+        ), mock.patch(
+            staging + ".alloc_host",
+            side_effect=lambda shape, dtype, dev: (
+                torch.empty(shape, dtype=dtype),
+                False,
+            ),
+        ), mock.patch(
+            staging + ".submit_copy",
+            side_effect=lambda dst, src: (dst.copy_(src), event)[1],
+        ):
+            bufs.fill_npu(req, pool, branch, [7], 1, 3, 8, 14, None)
+            self.assertEqual(bufs.meta_device[0].tolist(), [0, 7, 0])
+            old = bufs.src_buf
+            bufs.fill_npu(req, pool, branch, [7, 15], 0, 3, 8, 42, None)
+            self.assertTrue(event.synchronize.called)
+            self.assertIs(bufs.retired[0][1][0], old)
+            self.assertEqual(bufs.meta_device[:2].tolist(), [[0, 7, 0], [8, 7, 21]])
+            pointer = bufs.src_buf.data_ptr()
+            event.query.return_value = True
+            bufs.fill_npu(req, pool, branch, [7], 1, 3, 8, 14, None)
+            self.assertEqual(bufs.src_buf.data_ptr(), pointer)
+            self.assertEqual(bufs.retired, [])
+            event.synchronize.side_effect = RuntimeError("wait failed")
+            before = kernel.prefix_tail.call_count
+            with self.assertRaises(KVMoveSubmittedError):
+                bufs.fill_npu(req, pool, branch, [7], 1, 3, 8, 14, None)
+            with self.assertRaises(KVMoveSubmittedError):
+                bufs.fill_npu(req, pool, branch, [7], 1, 3, 8, 14, None)
+            self.assertEqual(kernel.prefix_tail.call_count, before)
+            self.assertIsNotNone(bufs.hold)
+
     def _branch_ids(self, batch, topk, n_pages):
         ids = []
         nxt = 40
@@ -375,7 +500,9 @@ class TestQueryVsAllocPages(CustomTestCase):
         self.assertEqual(n_q, [1])
         self.assertEqual(int(tables.shape[1]), 1)
         self.assertEqual(int(branch.shape[2]), 2)
-        self.assertTrue(torch.equal(tables[:, 0], torch.tensor([40, 55], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(tables[:, 0], torch.tensor([40, 55], dtype=torch.int32))
+        )
 
 
 class TestBlockTablesAndPadding(CustomTestCase):
@@ -405,7 +532,9 @@ class TestBlockTablesAndPadding(CustomTestCase):
         active = fill_active_rows(raw_bs=2, topk=2, capture_rows=6)
         padded = torch.where(active.view(-1, 1), tables, torch.full_like(tables, dummy))
         self.assertTrue(torch.equal(padded[4:], torch.full((2, 3), dummy)))
-        self.assertFalse(torch.equal(padded[4:], torch.zeros((2, 3), dtype=torch.int32)))
+        self.assertFalse(
+            torch.equal(padded[4:], torch.zeros((2, 3), dtype=torch.int32))
+        )
 
     def test_batch_shrink_then_grow_clears_leftover(self):
         dummy = 5
@@ -526,9 +655,7 @@ class TestOncePerRoundAndTxn(CustomTestCase):
         self.assertIn("_try_confirm_tree_completion", expand_src)
         self.assertIn("tree expand in-flight; refuse rollback", expand_src)
 
-        path = (
-            _REPO / "python/sglang/srt/speculative/spec_utils.py"
-        )
+        path = _REPO / "python/sglang/srt/speculative/spec_utils.py"
         tree = ast.parse(path.read_text())
         names = {"NpuGraphReplaySubmittedError", "run_npu_graph_update_and_replay"}
         nodes = [
@@ -839,8 +966,12 @@ class TestPagedGraphRecords(CustomTestCase):
         self.assertEqual(n_sh, [0])
         self.assertEqual(n_q, [1])
         self.assertEqual(int(tables.shape[1]), 4)
-        self.assertTrue(torch.equal(tables[:, 0], torch.tensor([40, 55], dtype=torch.int32)))
-        self.assertTrue(torch.equal(tables[:, 1:], torch.full((2, 3), dummy, dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(tables[:, 0], torch.tensor([40, 55], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(tables[:, 1:], torch.full((2, 3), dummy, dtype=torch.int32))
+        )
         lens_after = build_step_context_lens(prefixes, topk, 0, topk)
         self.assertTrue(torch.equal(lens_before, lens_after))
 
@@ -1032,19 +1163,21 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("bind_sr_tree_paged_capture", src)
         self.assertIn("bind_sr_tree_paged_replay", src)
         self.assertIn("fill_paged_cpu_update_payload", src)
-        self.assertIn("if getattr(self, \"_tree_paged\", False)", src)
+        self.assertIn('if getattr(self, "_tree_paged", False)', src)
         self.assertIn("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE", src)
         self.assertIn("sr_paged_overlap", src)
         self.assertIn("_npu_sr_tree_update_overlap", src)
         skip_src = _fn_source(_RUNNER, "capture_one_batch_size")
-        self.assertIn("not getattr(self, \"_tree_paged\", False)", skip_src)
+        self.assertIn('not getattr(self, "_tree_paged", False)', skip_src)
         can_src = _fn_source(_RUNNER, "can_run")
         self.assertIn("_tree_fia_maps", can_src)
         self.assertIn("_tree_paged", can_src)
 
     def test_drafter_marks_before_submit_and_refuses_retry(self):
         src = _fn_source(_DRAFTER, "_expand_tree")
-        self.assertLess(src.find("mark_copy_begin"), src.find("_prepare_paged_tree_round"))
+        self.assertLess(
+            src.find("mark_copy_begin"), src.find("_prepare_paged_tree_round")
+        )
         self.assertLess(src.find("mark_compute_begin"), src.find("replay"))
         self.assertIn("NpuGraphReplaySubmittedError", src)
         self.assertIn("abandon", src)
@@ -1086,9 +1219,11 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("prepare_tree_paged_view", builder_src)
         init_src = _fn_source(_DRAFTER, "_init_cuda_graphs")
         self.assertIn("_sr_warm_tree_shapes", init_src)
-        self.assertGreater(init_src.rfind("_sr_warm_tree_shapes"), init_src.rfind("_init_tail_graphs"))
+        self.assertGreater(
+            init_src.rfind("_sr_warm_tree_shapes"), init_src.rfind("_init_tail_graphs")
+        )
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
-        self.assertIn("not getattr(runner, \"_tree_paged\", False)", can_src)
+        self.assertIn('not getattr(runner, "_tree_paged", False)', can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
         self.assertIn(
             "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
@@ -1128,9 +1263,7 @@ class TestAssembleSharedAndBranch(CustomTestCase):
         self.assertEqual(int(branch[0, 1, 0]), 21)
         aligned = _draft_slots([128], page, topk, steps, [[[40], [41]]])
         req_a = _req_to_token([[3]], page)
-        branch_a = materialize_branch_pages(
-            aligned, [128], page, topk, steps
-        )
+        branch_a = materialize_branch_pages(aligned, [128], page, topk, steps)
         self.assertEqual(int(branch_a[0, 0, 0]), 40)
         self.assertEqual(int(branch_a[0, 1, 0]), 41)
 
@@ -1249,10 +1382,10 @@ class TestPagedReplayBind(CustomTestCase):
             impl=impl,
         )
 
-    def _backend(self, raw_bs, capture_bs, topk, max_pages, prefix, src, src_act, dummy=0):
-        dest = torch.full(
-            (capture_bs * topk, max_pages), 777, dtype=torch.int32
-        )
+    def _backend(
+        self, raw_bs, capture_bs, topk, max_pages, prefix, src, src_act, dummy=0
+    ):
+        dest = torch.full((capture_bs * topk, max_pages), 777, dtype=torch.int32)
         dest_act = torch.full((capture_bs * topk,), 9, dtype=torch.int32)
         eager = self._eager_meta(src, src_act, dummy=dummy)
         inners = [
@@ -1273,9 +1406,7 @@ class TestPagedReplayBind(CustomTestCase):
             paged_impl_selected=lambda: True,
         )
         backend.bind_sr_tree_paged_replay = MethodType(self._bind_fn, backend)
-        backend._validate_sr_tree_paged_replay = MethodType(
-            self._validate_fn, backend
-        )
+        backend._validate_sr_tree_paged_replay = MethodType(self._validate_fn, backend)
         backend._paged_graph_table_view = MethodType(self._view_fn, backend)
         return backend, dest, dest_act, eager, inners
 
@@ -1398,7 +1529,10 @@ class TestPagedReplayBind(CustomTestCase):
                 dest_holder["dest"] = dest
                 dest_holder["dest_act"] = dest_act
             else:
-                key = (int(dest_holder["dest"].shape[0]), int(dest_holder["dest"].shape[1]))
+                key = (
+                    int(dest_holder["dest"].shape[0]),
+                    int(dest_holder["dest"].shape[1]),
+                )
                 for inner in inners:
                     inner.cuda_graph_paged_tables = {key: dest_holder["dest"]}
                     inner.cuda_graph_paged_actives = {key: dest_holder["dest_act"]}
@@ -1418,7 +1552,9 @@ class TestPagedReplayBind(CustomTestCase):
         )
         self.assertEqual(dest.data_ptr(), ptr)
         torch.testing.assert_close(dest[:2], src1)
-        self.assertTrue(torch.equal(dest[2:], torch.full((2, 4), dummy, dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(dest[2:], torch.full((2, 4), dummy, dtype=torch.int32))
+        )
         self.assertTrue(torch.equal(dest_act[2:], torch.zeros(2, dtype=torch.int32)))
         self.assertEqual(
             list(inners[0]._sr_tree_paged_meta.context_lens_list),
@@ -1457,7 +1593,9 @@ class TestPagedEagerPrep(CustomTestCase):
         )
         self._prep_fn = fn["prepare_sr_tree_paged_eager"]
 
-    def _backend(self, raw_bs, dest_bs, topk=2, dest_pages=4, page_size=128, steps=3, dummy=99):
+    def _backend(
+        self, raw_bs, dest_bs, topk=2, dest_pages=4, page_size=128, steps=3, dummy=99
+    ):
         dest = torch.full((dest_bs * topk, dest_pages), 777, dtype=torch.int32)
         dest_act = torch.full((dest_bs * topk,), 9, dtype=torch.int32)
         prefixes = [page_size] * raw_bs
@@ -1500,7 +1638,9 @@ class TestPagedEagerPrep(CustomTestCase):
         prefix = torch.tensor(prefixes, dtype=torch.int32)
         return backend, dest, dest_act, inners, forward_batch, compact, prefix, dummy
 
-    def _assert_no_dest_writes(self, backend, dest, dest_act, forward_batch, compact, prefix, dummy):
+    def _assert_no_dest_writes(
+        self, backend, dest, dest_act, forward_batch, compact, prefix, dummy
+    ):
         writes = []
         orig_fill = torch.Tensor.fill_
         orig_copy = torch.Tensor.copy_
@@ -1537,29 +1677,33 @@ class TestPagedEagerPrep(CustomTestCase):
 
     def test_eager_over_graph_capacity_does_not_write_or_raise(self):
         topk = 2
-        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = self._backend(
-            raw_bs=4, dest_bs=2, topk=topk
+        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = (
+            self._backend(raw_bs=4, dest_bs=2, topk=topk)
         )
         inners = self._assert_no_dest_writes(
             backend, dest, dest_act, forward_batch, compact, prefix, dummy
         )
         need = 4 * topk
         self.assertEqual(int(backend._paged_round_tables.shape[0]), need)
-        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables)
+        self.assertIs(
+            inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables
+        )
         self.assertEqual(int(inners[0]._sr_tree_paged_meta.block_tables.shape[0]), need)
         self.assertEqual(int(inners[0].forward_metadata.block_tables.shape[0]), need)
 
     def test_eager_fitting_capacity_still_skips_graph_buffers(self):
         topk = 2
-        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = self._backend(
-            raw_bs=2, dest_bs=2, topk=topk
+        backend, dest, dest_act, _, forward_batch, compact, prefix, dummy = (
+            self._backend(raw_bs=2, dest_bs=2, topk=topk)
         )
         inners = self._assert_no_dest_writes(
             backend, dest, dest_act, forward_batch, compact, prefix, dummy
         )
         need = 2 * topk
         self.assertEqual(int(backend._paged_round_tables.shape[0]), need)
-        self.assertIs(inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables)
+        self.assertIs(
+            inners[0]._sr_tree_paged_meta.block_tables, backend._paged_round_tables
+        )
 
     def test_eager_width_snaps_to_graph_bucket_dummy_extra_cols(self):
         page, topk, steps = 128, 2, 3
@@ -1614,7 +1758,9 @@ class TestPagedEagerPrep(CustomTestCase):
         )
         tables = backend._paged_round_tables
         self.assertEqual(int(tables.shape[1]), 4)
-        self.assertTrue(torch.equal(tables[:, 3], torch.full((2,), dummy, dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(tables[:, 3], torch.full((2,), dummy, dtype=torch.int32))
+        )
         self.assertEqual(int(inners[0]._sr_tree_paged_meta.max_pages), 4)
         self.assertTrue(
             torch.equal(
@@ -1751,8 +1897,7 @@ class TestSRWarmup(CustomTestCase):
                 pages = self.free_pages[:n]
                 self.free_pages = self.free_pages[n:]
                 return (
-                    pages.unsqueeze(1) * self.page_size
-                    + torch.arange(self.page_size)
+                    pages.unsqueeze(1) * self.page_size + torch.arange(self.page_size)
                 ).reshape(-1)
 
             def alloc_extend(self, *args, **kwargs):

@@ -4137,6 +4137,7 @@ class AscendAttnMultiStepDraftBackend:
             topk,
             self.page_size,
             buffers,
+            metrics=metrics,
         )
         if int(src.numel()) > 0 and commit_kv:
             inner0._sr_tree_paged_copy_count += 1

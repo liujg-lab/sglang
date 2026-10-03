@@ -111,7 +111,11 @@ def _worker(page_size=128, device_type="cpu"):
     alloc = NPUPagedTokenToKVPoolAllocator(page_size)
     alloc.kv_buffer = torch.zeros((2, 1, 4, page_size, 1, 1))
     if device_type == "npu":
-        alloc.kv_buffer = SimpleNamespace(dim=lambda: 6, shape=(2, 1, 4, page_size, 1, 1), device=SimpleNamespace(type="npu"))
+        alloc.kv_buffer = SimpleNamespace(
+            dim=lambda: 6,
+            shape=(2, 1, 4, page_size, 1, 1),
+            device=SimpleNamespace(type="npu"),
+        )
     return SimpleNamespace(
         topk=2,
         page_size=page_size,
@@ -163,20 +167,23 @@ class FixedAcceptEnvTest(CustomTestCase):
         self.assertFalse(read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "false"}))
         self.assertFalse(read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "no"}))
         self.assertFalse(read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "off"}))
-        for enabled in (read_sr_fixed_accept_env({}), read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "1"})):
+        for enabled in (
+            read_sr_fixed_accept_env({}),
+            read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "1"}),
+        ):
             self.assertEqual(
                 accept_control_decision(enabled, "greedy", False), "finalizer"
             )
         self.assertEqual(
-            accept_control_decision(read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "0"}), "greedy", False),
+            accept_control_decision(
+                read_sr_fixed_accept_env({SR_FIXED_ACCEPT_ENV: "0"}), "greedy", False
+            ),
             "fresh_v1",
         )
 
     def test_env_off_and_static_reject_skip_workspace_and_kernel_import(self):
         sys.modules.pop(_KERNEL_MODULE, None)
-        state = build_fixed_accept_state(
-            _worker(), env={SR_FIXED_ACCEPT_ENV: "0"}
-        )
+        state = build_fixed_accept_state(_worker(), env={SR_FIXED_ACCEPT_ENV: "0"})
         self.assertIsNone(state)
         self.assertNotIn(_KERNEL_MODULE, sys.modules)
 
@@ -220,11 +227,40 @@ class FixedAcceptEnvTest(CustomTestCase):
         self.assertTrue(torch.all(state.accept_length == 0))
         self.assertTrue(torch.all(state.predict == 0))
 
+    def test_warmup_checks_release_consumers_and_propagates_failures(self):
+        import sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept as fixed
+        from sglang.srt.speculative.standalone_remote import sr_warmup
+
+        state = SRFixedAcceptState(1, 6, 15, 128, "cpu")
+        with patch.object(
+            fixed, "apply_free_unique_pages", wraps=apply_free_unique_pages
+        ) as release:
+            cases = state._warmup_commit_slots()
+        self.assertEqual(len(cases), 16)
+        self.assertEqual(release.call_count, 16)
+        self.assertIn(("torch.int32", 6, 1, False), cases)
+        self.assertIn(("torch.int64", 6, 1, True), cases)
+        for target, name in (
+            (fixed, "apply_free_unique_pages"),
+            (sr_warmup, "warmup_synchronize"),
+        ):
+            failure = RuntimeError(name + " failed")
+            with patch.object(
+                target, name, side_effect=failure
+            ) as operation, patch.object(fixed.logger, "info") as log:
+                with self.assertRaises(RuntimeError) as caught:
+                    state.warmup_scratch()
+                self.assertIs(caught.exception, failure)
+                operation.assert_called_once()
+                log.assert_not_called()
+
 
 class FixedAcceptRouteTest(CustomTestCase):
     def test_two_exits_and_defensive_branch_runs_each_stage_once(self):
         self.assertEqual(accept_control_decision(False, "greedy", False), "fresh_v1")
-        self.assertEqual(accept_control_decision(True, "target_only", False), "v1_workspace")
+        self.assertEqual(
+            accept_control_decision(True, "target_only", False), "v1_workspace"
+        )
         self.assertEqual(accept_control_decision(True, "rpd", False), "v1_workspace")
         calls = []
 
@@ -264,7 +300,9 @@ class FixedAcceptRouteTest(CustomTestCase):
             "rpd_context",
         )
         self.assertEqual(
-            state.reject_before_alloc(**_admit_kwargs(state, verify_mode="target_only")),
+            state.reject_before_alloc(
+                **_admit_kwargs(state, verify_mode="target_only")
+            ),
             "mode",
         )
         self.assertEqual(
@@ -397,19 +435,22 @@ class FixedAcceptCpuLoopTest(CustomTestCase):
 class FixedAcceptFinalizeTest(CustomTestCase):
     def _batch(self, reqs, prefixes, cache, kv):
         bs = len(reqs)
-        return SimpleNamespace(
-            reqs=reqs,
-            seq_lens=torch.tensor(prefixes, dtype=torch.int64),
-            seq_lens_cpu=torch.tensor(prefixes, dtype=torch.int64),
-            out_cache_loc=cache.clone(),
-            req_pool_indices=torch.arange(bs, dtype=torch.int64),
-            device=torch.device("cpu"),
-            topk=2,
-            spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
-            model_config=SimpleNamespace(
-                think_end_id=None, hidden_size=4, dtype=torch.float32
+        return (
+            SimpleNamespace(
+                reqs=reqs,
+                seq_lens=torch.tensor(prefixes, dtype=torch.int64),
+                seq_lens_cpu=torch.tensor(prefixes, dtype=torch.int64),
+                out_cache_loc=cache.clone(),
+                req_pool_indices=torch.arange(bs, dtype=torch.int64),
+                device=torch.device("cpu"),
+                topk=2,
+                spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
+                model_config=SimpleNamespace(
+                    think_end_id=None, hidden_size=4, dtype=torch.float32
+                ),
             ),
-        ), kv
+            kv,
+        )
 
     def _run(self, rows, tokens, pre_lengths, prefixes, finish_at, cache=None):
         bs = len(rows)
@@ -428,7 +469,9 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         if cache is None:
             cache = torch.arange(bs * width, dtype=torch.int64)
         pages = int(cache.max()) // 4 + 2
-        kv = torch.arange(2 * pages * 4, dtype=torch.float32).reshape(2, 1, pages, 4, 1, 1)
+        kv = torch.arange(2 * pages * 4, dtype=torch.float32).reshape(
+            2, 1, pages, 4, 1, 1
+        )
         alloc = NPUPagedTokenToKVPoolAllocator(4)
         alloc.kv_buffer = kv
         reqs = [_Req(finish_at=item) for item in finish_at]
@@ -485,7 +528,10 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(batch.seq_lens_cpu.tolist(), [8, 9])
         self.assertEqual(result.accept_length_per_req_cpu, [0, 0])
         self.assertEqual(
-            [pre + (length + 1) for pre, length in zip([8, 9], result.accept_length_per_req_cpu)],
+            [
+                pre + (length + 1)
+                for pre, length in zip([8, 9], result.accept_length_per_req_cpu)
+            ],
             [9, 10],
         )
         self.assertEqual(reqs[0].kv_committed_len, 6)
@@ -549,21 +595,15 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             return original(dim, index)
 
         cache.index_select = _select
-        src_buf = torch.empty((8,), dtype=torch.int64)
-        tgt_buf = torch.empty((8,), dtype=torch.int64)
-        page_buf = torch.empty((4,), dtype=torch.int64)
         _, _, pages = gather_commit_slots(
             cache,
             torch.tensor([0, 1, 2]),
             torch.tensor([0, 1, 2]),
             torch.tensor([], dtype=torch.int64),
             128,
-            src_buf,
-            tgt_buf,
-            page_buf,
         )
         self.assertEqual(pages.numel(), 0)
-        self.assertEqual(src_buf.device, cache.device)
+        self.assertEqual(pages.device, cache.device)
         with self.assertRaises(RuntimeError):
             gather_commit_slots(
                 cache,
@@ -571,9 +611,6 @@ class FixedAcceptFinalizeTest(CustomTestCase):
                 torch.tensor([0, 1, 2]),
                 torch.tensor([], dtype=torch.int64),
                 128,
-                src_buf,
-                tgt_buf,
-                page_buf,
             )
         self.assertEqual(free_page_row_offsets(100, 3, 15, 128), [])
         self.assertTrue(all(28 not in group for group in reads))
@@ -601,10 +638,14 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             req_pool_indices=torch.arange(2),
             device=torch.device("cpu"),
             spec_algorithm=None,
-            model_config=SimpleNamespace(think_end_id=None, hidden_size=1, dtype=torch.float32),
+            model_config=SimpleNamespace(
+                think_end_id=None, hidden_size=1, dtype=torch.float32
+            ),
         )
         with self.assertRaises(RuntimeError):
-            state.finalize(batch, None, 4, 2, alloc, accept_index, predict, accept_length)
+            state.finalize(
+                batch, None, 4, 2, alloc, accept_index, predict, accept_length
+            )
         self.assertEqual(reqs[0].output_ids, [])
         self.assertEqual(reqs[1].output_ids, [])
         self.assertEqual(alloc.freed, [])
@@ -629,7 +670,9 @@ class FixedAcceptFinalizeTest(CustomTestCase):
                 req_pool_indices=torch.tensor([0]),
                 device=torch.device("cpu"),
                 spec_algorithm=None,
-                model_config=SimpleNamespace(think_end_id=None, hidden_size=1, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    think_end_id=None, hidden_size=1, dtype=torch.float32
+                ),
             )
             state.inject_error = inject
             with self.assertRaises(RuntimeError):
@@ -667,7 +710,9 @@ class FixedAcceptFinalizeTest(CustomTestCase):
                 req_pool_indices=torch.tensor([3]),
                 device=torch.device("cpu"),
                 spec_algorithm=None,
-                model_config=SimpleNamespace(think_end_id=None, hidden_size=1, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    think_end_id=None, hidden_size=1, dtype=torch.float32
+                ),
             )
             result = state.finalize(
                 batch, None, 4, 2, alloc, accept_index, predict, accept_length
@@ -704,12 +749,14 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(int(output.verified_id[0]), 7)
         self.assertEqual(int(output.draft_input.accept_length[0]), 7)
         self.assertEqual(int(output.draft_input.seq_lens_for_draft_extend[0]), 7)
-        self.assertEqual(int(output.draft_input.req_pool_indices_for_draft_extend[0]), 7)
+        self.assertEqual(
+            int(output.draft_input.req_pool_indices_for_draft_extend[0]), 7
+        )
 
     def test_page_capacity_matches_new_bound(self):
         state = SRFixedAcceptState(2, 4, 128, 128, "cpu")
         self.assertEqual(state.F_cap, 4)
-        self.assertEqual(state.page_buf.numel(), 4)
+        self.assertFalse(hasattr(state, "page_buf"))
         self.assertEqual(state.N_cap, 8)
         self.assertEqual(state.packet_cap, 3 * 8 + 4 + 4)
 
@@ -742,7 +789,13 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             result = state.finalize(
                 batch, None, 4, 2, alloc, accept_index, predict, accept_length
             )
-            held.append((result, batch.out_cache_loc.clone(), [r.output_ids[:] for r in batch.reqs]))
+            held.append(
+                (
+                    result,
+                    batch.out_cache_loc.clone(),
+                    [r.output_ids[:] for r in batch.reqs],
+                )
+            )
             return result
 
         run(2, 10)
@@ -805,7 +858,9 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             req_pool_indices=torch.tensor([3]),
             device=torch.device("cpu"),
             spec_algorithm=None,
-            model_config=SimpleNamespace(think_end_id=None, hidden_size=1, dtype=torch.float32),
+            model_config=SimpleNamespace(
+                think_end_id=None, hidden_size=1, dtype=torch.float32
+            ),
         )
         seen = {}
 
@@ -828,9 +883,11 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(seen["seq"], [3])
         self.assertEqual(seen["cache"], [0, 1])
         self.assertEqual(result.verified_id.tolist(), [10, 11])
-        state.src_buf.fill_(123)
+        state.commit_device.fill_(123)
         self.assertEqual(result.verified_id.tolist(), [10, 11])
-        self.assertTrue(torch.equal(state.control_buf, torch.full_like(state.control_buf, -7)))
+        self.assertTrue(
+            torch.equal(state.control_buf, torch.full_like(state.control_buf, -7))
+        )
 
     def test_pack_masks_invalid_indexes(self):
         accept_index = torch.tensor([[0, -1], [4, 1]], dtype=torch.int32)
@@ -842,12 +899,138 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(int(out[0, 5]), 0)
         self.assertEqual(int(out[1, 5]), 1)
 
+    def test_pack_empty_predict_and_strided_rows(self):
+        for dtype in (torch.int32, torch.int64):
+            indices = torch.tensor([[0, -1, -2], [1, 1, -1]], dtype=dtype)
+            lengths = torch.tensor([0, 1], dtype=dtype)
+            backing = torch.full((2, 20), 999, dtype=torch.int64)
+            out = backing[:, ::2]
+            pack_accept(indices, torch.empty(0, dtype=dtype), lengths, out)
+            self.assertEqual(out[:, :3].tolist(), indices.tolist())
+            self.assertEqual(out[:, 3:6].tolist(), [[0, 0, 0], [0, 0, 0]])
+            self.assertEqual(out[:, 6:8].tolist(), [[0, 1], [1, 1]])
+            self.assertTrue(torch.all(backing[:, 1::2] == 999))
+            # Preserve the legacy empty-predict flag for <-1; the CPU row
+            # validator still rejects this path before any token append.
+            out = torch.empty(1, 4, dtype=torch.int64)
+            pack_accept(
+                torch.tensor([[-2]]),
+                torch.empty(0, dtype=dtype),
+                torch.tensor([0]),
+                out,
+            )
+            self.assertEqual(int(out[0, -1]), 0)
+            with self.assertRaises(RuntimeError):
+                validate_packed_rows([[-2]], [0], [0])
+
+    def test_commit_owned_storage_survives_next_round_and_cache_changes(self):
+        for dtype in (torch.int32, torch.int64):
+            cache = torch.arange(20, dtype=dtype) + 128
+            index = torch.tensor([3, 0, 3, 8])
+            src, dst, pages = gather_commit_slots(
+                cache, index, index.flip(0), torch.tensor([0, 19]), 7
+            )
+            snapshot = [t.clone() for t in (src, dst, pages)]
+            self.assertNotEqual(
+                src.untyped_storage().data_ptr(), dst.untyped_storage().data_ptr()
+            )
+            self.assertNotEqual(
+                src.untyped_storage().data_ptr(), pages.untyped_storage().data_ptr()
+            )
+            self.assertNotEqual(
+                dst.untyped_storage().data_ptr(), pages.untyped_storage().data_ptr()
+            )
+            for tensor in (src, dst, pages):
+                self.assertEqual(tensor.storage_offset(), 0)
+                self.assertEqual(
+                    tensor.untyped_storage().nbytes(),
+                    tensor.numel() * tensor.element_size(),
+                )
+            self.assertEqual(src.tolist(), [131, 128, 131, 136])
+            self.assertEqual(pages.tolist(), [18, 21])
+            cache.fill_(777)
+            newer = gather_commit_slots(cache, index, index, index[:0], 7)
+            newer[0].fill_(0)
+            for actual, expected in zip((src, dst, pages), snapshot):
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_commit_empty_and_invalid_metadata(self):
+        empty = torch.empty(0, dtype=torch.int64)
+        outputs = gather_commit_slots(empty, empty, empty, empty, 128)
+        self.assertTrue(all(t.numel() == 0 for t in outputs))
+        for page in (0, -1):
+            with self.assertRaises(RuntimeError):
+                gather_commit_slots(empty, empty, empty, empty, page)
+        with self.assertRaises(RuntimeError):
+            gather_commit_slots(torch.arange(4), torch.tensor([0]), empty, empty, 4)
+
+    def test_commit_release_single_page_storage_regression(self):
+        for dtype in (torch.int32, torch.int64):
+            for n, f in ((0, 0), (0, 3), (1, 0), (1, 1), (6, 1), (6, 3), (513, 3)):
+                cache = (torch.arange(2048, dtype=dtype) // 2 * 128)[::2]
+                index = torch.arange(n)
+                src, dst, pages = gather_commit_slots(
+                    cache,
+                    index,
+                    index,
+                    torch.tensor([7, 1, 4][:f], dtype=torch.int64),
+                    128,
+                )
+                for tensor in (src, dst, pages):
+                    self.assertEqual(tensor.storage_offset(), 0)
+                    self.assertEqual(
+                        tensor.untyped_storage().nbytes(), tensor.numel() * 8
+                    )
+                if (n, f) == (6, 1):
+                    self.assertEqual(pages.untyped_storage().nbytes(), 8)
+                for need_sort in (False, True):
+                    holder = SimpleNamespace(
+                        is_not_in_free_group=True,
+                        need_sort=need_sort,
+                        free_pages=torch.tensor([11]),
+                        release_pages=torch.tensor([13]),
+                    )
+                    apply_free_unique_pages(holder, pages)
+                    expected = sorted([7, 1, 4][:f])
+                    self.assertEqual(
+                        holder.free_pages.tolist(),
+                        expected + [11] if not need_sort else [11],
+                    )
+                    self.assertEqual(
+                        holder.release_pages.tolist(),
+                        expected + [13] if need_sort else [13],
+                    )
+
+    def test_sort_failure_does_not_publish_released_pages(self):
+        holder = SimpleNamespace(
+            is_not_in_free_group=True,
+            need_sort=False,
+            free_pages=torch.tensor([11]),
+            release_pages=torch.tensor([13]),
+        )
+        pages = gather_commit_slots(
+            torch.arange(15) + 248,
+            torch.arange(6),
+            torch.arange(6),
+            torch.tensor([8]),
+            128,
+        )[2]
+        failure = RuntimeError("sort failed")
+        with patch("torch.sort", side_effect=failure) as sort:
+            with self.assertRaises(RuntimeError) as caught:
+                apply_free_unique_pages(holder, pages)
+            self.assertIs(caught.exception, failure)
+            sort.assert_called_once_with(pages)
+        self.assertEqual(holder.free_pages.tolist(), [11])
+        self.assertEqual(holder.release_pages.tolist(), [13])
+
 
 class FixedAcceptSourceTest(CustomTestCase):
     def test_verify_keeps_the_two_exits_and_allocator_does_not_read_back(self):
         eagle = (_REPO / "python/sglang/srt/speculative/eagle_info.py").read_text()
         worker = (
-            _REPO / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py"
         ).read_text()
         alloc = (
             _REPO / "python/sglang/srt/hardware_backend/npu/allocator_npu.py"
@@ -1026,9 +1209,7 @@ class FixedAcceptMultimodalAdmitTest(CustomTestCase):
 
         text_only = [_Req(), _Req()]
         self.assertIsNone(
-            multimodal_accept_reject_reason(
-                SimpleNamespace(reqs=text_only), bs=2
-            )
+            multimodal_accept_reject_reason(SimpleNamespace(reqs=text_only), bs=2)
         )
 
     def test_rejections_leave_requests_and_workspace_unchanged(self):
@@ -1151,7 +1332,9 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
         path = max(len(row) for row in rows)
         image = _mm_input(torch.tensor([[5]]), "image", features=True)
         video = _mm_input(torch.tensor([[-2]]), "video", features=True)
-        mm_rows = [None if i % 2 == 0 else (image if i == 1 else video) for i in range(bs)]
+        mm_rows = [
+            None if i % 2 == 0 else (image if i == 1 else video) for i in range(bs)
+        ]
         if bs == 1:
             mm_rows = [image]
         base_reqs = []
@@ -1190,8 +1373,16 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
             2, 1, pages, page_size, 1, 1
         )
         fast_kv = ref_kv.clone()
-        src_slots = cache[torch.tensor(src_index, dtype=torch.int64)] if src_index else torch.empty(0, dtype=torch.int64)
-        tgt_slots = cache[torch.tensor(tgt_index, dtype=torch.int64)] if tgt_index else torch.empty(0, dtype=torch.int64)
+        src_slots = (
+            cache[torch.tensor(src_index, dtype=torch.int64)]
+            if src_index
+            else torch.empty(0, dtype=torch.int64)
+        )
+        tgt_slots = (
+            cache[torch.tensor(tgt_index, dtype=torch.int64)]
+            if tgt_index
+            else torch.empty(0, dtype=torch.int64)
+        )
         if src_slots.numel():
             flat = ref_kv.view(2, 1, -1, 1, 1)
             staged = flat.index_select(2, src_slots).clone()
@@ -1226,11 +1417,20 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
             device=torch.device("cpu"),
             topk=2,
             spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
-            model_config=SimpleNamespace(think_end_id=None, hidden_size=4, dtype=torch.float32),
+            model_config=SimpleNamespace(
+                think_end_id=None, hidden_size=4, dtype=torch.float32
+            ),
             multimodal_inputs=list(mm_rows),
         )
         result = state.finalize(
-            batch, SimpleNamespace(), page_size, 2, alloc, accept_index, predict, accept_length
+            batch,
+            SimpleNamespace(),
+            page_size,
+            2,
+            alloc,
+            accept_index,
+            predict,
+            accept_length,
         )
         self.assertEqual(
             [req.output_ids for req in base_reqs],
@@ -1245,7 +1445,9 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
             [req.spec_accepted_tokens for req in base_reqs],
             [req.spec_accepted_tokens for req in ref_reqs],
         )
-        self.assertEqual(result.accept_length_per_req_cpu, [count - 1 for count in accepted])
+        self.assertEqual(
+            result.accept_length_per_req_cpu, [count - 1 for count in accepted]
+        )
         self.assertEqual(batch.seq_lens.tolist(), ref_seq.tolist())
         self.assertEqual(batch.seq_lens_cpu.tolist(), ref_seq.tolist())
         self.assertEqual(
@@ -1355,7 +1557,9 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
                 req_pool_indices=torch.tensor([pool]),
                 device=torch.device("cpu"),
                 spec_algorithm=None,
-                model_config=SimpleNamespace(think_end_id=None, hidden_size=1, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    think_end_id=None, hidden_size=1, dtype=torch.float32
+                ),
             )
             return state.finalize(
                 batch, None, 4, 2, alloc, accept_index, predict, accept_length
@@ -1416,7 +1620,10 @@ class FixedAcceptMultimodalFinalizeTest(CustomTestCase):
 class FixedAcceptMultimodalPositionTest(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        namespace = {"torch": torch, "_has_foreach_copy": hasattr(torch, "_foreach_copy_")}
+        namespace = {
+            "torch": torch,
+            "_has_foreach_copy": hasattr(torch, "_foreach_copy_"),
+        }
         graph = _load_functions(
             _REPO / "python/sglang/srt/model_executor/cuda_graph_runner.py",
             ["_grouped_foreach_copy_", "populate_from_forward_batch"],
@@ -1473,9 +1680,7 @@ class FixedAcceptMultimodalPositionTest(CustomTestCase):
         text_positions = torch.tensor([[10, 11]], dtype=torch.int64)
         image = _mm_input(torch.tensor([[5]]), "image")
         video = _mm_input(torch.tensor([[-2]]), "video")
-        stored = torch.tensor(
-            [[0, 1, 8], [0, 2, 8], [0, 3, 8]], dtype=torch.int64
-        )
+        stored = torch.tensor([[0, 1, 8], [0, 2, 8], [0, 3, 8]], dtype=torch.int64)
         video.mrope_positions = stored
         v1_video = _mm_copy(video)
         v1_video.mrope_positions = stored.clone()
@@ -1512,7 +1717,9 @@ class FixedAcceptMultimodalPositionTest(CustomTestCase):
             maybe_wait_verify_done=lambda: None,
         )
         self.prod["filter_batch"](schedule)
-        self.assertEqual([req.multimodal_inputs for req in schedule.reqs], [None, video])
+        self.assertEqual(
+            [req.multimodal_inputs for req in schedule.reqs], [None, video]
+        )
         survivor_rows = torch.tensor([[10, 11], [30, 31]], dtype=torch.int64)
         survived = self._positions(survivor_rows, [None, video])
         expected = torch.cat((original[:, 0:2], original[:, 4:6]), dim=1)
@@ -1583,7 +1790,9 @@ class FixedAcceptMultimodalPositionTest(CustomTestCase):
         self.assertEqual(buffers.mrope_positions[:, :6].tolist(), round1.tolist())
         replay(round2, 1, 2)
         self.assertEqual(buffers.mrope_positions[:, :2].tolist(), round2.tolist())
-        self.assertEqual(buffers.mrope_positions[:, 2:6].tolist(), round1[:, 2:].tolist())
+        self.assertEqual(
+            buffers.mrope_positions[:, 2:6].tolist(), round1[:, 2:].tolist()
+        )
         self.assertTrue(torch.all(buffers.mrope_positions[:, 6:] == -99))
 
     def test_tail_graph_zeros_padding_before_copy(self):
