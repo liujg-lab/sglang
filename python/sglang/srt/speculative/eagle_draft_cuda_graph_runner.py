@@ -244,6 +244,12 @@ class EAGLEDraftCudaGraphRunner:
     def capture(self):
         prepare = getattr(self.eagle_worker, "prepare_tree_kv_graph", None)
         self._sr_kv_workspace = prepare(self.max_bs) if callable(prepare) else None
+        prepare_identity = getattr(
+            self.eagle_worker, "prepare_identity_remap_graph", None
+        )
+        self._sr_identity_workspace = (
+            prepare_identity(self.max_bs) if callable(prepare_identity) else None
+        )
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(
@@ -372,17 +378,27 @@ class EAGLEDraftCudaGraphRunner:
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
             workspace = getattr(self, "_sr_kv_workspace", None)
-            scope = (
+            identity_ws = getattr(self, "_sr_identity_workspace", None)
+            kv_scope = (
                 workspace.capture_scope() if workspace is not None else nullcontext()
             )
-            with scope:
+            identity_scope = (
+                identity_ws.capture_scope()
+                if identity_ws is not None
+                else nullcontext()
+            )
+            with kv_scope, identity_scope:
                 if workspace is not None:
                     self.eagle_worker._capture_tree_kv_workspace = workspace
+                if identity_ws is not None:
+                    self.eagle_worker._capture_identity_workspace = identity_ws
                 try:
                     ret = self.eagle_worker.draft_forward(forward_batch)
                 finally:
                     if workspace is not None:
                         self.eagle_worker._capture_tree_kv_workspace = None
+                    if identity_ws is not None:
+                        self.eagle_worker._capture_identity_workspace = None
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -407,11 +423,14 @@ class EAGLEDraftCudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         workspace = getattr(self, "_sr_kv_workspace", None)
+        identity_ws = getattr(self, "_sr_identity_workspace", None)
         if workspace is not None:
             workspace.check()
             workspace.metrics = getattr(
                 getattr(self.eagle_worker, "scheduler", None), "_sr_round_metrics", None
             )
+        if identity_ws is not None:
+            identity_ws.check()
         self.deepep_adapter.replay()
         buffers = self.buffers
 
@@ -491,9 +510,14 @@ class EAGLEDraftCudaGraphRunner:
                 KVMoveSubmittedError,
             )
 
-            if isinstance(exc, NpuGraphPreparationError) or workspace is None:
+            if isinstance(exc, NpuGraphPreparationError):
                 raise
-            workspace._poison()
+            if workspace is None and identity_ws is None:
+                raise
+            if workspace is not None:
+                workspace._poison()
+            if identity_ws is not None:
+                identity_ws.poison()
             if isinstance(exc, KVMoveSubmittedError):
                 raise
             raise KVMoveSubmittedError(

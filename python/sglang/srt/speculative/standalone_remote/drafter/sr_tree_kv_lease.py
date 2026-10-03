@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -17,6 +18,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     classify_prefix_alignment,
     find_fork_point,
 )
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 
 logger = logging.getLogger(__name__)
 
@@ -231,19 +233,280 @@ def later_forward_node_ids(tree_info_parents: torch.Tensor) -> torch.Tensor:
     return tree_info_parents.reshape(-1).to(dtype=torch.int64)
 
 
+class IdentityRemapSubmittedError(KVMoveSubmittedError):
+    """Identity remap was submitted; retain scratch and do not retry the move."""
+
+
+def _identity_stream(device):
+    if device.type == "cpu":
+        return None
+    return torch.get_device_module(device.type).current_stream(device)
+
+
+def _identity_stream_key(device):
+    stream = _identity_stream(device)
+    if stream is None:
+        return None
+    for name in ("stream_id", "cuda_stream", "npu_stream"):
+        value = getattr(stream, name, None)
+        if value is not None:
+            return int(value)
+    raise RuntimeError("backend stream does not expose a stable identity")
+
+
+def _identity_capturing(device):
+    if device.type == "cpu":
+        return False
+    fn = getattr(
+        torch.get_device_module(device.type), "is_current_stream_capturing", None
+    )
+    return bool(fn and fn())
+
+
+def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if left.numel() == 0 or right.numel() == 0:
+        return False
+    return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+
+
+def _validate_identity_remap(slot_node_ids, parent_rows, depth, scratch) -> int:
+    if slot_node_ids.ndim != 2 or scratch.ndim != 2:
+        raise RuntimeError("identity table and scratch must be rank 2")
+    if slot_node_ids.dtype != torch.int64 or scratch.dtype != torch.int64:
+        raise RuntimeError("identity table and scratch must be int64")
+    if slot_node_ids.device != scratch.device:
+        raise RuntimeError("identity scratch must be device-local")
+    if (
+        parent_rows.ndim != 1
+        or parent_rows.dtype not in (torch.int32, torch.int64)
+        or parent_rows.device != slot_node_ids.device
+    ):
+        raise RuntimeError("identity parents must be device-local integers")
+    rows = int(parent_rows.numel())
+    if depth > int(slot_node_ids.shape[0]) or depth > int(scratch.shape[0]):
+        raise RuntimeError("identity remap depth exceeds prepared capacity")
+    if rows > int(slot_node_ids.shape[1]) or rows > int(scratch.shape[1]):
+        raise RuntimeError("identity remap rows exceed prepared capacity")
+    if rows == 0:
+        return 0
+    if _same_storage(slot_node_ids, scratch):
+        raise RuntimeError("identity scratch aliases the identity table")
+    if slot_node_ids.device.type == "cpu":
+        idx = parent_rows.to(dtype=torch.int64)
+        if bool(((idx < 0) | (idx >= rows)).any()):
+            raise IndexError("identity parent outside rows")
+    return rows
+
+
+def _execute_identity_remap(slot_node_ids, parent_rows, depth, scratch) -> None:
+    """One gather of every historical row, then one scatter back into the table."""
+    rows = int(parent_rows.numel())
+    depth = int(depth)
+    if rows == 0 or depth <= 0:
+        return
+    if slot_node_ids.device.type == "cpu":
+        idx = parent_rows.to(dtype=torch.int64).reshape(-1).contiguous()
+        src = slot_node_ids.narrow(0, 0, depth).narrow(1, 0, rows)
+        out = scratch.narrow(0, 0, depth).narrow(1, 0, rows)
+        if out.is_contiguous():
+            torch.index_select(src, 1, idx, out=out)
+        else:
+            out.copy_(torch.index_select(src, 1, idx))
+        src.copy_(out)
+        return
+    from sglang.srt.speculative.standalone_remote.drafter.sr_identity_remap_kernels import (
+        remap_identity,
+    )
+
+    remap_identity(slot_node_ids, scratch, parent_rows, depth, rows)
+
+
 def remap_slot_node_ids(
     slot_node_ids: torch.Tensor,
     parent_rows: torch.Tensor,
     n_prev_steps: int,
-    tmp: torch.Tensor,
+    scratch: torch.Tensor,
 ) -> None:
-    """Gather historical IDs with a temp buffer; never overwrite in place."""
-    rows = int(parent_rows.shape[0])
-    idx = parent_rows.to(dtype=torch.int64)
-    for step in range(int(n_prev_steps)):
-        src = slot_node_ids[step, :rows]
-        tmp[:rows].copy_(src.index_select(0, idx))
-        slot_node_ids[step, :rows].copy_(tmp[:rows])
+    """Gather every historical identity, then scatter it back.
+
+    ``scratch`` is ``[depth_capacity, row_capacity]``. Only ``[:depth, :rows]``
+    is written. Padding columns past ``rows`` stay untouched, and there is no
+    active-row mask.
+    """
+    depth = int(n_prev_steps)
+    if depth <= 0:
+        return
+    _validate_identity_remap(slot_node_ids, parent_rows, depth, scratch)
+    _execute_identity_remap(slot_node_ids, parent_rows, depth, scratch)
+
+
+class IdentityRemapWorkspace:
+    """Draft-owned identity scratch. Graph and eager domains do not share it."""
+
+    def __init__(
+        self, device, depth_capacity, row_capacity, *, graph=False, domain="tree_eager"
+    ):
+        depth_capacity = int(depth_capacity)
+        row_capacity = int(row_capacity)
+        if depth_capacity < 1 or row_capacity < 1:
+            raise ValueError("identity remap capacity must be positive")
+        self.device = torch.device(device)
+        self.depth_capacity = depth_capacity
+        self.row_capacity = row_capacity
+        self.graph = bool(graph)
+        self.domain = domain
+        self.frozen = False
+        self.unresolved = False
+        self._inside_capture = False
+        self._used = False
+        self._warmed = False
+        self._warmup_hold = None
+        self.hold = None
+        self._retired = []
+        self.scratch = self._empty_scratch(row_capacity)
+        self._stream_key = _identity_stream_key(self.device)
+
+    def _empty_scratch(self, rows: int) -> torch.Tensor:
+        return torch.empty(
+            (self.depth_capacity, int(rows)),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def poison(self) -> None:
+        self.unresolved = True
+
+    def check(self, *, check_stream=True) -> None:
+        if self.unresolved:
+            raise IdentityRemapSubmittedError(
+                "identity remap completion is unresolved"
+            )
+        if (
+            check_stream
+            and not self._inside_capture
+            and self.device.type != "cpu"
+            and _identity_stream_key(self.device) != self._stream_key
+        ):
+            raise RuntimeError(
+                "identity workspace belongs to another execution stream"
+            )
+
+    def _record_event(self):
+        try:
+            event = torch.get_device_module(self.device.type).Event()
+            event.record(_identity_stream(self.device))
+            return event
+        except BaseException as exc:
+            self.poison()
+            raise IdentityRemapSubmittedError(
+                "cannot confirm identity scratch consumer completion"
+            ) from exc
+
+    def _collect_retired(self) -> None:
+        kept = []
+        try:
+            for item in self._retired:
+                if not item[0].query():
+                    kept.append(item)
+        except BaseException as exc:
+            self.poison()
+            raise IdentityRemapSubmittedError(
+                "identity scratch retirement query failed"
+            ) from exc
+        self._retired = kept
+
+    def reserve_rows(self, rows: int) -> "IdentityRemapWorkspace":
+        self.check()
+        rows = int(rows)
+        if rows < 0:
+            raise ValueError("negative identity row capacity")
+        if not self._inside_capture and not _identity_capturing(self.device):
+            self._collect_retired()
+        if rows <= self.row_capacity:
+            return self
+        if (
+            self.graph
+            or self.frozen
+            or self._inside_capture
+            or _identity_capturing(self.device)
+        ):
+            raise RuntimeError(
+                "identity scratch cannot grow during capture or after graph binding"
+            )
+        cap = 1 << (rows - 1).bit_length()
+        new = self._empty_scratch(cap)
+        if self._used and self.device.type != "cpu":
+            event = self._record_event()
+            self._retired.append((event, self.scratch, self.hold))
+        self.scratch = new
+        self.row_capacity = cap
+        return self
+
+    @contextmanager
+    def capture_scope(self):
+        if not self.graph:
+            raise RuntimeError("eager identity workspace cannot bind a graph")
+        self.check(check_stream=False)
+        self._inside_capture = True
+        try:
+            yield self
+        finally:
+            self._inside_capture = False
+            self.frozen = True
+
+    def warm(self) -> None:
+        """Compile the device kernel on private storage before capture."""
+        self.check()
+        if self._warmed or self.device.type == "cpu":
+            self._warmed = True
+            return
+        private_ids = torch.empty((2, 2), dtype=torch.int64, device=self.device)
+        private_scratch = torch.empty((2, 2), dtype=torch.int64, device=self.device)
+        parents = torch.tensor([1, 0], dtype=torch.int64, device=self.device)
+        private_ids.copy_(
+            torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device=self.device)
+        )
+        self._warmup_hold = (private_ids, private_scratch, parents)
+        try:
+            _execute_identity_remap(private_ids, parents, 2, private_scratch)
+            torch.get_device_module(self.device.type).synchronize()
+        except BaseException as exc:
+            self.poison()
+            raise IdentityRemapSubmittedError(
+                "identity remap warmup failed"
+            ) from exc
+        self._warmup_hold = None
+        self._warmed = True
+
+    def submitted(self, inputs, run) -> None:
+        self.hold = (inputs, self.scratch, self._warmup_hold)
+        self._used = True
+        try:
+            stream = _identity_stream(self.device)
+            if stream is not None and not self._inside_capture:
+                for tensor in inputs:
+                    if torch.is_tensor(tensor):
+                        tensor.record_stream(stream)
+                self.scratch.record_stream(stream)
+            run()
+        except BaseException as exc:
+            self.poison()
+            raise IdentityRemapSubmittedError(
+                "identity gather/scatter failed after submission; refuse retry"
+            ) from exc
+
+    def remap(self, slot_node_ids, parent_rows, depth) -> None:
+        self.check()
+        depth = int(depth)
+        if depth <= 0:
+            return
+        _validate_identity_remap(slot_node_ids, parent_rows, depth, self.scratch)
+        self.submitted(
+            (slot_node_ids, parent_rows),
+            lambda: _execute_identity_remap(
+                slot_node_ids, parent_rows, depth, self.scratch
+            ),
+        )
 
 
 def lookup_candidate_slots(

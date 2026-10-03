@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    IdentityRemapSubmittedError,
+    IdentityRemapWorkspace,
     LEASE_PREFIX_WINDOW,
     MIN_TREE_KV_REUSE_DEPTH,
     SRAlignResult,
@@ -31,6 +34,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     tree_raw_span_len,
     validate_lease_commit,
 )
+from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftReply,
     SRDraftRequest,
@@ -130,7 +134,7 @@ class TestIdentityAndLookup(unittest.TestCase):
         topk, steps, bs = 3, 4, 1
         ids = torch.full((steps, bs * topk), -1, dtype=torch.int64)
         phys = torch.arange(steps * bs * topk, dtype=torch.int64).reshape(steps, bs * topk)
-        tmp = torch.empty(bs * topk, dtype=torch.int64)
+        tmp = torch.empty((steps, bs * topk), dtype=torch.int64)
         ids[0].copy_(first_forward_node_ids(topk, bs))
         parent_rows = torch.tensor([1, 1, 2])
         remap_slot_node_ids(ids, parent_rows, 1, tmp)
@@ -147,7 +151,7 @@ class TestIdentityAndLookup(unittest.TestCase):
         topk, steps = 3, 3
         kv = torch.full((steps, topk), -1.0)
         ids = torch.full((steps, topk), -1, dtype=torch.int64)
-        tmp = torch.empty(topk, dtype=torch.int64)
+        tmp = torch.empty((steps, topk), dtype=torch.int64)
         ids[0] = torch.arange(topk)
         kv[0] = torch.tensor([100.0, 101.0, 102.0])
         parent_rows = torch.tensor([1, 1, 2])
@@ -184,6 +188,132 @@ class TestIdentityAndLookup(unittest.TestCase):
         ids = torch.arange(8, dtype=torch.int64).reshape(2, 4)
         ids.fill_(-1)
         self.assertTrue(bool((ids == -1).all()))
+
+
+def _identity_gold(ids, parents, depth):
+    out = ids.clone()
+    rows = int(parents.numel())
+    idx = parents.to(dtype=torch.int64).reshape(-1)
+    for step in range(int(depth)):
+        out[step, :rows] = out[step, :rows].index_select(0, idx)
+    return out
+
+
+class TestIdentityRemap(unittest.TestCase):
+    def test_swap_cycle_and_duplicate_parents_match_snapshot(self):
+        cases = [
+            torch.tensor([1, 0]),
+            torch.tensor([1, 2, 0]),
+            torch.tensor([0, 0, 0]),
+            torch.tensor([1, 0, 1]),
+            torch.tensor([2, 2, 0, 1]),
+        ]
+        ids = torch.arange(3 * 6, dtype=torch.int64).reshape(3, 6)
+        for parents in cases:
+            rows = int(parents.numel())
+            table = ids.clone()
+            tail = table[:, rows:].clone()
+            below = table[2:].clone()
+            scratch = torch.empty((3, 6), dtype=torch.int64)
+            remap_slot_node_ids(table, parents, 2, scratch)
+            self.assertEqual(table[:, :rows].tolist(), _identity_gold(ids, parents, 2)[:, :rows].tolist())
+            self.assertEqual(table[:, rows:].tolist(), tail.tolist())
+            self.assertEqual(table[2:].tolist(), below.tolist())
+
+    def test_one_index_select_covers_every_depth(self):
+        ids = torch.arange(12, dtype=torch.int64).reshape(3, 4)
+        scratch = torch.empty_like(ids)
+        parents = torch.tensor([1, 0, 3, 2])
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease.torch.index_select",
+            wraps=torch.index_select,
+        ) as spy:
+            remap_slot_node_ids(ids, parents, 3, scratch)
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(ids.tolist(), _identity_gold(torch.arange(12).reshape(3, 4), parents, 3).tolist())
+
+    def test_wide_stride_and_noncontiguous_int32_parents(self):
+        backing = torch.arange(80, dtype=torch.int64)
+        ids = backing.as_strided((3, 5), (10, 1))
+        before_gap = backing.clone()
+        parent_backing = torch.tensor([3, 9, 1, 9, 0, 9, 2], dtype=torch.int32)
+        parents = parent_backing.as_strided((4,), (2,))
+        scratch = torch.empty((4, 8), dtype=torch.int64)
+        remap_slot_node_ids(ids, parents, 2, scratch)
+        self.assertEqual(parents.tolist(), [3, 1, 0, 2])
+        self.assertEqual(
+            ids[:, :4].tolist(),
+            _identity_gold(before_gap.as_strided((3, 5), (10, 1)), parents, 2)[:, :4].tolist(),
+        )
+        for step in range(3):
+            self.assertEqual(backing[step * 10 + 4 : step * 10 + 10].tolist(), before_gap[step * 10 + 4 : step * 10 + 10].tolist())
+        self.assertEqual(backing[30:].tolist(), before_gap[30:].tolist())
+
+    def test_depth_zero_alias_and_bounds(self):
+        ids = torch.arange(6, dtype=torch.int64).reshape(2, 3)
+        scratch = torch.empty((2, 3), dtype=torch.int64)
+        before = ids.clone()
+        remap_slot_node_ids(ids, torch.tensor([2, 0, 1]), 0, scratch)
+        self.assertEqual(ids.tolist(), before.tolist())
+        with self.assertRaisesRegex(RuntimeError, "aliases"):
+            remap_slot_node_ids(ids, torch.tensor([0, 1, 2]), 1, ids)
+        with self.assertRaises(IndexError):
+            remap_slot_node_ids(ids, torch.tensor([0, 3]), 1, scratch)
+        self.assertEqual(ids.tolist(), before.tolist())
+        with self.assertRaisesRegex(RuntimeError, "depth exceeds"):
+            remap_slot_node_ids(ids, torch.tensor([0, 1]), 3, scratch)
+
+    def test_workspace_domains_freeze_and_submitted_failure(self):
+        eager = IdentityRemapWorkspace("cpu", 5, 2, graph=False, domain="tree_eager")
+        graph = IdentityRemapWorkspace("cpu", 5, 6, graph=True, domain="tree_graph")
+        self.assertNotEqual(eager.scratch.data_ptr(), graph.scratch.data_ptr())
+        self.assertIsInstance(IdentityRemapSubmittedError("x"), KVMoveSubmittedError)
+        eager.reserve_rows(3)
+        self.assertEqual(tuple(eager.scratch.shape), (5, 4))
+        graph.reserve_rows(6)
+        with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+            graph.reserve_rows(7)
+        eager.frozen = True
+        with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+            eager.reserve_rows(8)
+        with self.assertRaisesRegex(RuntimeError, "cannot bind a graph"):
+            with eager.capture_scope():
+                pass
+        with graph.capture_scope():
+            self.assertTrue(graph._inside_capture)
+        self.assertTrue(graph.frozen)
+        ids = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]], dtype=torch.int64)
+        parents = torch.tensor([1, 0, 1])
+        scratch = torch.empty((2, 4), dtype=torch.int64)
+        ws = IdentityRemapWorkspace("cpu", 2, 4, graph=False, domain="tree_eager")
+        ws.remap(ids, parents, 2)
+        self.assertFalse(ws.unresolved)
+        self.assertEqual(ids[:, :3].tolist(), [[2, 1, 2], [5, 4, 5]])
+        with self.assertRaises(IndexError):
+            ws.remap(ids, torch.tensor([0, 9]), 1)
+        self.assertFalse(ws.unresolved)
+        def fail():
+            raise RuntimeError("launch failed")
+
+        with self.assertRaises(IdentityRemapSubmittedError):
+            ws.submitted((ids,), fail)
+        self.assertTrue(ws.unresolved)
+        with self.assertRaises(IdentityRemapSubmittedError):
+            ws.remap(ids, parents, 1)
+
+    def test_capture_skips_stream_check_and_foreign_stream_fails(self):
+        ws = IdentityRemapWorkspace("cpu", 2, 2, graph=True, domain="tree_graph")
+        ws.device = type("Dev", (), {"type": "cuda"})()
+        ws._stream_key = 1
+        ws._inside_capture = True
+        ws.check()
+        ws._inside_capture = False
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease._identity_stream_key",
+            return_value=2,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "another execution stream"):
+                ws.check()
 
 
 class TestLeaseLifecycle(unittest.TestCase):

@@ -3218,7 +3218,7 @@ class TestBatchedKvCopy(unittest.TestCase):
     def _drafter(self, pool, copies, node_ids=None):
         from sglang.srt.speculative.standalone_remote import sr_kv_copy as kv_copy
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
-            remap_slot_node_ids,
+            IdentityRemapWorkspace,
         )
 
         def spy_remap(workspace, loc, parents, depth, active=None):
@@ -3236,7 +3236,6 @@ class TestBatchedKvCopy(unittest.TestCase):
             ["_remap_tree_kv_to_parents"],
             dict(
                 torch=torch,
-                remap_slot_node_ids=remap_slot_node_ids,
                 prepare_kv_move=kv_copy.prepare_kv_move,
                 remap_tree_kv_=spy_remap,
             ),
@@ -3249,7 +3248,9 @@ class TestBatchedKvCopy(unittest.TestCase):
                 if node_ids is None
                 else node_ids.clone()
             ),
-            _slot_node_id_tmp=torch.empty(8, dtype=torch.int64),
+            _identity_eager=IdentityRemapWorkspace(
+                "cpu", 4, 8, graph=False, domain="tree_eager"
+            ),
         )
         obj._remap_tree_kv_to_parents = MethodType(
             fns["_remap_tree_kv_to_parents"], obj
@@ -3370,6 +3371,62 @@ class TestBatchedKvCopy(unittest.TestCase):
         parent2 = torch.tensor([0, 1], dtype=torch.int64)
         drafter._remap_tree_kv_to_parents(loc_nc, parent2, 2)
         self.assertEqual(copies[0][0].tolist(), [5, 6, 7, 8])
+
+    def test_identity_table_stays_put_after_graph_bind(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            IdentityRemapWorkspace,
+            first_forward_node_ids,
+        )
+
+        fns = load_functions(
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+            [
+                "_identity_storage_key",
+                "_freeze_identity_table",
+                "_check_identity_table",
+                "_ensure_identity_capacity",
+            ],
+            dict(torch=torch, first_forward_node_ids=first_forward_node_ids),
+            class_name="SRTreeDrafter",
+        )
+        table = torch.full((4, 4), -1, dtype=torch.int64)
+        eager = IdentityRemapWorkspace("cpu", 4, 4, graph=False, domain="tree_eager")
+        obj = NS(
+            speculative_num_steps=4,
+            topk=2,
+            _slot_node_ids=table,
+            _identity_table_frozen=False,
+            _identity_table_key=None,
+            _identity_eager=eager,
+            _capture_identity_workspace=None,
+            _identity_rows=4,
+            device=torch.device("cpu"),
+        )
+        for name, fn in fns.items():
+            setattr(obj, name, MethodType(fn, obj))
+        obj._ensure_identity_capacity(4)
+        self.assertEqual(obj._slot_node_ids.data_ptr(), table.data_ptr())
+        obj._ensure_identity_capacity(6)
+        self.assertEqual(tuple(obj._slot_node_ids.shape), (4, 6))
+        self.assertGreaterEqual(eager.row_capacity, 6)
+        self.assertEqual(int(eager.scratch.shape[0]), 4)
+        grown = obj._slot_node_ids
+        obj._freeze_identity_table()
+        with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+            obj._ensure_identity_capacity(9)
+        self.assertEqual(obj._slot_node_ids.data_ptr(), grown.data_ptr())
+        obj._slot_node_ids = torch.full((4, 6), -1, dtype=torch.int64)
+        with self.assertRaisesRegex(RuntimeError, "storage was replaced"):
+            obj._ensure_identity_capacity(6)
+        obj._identity_table_frozen = False
+        obj._slot_node_ids = grown
+        obj._capture_identity_workspace = IdentityRemapWorkspace(
+            "cpu", 4, 8, graph=True, domain="tree_graph"
+        )
+        with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+            obj._ensure_identity_capacity(10)
+        self.assertEqual(obj._slot_node_ids.data_ptr(), grown.data_ptr())
 
     def test_seq_lens_sum_from_cpu_and_mismatch(self):
         from sglang.srt.speculative.standalone_remote.sr_align import (

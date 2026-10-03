@@ -41,6 +41,7 @@ from sglang.srt.speculative.spec_utils import (
     split_draft_cache_locs,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+    IdentityRemapWorkspace,
     SRTreeKVLease,
     first_forward_node_ids,
     immediate_free_pages,
@@ -49,7 +50,6 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     lookup_candidate_slots,
     plan_paged_tree_layout,
     prefix_window_tokens,
-    remap_slot_node_ids,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     ALLOC_LEASE,
@@ -215,8 +215,16 @@ class SRTreeDrafter:
             dtype=torch.int64,
             device=id_dev,
         )
-        self._slot_node_id_tmp = torch.empty(
-            (self._identity_rows,), dtype=torch.int64, device=id_dev
+        self._identity_table_frozen = False
+        self._identity_table_key = None
+        self._identity_graph = None
+        self._active_identity_workspace = None
+        self._identity_eager = IdentityRemapWorkspace(
+            id_dev,
+            self.speculative_num_steps,
+            self._identity_rows,
+            graph=False,
+            domain="tree_eager",
         )
         self._step0_node_ids = first_forward_node_ids(
             self.topk, max_bs, device=id_dev
@@ -237,16 +245,48 @@ class SRTreeDrafter:
     def _lease_supported(self) -> bool:
         return self.page_size > 1 and self.topk > 1
 
+    def _identity_storage_key(self):
+        table = self._slot_node_ids
+        return (
+            table.data_ptr(),
+            tuple(table.shape),
+            tuple(table.stride()),
+            table.dtype,
+            table.device,
+        )
+
+    def _freeze_identity_table(self) -> None:
+        self._identity_table_frozen = True
+        self._identity_table_key = self._identity_storage_key()
+
+    def _check_identity_table(self) -> None:
+        if not getattr(self, "_identity_table_frozen", False):
+            return
+        if self._identity_storage_key() != self._identity_table_key:
+            raise RuntimeError(
+                "identity table storage was replaced after graph binding"
+            )
+
     def _ensure_identity_capacity(self, rows: int) -> None:
         rows = max(int(rows), 1)
-        if self._slot_node_ids is not None and self._slot_node_ids.shape[1] >= rows:
+        self._check_identity_table()
+        capturing = getattr(self, "_capture_identity_workspace", None) is not None
+        table = self._slot_node_ids
+        if table is not None and int(table.shape[1]) >= rows:
+            if not capturing:
+                self._identity_eager.reserve_rows(rows)
             return
-        device = self._slot_node_ids.device if self._slot_node_ids is not None else self.device
+        if capturing or getattr(self, "_identity_table_frozen", False):
+            raise RuntimeError(
+                "identity table cannot grow during capture or after graph binding"
+            )
+        device = table.device if table is not None else self.device
+        # Grow scratch first. A failed allocation leaves the live table in place.
+        self._identity_eager.reserve_rows(rows)
         steps = self.speculative_num_steps
         self._slot_node_ids = torch.full(
             (steps, rows), -1, dtype=torch.int64, device=device
         )
-        self._slot_node_id_tmp = torch.empty((rows,), dtype=torch.int64, device=device)
         max_bs = max((rows + self.topk - 1) // max(self.topk, 1), 1)
         self._step0_node_ids = first_forward_node_ids(self.topk, max_bs, device=device)
         self._identity_rows = rows
@@ -360,6 +400,8 @@ class SRTreeDrafter:
                 self.cuda_graph_runner = None
             else:
                 self.tree_graph_capture_succeeded = True
+                if getattr(self, "_identity_graph", None) is not None:
+                    self._freeze_identity_table()
             logger.info("[SR] Capture tree draft graph end.")
         except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
             raise
@@ -1700,6 +1742,11 @@ class SRTreeDrafter:
         self._active_tree_kv_workspace = getattr(
             self, "_capture_tree_kv_workspace", None
         )
+        self._active_identity_workspace = getattr(
+            self, "_capture_identity_workspace", None
+        )
+        if self._active_identity_workspace is None:
+            self._active_identity_workspace = self._identity_eager
         if kv_pool is not None and self.topk > 1 and self.speculative_num_steps > 2:
             if self._active_tree_kv_workspace is None:
                 self._active_tree_kv_workspace = prepare_kv_move(
@@ -1781,6 +1828,28 @@ class SRTreeDrafter:
             graph=True,
         )
 
+    def prepare_identity_remap_graph(self, batch_cap):
+        if self.topk <= 1 or self.speculative_num_steps <= 2:
+            return None
+        rows = int(batch_cap) * int(self.topk)
+        if rows < 1:
+            return None
+        self._ensure_identity_capacity(rows)
+        workspace = getattr(self, "_identity_graph", None)
+        if workspace is None:
+            workspace = IdentityRemapWorkspace(
+                self._slot_node_ids.device,
+                int(self.speculative_num_steps),
+                rows,
+                graph=True,
+                domain="tree_graph",
+            )
+            self._identity_graph = workspace
+        else:
+            workspace.reserve_rows(rows)
+        workspace.warm()
+        return workspace
+
     def _remap_tree_kv_to_parents(
         self,
         out_cache_loc: torch.Tensor,
@@ -1792,9 +1861,15 @@ class SRTreeDrafter:
         rows = int(out_cache_loc.shape[1])
         if int(parent_rows.numel()) != rows:
             raise RuntimeError("parent_rows width must match out_cache_loc rows")
-        remap_slot_node_ids(
-            self._slot_node_ids, parent_rows, n_prev_steps, self._slot_node_id_tmp
-        )
+        check = getattr(self, "_check_identity_table", None)
+        if callable(check):
+            check()
+        workspace = getattr(self, "_active_identity_workspace", None)
+        if workspace is None:
+            workspace = getattr(self, "_identity_eager", None)
+        if workspace is None:
+            raise RuntimeError("identity remap workspace is not prepared")
+        workspace.remap(self._slot_node_ids, parent_rows, n_prev_steps)
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         if kv_pool is None:
             return

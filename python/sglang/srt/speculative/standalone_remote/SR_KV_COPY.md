@@ -96,8 +96,9 @@ the ordinary unmasked layout; masked paged remaps require the NPU kernel.
 The final candidate selection does not launch another Draft forward. Thus
 historical remap depths are `1..S-2`, and graph capacity is
 `Bcap * K * max(S-2,0)`. `K<=1` and `S<=2` need no tree scratch.
-Node-identity remapping remains a separate operation with its original
-semantics.
+Node-identity remapping is a separate two-stage gather-then-scatter on
+Draft-owned scratch. It does not read `active_rows`, and the KV remap still
+runs after it.
 
 The existing Draft CUDA graph runner prepares SR-specific scratch before
 capture; its NPU subclass uses that hook too. Tree-layout warmup still
