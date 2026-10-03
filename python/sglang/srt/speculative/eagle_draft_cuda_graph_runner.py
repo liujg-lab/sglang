@@ -175,9 +175,15 @@ class EAGLEDraftCudaGraphRunner:
         self.buffers.share_buffers()
 
         # Capture
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
         try:
             with model_capture_mode():
                 self.capture()
+        except SRTransferUnresolved:
+            raise
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"

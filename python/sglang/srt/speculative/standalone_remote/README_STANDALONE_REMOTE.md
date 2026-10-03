@@ -8,6 +8,9 @@ Draft 负责生成候选；两端可以在同机或不同服务器运行。业�
 “有适配代码”不等于所有硬件、模型组合均已验证，也不保证投机比 Target 单独解码更快。
 大小模型是常见部署方式，协议并不要求 Target 参数量一定更大。
 
+NPU Target/Draft 分页元数据融合、工作区生命周期和设备验收说明见
+[SR_PAGED_METADATA.md](SR_PAGED_METADATA.md)。
+
 ## 目录
 
 - [概览与支持矩阵](#overview)

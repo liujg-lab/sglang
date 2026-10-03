@@ -182,14 +182,46 @@ class SRTargetTreeFiaMetadata:
     q_lens_cpu: List[int]
     active_rows: torch.Tensor
     page_size: int
+    workspace: object = None
 
     @classmethod
-    def allocate(cls, bs: int, queries: int, pages: int, page_size: int, device):
+    def allocate(
+        cls,
+        bs: int,
+        queries: int,
+        pages: int,
+        page_size: int,
+        device,
+        *,
+        domain="eager",
+    ):
         page = max(int(page_size), 1)
         width = mask_width_from_pages(pages, page)
         bs = int(bs)
         queries = int(queries)
         pages = int(pages)
+        if torch.device(device).type == "npu":
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                SRPagedMetadataWorkspace,
+                empty_metadata,
+            )
+
+            md = cls(
+                empty_metadata((bs, pages), torch.int32, device),
+                empty_metadata((bs, 1, queries, width), torch.bool, device),
+                [1] * bs,
+                [queries] * bs,
+                empty_metadata((bs,), torch.bool, device),
+                page,
+            )
+            md.workspace = SRPagedMetadataWorkspace(
+                device,
+                bs,
+                3,
+                (md.block_tables, md.blocked_mask, md.active_rows),
+                domain=domain,
+            )
+            return md
         return cls(
             block_tables=torch.zeros((bs, pages), dtype=torch.int32, device=device),
             blocked_mask=torch.ones(
@@ -343,10 +375,23 @@ def fill_target_tree_fia_metadata_(
         capture_bs,
         pages,
         md.page_size,
-        table_width=table_width
-        if table_width is not None
-        else int(req_to_token.shape[1]),
+        table_width=(
+            table_width if table_width is not None else int(req_to_token.shape[1])
+        ),
     )
+    if md.block_tables.device.type == "npu":
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRTargetPagedPlan,
+            fill_target_paged_metadata_,
+        )
+
+        plan = SRTargetPagedPlan.build(
+            prefixes, capture_bs, queries, pages, md.page_size
+        )
+        fill_target_paged_metadata_(
+            md, req_to_token, req_pool_indices, custom_mask, plan, dummy_page
+        )
+        return
     _, kv_lens, q_lens = plan_target_tree_fia_lengths(
         prefixes, queries, raw_bs, capture_bs
     )
@@ -366,9 +411,7 @@ def fill_target_tree_fia_metadata_(
         md.active_rows[: int(raw_bs)] = True
 
 
-def prefix_columns_visible(
-    blocked_mask: torch.Tensor, prefixes: Sequence[int]
-) -> bool:
+def prefix_columns_visible(blocked_mask: torch.Tensor, prefixes: Sequence[int]) -> bool:
     """True when every prefix column of every query is unmasked."""
     for b, prefix in enumerate(prefixes):
         if int(prefix) <= 0:

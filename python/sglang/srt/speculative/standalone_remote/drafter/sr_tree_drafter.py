@@ -1178,13 +1178,46 @@ class SRTreeDrafter:
             )
             init_s = time.perf_counter() - t_prep
             t_paged = time.perf_counter()
+            paged_graph_selected = None
+            if (
+                getattr(self, "sr_tree_paged", False)
+                and batch.out_cache_loc.device.type == "npu"
+            ):
+                # Admission reads CPU lengths and captured geometry only. Select
+                # the final output addresses before writing any paged metadata.
+                paged_graph_selected = self._can_run_tree_graph(forward_batch)
+                runner = getattr(self, "cuda_graph_runner", None)
+                plan = (
+                    getattr(runner, "_tree_replay_plan", None)
+                    if paged_graph_selected
+                    else None
+                )
+                if plan is not None:
+                    try:
+                        runner._assert_tree_replay_graph(plan)
+                        self.draft_attn_backend._paged_graph_table_view(
+                            plan.capture_bs, plan.kv_bucket, 0
+                        )
+                        if (plan.capture_bs, plan.kv_bucket) not in getattr(
+                            self.draft_attn_backend, "_sr_paged_graph_views", {}
+                        ):
+                            raise NpuGraphPreparationError(
+                                "missing captured metadata workspace", scope="graph"
+                            )
+                    except NpuGraphPreparationError:
+                        runner._clear_tree_replay_plan()
+                        runner._last_can_run_reject = "metadata_preparation"
+                        paged_graph_selected, plan = False, None
+                        if metrics is not None:
+                            metrics.counts[
+                                "paged_metadata_draft_admission_fallback"
+                            ] += 1
+                forward_batch._sr_paged_replay_plan = plan
             if getattr(self, "sr_tree_paged", False):
                 txn.mark_copy_begin()
                 prepare = getattr(self, "_prepare_paged_tree_round", None)
                 if prepare is not None:
-                    prepare(
-                        forward_batch, batch, lease_state is not None, metrics
-                    )
+                    prepare(forward_batch, batch, lease_state is not None, metrics)
             paged_s = time.perf_counter() - t_paged
             prep_s = time.perf_counter() - t_prep
             if metrics is not None:
@@ -1192,7 +1225,9 @@ class SRTreeDrafter:
                 metrics.add_host("tree_paged_eager", paged_s)
                 metrics.add_host("tree_prepare_meta", prep_s)
             can_fn = getattr(self, "_can_run_tree_graph", None)
-            if can_fn is not None:
+            if paged_graph_selected is not None:
+                can_cuda_graph = paged_graph_selected
+            elif can_fn is not None:
                 can_cuda_graph = can_fn(forward_batch)
             else:
                 runner = getattr(self, "cuda_graph_runner", None)
@@ -1258,14 +1293,30 @@ class SRTreeDrafter:
                     parent_list, top_scores_index, draft_tokens = self._draft_forward(
                         forward_batch
                     )
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    finish_paged_metadata,
+                )
+
+                finish_paged_metadata(self.draft_attn_backend)
             exec_s = time.perf_counter() - t_exec
             txn.completion_confirmed = True
         except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                poison_paged_metadata,
+            )
+
+            poison_paged_metadata(self.draft_attn_backend)
             graph_submitted = True
             raise
         except Exception as e:
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                finish_paged_metadata,
+                poison_paged_metadata,
+            )
+
             ctx_err = globals().get("is_device_context_error")
             if ctx_err is not None and ctx_err(e):
+                poison_paged_metadata(self.draft_attn_backend)
                 graph_submitted = True
                 raise NpuGraphReplaySubmittedError(
                     "tree expand device context error"
@@ -1273,11 +1324,15 @@ class SRTreeDrafter:
             if txn.in_flight():
                 confirm = getattr(self, "_try_confirm_tree_completion", lambda: True)
                 if not confirm():
+                    poison_paged_metadata(self.draft_attn_backend)
                     graph_submitted = True
                     raise NpuGraphReplaySubmittedError(
                         "tree expand in-flight; refuse rollback"
                     ) from e
                 txn.completion_confirmed = True
+                # A successful device confirmation also closes metadata use on
+                # this recoverable error path, before rollback frees pages.
+                finish_paged_metadata(self.draft_attn_backend)
             if txn.may_rollback() and not graph_submitted:
                 rollback = getattr(self, "_rollback_tree_expand", None)
                 if rollback is not None:
@@ -1294,6 +1349,9 @@ class SRTreeDrafter:
                 txn.in_flight() and not txn.completion_confirmed
             )
             if abandon:
+                view = getattr(self.draft_attn_backend, "_sr_draft_paged_view", None)
+                if view is not None:
+                    view.workspace.lease_hold = lease_state
                 self._pending_lease_state = None
             elif txn.rolled_back:
                 pass
@@ -1307,8 +1365,10 @@ class SRTreeDrafter:
         replay_n = getattr(runner, "tree_graph_replay_count", 0) if runner else 0
         self._tree_forward_calls = getattr(self, "_tree_forward_calls", 0) + 1
         calls = self._tree_forward_calls
-        reason = None if can_cuda_graph else (
-            getattr(runner, "_last_can_run_reject", None) or "graph_unavailable"
+        reason = (
+            None
+            if can_cuda_graph
+            else (getattr(runner, "_last_can_run_reject", None) or "graph_unavailable")
         )
         if calls <= 1 or calls % 8 == 0:
             logger.info(

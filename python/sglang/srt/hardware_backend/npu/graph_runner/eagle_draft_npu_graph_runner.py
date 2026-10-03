@@ -407,7 +407,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         backend, "bind_sr_tree_paged_replay"
                     ):
                         pages = int(plan.kv_bucket) if plan.kv_bucket is not None else 1
-                        backend.bind_sr_tree_paged_replay(plan.capture_bs, pages)
+                        if getattr(backend, "_sr_draft_paged_view", None) is not None:
+                            backend.bind_sr_tree_paged_replay(
+                                plan.capture_bs,
+                                pages,
+                                generation=forward_batch._sr_paged_metadata_generation,
+                            )
+                        else:
+                            backend.bind_sr_tree_paged_replay(plan.capture_bs, pages)
                     if getattr(self, "_tree_shared_prefix", False):
                         for inner in backend.attn_backends:
                             inner._replay_tree_s_cap = plan.kv_bucket
@@ -415,6 +422,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         except NpuGraphPreparationError as exc:
             self._restore_forward_batch_fields(forward_batch, snap)
             if not getattr(self, "_tree_paged", False):
+                raise
+            restore = getattr(backend, "restore_sr_tree_paged_eager", None)
+            if restore is not None and restore():
                 raise
             if meta_snap is not None and self._paged_eager_restore_valid(
                 backend, meta_snap, raw_bs

@@ -558,11 +558,37 @@ class AscendAttnBackend(AttentionBackend):
             self._target_fia_graph_metadata = cache
         if graph and key in cache:
             return cache[key]
+        if not graph:
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                SRPagedMetadataCache,
+                stream_key,
+            )
+
+            eager = getattr(self, "_target_paged_eager_cache", None)
+            if eager is None:
+                eager = self._target_paged_eager_cache = SRPagedMetadataCache()
+            return eager.get(
+                stream_key(self.device),
+                key,
+                lambda: SRTargetTreeFiaMetadata.allocate(
+                    bs,
+                    queries,
+                    pages,
+                    self.page_size,
+                    self.device,
+                ),
+            )
         md = SRTargetTreeFiaMetadata.allocate(
-            bs, queries, pages, self.page_size, self.device
+            bs, queries, pages, self.page_size, self.device, domain="graph"
         )
         if graph:
             cache[key] = md
+            if md.workspace is not None:
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    warm_target_paged_metadata,
+                )
+
+                warm_target_paged_metadata(md, self.req_to_token)
         return md
 
     def _prepare_target_tree_fia_eager(self, batch) -> bool:
@@ -575,6 +601,9 @@ class AscendAttnBackend(AttentionBackend):
         needed = max((p + queries for p in prefixes), default=queries)
         pages = pages_for_s_cap(needed, self.page_size)
         md = self._target_fia_metadata(raw_bs, queries, pages, graph=False)
+        self._sr_target_paged_workspace = md.workspace
+        if md.workspace is not None:
+            md.workspace.metrics = getattr(self, "_sr_paged_metrics", None)
         fill_target_tree_fia_metadata_(
             md,
             self.req_to_token,
@@ -586,6 +615,11 @@ class AscendAttnBackend(AttentionBackend):
             dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
         )
         self.forward_metadata.sr_target_tree_fia = md
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            report_paged_metadata,
+        )
+
+        report_paged_metadata(self, "target", getattr(self, "_sr_paged_metrics", None))
         return True
 
     def _run_sr_target_tree_fia(self, q, k_cache, v_cache, layer):
@@ -2026,6 +2060,9 @@ class AscendAttnBackend(AttentionBackend):
             md = cache[key]
             lengths, raw_bs = self._tree_verify_mask_layout(spec_info, seq_lens_cpu)
             prefixes = cpu_prefix_lengths(lengths, raw_bs)
+            self._sr_target_paged_workspace = md.workspace
+            if md.workspace is not None:
+                md.workspace.metrics = getattr(self, "_sr_paged_metrics", None)
             fill_target_tree_fia_metadata_(
                 md,
                 self.req_to_token,
@@ -2037,6 +2074,13 @@ class AscendAttnBackend(AttentionBackend):
                 dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
             )
             metadata.sr_target_tree_fia = md
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                report_paged_metadata,
+            )
+
+            report_paged_metadata(
+                self, "target", getattr(self, "_sr_paged_metrics", None)
+            )
             self.forward_metadata = metadata
             self.graph_mode = True
             return
@@ -4044,6 +4088,23 @@ class AscendAttnMultiStepDraftBackend:
 
     def _sr_clear_paged_round_state(self) -> None:
         """Drop warmup/round tables so the next request rebuilds them."""
+        view = getattr(self, "_sr_draft_paged_view", None)
+        if view is not None and view.workspace.pending_consumer:
+            import sys
+
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                SRPagedMetadataSubmittedError,
+            )
+
+            view.workspace.poison()
+            # A failing submit already poisoned the workspace and is propagating.
+            # Raising here would hide that kernel error and drop the view.
+            if view.workspace.unresolved and sys.exc_info()[0] is not None:
+                return
+            raise SRPagedMetadataSubmittedError(
+                "cannot clear paged metadata before consumer completion"
+            )
+        self._sr_draft_paged_view = None
         self._paged_round_tables = None
         self._paged_round_active = None
         self._paged_round_prefix = None
@@ -4087,7 +4148,10 @@ class AscendAttnMultiStepDraftBackend:
         self._paged_prep_count += 1
         raw_bs = len(prefix_lens_cpu)
         topk = int(self.topk)
-        slots = compact_slots.reshape(raw_bs, topk, self.speculative_num_steps)
+        if compact_slots.device.type == "npu":
+            slots = compact_slots.view(raw_bs, topk, self.speculative_num_steps)
+        else:
+            slots = compact_slots.reshape(raw_bs, topk, self.speculative_num_steps)
         needed_pages = max(
             max_query_pages_for_tree(
                 prefix_lens_cpu, self.speculative_num_steps, self.page_size
@@ -4101,20 +4165,35 @@ class AscendAttnMultiStepDraftBackend:
         )
         max_pages = quantize_page_width(needed_pages, page_buckets)
         t_view = time.perf_counter()
-        tables, _shared, branch, active, _n_sh, _n_q = prepare_tree_paged_view(
-            inner0.req_to_token,
-            forward_batch.req_pool_indices[:raw_bs],
-            slots,
-            prefix_lens_cpu,
-            self.page_size,
-            topk,
-            self.speculative_num_steps,
-            dummy_page=dummy_page,
-            max_pages=max_pages,
-        )
+        if slots.device.type == "npu":
+            view = self._prepare_fused_sr_tree_paged(
+                forward_batch,
+                slots,
+                prefix_lens_cpu,
+                max_pages,
+                dummy_page,
+                metrics,
+            )
+            tables, branch, active = (
+                view.block_tables,
+                view.branch_pages,
+                view.active_rows,
+            )
+        else:
+            tables, _shared, branch, active, _n_sh, _n_q = prepare_tree_paged_view(
+                inner0.req_to_token,
+                forward_batch.req_pool_indices[:raw_bs],
+                slots,
+                prefix_lens_cpu,
+                self.page_size,
+                topk,
+                self.speculative_num_steps,
+                dummy_page=dummy_page,
+                max_pages=max_pages,
+            )
         if metrics is not None:
             metrics.add_host("tree_paged_view", time.perf_counter() - t_view)
-        # Graph buffers belong to bind_sr_tree_paged_replay; eager binds fresh tables.
+        # NPU preparation already chose the final graph/eager output addresses.
         dummy = int(dummy_page)
         self._paged_round_tables = tables
         self._paged_round_active = active
@@ -4186,7 +4265,136 @@ class AscendAttnMultiStepDraftBackend:
             inner.forward_metadata.block_tables = tables
         if metrics is not None:
             metrics.add_host("tree_paged_bind", time.perf_counter() - t_bind)
+        if not commit_kv:
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                finish_paged_metadata,
+            )
+
+            finish_paged_metadata(self)
         return copied
+
+    def _prepare_fused_sr_tree_paged(
+        self, forward_batch, slots, prefixes, pages, dummy, metrics
+    ):
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRDraftPagedPlan,
+            SRPagedMetadataCache,
+            allocate_draft_view,
+            fill_draft_paged_metadata_,
+            stream_key,
+        )
+
+        replay = getattr(forward_batch, "_sr_paged_replay_plan", None)
+        cap = len(prefixes) if replay is None else int(replay.capture_bs)
+        pages = int(pages if replay is None else replay.kv_bucket)
+        domain = "eager" if replay is None else "graph"
+        plan = SRDraftPagedPlan.build(
+            prefixes,
+            cap,
+            self.topk,
+            self.speculative_num_steps,
+            pages,
+            self.page_size,
+            domain,
+        )
+        if replay is not None:
+            tables, active = self._paged_graph_table_view(cap, pages, dummy)
+            views = getattr(self, "_sr_paged_graph_views", {})
+            view = views.get((cap, pages))
+            if view is None:
+                raise NpuGraphPreparationError(
+                    "captured paged metadata workspace missing", scope="graph"
+                )
+            if view.block_tables is not tables or view.active_rows is not active:
+                raise NpuGraphPreparationError(
+                    "captured paged metadata storage changed", scope="graph"
+                )
+        else:
+            cache = getattr(self, "_sr_paged_eager_cache", None)
+            if cache is None:
+                cache = self._sr_paged_eager_cache = SRPagedMetadataCache()
+            view = cache.get(
+                stream_key(slots.device),
+                (cap, pages, plan.branch_capacity),
+                lambda: allocate_draft_view(plan, slots.device, metrics=metrics),
+            )
+        view.workspace.metrics = metrics
+        self._sr_draft_paged_view = view
+        fill_draft_paged_metadata_(
+            view,
+            self.attn_backends[0].req_to_token,
+            forward_batch.req_pool_indices[: len(prefixes)],
+            slots,
+            plan,
+            dummy,
+        )
+        forward_batch._sr_paged_metadata_generation = view.generation
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            report_paged_metadata,
+        )
+
+        report_paged_metadata(self, "draft", metrics)
+        return view
+
+    def restore_sr_tree_paged_eager(self):
+        """Host graph-preparation fallback; never repeat prefix-tail KV copying."""
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRDraftPagedPlan,
+            SRPagedMetadataCache,
+            allocate_draft_view,
+            fill_draft_paged_metadata_,
+            stream_key,
+        )
+
+        old = getattr(self, "_sr_draft_paged_view", None)
+        if old is None or old.plan.domain != "graph":
+            return False
+        old.check()
+        mapping, pool, slots = old.workspace.holds
+        p = old.plan
+        # No graph consumer was submitted. Ready-stream ordering protects the
+        # old preparation, and its outputs remain owned by the graph.
+        old.workspace.consumed()
+        cache = getattr(self, "_sr_paged_eager_cache", None)
+        if cache is None:
+            cache = self._sr_paged_eager_cache = SRPagedMetadataCache()
+        plan = SRDraftPagedPlan.build(
+            p.prefixes, len(p.prefixes), p.topk, p.steps, p.pages, p.page_size, "eager"
+        )
+        view = cache.get(
+            stream_key(slots.device),
+            (plan.capacity, plan.pages, plan.branch_capacity),
+            lambda: allocate_draft_view(plan, slots.device),
+        )
+        view.workspace.metrics = old.workspace.metrics
+        view.workspace.lease_hold = old.workspace.lease_hold
+        view.workspace.count("graph_preparation_fallback")
+        self._sr_draft_paged_view = view
+        fill_draft_paged_metadata_(
+            view, mapping, pool, slots, plan, self._paged_round_dummy
+        )
+        self._paged_round_tables = view.block_tables
+        self._paged_round_active = view.active_rows
+        for inner in self.attn_backends:
+            step = min(int(inner.speculative_step_id), max(plan.steps - 2, 0))
+            lens = build_step_context_lens(
+                p.prefixes, p.topk, step, plan.capacity * p.topk
+            )
+            md = SRTreePagedMetadata(
+                view.block_tables,
+                view.active_rows,
+                lens,
+                context_lens_list(lens),
+                self._paged_round_dummy,
+                plan.pages,
+                self._paged_round_impl,
+            )
+            inner.bind_sr_tree_paged_metadata(md)
+            if inner.forward_metadata is None:
+                inner.forward_metadata = ForwardMetadata()
+            inner.forward_metadata.sr_tree_paged = md
+            inner.forward_metadata.block_tables = view.block_tables
+        return True
 
     def _paged_graph_table_view(
         self,
@@ -4232,10 +4440,18 @@ class AscendAttnMultiStepDraftBackend:
                     "paged tree graph buffer device missing", scope="graph"
                 )
             if tables is None:
-                tables = torch.zeros((rows, pages), dtype=torch.int32, device=device)
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    empty_metadata,
+                )
+
+                tables = empty_metadata((rows, pages), torch.int32, device)
                 tables_map[key] = tables
             if active is None:
-                active = torch.zeros((rows,), dtype=torch.bool, device=device)
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    empty_metadata,
+                )
+
+                active = empty_metadata((rows,), torch.bool, device)
                 actives_map[key] = active
         if (
             int(tables.ndim) != 2
@@ -4257,13 +4473,45 @@ class AscendAttnMultiStepDraftBackend:
             )
         return tables, active
 
-    def bind_sr_tree_paged_capture(self, capture_bs: int, max_pages: int, dummy_page: int):
+    def bind_sr_tree_paged_capture(
+        self, capture_bs: int, max_pages: int, dummy_page: int
+    ):
         if not self.paged_impl_selected():
             return
         dummy = int(dummy_page)
         tables, active = self._paged_graph_table_view(
             capture_bs, max_pages, dummy, allow_alloc=True
         )
+        if tables.device.type == "npu":
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                SRDraftPagedPlan,
+                allocate_draft_view,
+            )
+
+            views = getattr(self, "_sr_paged_graph_views", None)
+            if views is None:
+                views = self._sr_paged_graph_views = {}
+            key = (int(capture_bs), int(max_pages))
+            if key not in views:
+                plan = SRDraftPagedPlan.build(
+                    (),
+                    key[0],
+                    self.topk,
+                    self.speculative_num_steps,
+                    key[1],
+                    self.page_size,
+                    "graph",
+                )
+                views[key] = allocate_draft_view(
+                    plan, tables.device, tables=tables, active=active
+                )
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    warm_draft_paged_metadata,
+                )
+
+                warm_draft_paged_metadata(
+                    views[key], self.attn_backends[0].req_to_token
+                )
         tables.fill_(dummy)
         active.zero_()
         impl = self.attn_backends[0].tree_attention_impl
@@ -4348,10 +4596,50 @@ class AscendAttnMultiStepDraftBackend:
         tables, active = self._paged_graph_table_view(
             capture_bs, max_pages, dummy, allow_alloc=False
         )
-        return prefix, src, src_act, tables, active, dummy, raw_bs, capture_bs, max_pages, topk
+        return (
+            prefix,
+            src,
+            src_act,
+            tables,
+            active,
+            dummy,
+            raw_bs,
+            capture_bs,
+            max_pages,
+            topk,
+        )
 
-    def bind_sr_tree_paged_replay(self, capture_bs: int, max_pages: int):
+    def bind_sr_tree_paged_replay(
+        self, capture_bs: int, max_pages: int, *, generation=None
+    ):
         if not self.paged_impl_selected():
+            return
+        view = getattr(self, "_sr_draft_paged_view", None)
+        if view is not None:
+            view.check()
+            if generation is not None and generation != view.generation:
+                # A stale batch must not reuse another round's plan in the
+                # ordinary graph-preparation eager fallback.
+                raise RuntimeError("paged metadata round generation mismatch")
+            p = view.plan
+            if (
+                p.domain != "graph"
+                or p.capacity != int(capture_bs)
+                or p.pages != int(max_pages)
+                or len(p.prefixes) != int(self._tree_replay_raw_bs)
+            ):
+                raise NpuGraphPreparationError(
+                    "paged metadata replay plan mismatch", scope="graph"
+                )
+            tables, active = self._paged_graph_table_view(
+                capture_bs, max_pages, self._paged_round_dummy
+            )
+            if tables is not view.block_tables or active is not view.active_rows:
+                raise NpuGraphPreparationError(
+                    "paged metadata replay storage mismatch", scope="graph"
+                )
+            # Already filled directly in the captured outputs. CPU step lengths
+            # were bound during preparation; no clear/copy/second upload here.
             return
         (
             prefix,
@@ -4371,7 +4659,9 @@ class AscendAttnMultiStepDraftBackend:
         active.zero_()
         tables[:need_src, :src_cols].copy_(src)
         active[:need_src].copy_(src_act.to(device=active.device))
-        impl = getattr(self, "_paged_round_impl", self.attn_backends[0].tree_attention_impl)
+        impl = getattr(
+            self, "_paged_round_impl", self.attn_backends[0].tree_attention_impl
+        )
         n_rows = int(tables.shape[0])
         n_fwd = max(int(self.speculative_num_steps) - 1, 0)
         for inner in self.attn_backends:

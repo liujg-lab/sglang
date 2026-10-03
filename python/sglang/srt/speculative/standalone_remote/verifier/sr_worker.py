@@ -382,12 +382,39 @@ class StandaloneRemoteWorker:
             getattr(self.target_worker, "model_runner", None), "graph_runner", None
         )
         metrics_token = bind_graph_host_metrics(graph_runner, metrics)
+        paged_backend = getattr(
+            getattr(self.target_worker, "model_runner", None), "attn_backend", None
+        )
+        if paged_backend is not None:
+            paged_backend._sr_paged_metrics = metrics
         try:
-            with metrics.phase("verify_forward", device=True) if metrics else nullcontext():
+            with (
+                metrics.phase("verify_forward", device=True)
+                if metrics
+                else nullcontext()
+            ):
                 batch_result = self.target_worker.forward_batch_generation(
                     model_worker_batch, is_verify=True
                 )
+                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                    finish_paged_metadata,
+                )
+
+                finish_paged_metadata(paged_backend)
+        except BaseException as exc:
+            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+                SRPagedMetadataSubmittedError,
+                poison_paged_metadata,
+            )
+
+            if poison_paged_metadata(paged_backend):
+                raise SRPagedMetadataSubmittedError(
+                    "Target forward failed after paged metadata submission"
+                ) from exc
+            raise
         finally:
+            if paged_backend is not None:
+                paged_backend._sr_paged_metrics = None
             restore_graph_host_metrics(metrics_token)
         accept_start = time.perf_counter()
         logits_output, can_run_cuda_graph = (
