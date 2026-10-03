@@ -4,7 +4,8 @@
 功能
     HTTP 客户端，打已启动的 SPECTRE Target（默认 :30000），不拉起服务。
     闭式并发：每个 chunk 同时发出 batch_size 条独立 POST，等全部返回再发下一批。
-    逐条把结果追加到 jsonl；全部结束后写/追加汇总 CSV，并 subprocess 调用
+    每次运行创建带唯一 run_id 的 jsonl、CSV、.run.json；不覆盖历史文件。
+    逐条把结果追加到本轮 jsonl；全部结束后写汇总 CSV，并 subprocess 调用
     eval_rsteller_metrics.py 补 BLEU / ROUGE。
 
 支持的数据集
@@ -31,8 +32,14 @@ jsonl 每条字段（在原始 sample 上追加）
     completion_tokens         生成 token 数
     e2e_latency               服务端端到端时延（秒）；缺则用客户端墙钟
     prefill_s                 TTFT（秒）；仅 serial stream 有值
-    decode_s                  e2e - prefill（无 TTFT 则为 e2e）
+    decode_s                  e2e - prefill（无 TTFT 则为空）
     decode_tok_s              该条 completion_tokens / decode_s
+    e2e_tok_s                 该条 completion_tokens / e2e_latency
+    output_ids / token_ids_complete  服务端 token IDs 及完整性校验结果
+    finish_reason / response_meta_info  结束原因及服务端原始元数据
+    request_fingerprint       prompt、图片内容和采样参数的 SHA256
+    request_started_at / request_finished_at  客户端 UTC 请求时间
+    run_id / cache_policy / cache_flush / warmup_enabled / batch_size
     spec_accept_rate          投机接受率（不含 Target bonus）
     spec_accept_length        平均接受长度 = toks / verify
     spec_verify_ct            Target verify 次数
@@ -47,7 +54,7 @@ CSV 汇总列含义
     Total Items                   实际跑的条数（含失败）
     Total Generated Tokens        成功条 completion_tokens 之和
     Avg Prefill (ms)              prefill_s 均值×1000；bs>1 无 TTFT 时常为空
-    Decode tok/s                  sum(completion_tokens) / 各 chunk 墙钟之和
+    End-to-end tok/s              sum(completion_tokens) / 各 chunk 墙钟之和
     Avg Accept Length             spec_accept_length 均值（toks/verify）
     Avg Accept Rate               spec_accept_rate 均值
                                   = 猜中 draft / (verify × (num_draft_tokens-1))
@@ -69,8 +76,9 @@ CSV 汇总列含义
     --temperature             默认 0.0
     --timeout                 单条 HTTP 超时秒，默认 600
     --data-file / --img-dir   数据集 JSON 与图片根目录
-    --output-jsonl            默认 test_sglang_liujg/result/RSTeller_spectre_results.jsonl
-    --output-csv              默认 test_sglang_liujg/result/RSTeller_spectre_statistics.csv
+    --output-jsonl            输出路径模板；文件名追加 UTC 时间和唯一 run_id
+    --output-csv              汇总路径模板；追加与 jsonl 相同的 run_id
+    --compare-jsonl           可选：与历史 JSONL 对照，首个 token 差异写入 .run.json
     --no-warmup               跳过用第一条做的丢弃 warmup
     --flush-cache             warmup 后以及每个 chunk 前 POST /flush_cache
     --skip-metrics            生成结束后不调用精度脚本
@@ -82,6 +90,7 @@ import argparse
 import base64
 import concurrent.futures
 import csv
+import hashlib
 import json
 import mimetypes
 import subprocess
@@ -89,6 +98,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -108,7 +119,7 @@ CSV_FIELDS = [
     "Total Items",
     "Total Generated Tokens",
     "Avg Prefill (ms)",
-    "Decode tok/s",
+    "End-to-end tok/s",
     "Avg Accept Length",
     "Avg Accept Rate",
     "Avg Draft Tokens per Verify",
@@ -198,19 +209,40 @@ def post_generate_stream(
     t0 = time.perf_counter()
     ttft: float | None = None
     last: dict[str, Any] | None = None
+    output_ids: list[int] = []
+    output_text = ""
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="replace")
             parsed = parse_sse_chunk(line)
             if parsed is None:
                 continue
+            if "error" in parsed:
+                raise RuntimeError(f"server error: {parsed['error']}")
             if ttft is None:
                 ttft = time.perf_counter() - t0
+            ids = parsed.get("output_ids")
+            count = (parsed.get("meta_info") or {}).get("completion_tokens")
+            if isinstance(ids, list) and isinstance(count, int):
+                if len(ids) == count:
+                    output_ids = list(ids)
+                    output_text = parsed.get("text", "")
+                elif len(output_ids) + len(ids) == count:
+                    output_ids.extend(ids)
+                    output_text += parsed.get("text", "")
+                else:
+                    # Do not label a suffix or a gapped stream as complete.
+                    output_ids = []
+                    output_text = parsed.get("text", "")
+            else:
+                output_ids = list(ids) if isinstance(ids, list) else []
+                output_text = parsed.get("text", "")
             last = parsed
     if last is None:
         raise RuntimeError("empty streaming generate response")
     if "error" in last:
         raise RuntimeError(f"server error: {last['error']}")
+    last = dict(last, output_ids=output_ids, text=output_text)
     return last, float(ttft if ttft is not None else time.perf_counter() - t0)
 
 
@@ -218,13 +250,15 @@ def post_generate(url: str, payload: dict[str, Any], timeout: float) -> dict[str
     return _as_result_list(post_json(url, payload, timeout))[0]
 
 
-def flush_cache(base_url: str, timeout: float) -> None:
+def flush_cache(base_url: str, timeout: float) -> dict[str, Any]:
     url = f"{base_url}/flush_cache"
     print(f"  flush_cache -> {url}")
     try:
-        post_json(url, None, timeout, method="POST")
+        response = post_json(url, None, timeout, method="POST")
+        return {"status": "http_success", "response": response}
     except Exception as e:  # noqa: BLE001 — cache flush is best-effort
         print(f"  flush_cache failed: {e}")
+        return {"status": "failed", "error": str(e)}
 
 
 def load_dataset(path: Path, max_items: int | None) -> list[dict[str, Any]]:
@@ -265,8 +299,6 @@ def extract_perf(
     decode_s: float | None = None
     if e2e is not None and prefill_s is not None and e2e > prefill_s:
         decode_s = e2e - prefill_s
-    elif e2e is not None:
-        decode_s = e2e
     decode_tok_s: float | None = None
     if toks is not None and decode_s and decode_s > 0:
         decode_tok_s = toks / decode_s
@@ -279,11 +311,22 @@ def extract_perf(
 
     rec = dict(item)
     rec["model_output"] = text
+    ids = generate_result.get("output_ids")
+    rec["output_ids"] = ids if isinstance(ids, list) else None
+    rec["token_ids_complete"] = (
+        isinstance(ids, list)
+        and all(type(token) is int for token in ids)
+        and toks is not None
+        and len(ids) == toks
+    )
+    rec["finish_reason"] = meta.get("finish_reason")
+    rec["response_meta_info"] = meta
     rec["completion_tokens"] = toks
     rec["e2e_latency"] = e2e
     rec["prefill_s"] = prefill_s
     rec["decode_s"] = decode_s
     rec["decode_tok_s"] = decode_tok_s
+    rec["e2e_tok_s"] = toks / e2e if toks is not None and e2e and e2e > 0 else None
     rec["spec_accept_rate"] = _num(meta, "spec_accept_rate")
     rec["spec_accept_length"] = _num(meta, "spec_accept_length")
     rec["spec_verify_ct"] = verify_ct
@@ -293,7 +336,9 @@ def extract_perf(
     return rec
 
 
-def one_payload(prompt: str, data_uri: str, sampling: dict[str, Any], stream: bool) -> dict[str, Any]:
+def one_payload(
+    prompt: str, data_uri: str, sampling: dict[str, Any], stream: bool
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": prompt,
         "image_data": data_uri,
@@ -369,21 +414,36 @@ def run_one(
         rec["model_output"] = ""
         return rec
     payload = one_payload(prompt, extra, sampling, stream=stream)
+    evidence = {
+        "request_started_at": datetime.now(timezone.utc).isoformat(),
+        "sampling_params": dict(sampling),
+        "stream": stream,
+        "request_fingerprint": hashlib.sha256(
+            json.dumps(
+                {"prompt": prompt, "image": extra, "sampling": sampling},
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
     t0 = time.perf_counter()
     try:
         if stream:
             result, ttft = post_generate_stream(generate_url, payload, timeout)
             client_e2e = time.perf_counter() - t0
-            return extract_perf(item, result, ttft_s=ttft, client_e2e_s=client_e2e)
-        result = post_generate(generate_url, payload, timeout)
-        client_e2e = time.perf_counter() - t0
-        return extract_perf(item, result, ttft_s=None, client_e2e_s=client_e2e)
+            rec = extract_perf(item, result, ttft_s=ttft, client_e2e_s=client_e2e)
+        else:
+            result = post_generate(generate_url, payload, timeout)
+            client_e2e = time.perf_counter() - t0
+            rec = extract_perf(item, result, ttft_s=None, client_e2e_s=client_e2e)
     except Exception as e:  # noqa: BLE001 — keep eval going
         rec = dict(item)
         rec["error"] = str(e)
         rec["model_output"] = ""
         rec["e2e_latency"] = time.perf_counter() - t0
-        return rec
+    rec.update(evidence)
+    rec["request_finished_at"] = datetime.now(timezone.utc).isoformat()
+    return rec
 
 
 def run_chunk_concurrent(
@@ -414,7 +474,7 @@ def run_chunk_concurrent(
 
 def write_csv_row(csv_path: Path, row: dict[str, Any]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = csv_path.exists()
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
     with csv_path.open("a" if file_exists else "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if not file_exists:
@@ -422,27 +482,171 @@ def write_csv_row(csv_path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def create_run_paths(jsonl: Path, csv_path: Path) -> tuple[str, Path, Path, Path]:
+    """Treat CLI output paths as stems; never truncate another run's files."""
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    result = jsonl.with_name(f"{jsonl.stem}.{run_id}{jsonl.suffix}")
+    summary = csv_path.with_name(f"{csv_path.stem}.{run_id}{csv_path.suffix}")
+    manifest = result.with_suffix(".run.json")
+    for path in (result, summary, manifest):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Reserve exclusively, including CSV: parallel runs cannot share it.
+        with path.open("x", encoding="utf-8"):
+            pass
+    return run_id, result, summary, manifest
+
+
+def server_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
+    """Best-effort configuration evidence; exclude credentials/internal state."""
+    fields = (
+        "version",
+        "model_path",
+        "tokenizer_path",
+        "revision",
+        "dtype",
+        "quantization",
+        "kv_cache_dtype",
+        "device",
+        "tp_size",
+        "page_size",
+        "random_seed",
+        "enable_deterministic_inference",
+        "disable_radix_cache",
+        "disable_cuda_graph",
+        "cuda_graph_bs",
+        "attention_backend",
+        "speculative_algorithm",
+        "speculative_verify_mode",
+        "speculative_rpd_tau",
+        "speculative_num_steps",
+        "speculative_eagle_topk",
+        "speculative_num_draft_tokens",
+        "incremental_streaming_output",
+    )
+    try:
+        info = post_json(
+            f"{base_url}/server_info", None, min(timeout, 10), method="GET"
+        )
+        return {
+            "status": "available",
+            "settings": {k: info[k] for k in fields if k in info},
+        }
+    except Exception as exc:
+        return {"status": "unavailable", "error": str(exc)}
+
+
+def compare_records(
+    baseline: list[dict[str, Any]], current: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Compare complete server token IDs. Never infer IDs from decoded text."""
+
+    def indexed(rows):
+        result = {}
+        for row in rows:
+            key = row["global_index"]
+            if key in result:
+                raise ValueError(f"duplicate global_index in comparison: {key}")
+            result[key] = row
+        return result
+
+    before, after = indexed(baseline), indexed(current)
+    comparisons = []
+    for key in sorted(before.keys() | after.keys()):
+        old, new = before.get(key), after.get(key)
+        entry = {"global_index": key}
+        if old is None or new is None:
+            entry["status"] = "missing_request"
+        elif old.get("error") or new.get("error"):
+            entry["status"] = "request_failed"
+        elif not old.get("request_fingerprint") or not new.get("request_fingerprint"):
+            entry["status"] = "request_identity_unavailable"
+        elif old["request_fingerprint"] != new["request_fingerprint"]:
+            entry["status"] = "request_mismatch"
+        else:
+            context_fields = (
+                "batch_size",
+                "cache_policy",
+                "warmup_enabled",
+                "stream",
+                "chunk_index",
+            )
+            entry["context_differences"] = {
+                k: {"baseline": old.get(k), "current": new.get(k)}
+                for k in context_fields
+                if old.get(k) != new.get(k)
+            }
+            entry["text_equal"] = old.get("model_output") == new.get("model_output")
+            entry["finish_reason_equal"] = old.get("finish_reason") == new.get(
+                "finish_reason"
+            )
+            if not old.get("token_ids_complete") or not new.get("token_ids_complete"):
+                entry["status"] = "token_ids_unavailable"
+            else:
+                left, right = old["output_ids"], new["output_ids"]
+                pos = next(
+                    (i for i, (a, b) in enumerate(zip(left, right)) if a != b), None
+                )
+                if pos is None and len(left) != len(right):
+                    pos = min(len(left), len(right))
+                entry.update(
+                    status="equal_tokens" if pos is None else "different_tokens",
+                    baseline_length=len(left),
+                    current_length=len(right),
+                    first_difference_index=pos,
+                    baseline_token=(
+                        left[pos] if pos is not None and pos < len(left) else None
+                    ),
+                    current_token=(
+                        right[pos] if pos is not None and pos < len(right) else None
+                    ),
+                )
+        comparisons.append(entry)
+    return comparisons
+
+
 def summarize(records: list[dict[str, Any]], total_wall_s: float) -> dict[str, Any]:
     ok = [r for r in records if not r.get("error")]
-    toks = [r["completion_tokens"] for r in ok if isinstance(r.get("completion_tokens"), (int, float))]
-    prefills = [r["prefill_s"] for r in ok if isinstance(r.get("prefill_s"), (int, float))]
-    alens = [r["spec_accept_length"] for r in ok if isinstance(r.get("spec_accept_length"), (int, float))]
-    rates = [r["spec_accept_rate"] for r in ok if isinstance(r.get("spec_accept_rate"), (int, float))]
+    toks = [
+        r["completion_tokens"]
+        for r in ok
+        if isinstance(r.get("completion_tokens"), (int, float))
+    ]
+    prefills = [
+        r["prefill_s"] for r in ok if isinstance(r.get("prefill_s"), (int, float))
+    ]
+    alens = [
+        r["spec_accept_length"]
+        for r in ok
+        if isinstance(r.get("spec_accept_length"), (int, float))
+    ]
+    rates = [
+        r["spec_accept_rate"]
+        for r in ok
+        if isinstance(r.get("spec_accept_rate"), (int, float))
+    ]
     drafts = [
         r["draft_tokens_per_verify"]
         for r in ok
         if isinstance(r.get("draft_tokens_per_verify"), (int, float))
     ]
-    verifies = [r["spec_verify_ct"] for r in ok if isinstance(r.get("spec_verify_ct"), (int, float))]
+    verifies = [
+        r["spec_verify_ct"]
+        for r in ok
+        if isinstance(r.get("spec_verify_ct"), (int, float))
+    ]
     total_toks = sum(toks)
     avg_prefill_ms = (mean(prefills) * 1000.0) if prefills else None
-    decode_tok_s = (total_toks / total_wall_s) if total_wall_s > 0 and total_toks else None
+    e2e_tok_s = (total_toks / total_wall_s) if total_wall_s > 0 and total_toks else None
     return {
         "n_ok": len(ok),
         "n_total": len(records),
         "total_tokens": total_toks,
         "avg_prefill_ms": avg_prefill_ms,
-        "decode_tok_s": decode_tok_s,
+        "e2e_tok_s": e2e_tok_s,
         "avg_alen": mean(alens),
         "avg_accept": mean(rates),
         "avg_draft_per_verify": mean(drafts),
@@ -485,6 +689,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument(
+        "--compare-jsonl", type=Path, help="Compare token IDs with a previous run"
+    )
+    p.add_argument(
         "--flush-cache",
         action="store_true",
         help="POST /flush_cache after warmup and before each chunk",
@@ -511,6 +718,12 @@ def main() -> int:
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
     }
+    baseline = None
+    if args.compare_jsonl is not None:
+        with args.compare_jsonl.open(encoding="utf-8") as previous:
+            baseline = [json.loads(line) for line in previous if line.strip()]
+        # Reject malformed/duplicate request keys before sending any requests.
+        compare_records(baseline, [])
 
     dataset = load_dataset(args.data_file, args.max_items)
     print(f"loaded {len(dataset)} items from {args.data_file}")
@@ -519,13 +732,50 @@ def main() -> int:
         f"max_new_tokens={args.max_new_tokens}"
     )
 
-    args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    args.output_jsonl.write_text("", encoding="utf-8")
+    cli_args = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    run_id, args.output_jsonl, args.output_csv, manifest_path = create_run_paths(
+        args.output_jsonl, args.output_csv
+    )
+    cache_policy = (
+        "flush_after_warmup_and_before_chunk"
+        if args.flush_cache
+        else "reuse_uncontrolled_initial_cache"
+    )
+    manifest = {
+        "run_id": run_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "arguments": cli_args,
+        "sampling_params": sampling,
+        "cache_policy": cache_policy,
+        "server": server_snapshot(base_url, args.timeout),
+        "request_order": list(range(len(dataset))),
+        "concurrent_order_note": "Dataset submission order; server scheduling order is not controlled.",
+        "results_jsonl": str(args.output_jsonl),
+        "summary_csv": str(args.output_csv),
+        "flush_events": [],
+    }
+
+    def save_manifest():
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def record_flush(stage):
+        event = dict(flush_cache(base_url, args.timeout), stage=stage)
+        manifest["flush_events"].append(event)
+        save_manifest()
+        return event
+
+    save_manifest()
+    print(f"run_id={run_id}  manifest={manifest_path}")
 
     if not args.no_warmup and dataset:
         print("=== warmup (first item, discarded) ===")
-        run_one(
+        manifest["warmup_result"] = run_one(
             generate_url,
             dataset[0],
             args.img_dir,
@@ -533,8 +783,9 @@ def main() -> int:
             args.timeout,
             stream=False,
         )
+        save_manifest()
         if args.flush_cache:
-            flush_cache(base_url, args.timeout)
+            record_flush("after_warmup")
 
     records: list[dict[str, Any]] = []
     total_wall = 0.0
@@ -544,8 +795,9 @@ def main() -> int:
 
     for g_i, group in enumerate(groups):
         print(f"=== chunk {g_i + 1}/{n_groups}  n={len(group)} ===")
+        flush_event = None
         if args.flush_cache:
-            flush_cache(base_url, args.timeout)
+            flush_event = record_flush(f"before_chunk_{g_i}")
 
         if args.batch_size == 1:
             idx, item = group[0]
@@ -571,6 +823,11 @@ def main() -> int:
             rec["batch_wall_s"] = wall
             rec["chunk_index"] = g_i
             rec["global_index"] = idx
+            rec["run_id"] = run_id
+            rec["batch_size"] = args.batch_size
+            rec["cache_policy"] = cache_policy
+            rec["cache_flush"] = flush_event
+            rec["warmup_enabled"] = not args.no_warmup
             print_item(idx, rec)
             append_jsonl(args.output_jsonl, rec)
             records.append(rec)
@@ -580,7 +837,9 @@ def main() -> int:
             for r in chunk_recs
             if isinstance(r.get("completion_tokens"), (int, float))
         )
-        print(f"  chunk wall={wall:.3f}s  toks={toks}  tok/s={toks / wall if wall else 0:.2f}")
+        print(
+            f"  chunk wall={wall:.3f}s  toks={toks}  tok/s={toks / wall if wall else 0:.2f}"
+        )
 
     stats = summarize(records, total_wall)
     test_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -591,10 +850,12 @@ def main() -> int:
         "Total Items": stats["n_total"],
         "Total Generated Tokens": f"{stats['total_tokens']:.0f}",
         "Avg Prefill (ms)": (
-            f"{stats['avg_prefill_ms']:.2f}" if stats["avg_prefill_ms"] is not None else ""
+            f"{stats['avg_prefill_ms']:.2f}"
+            if stats["avg_prefill_ms"] is not None
+            else ""
         ),
-        "Decode tok/s": (
-            f"{stats['decode_tok_s']:.2f}" if stats["decode_tok_s"] is not None else ""
+        "End-to-end tok/s": (
+            f"{stats['e2e_tok_s']:.2f}" if stats["e2e_tok_s"] is not None else ""
         ),
         "Avg Accept Length": (
             f"{stats['avg_alen']:.4f}" if stats["avg_alen"] is not None else ""
@@ -617,7 +878,7 @@ def main() -> int:
     print(
         f"summary items={stats['n_ok']}/{stats['n_total']}  "
         f"toks={stats['total_tokens']:.0f}  wall={total_wall:.3f}s  "
-        f"decode_tok/s={_fmt(stats['decode_tok_s'])}  "
+        f"e2e_tok/s={_fmt(stats['e2e_tok_s'])}  "
         f"prefill_ms={_fmt(stats['avg_prefill_ms'], 2)}  "
         f"accept={_fmt(stats['avg_accept'])}  "
         f"alen={_fmt(stats['avg_alen'])}  "
@@ -625,6 +886,21 @@ def main() -> int:
     )
     print(f"wrote {args.output_jsonl}")
     print(f"wrote {args.output_csv}")
+
+    manifest.update(
+        status="generation_complete",
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        total_chunk_wall_s=total_wall,
+        summary=stats,
+    )
+    if baseline is not None:
+        manifest["comparison"] = {
+            "baseline": str(args.compare_jsonl),
+            "note": "Token equality only; inspect both run manifests and flush outcomes before attributing differences.",
+            "requests": compare_records(baseline, records),
+        }
+        print(f"comparison saved in {manifest_path}")
+    save_manifest()
 
     if not args.skip_metrics:
         call_metrics_script(args.output_jsonl, args.output_csv)
