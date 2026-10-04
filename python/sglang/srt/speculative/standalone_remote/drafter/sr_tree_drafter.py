@@ -1783,7 +1783,9 @@ class SRTreeDrafter:
             self.token_to_kv_pool_allocator.free(slots)
 
     def _draft_forward(self, forward_batch: ForwardBatch):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import candidate_workspace
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            draft_candidate_workspace,
+        )
 
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -1801,9 +1803,9 @@ class SRTreeDrafter:
             self.speculative_num_steps, -1
         )
         rows = int(out_cache_loc.shape[1])
-        candidates = getattr(self, "_capture_candidate_workspace", None)
-        if candidates is None:
-            candidates = candidate_workspace(self, forward_batch.batch_size, topk_p)
+        candidates = draft_candidate_workspace(
+            self, forward_batch.batch_size, topk_p
+        )
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         self._active_tree_kv_workspace = getattr(
             self, "_capture_tree_kv_workspace", None
@@ -1894,12 +1896,32 @@ class SRTreeDrafter:
         if self.topk <= 1 or self.speculative_num_steps <= 2:
             return None
         pool = self.draft_model_runner.token_to_kv_pool
-        return prepare_kv_move(
+        workspace = prepare_kv_move(
             pool,
             int(batch_cap) * self.topk * (self.speculative_num_steps - 2),
             domain="tree_graph",
             graph=True,
         )
+        if (
+            workspace is not None
+            and workspace.layout.device.type == "cuda"
+            and int(self.page_size) == 1
+            and not getattr(self, "sr_tree_paged", False)
+        ):
+            rows = int(batch_cap) * int(self.topk)
+            current = getattr(self, "_tree_active_graph", None)
+            if (
+                current is None
+                or current.device != workspace.layout.device
+                or current.dtype != torch.bool
+                or current.numel() < rows
+            ):
+                self._tree_active_graph = torch.ones(
+                    rows, dtype=torch.bool, device=workspace.layout.device
+                )
+            else:
+                current.fill_(True)
+        return workspace
 
     def prepare_identity_remap_graph(self, batch_cap):
         if self.topk <= 1 or self.speculative_num_steps <= 2:
@@ -1964,4 +1986,47 @@ class SRTreeDrafter:
             active = getattr(meta, "active_rows", None)
             if active is None:
                 raise RuntimeError("paged tree KV remap requires live active_rows")
+        elif (
+            out_cache_loc.device.type == "cuda"
+            and int(getattr(self, "page_size", 1) or 1) == 1
+        ):
+            active = self._cuda_tree_active_rows(rows, out_cache_loc.device)
         remap_tree_kv_(workspace, out_cache_loc, parent_rows, n_prev_steps, active)
+
+    def _cuda_tree_active_rows(self, rows: int, device) -> torch.Tensor:
+        """page_size=1 CUDA row mask. Graph storage is allocated before capture."""
+        rows = int(rows)
+        if rows < 1:
+            raise RuntimeError("CUDA tree active mask requires at least one row")
+        if getattr(self, "_capture_tree_kv_workspace", None) is not None:
+            buf = getattr(self, "_tree_active_graph", None)
+            if (
+                buf is None
+                or buf.device != device
+                or buf.dtype != torch.bool
+                or buf.ndim != 1
+                or buf.numel() < rows
+            ):
+                raise RuntimeError(
+                    "CUDA tree active mask must be allocated before capture"
+                )
+            return buf[:rows]
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import _capturing
+
+        buf = getattr(self, "_tree_active_eager", None)
+        if (
+            buf is None
+            or buf.device != device
+            or buf.dtype != torch.bool
+            or buf.ndim != 1
+            or buf.numel() < rows
+        ):
+            if _capturing(device):
+                raise RuntimeError(
+                    "CUDA tree active mask must be allocated before capture"
+                )
+            buf = torch.ones(rows, dtype=torch.bool, device=device)
+            self._tree_active_eager = buf
+            return buf[:rows]
+        buf[:rows].fill_(True)
+        return buf[:rows]

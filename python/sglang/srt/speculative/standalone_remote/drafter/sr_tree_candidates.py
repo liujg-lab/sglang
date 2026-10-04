@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -12,6 +12,41 @@ from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CandidatePreflightDeclined(RuntimeError):
+    """Completed private comparisons declined the workspace; safe to fall back."""
+
+
+def _candidate_device(device):
+    device = torch.device(device)
+    if device.type != "cpu" and device.index is None:
+        device = torch.device(
+            device.type, torch.get_device_module(device.type).current_device()
+        )
+    return device
+
+
+@contextmanager
+def candidate_capture_scope(worker, workspace):
+    """Bind an explicit capture decision, including a safe legacy decision."""
+    previous = getattr(worker, "_capture_candidate_prepared", False)
+    previous_workspace = getattr(worker, "_capture_candidate_workspace", None)
+    scope = workspace.capture_scope() if workspace is not None else nullcontext()
+    with scope:
+        worker._capture_candidate_prepared = True
+        worker._capture_candidate_workspace = workspace
+        try:
+            yield
+        finally:
+            worker._capture_candidate_workspace = previous_workspace
+            worker._capture_candidate_prepared = previous
+
+
+def draft_candidate_workspace(worker, batch, seed):
+    if getattr(worker, "_capture_candidate_prepared", False):
+        return worker._capture_candidate_workspace
+    return candidate_workspace(worker, batch, seed)
 
 
 def _topk_out(value, k, values, indices):
@@ -32,14 +67,16 @@ class SRTreeCandidateWorkspace:
     def __init__(self, device, batch, topk, steps, width, vocab, dtype, *, graph=False):
         if min(batch, topk, steps, width, vocab) < 1:
             raise ValueError("invalid candidate workspace geometry")
-        self.device = torch.device(device)
+        device = self.device = _candidate_device(device)
         self.batch, self.topk, self.steps = batch, topk, steps
         self.width, self.vocab, self.dtype = width, vocab, dtype
         self.graph, self.unresolved = graph, False
         self.holds = None
         self._inside_capture = False
         self.probability_out = True
-        self.selection_out = True
+        # CUDA already compiles candidate selection; preserve that fused path.
+        # Fixed tables still replace cat and the final selection uses out=.
+        self.selection_out = device.type != "cuda"
         self.validated = self.device.type == "cpu"
         self.stream = self._stream()
         total = topk + (steps - 1) * topk * topk
@@ -111,7 +148,7 @@ class SRTreeCandidateWorkspace:
     def capture_scope(self):
         if not self.graph or not self.validated:
             raise RuntimeError("candidate workspace must be prepared before capture")
-        self.check(self.batch)
+        self.check(self.batch, check_stream=False)
         self._inside_capture = True
         try:
             yield self
@@ -250,7 +287,7 @@ class SRTreeCandidateWorkspace:
 
     def _finish(self, batch):
         n = self.width - 1
-        if not self.selection_out:
+        if not self.selection_out and self.device.type != "cuda":
             indices = torch.sort(
                 torch.topk(self.score_table[:batch], n, dim=-1).indices
             ).values
@@ -283,49 +320,66 @@ class SRTreeCandidateWorkspace:
         ).synchronize()
 
     def warm(self):
-        """Validate out variants on private data before graph/eager submission.
+        """Only completed numerical comparisons may choose original operators.
 
-        Preflight calls the operators directly. An ``out=`` rejection or numeric
-        mismatch turns that flag off and retries the original operator into the
-        same buffers. It does not mark the workspace unresolved and is not a
-        request retry. Request launch failures still go through ``_submitted``.
+        Operator exceptions do not establish that no device work was submitted.
+        Keep private inputs and the owner's workspace on any uncertain failure.
         """
+        if self.unresolved:
+            raise SRTransferUnresolved("candidate preflight completion is unresolved")
         if self.validated:
             return
+        # Imports are preflight metadata work, before private device submissions.
+        from sglang.srt.speculative.eagle_utils import organize_draft_results
+        from sglang.srt.speculative.spec_utils import select_top_k_tokens
+
+        self.holds = []
+        try:
+            self._warm_compare(organize_draft_results, select_top_k_tokens)
+        except CandidatePreflightDeclined:
+            self.holds = None
+            raise
+        except BaseException as exc:
+            if self.device.type != "cpu" or isinstance(exc, SRTransferUnresolved):
+                self.unresolved = True
+                if isinstance(exc, Exception) and not isinstance(
+                    exc, SRTransferUnresolved
+                ):
+                    raise SRTransferUnresolved(
+                        "candidate preflight failed after device submission"
+                    ) from exc
+            raise
+
+    def _warm_compare(self, organize_draft_results, select_top_k_tokens):
         # Deterministic values with ties and near ties, without RNG side effects.
         row = torch.arange(self.vocab, dtype=torch.float32, device=self.device)
+        self.holds.append(row)
         logits = (
             ((row % 97) * 0.03125)
             .to(self.dtype)
             .reshape(1, -1)
             .repeat(self.batch * self.topk, 1)
         )
+        self.holds.append(logits)
         p = torch.softmax(logits, dim=-1)
+        self.holds.append(p)
         expected = (
             torch.max(p, dim=-1, keepdim=True)
             if self.topk == 1
             else torch.topk(p, self.topk, dim=-1)
         )
-        self.holds = (logits, p, expected)
+        self.holds.append(expected)
         self.probability_out = True
-        try:
-            values, indices = self._probabilities(logits, 0)
-        except Exception:
-            self.unresolved = False
-            probability_match = False
-        else:
-            self._sync()
-            probability_match = (
-                torch.equal(self.probs, p)
-                and torch.equal(values, expected.values)
-                and torch.equal(indices, expected.indices)
-            )
+        values, indices = self._probabilities(logits, 0)
+        self._sync()
+        probability_match = (
+            torch.equal(self.probs, p)
+            and torch.equal(values, expected.values)
+            and torch.equal(indices, expected.indices)
+        )
         self.probability_out = bool(probability_match)
         # Validate strided score regions and all selection/order out variants.
         # A mismatch here cannot silently change the captured tree.
-        from sglang.srt.speculative.eagle_utils import organize_draft_results
-        from sglang.srt.speculative.spec_utils import select_top_k_tokens
-
         seed_p, seed_i = expected.values[: self.batch], expected.indices[: self.batch]
 
         def validate_selection():
@@ -334,47 +388,46 @@ class SRTreeCandidateWorkspace:
             reference_scores = workspace_scores = None
             score_list, token_list, parent_list = [], [], []
             compared = []
-            try:
-                for step in range(self.steps):
-                    ids, _, reference_scores, info, parents = select_top_k_tokens(
-                        step,
-                        rp,
-                        ri,
-                        None,
-                        reference_scores,
-                        self.topk,
-                    )
-                    wids, workspace_scores, nodes, wparents = self._select(
-                        step, wp, wi, workspace_scores, self.batch
-                    )
-                    next_probs = None
-                    if step < self.steps - 1:
-                        rp, ri = expected.values, expected.indices
-                        wp, wi = self._probabilities(logits, step)
-                        next_probs = (wp, wi, rp, ri)
-                    compared.append(
-                        (
-                            ids,
-                            wids,
-                            reference_scores,
-                            workspace_scores,
-                            info[2],
-                            nodes,
-                            parents,
-                            wparents,
-                            next_probs,
-                        )
-                    )
-                    score_list.append(info[0])
-                    token_list.append(info[1])
-                    parent_list.append(info[2])
-                ref = organize_draft_results(
-                    score_list, token_list, parent_list, self.width
+            self.holds.extend((score_list, token_list, parent_list, compared))
+            for step in range(self.steps):
+                ids, _, reference_scores, info, parents = select_top_k_tokens(
+                    step,
+                    rp,
+                    ri,
+                    None,
+                    reference_scores,
+                    self.topk,
                 )
-                got = self._finish(self.batch)
-            except Exception:
-                self.unresolved = False
-                return False
+                self.holds.append((ids, reference_scores, info, parents))
+                wids, workspace_scores, nodes, wparents = self._select(
+                    step, wp, wi, workspace_scores, self.batch
+                )
+                next_probs = None
+                if step < self.steps - 1:
+                    rp, ri = expected.values, expected.indices
+                    wp, wi = self._probabilities(logits, step)
+                    next_probs = (wp, wi, rp, ri)
+                compared.append(
+                    (
+                        ids,
+                        wids,
+                        reference_scores,
+                        workspace_scores,
+                        info[2],
+                        nodes,
+                        parents,
+                        wparents,
+                        next_probs,
+                    )
+                )
+                score_list.append(info[0])
+                token_list.append(info[1])
+                parent_list.append(info[2])
+            ref = organize_draft_results(
+                score_list, token_list, parent_list, self.width
+            )
+            self.holds.append(ref)
+            got = self._finish(self.batch)
             self._sync()
             for (
                 ids,
@@ -401,13 +454,14 @@ class SRTreeCandidateWorkspace:
                     return False
             return all(torch.equal(a, b) for a, b in zip(ref, got))
 
-        self.selection_out = True
+        self.selection_out = self.device.type != "cuda"
         if not validate_selection():
             self.selection_out = False
             if not validate_selection():
-                self.unresolved = False
                 self.holds = None
-                raise RuntimeError("candidate workspace changed tree semantics")
+                raise CandidatePreflightDeclined(
+                    "candidate workspace changed tree semantics"
+                )
         self.holds = None
         self.validated = True
         logger.info(
@@ -421,9 +475,10 @@ class SRTreeCandidateWorkspace:
 
 def candidate_workspace(worker, batch, seed, *, graph=False):
     device = seed.device
-    if device.type != "npu":
+    if device.type not in ("npu", "cuda"):
         return None
-    stream = torch.npu.current_stream(device)
+    backend = torch.npu if device.type == "npu" else torch.cuda
+    stream = backend.current_stream(device)
     from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
         _capturing,
         _stream_key,
@@ -451,15 +506,20 @@ def candidate_workspace(worker, batch, seed, *, graph=False):
             seed.dtype,
             graph=graph,
         )
+        # The owner must retain the object even if warmup fails after submission.
+        workspaces[key] = workspace
         try:
             workspace.warm()
-        except Exception:
+        except CandidatePreflightDeclined:
             logger.warning(
                 "[SR] candidate workspace preflight declined; using original draft assembly",
                 exc_info=True,
             )
             # Remember the decline so a failed preflight is not launched again.
             workspaces[key] = None
+        except BaseException:
+            workspace.unresolved = True
+            raise
         else:
             workspaces[key] = workspace
             metrics = getattr(

@@ -1302,13 +1302,14 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    branch_steps: tl.constexpr = 0,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
     topk_id = tl.program_id(axis=2)
 
-    num_steps = tl.num_programs(axis=0)
+    num_steps = branch_steps if branch_steps else tl.num_programs(axis=0)
     num_seqs = tl.num_programs(axis=1)
     topk = tl.num_programs(axis=2)
 

@@ -703,6 +703,83 @@ class TestKVMove(unittest.TestCase):
         kv.remap_tree_kv_(ws, slots.to(torch.int32), torch.arange(4), 3, active)
         self.assertEqual(ws.tree_indices.dtype, torch.int32)
 
+    def test_inactive_padding_does_not_overwrite_live_identity_source(self):
+        # Padding aliases a live identity slot and would write it if active.
+        # The mask leaves that slot unchanged while another live row reads it.
+        k = torch.arange(16, dtype=torch.float32).reshape(16, 1, 1)
+        v = k + 100
+        pool = NS(k_buffer=k.clone(), v_buffer=v.clone())
+        ws = kv.prepare_kv_move(pool, 4)
+        slots = torch.tensor([[5, 6, 7, 5]], dtype=torch.int64)
+        parents = torch.tensor([0, 0, 1, 2], dtype=torch.int64)
+        active = torch.tensor([True, True, True, False])
+        initial_k, initial_v = k.clone(), v.clone()
+        kv.remap_tree_kv_(ws, slots, parents, 1, active)
+
+        def reference(initial):
+            expected = initial.clone()
+            staged = {}
+            for row in range(4):
+                if not bool(active[row]):
+                    continue
+                src = int(slots[0, parents[row]])
+                dst = int(slots[0, row])
+                if src != dst:
+                    staged[row] = expected[src].clone()
+            for row, value in staged.items():
+                expected[int(slots[0, row])] = value
+            return expected
+
+        self.assertTrue(torch.equal(pool.k_buffer, reference(initial_k)))
+        self.assertTrue(torch.equal(pool.v_buffer, reference(initial_v)))
+        self.assertTrue(torch.equal(pool.k_buffer[5], initial_k[5]))
+        self.assertTrue(torch.equal(pool.k_buffer[6], initial_k[5]))
+
+    def test_tree_active_mask_prefix_and_capture_buffer(self):
+        mask = torch.zeros(8, dtype=torch.bool)
+        kv.fill_tree_active_mask(mask, 3)
+        self.assertEqual(
+            mask.tolist(), [True, True, True, False, False, False, False, False]
+        )
+        kv.fill_tree_active_mask(mask, 8)
+        self.assertTrue(bool(mask.all()))
+        with self.assertRaisesRegex(RuntimeError, "does not cover"):
+            kv.fill_tree_active_mask(mask, 9)
+
+        drafter = Path(kv.__file__).with_name("drafter") / "sr_tree_drafter.py"
+        tree = ast.parse(drafter.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter"
+        )
+        fn = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_cuda_tree_active_rows"
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+        namespace = {"torch": torch}
+        exec(compile(module, str(drafter), "exec"), namespace)
+        active_rows = namespace["_cuda_tree_active_rows"]
+
+        eager = NS(_capture_tree_kv_workspace=None)
+        first = active_rows(eager, 4, torch.device("cpu"))
+        second = active_rows(eager, 2, torch.device("cpu"))
+        self.assertEqual(first.tolist(), [True, True, True, True])
+        self.assertEqual(second.tolist(), [True, True])
+        self.assertEqual(second.data_ptr(), eager._tree_active_eager.data_ptr())
+        graph_buf = torch.ones(6, dtype=torch.bool)
+        graph = NS(
+            _capture_tree_kv_workspace=object(),
+            _tree_active_graph=graph_buf,
+        )
+        view = active_rows(graph, 6, torch.device("cpu"))
+        self.assertEqual(view.data_ptr(), graph_buf.data_ptr())
+        missing = NS(_capture_tree_kv_workspace=object(), _tree_active_graph=None)
+        with self.assertRaisesRegex(RuntimeError, "before capture"):
+            active_rows(missing, 2, torch.device("cpu"))
+
     def test_tree_bad_metadata_fails_before_copy(self):
         ws = kv.prepare_kv_move(paged(), 4)
         for slots, parents, depth in (

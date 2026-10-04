@@ -334,6 +334,21 @@ class TestCUDAKVMove(unittest.TestCase):
 
 @unittest.skipUnless(torch_npu is not None, "requires torch_npu and NPU")
 class TestNPUCandidates(unittest.TestCase):
+    def test_unindexed_device_resolves_to_tensor_device(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        ws = SRTreeCandidateWorkspace("npu", 1, 2, 2, 3, 37, torch.float32)
+        self.assertEqual(ws.device, torch.device("npu", torch.npu.current_device()))
+        self.assertEqual(ws.device, ws.probs.device)
+        ws.warm()
+        logits = torch.randn(2, 37, device=ws.device)
+        values, indices = ws.probabilities(logits, 0)
+        expected = torch.topk(torch.softmax(logits, -1), 2, -1)
+        torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
+        self.assertTrue(torch.equal(indices, expected.indices))
+
     def episode(self, workspace, seed_p, seed_i, logits):
         from sglang.srt.speculative.spec_utils import select_top_k_tokens
         from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -375,7 +390,8 @@ class TestNPUCandidates(unittest.TestCase):
         )
 
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            workspace = SRTreeCandidateWorkspace("npu", 4, 3, 5, 15, 151936, dtype)
+            device = torch.device("npu", torch.npu.current_device())
+            workspace = SRTreeCandidateWorkspace(device, 4, 3, 5, 15, 151936, dtype)
             workspace.warm()
             key = workspace._storage_key()
             for batch in (1, 2, 3, 4, 3, 1):
@@ -394,7 +410,14 @@ class TestNPUCandidates(unittest.TestCase):
         )
 
         workspace = SRTreeCandidateWorkspace(
-            "npu", 4, 3, 5, 15, 257, torch.float32, graph=True
+            torch.device("npu", torch.npu.current_device()),
+            4,
+            3,
+            5,
+            15,
+            257,
+            torch.float32,
+            graph=True,
         )
         workspace.warm()
         seed_p = torch.rand(4, 3, device="npu")
@@ -451,6 +474,472 @@ class TestNPUCandidates(unittest.TestCase):
             self.assertTrue(all(d == device and s == stream for d, s in observed))
         finally:
             worker.close()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestCUDASRPaths(unittest.TestCase):
+    def test_actual_backend_eager_graph_metadata_binding_and_reuse(self):
+        from sglang.srt.layers.attention.triton_backend import (
+            TritonMultiStepDraftBackend,
+        )
+
+        backend = TritonMultiStepDraftBackend.__new__(TritonMultiStepDraftBackend)
+        backend._sr_cuda_metadata = True
+        backend._sr_eager_metadata = {}
+        backend.device = "cuda"
+        backend.metadata_steps, backend.speculative_num_steps = 4, 5
+        backend.topk, backend.max_context_len, backend.pool_len, backend.page_size = (
+            3,
+            64,
+            64,
+            1,
+        )
+        backend.kv_indptr = torch.zeros(4, 13, dtype=torch.int32, device="cuda")
+        backend.cuda_graph_kv_indices = torch.empty(
+            4, 12 * 64, dtype=torch.int64, device="cuda"
+        )
+        views = []
+        backend.attn_backends = [
+            NS(
+                init_forward_metadata=lambda b: views.append(
+                    (b.spec_info.kv_indices, b.spec_info.kv_indptr)
+                )
+            )
+            for _ in range(4)
+        ]
+        backend.attn_backends[-1].cuda_graph_num_kv_splits = torch.zeros(
+            12, dtype=torch.int32, device="cuda"
+        )
+        backend.attn_backends[-1].get_num_kv_splits = lambda *a: None
+        mapping = torch.arange(4 * 64, dtype=torch.int32, device="cuda").reshape(4, 64)
+        for b in (1, 2, 3, 4, 3, 1):
+            seq = torch.arange(5, 5 + b, device="cuda")
+            batch = NS(
+                batch_size=b,
+                seq_lens=seq,
+                seq_lens_sum=int(seq.sum()),
+                req_pool_indices=torch.arange(b - 1, -1, -1, device="cuda"),
+                req_to_token_pool=NS(req_to_token=mapping),
+                positions=seq.repeat_interleave(3),
+                spec_info=NS(),
+            )
+            views.clear()
+            backend.init_forward_metadata(batch)
+            eager = [(i.clone(), p.clone()) for i, p in views]
+            pointers = [(i.data_ptr(), p.data_ptr()) for i, p in views]
+            views.clear()
+            backend.init_forward_metadata(batch)
+            self.assertEqual(pointers, [(i.data_ptr(), p.data_ptr()) for i, p in views])
+            backend.init_forward_metadata_replay_cuda_graph(batch, b)
+            for step, (indices, indptr) in enumerate(eager):
+                self.assertTrue(
+                    torch.equal(
+                        indices, backend.cuda_graph_kv_indices[step, : indices.numel()]
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(indptr, backend.kv_indptr[step, : indptr.numel()])
+                )
+            self.assertIs(backend._sr_metadata_holds[1], backend.cuda_graph_kv_indices)
+        self.assertEqual(len(backend._sr_eager_metadata), 1)
+
+    def test_masked_padding_keeps_identity_source_read_by_live_row(self):
+        k = torch.arange(16, device="cuda", dtype=torch.float32).view(16, 1, 1)
+        v = k + 100
+        pool = NS(k_buffer=k.clone(), v_buffer=v.clone())
+        ws = kv.prepare_kv_move(pool, 4)
+        self.assertEqual(ws.backend, "cuda_layered")
+        slots = torch.tensor([[5, 6, 7, 5]], device="cuda")
+        parents = torch.tensor([0, 0, 1, 2], device="cuda")
+        active = torch.tensor([True, True, True, False], device="cuda")
+        initial_k = k.clone()
+        kv.remap_tree_kv_(ws, slots, parents, 1, active)
+        torch.cuda.synchronize()
+        actual = pool.k_buffer.cpu()
+        self.assertTrue(torch.equal(actual[5], initial_k.cpu()[5]))
+        self.assertTrue(torch.equal(actual[6], initial_k.cpu()[5]))
+        self.assertTrue(torch.equal(actual[7], initial_k.cpu()[6]))
+        self.assertTrue(torch.equal(pool.v_buffer.cpu()[5], (initial_k + 100).cpu()[5]))
+
+    def test_layered_overlap_across_cuda_grid_chunk_boundary(self):
+        # This cycle crosses the y-axis chunk boundary. Chunk-interleaved
+        # gather/scatter would lose the last source before it is read.
+        n = 65537
+        tensors = [
+            torch.arange(n * 3, device="cuda", dtype=torch.float32).view(n, 1, 3) + j
+            for j in range(4)
+        ]
+        pool = NS(k_buffer=tensors[:2], v_buffer=tensors[2:])
+        ws = kv.prepare_kv_move(pool, n)
+        dst = torch.arange(n, device="cuda")
+        src = dst.roll(1)
+        snapshots = [t.clone() for t in tensors]
+        kv.move_kv_slots_(ws, src, dst)
+        for initial, actual in zip(snapshots, tensors):
+            self.assertTrue(torch.equal(actual, initial.index_select(0, src)))
+
+    def test_token_accept_admission_commit_and_stop(self):
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            build_fixed_accept_state,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDHostPlan,
+            rpd_batch_key,
+        )
+
+        class MHATokenToKVPool:
+            row_dim = 0
+
+            def __init__(self):
+                self.k_buffer = [torch.randn(64, 2, 7, device="cuda")]
+                self.v_buffer = [torch.randn(64, 2, 7, device="cuda")]
+
+        class TokenToKVPoolAllocator:
+            page_size, is_not_in_free_group = 1, True
+
+            def __init__(self):
+                self.pool, self.freed = MHATokenToKVPool(), []
+
+            def get_kvcache(self):
+                return self.pool
+
+            def free(self, slots):
+                self.freed.append(slots.clone())
+
+        def request(stop):
+            req = NS(
+                output_ids=[],
+                require_reasoning=False,
+                kv_committed_len=5,
+                spec_verify_ct=0,
+                spec_accepted_tokens=0,
+            )
+            req.finished = lambda: stop is not None and len(req.output_ids) >= stop
+            req.check_finished = lambda: None
+            req.update_spec_acceptance_histogram = lambda n: None
+            return req
+
+        for stops in ((None, None), (1, None), (1, 2)):
+            for host in (False, True):
+                alloc = TokenToKVPoolAllocator()
+                worker = NS(
+                    device="cuda",
+                    topk=2,
+                    page_size=1,
+                    speculative_num_steps=2,
+                    speculative_num_draft_tokens=4,
+                    _verify_max_bs=2,
+                    _hybrid_needs_hidden=False,
+                    token_to_kv_pool_allocator=alloc,
+                )
+                state = build_fixed_accept_state(worker)
+                self.assertIsNotNone(state)
+                state.warmup_scratch()
+                batch = NS(
+                    reqs=[request(n) for n in stops],
+                    seq_lens=torch.tensor([5, 7], device="cuda"),
+                    seq_lens_cpu=torch.tensor([5, 7]),
+                    req_pool_indices=torch.tensor([2, 0], device="cuda"),
+                    req_to_token_pool=NS(
+                        req_to_token=torch.zeros(
+                            4, 64, dtype=torch.int32, device="cuda"
+                        )
+                    ),
+                    out_cache_loc=torch.tensor(
+                        [11, 15, 17, 19, 21, 23, 25, 27], device="cuda"
+                    ),
+                    model_config=NS(think_end_id=None),
+                    spec_algorithm=NS(is_standalone_remote=lambda: True),
+                )
+                rows, tokens = [[0, 2, -1], [4, 7, 5]], [[31, 32, 0], [41, 42, 43]]
+                before = alloc.pool.k_buffer[0].clone()
+                if host:
+                    plan = SRRPDHostPlan(
+                        rows, tokens, [1, 2], 100, rpd_batch_key(batch.reqs)
+                    )
+                    out = state.finalize_from_host(batch, NS(), 1, 2, alloc, plan)
+                    self.assertEqual(state._d2h_count, 0)
+                else:
+                    pred = torch.tensor(
+                        [31, 0, 32, 0, 41, 43, 0, 42, 0],
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    out = state.finalize(
+                        batch,
+                        NS(),
+                        1,
+                        2,
+                        alloc,
+                        torch.tensor(rows, device="cuda"),
+                        pred,
+                        torch.tensor([1, 2], device="cuda"),
+                    )
+                counts = [1 if stops[0] else 2, stops[1] or 3]
+                kept = rows[0][: counts[0]] + rows[1][: counts[1]]
+                cache = [11, 15, 17, 19, 21, 23, 25, 27]
+                self.assertEqual(out.accepted_indices.cpu().tolist(), kept)
+                self.assertEqual(
+                    alloc.freed[0].cpu().tolist(),
+                    [cache[i] for i in range(8) if i not in kept],
+                )
+                self.assertEqual(
+                    batch.seq_lens.cpu().tolist(), [5 + counts[0], 7 + counts[1]]
+                )
+                self.assertTrue(torch.equal(before, alloc.pool.k_buffer[0]))
+                self.assertEqual(state._h2d_count, 1)
+                self.assertFalse(hasattr(alloc.pool, "_kv_move_workspaces"))
+
+    def test_metadata_graph_reads_live_mapping_and_keeps_five_step_span(self):
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.standalone_remote.sr_cuda_metadata import (
+            SRDraftDecodeMetadataWorkspace,
+        )
+
+        ws = SRDraftDecodeMetadataWorkspace("cuda", 4, 64)
+        indices, indptr = ws.reserve(12)
+        mapping = torch.arange(4 * 64, device="cuda").reshape(4, 64)
+        mapping[0].zero_()
+        req = torch.tensor([1, 2, 3, 0], device="cuda")
+        prefix = torch.tensor([5, 7, 9, 0], device="cuda")
+        positions = prefix.repeat_interleave(3)
+
+        def run():
+            generate_draft_decode_kv_indices[(4, 4, 3)](
+                req,
+                mapping,
+                prefix,
+                indices,
+                indptr,
+                positions,
+                64,
+                indices.shape[1],
+                indptr.shape[1],
+                4,
+                8,
+                16,
+                1,
+                branch_steps=5,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for lens in ([5, 7, 9, 0], [0, 11, 3, 0]):
+            prefix.copy_(torch.tensor(lens, device="cuda"))
+            positions.copy_(prefix.repeat_interleave(3))
+            req[:3].copy_(torch.tensor([3, 1, 2], device="cuda"))
+            graph.replay()
+            actual, pointers = indices.cpu(), indptr.cpu()
+            cpu_map, cpu_req = mapping.cpu(), req.cpu()
+            for step in range(4):
+                gold, ends = [], [0]
+                for b, length in enumerate(lens):
+                    for branch in range(3):
+                        gold.extend(cpu_map[cpu_req[b], :length].tolist())
+                        start = length + branch * 5
+                        gold.extend(
+                            cpu_map[cpu_req[b], start : start + step + 1].tolist()
+                        )
+                        ends.append(len(gold))
+                self.assertEqual(actual[step, : len(gold)].tolist(), gold)
+                self.assertEqual(pointers[step, :13].tolist(), ends)
+
+    def test_pack_and_token_slots_strides_and_storage(self):
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept_kernels import (
+            pack_accept,
+            gather_token_slots,
+        )
+
+        for dtype in (torch.int32, torch.int64):
+            index = torch.tensor(
+                [[0, 4, -1, -1], [8, 10, 14, -1]], dtype=dtype, device="cuda"
+            )[:, ::2]
+            pred = torch.arange(15, dtype=dtype, device="cuda")
+            lengths = torch.tensor([0, 1], dtype=dtype, device="cuda")
+            out = torch.empty(2, 6, dtype=torch.int64, device="cuda")
+            gold = torch.empty(2, 6, dtype=torch.int64)
+            pack_accept(index.cpu(), pred.cpu(), lengths.cpu(), gold)
+            pack_accept(index, pred, lengths, out)
+            self.assertTrue(torch.equal(gold, out.cpu()))
+            cache = torch.arange(40, dtype=dtype, device="cuda")[::2]
+            kept = torch.tensor([0, 3, 7], device="cuda")
+            free = torch.tensor([1, 4, 9], device="cuda")
+            slots, released = gather_token_slots(cache, kept, free)
+            self.assertEqual(slots.cpu().tolist(), [0, 6, 14])
+            self.assertEqual(released.cpu().tolist(), [2, 8, 18])
+            self.assertEqual(slots.storage_offset(), 0)
+            self.assertNotEqual(
+                slots.untyped_storage().data_ptr(),
+                released.untyped_storage().data_ptr(),
+            )
+
+    def test_layered_bits_strides_overlap_and_growth(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.uint8):
+            k = [
+                torch.arange(32 * 2 * 67, device="cuda").reshape(32, 2, 67).to(dtype)
+                for _ in range(3)
+            ]
+            v = [t.transpose(1, 2) for t in k]  # distinct views need separate storage
+            v = [t.clone() for t in v]
+            pool = NS(k_buffer=k, v_buffer=v)
+            ws = kv.prepare_kv_move(pool, 8)
+            self.assertEqual(ws.backend, "cuda_layered")
+            for src in (
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [1, 2, 3, 4, 5, 6, 7, 0],
+                [0, 0, 2, 2, 0, 2, 6, 6],
+            ):
+                before = [b.tensor.clone() for b in ws.layout.buffers]
+                s = torch.tensor(src, dtype=torch.int32, device="cuda")
+                d = torch.arange(8, device="cuda")
+                kv.move_kv_slots_(ws, s, d)
+                for b, original in zip(ws.layout.buffers, before):
+                    gold = original.index_copy(0, d, original.index_select(0, s.long()))
+                    self.assertTrue(torch.equal(b.tensor, gold))
+            kv.prepare_kv_move(pool, 17)
+            self.assertEqual(ws.capacity, 32)
+            table_ptrs = [row[0].data_ptr() for row in ws.cuda_tables]
+            kv.prepare_kv_move(pool, 12)
+            self.assertEqual(table_ptrs, [row[0].data_ptr() for row in ws.cuda_tables])
+            kv.warm_private_slot_move(pool)
+
+    def test_tree_graph_dynamic_parents_slots_and_active(self):
+        pool = NS(
+            k_buffer=[torch.randn(64, 2, 67, device="cuda") for _ in range(3)],
+            v_buffer=[torch.randn(64, 2, 67, device="cuda") for _ in range(3)],
+        )
+        ws = kv.prepare_kv_move(pool, 36, domain="test_tree", graph=True)
+        slots = torch.arange(36, device="cuda").reshape(3, 12).t().contiguous().t()
+        parents = torch.arange(12, device="cuda")
+        active = torch.tensor([True] * 9 + [False] * 3, device="cuda")
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm), ws.capture_scope():
+            kv.remap_tree_kv_(ws, slots, parents, 3, active)
+        torch.cuda.current_stream().wait_stream(warm)
+        graph = torch.cuda.CUDAGraph()
+        with ws.capture_scope(), torch.cuda.graph(graph):
+            kv.remap_tree_kv_(ws, slots, parents, 3, active)
+        for p in ([1, 2, 0] * 4, [2, 2, 2, 3, 4, 5, 8, 6, 7, 9, 10, 11]):
+            parents.copy_(torch.tensor(p, device="cuda"))
+            slots.add_(1)
+            before = [b.tensor.clone() for b in ws.layout.buffers]
+            graph.replay()
+            for b, original in zip(ws.layout.buffers, before):
+                gold = original.clone()
+                for step in range(3):
+                    gold.index_copy_(
+                        0,
+                        slots[step, :9],
+                        original.index_select(0, slots[step, parents[:9]]),
+                    )
+                self.assertTrue(torch.equal(gold, b.tensor))
+
+    def test_rpd_host_plan_matches_old_compact_and_single_wait(self):
+        from collections import Counter
+        from sglang.srt.speculative import rpd_verify as rpd
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            VerifyInputPacket,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDWorkspace,
+            verify_sr_rpd_host,
+        )
+
+        ws = SRRPDWorkspace()
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for tau in (0.0, 0.2, 0.5):
+                packet = VerifyInputPacket()
+                packet.load(
+                    [2, 2],
+                    [[1, 2, 3, 4, 5]] * 2,
+                    [[-1, 0, 1, 2, 3]] * 2,
+                    [list(range(5))] * 2,
+                    2,
+                    3,
+                    6,
+                    "cuda",
+                    rpd_vocab=32,
+                )
+                ctx = packet.rpd_input
+                logits = torch.randn(12, 32, dtype=dtype, device="cuda")
+                logits[0, 0] = float("nan")
+                metrics = NS(counts=Counter())
+                self.assertIsNone(ws.prepare(logits, ctx, metrics))
+                tree = ctx.tree.to("cuda")
+                pred = torch.zeros(13, dtype=torch.int32, device="cuda")
+                rows = torch.full((2, 4), -1, dtype=torch.int32, device="cuda")
+                lengths = torch.zeros(2, dtype=torch.int32, device="cuda")
+                rpd.verify_tree_rpd(pred, rows, lengths, *tree, logits, tau)
+                plan = verify_sr_rpd_host(logits, ctx, ws, tau, 4)
+                self.assertEqual(plan.rows, rows.cpu().tolist())
+                self.assertEqual(plan.pre_lengths, lengths.cpu().tolist())
+                gold_tokens = [
+                    [int(pred[i]) if i >= 0 else 0 for i in row] for row in plan.rows
+                ]
+                self.assertEqual(plan.tokens, gold_tokens)
+                self.assertEqual(metrics.counts["rpd_host_stats_waits"], 1)
+                self.assertEqual(metrics.counts["rpd_host_stats_d2h_count"], 2)
+
+    def test_candidates_cuda_preserve_compiled_selection_and_graph(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+        from sglang.srt.speculative.spec_utils import select_top_k_tokens
+        from sglang.srt.speculative.eagle_utils import organize_draft_results
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            # Separate model dtypes must not share a test-only accumulated
+            # compile guard cache and silently exceed Dynamo's default limit.
+            torch._dynamo.reset()
+            ws = SRTreeCandidateWorkspace(
+                "cuda", 4, 3, 5, 15, 151936, dtype, graph=True
+            )
+            ws.warm()
+            self.assertFalse(ws.selection_out)
+            logits = torch.zeros(4, 12, 151936, dtype=dtype, device="cuda")
+            seed = torch.topk(torch.softmax(logits[0, :4], -1), 3, -1)
+
+            def run():
+                p, ids, scores = seed.values, seed.indices, None
+                for step in range(5):
+                    _, scores, _, _ = ws.select(step, p, ids, scores)
+                    if step < 4:
+                        p, ids = ws.probabilities(logits[step], step)
+                return ws.finish(4)
+
+            warm = torch.cuda.Stream()
+            warm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm), ws.capture_scope():
+                run()
+            torch.cuda.current_stream().wait_stream(warm)
+            graph = torch.cuda.CUDAGraph()
+            with ws.capture_scope(), torch.cuda.graph(graph):
+                out = run()
+            for value in (0.0, 0.01, float("nan"), float("inf"), -float("inf")):
+                logits[:, :, 10:13].fill_(value)
+                graph.replay()
+                p, ids, scores = seed.values, seed.indices, None
+                ss, tt, pp = [], [], []
+                for step in range(5):
+                    _, _, scores, info, _ = select_top_k_tokens(
+                        step, p, ids, None, scores, 3
+                    )
+                    ss.append(info[0])
+                    tt.append(info[1])
+                    pp.append(info[2])
+                    torch.testing.assert_close(
+                        ws.scores[step], scores, rtol=0, atol=0, equal_nan=True
+                    )
+                    if step < 4:
+                        top = torch.topk(torch.softmax(logits[step], -1), 3, -1)
+                        p, ids = top.values, top.indices
+                gold = organize_draft_results(ss, tt, pp, 15)
+                for actual, expected in zip(out, gold):
+                    self.assertTrue(torch.equal(actual, expected))
 
 
 if __name__ == "__main__":

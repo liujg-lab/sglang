@@ -396,6 +396,23 @@ class KVMoveWorkspace:
 
             self.kernels = sr_kv_copy_kernels
             self.backend = "npu_paged6"
+        elif (
+            layout.device.type == "cuda"
+            and layout.kind == "token"
+            and all(
+                b.axis == 0
+                and b.tensor.ndim == 3
+                and b.tensor.element_size() in (1, 2, 4, 8)
+                for b in layout.buffers
+            )
+        ):
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy_kernels_cuda import (
+                CudaLayeredCopy,
+            )
+
+            self.kernels = CudaLayeredCopy(layout)
+            self.cuda_tables = []
+            self.backend = "cuda_layered"
 
     def _count(self, key, value=1):
         self.counts[key] += value
@@ -449,6 +466,23 @@ class KVMoveWorkspace:
             tree_index = torch.empty(
                 (2, cap), dtype=self.tree_indices.dtype, device=self.layout.device
             )
+        new_tables = None
+        if self.backend == "cuda_layered":
+            # If a pointer-table transfer fails, its completion is uncertain.
+            # Retain both generations and never submit a move with stale tables.
+            try:
+                new_tables = self.kernels.prepare(self, new)
+            except BaseException as exc:
+                self.hold = (
+                    self.hold,
+                    new,
+                    new_backings,
+                    getattr(self, "_cuda_preparing", None),
+                )
+                self._poison()
+                raise KVMoveSubmittedError(
+                    "CUDA KV pointer-table preparation failed"
+                ) from exc
         # Commit all allocations together. A failed integer-buffer allocation
         # must not leave a larger capacity paired with the old small indices.
         if self.scratch and self._used and self.layout.device.type != "cpu":
@@ -460,6 +494,7 @@ class KVMoveWorkspace:
                     self.index_scratch,
                     getattr(self, "tree_indices", None),
                     self.hold,
+                    getattr(self, "cuda_tables", None),
                     self.scratch_backings,
                 )
             )
@@ -471,6 +506,9 @@ class KVMoveWorkspace:
         if tree_index is not None:
             self.tree_indices = tree_index
         self.capacity = cap
+        if new_tables is not None:
+            self.cuda_tables = new_tables
+            self._cuda_preparing = None
         self._refresh_memory()
         self.peak_bytes = max(self.peak_bytes, self.scratch_bytes + self.retired_bytes)
         self._count("grow")
@@ -538,6 +576,8 @@ class KVMoveWorkspace:
             self.index_scratch,
             getattr(self, "tree_indices", None),
         ]
+        for table in getattr(self, "cuda_tables", ()):
+            tensors.extend(table[:2])
         self.scratch_bytes = sum(
             t.numel() * t.element_size() for t in tensors if t is not None
         )
@@ -579,7 +619,12 @@ class KVMoveWorkspace:
             )
 
     def submitted(self, inputs, run):
-        self.hold = (inputs, self.scratch, self.scratch_backings)
+        self.hold = (
+            inputs,
+            self.scratch,
+            self.scratch_backings,
+            getattr(self, "cuda_tables", None),
+        )
         self._used = True
         try:
             stream = _stream(self.layout.device)
@@ -819,7 +864,9 @@ def move_kv_slots_(workspace, src, dst):
     n = src.numel()
 
     def run():
-        if workspace.kernels is not None:
+        if workspace.backend == "cuda_layered":
+            workspace.kernels.launch(workspace, src, dst)
+        elif workspace.kernels is not None:
             workspace.kernels.move(
                 workspace.layout.buffers[0].tensor,
                 workspace.scratch[0],
@@ -831,6 +878,23 @@ def move_kv_slots_(workspace, src, dst):
 
     workspace.submitted(original_indices + (src, dst), run)
     workspace.account(n)
+
+
+def fill_tree_active_mask(mask: torch.Tensor, live_rows: int) -> None:
+    """Mark the raw-batch prefix live and the graph-padding tail inactive.
+
+    The buffer is allocated before capture. Replay only updates its contents,
+    so captured kernels keep the same address and grid.
+    """
+    live = int(live_rows)
+    if mask.ndim != 1 or mask.dtype != torch.bool:
+        raise RuntimeError("tree active mask must be a boolean row vector")
+    if live < 0 or live > int(mask.numel()):
+        raise RuntimeError("tree active mask does not cover the raw batch")
+    if live:
+        mask[:live].fill_(True)
+    if live < int(mask.numel()):
+        mask[live:].fill_(False)
 
 
 def remap_tree_kv_(workspace, slots, parents, depth, active_rows=None):
@@ -858,6 +922,15 @@ def remap_tree_kv_(workspace, slots, parents, depth, active_rows=None):
         or active_rows.dtype not in (torch.bool, torch.int32, torch.int64)
     ):
         raise RuntimeError("tree KV active mask mismatch")
+    if workspace.backend == "cuda_layered":
+        workspace.submitted(
+            (slots, parents) + (() if active_rows is None else (active_rows,)),
+            lambda: workspace.kernels.launch(
+                workspace, slots=slots, parents=parents, depth=depth, active=active_rows
+            ),
+        )
+        workspace.account(depth * rows)
+        return
     if workspace.kernels is not None:
         workspace.submitted(
             (slots, parents) + (() if active_rows is None else (active_rows,)),

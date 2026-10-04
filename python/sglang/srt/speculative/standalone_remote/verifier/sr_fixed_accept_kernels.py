@@ -32,6 +32,15 @@ def pack_accept(
         raise RuntimeError("fixed accept pack requires integer tensors on one device")
     if accept_length.numel() != bs:
         raise RuntimeError("fixed accept length batch mismatch")
+    if out.device.type == "cuda":
+        from sglang.srt.speculative.standalone_remote import sr_small_kernels_cuda
+
+        if not predict.is_contiguous() or accept_length.ndim != 1:
+            raise RuntimeError(
+                "CUDA accept pack requires contiguous predict and flat lengths"
+            )
+        sr_small_kernels_cuda.pack_accept(accept_index, predict, accept_length, out)
+        return
     if out.device.type == "npu":
         from sglang.srt.speculative.standalone_remote import sr_small_kernels_npu
 
@@ -112,3 +121,29 @@ def gather_commit_slots(
                 cache.index_select(0, page_index).to(torch.int64) // int(page_size)
             )
     return src, tgt, pages
+
+
+def gather_token_slots(out_cache_loc, kept_index, free_index):
+    """Known CPU-planned lengths; independent outputs survive later rounds."""
+    cache = out_cache_loc.reshape(-1)
+    if cache.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError("token-slot cache must be integer")
+    for index in (kept_index, free_index):
+        if (
+            index.ndim != 1
+            or index.device != cache.device
+            or index.dtype != torch.int64
+        ):
+            raise RuntimeError("token-slot indices must be local int64 vectors")
+    kept = torch.empty(kept_index.numel(), dtype=torch.int64, device=cache.device)
+    released = torch.empty(free_index.numel(), dtype=torch.int64, device=cache.device)
+    if cache.device.type == "cuda":
+        from sglang.srt.speculative.standalone_remote import sr_small_kernels_cuda
+
+        sr_small_kernels_cuda.gather_token_slots(
+            cache, kept_index, free_index, kept, released
+        )
+    else:
+        torch.index_select(cache, 0, kept_index, out=kept)
+        torch.index_select(cache, 0, free_index, out=released)
+    return kept, released

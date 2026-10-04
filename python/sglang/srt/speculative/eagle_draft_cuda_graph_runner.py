@@ -399,13 +399,16 @@ class EAGLEDraftCudaGraphRunner:
                 if identity_ws is not None
                 else nullcontext()
             )
-            candidate_scope = candidate_ws.capture_scope() if candidate_ws is not None else nullcontext()
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+                candidate_capture_scope,
+            )
+
+            candidate_scope = candidate_capture_scope(self.eagle_worker, candidate_ws)
             with kv_scope, identity_scope, candidate_scope:
                 if workspace is not None:
                     self.eagle_worker._capture_tree_kv_workspace = workspace
                 if identity_ws is not None:
                     self.eagle_worker._capture_identity_workspace = identity_ws
-                self.eagle_worker._capture_candidate_workspace = candidate_ws
                 try:
                     ret = self.eagle_worker.draft_forward(forward_batch)
                 finally:
@@ -413,7 +416,6 @@ class EAGLEDraftCudaGraphRunner:
                         self.eagle_worker._capture_tree_kv_workspace = None
                     if identity_ws is not None:
                         self.eagle_worker._capture_identity_workspace = None
-                    self.eagle_worker._capture_candidate_workspace = None
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -465,6 +467,16 @@ class EAGLEDraftCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
         bs = self.capture_bs[index]
+        candidate_ws = getattr(self, "_sr_candidate_workspaces", {}).get(bs)
+        if candidate_ws is not None:
+            candidate_ws.check(bs, check_stream=False)
+            # Capture streams may differ from the caller's replay stream. Bind
+            # the first consumer stream; later cross-stream reuse is rejected.
+            stream = torch.cuda.current_stream(candidate_ws.device)
+            previous = getattr(candidate_ws, "_replay_stream", stream)
+            if previous != stream:
+                raise RuntimeError("candidate graph workspace replay stream changed")
+            candidate_ws._replay_stream = stream
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -516,6 +528,14 @@ class EAGLEDraftCudaGraphRunner:
         self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
+        active = getattr(self.eagle_worker, "_tree_active_graph", None)
+        if active is not None:
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+                fill_tree_active_mask,
+            )
+
+            fill_tree_active_mask(active, int(raw_bs) * int(self.eagle_worker.topk))
+
         # Replay
         try:
             self._replay(forward_batch)
@@ -527,7 +547,10 @@ class EAGLEDraftCudaGraphRunner:
 
             if isinstance(exc, NpuGraphPreparationError):
                 raise
-            if workspace is None and identity_ws is None:
+            if candidate_ws is not None:
+                candidate_ws.unresolved = True
+                candidate_ws.holds = (forward_batch, candidate_ws._storage)
+            if workspace is None and identity_ws is None and candidate_ws is None:
                 raise
             if workspace is not None:
                 workspace._poison()
