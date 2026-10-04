@@ -24,22 +24,18 @@ KV 搬移算法或共享 `verify_tree_rpd()` 的签名及返回值。
    `gap <= -ln(1-tau)`，tau=0 比较 argmax token；优先最长路径，然后累计 gap
    较小，最后保持原 sibling 次序。token 按原折叠结果构造，重复写位置最后一次生效。
 5. `SRFixedAcceptState.finalize_from_host()` 整批校验主机计划，再进入与 greedy
-   共用的 CPU 停止判断、路径导出和一次提交包 H2D。
+   共用的 CPU 停止判断、路径导出、提交包、KV 搬移和页面释放。
    不调用树 D2H、`_rpd_compact_apply()` 或 greedy 接受结果打包/D2H。
-   NPU 分页提交仍搬移 KV 并释放页面。CUDA `page_size=1` 的 token 槽位提交保留
-   接受 token 的原物理槽位，不压紧、不搬移 KV。
-   输出/KV 增量为含 bonus 的 A，对外草稿数为 A-1；接受
+   最终提交包一次 H2D。输出/KV 增量为含 bonus 的 A，对外草稿数为 A-1；接受
    histogram 保留停止截断前口径。结果按原固定接受流程独立持有，不借用下一轮缓冲。
 
 ## 分派与失败
 
 沿用 `SGLANG_NPU_SR_FIXED_ACCEPT`，未设置或真值请求启用；设为 0 并重启 Target，
-恢复 NPU 上整条旧 RPD 路径，包括旧输入包布局。NPU 固定接受仍只覆盖六维分页
-MHA/GQA、topk>1 且容量匹配的批次。CUDA 使用独立准入：`page_size=1` 的普通
-token-major MHA/GQA，不放宽 NPU 的六维分页检查，也不读取该 NPU 开关。
-RPD 上下文缺失/过期、grammar、logprob、hidden 消费、自定义处理器、模拟接受长度、
-非支持 logits 布局或 pinned/event 能力不足时，在优化核验前走旧路径。
-共享 conservative mode 判定未放宽。
+恢复整条旧 RPD 路径，包括旧输入包布局。仅原固定接受支持的 NPU、六维分页
+MHA/GQA、topk>1、容量匹配批次可用。RPD 上下文缺失/过期、grammar、logprob、
+hidden 消费、自定义处理器、模拟接受长度、非支持 logits 布局或 pinned/event
+能力不足时，在优化核验前走旧路径。共享 conservative mode 判定未放宽；CUDA 不变。
 
 输入 generation 或请求行序变化拒绝旧计划；同一上下文、同一计划只消费一次。
 缺失上下文的回退原因是 `rpd_context`，请求行序变化是 `rpd_batch_key`，二者都不是共享的 `mode`。

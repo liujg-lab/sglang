@@ -354,7 +354,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         fixed_decision = None
         if sr_accept_state is not None:
             from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
-                FixedAcceptBufferUnsupported,
                 accept_control_decision,
                 detach_verify_output,
                 multimodal_accept_reject_reason,
@@ -408,8 +407,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         sr_accept_state.bind_verify_buffers(bs)
                     )
                     fixed_bound = True
-                except FixedAcceptBufferUnsupported as exc:
-                    sr_accept_state.note_path("fixed_accept_" + exc.reason)
+                except RuntimeError:
+                    sr_accept_state.note_path("fixed_accept_noncontiguous")
             else:
                 sr_accept_state.note_path("fixed_accept_" + reject_reason)
                 if early_mode == "rpd":

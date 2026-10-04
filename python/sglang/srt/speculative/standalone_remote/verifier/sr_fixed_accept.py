@@ -1,8 +1,7 @@
 """Fixed-capacity SR Target accept postprocess.
 
-CPU-importable. Device kernels load only after static admission decides to build
-the workspace. CUDA token slots and NPU paged commits have separate policies.
-``A`` is the final output count including the bonus token.
+CPU-importable. NPU kernels load only after static admission decides to build
+the workspace. ``A`` is the final output count including the bonus token.
 ``accept_length_per_req_cpu`` stays ``A - 1`` for the existing API. KV bounds
 move by ``A``.
 """
@@ -21,7 +20,6 @@ import torch
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
     alloc_host,
-    event_supported,
     submit_copy,
     wait_event,
 )
@@ -33,14 +31,6 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _KERNEL_MODULE = (
     "sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept_kernels"
 )
-
-
-class FixedAcceptBufferUnsupported(RuntimeError):
-    """A metadata-only rejection, before any accept-buffer initialization."""
-
-    def __init__(self, reason: str):
-        self.reason = reason
-        super().__init__(f"fixed accept buffer unsupported: {reason}")
 
 
 def read_sr_fixed_accept_env(env=None) -> bool:
@@ -406,37 +396,6 @@ def _kv_buffer(worker):
     return getattr(cache, "kv_buffer", None)
 
 
-def _cuda_token_pool(worker):
-    """Metadata-only admission for ordinary, uncompressed token-major MHA."""
-    allocator = getattr(worker, "token_to_kv_pool_allocator", None)
-    if allocator is None or not callable(getattr(allocator, "free", None)):
-        return None
-    if "TokenToKVPoolAllocator" not in [c.__name__ for c in type(allocator).mro()]:
-        return None
-    pool = allocator.get_kvcache()
-    if "MHATokenToKVPool" not in [c.__name__ for c in type(pool).mro()]:
-        return None
-    k, v = getattr(pool, "k_buffer", None), getattr(pool, "v_buffer", None)
-    if not isinstance(k, (list, tuple)) or not isinstance(v, (list, tuple)):
-        return None
-    if not k or len(k) != len(v) or getattr(pool, "row_dim", 0) != 0:
-        return None
-    first = k[0]
-    if not torch.is_tensor(first) or first.device.type != "cuda":
-        return None
-    for tensor in (*k, *v):
-        if (
-            not torch.is_tensor(tensor)
-            or tensor.ndim != 3
-            or tensor.device != first.device
-            or tensor.shape[0] != first.shape[0]
-            or tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-            or not tensor.is_contiguous()
-        ):
-            return None
-    return pool
-
-
 def static_disable_reason(worker) -> Optional[str]:
     """Reason to skip workspace construction. Does not import kernels."""
     if bool(getattr(worker, "_hybrid_needs_hidden", False)):
@@ -451,14 +410,10 @@ def static_disable_reason(worker) -> Optional[str]:
         return "capacity"
     if topk <= 1:
         return "topk"
-    if width < 1 or steps < 0 or batch_cap < 1 or steps + 1 > width:
-        return "capacity"
-    if torch.device(getattr(worker, "device", "cpu")).type == "cuda":
-        if page_size != 1:
-            return "cuda page_size"
-        return None if _cuda_token_pool(worker) is not None else "cuda token layout"
     if page_size <= 1:
         return "page_size"
+    if width < 1 or steps < 0 or batch_cap < 1 or steps + 1 > width:
+        return "capacity"
     allocator = getattr(worker, "token_to_kv_pool_allocator", None)
     alloc_reason = _allocator_supported(allocator)
     if alloc_reason is not None:
@@ -570,7 +525,6 @@ class SRFixedAcceptState:
         self.L = int(path_cap)
         self.W = int(width)
         self.page_size = int(page_size)
-        self.slot_mode = "token" if self.page_size == 1 else "paged"
         self.device = torch.device(device)
         self.metrics = None
         self.inject_error = None
@@ -608,7 +562,6 @@ class SRFixedAcceptState:
             (self.packet_cap,), dtype=torch.int64, device=self.device
         )
         self.commit_h2d_event = None
-        self._commit_done_event = None
         self._commit_unresolved = False
         self.index_buf = torch.empty(
             (self.N_cap,), dtype=torch.int64, device=self.device
@@ -618,9 +571,6 @@ class SRFixedAcceptState:
         self._h2d_count = 0
         self.rpd_workspace = None
         self._rpd_fallback_logged = set()
-        self._commit_holds = None
-        self._readback_holds = None
-        self._verify_init_holds = None
 
     def note_rpd_fallback(self, reason: str) -> None:
         self.note_path("rpd_host_fallback_" + reason)
@@ -660,8 +610,6 @@ class SRFixedAcceptState:
         rpd_host_input=None,
         rpd_live_batch_key=None,
     ) -> Optional[str]:
-        if self._commit_unresolved:
-            raise SRTransferUnresolved("fixed accept completion is unresolved")
         reason = conservative_mode_reason(verify_mode, is_all_greedy)
         if reason and verify_mode != "rpd":
             return reason
@@ -731,51 +679,17 @@ class SRFixedAcceptState:
         return None
 
     def bind_verify_buffers(self, bs: int):
-        if self._commit_unresolved:
-            raise SRTransferUnresolved("fixed accept completion is unresolved")
-        bs = int(bs)
-        if not 0 <= bs <= self.B_cap:
-            raise FixedAcceptBufferUnsupported("batch_cap")
-        predict = self.predict[: bs * self.W + 1]
-        accept_index = self.accept_index[:bs]
-        accept_length = self.accept_length[:bs]
-        for tensor, shape in (
-            (predict, (bs * self.W + 1,)),
-            (accept_index, (bs, self.L)),
-            (accept_length, (bs,)),
-        ):
-            if tuple(tensor.shape) != shape:
-                raise FixedAcceptBufferUnsupported("shape")
-            if tensor.dtype != torch.int32:
-                raise FixedAcceptBufferUnsupported("dtype")
-            if tensor.device != self.device:
-                raise FixedAcceptBufferUnsupported("device")
+        predict = self.predict[: int(bs) * self.W + 1]
+        accept_index = self.accept_index[: int(bs)]
+        accept_length = self.accept_length[: int(bs)]
         if not (
             predict.is_contiguous()
             and accept_index.is_contiguous()
             and accept_length.is_contiguous()
         ):
-            raise FixedAcceptBufferUnsupported("noncontiguous")
-        # Only the metadata checks above can select V1. A failed launch may
-        # already have queued a write, including when the first fill raises.
-        accelerator = self.device.type != "cpu"
-        if accelerator:
-            self._verify_init_holds = (predict, accept_index, accept_length)
-        try:
-            accept_index.fill_(-1)
-            accept_length.zero_()
-        except BaseException as exc:
-            if accelerator:
-                self._commit_unresolved = True
-                if isinstance(exc, Exception) and not isinstance(
-                    exc, SRTransferUnresolved
-                ):
-                    raise SRTransferUnresolved(
-                        "fixed accept buffer initialization failed after submission"
-                    ) from exc
-            raise
-        # The state and returned views continue owning these same buffers.
-        self._verify_init_holds = None
+            raise RuntimeError("fixed accept workspace view is not contiguous")
+        accept_index.fill_(-1)
+        accept_length.zero_()
         return predict, accept_index, accept_length
 
     def warmup_scratch(self, kv_pool=None) -> None:
@@ -792,7 +706,7 @@ class SRFixedAcceptState:
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
         packed.detach().to("cpu")
         coverage = self._warmup_commit_slots()
-        if kv_pool is not None and self.slot_mode != "token":
+        if kv_pool is not None:
             from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
                 warm_private_slot_move,
             )
@@ -827,15 +741,6 @@ class SRFixedAcceptState:
                 src, dst, pages = self.kernels.gather_commit_slots(
                     cache, index, index, page_index, self.page_size
                 )
-                if self.slot_mode == "token":
-                    slots, released = self.kernels.gather_token_slots(
-                        cache, index, page_index
-                    )
-                    warmup_synchronize(self.device)
-                    if not torch.equal(slots.cpu(), src.cpu()) or not torch.equal(
-                        released.cpu(), pages.cpu()
-                    ):
-                        raise RuntimeError("token-slot private warmup mismatch")
                 for need_sort in (False, True):
                     # Never borrow the live allocator's free/release lists.
                     private = SimpleNamespace(
@@ -881,26 +786,12 @@ class SRFixedAcceptState:
         accept_length: torch.Tensor,
         prepare_local_draft_hidden: bool = False,
     ):
-        if self._commit_unresolved:
-            raise SRTransferUnresolved("fixed accept completion is unresolved")
         del prepare_local_draft_hidden  # fast path never gathers target hidden
         bs = int(accept_index.shape[0])
         self._note_staging()
-        # Keep the previous commit generation until its completion event is
-        # waited. This round's pack inputs are a separate keepalive.
-        phase = "pre"
-        if self.device.type == "cuda":
-            self._readback_holds = (
-                batch,
-                logits_output,
-                accept_index,
-                predict,
-                accept_length,
-            )
         try:
             if self.inject_error == "pack":
                 raise RuntimeError("fixed accept pack failed")
-            phase = "pack"
             packed = _timed(
                 self.metrics,
                 "fixed_accept_pack",
@@ -914,7 +805,6 @@ class SRFixedAcceptState:
                     lambda: self._submit_accept_readback(packed),
                     device=False,
                 )
-                phase = "inflight"
             prefixes = _prefix_lengths(batch, bs) if bs > 0 else []
             think_end_id = getattr(
                 getattr(batch, "model_config", None), "think_end_id", None
@@ -931,8 +821,6 @@ class SRFixedAcceptState:
                 self._wait_previous_h2d,
                 device=False,
             )
-            self._readback_holds = None
-            phase = "host"
             if bs > 0:
                 rows, token_rows, pre_lengths, errors = _parse_pack(
                     self.accept_host[:bs], bs, self.L
@@ -940,30 +828,17 @@ class SRFixedAcceptState:
                 validate_packed_rows(rows, pre_lengths, errors)
             else:
                 rows, token_rows = [], []
-        except Exception as exc:
+        except Exception:
             self.note_path("fixed_accept_error")
-            if self.device.type == "cuda" and phase in ("pack", "inflight"):
-                self._commit_unresolved = True
-                self._commit_holds = (self._commit_holds, self._readback_holds)
-                if not isinstance(exc, SRTransferUnresolved):
-                    raise SRTransferUnresolved(
-                        "CUDA accept readback failed after submission"
-                    ) from exc
-            elif self.device.type == "cuda" and not self._commit_unresolved:
-                self._readback_holds = None
             raise
 
         from sglang.srt.speculative.standalone_remote.sr_kv_copy import prepare_kv_move
 
-        workspace = (
-            None
-            if self.slot_mode == "token"
-            else prepare_kv_move(
-                allocator.get_kvcache(),
-                self.B_cap * self.W,
-                domain="fixed_accept",
-                metrics=self.metrics,
-            )
+        workspace = prepare_kv_move(
+            allocator.get_kvcache(),
+            self.B_cap * self.W,
+            domain="fixed_accept",
+            metrics=self.metrics,
         )
         return self._finalize_cpu_rows(
             batch,
@@ -982,8 +857,6 @@ class SRFixedAcceptState:
         self, batch, logits_output, page_size, topk, allocator, plan
     ):
         """RPD already owns CPU tokens. Never pack or read device accept results."""
-        if self._commit_unresolved:
-            raise SRTransferUnresolved("fixed accept completion is unresolved")
         from sglang.srt.speculative.standalone_remote.sr_rpd import (
             SRRPDHostPlan,
             rpd_batch_key,
@@ -1014,7 +887,6 @@ class SRFixedAcceptState:
         if not bool(getattr(allocator, "is_not_in_free_group", False)):
             raise RuntimeError("RPD host plan allocator entered a free group")
         prefixes = _prefix_lengths(batch, bs) if bs else []
-        self._validate_token_rows(batch, allocator, plan.rows, plan.tokens, prefixes)
         think_end_id = getattr(
             getattr(batch, "model_config", None), "think_end_id", None
         )
@@ -1024,15 +896,11 @@ class SRFixedAcceptState:
 
         # Layout and capacity failures stay before plan consumption and token
         # append. A later stop-check failure still must not append twice.
-        self.kv_move_workspace = (
-            None
-            if self.slot_mode == "token"
-            else prepare_kv_move(
-                allocator.get_kvcache(),
-                self.B_cap * self.W,
-                domain="fixed_accept",
-                metrics=self.metrics,
-            )
+        self.kv_move_workspace = prepare_kv_move(
+            allocator.get_kvcache(),
+            self.B_cap * self.W,
+            domain="fixed_accept",
+            metrics=self.metrics,
         )
         plan.consumed = True
         self.note_path("rpd_host_finalize")
@@ -1063,7 +931,6 @@ class SRFixedAcceptState:
         workspace,
     ):
         self.kv_move_workspace = workspace
-        self._validate_token_rows(batch, allocator, rows, token_rows, prefixes)
         try:
             accepted, finished, truncated = _timed(
                 self.metrics,
@@ -1103,50 +970,10 @@ class SRFixedAcceptState:
             self.note_path("fixed_accept_multimodal_hit")
         return output
 
-    def _validate_token_rows(self, batch, allocator, rows, token_rows, prefixes):
-        # Validate the entire batch before the first request append. Token-slot
-        # release relies on disjoint paths and an exact partition of each row.
-        if self.slot_mode == "token":
-            if len(rows) != len(batch.reqs) or len(token_rows) != len(rows):
-                raise RuntimeError("token accept batch mismatch")
-            mapping = getattr(
-                getattr(batch, "req_to_token_pool", None), "req_to_token", None
-            )
-            if (
-                not torch.is_tensor(mapping)
-                or mapping.ndim != 2
-                or mapping.device != self.device
-                or mapping.dtype not in (torch.int32, torch.int64)
-                or len(prefixes) != len(rows)
-                or any(p < 0 or p + self.L > mapping.shape[1] for p in prefixes)
-                or not callable(getattr(allocator, "free", None))
-                or any(
-                    not torch.is_tensor(t)
-                    or t.ndim != 1
-                    or t.numel() != len(rows)
-                    or t.device != self.device
-                    or t.dtype not in (torch.int32, torch.int64)
-                    for t in (batch.req_pool_indices, batch.seq_lens)
-                )
-            ):
-                raise RuntimeError("token accept request mapping or allocator mismatch")
-            for b, (row, tokens) in enumerate(zip(rows, token_rows)):
-                live = [int(i) for i in row if i != -1]
-                if (
-                    len(row) != self.L
-                    or len(tokens) != self.L
-                    or not live
-                    or len(set(live)) != len(live)
-                    or any(i < b * self.W or i >= (b + 1) * self.W for i in live)
-                ):
-                    raise RuntimeError(
-                        "token accept path outside request or repeated slot"
-                    )
-
     def _pack(self, bs, accept_index, predict, accept_length):
         packed = self.pack_buf[:bs]
         self.kernels.pack_accept(accept_index, predict, accept_length, packed)
-        if bs and self.device.type in ("npu", "cuda"):
+        if bs and self.device.type == "npu":
             self._count("fixed_accept_pack_kernel_calls")
         return packed
 
@@ -1190,13 +1017,10 @@ class SRFixedAcceptState:
             raise RuntimeError("fixed accept h2d reuse wait failed")
         try:
             wait_event(self.commit_h2d_event)
-            wait_event(self._commit_done_event)
         except SRTransferUnresolved:
             self._commit_unresolved = True
             raise
         self.commit_h2d_event = None
-        self._commit_done_event = None
-        self._commit_holds = None
 
     def _readback(self, packed: torch.Tensor) -> torch.Tensor:
         """Compatibility wrapper. Prefer submit then wait around host metadata."""
@@ -1248,17 +1072,6 @@ class SRFixedAcceptState:
         prefixes,
         workspace,
     ):
-        if self.slot_mode == "token":
-            return self._commit_token_slots(
-                batch,
-                logits_output,
-                allocator,
-                accepted,
-                finished,
-                truncated,
-                token_rows,
-                prefixes,
-            )
         if int(page_size) != self.page_size or int(topk) <= 1:
             raise RuntimeError("fixed accept commit saw an unsupported layout")
         if not bool(getattr(allocator, "is_not_in_free_group", False)):
@@ -1373,131 +1186,6 @@ class SRFixedAcceptState:
         allocator.free_unique_pages(pages)
         return result
 
-    def _commit_token_slots(
-        self,
-        batch,
-        logits_output,
-        allocator,
-        accepted,
-        finished,
-        truncated,
-        token_rows,
-        prefixes,
-    ):
-        """Retain physical accepted slots; no KV movement or device compaction."""
-        kept, free, tokens = [], [], []
-        for b, (row, count, token_row) in enumerate(
-            zip(truncated, accepted, token_rows)
-        ):
-            live = [int(i) for i in row[:count]]
-            kept.extend(live)
-            selected = set(live)
-            free.extend(
-                i for i in range(b * self.W, (b + 1) * self.W) if i not in selected
-            )
-            tokens.extend(int(t) for t in token_row[:count])
-        unfinished = [b for b, done in enumerate(finished) if not done]
-        n, f, bs = len(kept), len(free), len(accepted)
-        # Reuse the existing packet's capacity bound, with two instead of three
-        # N regions: kept indices, free indices, tokens, counts, unfinished.
-        flat = kept + free + tokens + list(accepted) + unfinished
-        if len(flat) > self.packet_cap:
-            raise RuntimeError("token commit packet exceeds capacity")
-        self.commit_host[: len(flat)].copy_(torch.tensor(flat, dtype=torch.int64))
-        self._commit_holds = (batch, logits_output, self.commit_device, allocator)
-        if bs:
-            self._submit_commit_packet(len(flat))
-        packet = self.commit_device
-        kept_index, free_index = packet[:n], packet[n : n + f]
-        token_dev = packet[n + f : 2 * n + f]
-        counts = packet[2 * n + f : 2 * n + f + bs]
-        unfinished_dev = packet[2 * n + f + bs : len(flat)]
-        self._commit_holds = (
-            batch.out_cache_loc,
-            packet,
-            batch.req_to_token_pool,
-            batch.req_pool_indices,
-            batch.seq_lens,
-            allocator,
-        )
-        try:
-            slots, released = self.kernels.gather_token_slots(
-                batch.out_cache_loc,
-                kept_index,
-                free_index,
-            )
-            self._commit_holds += (slots, released)
-            if self.device.type == "cpu":
-                cursor = 0
-                for b, (prefix, count) in enumerate(zip(prefixes, accepted)):
-                    req_row = int(batch.req_pool_indices[b])
-                    batch.req_to_token_pool.req_to_token[
-                        req_row, prefix : prefix + count
-                    ].copy_(slots[cursor : cursor + count])
-                    cursor += count
-            else:
-                from sglang.srt.speculative.spec_utils import (
-                    assign_req_to_token_pool_func,
-                )
-
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + counts,
-                    slots,
-                    bs,
-                )
-            allocator.free(released)
-            result = self._publish(
-                batch,
-                logits_output,
-                accepted,
-                finished,
-                slots,
-                token_dev,
-                counts,
-                self.commit_host[2 * n + f : 2 * n + f + bs],
-                unfinished_dev,
-                self.commit_host[2 * n + f + bs : len(flat)],
-                kept_index,
-            )
-        except BaseException as exc:
-            self._commit_unresolved = True
-            if isinstance(exc, SRTransferUnresolved):
-                raise
-            raise SRTransferUnresolved(
-                "token-slot commit failed after submission"
-            ) from exc
-        self._record_commit_done()
-        self._count("fixed_accept_slot_output_alloc", int(n > 0) + int(f > 0))
-        self._count("fixed_accept_slot_output_bytes", (n + f) * 8)
-        if self.device.type == "cuda" and n + f:
-            self._count("fixed_accept_slot_kernel_calls")
-        self.note_path(
-            "cuda_token_commit" if self.device.type == "cuda" else "token_commit"
-        )
-        return result
-
-    def _record_commit_done(self) -> None:
-        """Queue a completion event after gather, mapping update, and free.
-
-        CPU work is already finished, so there is no event to wait. A failed
-        record leaves the commit references in place and refuses reuse.
-        """
-        if self.device.type == "cpu" or not event_supported(self.device):
-            self._commit_done_event = None
-            return
-        try:
-            event = torch.get_device_module(self.device.type).Event()
-            event.record()
-        except Exception as exc:
-            self._commit_unresolved = True
-            raise SRTransferUnresolved(
-                "token-slot commit completion event failed"
-            ) from exc
-        self._commit_done_event = event
-
     def _submit_commit_packet(self, used: int) -> None:
         if used <= 0:
             self.commit_h2d_event = None
@@ -1553,9 +1241,6 @@ class SRFixedAcceptState:
         src_index_dev,
     ):
         mode = length_update_mode(finished)
-        if self.slot_mode == "token" and accepted:
-            # V1 page_size=1 updates every sequence even when all requests end.
-            mode = "all"
         accept_length_list = [int(count) - 1 for count in accepted]
         length_tensor = (counts_dev - 1).to(dtype=torch.int32)
         if mode == "all":
@@ -1683,20 +1368,11 @@ def build_fixed_accept_state(worker, env=None):
     An explicit off switch does not import kernels. Unsupported static
     conditions are logged and also skip the import.
     """
-    # The existing switch is NPU-specific. CUDA admission has no new switch.
-    requested = (
-        True
-        if torch.device(getattr(worker, "device", "cpu")).type == "cuda"
-        else read_sr_fixed_accept_env(env)
-    )
+    requested = read_sr_fixed_accept_env(env)
     device = getattr(worker, "device", None)
     buf = _kv_buffer(worker)
     if torch.is_tensor(buf):
         device = buf.device
-    elif torch.device(device or "cpu").type == "cuda":
-        pool = _cuda_token_pool(worker)
-        if pool is not None:
-            device = pool.k_buffer[0].device
     if not requested:
         logger.info(
             "[SR] fixed accept requested=False effective=False device=%s reason=env off",
@@ -1711,17 +1387,6 @@ def build_fixed_accept_state(worker, env=None):
             reason,
         )
         return None
-    if torch.device(device).type == "cuda":
-        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
-            event_supported,
-            pin_supported,
-        )
-
-        if not pin_supported(device) or not event_supported(device):
-            logger.info(
-                "[SR] CUDA token accept disabled: pinned/event staging unavailable"
-            )
-            return None
     try:
         _load_kernels()
     except Exception as exc:
@@ -1736,7 +1401,7 @@ def build_fixed_accept_state(worker, env=None):
         path_cap=int(worker.speculative_num_steps) + 1,
         width=int(worker.speculative_num_draft_tokens),
         page_size=int(worker.page_size),
-        device=device,
+        device=buf.device,
     )
     logger.info(
         "[SR] fixed accept requested=True effective=True device=%s reason=",

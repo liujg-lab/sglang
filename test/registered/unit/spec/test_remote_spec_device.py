@@ -77,7 +77,9 @@ def _reference_tree_draft_block_tables(
                         pos = p
                     else:
                         pos = seq + k * num_steps + (p - seq)
-                    pages.append(int(req_to_token[pool, pos]) if p < kv_len else 0)
+                    pages.append(
+                        int(req_to_token[pool, pos]) if p < kv_len else 0
+                    )
                 rows.append(pages)
             continue
         last_page_len = seq % page_size
@@ -90,11 +92,9 @@ def _reference_tree_draft_block_tables(
                 if p < n_shared:
                     pos = p * page_size
                 else:
-                    pos = (
-                        prefix_base
-                        + k * num_new_pages * page_size
-                        + (p - n_shared) * page_size
-                    )
+                    pos = prefix_base + k * num_new_pages * page_size + (
+                        p - n_shared
+                    ) * page_size
                 pages.append(
                     int(req_to_token[pool, pos]) // page_size if p < n_pages else 0
                 )
@@ -177,13 +177,7 @@ def _load_tree_draft_helpers():
                 keep.append(node)
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
-    ns = {
-        "torch": torch,
-        "Optional": Optional,
-        "Mapping": __import__("collections.abc", fromlist=["Mapping"]).Mapping,
-        "logging": __import__("logging"),
-        "logger": __import__("logging").getLogger("tree_draft_helpers"),
-    }
+    ns = {"torch": torch, "Optional": Optional, "Mapping": __import__("collections.abc", fromlist=["Mapping"]).Mapping, "logging": __import__("logging"), "logger": __import__("logging").getLogger("tree_draft_helpers")}
     ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
     ns.setdefault("SRTransferUnresolved", SRTransferUnresolved)
     ns.setdefault("nullcontext", nullcontext)
@@ -378,7 +372,6 @@ class TestRemoteSpecDevice(CustomTestCase):
             return fn()
         except Exception as e:
             self.skipTest(f"sglang runtime deps missing: {e}")
-
     def test_idle_input_uses_explicit_device(self):
         try:
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -558,9 +551,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             _sr_device_poisoned=True,
-            sr_state=SimpleNamespace(
-                delete=lambda rid: SimpleNamespace(req_object=req)
-            ),
+            sr_state=SimpleNamespace(delete=lambda rid: SimpleNamespace(req_object=req)),
             _sr_remove_req=lambda r: None,
             _sr_release_tree_lease=lambda rid: None,
             sr_kv=SimpleNamespace(
@@ -644,7 +635,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertIn("def _init_kv_copy_and_warmup", npu_src)
 
     def test_npu_tree_draft_triton_and_kv_restore_source_guards(self):
-        spec_src = (_REPO / "python/sglang/srt/speculative/spec_utils.py").read_text()
+        spec_src = (
+            _REPO / "python/sglang/srt/speculative/spec_utils.py"
+        ).read_text()
         self.assertNotIn(
             "if ((page_size != 1) and (topk != 1)) and (duplicate_cache_len > 0):",
             spec_src,
@@ -770,7 +763,10 @@ class TestRemoteSpecDevice(CustomTestCase):
         keys = [d["actual_seq_lengths_kv"] for d in expanded]
         self.assertEqual(
             keys,
-            [[129] * 3] * 3 + [[130] * 3] * 3 + [[131] * 3] * 3 + [[132] * 3] * 3,
+            [[129] * 3] * 3
+            + [[130] * 3] * 3
+            + [[131] * 3] * 3
+            + [[132] * 3] * 3,
         )
 
     def test_validate_tree_draft_fia_records_rejects_mixed_ops(self):
@@ -864,9 +860,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(ctx.exception.scope, "format")
         with self.assertRaises(Prep) as ctx:
             inspect = helpers.inspect_dispatch_record
-            inspect(
-                SimpleNamespace(value="actual_seq_lengths_kv"), "actual_seq_lengths_kv"
-            )
+            inspect(SimpleNamespace(value="actual_seq_lengths_kv"), "actual_seq_lengths_kv")
         self.assertEqual(ctx.exception.scope, "format")
 
     def test_validate_draft_graph_step_kv_lens_padding(self):
@@ -1046,7 +1040,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             [[4, 4, 1, 2], [4, 9, 1, 8]], dtype=torch.int64, device=device
         )
         compact = torch.arange(batch * topk * steps, dtype=torch.int64, device=device)
-        needed = tokens.numel() + parents.numel() + indices.numel() + indices.numel()
+        needed = (
+            tokens.numel() + parents.numel() + indices.numel() + indices.numel()
+        )
         buf = torch.empty(needed, dtype=torch.int64, device=device)
         pack_tree_reply(
             buf,
@@ -1066,7 +1062,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             .reshape(steps, -1)
             .cpu()
         )
-        slots = lookup_candidate_slots(node_ids.cpu(), phys, indices.cpu(), batch, topk)
+        slots = lookup_candidate_slots(
+            node_ids.cpu(), phys, indices.cpu(), batch, topk
+        )
         expected = torch.cat(
             [
                 tokens.reshape(-1).cpu(),
@@ -1094,10 +1092,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         tree = ast.parse(src_path.read_text())
         fn = None
         for node in tree.body:
-            if (
-                isinstance(node, ast.ClassDef)
-                and node.name == "StandaloneRemoteDraftSchedulerMixin"
-            ):
+            if isinstance(node, ast.ClassDef) and node.name == "StandaloneRemoteDraftSchedulerMixin":
                 for item in node.body:
                     if (
                         isinstance(item, ast.FunctionDef)
@@ -1143,8 +1138,8 @@ class TestRemoteSpecDevice(CustomTestCase):
         mixin._sr_park_in_running_many = lambda _reqs: None
         mixin._sr_pause_req = lambda _req: None
         mixin._sr_is_finished = lambda _req: False
-        mixin._sr_kv_len = lambda req: (
-            len(req.origin_input_ids) + len(req.output_ids or [])
+        mixin._sr_kv_len = lambda req: len(req.origin_input_ids) + len(
+            req.output_ids or []
         )
         mixin._sr_mark_degraded = lambda *_a, **_k: None
         mixin.last_batch = object()
@@ -1184,8 +1179,8 @@ class TestRemoteSpecDevice(CustomTestCase):
         mixin._sr_park_in_running_many = lambda _reqs: None
         mixin._sr_pause_req = lambda _req: None
         mixin._sr_is_finished = lambda _req: False
-        mixin._sr_kv_len = lambda req: (
-            len(req.origin_input_ids) + len(req.output_ids or [])
+        mixin._sr_kv_len = lambda req: len(req.origin_input_ids) + len(
+            req.output_ids or []
         )
         mixin._sr_mark_degraded = lambda *_a, **_k: None
         mixin.last_batch = object()
@@ -1220,13 +1215,7 @@ class TestRemoteSpecDevice(CustomTestCase):
                         cases.append((page_size, topk, step_id, num_steps, [seq]))
                     if page_size != 1:
                         cases.append(
-                            (
-                                page_size,
-                                topk,
-                                step_id,
-                                num_steps,
-                                [prefixes[0], prefixes[-1]],
-                            )
+                            (page_size, topk, step_id, num_steps, [prefixes[0], prefixes[-1]])
                         )
 
         for page_size, topk, step_id, num_steps, seqs in cases:
@@ -1235,8 +1224,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             ):
                 last_page_len = [s % page_size for s in seqs]
                 num_new = [
-                    (lp + num_steps + page_size - 1) // page_size
-                    for lp in last_page_len
+                    (lp + num_steps + page_size - 1) // page_size for lp in last_page_len
                 ]
                 n_logical = []
                 for s, nnp in zip(seqs, num_new):
@@ -1374,7 +1362,8 @@ class TestRemoteSpecDevice(CustomTestCase):
 
     def test_npu_tree_draft_block_tables_source_guards(self):
         src = (
-            _REPO / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
         ).read_text()
         self.assertIn("build_tree_draft_block_tables", src)
         self.assertIn("normalize_tree_draft_kv_lens", src)
@@ -1405,7 +1394,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         spec_src = (_REPO / "python/sglang/srt/speculative/spec_utils.py").read_text()
         self.assertIn("normalize_fia_op_name", spec_src)
         self.assertIn('getattr(obj, "__name__", None)', spec_src)
-        self.assertIn('scope="format"', spec_src)
+        self.assertIn("scope=\"format\"", spec_src)
         self.assertNotIn("count_fia_kv_len_records", graph_src)
         self.assertNotIn("if attr_name in str(rec)", graph_src)
         drafter_src = (
@@ -1438,7 +1427,8 @@ class TestRemoteSpecDevice(CustomTestCase):
 
     def test_npu_tree_draft_fia_alignment_source_guards(self):
         src = (
-            _REPO / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+            _REPO
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
         ).read_text()
         self.assertIn("query = q.reshape(", src)
         self.assertIn("-1, 1, layer.tp_q_head_num, layer.qk_head_dim", src)
@@ -1465,12 +1455,12 @@ class TestRemoteSpecDevice(CustomTestCase):
     def test_tree_reselect_parent_rows_and_kv_remap(self):
         from kv_move_test_utils import move_paged
 
-        tree_reselect_parent_rows = _load_tree_draft_helpers().tree_reselect_parent_rows
+        tree_reselect_parent_rows = (
+            _load_tree_draft_helpers().tree_reselect_parent_rows
+        )
         topk = 2
         topk_cs_index = torch.tensor([[3, 1]], dtype=torch.int64)
-        parent_rows = tree_reselect_parent_rows(
-            topk_cs_index, num_hidden_rows=2, topk=topk
-        )
+        parent_rows = tree_reselect_parent_rows(topk_cs_index, num_hidden_rows=2, topk=topk)
         self.assertEqual(parent_rows.tolist(), [1, 0])
 
         page_size = 4
@@ -1533,9 +1523,9 @@ class TestRemoteSpecDevice(CustomTestCase):
                     topk_p = block.repeat(bs, 1)
                 else:
                     topk_p = torch.tensor(topk_p_rows, dtype=torch.float32)
-                topk_index = torch.arange(bs * topk * topk, dtype=torch.int64).reshape(
-                    bs * topk, topk
-                )
+                topk_index = torch.arange(
+                    bs * topk * topk, dtype=torch.int64
+                ).reshape(bs * topk, topk)
                 scores = torch.ones(bs, topk)
                 hidden = torch.arange(bs * topk * 2, dtype=torch.float32).reshape(
                     bs * topk, 2
@@ -1643,13 +1633,8 @@ class TestRemoteSpecDevice(CustomTestCase):
                 "def _try_alloc_lease_tree_kv"
             )
         ]
-        self.assertIn(
-            "paged_tree_mapping_fits(\n            seq_lens_cpu_for_host(batch)",
-            alloc_src,
-        )
-        self.assertNotIn(
-            "paged_tree_mapping_fits(\n            batch.seq_lens", alloc_src
-        )
+        self.assertIn("paged_tree_mapping_fits(\n            seq_lens_cpu_for_host(batch)", alloc_src)
+        self.assertNotIn("paged_tree_mapping_fits(\n            batch.seq_lens", alloc_src)
         eagle_src = (
             _REPO / "python/sglang/srt/speculative/eagle_worker.py"
         ).read_text()
@@ -1696,7 +1681,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         )
 
     def test_eagle_verify_refuses_silent_greedy_for_remote_spec(self):
-        eagle_src = (_REPO / "python/sglang/srt/speculative/eagle_info.py").read_text()
+        eagle_src = (
+            _REPO / "python/sglang/srt/speculative/eagle_info.py"
+        ).read_text()
         self.assertIn("Refusing to fall back to greedy", eagle_src)
         self.assertIn("is_remote_spec_algorithm", eagle_src)
 
@@ -2050,9 +2037,7 @@ class TestSRTargetWarmup(CustomTestCase):
                         init = ast.get_source_segment(text, child) or ast.unparse(child)
         self.assertIsNotNone(init)
         self.assertIn("warm_sr_target_kernels", init)
-        self.assertGreater(
-            init.rfind("warm_sr_target_kernels"), init.find("get_memory_pool")
-        )
+        self.assertGreater(init.rfind("warm_sr_target_kernels"), init.find("get_memory_pool"))
 
     def test_greedy_warmup_runs_before_paged_gate(self):
         src = (
@@ -2165,9 +2150,7 @@ class TestSRTreeCandidates(unittest.TestCase):
             torch.max(x, dim=dim, keepdim=True) if k == 1 else torch.topk(x, k, dim=dim)
         )
 
-        def organize_draft_results(
-            score_list, token_list, parents_list, num_draft_token
-        ):
+        def organize_draft_results(score_list, token_list, parents_list, num_draft_token):
             scores = torch.cat(score_list, dim=1).flatten(1)
             tokens = torch.cat(token_list, dim=1)
             selected = torch.sort(
@@ -2176,9 +2159,7 @@ class TestSRTreeCandidates(unittest.TestCase):
             if len(parents_list) > 1:
                 parents = torch.cat(parents_list[:-1], dim=1)
             else:
-                parents = torch.empty(
-                    parents_list[0].shape[0], 0, device=parents_list[0].device
-                )
+                parents = torch.empty(parents_list[0].shape[0], 0, device=parents_list[0].device)
             return parents, selected, torch.gather(tokens, 1, selected)
 
         spec = types.ModuleType("sglang.srt.speculative.spec_utils")
@@ -2371,7 +2352,7 @@ class TestSRTreeCandidates(unittest.TestCase):
         self.assertTrue(workspace.validated)
         self.assertFalse(workspace.unresolved)
 
-    def test_completed_numeric_mismatch_uses_original_operators(self):
+    def test_preflight_rejects_out_and_matches_original_assembly(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
             SRTreeCandidateWorkspace,
         )
@@ -2382,14 +2363,12 @@ class TestSRTreeCandidates(unittest.TestCase):
 
         def softmax(inp, dim=None, dtype=None, out=None):
             if out is not None:
-                out.copy_(real_softmax(inp, dim=dim, dtype=dtype)).add_(1)
-                return out
+                raise RuntimeError("softmax out rejected")
             return real_softmax(inp, dim=dim, dtype=dtype)
 
         def mul(inp, other, *, out=None):
             if out is not None:
-                real_mul(inp, other, out=out)
-                return out.add_(1)
+                raise RuntimeError("mul out rejected")
             return real_mul(inp, other)
 
         saved = self._preflight_references()
@@ -2412,9 +2391,8 @@ class TestSRTreeCandidates(unittest.TestCase):
         finally:
             self._restore_modules(saved)
 
-    def test_completed_semantics_mismatch_declines_without_poisoning(self):
+    def test_preflight_failure_leaves_workspace_unpoisoned(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
-            CandidatePreflightDeclined,
             SRTreeCandidateWorkspace,
         )
 
@@ -2422,30 +2400,24 @@ class TestSRTreeCandidates(unittest.TestCase):
         workspace.validated = False
         saved = self._preflight_references()
         try:
-            original = workspace._finish
-
-            def wrong(batch):
-                parents, indices, tokens = original(batch)
-                return parents, indices, tokens + 1
-
-            with unittest.mock.patch.object(workspace, "_finish", wrong):
-                with self.assertRaisesRegex(
-                    CandidatePreflightDeclined, "changed tree semantics"
-                ):
+            with unittest.mock.patch.object(
+                workspace, "_select", side_effect=RuntimeError("select")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed tree semantics"):
                     workspace.warm()
         finally:
             self._restore_modules(saved)
         self.assertFalse(workspace.unresolved)
         self.assertFalse(workspace.validated)
 
-    def test_candidate_factory_skips_cpu_and_caches_completed_decline(self):
+    def test_candidate_factory_skips_cpu_cuda_and_failed_preflight(self):
         from sglang.srt.speculative.standalone_remote.drafter import (
             sr_tree_candidates as candidates,
         )
 
-        self.assertIsNone(
-            candidates.candidate_workspace(object(), 1, torch.zeros(1, 2))
-        )
+        self.assertIsNone(candidates.candidate_workspace(object(), 1, torch.zeros(1, 2)))
+        cuda_seed = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        self.assertIsNone(candidates.candidate_workspace(object(), 1, cuda_seed))
 
         calls = {"warm": 0}
 
@@ -2454,7 +2426,7 @@ class TestSRTreeCandidates(unittest.TestCase):
 
         def warm(self):
             calls["warm"] += 1
-            raise candidates.CandidatePreflightDeclined("declined")
+            raise RuntimeError("declined")
 
         worker = SimpleNamespace(
             topk=2,
@@ -2475,213 +2447,18 @@ class TestSRTreeCandidates(unittest.TestCase):
                 "sglang.srt.speculative.standalone_remote.sr_kv_copy._stream_key",
                 return_value="stream",
             ),
-            unittest.mock.patch.object(
-                candidates.SRTreeCandidateWorkspace, "__init__", init
-            ),
-            unittest.mock.patch.object(
-                candidates.SRTreeCandidateWorkspace, "warm", warm
-            ),
+            unittest.mock.patch.object(candidates.SRTreeCandidateWorkspace, "__init__", init),
+            unittest.mock.patch.object(candidates.SRTreeCandidateWorkspace, "warm", warm),
             unittest.mock.patch.object(
                 candidates.SRTreeCandidateWorkspace,
                 "check",
                 side_effect=AssertionError("declined workspace reused"),
             ),
         ):
-            self.assertIsNone(
-                candidates.candidate_workspace(worker, 2, seed, graph=False)
-            )
-            self.assertIsNone(
-                candidates.candidate_workspace(worker, 2, seed, graph=False)
-            )
+            self.assertIsNone(candidates.candidate_workspace(worker, 2, seed, graph=False))
+            self.assertIsNone(candidates.candidate_workspace(worker, 2, seed, graph=False))
         self.assertEqual(calls["warm"], 1)
         self.assertEqual(list(worker._candidate_workspaces.values()), [None])
-
-    def test_preflight_uncertain_failures_never_retry_or_clear_holds(self):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
-            SRTreeCandidateWorkspace,
-        )
-
-        saved = self._preflight_references()
-        try:
-            for stage in ("_probabilities", "_select", "_finish", "_sync"):
-                with self.subTest(stage=stage):
-                    ws = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
-                    ws.validated = False
-                    error = SRTransferUnresolved(stage)
-                    with unittest.mock.patch.object(ws, stage, side_effect=error) as op:
-                        with self.assertRaises(SRTransferUnresolved) as caught:
-                            ws.warm()
-                        self.assertIs(caught.exception, error)
-                        op.assert_called_once()
-                        with self.assertRaises(SRTransferUnresolved):
-                            ws.warm()
-                        op.assert_called_once()
-                    self.assertTrue(ws.unresolved)
-                    self.assertFalse(ws.validated)
-                    self.assertTrue(ws.holds)
-                    with self.assertRaises(SRTransferUnresolved):
-                        ws.check(2)
-
-            # Classify an ordinary launch/sync error on the accelerator branch.
-            ws = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
-            ws.device = SimpleNamespace(type="npu")
-            ws.validated = False
-            error = RuntimeError("device synchronization failed")
-            with unittest.mock.patch.object(ws, "_warm_compare", side_effect=error):
-                with self.assertRaises(SRTransferUnresolved) as caught:
-                    ws.warm()
-            self.assertIs(caught.exception.__cause__, error)
-            self.assertTrue(ws.unresolved)
-            self.assertIsNotNone(ws.holds)
-        finally:
-            self._restore_modules(saved)
-
-    def test_factory_retains_unresolved_workspace_and_original_exception(self):
-        from sglang.srt.speculative.standalone_remote.drafter import (
-            sr_tree_candidates as c,
-        )
-
-        owner = SimpleNamespace(
-            topk=2,
-            speculative_num_steps=2,
-            speculative_num_draft_tokens=3,
-            model_config=SimpleNamespace(vocab_size=8),
-            scheduler=None,
-        )
-        seed = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.float32)
-        error = SRTransferUnresolved("unknown completion")
-
-        def init(ws, *args, **kwargs):
-            ws.unresolved = False
-            ws.holds = [object()]
-
-        with (
-            unittest.mock.patch.object(
-                torch,
-                "npu",
-                SimpleNamespace(current_stream=lambda _: None),
-                create=True,
-            ),
-            unittest.mock.patch(
-                "sglang.srt.speculative.standalone_remote.sr_kv_copy._capturing",
-                return_value=False,
-            ),
-            unittest.mock.patch(
-                "sglang.srt.speculative.standalone_remote.sr_kv_copy._stream_key",
-                return_value="stream",
-            ),
-            unittest.mock.patch.object(c.SRTreeCandidateWorkspace, "__init__", init),
-            unittest.mock.patch.object(
-                c.SRTreeCandidateWorkspace, "warm", side_effect=error
-            ) as warm,
-        ):
-            with self.assertRaises(SRTransferUnresolved) as caught:
-                c.candidate_workspace(owner, 2, seed)
-            self.assertIs(caught.exception, error)
-            installed = next(iter(owner._candidate_workspaces.values()))
-            self.assertTrue(installed.unresolved)
-            self.assertTrue(installed.holds)
-            with self.assertRaises(SRTransferUnresolved):
-                c.candidate_workspace(owner, 2, seed)
-            warm.assert_called_once()
-
-    def test_capture_decline_is_explicit_and_does_not_enter_eager_factory(self):
-        from sglang.srt.speculative.standalone_remote.drafter import (
-            sr_tree_candidates as c,
-        )
-
-        owner = SimpleNamespace()
-        seed = torch.zeros(1, 3)
-        ws = SimpleNamespace(capture_scope=MagicMock(side_effect=lambda: nullcontext()))
-        with unittest.mock.patch.object(
-            c, "candidate_workspace", side_effect=AssertionError("eager factory")
-        ):
-            for choice in (None, ws):
-                with c.candidate_capture_scope(owner, choice):
-                    # Same decision in warmup, capture and nested scopes.
-                    for _ in range(3):
-                        self.assertIs(
-                            c.draft_candidate_workspace(owner, 1, seed), choice
-                        )
-                    with c.candidate_capture_scope(owner, None):
-                        self.assertIsNone(c.draft_candidate_workspace(owner, 1, seed))
-                    self.assertIs(c.draft_candidate_workspace(owner, 1, seed), choice)
-                self.assertFalse(owner._capture_candidate_prepared)
-            with self.assertRaisesRegex(RuntimeError, "capture"):
-                with c.candidate_capture_scope(owner, None):
-                    raise RuntimeError("capture")
-            self.assertFalse(owner._capture_candidate_prepared)
-        with unittest.mock.patch.object(
-            c, "candidate_workspace", return_value=ws
-        ) as eager:
-            self.assertIs(c.draft_candidate_workspace(owner, 1, seed), ws)
-            eager.assert_called_once_with(owner, 1, seed)
-
-    def test_device_resolution_keeps_explicit_indices(self):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
-            _candidate_device,
-        )
-
-        # CUDA device metadata needs no runtime installation or device allocation.
-        module = SimpleNamespace(current_device=MagicMock(return_value=2))
-        with unittest.mock.patch.object(
-            torch, "get_device_module", return_value=module
-        ):
-            self.assertEqual(_candidate_device("cuda"), torch.device("cuda:2"))
-            self.assertEqual(_candidate_device("cuda:1"), torch.device("cuda:1"))
-            self.assertEqual(_candidate_device("cpu"), torch.device("cpu"))
-            module.current_device.assert_called_once()
-
-    def test_real_draft_entry_honors_capture_decline(self):
-        from sglang.srt.speculative.standalone_remote.drafter import (
-            sr_tree_candidates as c,
-        )
-
-        path = (
-            _REPO
-            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
-        )
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        method = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "_draft_forward"
-        )
-        # Exercise real admission code before model/KV operations, without loading
-        # hardware runtime dependencies. A capture decline must never reach eager.
-        stop = next(
-            i
-            for i, n in enumerate(method.body)
-            if isinstance(n, ast.Assign)
-            and isinstance(n.targets[0], ast.Name)
-            and n.targets[0].id == "kv_pool"
-        )
-        method.body = method.body[:stop] + [
-            ast.Return(value=ast.Name(id="candidates", ctx=ast.Load()))
-        ]
-        method.returns = None
-        for arg in method.args.args:
-            arg.annotation = None
-        module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
-        ns = {
-            "EagleDraftInput": SimpleNamespace,
-            "maybe_detect_nan": lambda *args: None,
-        }
-        exec(compile(module, str(path), "exec"), ns)
-        worker = SimpleNamespace(topk=3, speculative_num_steps=5)
-        batch = SimpleNamespace(
-            batch_size=1,
-            out_cache_loc=torch.arange(15),
-            spec_info=SimpleNamespace(
-                topk_p=torch.zeros(1, 3),
-                topk_index=torch.zeros(1, 3, dtype=torch.int64),
-            ),
-        )
-        with unittest.mock.patch.object(
-            c, "candidate_workspace", side_effect=AssertionError("eager allocation")
-        ):
-            with c.candidate_capture_scope(worker, None):
-                self.assertIsNone(ns["_draft_forward"](worker, batch))
 
     def test_candidate_submitted_failure_keeps_sources_and_refuses_reuse(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
@@ -2703,192 +2480,6 @@ class TestSRTreeCandidates(unittest.TestCase):
         self.assertIs(workspace.holds[0], source)
         with self.assertRaises(SRTransferUnresolved):
             workspace.check(2)
-
-
-class TestSRDraftDecodeMetadata(unittest.TestCase):
-    def test_retirement_query_failure_retains_old_buffers(self):
-        from sglang.srt.speculative.standalone_remote.sr_cuda_metadata import (
-            SRDraftDecodeMetadataWorkspace,
-        )
-
-        workspace = SRDraftDecodeMetadataWorkspace("cpu", 4, 32)
-        indices, indptr = workspace.reserve(9)
-        event = MagicMock()
-        error = RuntimeError("retirement query failed")
-        event.query.side_effect = error
-        workspace.retired = [(event, indices, indptr, object())]
-        with self.assertRaises(SRTransferUnresolved) as caught:
-            workspace.reserve(17)
-        self.assertIs(caught.exception.__cause__, error)
-        self.assertIs(workspace.indices, indices)
-        self.assertEqual(len(workspace.retired), 1)
-        with self.assertRaises(SRTransferUnresolved):
-            workspace.reserve(9)
-        event.query.assert_called_once()
-
-    def test_real_graph_metadata_failure_keeps_inputs_and_blocks_retry(self):
-        path = _REPO / "python/sglang/srt/layers/attention/triton_backend.py"
-        cls = next(
-            n
-            for n in ast.parse(path.read_text(encoding="utf-8")).body
-            if isinstance(n, ast.ClassDef) and n.name == "TritonMultiStepDraftBackend"
-        )
-        function = copy.deepcopy(
-            next(
-                n
-                for n in cls.body
-                if isinstance(n, ast.FunctionDef)
-                and n.name == "init_forward_metadata_replay_cuda_graph"
-            )
-        )
-        function.returns = None
-        for arg in function.args.args:
-            arg.annotation = None
-        scope = {}
-        exec(
-            compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
-            scope,
-        )
-        backend = SimpleNamespace(
-            _sr_cuda_metadata=True,
-            cuda_graph_kv_indices=torch.empty(4, 32),
-            kv_indptr=torch.zeros(4, 13),
-            _prepare_replay_metadata=MagicMock(),
-        )
-        batch = object()
-        entry = scope[function.name]
-        entry(backend, batch, 3)
-        self.assertIs(backend._sr_metadata_holds[1], backend.cuda_graph_kv_indices)
-        error = RuntimeError("graph metadata launch failed")
-        backend._prepare_replay_metadata.side_effect = error
-        with self.assertRaises(SRTransferUnresolved) as caught:
-            entry(backend, batch, 3)
-        self.assertIs(caught.exception.__cause__, error)
-        self.assertIs(backend._sr_metadata_holds[0], batch)
-        with self.assertRaises(SRTransferUnresolved):
-            entry(backend, batch, 3)
-        self.assertEqual(backend._prepare_replay_metadata.call_count, 2)
-
-    def test_capacity_views_disjoint_steps_and_growth(self):
-        from sglang.srt.speculative.standalone_remote.sr_cuda_metadata import (
-            SRDraftDecodeMetadataWorkspace,
-        )
-
-        workspace = SRDraftDecodeMetadataWorkspace("cpu", 4, 32)
-        indices, indptr = workspace.reserve(9)
-        indices.fill_(3)
-        indices[1].fill_(7)
-        self.assertTrue(torch.all(indices[0] == 3))
-        self.assertEqual(workspace.rows, 16)
-        for rows in (12, 9, 1):
-            again, ptr = workspace.reserve(rows)
-            self.assertIs(again, indices)
-            self.assertIs(ptr, indptr)
-        grown, _ = workspace.reserve(17)
-        self.assertEqual(grown.shape, (4, 32 * 32))
-        self.assertTrue(torch.all(indices[1] == 7))
-
-    def test_generation_failure_keeps_inputs_and_never_repeats(self):
-        from sglang.srt.speculative.standalone_remote.sr_cuda_metadata import (
-            SRDraftDecodeMetadataWorkspace,
-        )
-
-        workspace = SRDraftDecodeMetadataWorkspace("cpu", 4, 32)
-        workspace.reserve(9)
-        error = RuntimeError("generation failed")
-        source = object()
-        op = unittest.mock.Mock(side_effect=error)
-        with self.assertRaises(SRTransferUnresolved) as raised:
-            workspace.submit((source,), op)
-        self.assertIs(raised.exception.__cause__, error)
-        self.assertIs(workspace.holds[0][0], source)
-        with self.assertRaises(SRTransferUnresolved):
-            workspace.submit((source,), op)
-        with self.assertRaises(SRTransferUnresolved):
-            workspace.reserve(9)
-        self.assertEqual(op.call_count, 1)
-
-    def test_real_metadata_entry_reuses_views_and_preserves_branch_span(self):
-        # Execute the actual backend entry with a CPU backend substitute. Kernel
-        # argument/replay behavior is separately tested on the real CUDA device.
-        path = _REPO / "python/sglang/srt/layers/attention/triton_backend.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        cls = next(
-            n
-            for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "TritonMultiStepDraftBackend"
-        )
-        functions = [
-            copy.deepcopy(n)
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef)
-            and n.name in ("init_forward_metadata", "common_template")
-        ]
-        for f in functions:
-            f.returns = None
-            for arg in f.args.args:
-                arg.annotation = None
-        calls = []
-
-        class Kernel:
-            def __getitem__(self, grid):
-                def launch(*args, **kwargs):
-                    calls.append((grid, args, kwargs))
-
-                return launch
-
-        scope = {
-            "torch": torch,
-            "generate_draft_decode_kv_indices": Kernel(),
-            "next_power_of_2": lambda v: 1 << (v - 1).bit_length(),
-        }
-        exec(
-            compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
-            scope,
-        )
-        views = []
-        backend = SimpleNamespace(
-            _sr_cuda_metadata=True,
-            _sr_eager_metadata={},
-            device="cpu",
-            metadata_steps=4,
-            speculative_num_steps=5,
-            topk=3,
-            max_context_len=32,
-            pool_len=64,
-            page_size=1,
-            kv_indptr=torch.zeros(4, 13, dtype=torch.int32),
-            attn_backends=[
-                SimpleNamespace(
-                    init_forward_metadata=lambda b: views.append(
-                        (b.spec_info.kv_indices, b.spec_info.kv_indptr)
-                    )
-                )
-                for _ in range(4)
-            ],
-        )
-        backend.common_template = lambda *a: scope["common_template"](backend, *a)
-        batch = SimpleNamespace(
-            batch_size=3,
-            seq_lens_sum=21,
-            seq_lens=torch.tensor([5, 7, 9]),
-            req_pool_indices=torch.tensor([2, 0, 1]),
-            positions=torch.zeros(9),
-            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 64)),
-            spec_info=SimpleNamespace(),
-        )
-        # common_template obtains the mapping from ForwardBatch's pool.
-        with unittest.mock.patch.object(
-            torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=7)
-        ):
-            scope["init_forward_metadata"](backend, batch)
-            first = [(v.data_ptr(), p.data_ptr()) for v, p in views]
-            views.clear()
-            scope["init_forward_metadata"](backend, batch)
-        self.assertEqual(first, [(v.data_ptr(), p.data_ptr()) for v, p in views])
-        self.assertEqual(calls[0][0], (4, 3, 3))
-        self.assertEqual(calls[0][2]["branch_steps"], 5)
-        self.assertEqual(len(backend._sr_eager_metadata), 1)
 
 
 if __name__ == "__main__":

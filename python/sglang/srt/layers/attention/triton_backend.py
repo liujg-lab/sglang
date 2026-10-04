@@ -209,9 +209,9 @@ class TritonAttnBackend(AttentionBackend):
         # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
 
-        assert num_group * num_seq == num_token, (
-            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
-        )
+        assert (
+            num_group * num_seq == num_token
+        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
         # Legacy dynamic splitting logic (non-deterministic)
         if (
@@ -1188,21 +1188,10 @@ class TritonMultiStepDraftBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self._sr_cuda_metadata = (
-            model_runner.spec_algorithm.is_standalone_remote()
-            and torch.device(model_runner.device).type == "cuda"
-            and model_runner.server_args.page_size == 1
-        )
-        self.metadata_steps = (
-            speculative_num_steps - 1
-            if self._sr_cuda_metadata
-            else speculative_num_steps
-        )
-        self._sr_eager_metadata = {}
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
-                self.metadata_steps,
+                self.speculative_num_steps,
                 max_bs + 1,
             ),
             dtype=torch.int32,
@@ -1231,7 +1220,6 @@ class TritonMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         kv_indices_buffer: Optional[torch.Tensor],
         call_fn: int,
-        kv_indptr_buffer=None,
     ):
         if kv_indices_buffer is None:
             kv_indices_buffer = self.cuda_graph_kv_indices
@@ -1239,64 +1227,36 @@ class TritonMultiStepDraftBackend:
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
-        kv_indptr = self.kv_indptr if kv_indptr_buffer is None else kv_indptr_buffer
 
-        generate_draft_decode_kv_indices[(self.metadata_steps, num_seqs, self.topk)](
+        generate_draft_decode_kv_indices[
+            (self.speculative_num_steps, num_seqs, self.topk)
+        ](
             forward_batch.req_pool_indices,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
-            kv_indptr,
+            self.kv_indptr,
             forward_batch.positions,
             self.pool_len,
             kv_indices_buffer.shape[1],
-            kv_indptr.shape[1],
+            self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
-            branch_steps=self.speculative_num_steps if self._sr_cuda_metadata else 0,
         )
 
         if call_fn is None:
             return
 
         for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = kv_indptr[i, : bs + 1]
+            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
             ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if self._sr_cuda_metadata and forward_batch.batch_size:
-            from sglang.srt.speculative.standalone_remote.sr_cuda_metadata import (
-                SRDraftDecodeMetadataWorkspace,
-            )
-
-            stream = torch.cuda.current_stream(self.device)
-            key = stream.cuda_stream
-            workspace = self._sr_eager_metadata.get(key)
-            if workspace is None:
-                workspace = SRDraftDecodeMetadataWorkspace(
-                    self.device,
-                    self.metadata_steps,
-                    self.max_context_len,
-                )
-                self._sr_eager_metadata[key] = workspace
-            indices, indptr = workspace.reserve(forward_batch.batch_size * self.topk)
-            # Each step owns disjoint rows. Child backends retain these views;
-            # none modifies another step's source, so no clone is required.
-            workspace.submit(
-                (forward_batch, indices, indptr),
-                lambda: self.common_template(
-                    forward_batch,
-                    indices,
-                    lambda i, batch: self.attn_backends[i].init_forward_metadata(batch),
-                    indptr,
-                ),
-            )
-            return
         kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
@@ -1319,7 +1279,7 @@ class TritonMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.metadata_steps, max_num_tokens * self.max_context_len),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int64,
             device=self.device,
         )
@@ -1355,33 +1315,6 @@ class TritonMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if self._sr_cuda_metadata:
-            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
-                SRTransferUnresolved,
-            )
-
-            if getattr(self, "_sr_metadata_unresolved", False):
-                raise SRTransferUnresolved(
-                    "Draft graph metadata completion is unresolved"
-                )
-            self._sr_metadata_holds = (
-                forward_batch,
-                self.cuda_graph_kv_indices,
-                self.kv_indptr,
-            )
-        try:
-            self._prepare_replay_metadata(forward_batch, bs)
-        except BaseException as exc:
-            if not self._sr_cuda_metadata:
-                raise
-            self._sr_metadata_unresolved = True
-            if isinstance(exc, SRTransferUnresolved):
-                raise
-            raise SRTransferUnresolved(
-                "Draft graph metadata generation failed after submission"
-            ) from exc
-
-    def _prepare_replay_metadata(self, forward_batch: ForwardBatch, bs: int):
         self.common_template(forward_batch, None, None)
 
         # NOTE: Multi-step's attention backends use the slice of

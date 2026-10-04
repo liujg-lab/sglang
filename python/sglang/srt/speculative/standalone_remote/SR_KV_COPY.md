@@ -26,13 +26,6 @@ neighboring tests were migrated to the explicit workspace API.
 
 ## Layouts and two-stage execution
 
-CUDA extension: ordinary three-dimensional token-major layer buffers now select
-the grouped `cuda_layered` backend. Pointer/stride tables and all gather groups
-share the same workspace lifecycle. Other CUDA layouts retain `torch_out`.
-CUDA page-size-one Target acceptance retains physical slots without KV compaction;
-its independent token commit policy does not call this mover. See
-[SR_CUDA_OPTIMIZATION.md](SR_CUDA_OPTIMIZATION.md) for scope and device validation.
-
 `KVMoveLayout.from_pool()` validates the entire pool before allocating scratch
 or modifying KV. It describes:
 

@@ -43,12 +43,6 @@ def _use_npu_edge_kernel(logits) -> bool:
 
 def _edge_gather_impl(logits):
     """Resolve backend capability before submitting the reduction."""
-    if isinstance(logits.device, torch.device) and logits.device.type == "cuda":
-        from sglang.srt.speculative.standalone_remote.sr_rpd_kernels_cuda import (
-            gather_edge_stats,
-        )
-
-        return gather_edge_stats
     if _use_npu_edge_kernel(logits):
         from sglang.srt.speculative.standalone_remote.sr_rpd_kernels_npu import (
             gather_edge_stats,
@@ -228,9 +222,9 @@ class SRRPDWorkspace:
         ):
             return "edge_layout"
         device = logits.device
-        # CPU supports deterministic contract tests; production admission uses
-        # the separate CUDA token-slot and NPU paged layout checks.
-        if device.type not in ("cpu", "npu", "cuda"):
+        # CPU supports deterministic contract tests, but production admission is
+        # restricted to NPU by SRFixedAcceptState.static_disable_reason.
+        if device.type not in ("cpu", "npu"):
             return "device"
         if device.type != "cpu" and (
             not pin_supported(device) or not event_supported(device)
@@ -393,6 +387,6 @@ def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
     token_rows = [[folded[i] if i >= 0 else 0 for i in row] for row in rows]
     workspace.count("rpd_host_plan_hit")
     if not workspace.logged:
-        logger.info("Speculative RPD verify path: %s_sr_host_plan", logits.device.type)
+        logger.info("Speculative RPD verify path: npu_sr_host_plan")
         workspace.logged = True
     return SRRPDHostPlan(rows, token_rows, lengths, context.vocab, context.batch_key)
