@@ -234,7 +234,7 @@ class SRRPDTest(unittest.TestCase):
                 return_value=SimpleNamespace(type="npu"),
             ):
                 if fail:
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises(SRTransferUnresolved):
                         verify_sr_rpd_host(logits, context, workspace, 0.2, 4)
                 else:
                     verify_sr_rpd_host(logits, context, workspace, 0.2, 4)
@@ -251,6 +251,129 @@ class SRRPDTest(unittest.TestCase):
                     metrics.counts["rpd_host_stats_d2h_bytes"],
                     12 * 8 + 4 * len(context.edges),
                 )
+
+    def test_statistics_submission_failures_retain_all_sources_and_refuse_reuse(self):
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        for stage in ("max", "edge", "first_copy", "second_copy", "record", "wait"):
+            with self.subTest(stage=stage):
+                packet, _ = packet_input()
+                context = packet.rpd_input
+                ws = SRRPDWorkspace()
+                logits = torch.zeros(12, 32)
+                self.assertIsNone(ws.prepare(logits, context))
+                ws.event = Mock()
+                error = RuntimeError(stage)
+                real_max, real_copy = torch.max, torch.Tensor.copy_
+                real_gather = module._gather_edge_stats
+                copy_calls = []
+
+                def reduction(*args, **kwargs):
+                    self.assertIsNotNone(ws.holds)
+                    self.assertTrue(any(t is context.edge_index for t in ws.holds))
+                    if stage == "max":
+                        raise error
+                    return real_max(*args, **kwargs)
+
+                def gather(*args):
+                    if stage == "edge":
+                        raise error
+                    return real_gather(*args)
+
+                def copy_into(dest, src, **kwargs):
+                    if dest.data_ptr() in (
+                        ws.star_host.data_ptr(),
+                        ws.stats_host.data_ptr(),
+                    ):
+                        copy_calls.append(dest)
+                        if stage == (
+                            "first_copy" if len(copy_calls) == 1 else "second_copy"
+                        ):
+                            raise error
+                    return real_copy(dest, src, **kwargs)
+
+                if stage == "record":
+                    ws.event.record.side_effect = error
+                if stage == "wait":
+                    ws.event.synchronize.side_effect = error
+                with (
+                    patch.object(
+                        torch.Tensor,
+                        "device",
+                        new_callable=PropertyMock,
+                        return_value=SimpleNamespace(type="npu"),
+                    ),
+                    patch.object(torch, "max", side_effect=reduction) as maximum,
+                    patch.object(
+                        module, "_gather_edge_stats", side_effect=gather
+                    ) as edge,
+                    patch.object(torch.Tensor, "copy_", copy_into),
+                ):
+                    with self.assertRaises(SRTransferUnresolved) as caught:
+                        verify_sr_rpd_host(logits, context, ws, 0.2, 4)
+                self.assertIs(caught.exception.__cause__, error)
+                self.assertEqual(maximum.call_count, 1)
+                self.assertEqual(edge.call_count, int(stage != "max"))
+                self.assertTrue(ws.unresolved)
+                self.assertTrue(packet.unresolved)
+                self.assertIsNotNone(ws.holds)
+                with self.assertRaises(SRTransferUnresolved):
+                    ws.prepare(logits, context)
+                with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                    packet_input(packet=packet)
+                with self.assertRaises(SRTransferUnresolved):
+                    ws.statistics(logits, context)
+
+    def test_statistics_preflight_failures_do_not_submit_or_poison(self):
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        for case in ("logits", "capacity", "index", "buffer", "kernel"):
+            with self.subTest(case=case):
+                packet, _ = packet_input()
+                context = packet.rpd_input
+                ws = SRRPDWorkspace()
+                logits = torch.zeros(12, 32)
+                ws.prepare(logits, context)
+                if case == "logits":
+                    logits = logits[:, :-1]
+                elif case == "capacity":
+                    ws.rows_cap = 1
+                elif case == "index":
+                    context.edge_index = context.edge_index.int()
+                elif case == "buffer":
+                    ws.argmax = ws.argmax.int()
+                with (
+                    patch.object(torch, "max") as maximum,
+                    patch.object(
+                        module,
+                        "_edge_gather_impl",
+                        side_effect=ImportError("kernel unavailable"),
+                    ),
+                ):
+                    with self.assertRaises((RuntimeError, ImportError)):
+                        verify_sr_rpd_host(logits, context, ws, 0.2, 4)
+                maximum.assert_not_called()
+                self.assertFalse(ws.unresolved)
+                self.assertFalse(packet.unresolved)
+                self.assertIsNone(ws.holds)
+                packet_input(packet=packet)
+                self.assertIsNotNone(packet.rpd_input)
+
+    def test_missing_edge_kernel_declines_before_workspace_allocation(self):
+        packet, _ = packet_input()
+        ws = SRRPDWorkspace()
+        with (
+            patch(
+                "sglang.srt.speculative.standalone_remote.sr_rpd._edge_gather_impl",
+                side_effect=ImportError("missing Triton"),
+            ),
+            patch("torch.empty") as allocate,
+        ):
+            self.assertEqual(
+                ws.prepare(torch.zeros(12, 32), packet.rpd_input), "edge_kernel"
+            )
+        allocate.assert_not_called()
+        self.assertIsNone(ws.key)
 
     def test_empty_batch_and_root_only(self):
         for bs in (0, 2):
@@ -312,6 +435,63 @@ class SRRPDTest(unittest.TestCase):
                     self.assertEqual(plan.pre_lengths, length.tolist())
                     if plan.pre_lengths[0]:
                         self.assertEqual(plan.rows[0][1], 1)  # first sibling wins
+
+    def test_special_logits_host_plan_matches_compact_at_tau0(self):
+        workspace = SRRPDWorkspace()
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for tau in (0.0, 0.2):
+                packet, _ = packet_input()
+                context = packet.rpd_input
+                self.assertGreater(len(context.edges), 0)
+                logits = torch.zeros(12, 32, dtype=dtype)
+                logits[0, 0] = float("nan")
+                logits[0, 1] = float("inf")
+                logits[1, :] = float("-inf")
+                logits[2, 3] = float("nan")
+                logits[4, 5] = float("inf")
+                logits[6, 2] = float("-inf")
+                ref_idx = torch.full((2, 4), -1, dtype=torch.int32)
+                ref_len = torch.zeros(2, dtype=torch.int32)
+                rpd._verify_tree_rpd_compact(
+                    torch.full((13,), -1, dtype=torch.int32),
+                    ref_idx,
+                    ref_len,
+                    *context.tree,
+                    logits,
+                    rpd.rpd_gap_max(tau),
+                    tau == 0.0,
+                )
+                metrics = SimpleNamespace(counts=Counter())
+                self.assertIsNone(workspace.prepare(logits, context, metrics))
+                plan = verify_sr_rpd_host(logits, context, workspace, tau, 4)
+                self.assertEqual(plan.rows, ref_idx.tolist())
+                self.assertEqual(plan.pre_lengths, ref_len.tolist())
+                self.assertEqual(metrics.counts["rpd_host_edge_gather"], 0)
+
+    def test_tau0_nan_gap_uses_python_comparison(self):
+        """An equal-length tau=0 tie keeps the NaN gap instead of treating it as 0."""
+        cand = torch.tensor([[0, 7, 7]], dtype=torch.int64)
+        retr = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+        nxt = torch.tensor([[1, -1, -1]], dtype=torch.int64)
+        sibling = torch.tensor([[-1, 2, -1]], dtype=torch.int64)
+        tree = torch.stack((cand, retr, nxt, sibling))
+        edges = [(0, 1, 0), (0, 2, 0)]
+        star = torch.tensor([[7, 3, 4]], dtype=torch.int64)
+        # Both children match the root argmax. The first gap is NaN; the
+        # second is -1. Python ``-1 < nan`` is false, so the first sibling
+        # stays. Replacing the NaN with 0 makes ``-1 < 0`` and selects the other.
+        stats = torch.tensor([[float("nan"), 0.0], [0.0, 1.0]], dtype=torch.float32)
+        accept, lengths, _, _ = rpd._rpd_compact_select(
+            tree, edges, star, stats, 0.0, True, 3, 3, 4
+        )
+        self.assertEqual(lengths.tolist(), [1])
+        self.assertEqual(accept[0, :2].tolist(), [0, 1])
+        zeroed = stats.clone()
+        zeroed[0, 0] = 0.0
+        accept_zero, _, _, _ = rpd._rpd_compact_select(
+            tree, edges, star, zeroed, 0.0, True, 3, 3, 4
+        )
+        self.assertEqual(accept_zero[0, :2].tolist(), [0, 2])
 
     def test_rpd_admission_keeps_shared_gates(self):
         import test_sr_fixed_accept as fixed

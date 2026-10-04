@@ -518,22 +518,48 @@ def lookup_candidate_slots(
 ) -> torch.Tensor:
     """Map reply indices to still-live physical slots; missing -> -1.
 
-    Lookup is confined to each request's own ``topk`` columns.
+    CPU reference for tests and kernel checks. The reply path does not call
+    this. Lookup is confined to each request's own ``topk`` columns and keeps
+    the first match in ``step`` then ``branch`` order. A node id of ``-1``
+    still compares equal; it is not a special miss.
     """
     steps = int(slot_node_ids.shape[0])
-    rows = int(batch_size) * int(topk)
-    ids = slot_node_ids[:, :rows].reshape(steps, int(batch_size), int(topk))
-    phys = physical_slots[:, :rows].reshape(steps, int(batch_size), int(topk))
-    cands = top_scores_index.to(dtype=torch.int64)
+    bs = int(batch_size)
+    k = int(topk)
+    rows = bs * k
+    cands = top_scores_index
     if cands.dim() == 1:
         cands = cands.unsqueeze(0)
-    ids_f = ids.permute(1, 0, 2).reshape(int(batch_size), steps * int(topk))
-    phys_f = phys.permute(1, 0, 2).reshape(int(batch_size), steps * int(topk))
-    match = ids_f.unsqueeze(-1) == cands.unsqueeze(1)
-    any_match = match.any(dim=1)
-    first = match.to(dtype=torch.int64).argmax(dim=1)
-    gathered = phys_f.gather(1, first)
-    return torch.where(any_match, gathered, gathered.new_full(gathered.shape, -1))
+    if cands.dim() != 2:
+        raise RuntimeError("candidate indices must be rank 1 or 2")
+    n_cand = int(cands.shape[-1])
+    if bs == 0 or n_cand == 0:
+        return torch.empty((bs, n_cand), dtype=torch.int64, device=cands.device)
+    if int(cands.shape[0]) not in (bs, 1):
+        raise RuntimeError("candidate batch does not match requests")
+    ids = slot_node_ids[:, :rows].reshape(steps, bs, k).tolist()
+    phys = physical_slots[:, :rows].reshape(steps, bs, k).tolist()
+    cand_rows = cands.tolist()
+    if len(cand_rows) == 1 and bs != 1:
+        cand_rows = cand_rows * bs
+    out = []
+    for request in range(bs):
+        row = []
+        for target in cand_rows[request]:
+            target = int(target)
+            found = -1
+            for step in range(steps):
+                matched = False
+                for branch in range(k):
+                    if int(ids[step][request][branch]) == target:
+                        found = int(phys[step][request][branch])
+                        matched = True
+                        break
+                if matched:
+                    break
+            row.append(found)
+        out.append(row)
+    return torch.tensor(out, dtype=torch.int64, device=cands.device)
 
 
 def live_accept_prefix(

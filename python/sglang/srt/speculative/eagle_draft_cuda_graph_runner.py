@@ -175,6 +175,10 @@ class EAGLEDraftCudaGraphRunner:
         self.buffers.share_buffers()
 
         # Capture
+        from sglang.srt.speculative.spec_utils import NpuGraphReplaySubmittedError
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
         from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
             SRTransferUnresolved,
         )
@@ -182,12 +186,14 @@ class EAGLEDraftCudaGraphRunner:
         try:
             with model_capture_mode():
                 self.capture()
-        except SRTransferUnresolved:
+        except (SRTransferUnresolved, NpuGraphReplaySubmittedError):
             raise
         except RuntimeError as e:
+            if is_device_context_error(e):
+                raise
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+            ) from e
 
     def filter_capture_batch_sizes(self, capture_bs, compile_bs):
         """Optional capture-bs filter before max_bs and buffer allocation."""

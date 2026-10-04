@@ -45,6 +45,17 @@ prefix-tail 仍可读取 reserved branch pages。例：page=128、prefix=124、s
 预热成功标记必须在完成同步之后设置。运行时出现尚未预热的 eager 几何仍可能首次编译，
 不能把新几何的冷启动时间混入已预热稳态收益。
 
+预热布局准备失败时，调用方检查本轮 workspace 的 pending/unresolved 状态；未确认
+完成则保留 view、输入和输出引用，原样传播最早的异常。安全的提交前失败仍可清理；
+清理自身失败只记录次要诊断，不能覆盖首个错误。backend 原有禁止清理未完成消费者
+的检查继续保留，成功预热仍正常清理。
+
+共享 Draft graph 构造器原样传播 `SRTransferUnresolved`、
+`NpuGraphReplaySubmittedError` 和现有分类器识别的设备上下文错误，避免转换为普通
+捕获失败后继续 tail capture/eager 预热。普通可恢复捕获错误保留原回退及诊断。
+本地测试执行实际捕获处理分支、Draft 初始化及预热方法，设备调用使用故障注入；
+这些检查不能证明 NPU graph 的硬件行为。
+
 ## 指标
 
 计数前缀为 `paged_metadata_target_` / `paged_metadata_draft_`：

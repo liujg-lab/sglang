@@ -288,6 +288,8 @@ class TestNpuRpdCompact(unittest.TestCase):
                     self.assertEqual(plan.rows, index.cpu().tolist())
                     self.assertEqual(plan.pre_lengths, length.cpu().tolist())
                     self.assertEqual(metrics.counts["rpd_host_stats_waits"], 1)
+                    self.assertEqual(metrics.counts["rpd_host_stats_d2h_count"], 2)
+                    self.assertEqual(metrics.counts["rpd_host_edge_gather"], 1)
                     self.assertEqual(
                         metrics.counts["rpd_host_stats_d2h_bytes"],
                         bs * 4 * 8 + 2 * len(context.edges) * logits.element_size(),
@@ -334,6 +336,89 @@ class TestNpuRpdCompact(unittest.TestCase):
                         result.verified_id.cpu(), expected[4].verified_id
                     )
                     torch.testing.assert_close(alloc.kv_buffer.cpu(), expected[5])
+
+    def test_edge_gather_bits_and_empty_edges(self):
+        """Kernel stores original-dtype bits into the live stats view."""
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDWorkspace,
+            build_sr_rpd_input,
+            verify_sr_rpd_host,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd_kernels_npu import (
+            gather_edge_stats,
+        )
+
+        device = self._device()
+        bit_dtype = {
+            torch.float16: torch.int16,
+            torch.bfloat16: torch.int16,
+            torch.float32: torch.int32,
+        }
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for edges in (3, 130):
+                rows, vocab = 6, 17
+                parent = torch.arange(edges, dtype=torch.int64, device=device) % rows
+                token = torch.arange(edges, dtype=torch.int64, device=device) % vocab
+                token[-1] = vocab - 1
+                parent[-1] = rows - 1
+                edge_index = torch.stack((parent, token))
+                values = torch.randn(rows, dtype=dtype, device=device)
+                values[0] = float("nan")
+                values[rows - 1] = float("inf")
+                logits = torch.randn(rows, vocab, dtype=dtype, device=device)
+                logits[0, int(token[0])] = float("nan")
+                logits[rows - 1, vocab - 1] = float("-inf")
+                logits[int(parent[1]), int(token[1])] = float("inf")
+                capacity = 1 << (2 * edges - 1).bit_length()
+                backing = torch.full((capacity,), 7, dtype=dtype, device=device)
+                stats = backing[: 2 * edges].view(2, edges)
+                self.assertTrue(gather_edge_stats(values, logits, edge_index, stats))
+                _sync(device)
+                ref = torch.empty((2, edges), dtype=dtype)
+                parent_cpu, token_cpu = parent.cpu(), token.cpu()
+                ref[0].copy_(values.cpu().index_select(0, parent_cpu))
+                ref[1].copy_(logits.cpu()[parent_cpu, token_cpu])
+                got = stats.cpu()
+                self.assertTrue(
+                    torch.equal(got.view(bit_dtype[dtype]), ref.view(bit_dtype[dtype]))
+                )
+                if capacity > 2 * edges:
+                    tail = backing[2 * edges :].cpu()
+                    self.assertTrue(torch.all(tail == 7))
+            self.assertFalse(
+                gather_edge_stats(
+                    torch.empty(1, dtype=dtype, device=device),
+                    torch.empty((1, 1), dtype=dtype, device=device),
+                    torch.empty((2, 0), dtype=torch.int64, device=device),
+                    torch.empty((2, 0), dtype=dtype, device=device),
+                )
+            )
+
+        owner = SimpleNamespace(generation=1, unresolved=False, rpd_input=None)
+        context = build_sr_rpd_input(
+            torch.zeros(2, dtype=torch.int64),
+            torch.empty((2, 0), dtype=torch.int64),
+            torch.full((2, 1), -1, dtype=torch.int64),
+            torch.empty((2, 0), dtype=torch.int64),
+            topk=2,
+            steps=1,
+            width=1,
+            vocab=4,
+            owner=owner,
+            generation=1,
+        )
+        owner.rpd_input = context
+        context.edge_index = torch.empty((2, 0), dtype=torch.int64, device=device)
+        logits = torch.randn(2, 4, dtype=torch.float16, device=device)
+        workspace = SRRPDWorkspace()
+        metrics = SimpleNamespace(counts=Counter())
+        self.assertIsNone(workspace.prepare(logits, context, metrics))
+        plan = verify_sr_rpd_host(logits, context, workspace, 0.0, 2)
+        self.assertEqual(plan.pre_lengths, [0, 0])
+        self.assertEqual(metrics.counts["rpd_host_edge_gather"], 0)
+        self.assertEqual(metrics.counts["rpd_host_stats_waits"], 1)
+        self.assertEqual(metrics.counts["rpd_host_stats_d2h_count"], 1)
+        self.assertEqual(metrics.counts["rpd_host_stats_d2h_bytes"], 2 * 8)
 
 
 def benchmark_rpd_compact_stages(device: torch.device | None = None) -> None:

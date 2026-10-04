@@ -2,7 +2,8 @@
 
 Topology comes from the normalized verify packet, never from device readback.
 Statistics keep their original dtypes; both D2H copies share one completion
-event. CPU selection deliberately uses the existing RPD reference arithmetic.
+event. NPU edge logits are gathered into that reused buffer without a device
+gap. CPU selection deliberately uses the existing RPD reference arithmetic.
 """
 
 from __future__ import annotations
@@ -27,6 +28,35 @@ from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _use_npu_edge_kernel(logits) -> bool:
+    """True only for a real NPU tensor.
+
+    Contract tests spoof ``Tensor.device`` with a plain object whose ``type``
+    is ``"npu"``. Those tensors stay on the reference gather.
+    """
+    device = logits.device
+    return isinstance(device, torch.device) and device.type == "npu"
+
+
+def _edge_gather_impl(logits):
+    """Resolve backend capability before submitting the reduction."""
+    if _use_npu_edge_kernel(logits):
+        from sglang.srt.speculative.standalone_remote.sr_rpd_kernels_npu import (
+            gather_edge_stats,
+        )
+
+        return gather_edge_stats
+    return _gather_edge_stats
+
+
+def _gather_edge_stats(values, logits, edge_index, stats) -> bool:
+    """CPU reference gather used by contract tests."""
+    parent, token = edge_index
+    stats[0].copy_(values.index_select(0, parent))
+    stats[1].copy_(logits[parent, token])
+    return False
 
 
 def rpd_batch_key(reqs):
@@ -177,6 +207,7 @@ class SRRPDWorkspace:
             or index.device != logits.device
             or index.dtype != torch.int64
             or tuple(index.shape) != (2, len(context.edges))
+            or not index.is_contiguous()
         ):
             return "edge_layout"
         device = logits.device
@@ -190,6 +221,11 @@ class SRRPDWorkspace:
             return "staging"
         key = (device, logits.dtype)
         edges = len(context.edges)
+        if edges:
+            try:
+                _edge_gather_impl(logits)
+            except (ImportError, AttributeError):
+                return "edge_kernel"
         if key != self.key or rows > self.rows_cap or edges > self.edges_cap:
             rc = max(rows, self.rows_cap, 1)
             ec = max(edges, self.edges_cap, 1)
@@ -198,48 +234,100 @@ class SRRPDWorkspace:
             stats_host, stats_pinned = alloc_host((2, ec), logits.dtype, device)
             if device.type != "cpu" and not (star_pinned and stats_pinned):
                 return "staging"
-            self.values = torch.empty(rc, dtype=logits.dtype, device=device)
-            self.argmax = torch.empty(rc, dtype=torch.int64, device=device)
-            self.edge_values = torch.empty((2, ec), dtype=logits.dtype, device=device)
-            self.star_host, self.stats_host = star_host, stats_host
-            self.rows_cap, self.edges_cap, self.key = rc, ec, key
-            self.event = (
+            values = torch.empty(rc, dtype=logits.dtype, device=device)
+            argmax = torch.empty(rc, dtype=torch.int64, device=device)
+            edge_values = torch.empty((2, ec), dtype=logits.dtype, device=device)
+            event = (
                 torch.get_device_module(device.type).Event()
                 if device.type != "cpu"
                 else None
             )
+            self.values, self.argmax, self.edge_values = values, argmax, edge_values
+            self.star_host, self.stats_host = star_host, stats_host
+            self.rows_cap, self.edges_cap, self.key = rc, ec, key
+            self.event = event
             self.count("rpd_host_workspace_grow")
         return None
 
     def statistics(self, logits, context):
+        if self.unresolved or context.owner.unresolved:
+            raise SRTransferUnresolved("RPD statistics workspace is unresolved")
         bs, width = context.tree.shape[1:]
         rows, edges = bs * width, len(context.edges)
+        # Metadata checks and lazy imports must finish before the first device
+        # operation. An import failure does not imply an in-flight reduction.
+        if (
+            self.key is None
+            or rows > self.rows_cap
+            or edges > self.edges_cap
+            or tuple(logits.shape) != (rows, context.vocab)
+            or logits.dtype != self.key[1]
+            or not logits.is_contiguous()
+        ):
+            raise RuntimeError("RPD statistics logits or prepared capacity mismatch")
+        index = context.edge_index
+        if (
+            index is None
+            or tuple(index.shape) != (2, edges)
+            or index.dtype != torch.int64
+            or index.device != logits.device
+            or not index.is_contiguous()
+        ):
+            raise RuntimeError("RPD statistics edge layout mismatch")
+        for tensor, dtype, shape in (
+            (self.values, logits.dtype, (self.rows_cap,)),
+            (self.argmax, torch.int64, (self.rows_cap,)),
+            (self.edge_values, logits.dtype, (2, self.edges_cap)),
+        ):
+            if (
+                tensor.device != logits.device
+                or tensor.dtype != dtype
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+            ):
+                raise RuntimeError("RPD statistics device buffer layout mismatch")
+        for tensor, dtype, shape in (
+            (self.star_host, torch.int64, (self.rows_cap,)),
+            (self.stats_host, logits.dtype, (2, self.edges_cap)),
+        ):
+            if (
+                tensor.dtype != dtype
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+            ):
+                raise RuntimeError("RPD statistics host buffer layout mismatch")
+        gather = _edge_gather_impl(logits) if edges else None
         if rows == 0:
             return self.star_host[:0].reshape(bs, width), None
+        async_copy = logits.device.type != "cpu"
+        if async_copy and self.event is None:
+            raise RuntimeError("RPD statistics completion event is missing")
         values, argmax = self.values[:rows], self.argmax[:rows]
         # Edge buffers are flattened contiguous live regions, independent of
         # capacity; this also avoids strided D2H copies when the batch shrinks.
         stats = self.edge_values.reshape(-1)[: 2 * edges].reshape(2, edges)
         host_stats = self.stats_host.reshape(-1)[: 2 * edges].reshape(2, edges)
         host_star = self.star_host[:rows]
-        # Reduction and on-device gathers have not queued a host readback.
-        # A launch failure here must leave the packet reusable for the next round.
-        torch.max(logits, dim=-1, out=(values, argmax))
-        if edges:
-            parent, token = context.edge_index
-            stats[0].copy_(values.index_select(0, parent))
-            stats[1].copy_(logits[parent, token])
-        async_copy = logits.device.type != "cpu"
-        if not async_copy:
-            host_star.copy_(argmax, non_blocking=False)
-            if edges:
-                host_stats.copy_(stats, non_blocking=False)
-            return host_star.reshape(bs, width), host_stats if edges else None
-        self.holds = (logits, context, values, argmax, stats)
+        if async_copy:
+            self.holds = (
+                logits,
+                context,
+                index,
+                values,
+                argmax,
+                stats,
+                host_star,
+                host_stats,
+            )
         try:
-            host_star.copy_(argmax, non_blocking=True)
+            torch.max(logits, dim=-1, out=(values, argmax))
+            if edges and gather(values, logits, index, stats):
+                self.count("rpd_host_edge_gather")
+            host_star.copy_(argmax, non_blocking=async_copy)
             if edges:
-                host_stats.copy_(stats, non_blocking=True)
+                host_stats.copy_(stats, non_blocking=async_copy)
+            if not async_copy:
+                return host_star.reshape(bs, width), host_stats if edges else None
             self.count("rpd_host_stats_d2h_count", 1 + int(edges > 0))
             self.count(
                 "rpd_host_stats_d2h_bytes",
@@ -248,10 +336,18 @@ class SRRPDWorkspace:
             self.event.record()
             self.count("rpd_host_stats_waits")
             wait_event(self.event)
-        except BaseException:
-            # The D2H or its event may still be running. Keep sources alive.
-            self.unresolved = True
-            context.owner.unresolved = True
+        except BaseException as exc:
+            if async_copy:
+                # Even a reduction/gather launch can have submitted work. No
+                # later packet fill, workspace growth or retry is safe yet.
+                self.unresolved = True
+                context.owner.unresolved = True
+                if isinstance(exc, Exception) and not isinstance(
+                    exc, SRTransferUnresolved
+                ):
+                    raise SRTransferUnresolved(
+                        "RPD statistics failed after device submission; refuse reuse"
+                    ) from exc
             raise
         self.holds = None
         return host_star.reshape(bs, width), host_stats if edges else None

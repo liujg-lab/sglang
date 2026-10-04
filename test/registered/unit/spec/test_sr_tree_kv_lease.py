@@ -34,6 +34,11 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     tree_raw_span_len,
     validate_lease_commit,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
+    pack_tree_reply,
+    plan_tree_reply,
+    warm_tree_reply_pack,
+)
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftReply,
@@ -184,10 +189,178 @@ class TestIdentityAndLookup(unittest.TestCase):
         self.assertEqual(int(slots[0, 0]), 0)
         self.assertEqual(int(slots[1, 0]), 3)
 
+    def test_lookup_keeps_first_step_then_branch(self):
+        # Same id is overwritten later in the scan. The earliest step/branch wins.
+        ids = torch.tensor(
+            [
+                [4, 4],
+                [4, 9],
+            ],
+            dtype=torch.int64,
+        )
+        phys = torch.tensor(
+            [
+                [10, 11],
+                [20, 21],
+            ],
+            dtype=torch.int64,
+        )
+        slots = lookup_candidate_slots(ids, phys, torch.tensor([[4, 9, 7, -1]]), 1, 2)
+        self.assertEqual(slots.tolist(), [[10, 21, -1, -1]])
+
+    def test_lookup_matches_minus_one_node_id(self):
+        ids = torch.full((1, 2), -1, dtype=torch.int64)
+        ids[0, 1] = 3
+        phys = torch.tensor([[8, 9]], dtype=torch.int64)
+        slots = lookup_candidate_slots(ids, phys, torch.tensor([[-1, 3]]), 1, 2)
+        self.assertEqual(slots.tolist(), [[8, 9]])
+
     def test_identity_reset_clears_padding(self):
         ids = torch.arange(8, dtype=torch.int64).reshape(2, 4)
         ids.fill_(-1)
         self.assertTrue(bool((ids == -1).all()))
+
+
+def _expected_reply(tokens, parents, indices, node_ids, compact, batch, topk, steps, write_slots):
+    parts = []
+    for tensor in (tokens, parents, indices):
+        if int(tensor.numel()) == 0:
+            continue
+        parts.append(tensor.detach().reshape(-1).to(dtype=torch.int64).cpu())
+    if write_slots and int(indices.numel()) > 0:
+        phys = (
+            compact.detach()
+            .reshape(int(batch), int(topk), int(steps))
+            .permute(2, 0, 1)
+            .reshape(int(steps), -1)
+            .cpu()
+        )
+        slots = lookup_candidate_slots(
+            node_ids.detach().cpu(), phys, indices.detach().cpu(), batch, topk
+        )
+        parts.append(slots.reshape(-1))
+    if not parts:
+        return torch.empty(0, dtype=torch.int64)
+    return torch.cat(parts)
+
+
+class TestTreeReplyPack(unittest.TestCase):
+    def _assert_packed(self, tokens, parents, indices, node_ids, compact, batch, topk, steps, write_slots):
+        segments, needed = plan_tree_reply(tokens, parents, indices, write_slots)
+        buf = torch.empty(max(needed, 1), dtype=torch.int64)
+        copies = {"n": 0}
+        orig = torch.Tensor.copy_
+
+        def counting_copy(self, src, *args, **kwargs):
+            copies["n"] += 1
+            return orig(self, src, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "copy_", counting_copy):
+            pack_tree_reply(
+                buf,
+                tokens,
+                parents,
+                indices,
+                node_ids,
+                compact,
+                batch=batch,
+                topk=topk,
+                steps=steps,
+                write_slots=write_slots,
+            )
+        self.assertEqual(copies["n"], 0)
+        expected = _expected_reply(
+            tokens, parents, indices, node_ids, compact, batch, topk, steps, write_slots
+        )
+        self.assertEqual(buf[:needed].tolist(), expected.tolist())
+        self.assertEqual(
+            [name for name, _shape, _offset, _length in segments],
+            self._segment_names(tokens, parents, indices, write_slots),
+        )
+
+    def _segment_names(self, tokens, parents, indices, write_slots):
+        names = []
+        for name, tensor in (
+            ("tokens", tokens),
+            ("parents", parents),
+            ("indices", indices),
+        ):
+            if int(tensor.numel()) > 0:
+                names.append(name)
+        if write_slots and int(indices.numel()) > 0:
+            names.append("candidate_slots")
+        return names
+
+    def test_pack_without_slots_skips_empty_parents(self):
+        tokens = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+        parents = torch.empty((2, 0), dtype=torch.int64)
+        indices = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64)
+        self._assert_packed(tokens, parents, indices, None, None, 2, 1, 1, False)
+
+    def test_pack_matches_oracle_for_duplicates_and_isolation(self):
+        batch, topk, steps = 2, 2, 2
+        tokens = torch.arange(12, dtype=torch.int64).view(3, 4)[:batch, ::2]
+        parents = torch.tensor([[-1, 0], [-1, 1]], dtype=torch.int64)
+        indices = torch.tensor([[4, 9, 7, -1], [1, 1, 8, -1]], dtype=torch.int64)
+        node_ids = torch.full((steps, batch * topk + 1), -1, dtype=torch.int64)
+        node_ids[:, : batch * topk] = torch.tensor(
+            [
+                [4, 4, 1, 2],
+                [4, 9, 1, 8],
+            ],
+            dtype=torch.int64,
+        )
+        # Padding column repeats an id and must not be selected.
+        node_ids[:, -1] = 4
+        base = torch.arange(batch * topk * (steps + 1), dtype=torch.int64).view(
+            batch, topk, steps + 1
+        )
+        compact = base[:, :, ::2][:, :, :steps]
+        self.assertEqual(tuple(compact.shape), (batch, topk, steps))
+        self.assertFalse(compact.is_contiguous())
+        self._assert_packed(
+            tokens, parents, indices, node_ids, compact, batch, topk, steps, True
+        )
+
+    def test_pack_reads_strided_sources_in_row_major_order(self):
+        tokens = torch.arange(12, dtype=torch.int64).view(3, 4)[1:, 1::2]
+        parents = torch.arange(12, dtype=torch.int64).view(3, 4)[:, ::2]
+        indices = torch.arange(6, dtype=torch.int32).view(2, 3)[:, [2, 0]]
+        self.assertFalse(tokens.is_contiguous())
+        self.assertFalse(parents.is_contiguous())
+        self._assert_packed(tokens, parents, indices, None, None, 2, 1, 1, False)
+
+    def test_cpu_warmup_does_not_launch_or_count_packs(self):
+        import sys
+        from pathlib import Path
+
+        kernel = (
+            "sglang.srt.speculative.standalone_remote.drafter."
+            "sr_tree_reply_pack_kernels"
+        )
+        self.assertNotIn(kernel, sys.modules)
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter."
+            "sr_tree_reply_pack.pack_tree_reply"
+        ) as packed:
+            held = warm_tree_reply_pack(torch.device("cpu"), 3, 5, 15)
+        packed.assert_not_called()
+        self.assertEqual(held, [])
+        self.assertNotIn(kernel, sys.modules)
+        drafter = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        text = drafter.read_text(encoding="utf-8")
+        start = text.index("def _sr_warm_tree_shapes")
+        body = text[start : text.index("\n    def ", start + 1)]
+        self.assertIn("warm_tree_reply_pack", body)
+        self.assertIn("warmup_synchronize", body)
+        self.assertNotIn("tree_device_pack_copies", body)
+        tokens = torch.tensor([[10, 11]], dtype=torch.int64)
+        parents = torch.tensor([[-1, 0]], dtype=torch.int64)
+        indices = torch.tensor([[0, 1]], dtype=torch.int64)
+        self._assert_packed(tokens, parents, indices, None, None, 1, 1, 1, False)
 
 
 def _identity_gold(ids, parents, depth):

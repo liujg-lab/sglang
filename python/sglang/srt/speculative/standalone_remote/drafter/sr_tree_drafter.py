@@ -47,7 +47,6 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     immediate_free_pages,
     later_forward_node_ids,
     lease_budget_ok,
-    lookup_candidate_slots,
     plan_paged_tree_layout,
     prefix_window_tokens,
 )
@@ -631,7 +630,29 @@ class SRTreeDrafter:
                             commit_kv=False,
                         )
                         combos.append(key)
-        finally:
+        except BaseException:
+            view = getattr(backend, "_sr_draft_paged_view", None)
+            workspace = getattr(view, "workspace", None)
+            if workspace is not None and (
+                workspace.pending_consumer or workspace.unresolved
+            ):
+                workspace.poison()
+            else:
+                clear = getattr(backend, "_sr_clear_paged_round_state", None)
+                if clear is not None:
+                    try:
+                        clear()
+                    except BaseException:
+                        # Keep the primary warmup error, including interrupts.
+                        # Failed cleanup retains the backend's remaining refs.
+                        try:
+                            logger.exception(
+                                "[SR] secondary paged warmup cleanup failure"
+                            )
+                        except BaseException:
+                            pass
+            raise
+        else:
             clear = getattr(backend, "_sr_clear_paged_round_state", None)
             if clear is not None:
                 clear()
@@ -703,6 +724,7 @@ class SRTreeDrafter:
         combos = []
         alloc_keys = []
         mapping_keys = []
+        reply_pack_s = 0.0
         try:
             # Lease sources are assembled as int64, while destinations retain
             # the request mapping dtype. Warm that distinct pointer signature.
@@ -715,6 +737,24 @@ class SRTreeDrafter:
             coverage = warm_draft_alloc_mapping(self)
             alloc_keys = coverage.get("allocation") or []
             mapping_keys = coverage.get("mapping") or []
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
+                warm_tree_reply_pack,
+            )
+            from sglang.srt.speculative.standalone_remote.sr_warmup import (
+                warmup_synchronize,
+            )
+
+            t_pack = time.perf_counter()
+            # Hold the sources across the sync. The first launch compiles.
+            reply_holds = warm_tree_reply_pack(
+                self.device,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+            warmup_synchronize(self.device)
+            reply_pack_s = time.perf_counter() - t_pack
+            del reply_holds
         except (NpuGraphReplaySubmittedError, KVMoveSubmittedError, SRWarmupFatalError):
             raise
         except Exception as e:
@@ -735,10 +775,12 @@ class SRTreeDrafter:
             self._seen_tree_paged_shapes = seen
         seen.update(combos)
         logger.info(
-            "[SR] tree warmup layout=%s allocation=%s mapping=%s elapsed=%.3fs",
+            "[SR] tree warmup layout=%s allocation=%s mapping=%s "
+            "reply_pack=%.3fs elapsed=%.3fs",
             combos,
             alloc_keys,
             mapping_keys,
+            reply_pack_s,
             time.perf_counter() - t0,
         )
 
@@ -980,6 +1022,11 @@ class SRTreeDrafter:
         from sglang.srt.speculative.standalone_remote.sr_align import (
             is_device_context_error,
         )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
+            pack_tree_reply,
+            prepare_tree_reply,
+            record_reply_inputs,
+        )
         from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
             SRTransferUnresolved,
             cross_device_d2h,
@@ -999,73 +1046,80 @@ class SRTreeDrafter:
         tokens = _as_2d(draft_tokens.detach())
         parents = _as_2d(parent_list.detach())
         indices = _as_2d(top_scores_index.detach())
-        n = int(tokens.shape[0])
-        pieces = [("tokens", tokens), ("parents", parents), ("indices", indices)]
         lease_state = getattr(self, "_pending_lease_state", None)
+        compact = None
+        node_ids = None
+        write_slots = False
         if lease_state is not None:
             compact = getattr(self, "_lease_compact_slots", None)
             node_ids = getattr(self, "_slot_node_ids", None)
-            if compact is not None and node_ids is not None:
-                from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
-                    lookup_candidate_slots,
-                )
-
-                phys = (
-                    compact.reshape(n, self.topk, self.speculative_num_steps)
-                    .permute(2, 0, 1)
-                    .reshape(self.speculative_num_steps, -1)
-                )
-                slots_dev = lookup_candidate_slots(
-                    node_ids, phys, indices, n, self.topk
-                ).clone()
-                if int(slots_dev.numel()) > 0:
-                    pieces.append(("candidate_slots", slots_dev))
+            if (
+                compact is not None
+                and node_ids is not None
+                and int(indices.numel()) > 0
+            ):
+                write_slots = True
+        batch = int(tokens.shape[0])
+        # No-lease replies never touch the lease tables. Reading topk only when
+        # slots are packed keeps callers that do not set those attributes working.
+        topk = int(self.topk) if write_slots else 1
+        steps = int(self.speculative_num_steps) if write_slots else 1
+        segments, needed = prepare_tree_reply(
+            tokens,
+            parents,
+            indices,
+            node_ids if write_slots else None,
+            compact if write_slots else None,
+            batch=batch,
+            topk=topk,
+            steps=steps,
+            write_slots=write_slots,
+        )
         slot = self._acquire_tree_slot()
         self._mark_tree_slot(slot, "free")
-        needed = 0
-        flats = []
-        for name, tensor in pieces:
-            flat = tensor.reshape(-1)
-            if flat.dtype != torch.int64:
-                flat = flat.to(dtype=torch.int64)
-            if int(flat.numel()) == 0:
-                continue
-            flats.append((name, tensor.shape, tensor, flat))
-            needed += int(flat.numel())
         if slot.grow(needed, tokens.device):
             self._count_tree("tree_staging_grow")
         if slot.pinned:
             metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
             if metrics is not None and hasattr(metrics, "counts"):
                 metrics.counts["tree_pinned"] = 1
-        holds = []
-        segments = []
-        offset = 0
+        holds = [tokens, parents, indices]
+        if write_slots:
+            holds.extend((node_ids, compact))
         try:
             with self._tree_phase("tree_pack_device", device=True):
-                for name, shape, tensor, flat in flats:
-                    length = int(flat.numel())
-                    slot.device_buf[offset : offset + length].copy_(flat)
+                if needed > 0:
+                    pack_tree_reply(
+                        slot.device_buf,
+                        tokens,
+                        parents,
+                        indices,
+                        node_ids if write_slots else None,
+                        compact if write_slots else None,
+                        batch=batch,
+                        topk=topk,
+                        steps=steps,
+                        write_slots=write_slots,
+                    )
                     self._count_tree("tree_device_pack_copies")
-                    segments.append((name, tuple(int(v) for v in shape), offset, length))
-                    holds.append(tensor)
-                    offset += length
+                record_reply_inputs(holds, tokens.device)
         except Exception as exc:
             if is_device_context_error(exc):
+                record_reply_inputs(holds, tokens.device)
                 slot.src_hold = holds
                 slot.segments = segments
-                slot.used = offset
+                slot.used = needed
                 self._mark_tree_slot(slot, "unresolved")
-                raise SRTransferUnresolved("device pack copy failed") from exc
+                raise SRTransferUnresolved("device pack failed") from exc
             raise
         slot.src_hold = holds
         slot.segments = segments
-        slot.used = offset
-        if offset <= 0:
+        slot.used = needed
+        if needed <= 0:
             self._mark_tree_slot(slot, "consuming")
             return tokens[:0], parents[:0], indices[:0], None
-        host = slot.host_buf[:offset]
-        device_src = slot.device_buf[:offset]
+        host = slot.host_buf[:needed]
+        device_src = slot.device_buf[:needed]
         self._mark_tree_slot(slot, "in_flight")
         try:
             with self._tree_phase("tree_d2h_submit"):
@@ -1075,11 +1129,13 @@ class SRTreeDrafter:
             raise
         self._count_tree("tree_host_payload_submits")
         self._count_tree("tree_d2h_count")
-        self._count_tree("tree_d2h_bytes", offset * 8)
+        self._count_tree("tree_d2h_bytes", needed * 8)
         if cross_device_d2h(device_src, host):
             self._count_tree("tree_cross_device_d2h")
         slot.event = event
         try:
+            # Recorded after the pack on this stream, so the wait also covers
+            # earlier Draft compute. It is not only the copy duration.
             with self._tree_phase("tree_d2h_wait"):
                 wait_event(event)
         except Exception:

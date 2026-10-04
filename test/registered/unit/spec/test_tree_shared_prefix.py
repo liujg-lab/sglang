@@ -795,14 +795,10 @@ class TestTreeFailureHandling(unittest.TestCase):
         self.assertEqual(windows[0][1], [-1, 0])
         self.assertEqual(windows[1][2], [3, 4, 5])
         self.assertEqual(self.drafter._tree_host_payload_submits, 1)
-        self.assertEqual(self.drafter._tree_device_pack_copies, 3)
+        self.assertEqual(self.drafter._tree_device_pack_copies, 1)
         self.assertEqual(self.drafter._tree_cross_device_d2h, 0)
         self.assertEqual(copies["cross"], 0)
-        self.assertEqual(
-            copies["cpu"],
-            self.drafter._tree_device_pack_copies
-            + self.drafter._tree_host_payload_submits,
-        )
+        self.assertEqual(copies["cpu"], self.drafter._tree_host_payload_submits)
         self.assertEqual(
             self.drafter._tree_slot_trace,
             ["free", "in_flight", "consuming", "free"],
@@ -819,6 +815,12 @@ class TestTreeFailureHandling(unittest.TestCase):
         parent = torch.tensor([[-1, 0]], dtype=torch.int64)
         index = torch.tensor([[0, 1]], dtype=torch.int64)
         tokens = torch.tensor([[10, 11]], dtype=torch.int64)
+        node_ids = torch.tensor([[5]], dtype=torch.int64)
+        compact = torch.tensor([9], dtype=torch.int64)
+        self.drafter.topk = 1
+        self.drafter.speculative_num_steps = 1
+        self.drafter._slot_node_ids = node_ids
+        self.drafter._lease_compact_slots = compact
         self.drafter._expand_tree = Mock(return_value=(parent, index, tokens))
         for name in ("expand_batch", "_expand_one"):
             freed = {"n": 0}
@@ -844,6 +846,9 @@ class TestTreeFailureHandling(unittest.TestCase):
             slot = self.drafter._active_tree_slot
             self.assertEqual(slot.state, "unresolved")
             self.assertTrue(slot.src_hold)
+            self.assertTrue(any(t is node_ids for t in slot.src_hold))
+            self.assertTrue(any(t is compact for t in slot.src_hold))
+            self.assertNotEqual(slot.state, "free")
 
     def test_submitted_and_device_errors_propagate(self):
         for exc in (

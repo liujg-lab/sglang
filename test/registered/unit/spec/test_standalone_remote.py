@@ -2068,10 +2068,10 @@ class TestStandaloneRemoteTree(CustomTestCase):
             drafter.expand_batch([r0, r1])
         self.assertEqual(order, ["submit", "wait"])
         self.assertEqual(drafter._tree_host_payload_submits, 1)
-        self.assertEqual(drafter._tree_device_pack_copies, 3)
+        self.assertEqual(drafter._tree_device_pack_copies, 1)
         self.assertEqual(drafter._tree_cross_device_d2h, 0)
         self.assertEqual(copies["cross"], 0)
-        self.assertEqual(copies["cpu"], 4)
+        self.assertEqual(copies["cpu"], 1)
         self.assertEqual(
             drafter._tree_slot_trace, ["free", "in_flight", "consuming", "free"]
         )
@@ -2112,6 +2112,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
                 "n", freed["n"] + 1
             )
             drafter._pending_lease_state = {"page_slots": [torch.tensor([7])]}
+            node_ids = torch.tensor([[5]], dtype=torch.int64)
+            compact = torch.tensor([9], dtype=torch.int64)
+            drafter.topk = 1
+            drafter.speculative_num_steps = 1
+            drafter._slot_node_ids = node_ids
+            drafter._lease_compact_slots = compact
             with patch(
                 "sglang.srt.speculative.standalone_remote.sr_transfer_staging.submit_copy",
                 side_effect=SRTransferUnresolved("d2h"),
@@ -2123,6 +2129,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
             slot = drafter._active_tree_slot
             self.assertEqual(slot.state, "unresolved")
             self.assertTrue(slot.src_hold)
+            self.assertTrue(any(t is node_ids for t in slot.src_hold))
+            self.assertTrue(any(t is compact for t in slot.src_hold))
+            self.assertNotEqual(slot.state, "free")
 
     def test_tree_drafter_exposes_eagle_draft_graph_aliases(self):
         try:

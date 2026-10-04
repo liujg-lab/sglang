@@ -13,8 +13,10 @@ KV 搬移算法或共享 `verify_tree_rpd()` 的签名及返回值。
    未请求 RPD 时包布局不变。NPU mask、position 和树构建仍走原实现。
 3. `EagleVerifyInput.verify()` 在 penalty/logit bias 之后调用 `verify_sr_rpd_host()`。
    `torch.max` 的 argmax 使用 int64，边 logit 使用原 FP16/BF16/FP32 dtype。
+   NPU 上父节点最大 logit 与候选 logit 由一次 edge-gather 直接写入复用缓冲，
+   不在设备上计算 gap；CPU 契约测试仍用原来的 index_select 与高级下标。
    复用按容量增长的设备/主机 pinned 缓冲；两次 D2H 同流提交，末尾一个 event、
-   一次等待。无边只读 argmax，空批次没有传输和等待。
+   一次等待。dtype、D2H 次数和等待次数不变。无边只读 argmax，空批次没有传输和等待。
 4. 原 `_rpd_compact_select()` / `_longest_path()` 返回主机选路结果。
    原 logit 转 Python float 后减法、比较与累加顺序不变；边界为
    `gap <= -ln(1-tau)`，tau=0 比较 argmax token；优先最长路径，然后累计 gap
@@ -35,9 +37,14 @@ hidden 消费、自定义处理器、模拟接受长度、非支持 logits 布�
 
 输入 generation 或请求行序变化拒绝旧计划；同一上下文、同一计划只消费一次。
 缺失上下文的回退原因是 `rpd_context`，请求行序变化是 `rpd_batch_key`，二者都不是共享的 `mode`。
-词表归约或设备上的边取值失败原样传播，不锁工作区，下一轮仍可填充输入包。
-异步统计 D2H、event 记录或等待失败原样传播并锁住工作区与输入包，保留 logits/边索引源引用。
-CPU 上的同步统计拷贝失败不锁包。禁止将完成状态不明当作普通 fallback。CPU 校验失败不修改任何请求；停止判断或
+形状、dtype、容量和 kernel 导入能力在设备提交前检查；缺少边 kernel 的 admission
+回退原因为 `rpd_edge_kernel`。提交前校验失败不锁工作区、不提交计算或改变请求。
+NPU 首次归约提交前保留 logits、上下文、边索引及设备/主机缓冲引用。归约、边取值、
+任一次统计 D2H、event 记录或等待失败且完成状态不明时，锁住工作区与输入包；普通
+异常包装为 `SRTransferUnresolved` 并保留 cause，已有该类异常和中断原样传播。
+不能因为尚未提交 D2H 就允许覆盖仍可能被计算读取的缓冲。下一轮填包、准备或直接
+统计均拒绝复用；只有等待成功后释放本轮引用。正常非空路径仍只等待一次。
+CPU 上的同步统计失败不锁包。禁止将完成状态不明当作普通 fallback。CPU 校验失败不修改任何请求；停止判断或
 提交开始后的异常不重试，不重复追加或提前释放页面。最终提交 H2D 的提交或等待
 无法确认完成时，接受状态也锁住提交包；即使换一个新主机计划，也不能覆盖源缓冲
 或再次追加。输入包复用等待与上一轮提交包
@@ -58,6 +65,7 @@ CPU 上的同步统计拷贝失败不锁包。禁止将完成状态不明当作�
 | `rpd_host_stats_d2h_bytes` | `8*B*W + 2*E*logit_element_size` |
 | `rpd_host_stats_d2h_count` | 非空批次 1 或 2 次 typed D2H |
 | `rpd_host_stats_waits` | 非空批次一次统计等待尝试 |
+| `rpd_host_edge_gather` | 真实 NPU 边 gather 启动次数；无边为 0，不计入 D2H |
 | `rpd_host_workspace_grow` | 容量或 dtype/device 改变引起的工作区分配 |
 | `fixed_accept_h2d_count` | 最终提交包上传次数 |
 
@@ -106,3 +114,31 @@ PYTHONPATH=/mnt/user/liujg/sglang/python python3 test/manual/test_npu_rpd_verify
 
 同时记录均值及 p50/p95、统计传输字节和等待次数，区分稳态与首次分配/JIT。
 现有 `--bench` 只测旧 compact 分段，不能替代整条主机计划的服务对照或据此推算收益。
+
+## 2026-10-04 提交保护本地验收
+
+使用 Windows 临时 Python 3.12 / PyTorch 2.8 CPU 环境，设置 `PYTHONPATH=python`、
+`PYTHONUTF8=1`、`PYTHONDONTWRITEBYTECODE=1` 和 `OMP_NUM_THREADS=MKL_NUM_THREADS=1`。
+以下每项均执行 `python test/registered/unit/spec/<文件名>`：
+
+| 文件 | 通过 | 跳过 |
+|---|---:|---:|
+| `test_sr_rpd.py` | 25 | 0 |
+| `test_sr_fixed_accept.py` | 35 | 0 |
+| `test_sr_kv_copy.py` | 31 | 0 |
+| `test_sr_tree_paged_layout.py` | 66 | 0 |
+| `test_sr_comm_metrics.py` | 44 | 0 |
+| `test_sr_tree_kv_lease.py` | 42 | 0 |
+| `test_sr_paged_metadata.py` | 24 | 0 |
+| `test_remote_spec_device.py` | 44 | 10 |
+
+另执行 `python test/manual/test_sr_paged_metadata_device.py -v` 和
+`python test/manual/test_npu_rpd_verify.py -v`，各 5 项因无 torch_npu/NPU 跳过。
+合计 311 通过、20 跳过；remote-spec 跳过项因本地缺少运行时依赖/加速设备。
+统计测试中的超时、event 错误日志来自预期故障注入。
+
+六个修改的生产/测试 Python 文件通过内存 `compile()` 语法检查，以及
+`python -m ruff check --select E9,F63,F7,F82 <六个文件>`；`git diff --check` 通过。
+新增 CPU 测试覆盖 max、edge gather、两次 D2H、record、wait 失败、提交前拒绝、
+graph 致命异常穿透和预热双重异常。graph 初始化测试提取实际方法执行，不能作为
+完整 SGLang 模块导入或服务启动成功的证据。未连接服务器、未做硬件或性能验收。

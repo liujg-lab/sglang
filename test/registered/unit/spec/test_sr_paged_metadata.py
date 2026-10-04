@@ -559,6 +559,92 @@ class TestPagedMetadata(unittest.TestCase):
         self.assertTrue(private.workspace.unresolved)
         self.assertFalse(getattr(md, "_paged_warm_complete", False))
 
+    def test_layout_warmup_preserves_primary_error_and_pending_resources(self):
+        path = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        method = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_sr_warm_layout_shapes"
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+            ALLOC_LEASE,
+            ALLOC_ORDINARY,
+            tree_paged_shape_key,
+        )
+
+        log = Mock()
+        ns = dict(
+            torch=torch,
+            SimpleNamespace=types.SimpleNamespace,
+            logger=log,
+            tree_paged_shape_key=tree_paged_shape_key,
+            ALLOC_ORDINARY=ALLOC_ORDINARY,
+            ALLOC_LEASE=ALLOC_LEASE,
+        )
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), ns)
+        for status in (
+            "success",
+            "pre_submit",
+            "cleanup_failure",
+            "pending",
+            "unresolved",
+        ):
+            with self.subTest(status=status):
+                backend, _, _, view = self.backend_fixture()
+                backend._sr_draft_paged_view = view
+                view.workspace.pending_consumer = status == "pending"
+                view.workspace.unresolved = status == "unresolved"
+                held = (object(),)
+                view.workspace.holds = held
+                primary = RuntimeError("original warmup failure")
+                backend.prepare_sr_tree_paged_eager = Mock(
+                    side_effect=None if status == "success" else primary
+                )
+                real_clear = backend._sr_clear_paged_round_state
+                backend._sr_clear_paged_round_state = Mock(
+                    wraps=real_clear,
+                    side_effect=RuntimeError("secondary cleanup failure")
+                    if status == "cleanup_failure"
+                    else None,
+                )
+                worker = types.SimpleNamespace(
+                    draft_attn_backend=backend,
+                    req_to_token_pool=types.SimpleNamespace(
+                        req_to_token=backend.attn_backends[0].req_to_token
+                    ),
+                    _paged_dummy_page=0,
+                    page_size=128,
+                    topk=3,
+                    speculative_num_steps=5,
+                    draft_model_runner=types.SimpleNamespace(token_to_kv_pool=None),
+                    _sr_warmup_page_buckets=lambda: [1],
+                    _sr_warmup_raw_batch_sizes=lambda: [1],
+                )
+                if status == "success":
+                    self.assertTrue(ns[method.name](worker))
+                else:
+                    with self.assertRaises(RuntimeError) as caught:
+                        ns[method.name](worker)
+                    self.assertIs(caught.exception, primary)
+                    backend.prepare_sr_tree_paged_eager.assert_called_once()
+                if status in ("pending", "unresolved"):
+                    backend._sr_clear_paged_round_state.assert_not_called()
+                    self.assertIs(backend._sr_draft_paged_view, view)
+                    self.assertIs(view.workspace.holds, held)
+                    self.assertTrue(view.workspace.unresolved)
+                else:
+                    backend._sr_clear_paged_round_state.assert_called_once()
+                    if status == "cleanup_failure":
+                        self.assertIs(backend._sr_draft_paged_view, view)
+                        self.assertIs(view.workspace.holds, held)
+                        log.exception.assert_called()
+                    else:
+                        self.assertIsNone(backend._sr_draft_paged_view)
+
 
 if __name__ == "__main__":
     unittest.main()

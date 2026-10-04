@@ -266,6 +266,107 @@ def _load_sr_tree_expand_methods():
 
 
 class TestRemoteSpecDevice(CustomTestCase):
+    def test_capture_preserves_fatal_errors_and_stops_initialization(self):
+        # Execute the actual constructor's capture try/except together with the
+        # actual Draft initializer, without loading the model/NPU dependencies.
+        import sys
+        import types
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRPagedMetadataSubmittedError,
+        )
+
+        helpers = _load_tree_draft_helpers()
+        path = _REPO / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        init = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+        capture = next(n for n in init.body if isinstance(n, ast.Try))
+        ns = dict(
+            model_capture_mode=nullcontext,
+            SRTransferUnresolved=SRTransferUnresolved,
+            NpuGraphReplaySubmittedError=helpers.NpuGraphReplaySubmittedError,
+            is_device_context_error=is_device_context_error,
+            CUDA_GRAPH_CAPTURE_FAILED_MSG="ordinary capture advice",
+            KVMoveSubmittedError=KVMoveSubmittedError,
+            device_backend_key=lambda device: "cuda",
+            logger=MagicMock(),
+        )
+        wrapped = ast.parse("def capture_constructor(self):\n    pass").body[0]
+        wrapped.body = [capture]
+        draft_path = (
+            _REPO
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        draft_tree = ast.parse(draft_path.read_text(encoding="utf-8"))
+        init_graphs = next(
+            n
+            for n in ast.walk(draft_tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_init_cuda_graphs"
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[wrapped, init_graphs], type_ignores=[])
+        )
+        exec(compile(module, str(path), "exec"), ns)
+
+        for error in (
+            SRTransferUnresolved("copy pending"),
+            SRPagedMetadataSubmittedError("metadata pending"),
+            helpers.NpuGraphReplaySubmittedError("NPU graph update/replay failed"),
+            RuntimeError("illegal memory access"),
+            RuntimeError("ordinary capture failure"),
+        ):
+            with self.subTest(error=type(error).__name__, message=str(error)):
+                capture_call = MagicMock(side_effect=error)
+
+                def construct(worker):
+                    return ns["capture_constructor"](
+                        SimpleNamespace(capture=capture_call)
+                    )
+
+                runner_module = types.ModuleType(
+                    "sglang.srt.speculative.eagle_draft_cuda_graph_runner"
+                )
+                runner_module.EAGLEDraftCudaGraphRunner = construct
+                previous = object()
+                worker = SimpleNamespace(
+                    device="cuda",
+                    server_args=SimpleNamespace(disable_cuda_graph=False),
+                    speculative_num_steps=5,
+                    draft_attn_backend=object(),
+                    draft_model_runner=SimpleNamespace(draft_attn_backend=previous),
+                    _init_tail_graphs=MagicMock(),
+                    _sr_warm_tree_shapes=MagicMock(),
+                    _log_tree_failure=MagicMock(),
+                )
+                fatal = is_device_context_error(error) or isinstance(
+                    error, helpers.NpuGraphReplaySubmittedError
+                )
+                with unittest.mock.patch.dict(
+                    sys.modules, {runner_module.__name__: runner_module}
+                ):
+                    if fatal:
+                        with self.assertRaises(type(error)) as caught:
+                            ns["_init_cuda_graphs"](worker)
+                        self.assertIs(caught.exception, error)
+                        worker._init_tail_graphs.assert_not_called()
+                        worker._sr_warm_tree_shapes.assert_not_called()
+                        worker._log_tree_failure.assert_not_called()
+                    else:
+                        ns["_init_cuda_graphs"](worker)
+                        worker._init_tail_graphs.assert_called_once()
+                        worker._sr_warm_tree_shapes.assert_called_once()
+                        wrapped_error = worker._log_tree_failure.call_args.args[1]
+                        self.assertIs(wrapped_error.__cause__, error)
+                        self.assertIn("ordinary capture advice", str(wrapped_error))
+                capture_call.assert_called_once()
+                self.assertIs(worker.draft_model_runner.draft_attn_backend, previous)
+
     def _import_or_skip(self, fn):
         try:
             return fn()
@@ -905,10 +1006,74 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(windows[0][0], [10, 11, 12])
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(copies["cross"], 1)
-        self.assertGreaterEqual(copies["device"], 3)
+        self.assertEqual(copies["device"], 0)
         self.assertEqual(drafter._tree_host_payload_submits, 1)
         self.assertEqual(drafter._tree_cross_device_d2h, 1)
-        self.assertGreaterEqual(drafter._tree_device_pack_copies, 3)
+        self.assertEqual(drafter._tree_device_pack_copies, 1)
+
+    def test_tree_reply_pack_matches_cpu_oracle(self):
+        device = None
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            npu = getattr(torch, "npu", None)
+            if npu is not None and npu.is_available():
+                device = torch.device("npu")
+        if device is None:
+            self.skipTest("no CUDA or NPU device")
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            lookup_candidate_slots,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
+            pack_tree_reply,
+        )
+
+        batch, topk, steps = 2, 2, 2
+        tokens = torch.tensor(
+            [[10, 11, 12], [20, 21, 22]], dtype=torch.int64, device=device
+        )
+        parents = torch.tensor([[-1, 0], [-1, 1]], dtype=torch.int64, device=device)
+        indices = torch.tensor(
+            [[4, 9, -1], [1, 8, 3]], dtype=torch.int32, device=device
+        )
+        node_ids = torch.tensor(
+            [[4, 4, 1, 2], [4, 9, 1, 8]], dtype=torch.int64, device=device
+        )
+        compact = torch.arange(batch * topk * steps, dtype=torch.int64, device=device)
+        needed = (
+            tokens.numel() + parents.numel() + indices.numel() + indices.numel()
+        )
+        buf = torch.empty(needed, dtype=torch.int64, device=device)
+        pack_tree_reply(
+            buf,
+            tokens,
+            parents,
+            indices,
+            node_ids,
+            compact,
+            batch=batch,
+            topk=topk,
+            steps=steps,
+            write_slots=True,
+        )
+        phys = (
+            compact.reshape(batch, topk, steps)
+            .permute(2, 0, 1)
+            .reshape(steps, -1)
+            .cpu()
+        )
+        slots = lookup_candidate_slots(
+            node_ids.cpu(), phys, indices.cpu(), batch, topk
+        )
+        expected = torch.cat(
+            [
+                tokens.reshape(-1).cpu(),
+                parents.reshape(-1).cpu(),
+                indices.reshape(-1).to(dtype=torch.int64).cpu(),
+                slots.reshape(-1),
+            ]
+        )
+        self.assertEqual(buf.cpu().tolist(), expected.tolist())
 
     def test_scheduler_reraises_unresolved_transfer(self):
         from contextlib import nullcontext
