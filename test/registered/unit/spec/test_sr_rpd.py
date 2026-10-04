@@ -69,6 +69,47 @@ def packet_input(bs=2, packet=None, reqs=None, vocab=32):
 
 
 class SRRPDTest(unittest.TestCase):
+    def test_host_selection_uses_owned_topology_and_no_tensor_results(self):
+        packet, _ = packet_input(2)
+        context = packet.rpd_input
+        logits = torch.randn(12, 32)
+        workspace = SRRPDWorkspace()
+        workspace.prepare(logits, context)
+        with patch.object(rpd, "_rpd_host_topology", side_effect=AssertionError("rebuilt topology")), patch.object(
+            rpd, "_rpd_compact_select", side_effect=AssertionError("intermediate tensors")
+        ), patch.object(torch, "tensor", side_effect=AssertionError("tensor allocation")), patch.object(
+            torch, "full", side_effect=AssertionError("tensor allocation")
+        ):
+            plan = verify_sr_rpd_host(logits, context, workspace, .2, 4)
+        self.assertTrue(all(isinstance(row, list) for row in plan.rows))
+        before = copy.deepcopy(context.topology)
+        packet_input(1, packet)
+        self.assertEqual(context.topology.candidates, before.candidates)
+        self.assertEqual(context.topology.children, before.children)
+        self.assertEqual(context.topology.edge_pos, before.edge_pos)
+
+    def test_python_selection_fold_and_nan_match_independent_reference(self):
+        # Duplicate retrieve writes across requests are folded globally, in
+        # request/path order, before any token rows are materialized.
+        tree = torch.tensor(
+            [
+                [[1, 3, 3], [2, 4, 4]],
+                [[0, 1, 2], [0, 4, 5]],
+                [[1, -1, -1], [1, -1, -1]],
+                [[-1, 2, -1], [-1, 2, -1]],
+            ]
+        )
+        edges = [(0, 1, 0), (0, 2, 0), (1, 1, 0), (1, 2, 0)]
+        topology = rpd._rpd_host_topology(tree, edges)
+        star = [[3, 8, 9], [4, 10, 11]]
+        stats = [[float("nan"), 0.0, float("inf"), 0.0], [0.0, 1.0, float("inf"), 1.0]]
+        rows, lengths, folded = rpd._rpd_select_host(
+            topology, star, stats, 0.0, True, 3, 6, 7
+        )
+        self.assertEqual(rows, [[0, 1, -1], [0, 4, -1]])
+        self.assertEqual(lengths, [1, 1])
+        self.assertEqual(folded, {0: 4, 1: 8, 4: 10})
+
     def test_topology_matches_reference_and_survives_packet_reuse(self):
         packet, (_, parents, indices, _) = packet_input()
         context = packet.rpd_input

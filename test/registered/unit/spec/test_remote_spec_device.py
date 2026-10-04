@@ -2057,7 +2057,11 @@ class TestSRTargetWarmup(CustomTestCase):
         self.assertIn("not_applicable", src)
         self.assertIn("return (1,)", src)
         self.assertNotIn("sgl_kernel_npu", src)
-        greedy_fn = src[src.index("def warm_target_greedy_verify") : src.index("def warm_sr_target_kernels")]
+        greedy_fn = src[
+            src.index("def warm_target_greedy_verify") : src.index(
+                "def warm_sr_target_kernels"
+            )
+        ]
         self.assertNotIn("token_to_kv_pool_allocator", greedy_fn)
         self.assertNotIn("req_to_token_pool", greedy_fn)
 
@@ -2133,6 +2137,349 @@ class TestSRTargetWarmup(CustomTestCase):
         adapter.free(torch.empty((0,), dtype=torch.int64))
         self.assertEqual(page_set(inner), before)
         self.assertEqual(adapter.owned_pages, set())
+
+
+class TestSRTreeCandidates(unittest.TestCase):
+    def _preflight_references(self):
+        """Reference ops for warm(), without importing the full runtime stack."""
+        import sys
+        import types
+
+        select = TestRemoteSpecDevice()._select_top_k_tokens()
+        select.__globals__["fast_topk"] = lambda x, k, dim=-1: (
+            torch.max(x, dim=dim, keepdim=True) if k == 1 else torch.topk(x, k, dim=dim)
+        )
+
+        def organize_draft_results(score_list, token_list, parents_list, num_draft_token):
+            scores = torch.cat(score_list, dim=1).flatten(1)
+            tokens = torch.cat(token_list, dim=1)
+            selected = torch.sort(
+                torch.topk(scores, num_draft_token - 1, dim=-1).indices
+            ).values
+            if len(parents_list) > 1:
+                parents = torch.cat(parents_list[:-1], dim=1)
+            else:
+                parents = torch.empty(parents_list[0].shape[0], 0, device=parents_list[0].device)
+            return parents, selected, torch.gather(tokens, 1, selected)
+
+        spec = types.ModuleType("sglang.srt.speculative.spec_utils")
+        spec.select_top_k_tokens = select
+        eagle = types.ModuleType("sglang.srt.speculative.eagle_utils")
+        eagle.organize_draft_results = organize_draft_results
+        names = (
+            "sglang.srt.speculative.spec_utils",
+            "sglang.srt.speculative.eagle_utils",
+        )
+        saved = {name: sys.modules.get(name) for name in names}
+        sys.modules[names[0]] = spec
+        sys.modules[names[1]] = eagle
+        return saved
+
+    def _restore_modules(self, saved):
+        import sys
+
+        for name, old in saved.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+    def episode(self, workspace, batch, logits, seeds, indices):
+        select = TestRemoteSpecDevice()._select_top_k_tokens()
+        # Match the real NPU fast_topk==1 branch too.
+        select.__globals__["fast_topk"] = lambda x, k, dim=-1: (
+            torch.max(x, dim=dim, keepdim=True) if k == 1 else torch.topk(x, k, dim=dim)
+        )
+        rp, ri, wp, wi = seeds, indices, seeds, indices
+        rs = ws = None
+        score_list, token_list, parent_list = [], [], []
+        for step in range(workspace.steps):
+            ids, _, rs, info, parents = select(step, rp, ri, None, rs, workspace.topk)
+            got_ids, ws, nodes, got_parents = workspace.select(step, wp, wi, ws)
+            torch.testing.assert_close(got_ids, ids, rtol=0, atol=0)
+            torch.testing.assert_close(ws, rs, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(nodes, info[2], rtol=0, atol=0)
+            if parents is not None:
+                torch.testing.assert_close(got_parents, parents, rtol=0, atol=0)
+            score_list.append(info[0].clone())
+            token_list.append(info[1].clone())
+            parent_list.append(info[2].clone())
+            if step < workspace.steps - 1:
+                probs = torch.softmax(logits[step], dim=-1)
+                ref = (
+                    torch.max(probs, dim=-1, keepdim=True)
+                    if workspace.topk == 1
+                    else torch.topk(probs, workspace.topk, dim=-1)
+                )
+                rp, ri = ref.values, ref.indices
+                wp, wi = workspace.probabilities(logits[step], step)
+                torch.testing.assert_close(wp, rp, rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(wi, ri, rtol=0, atol=0)
+        scores = torch.cat(score_list, 1).flatten(1)
+        tokens = torch.cat(token_list, 1)
+        selected = torch.sort(
+            torch.topk(scores, workspace.width - 1, dim=-1).indices
+        ).values
+        parents = (
+            torch.cat(parent_list[:-1], 1)
+            if workspace.steps > 1
+            else torch.empty((batch, 0))
+        )
+        expected = parents, selected, torch.gather(tokens, 1, selected)
+        actual = workspace.finish(batch)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        return actual
+
+    def test_candidate_steps_exact_special_values_and_reuse(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for k, steps in ((1, 1), (1, 3), (2, 3), (3, 5)):
+                width = min(15, k + (steps - 1) * k * k + 1)
+                workspace = SRTreeCandidateWorkspace(
+                    "cpu", 4, k, steps, width, 37, dtype
+                )
+                storage = workspace._storage_key()
+                for batch, kind in (
+                    (4, "random"),
+                    (3, "ties"),
+                    (1, "special"),
+                    (2, "near"),
+                    (4, "random"),
+                ):
+                    with self.subTest(
+                        dtype=dtype, k=k, steps=steps, batch=batch, kind=kind
+                    ):
+                        logits = torch.randn(
+                            (max(steps - 1, 1), batch * k, 37), dtype=dtype
+                        )
+                        if kind == "ties":
+                            logits.zero_()
+                        if kind == "special":
+                            logits[0, 0, :3] = torch.tensor(
+                                [float("nan"), float("inf"), float("-inf")], dtype=dtype
+                            )
+                        if kind == "near":
+                            logits[..., :2] = torch.tensor([1.0, 1.001], dtype=dtype)
+                        seed = torch.softmax(torch.randn(batch, 37, dtype=dtype), -1)
+                        top = (
+                            torch.max(seed, -1, keepdim=True)
+                            if k == 1
+                            else torch.topk(seed, k, dim=-1)
+                        )
+                        self.episode(workspace, batch, logits, top.values, top.indices)
+                        self.assertEqual(storage, workspace._storage_key())
+
+    def test_candidate_outputs_keep_step_data_and_no_concat(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 5, 15, 37, torch.float32)
+        p, ids = torch.rand(2, 3), torch.arange(6).reshape(2, 3)
+        _, scores, _, _ = workspace.select(0, p, ids, None)
+        saved = scores.clone()
+        first_values, first_indices = workspace.probabilities(torch.randn(6, 37), 0)
+        fv, fi = first_values.clone(), first_indices.clone()
+        workspace.probabilities(torch.randn(6, 37), 1)
+        self.assertTrue(torch.equal(first_values, fv))
+        self.assertTrue(torch.equal(first_indices, fi))
+        self.assertTrue(torch.equal(scores, saved))
+        with unittest.mock.patch.object(
+            torch, "cat", side_effect=AssertionError("concat")
+        ):
+            for step in range(1, 5):
+                _, scores, _, _ = workspace.select(
+                    step, first_values, first_indices, scores
+                )
+            workspace.finish(2)
+        with self.assertRaisesRegex(RuntimeError, "capacity/storage"):
+            workspace.check(3)
+        workspace.score_table = workspace.score_table.clone()
+        with self.assertRaisesRegex(RuntimeError, "capacity/storage"):
+            workspace.check(2)
+
+    def test_candidate_cpu_preflight_and_fallback_probability_operator(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
+        with unittest.mock.patch.object(
+            torch, "softmax", side_effect=AssertionError("submitted")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "layout/dtype"):
+                workspace.probabilities(torch.zeros(6, 38), 0)
+        self.assertFalse(workspace.unresolved)
+        workspace.probability_out = False
+        logits = torch.randn(2, 6, 37)
+        top = torch.topk(torch.rand(2, 37), 3, -1)
+        self.episode(workspace, 2, logits, top.values, top.indices)
+        workspace.selection_out = False
+        reference = TestRemoteSpecDevice()._select_top_k_tokens()
+        import sys
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.speculative.spec_utils": SimpleNamespace(
+                    select_top_k_tokens=reference
+                ),
+            },
+        ):
+            self.episode(workspace, 2, logits, top.values, top.indices)
+
+    def test_preflight_accepts_out_without_submission_tracking(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
+        workspace.validated = False
+        saved = self._preflight_references()
+        try:
+            with unittest.mock.patch.object(
+                workspace, "_submitted", side_effect=AssertionError("submitted")
+            ):
+                workspace.warm()
+        finally:
+            self._restore_modules(saved)
+        self.assertTrue(workspace.probability_out)
+        self.assertTrue(workspace.selection_out)
+        self.assertTrue(workspace.validated)
+        self.assertFalse(workspace.unresolved)
+
+    def test_preflight_rejects_out_and_matches_original_assembly(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
+        workspace.validated = False
+        real_softmax, real_mul = torch.softmax, torch.mul
+
+        def softmax(inp, dim=None, dtype=None, out=None):
+            if out is not None:
+                raise RuntimeError("softmax out rejected")
+            return real_softmax(inp, dim=dim, dtype=dtype)
+
+        def mul(inp, other, *, out=None):
+            if out is not None:
+                raise RuntimeError("mul out rejected")
+            return real_mul(inp, other)
+
+        saved = self._preflight_references()
+        try:
+            with (
+                unittest.mock.patch.object(torch, "softmax", softmax),
+                unittest.mock.patch.object(torch, "mul", mul),
+                unittest.mock.patch.object(
+                    workspace, "_submitted", side_effect=AssertionError("submitted")
+                ),
+            ):
+                workspace.warm()
+            self.assertFalse(workspace.probability_out)
+            self.assertFalse(workspace.selection_out)
+            self.assertTrue(workspace.validated)
+            self.assertFalse(workspace.unresolved)
+            logits = torch.randn(2, 6, 37)
+            top = torch.topk(torch.rand(2, 37), 3, -1)
+            self.episode(workspace, 2, logits, top.values, top.indices)
+        finally:
+            self._restore_modules(saved)
+
+    def test_preflight_failure_leaves_workspace_unpoisoned(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
+        workspace.validated = False
+        saved = self._preflight_references()
+        try:
+            with unittest.mock.patch.object(
+                workspace, "_select", side_effect=RuntimeError("select")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed tree semantics"):
+                    workspace.warm()
+        finally:
+            self._restore_modules(saved)
+        self.assertFalse(workspace.unresolved)
+        self.assertFalse(workspace.validated)
+
+    def test_candidate_factory_skips_cpu_cuda_and_failed_preflight(self):
+        from sglang.srt.speculative.standalone_remote.drafter import (
+            sr_tree_candidates as candidates,
+        )
+
+        self.assertIsNone(candidates.candidate_workspace(object(), 1, torch.zeros(1, 2)))
+        cuda_seed = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        self.assertIsNone(candidates.candidate_workspace(object(), 1, cuda_seed))
+
+        calls = {"warm": 0}
+
+        def init(self, device, batch, topk, steps, width, vocab, dtype, graph=False):
+            self.batch = batch
+
+        def warm(self):
+            calls["warm"] += 1
+            raise RuntimeError("declined")
+
+        worker = SimpleNamespace(
+            topk=2,
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            model_config=SimpleNamespace(vocab_size=8),
+            scheduler=None,
+        )
+        seed = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.float32)
+        npu = SimpleNamespace(current_stream=lambda device: SimpleNamespace())
+        with (
+            unittest.mock.patch.object(torch, "npu", npu, create=True),
+            unittest.mock.patch(
+                "sglang.srt.speculative.standalone_remote.sr_kv_copy._capturing",
+                return_value=False,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.speculative.standalone_remote.sr_kv_copy._stream_key",
+                return_value="stream",
+            ),
+            unittest.mock.patch.object(candidates.SRTreeCandidateWorkspace, "__init__", init),
+            unittest.mock.patch.object(candidates.SRTreeCandidateWorkspace, "warm", warm),
+            unittest.mock.patch.object(
+                candidates.SRTreeCandidateWorkspace,
+                "check",
+                side_effect=AssertionError("declined workspace reused"),
+            ),
+        ):
+            self.assertIsNone(candidates.candidate_workspace(worker, 2, seed, graph=False))
+            self.assertIsNone(candidates.candidate_workspace(worker, 2, seed, graph=False))
+        self.assertEqual(calls["warm"], 1)
+        self.assertEqual(list(worker._candidate_workspaces.values()), [None])
+
+    def test_candidate_submitted_failure_keeps_sources_and_refuses_reuse(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
+        # Submission classification only; no NPU execution is claimed.
+        workspace.device = SimpleNamespace(type="npu")
+        source = torch.zeros(6, 37)
+        original = RuntimeError("launch")
+
+        def fail():
+            raise original
+
+        with self.assertRaises(SRTransferUnresolved) as raised:
+            workspace._submitted(fail, source)
+        self.assertIs(raised.exception.__cause__, original)
+        self.assertIs(workspace.holds[0], source)
+        with self.assertRaises(SRTransferUnresolved):
+            workspace.check(2)
 
 
 if __name__ == "__main__":

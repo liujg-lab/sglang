@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -422,6 +423,85 @@ def _compact_await_stats(
     return pinned[0], pinned[1]
 
 
+@dataclass(frozen=True)
+class _RPDHostTopology:
+    candidates: list
+    retrieve: list
+    children: list
+    edge_pos: dict
+    edges: tuple
+
+
+def _rpd_host_topology(tree_cpu, edges):
+    cand, retr, next_token, next_sibling = tree_cpu.tolist()
+    return _RPDHostTopology(
+        cand,
+        retr,
+        [_children_and_parents(n, s)[0] for n, s in zip(next_token, next_sibling)],
+        {(b, v): i for i, (b, v, _parent) in enumerate(edges)},
+        tuple(edges),
+    )
+
+
+def _rpd_select_host(
+    topology, star, stats, gap_max, use_equality, accept_width, rows, predict_len
+):
+    """Shared Python selection; no tensors or device operations are created."""
+    cand, retr = topology.candidates, topology.retrieve
+    edges, edge_pos = topology.edges, topology.edge_pos
+    batch = len(cand)
+    width = len(cand[0]) if batch else 0
+    plans = []
+    for b in range(batch):
+        children = topology.children[b]
+        valid = [False] * width
+        gaps = [0.0] * width
+        for v in range(width):
+            edge_i = edge_pos.get((b, v))
+            if edge_i is None:
+                continue
+            if stats is None:
+                raise RuntimeError("RPD compact is missing edge statistics.")
+            z_star = float(stats[0][edge_i])
+            z_candidate = float(stats[1][edge_i])
+            gap = z_star - z_candidate
+            gaps[v] = gap
+            if use_equality:
+                parent_slot = int(edges[edge_i][2])
+                valid[v] = int(cand[b][v]) == int(star[b][parent_slot])
+            else:
+                valid[v] = gap <= gap_max
+        path = _longest_path(children, valid, gaps)
+        if len(path) > accept_width:
+            raise RuntimeError(
+                f"RPD accept path length {len(path)} exceeds accept_index "
+                f"width {accept_width} for batch {b}."
+            )
+        flats = []
+        for slot in path:
+            flat = int(retr[b][slot])
+            if flat < 0 or flat >= rows or flat >= predict_len:
+                raise ValueError(
+                    f"RPD accepted retrieve {flat} is outside logits rows "
+                    f"[0, {rows}) or predicts length {predict_len}."
+                )
+            if int(star[b][slot]) < 0:
+                raise ValueError("RPD clamp placeholder reached an accepted retrieve.")
+            flats.append(flat)
+        plans.append((path, flats))
+
+    accept = [[-1] * accept_width for _ in range(batch)]
+    lengths = []
+    folded = {}
+    for b, (path, flats) in enumerate(plans):
+        lengths.append(len(path) - 1)
+        accept[b][: len(flats)] = flats
+        for t in range(1, len(path)):
+            folded[flats[t - 1]] = int(cand[b][path[t]])
+        folded[flats[-1]] = int(star[b][path[-1]])
+    return accept, lengths, folded
+
+
 def _rpd_compact_select(
     tree_cpu: torch.Tensor,
     edges: Sequence[Tuple[int, int, int]],
@@ -438,72 +518,20 @@ def _rpd_compact_select(
     A path longer than ``accept_index`` or a retrieve outside the logit rows
     and ``predicts`` raises here, before the result packet is uploaded.
     """
-    cand = tree_cpu[0].tolist()
-    retr = tree_cpu[1].tolist()
-    next_token = tree_cpu[2].tolist()
-    next_sibling = tree_cpu[3].tolist()
-    star = star_cpu.tolist()
-    batch = len(cand)
-    width = len(cand[0]) if batch else 0
-    edge_pos = {(b, v): i for i, (b, v, _parent) in enumerate(edges)}
-    plans: List[Tuple[List[int], List[int]]] = []
-    for b in range(batch):
-        children, _parent = _children_and_parents(next_token[b], next_sibling[b])
-        valid = [False] * width
-        gaps = [0.0] * width
-        for v in range(width):
-            edge_i = edge_pos.get((b, v))
-            if edge_i is None:
-                continue
-            if stats_cpu is None:
-                raise RuntimeError("RPD compact is missing edge statistics.")
-            z_star = float(stats_cpu[0, edge_i])
-            z_candidate = float(stats_cpu[1, edge_i])
-            gap = z_star - z_candidate
-            gaps[v] = gap
-            if use_equality:
-                parent_slot = int(edges[edge_i][2])
-                valid[v] = int(cand[b][v]) == int(star[b][parent_slot])
-            else:
-                valid[v] = gap <= gap_max
-        path = _longest_path(children, valid, gaps)
-        if len(path) > accept_width:
-            raise RuntimeError(
-                f"RPD accept path length {len(path)} exceeds accept_index "
-                f"width {accept_width} for batch {b}."
-            )
-        flats: List[int] = []
-        for slot in path:
-            flat = int(retr[b][slot])
-            if flat < 0 or flat >= rows or flat >= predict_len:
-                raise ValueError(
-                    f"RPD accepted retrieve {flat} is outside logits rows "
-                    f"[0, {rows}) or predicts length {predict_len}."
-                )
-            bonus = int(star[b][slot])
-            if bonus < 0:
-                raise ValueError(
-                    "RPD clamp placeholder reached an accepted retrieve."
-                )
-            flats.append(flat)
-        plans.append((path, flats))
-
-    accept = torch.full((batch, accept_width), -1, dtype=torch.int64)
-    lengths = torch.empty((batch,), dtype=torch.int64)
-    writes: List[Tuple[int, int]] = []
-    for b, (path, flats) in enumerate(plans):
-        lengths[b] = len(path) - 1
-        for t, flat in enumerate(flats):
-            accept[b, t] = flat
-        for t in range(1, len(path)):
-            child_slot = path[t]
-            writes.append((flats[t - 1], int(cand[b][child_slot])))
-        last_slot = path[-1]
-        writes.append((flats[-1], int(star[b][last_slot])))
-
-    folded: dict[int, int] = {}
-    for pos, tok in writes:
-        folded[pos] = int(tok)
+    rows_list, lengths_list, folded = _rpd_select_host(
+        _rpd_host_topology(tree_cpu, edges),
+        star_cpu.tolist(),
+        None if stats_cpu is None else stats_cpu.tolist(),
+        gap_max,
+        use_equality,
+        accept_width,
+        rows,
+        predict_len,
+    )
+    accept = torch.tensor(rows_list, dtype=torch.int64).reshape(
+        len(rows_list), accept_width
+    )
+    lengths = torch.tensor(lengths_list, dtype=torch.int64)
     if folded:
         positions = torch.tensor(list(folded.keys()), dtype=torch.int64)
         tokens = torch.tensor(list(folded.values()), dtype=torch.int64)
@@ -559,9 +587,7 @@ def _verify_tree_rpd_compact(
     use_equality: bool,
 ) -> None:
     if candidates.dim() != 2:
-        raise ValueError(
-            f"RPD candidates must be rank 2, got dim={candidates.dim()}."
-        )
+        raise ValueError(f"RPD candidates must be rank 2, got dim={candidates.dim()}.")
     batch, width = candidates.shape
     if batch == 0:
         return
@@ -606,9 +632,7 @@ def _verify_tree_rpd_compact(
     slot_argmax = _rpd_slot_argmax(argmax, retrive_index, rows)
     edge_values = None
     if edge_index is not None:
-        edge_values = _rpd_compact_edge_values(
-            logits, z_star, edge_index, row_stride
-        )
+        edge_values = _rpd_compact_edge_values(logits, z_star, edge_index, row_stride)
     star_cpu, stats_cpu = _compact_await_stats(slot_argmax, edge_values)
     payload = _rpd_compact_select(
         tree_cpu,
@@ -621,9 +645,7 @@ def _verify_tree_rpd_compact(
         rows,
         int(predicts.numel()),
     )
-    _rpd_compact_apply(
-        payload, predicts, accept_index, accept_token_num, device
-    )
+    _rpd_compact_apply(payload, predicts, accept_index, accept_token_num, device)
 
 
 def verify_tree_rpd(

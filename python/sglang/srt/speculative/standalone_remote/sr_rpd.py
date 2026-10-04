@@ -16,7 +16,8 @@ import torch
 
 from sglang.srt.speculative.rpd_verify import (
     _rpd_compact_edges,
-    _rpd_compact_select,
+    _rpd_host_topology,
+    _rpd_select_host,
     rpd_gap_max,
 )
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
@@ -74,6 +75,7 @@ class SRRPDHostInput:
     owner: object
     generation: int
     batch_key: tuple
+    topology: object
     edge_index: Optional[torch.Tensor] = None
     consumed: bool = False
 
@@ -166,7 +168,16 @@ def build_sr_rpd_input(
     edges, index = _rpd_compact_edges(tree, bs * width, vocab)
     if index is None:
         index = torch.empty((2, 0), dtype=torch.int64)
-    return SRRPDHostInput(tree, edges, index, int(vocab), owner, generation, batch_key)
+    return SRRPDHostInput(
+        tree,
+        edges,
+        index,
+        int(vocab),
+        owner,
+        generation,
+        batch_key,
+        _rpd_host_topology(tree, edges),
+    )
 
 
 class SRRPDWorkspace:
@@ -363,24 +374,19 @@ def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
     if bs == 0:
         return SRRPDHostPlan([], [], [], context.vocab, context.batch_key)
     star, stats = workspace.statistics(logits, context)
-    accept, lengths, positions, tokens = _rpd_compact_select(
-        context.tree,
-        context.edges,
-        star,
-        stats,
+    rows, lengths, folded = _rpd_select_host(
+        context.topology,
+        star.tolist(),
+        None if stats is None else stats.tolist(),
         gap,
         float(tau) == 0.0,
         path_cap,
         bs * width,
         bs * width + 1,
     )
-    folded = dict(zip(positions.tolist(), tokens.tolist()))
-    rows = accept.tolist()
     token_rows = [[folded[i] if i >= 0 else 0 for i in row] for row in rows]
     workspace.count("rpd_host_plan_hit")
     if not workspace.logged:
         logger.info("Speculative RPD verify path: npu_sr_host_plan")
         workspace.logged = True
-    return SRRPDHostPlan(
-        rows, token_rows, lengths.tolist(), context.vocab, context.batch_key
-    )
+    return SRRPDHostPlan(rows, token_rows, lengths, context.vocab, context.batch_key)

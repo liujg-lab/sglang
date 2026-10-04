@@ -78,6 +78,10 @@ def tail_graph_cpu_update_payload(seq_lens_kv, *, use_fia: bool):
 
 
 class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
+    def close(self):
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import close_runner_update_worker
+        close_runner_update_worker(self)
+
     def __init__(self, drafter) -> None:
         self.update_payloads = {}
         self._npu_sr_tail_update_overlap = False
@@ -215,7 +219,11 @@ class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
                     device_id,
                     overlap,
                 )
-            run_npu_graph_update_and_replay(update, replay, overlap=overlap)
+            from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
+            run_npu_graph_update_and_replay(
+                update, replay, overlap=overlap,
+                update_worker=runner_update_worker(self, overlap),
+            )
 
         def _prepare():
             measure_call(sample, "payload_fill", _fill)

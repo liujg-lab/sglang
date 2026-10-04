@@ -12,10 +12,12 @@ import logging
 import pathlib
 import threading
 import unittest
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import SRTransferUnresolved
 
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     begin_graph_host_sample,
@@ -153,7 +155,9 @@ class _HelperBox:
         self.calls = []
         self.impl = _run_update_replay
 
-    def __call__(self, update_fn, replay_fn, overlap=False):
+    def __call__(self, update_fn, replay_fn, overlap=False, update_worker=None):
+        # Legacy runner tests exercise their original temporary-thread helper.
+        # Persistent workers have separate lifecycle/integration tests below.
         self.calls.append({"overlap": overlap, "replay_fn": replay_fn})
         return self.impl(update_fn, replay_fn, overlap=overlap)
 
@@ -1898,6 +1902,289 @@ class TestMaybeEnableSrTreeUpdateOverlap(CustomTestCase):
         self.assertIsNone(runner._npu_graph_device_id)
         self.assertEqual(logs[0][1][:2], (True, False))
         self.assertIn("current_device failed", logs[0][0] % logs[0][1])
+
+
+class TestPersistentGraphUpdate(unittest.TestCase):
+    def test_interpreter_shutdown_joins_idle_non_daemon_worker(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sglang.srt.speculative.standalone_remote.sr_graph_update import SRGraphUpdateWorker; "
+                "w=SRGraphUpdateWorker(0); n=w.submit(lambda: None); w.wait(n); print('ready')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ready", result.stdout)
+
+    def worker(self):
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+            SRGraphUpdateWorker,
+        )
+
+        worker = SRGraphUpdateWorker(0)
+        worker.execution_context = lambda: nullcontext()
+        self.addCleanup(worker.close)
+        return worker
+
+    def test_reuses_thread_generations_and_preserves_overlap(self):
+        worker = self.worker()
+        ids = []
+        for round_id in range(8):
+            started, replayed = threading.Event(), threading.Event()
+
+            def update():
+                ids.append(threading.get_ident())
+                started.set()
+                self.assertTrue(replayed.wait(2))
+
+            def replay():
+                self.assertTrue(started.wait(2))
+                replayed.set()
+
+            _run_update_replay(update, replay, overlap=True, update_worker=worker)
+            self.assertEqual(worker.completed, round_id + 1)
+        self.assertEqual(len(set(ids)), 1)
+        self.assertNotEqual(ids[0], threading.get_ident())
+        self.assertFalse(worker._thread.daemon)
+        worker.close()
+        self.assertFalse(worker._thread.is_alive())
+        with self.assertRaises(RuntimeError):
+            worker.submit(lambda: None)
+
+    def test_submitted_errors_and_interrupts_poison_worker_without_retry(self):
+        for stage in ("update", "replay"):
+            for original in (
+                RuntimeError("failure"),
+                _SubmittedError("fatal"),
+                SRTransferUnresolved("transfer"),
+                KeyboardInterrupt(),
+            ):
+                with self.subTest(stage=stage, original=type(original)):
+                    worker = self.worker()
+                    calls = []
+
+                    def update():
+                        calls.append("update")
+                        if stage == "update":
+                            raise original
+
+                    def replay():
+                        calls.append("replay")
+                        if stage == "replay":
+                            raise original
+
+                    with self.assertRaises(BaseException) as raised:
+                        _run_update_replay(
+                            update, replay, overlap=True, update_worker=worker
+                        )
+                    if isinstance(
+                        original,
+                        (SRTransferUnresolved, _SubmittedError, KeyboardInterrupt),
+                    ):
+                        self.assertIs(raised.exception, original)
+                    else:
+                        self.assertIs(raised.exception.__cause__, original)
+                    self.assertCountEqual(calls, ["update", "replay"])
+                    self.assertEqual(worker.completed, 1)
+                    with self.assertRaises(RuntimeError):
+                        _run_update_replay(
+                            lambda: calls.append("again"),
+                            lambda: calls.append("again"),
+                            overlap=True,
+                            update_worker=worker,
+                        )
+                    self.assertNotIn("again", calls)
+
+    def test_busy_and_shutdown_wait_for_current_generation(self):
+        worker = self.worker()
+        started, release = threading.Event(), threading.Event()
+        generation = worker.submit(lambda: (started.set(), release.wait(2)))
+        self.assertTrue(started.wait(2))
+        with self.assertRaises(RuntimeError):
+            worker.submit(lambda: None)
+        with self.assertRaises(RuntimeError):
+            worker.wait(generation + 1)
+        closed = threading.Event()
+        closer = threading.Thread(target=lambda: (worker.close(), closed.set()))
+        closer.start()
+        self.assertFalse(closed.wait(0.02))
+        release.set()
+        closer.join(2)
+        self.assertTrue(closed.is_set())
+        self.assertIsNone(worker.wait(generation))
+
+    def test_start_and_context_failure_do_not_replay(self):
+        worker = self.worker()
+        calls = []
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("start")):
+            with self.assertRaisesRegex(RuntimeError, "start"):
+                _run_update_replay(
+                    lambda: calls.append("update"),
+                    lambda: calls.append("replay"),
+                    overlap=True,
+                    update_worker=worker,
+                )
+        self.assertEqual(calls, [])
+
+    def test_wait_failure_is_submitted_and_never_retried(self):
+        worker = self.worker()
+        calls = []
+        original_wait = worker.wait
+
+        def fail(generation):
+            original_wait(generation)
+            raise RuntimeError("confirmation")
+
+        worker.wait = fail
+        with self.assertRaises(_SubmittedError) as raised:
+            _run_update_replay(
+                lambda: calls.append("update"),
+                lambda: calls.append("replay"),
+                overlap=True,
+                update_worker=worker,
+            )
+        self.assertEqual(str(raised.exception.__cause__), "confirmation")
+        self.assertCountEqual(calls, ["update", "replay"])
+        with self.assertRaises(RuntimeError):
+            worker.submit(lambda: calls.append("again"))
+
+    def test_real_context_sequences_payloads_failures_and_close(self):
+        """Drive the production context, not a nullcontext stand-in."""
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+            SRGraphUpdateWorker,
+        )
+
+        class _Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _NPU:
+            def __init__(self):
+                self.device_id = None
+                self.side = _Stream("side")
+                self.events = []
+
+            def current_stream(self, device_id):
+                self.events.append(("current", device_id, threading.get_ident()))
+                return self.side
+
+            def set_device(self, device_id):
+                self.device_id = device_id
+                self.events.append(("set", device_id, threading.get_ident()))
+
+            def stream(self, stream):
+                self.events.append(("use", stream, threading.get_ident()))
+                return stream
+
+        caller = threading.get_ident()
+        npu = _NPU()
+        rounds = (
+            ([0, 1, 2], [4, 5, 6], [1, 1, 0]),
+            ([1, 0, 2], [9, 8, 7], [1, 0, 1]),
+            ([2, 2, 1], [1, 1, 3], [0, 1, 1]),
+        )
+        with patch.object(torch, "npu", npu, create=True):
+            worker = SRGraphUpdateWorker(3)
+            self.addCleanup(worker.close)
+            seen = []
+            for parents, slots, active in rounds:
+
+                def update(parents=parents, slots=slots, active=active):
+                    self.assertEqual(torch.npu.device_id, 3)
+                    seen.append((list(parents), list(slots), list(active)))
+
+                _run_update_replay(update, lambda: None, overlap=True, update_worker=worker)
+            self.assertEqual(
+                seen, [(list(p), list(s), list(a)) for p, s, a in rounds]
+            )
+            self.assertTrue(
+                any(
+                    kind == "set" and device == 3 and tid != caller
+                    for kind, device, tid in npu.events
+                )
+            )
+            self.assertTrue(
+                any(
+                    kind == "use" and stream is npu.side and tid != caller
+                    for kind, stream, tid in npu.events
+                )
+            )
+
+            calls = []
+
+            def fail_update():
+                calls.append("update")
+                raise RuntimeError("update failed")
+
+            def replay():
+                calls.append("replay")
+
+            with self.assertRaises(_SubmittedError) as raised:
+                _run_update_replay(
+                    fail_update, replay, overlap=True, update_worker=worker
+                )
+            self.assertEqual(str(raised.exception.__cause__), "update failed")
+            self.assertCountEqual(calls, ["update", "replay"])
+            with self.assertRaises(RuntimeError):
+                _run_update_replay(
+                    lambda: calls.append("again"),
+                    lambda: calls.append("again"),
+                    overlap=True,
+                    update_worker=worker,
+                )
+            self.assertNotIn("again", calls)
+
+            blocked = SRGraphUpdateWorker(3)
+            self.addCleanup(blocked.close)
+            started, release = threading.Event(), threading.Event()
+
+            def blocking():
+                started.set()
+                self.assertTrue(release.wait(2))
+
+            runner = threading.Thread(
+                target=lambda: _run_update_replay(
+                    blocking, lambda: None, overlap=True, update_worker=blocked
+                )
+            )
+            runner.start()
+            self.assertTrue(started.wait(2))
+            closed = threading.Event()
+            closer = threading.Thread(target=lambda: (blocked.close(), closed.set()))
+            closer.start()
+            self.assertFalse(closed.wait(0.05))
+            release.set()
+            closer.join(2)
+            runner.join(2)
+            self.assertTrue(closed.is_set())
+            self.assertFalse(runner.is_alive())
+
+    def test_context_failure_is_before_submission(self):
+        worker = self.worker()
+        worker.execution_context = Mock(side_effect=RuntimeError("context"))
+        calls = []
+        with self.assertRaisesRegex(RuntimeError, "context"):
+            _run_update_replay(
+                lambda: calls.append("update"),
+                lambda: calls.append("replay"),
+                overlap=True,
+                update_worker=worker,
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(worker.generation, 0)
 
 
 if __name__ == "__main__":

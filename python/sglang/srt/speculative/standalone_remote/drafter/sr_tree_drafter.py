@@ -299,6 +299,11 @@ class SRTreeDrafter:
         """Alias for CUDA-graph capture, which calls ``eagle_worker.draft_forward``."""
         return self._draft_forward(forward_batch)
 
+    def prepare_tree_candidate_graph(self, batch_cap, seed):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import candidate_workspace
+
+        return candidate_workspace(self, batch_cap, seed, graph=True)
+
     def _log_tree_failure(self, stage: str, exc: Exception) -> None:
         """One traceback per failure signature; repeated failures report totals."""
         # NPU errors append timestamps/PIDs on subsequent lines. Do not include
@@ -1778,6 +1783,8 @@ class SRTreeDrafter:
             self.token_to_kv_pool_allocator.free(slots)
 
     def _draft_forward(self, forward_batch: ForwardBatch):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import candidate_workspace
+
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = forward_batch.out_cache_loc
@@ -1794,6 +1801,9 @@ class SRTreeDrafter:
             self.speculative_num_steps, -1
         )
         rows = int(out_cache_loc.shape[1])
+        candidates = getattr(self, "_capture_candidate_workspace", None)
+        if candidates is None:
+            candidates = candidate_workspace(self, forward_batch.batch_size, topk_p)
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         self._active_tree_kv_workspace = getattr(
             self, "_capture_tree_kv_workspace", None
@@ -1820,14 +1830,16 @@ class SRTreeDrafter:
         parents_list: List[torch.Tensor] = []
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info, parent_rows = (
-                select_top_k_tokens(
-                    i, topk_p, topk_index, hidden_states, scores, self.topk
+            if candidates is None:
+                input_ids, hidden_states, scores, tree_info, parent_rows = (
+                    select_top_k_tokens(i, topk_p, topk_index, hidden_states, scores, self.topk)
                 )
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
+                node_ids = tree_info[2]
+            else:
+                input_ids, scores, node_ids, parent_rows = candidates.select(i, topk_p, topk_index, scores)
             if i == self.speculative_num_steps - 1:
                 break
             if i > 0 and self.topk > 1 and parent_rows is not None:
@@ -1836,7 +1848,7 @@ class SRTreeDrafter:
                 self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
             else:
                 self._slot_node_ids[i, :rows].copy_(
-                    later_forward_node_ids(tree_info[2])[:rows]
+                    later_forward_node_ids(node_ids)[:rows]
                 )
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
@@ -1859,8 +1871,11 @@ class SRTreeDrafter:
             finally:
                 self.draft_model_runner.graph_runner = prev_graph_runner
             maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if candidates is None:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            else:
+                topk_p, topk_index = candidates.probabilities(logits_output.next_token_logits, i)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -1869,6 +1884,8 @@ class SRTreeDrafter:
             )
             hidden_states = None
         self._last_out_cache_loc = out_cache_loc
+        if candidates is not None:
+            return candidates.finish(forward_batch.batch_size)
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )

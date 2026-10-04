@@ -282,6 +282,12 @@ class EAGLEDraftCudaGraphRunner:
         )
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
+        prepare_candidates = getattr(self.eagle_worker, "prepare_tree_candidate_graph", None)
+        candidate_ws = prepare_candidates(num_seqs, topk_p) if callable(prepare_candidates) else None
+        if candidate_ws is not None:
+            if not hasattr(self, "_sr_candidate_workspaces"):
+                self._sr_candidate_workspaces = {}
+            self._sr_candidate_workspaces[num_seqs] = candidate_ws
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -393,11 +399,13 @@ class EAGLEDraftCudaGraphRunner:
                 if identity_ws is not None
                 else nullcontext()
             )
-            with kv_scope, identity_scope:
+            candidate_scope = candidate_ws.capture_scope() if candidate_ws is not None else nullcontext()
+            with kv_scope, identity_scope, candidate_scope:
                 if workspace is not None:
                     self.eagle_worker._capture_tree_kv_workspace = workspace
                 if identity_ws is not None:
                     self.eagle_worker._capture_identity_workspace = identity_ws
+                self.eagle_worker._capture_candidate_workspace = candidate_ws
                 try:
                     ret = self.eagle_worker.draft_forward(forward_batch)
                 finally:
@@ -405,6 +413,7 @@ class EAGLEDraftCudaGraphRunner:
                         self.eagle_worker._capture_tree_kv_workspace = None
                     if identity_ws is not None:
                         self.eagle_worker._capture_identity_workspace = None
+                    self.eagle_worker._capture_candidate_workspace = None
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup

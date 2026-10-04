@@ -17,7 +17,9 @@ KV 搬移算法或共享 `verify_tree_rpd()` 的签名及返回值。
    不在设备上计算 gap；CPU 契约测试仍用原来的 index_select 与高级下标。
    复用按容量增长的设备/主机 pinned 缓冲；两次 D2H 同流提交，末尾一个 event、
    一次等待。dtype、D2H 次数和等待次数不变。无边只读 argmax，空批次没有传输和等待。
-4. 原 `_rpd_compact_select()` / `_longest_path()` 返回主机选路结果。
+4. 输入准备时缓存独立 Python 拓扑；统计一次转列表后由共享 `_rpd_select_host()` /
+   `_longest_path()` 返回选路结果。SR 直接生成主机计划，不再生成中间 CPU Tensor；
+   旧 `_rpd_compact_select()` 作为适配层保持原 Tensor 返回契约。
    原 logit 转 Python float 后减法、比较与累加顺序不变；边界为
    `gap <= -ln(1-tau)`，tau=0 比较 argmax token；优先最长路径，然后累计 gap
    较小，最后保持原 sibling 次序。token 按原折叠结果构造，重复写位置最后一次生效。

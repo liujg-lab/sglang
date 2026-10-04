@@ -216,7 +216,9 @@ def fill_fia_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
     return payload
 
 
-def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
+def run_npu_graph_update_and_replay(
+    update_fn, replay_fn, overlap=False, update_worker=None
+):
     """Run graph.update then graph.replay.
 
     Default is serial. Plain AR DECODE enables overlap explicitly;
@@ -232,6 +234,9 @@ def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
     in-flight graph slots. Replay ``BaseException`` (for example
     ``KeyboardInterrupt``) joins the update thread and then propagates the
     original interrupt. Overlap uses a non-daemon thread that must be joined.
+    SR runners can supply their single-flight persistent ``update_worker``.
+    It binds the caller stream and confirms the current generation before
+    return. Other callers keep the temporary-thread implementation.
     Thread construct/start failure does not call replay and is not wrapped as
     submitted; callers keep their in-flight confirmation path.
     """
@@ -243,6 +248,44 @@ def run_npu_graph_update_and_replay(update_fn, replay_fn, overlap=False):
             raise NpuGraphReplaySubmittedError(
                 "NPU graph update/replay failed"
             ) from exc
+        return
+
+    if update_worker is not None:
+        # Context/worker admission is checked before either operation is queued.
+        context = update_worker.execution_context()
+        generation = update_worker.submit(update_fn, context=context)
+        replay_error = None
+        try:
+            replay_fn()
+        except BaseException as exc:
+            replay_error = exc
+        finally:
+            # Interrupts must also confirm the current update's completion.
+            try:
+                update_error = update_worker.wait(generation)
+            except BaseException as exc:
+                update_worker.poison()
+                if isinstance(exc, Exception):
+                    raise NpuGraphReplaySubmittedError(
+                        "NPU graph update completion could not be confirmed"
+                    ) from exc
+                raise
+        if replay_error is not None or update_error is not None:
+            update_worker.poison()
+            error = replay_error if replay_error is not None else update_error
+            if not isinstance(error, Exception):
+                raise error
+            if isinstance(error, NpuGraphReplaySubmittedError):
+                raise error
+            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+                SRTransferUnresolved,
+            )
+
+            if isinstance(error, SRTransferUnresolved):
+                raise error
+            raise NpuGraphReplaySubmittedError(
+                "NPU graph update/replay failed"
+            ) from error
         return
 
     errors = []

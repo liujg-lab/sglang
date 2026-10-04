@@ -769,6 +769,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             errors.append(e)
 
     def _replay(self, forward_batch: ForwardBatch):
+        candidate_ws = getattr(self, "_sr_candidate_workspaces", {}).get(self.bs)
+        if candidate_ws is not None:
+            candidate_ws.check(self.bs, check_stream=False)
         plan = self._tree_replay_plan
         if plan is None or self._tree_replay_batch_id != id(forward_batch):
             raise NpuGraphPreparationError(
@@ -1045,11 +1048,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 else:
                     measure_call(sample, "replay_call", graph.replay)
 
+            from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
+            update_worker = runner_update_worker(self, sr_paged_overlap)
             if sample is None:
                 run_npu_graph_update_and_replay(
                     _call_update,
                     _call_replay,
                     overlap=overlap,
+                    update_worker=update_worker,
                 )
             else:
                 _measure(
@@ -1058,6 +1064,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         _call_update,
                         _call_replay,
                         overlap=overlap,
+                        update_worker=update_worker,
                     ),
                 )
             self.tree_graph_replay_count += 1
@@ -1082,3 +1089,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int32
+
+    def close(self):
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import close_runner_update_worker
+        close_runner_update_worker(self)

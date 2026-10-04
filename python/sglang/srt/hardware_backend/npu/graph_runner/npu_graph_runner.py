@@ -606,7 +606,11 @@ class NPUGraphRunner(CudaGraphRunner):
 
             def _submit():
                 self._log_sr_target_overlap_submit(True)
-                run_npu_graph_update_and_replay(update, replay, overlap=True)
+                from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
+                run_npu_graph_update_and_replay(
+                    update, replay, overlap=True,
+                    update_worker=runner_update_worker(self, True),
+                )
 
             measure_call(sample, "submit_envelope", _submit)
 
@@ -623,6 +627,10 @@ class NPUGraphRunner(CudaGraphRunner):
             raise
         finally:
             record_graph_host_sample_safely(metrics, sample)
+
+    def close(self):
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import close_runner_update_worker
+        close_runner_update_worker(self)
 
     def _update_decode_inputs(self, seq_lens, graph_key):
         torch.npu.set_device(self.model_runner.gpu_id)

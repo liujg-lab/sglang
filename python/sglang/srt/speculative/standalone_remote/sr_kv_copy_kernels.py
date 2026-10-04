@@ -45,25 +45,35 @@ def _paged_move(
         step = j // Rows
         if HasActive:
             valid = valid & tl.load(Active + row * ActiveStride).to(tl.int1)
-        if Scatter:
-            slot = tl.load(Slots + step * StepStride + row * RowStride, valid, other=0)
-        else:
-            parent = tl.load(Parents + row * ParentStride, valid, other=0)
-            tl.device_assert(
-                (~valid) | ((parent >= 0) & (parent < Rows)),
-                "tree KV parent outside rows",
-            )
-            slot = tl.load(
-                Slots + step * StepStride + parent * RowStride, valid, other=0
-            )
-    elif Scatter:
-        slot = tl.load(Dst + j * DstStride, valid, other=0)
+        parent = tl.load(Parents + row * ParentStride, valid, other=0)
+        tl.device_assert(
+            (~valid) | ((parent >= 0) & (parent < Rows)),
+            "tree KV parent outside rows",
+        )
+        src_slot = tl.load(
+            Slots + step * StepStride + parent * RowStride, valid, other=0
+        )
+        dst_slot = tl.load(Slots + step * StepStride + row * RowStride, valid, other=0)
     else:
-        slot = tl.load(Src + j * SrcStride, valid, other=0)
+        src_slot = tl.load(Src + j * SrcStride, valid, other=0)
+        dst_slot = tl.load(Dst + j * DstStride, valid, other=0)
     tl.device_assert(
-        (~valid) | ((slot >= 0) & (slot < PoolSlots)), "KV slot outside pool"
+        (~valid)
+        | (
+            (src_slot >= 0)
+            & (src_slot < PoolSlots)
+            & (dst_slot >= 0)
+            & (dst_slot < PoolSlots)
+        ),
+        "KV slot outside pool",
     )
-    mask = valid & (col < Width)
+    # Identity destinations remain unchanged; other gathers may still read
+    # them. Both stages must use the same mask, with unique active targets.
+    mask = valid & (src_slot != dst_slot) & (col < Width)
+    if Scatter:
+        slot = dst_slot
+    else:
+        slot = src_slot
     pool_offset = (group.to(tl.int64) * PoolSlots + slot.to(tl.int64)) * Width + col
     scratch_offset = (group.to(tl.int64) * Capacity + j.to(tl.int64)) * Width + col
     if Scatter:
