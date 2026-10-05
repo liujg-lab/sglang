@@ -974,5 +974,348 @@ class TestKVMove(unittest.TestCase):
                 self.assertNotIn(name, text, str(path))
 
 
+class TestCudaExperimentContracts(unittest.TestCase):
+    def test_static_contiguous_groups_and_layout_rejection(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            continuous_groups,
+        )
+
+        a = torch.empty(12, 2, 7)
+        b = torch.empty(24, 2, 7)[::2]
+        c = torch.empty(12, 1, 19)
+        layout = kv.KVMoveLayout(
+            tuple(kv.KVMoveBuffer(t, 0) for t in (a, a.clone(), b, c, a.double())),
+            "token",
+        )
+        groups = continuous_groups(layout)
+        self.assertEqual([ids for _, ids in groups], [(0, 1), (2,), (3,), (4,)])
+        for t in (a.transpose(1, 2), torch.empty(12, 2, 14)[..., ::2]):
+            bad = kv.KVMoveLayout(
+                (kv.KVMoveBuffer(a, 0), kv.KVMoveBuffer(t, 0)), "token"
+            )
+            with self.assertRaises(kv.UnsupportedKVMoveLayout):
+                continuous_groups(bad)
+
+    def test_experimental_launch_global_boundary_and_static_addressing(self):
+        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda_experiment.py")
+        tree = ast.parse(path.read_text())
+        launch = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "launch"
+        )
+        calls = []
+
+        class Kernel:
+            def __getitem__(self, grid):
+                return lambda *args, **kw: calls.append((grid, args, kw))
+
+        ns = {
+            "_stage": Kernel(),
+            "tl": NS(uint8=1, uint16=2, uint32=4, uint64=8),
+            "triton": NS(
+                cdiv=lambda a, b: (a + b - 1) // b,
+                next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
+            ),
+        }
+        exec(compile(ast.Module(body=[launch], type_ignores=[]), str(path), "exec"), ns)
+        ws = NS(
+            tables=[(torch.empty(2, 2), 14, 14, 2), (torch.empty(1, 2), 2051, 4096, 4)],
+            layout=NS(buffers=[NS(tensor=NS(shape=(70000, 2, 7)))]),
+        )
+        source = torch.empty(66000, dtype=torch.int64)
+        ns["launch"](ws, src=source, dst=source)
+        self.assertEqual(len(calls), 8)
+        # Five pointers, geometry/strides, then TREE/SCATTER.
+        self.assertEqual([args[-3] for _, args, _ in calls], [False] * 4 + [True] * 4)
+        stage = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_stage"
+        )
+        divisions = [
+            ast.unparse(n)
+            for n in ast.walk(stage)
+            if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.FloorDiv, ast.Mod))
+        ]
+        self.assertEqual(set(divisions), {"j % ROWS", "j // ROWS"})
+        self.assertIn("slot * STRIDE + c", ast.unparse(stage))
+
+    def test_no_production_admission_or_candidate_copies(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            candidate_workspace,
+        )
+
+        # No CUDA runtime or tensor work is allowed for this rejection.
+        self.assertIsNone(candidate_workspace(NS(), 1, NS(device=NS(type="cuda"))))
+        root = Path(kv.__file__).parent
+        production = Path(kv.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("cuda_layered", production)
+        self.assertNotIn("ReplayActiveRows", production)
+        for path in root.rglob("*.py"):
+            if "experiment" in path.name or path.name == "sr_kv_copy.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("sr_kv_copy_cuda_experiment", text, str(path))
+            self.assertNotIn("ReplayActiveRows", text, str(path))
+
+        rows = torch.empty(8, 2, 4)
+        token = NS(k_buffer=[rows], v_buffer=[rows.clone()])
+        layout = kv.KVMoveLayout.from_pool(token)
+        self.assertFalse(kv.cuda_tree_experiment_eligible(token, layout, "tree_eager"))
+        cuda_layout = NS(kind="token", device=NS(type="cuda"), buffers=layout.buffers)
+        self.assertTrue(
+            kv.cuda_tree_experiment_eligible(token, cuda_layout, "tree_eager")
+        )
+        self.assertTrue(
+            kv.cuda_tree_experiment_eligible(token, cuda_layout, "tree_graph")
+        )
+        for domain in ("eager", "lease_copy", "fixed_accept", "other"):
+            self.assertFalse(
+                kv.cuda_tree_experiment_eligible(token, cuda_layout, domain), domain
+            )
+        indexed = NS(
+            k_buffer=[rows], v_buffer=[rows.clone()], index_k_buffer=[rows.clone()]
+        )
+        self.assertFalse(
+            kv.cuda_tree_experiment_eligible(indexed, cuda_layout, "tree_eager")
+        )
+        sliced = torch.empty(8, 2, 8)[..., ::2]
+        bad = NS(
+            kind="token",
+            device=NS(type="cuda"),
+            buffers=(kv.KVMoveBuffer(sliced, 0), kv.KVMoveBuffer(rows, 0)),
+        )
+        self.assertFalse(kv.cuda_tree_experiment_eligible(token, bad, "tree_eager"))
+        paged_pool = paged()
+        self.assertEqual(
+            kv.prepare_kv_move(paged_pool, 4, domain="tree_eager").backend, "torch_out"
+        )
+        self.assertEqual(
+            kv.prepare_kv_move(paged_pool, 4, domain="tree_graph", graph=True).backend,
+            "torch_out",
+        )
+        cpu_tree = kv.prepare_kv_move(token, 4, domain="tree_eager")
+        self.assertEqual(cpu_tree.backend, "torch_out")
+        self.assertIs(cpu_tree, kv.prepare_kv_move(token, 4, domain="lease_copy"))
+        self.assertIs(cpu_tree, kv.prepare_kv_move(token, 4, domain="fixed_accept"))
+
+    def test_tree_experiment_growth_parks_eager_and_keeps_graph(self):
+        class FakeExperiment(kv.KVMoveWorkspace):
+            def __init__(self, pool, capacity, *, graph=False):
+                super().__init__(pool, kv.KVMoveLayout.from_pool(pool), graph=graph)
+                self.reserve(int(capacity))
+                self.backend = "cuda_contiguous_experiment"
+                self.frozen = True
+                self.remaps = []
+
+            def remap(self, slots, parents, depth):
+                self.remaps.append((int(depth), None))
+
+        pool = NS(
+            k_buffer=[torch.empty(16, 2, 4)],
+            v_buffer=[torch.empty(16, 2, 4)],
+        )
+        held = []
+
+        def record(self):
+            event = NS(query=lambda: False)
+            held.append(event)
+            return event
+
+        def eligible(_pool, _layout, domain):
+            return domain in ("tree_eager", "tree_graph")
+
+        with (
+            patch.object(kv, "cuda_tree_experiment_eligible", side_effect=eligible),
+            patch.object(kv.KVMoveWorkspace, "_record_event", record),
+            patch(
+                "sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment.CudaKVExperiment",
+                FakeExperiment,
+            ),
+        ):
+            eager = kv.prepare_kv_move(pool, 3, domain="tree_eager")
+            self.assertEqual(eager.backend, "cuda_contiguous_experiment")
+            self.assertEqual(eager.capacity, 4)
+            grown = kv.prepare_kv_move(pool, 5, domain="tree_eager")
+            self.assertIsNot(grown, eager)
+            self.assertEqual(grown.capacity, 8)
+            self.assertIs(pool._kv_tree_experiment_retired[0][1], eager)
+            tail = kv.prepare_kv_move(pool, 4, domain="lease_copy")
+            target = kv.prepare_kv_move(pool, 4, domain="fixed_accept")
+            self.assertEqual(tail.backend, "torch_out")
+            self.assertIs(tail, target)
+            self.assertIsNot(tail, grown)
+            graph = kv.prepare_kv_move(pool, 4, domain="tree_graph", graph=True)
+            with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+                kv.prepare_kv_move(pool, 9, domain="tree_graph", graph=True)
+            self.assertIs(
+                graph, kv.prepare_kv_move(pool, 4, domain="tree_graph", graph=True)
+            )
+            slots = torch.arange(6).reshape(2, 3)
+            parents = torch.tensor([2, 0, 1])
+            with patch.object(kv, "_portable_move") as portable:
+                kv.remap_tree_kv_(grown, slots, parents, 1)
+            portable.assert_not_called()
+            self.assertEqual(grown.remaps, [(1, None)])
+            with self.assertRaisesRegex(RuntimeError, "active mask"):
+                kv.remap_tree_kv_(
+                    grown, slots, parents, 1, torch.ones(3, dtype=torch.bool)
+                )
+
+    def test_actual_cuda_kernel_body_against_snapshot(self):
+        # CPU execution of the real AST checks address/mask semantics, not
+        # Triton compilation. Pointer-table loads resolve into private tensors.
+        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda_experiment.py")
+        tree = ast.parse(path.read_text())
+        stage = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_stage"
+        )
+        stage.decorator_list = []
+        for arg in stage.args.args:
+            arg.annotation = None
+        registry, access = {}, Counter()
+
+        class Pointer:
+            def __init__(self, tensor, name, offset=0):
+                self.tensor = tensor
+                self.name, self.offset = name, offset
+
+            def __add__(self, value):
+                return Pointer(self.tensor, self.name, self.offset + value)
+
+        class Address:
+            def __init__(self, value):
+                self.value = int(value)
+
+            def to(self, _dtype):
+                return registry[self.value]
+
+        class Language:
+            int64 = torch.int64
+            pid = (0, 0, 0)
+            pointer_type = staticmethod(lambda bits: bits)
+            arange = staticmethod(torch.arange)
+            where = staticmethod(torch.where)
+
+            def program_id(self, axis):
+                return torch.tensor(self.pid[axis])
+
+            def load(self, ptr, mask=True, other=0):
+                index = torch.as_tensor(ptr.offset)
+                mask = torch.as_tensor(mask).expand_as(index)
+                index = torch.where(mask, index, 0)
+                value = torch.where(
+                    mask,
+                    ptr.tensor[index],
+                    torch.as_tensor(other, dtype=ptr.tensor.dtype),
+                )
+                access[(ptr.name, "read")] += int(mask.sum())
+                return Address(value) if ptr.name == "table" else value
+
+            def store(self, ptr, value, mask=True):
+                index, value, mask = torch.broadcast_tensors(
+                    torch.as_tensor(ptr.offset), value, torch.as_tensor(mask)
+                )
+                ptr.tensor[index[mask]] = value[mask]
+                access[(ptr.name, "write")] += int(mask.sum())
+
+        language = Language()
+        ns = {"tl": language}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[stage], type_ignores=[])),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        # Feature width has a masked tail; physical rows include a gap.
+        width, stride, capacity = 7, 11, 20
+        for tree_mode in (False, True):
+            slots = torch.arange(12).reshape(4, 3).T
+            parents = torch.tensor([0, 0, 1, 3])
+            for mapping in (
+                torch.arange(12),
+                torch.arange(12).roll(1),
+                torch.zeros(12, dtype=torch.int64),
+            ):
+                access.clear()
+                pool = torch.arange(capacity * stride).float()
+                original = pool.clone()
+                scratch = torch.full((12 * width,), -999.0)
+                registry.update(
+                    {1: Pointer(pool, "pool"), 2: Pointer(scratch, "scratch")}
+                )
+                source = slots[:, parents].reshape(-1) if tree_mode else mapping
+                target = slots.reshape(-1) if tree_mode else torch.arange(12)
+                expected = pool.clone()
+                for src, dst in zip(source.tolist(), target.tolist()):
+                    expected[dst * stride : dst * stride + width] = original[
+                        src * stride : src * stride + width
+                    ]
+                pointers = [
+                    Pointer(torch.tensor([1, 2]), "table"),
+                    Pointer(mapping, "src"),
+                    Pointer(torch.arange(12), "dst"),
+                    Pointer(torch.arange(12), "slots"),
+                    Pointer(parents, "parents"),
+                ]
+                # The physical storage behind transposed slots is arange(12).
+                for scatter in (False, True):
+                    for base in (0, 5, 10):
+                        for j in range(min(5, 12 - base)):
+                            for tile in range(2):
+                                language.pid = (0, j, tile)
+                                ns["_stage"](
+                                    *pointers,
+                                    12,
+                                    4,
+                                    base,
+                                    width,
+                                    stride,
+                                    capacity,
+                                    1,
+                                    1,
+                                    *slots.stride(),
+                                    1,
+                                    tree_mode,
+                                    scatter,
+                                    4,
+                                    4,
+                                )
+                self.assertTrue(torch.equal(pool, expected))
+                moved = int((source != target).sum()) * width
+                self.assertEqual(access["pool", "read"], moved)
+                self.assertEqual(access["pool", "write"], moved)
+
+    def test_submission_failure_preserves_holds_and_blocks_retry(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            CudaKVExperiment,
+        )
+
+        pool = NS(k_buffer=[torch.ones(8, 2, 7)], v_buffer=[torch.ones(8, 2, 7)])
+        ws = kv.prepare_kv_move(pool, 4)
+        failure = RuntimeError("scatter failed")
+        with self.assertRaises(kv.KVMoveSubmittedError) as caught:
+            ws.submitted(
+                (torch.tensor([1, 0]),), lambda: (_ for _ in ()).throw(failure)
+            )
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertIsNotNone(ws.hold)
+        with self.assertRaises(kv.KVMoveSubmittedError):
+            ws.check()
+        # Exercise actual replay wrapper with a harmless CPU-owned workspace.
+        ws2 = kv.prepare_kv_move(
+            NS(k_buffer=[torch.ones(8, 2, 7)], v_buffer=[torch.ones(8, 2, 7)]), 4
+        )
+        graph = NS(replay=lambda: (_ for _ in ()).throw(failure))
+        with self.assertRaises(kv.KVMoveSubmittedError):
+            CudaKVExperiment.replay(ws2, graph)
+        self.assertIs(ws2._failed_graph, graph)
+
+
 if __name__ == "__main__":
     unittest.main()

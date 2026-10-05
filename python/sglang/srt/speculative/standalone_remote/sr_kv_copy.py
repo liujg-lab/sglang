@@ -603,6 +603,63 @@ class KVMoveWorkspace:
             ) from exc
 
 
+_TREE_EXPERIMENT_DOMAINS = frozenset({"tree_eager", "tree_graph"})
+
+
+def cuda_tree_experiment_eligible(pool, layout, domain):
+    """Contiguous CUDA MHA/GQA tree remaps measured faster than per-buffer ATen."""
+    if domain not in _TREE_EXPERIMENT_DOMAINS:
+        return False
+    if layout.device.type != "cuda" or layout.kind != "token":
+        return False
+    if (
+        not isinstance(getattr(pool, "k_buffer", None), (list, tuple))
+        or not isinstance(getattr(pool, "v_buffer", None), (list, tuple))
+        or getattr(pool, "index_k_buffer", None) is not None
+    ):
+        return False
+    from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+        continuous_groups,
+    )
+
+    try:
+        continuous_groups(layout)
+    except UnsupportedKVMoveLayout:
+        return False
+    return True
+
+
+def _workspace_key(domain, graph, stream_key, *, experiment):
+    # Tree experiments own their pointer tables. Other eager users still share
+    # one torch_out workspace; captured graphs stay named by runner domain.
+    if experiment:
+        return (("cuda_tree", domain, bool(graph)), stream_key)
+    return (("graph", domain) if graph else "eager", stream_key)
+
+
+def _collect_parked_tree_experiments(pool):
+    parked = getattr(pool, "_kv_tree_experiment_retired", None)
+    if not parked:
+        return
+    kept = []
+    try:
+        for event, old in parked:
+            if not event.query():
+                kept.append((event, old))
+    except BaseException as exc:
+        pool._kv_move_unresolved = True
+        raise KVMoveSubmittedError("KV scratch retirement query failed") from exc
+    pool._kv_tree_experiment_retired = kept
+
+
+def _park_tree_experiment(pool, workspace):
+    event = workspace._record_event()
+    parked = getattr(pool, "_kv_tree_experiment_retired", None)
+    if parked is None:
+        parked = pool._kv_tree_experiment_retired = []
+    parked.append((event, workspace))
+
+
 def prepare_kv_move(pool, capacity, *, domain="eager", graph=False, metrics=None):
     layout = getattr(pool, "_kv_move_layout", None)
     if layout is None:
@@ -613,14 +670,45 @@ def prepare_kv_move(pool, capacity, *, domain="eager", graph=False, metrics=None
     registry = getattr(pool, "_kv_move_workspaces", None)
     if registry is None:
         registry = pool._kv_move_workspaces = {}
-    # All eager users on one stream share the maximum capacity. Graphs own
-    # separate stable allocations, named by their long-lived runner domain.
-    key = (("graph", domain) if graph else "eager", _stream_key(_stream(layout.device)))
+    capacity = int(capacity)
+    admit = capacity > 0 and cuda_tree_experiment_eligible(pool, layout, domain)
+    key = _workspace_key(
+        domain, graph, _stream_key(_stream(layout.device)), experiment=admit
+    )
+    if not _capturing(layout.device):
+        _collect_parked_tree_experiments(pool)
     ws = registry.get(key)
+    if (
+        ws is not None
+        and admit
+        and ws.backend == "cuda_contiguous_experiment"
+        and capacity > ws.capacity
+    ):
+        if ws.graph or ws._inside_capture or _capturing(layout.device):
+            raise RuntimeError(
+                "KV scratch cannot grow during capture or after graph binding"
+            )
+        # Build the replacement first. A failed allocation leaves the captured
+        # or in-flight pointer tables registered.
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            CudaKVExperiment,
+        )
+
+        replacement = CudaKVExperiment(pool, capacity, graph=graph)
+        _park_tree_experiment(pool, ws)
+        ws = replacement
+        registry[key] = ws
     if ws is None:
         if _capturing(layout.device):
             raise RuntimeError("KV workspace must be prepared before graph capture")
-        ws = KVMoveWorkspace(pool, layout, graph=graph, metrics=metrics)
+        if admit:
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+                CudaKVExperiment,
+            )
+
+            ws = CudaKVExperiment(pool, capacity, graph=graph)
+        else:
+            ws = KVMoveWorkspace(pool, layout, graph=graph, metrics=metrics)
         registry[key] = ws
     if ws.graph != bool(graph):
         raise RuntimeError("KV graph/eager workspace domain mismatch")
@@ -858,6 +946,12 @@ def remap_tree_kv_(workspace, slots, parents, depth, active_rows=None):
         or active_rows.dtype not in (torch.bool, torch.int32, torch.int64)
     ):
         raise RuntimeError("tree KV active mask mismatch")
+    if getattr(workspace, "backend", None) == "cuda_contiguous_experiment":
+        if active_rows is not None:
+            raise RuntimeError("CUDA tree remap does not accept an active mask")
+        # Same bytes as the portable path: every group gathers before scatter.
+        workspace.remap(slots, parents, depth)
+        return
     if workspace.kernels is not None:
         workspace.submitted(
             (slots, parents) + (() if active_rows is None else (active_rows,)),

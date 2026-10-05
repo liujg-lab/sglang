@@ -26,6 +26,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     SRTailExtendTransaction,
     TailExtendRecoveryRequired,
     clear_fill_credential,
+    clear_tree_seed_pack,
     invalidate_tree_seed,
     make_tail_extend_batch,
     plan_tail_extend,
@@ -881,6 +882,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_clear_prefix_stamp(state)
             req.output_ids[-1] = target[-1]
             req.sr_tree_seed = None
+            clear_tree_seed_pack(req)
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             if last_token_in_kv(fork, committed):
@@ -903,6 +905,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 req.output_ids = req.output_ids[:keep]
             self._sr_clear_prefix_stamp(state)
             req.sr_tree_seed = None
+            clear_tree_seed_pack(req)
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
@@ -982,6 +985,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                     None,
                     verified_id,
                 )
+                req.sr_tree_seed_row = None
+                req.sr_tree_seed_root = None
                 stamp_tree_seed(
                     req, len(req.origin_input_ids or []) + len(req.output_ids or [])
                 )
@@ -1050,6 +1055,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         req.kv_overallocated_freed = False
         req.logprob_start_len = max(0, len(req.origin_input_ids) - 1)
         req.sr_tree_seed = None
+        clear_tree_seed_pack(req)
         if req.multimodal_inputs is not None:
             # origin_input_ids was rewritten, so M-RoPE must be recomputed. If
             # that fails or the vision tensors are already gone, prefilling

@@ -22,10 +22,86 @@ class TailExtendRecoveryRequired(ValueError):
     """The existing prefix cannot be used by a text-tail extend."""
 
 
+def clear_tree_seed_pack(req: Req) -> None:
+    """Drop the shared-batch row recorded beside a tree seed."""
+    req.sr_tree_seed_row = None
+    req.sr_tree_seed_root = None
+
+
 def invalidate_tree_seed(req: Req) -> None:
     req.sr_prefix_revision = int(getattr(req, "sr_prefix_revision", 0)) + 1
     req.sr_tree_seed = None
     req.sr_tree_seed_boundary = None
+    clear_tree_seed_pack(req)
+
+
+def _matrix_seed_rows(parts, rows):
+    pieces = []
+    for part, row in zip(parts, rows):
+        tensor = part
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        if row is None:
+            pieces.append(tensor[:1])
+        else:
+            pieces.append(tensor[int(row) : int(row) + 1])
+    return pieces
+
+
+def _pack_seed_rows(parts, rows, fallback):
+    """Reuse one cloned batch, or select its rows, or concatenate per request."""
+    if (
+        parts
+        and all(row is not None for row in rows)
+        and all(
+            part.data_ptr() == parts[0].data_ptr() and part.shape == parts[0].shape
+            for part in parts
+        )
+    ):
+        base = parts[0]
+        if list(rows) == list(range(len(parts))) and int(base.shape[0]) == len(parts):
+            return base
+        index = torch.tensor(list(rows), dtype=torch.int64, device=base.device)
+        return base.index_select(0, index)
+    return torch.cat(fallback, dim=0)
+
+
+def stack_recorded_seeds(reqs):
+    """Stack seeds that may share one cloned ``[B, K]`` batch."""
+    ps = []
+    ixs = []
+    p_rows = []
+    ix_rows = []
+    v_parts = []
+    v_rows = []
+    v_fallback = []
+    for req in reqs:
+        topk_p, topk_index, _hidden_states, verified_id = req.sr_tree_seed
+        row = getattr(req, "sr_tree_seed_row", None)
+        if row is not None:
+            row = int(row)
+        ps.append(topk_p)
+        ixs.append(topk_index)
+        p_rows.append(row)
+        ix_rows.append(row)
+        root = getattr(req, "sr_tree_seed_root", None)
+        if row is not None and isinstance(root, torch.Tensor) and root.ndim == 1:
+            v_parts.append(root)
+            v_rows.append(row)
+            v_fallback.append(root[row : row + 1])
+        else:
+            if verified_id.dim() == 0:
+                verified_id = verified_id.unsqueeze(0)
+            piece = verified_id.reshape(-1)[:1]
+            v_parts.append(piece)
+            v_rows.append(None)
+            v_fallback.append(piece)
+    return (
+        _pack_seed_rows(ps, p_rows, _matrix_seed_rows(ps, p_rows)),
+        _pack_seed_rows(ixs, ix_rows, _matrix_seed_rows(ixs, ix_rows)),
+        None,
+        _pack_seed_rows(v_parts, v_rows, v_fallback),
+    )
 
 
 def tree_seed_is_current(req: Req) -> bool:
@@ -914,6 +990,15 @@ class SRTailExtendTransaction:
             or p.shape != (count, topk)
         ):
             raise RuntimeError("tail extend did not produce one seed per request")
+        p_seed = p.detach().clone()
+        ix_seed = ix.detach().clone()
+        root = self._root_tokens
+        share_root = (
+            isinstance(root, torch.Tensor)
+            and root.ndim == 1
+            and int(root.shape[0]) == count
+            and _root_device_matches(root.device, ix.device)
+        )
         prepared = []
         for i, plan in enumerate(self.plans):
             if (
@@ -925,8 +1010,8 @@ class SRTailExtendTransaction:
             if plan.rebuild_fill is not None and len(plan.rebuild_fill) != plan.total_len:
                 raise RuntimeError("tail fill rebuild does not match the plan")
             seed = (
-                p[i : i + 1].detach().clone(),
-                ix[i : i + 1].detach().clone(),
+                p_seed,
+                ix_seed,
                 None,
                 self._root_token_view(i, ix.device),
             )
@@ -938,10 +1023,10 @@ class SRTailExtendTransaction:
                 fill = plan.req.fill_ids
                 cred = SRFillCredential(id(fill), plan.total_len, plan.revision)
                 action = ("extend", list(plan.fill_append_tokens))
-            prepared.append((plan, seed, cred, action))
+            prepared.append((plan, seed, cred, action, i))
         undo = []
         try:
-            for plan, _seed, _cred, action in prepared:
+            for plan, _seed, _cred, action, _row in prepared:
                 kind, payload = action
                 if kind != "extend" or not payload:
                     continue
@@ -953,7 +1038,7 @@ class SRTailExtendTransaction:
             for fill, old_len in undo:
                 del fill[old_len:]
             raise
-        for plan, seed, cred, action in prepared:
+        for plan, seed, cred, action, row in prepared:
             kind, payload = action
             plan.req.kv_committed_len = plan.end
             plan.req.kv_allocated_len = plan.end
@@ -961,6 +1046,8 @@ class SRTailExtendTransaction:
                 plan.req.fill_ids = payload
             plan.req.sr_fill_credential = cred
             plan.req.sr_tree_seed = seed
+            plan.req.sr_tree_seed_row = row
+            plan.req.sr_tree_seed_root = root if share_root else None
             stamp_tree_seed(plan.req, plan.end)
             plan.req.draft_generation_start_len = len(plan.req.output_ids or [])
         self.committed = True

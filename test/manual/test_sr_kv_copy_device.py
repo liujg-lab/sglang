@@ -453,5 +453,194 @@ class TestNPUCandidates(unittest.TestCase):
             worker.close()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and Triton")
+class TestCudaKVExperiment(unittest.TestCase):
+    """Private pools only. These checks never enable production admission."""
+
+    def pool(self, dtype=torch.float16, layers=3, width=67, slots=512):
+        dev = torch.device("cuda", torch.cuda.current_device())
+        # Different rows, NaN payloads and signed zero are checked as raw bytes.
+        tensors = []
+        for i in range(2 * layers):
+            t = (
+                (torch.arange(slots * 2 * width, device=dev) % 1009)
+                .reshape(slots, 2, width)
+                .to(dtype)
+            )
+            t.add_(i)
+            tensors.append(t)
+        return NS(k_buffer=tensors[:layers], v_buffer=tensors[layers:])
+
+    def assert_bits(self, actual, expected):
+        self.assertTrue(
+            torch.equal(
+                actual.contiguous().view(torch.uint8),
+                expected.contiguous().view(torch.uint8),
+            )
+        )
+
+    def test_explicit_overlap_and_raw_bits(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            CudaKVExperiment,
+        )
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            pool = self.pool(dtype)
+            dev = pool.k_buffer[0].device
+            ws = CudaKVExperiment(pool, 257)
+            tensors = pool.k_buffer + pool.v_buffer
+            for t in tensors:
+                t[0, 0, 0] = float("nan")
+                t[1, 0, 0] = -0.0
+            dst = torch.arange(257, device=dev)
+            for src in (dst, dst.roll(1), torch.zeros_like(dst), dst.flip(0)):
+                before = [t.clone() for t in tensors]
+                ws.move(src, dst)
+                for actual, original in zip(tensors, before):
+                    expected = original.clone()
+                    expected.index_copy_(0, dst, original.index_select(0, src))
+                    self.assert_bits(actual, expected)
+            with self.assertRaisesRegex(RuntimeError, "grow"):
+                ws.reserve(ws.capacity + 1)
+            self.assertEqual(
+                kv.prepare_kv_move(self.pool(dtype), 4).backend, "torch_out"
+            )
+
+    def test_graph_live_mapping_mask_and_storage(self):
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            CudaKVExperiment,
+        )
+
+        pool = self.pool()
+        dev = pool.k_buffer[0].device
+        ws = CudaKVExperiment(pool, 36, graph=True)
+        # Real non-contiguous strides for both mappings.
+        slots = torch.arange(60, device=dev).reshape(12, 5).T
+        parent_backing = torch.arange(24, device=dev)
+        parents = parent_backing[::2]
+        parents.copy_(torch.arange(12, device=dev))
+        ws.remap(slots, parents, 3)
+        torch.cuda.synchronize(dev)
+        graph = torch.cuda.CUDAGraph()
+        with ws.capture_scope(), torch.cuda.graph(graph):
+            ws.remap(slots, parents, 3)
+        for turn in range(4):
+            slots.copy_(torch.arange(60, device=dev).reshape(12, 5).T + turn * 60)
+            # Identity row read by another row, and duplicate parents.
+            p = torch.tensor(
+                [b * 3 + x for b in range(4) for x in (0, 0, 1)], device=dev
+            )
+            parents.copy_(p)
+            tensors = pool.k_buffer + pool.v_buffer
+            before = [t.clone() for t in tensors]
+            src = slots[:3, parents].reshape(-1)
+            dst = slots[:3].reshape(-1)
+            ws.replay(graph)
+            for actual, original in zip(tensors, before):
+                expected = original.clone()
+                expected.index_copy_(0, dst, original.index_select(0, src))
+                self.assert_bits(actual, expected)
+        pool.k_buffer[0] = pool.k_buffer[0].clone()
+        with self.assertRaises(kv.UnsupportedKVMoveLayout):
+            ws.replay(graph)
+
+    def test_graph_benchmark_three_alternating_groups(self):
+        self._benchmark_moves(use_graph=True)
+
+    def test_eager_benchmark_three_alternating_groups(self):
+        self._benchmark_moves(use_graph=False)
+
+    def _benchmark_moves(self, *, use_graph):
+        """Component timing, NOT whole-model admission. 3 x 500 per B/version."""
+        import json
+        import time
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+            CudaKVExperiment,
+        )
+
+        for batch in (1, 2, 3, 4):
+            rows = batch * 3
+            graphs, owners = [], []
+            for experimental in (False, True):
+                pool = self.pool(layers=28, width=512, slots=256)
+                dev = pool.k_buffer[0].device
+                ws = (
+                    CudaKVExperiment(pool, rows * 3, graph=use_graph)
+                    if experimental
+                    else kv.prepare_kv_move(
+                        pool, rows * 3, domain="private_benchmark", graph=use_graph
+                    )
+                )
+                slots = torch.arange(rows * 5, device=dev).reshape(rows, 5).T
+                parents = (
+                    torch.arange(rows, device=dev)
+                    .reshape(batch, 3)
+                    .roll(1, 1)
+                    .flatten()
+                )
+
+                def run(ws=ws, slots=slots, parents=parents, experimental=experimental):
+                    for depth in (1, 2, 3):
+                        if experimental:
+                            ws.remap(slots, parents, depth)
+                        else:
+                            kv.remap_tree_kv_(ws, slots, parents, depth)
+
+                for _ in range(3):
+                    run()
+                torch.cuda.synchronize(dev)
+                if use_graph:
+                    graph = torch.cuda.CUDAGraph()
+                    with ws.capture_scope(), torch.cuda.graph(graph):
+                        run()
+                else:
+                    graph = NS(replay=run)
+                for _ in range(50):
+                    graph.replay()
+                torch.cuda.synchronize(dev)
+                graphs.append(graph)
+                owners.append((ws, pool, slots, parents))
+            for group in range(3):
+                for version in ((0, 1) if group % 2 == 0 else (1, 0)):
+                    ws = owners[version][0]
+                    ws.check()
+                    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                        enable_timing=True
+                    )
+                    wall = time.perf_counter()
+                    begin.record()
+                    for _ in range(500):
+                        graphs[version].replay()
+                    end.record()
+                    end.synchronize()
+                    wall_ms = (time.perf_counter() - wall) * 1000 / 500
+                    print(
+                        json.dumps(
+                            dict(
+                                kind=(
+                                    "kv_graph_component_only"
+                                    if use_graph
+                                    else "kv_eager_component_only"
+                                ),
+                                batch=batch,
+                                group=group,
+                                backend=ws.backend,
+                                iterations=500,
+                                device_ms=begin.elapsed_time(end) / 500,
+                                replay_wall_ms=wall_ms,
+                                historical_slots=[rows, rows * 2, rows * 3],
+                                scratch_bytes=ws.scratch_bytes,
+                                grows=ws.counts["grow"],
+                                pointer_table_bytes=sum(
+                                    t[0].numel() * t[0].element_size()
+                                    for t in getattr(ws, "tables", [])
+                                ),
+                                production_admitted=False,
+                            )
+                        )
+                    )
+            del graphs, owners
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1188,26 +1188,11 @@ class SRTreeDrafter:
     def _stack_seeds(
         self, reqs: List["Req"]
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        ps: List[torch.Tensor] = []
-        ixs: List[torch.Tensor] = []
-        vs: List[torch.Tensor] = []
-        for req in reqs:
-            topk_p, topk_index, _hidden_states, verified_id = req.sr_tree_seed
-            if topk_p.dim() == 1:
-                topk_p = topk_p.unsqueeze(0)
-            if topk_index.dim() == 1:
-                topk_index = topk_index.unsqueeze(0)
-            if verified_id.dim() == 0:
-                verified_id = verified_id.unsqueeze(0)
-            ps.append(topk_p[:1])
-            ixs.append(topk_index[:1])
-            vs.append(verified_id.reshape(-1)[:1])
-        return (
-            torch.cat(ps, dim=0),
-            torch.cat(ixs, dim=0),
-            None,
-            torch.cat(vs, dim=0),
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+            stack_recorded_seeds,
         )
+
+        return stack_recorded_seeds(reqs)
 
     def _expand_tree(
         self,

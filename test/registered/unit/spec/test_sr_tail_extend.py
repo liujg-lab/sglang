@@ -618,6 +618,73 @@ class TestTailTransaction(unittest.TestCase):
         self.assertEqual(int(req.sr_tree_seed[3]), plans[0].last_token)
         self.assertEqual(tuple(req.sr_tree_seed[3].shape), (1,))
 
+    def test_commit_packs_one_seed_batch(self):
+        reqs = [
+            request(prefix=3, output=(7, 20 + slot), slot=slot) for slot in range(4)
+        ]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.stage_root_tokens("cpu")
+        probs = torch.arange(12, dtype=torch.float32).reshape(4, 3) + 1
+        indices = torch.arange(40, 52, dtype=torch.int64).reshape(4, 3)
+        original_p = probs.clone()
+        original_ix = indices.clone()
+        txn.commit(
+            NS(
+                tree_seed_topk_p=probs,
+                tree_seed_topk_index=indices,
+                hidden_states=torch.ones(4, 4),
+            )
+        )
+        probs.fill_(-1)
+        indices.fill_(-1)
+        packed_p = reqs[0].sr_tree_seed[0]
+        packed_ix = reqs[0].sr_tree_seed[1]
+        self.assertNotEqual(packed_p.data_ptr(), probs.data_ptr())
+        self.assertNotEqual(packed_ix.data_ptr(), indices.data_ptr())
+        torch.testing.assert_close(packed_p, original_p)
+        self.assertTrue(torch.equal(packed_ix, original_ix))
+        for row, req in enumerate(reqs):
+            self.assertTrue(tail.tree_seed_is_current(req))
+            self.assertEqual(req.sr_tree_seed[0].data_ptr(), packed_p.data_ptr())
+            self.assertEqual(req.sr_tree_seed[1].data_ptr(), packed_ix.data_ptr())
+            self.assertEqual(req.sr_tree_seed_row, row)
+            self.assertIs(req.sr_tree_seed_root, txn._root_tokens)
+            self.assertIsNone(req.sr_tree_seed[2])
+            self.assertEqual(tuple(req.sr_tree_seed[3].shape), (1,))
+            self.assertEqual(int(req.sr_tree_seed[3]), plans[row].last_token)
+        same_p, same_ix, hidden, same_v = tail.stack_recorded_seeds(reqs)
+        self.assertIsNone(hidden)
+        self.assertEqual(same_p.data_ptr(), packed_p.data_ptr())
+        self.assertEqual(same_ix.data_ptr(), packed_ix.data_ptr())
+        self.assertEqual(same_v.data_ptr(), txn._root_tokens.data_ptr())
+        order = [2, 0, 3]
+        sel_p, sel_ix, sel_h, sel_v = tail.stack_recorded_seeds(
+            [reqs[i] for i in order]
+        )
+        index = torch.tensor(order, dtype=torch.int64)
+        self.assertIsNone(sel_h)
+        self.assertTrue(torch.equal(sel_p, original_p.index_select(0, index)))
+        self.assertTrue(torch.equal(sel_ix, original_ix.index_select(0, index)))
+        self.assertEqual(sel_v.tolist(), [plans[i].last_token for i in order])
+        legacy = NS(
+            sr_tree_seed=(
+                torch.tensor([[9.0, 8.0, 7.0]]),
+                torch.tensor([[1, 2, 3]]),
+                torch.ones(1, 4),
+                torch.tensor([4]),
+            )
+        )
+        mix_p, mix_ix, mix_h, mix_v = tail.stack_recorded_seeds([reqs[1], legacy])
+        self.assertIsNone(mix_h)
+        self.assertEqual(mix_p.tolist(), [original_p[1].tolist(), [9.0, 8.0, 7.0]])
+        self.assertEqual(mix_ix.tolist(), [original_ix[1].tolist(), [1, 2, 3]])
+        self.assertEqual(mix_v.tolist(), [plans[1].last_token, 4])
+        tail.invalidate_tree_seed(reqs[0])
+        self.assertIsNone(reqs[0].sr_tree_seed)
+        self.assertIsNone(reqs[0].sr_tree_seed_row)
+        self.assertIsNone(reqs[0].sr_tree_seed_root)
+
     def test_allocation_and_seed_failure_are_atomic(self):
         reqs = [request(slot=0), request(slot=1)]
         scheduler, plans = transaction_fixture(reqs, 128)

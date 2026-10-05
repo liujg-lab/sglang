@@ -380,6 +380,78 @@ counters describe logical copied data, not all gather/scratch/scatter memory
 traffic. No NPU/CUDA kernel compilation, end-to-end correctness or speedup
 has been certified by the local CPU results.
 
+## CUDA Draft tree remap
+
+`prepare_kv_move()` selects `cuda_contiguous_experiment` only when `domain` is
+`tree_eager` or `tree_graph` and the pool is separate contiguous CUDA MHA/GQA
+K/V with no `index_k_buffer`. Tail extend, Target fixed-accept, paged, MLA and
+non-contiguous layouts stay on `torch_out` (NPU paged stays `npu_paged6`).
+`remap_tree_kv_` still gathers every selected group before any scatter.
+CUDA candidate selection still returns its compiled results. Do not restore `cuda_layered`
+or cdc8a5e6e as a bundle.
+
+`sr_kv_copy_cuda_experiment.CudaKVExperiment` accepts separate ordinary MHA/GQA K/V lists with contiguous
+feature rows, groups by dtype/width/stride, and launches bitwise gather/scatter
+from `sr_kv_copy_kernels_cuda_experiment`. Width and stride are compile-time
+geometry; physical slots and parents remain runtime tensors. The feature
+address is `slot * STRIDE + c`, with no runtime head/dimension division.
+All groups and slot chunks gather before any scatter. Identity tasks skip
+both pool reads and writes, even when another task reads the identity source.
+Active destinations must be unique and all active indices must be valid;
+the caller owns these invariants, as for the baseline mover.
+
+Allocate on the intended stream before capture, use `capture_scope()` during
+capture and `workspace.replay(graph)` for correctness tests. Scratch and pointer
+tables are fixed for the workspace lifetime, including eager tests. Growth
+requires a new owner; retain the old owner with all old graphs/consumers. This
+deliberate experimental restriction avoids replacing pointers without completed
+consumer evidence. Submitted failures poison the pool and park the workspace
+on it; never retry or destroy its holds until completion can be established.
+Pointer-table host staging is retained for the workspace lifetime.
+
+### Validation commands and interpretation
+
+Use the existing Python/unittest entrypoints, with `PYTHONPATH=python`:
+
+```bash
+python test/registered/unit/spec/test_sr_kv_copy.py
+python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_explicit_overlap_and_raw_bits
+python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_graph_live_mapping_mask_and_storage
+python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_graph_benchmark_three_alternating_groups
+python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_eager_benchmark_three_alternating_groups
+```
+
+The CPU suite checks the actual kernel AST's indexing/masks against complete
+source snapshots (including artificial cross-chunk boundaries), launch order,
+group geometry, and the tree-only production admission.
+It does **not** compile Triton. The CUDA tests use the current device explicitly,
+private pools and real graph replay, including B=3 padded to 4 and subsequent
+4-row restoration. BF16/FP16/FP32 explicit copies include NaN and signed zero,
+compared as bytes. No live model KV is borrowed.
+
+The component benchmark captures all three history moves, with 28 layers,
+1024 feature elements per token, BF16/FP16-like two-byte storage (FP16 in the
+fixture), K=3/S=5 and B=1/2/3/4. It alternates baseline/new ordering for three
+groups of 500 replays after warmup, printing JSON records of device and replay
+wall time, scratch/pointer bytes and growth counts. Compilation is outside the
+timed region. Timing uses direct `graph.replay()` equally for both implementations
+after storage checks; the extra Python safety wrapper is not timed on just one
+side. These are complete **mover component graphs**, not model graphs: there
+is no model forward, RPC, TPOT or acceptance measurement here. Graph timing is
+not evidence of eager improvement. Run on an otherwise idle GPU and record
+model-specific geometry/dtype separately; adjust only test fixtures as needed.
+
+The RTX 3090 component measurements admitted this mover for Draft tree remaps
+on contiguous CUDA MHA/GQA only. Full Draft-model graphs, a fixed NPU Target,
+identical tokens, trees, seeds and acceptance counts are still separate
+evidence. Record cold start separately, and inspect KV, candidate
+copies and the Target timeline in a separate profiling run.
+If component or end-to-end performance does not improve for a shape, retain
+`torch_out` for it. The 3090 tree-remap measurement is the admission for that
+layout; further timing in this file does not widen it.
+Candidate assembly, attention S-1 metadata and tail seed capture remain separate
+experiments; none is bundled into this KV experiment.
+
 Earlier NPU service performance logs preceded these scalar/cache/lifecycle fixes. They are
 not hardware acceptance evidence for this revision. Real scalar argument
 specialization, warmup compile coverage, graph replay and performance remain
