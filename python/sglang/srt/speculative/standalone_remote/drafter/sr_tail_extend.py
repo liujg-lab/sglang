@@ -48,60 +48,161 @@ def _matrix_seed_rows(parts, rows):
     return pieces
 
 
-def _pack_seed_rows(parts, rows, fallback):
-    """Reuse one cloned batch, or select its rows, or concatenate per request."""
-    if (
-        parts
-        and all(row is not None for row in rows)
-        and all(
-            part.data_ptr() == parts[0].data_ptr() and part.shape == parts[0].shape
-            for part in parts
-        )
+def _note_uniform(uniform, identity, base, ptr, shape, tensor, row, index):
+    """Return whether this row still belongs to one shared batch."""
+    if not uniform:
+        return uniform, identity, base, ptr, shape
+    if row is None or (
+        base is not None and (tensor.data_ptr() != ptr or tensor.shape != shape)
     ):
-        base = parts[0]
-        if list(rows) == list(range(len(parts))) and int(base.shape[0]) == len(parts):
+        return False, False, base, ptr, shape
+    if base is None:
+        base = tensor
+        ptr = tensor.data_ptr()
+        shape = tensor.shape
+    if row != index:
+        identity = False
+    return True, identity, base, ptr, shape
+
+
+def _shared_row_index(cache, rows, device):
+    key = (rows, device)
+    index = cache.get(key)
+    if index is None:
+        index = torch.tensor(rows, dtype=torch.int64, device=device)
+        cache[key] = index
+    return index
+
+
+def _protect_seed_row_indexes(indexes) -> None:
+    """Keep gather indexes alive until this stream finishes reading them.
+
+    The index is uploaded once and then dropped with the packer. A backend
+    that reads it at kernel time, and recycles storage as soon as the last
+    reference disappears, can gather probability, token ids, and the root
+    with a reused row list.
+    """
+    for index in indexes:
+        device = index.device
+        if device.type == "cpu":
+            continue
+        module = torch.get_device_module(device.type)
+        capturing = getattr(module, "is_current_stream_capturing", None)
+        if callable(capturing) and capturing():
+            continue
+        current = getattr(module, "current_stream", None)
+        record = getattr(index, "record_stream", None)
+        if callable(current) and callable(record):
+            record(current(device))
+
+
+def _gather_seed_rows(base, index):
+    selected = base.index_select(0, index)
+    # The gathered rows keep the index reachable until the caller drops them.
+    selected._sr_seed_row_indexes = [index]
+    return selected
+
+
+def _pack_recorded_rows(cache, uniform, identity, base, rows, parts, fallback):
+    """Reuse one cloned batch, gather with a shared index, or concatenate."""
+    if uniform and rows:
+        count = len(rows)
+        if identity and int(base.shape[0]) == count:
             return base
-        index = torch.tensor(list(rows), dtype=torch.int64, device=base.device)
-        return base.index_select(0, index)
+        index = _shared_row_index(cache, tuple(rows), base.device)
+        return _gather_seed_rows(base, index)
+    if fallback is None:
+        fallback = _matrix_seed_rows(parts, rows)
     return torch.cat(fallback, dim=0)
 
 
 def stack_recorded_seeds(reqs):
-    """Stack seeds that may share one cloned ``[B, K]`` batch."""
+    """Stack seeds that may share one cloned ``[B, K]`` batch.
+
+    Same storage in ``0..B-1`` order returns that batch unchanged. A shared
+    source with a filter or permutation uploads one device index for each
+    distinct row order and device, then gathers probability, token index, and
+    root separately. That index stays reachable from the gathered rows and is
+    recorded on the current stream so its storage cannot be reused early.
+    Mixed sources build slice views only after that check fails.
+    """
     ps = []
-    ixs = []
     p_rows = []
+    p_uniform, p_identity = True, True
+    p_base, p_ptr, p_shape = None, None, None
+    ixs = []
     ix_rows = []
+    ix_uniform, ix_identity = True, True
+    ix_base, ix_ptr, ix_shape = None, None, None
     v_parts = []
     v_rows = []
-    v_fallback = []
-    for req in reqs:
+    v_fallback = None
+    v_uniform, v_identity = True, True
+    v_base, v_ptr, v_shape = None, None, None
+    for index, req in enumerate(reqs):
         topk_p, topk_index, _hidden_states, verified_id = req.sr_tree_seed
         row = getattr(req, "sr_tree_seed_row", None)
         if row is not None:
             row = int(row)
         ps.append(topk_p)
-        ixs.append(topk_index)
         p_rows.append(row)
+        p_uniform, p_identity, p_base, p_ptr, p_shape = _note_uniform(
+            p_uniform, p_identity, p_base, p_ptr, p_shape, topk_p, row, index
+        )
+        ixs.append(topk_index)
         ix_rows.append(row)
+        ix_uniform, ix_identity, ix_base, ix_ptr, ix_shape = _note_uniform(
+            ix_uniform,
+            ix_identity,
+            ix_base,
+            ix_ptr,
+            ix_shape,
+            topk_index,
+            row,
+            index,
+        )
         root = getattr(req, "sr_tree_seed_root", None)
         if row is not None and isinstance(root, torch.Tensor) and root.ndim == 1:
-            v_parts.append(root)
-            v_rows.append(row)
-            v_fallback.append(root[row : row + 1])
+            part = root
+            vrow = row
         else:
             if verified_id.dim() == 0:
                 verified_id = verified_id.unsqueeze(0)
-            piece = verified_id.reshape(-1)[:1]
-            v_parts.append(piece)
-            v_rows.append(None)
-            v_fallback.append(piece)
-    return (
-        _pack_seed_rows(ps, p_rows, _matrix_seed_rows(ps, p_rows)),
-        _pack_seed_rows(ixs, ix_rows, _matrix_seed_rows(ixs, ix_rows)),
-        None,
-        _pack_seed_rows(v_parts, v_rows, v_fallback),
+            part = verified_id.reshape(-1)[:1]
+            vrow = None
+        v_parts.append(part)
+        v_rows.append(vrow)
+        if v_fallback is not None:
+            v_fallback.append(part if vrow is None else part[vrow : vrow + 1])
+        elif vrow is None or (
+            v_base is not None and (part.data_ptr() != v_ptr or part.shape != v_shape)
+        ):
+            v_uniform = False
+            v_fallback = [
+                item if item_row is None else item[int(item_row) : int(item_row) + 1]
+                for item, item_row in zip(v_parts, v_rows)
+            ]
+        else:
+            if v_base is None:
+                v_base = part
+                v_ptr = part.data_ptr()
+                v_shape = part.shape
+            if vrow != index:
+                v_identity = False
+    cache = {}
+    packed_p = _pack_recorded_rows(
+        cache, p_uniform, p_identity, p_base, p_rows, ps, None
     )
+    packed_ix = _pack_recorded_rows(
+        cache, ix_uniform, ix_identity, ix_base, ix_rows, ixs, None
+    )
+    packed_v = _pack_recorded_rows(
+        cache, v_uniform, v_identity, v_base, v_rows, v_parts, v_fallback
+    )
+    # Record only after every gather is queued. Earlier work on this stream
+    # must stay ordered ahead of any later reuse of the index storage.
+    _protect_seed_row_indexes(cache.values())
+    return packed_p, packed_ix, None, packed_v
 
 
 def tree_seed_is_current(req: Req) -> bool:
@@ -573,17 +674,34 @@ def make_tail_extend_batch(scheduler, plans: List[SRTailExtendPlan]) -> Schedule
     batch.prefix_lens = [p.prefix_len for p in plans]
     batch.extend_num_tokens = sum(batch.extend_lens)
     batch.extend_logprob_start_lens = [0] * len(plans)
-    batch.input_ids = torch.tensor(
-        [token for p in plans for token in p.compute_tokens],
-        dtype=torch.int64,
-        device=device,
+    from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+        _owned_from_ints,
     )
-    batch.seq_lens_cpu = torch.tensor([p.end for p in plans], dtype=torch.int64)
-    batch.seq_lens = batch.seq_lens_cpu.to(device)
-    batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-    batch.seq_lens_sum = sum(p.end for p in plans)
-    batch.req_pool_indices = torch.tensor(
-        [p.req.req_pool_idx for p in plans], dtype=torch.int64, device=device
+
+    tokens = [token for p in plans for token in p.compute_tokens]
+    ends = [p.end for p in plans]
+    # Views of the persistent buffers. The execute path notes the consumer
+    # after this forward, before the next tail batch fills them again.
+    batch.input_ids = _owned_from_ints(
+        scheduler, "tail_input_ids", tokens, torch.int64, device, retain=False
+    )
+    batch.seq_lens_cpu = _owned_from_ints(
+        scheduler, "tail_seq_lens_cpu", ends, torch.int64, "cpu", retain=False
+    )
+    batch.seq_lens = _owned_from_ints(
+        scheduler, "tail_seq_lens", ends, torch.int64, device, retain=False
+    )
+    batch.orig_seq_lens = _owned_from_ints(
+        scheduler, "tail_orig_seq_lens", ends, torch.int32, device, retain=False
+    )
+    batch.seq_lens_sum = sum(ends)
+    batch.req_pool_indices = _owned_from_ints(
+        scheduler,
+        "tail_req_pool",
+        [p.req.req_pool_idx for p in plans],
+        torch.int64,
+        device,
+        retain=False,
     )
     batch.multimodal_inputs = [p.req.multimodal_inputs for p in plans]
     batch.top_logprobs_nums = [0] * len(plans)
@@ -746,10 +864,14 @@ class SRTailExtendTransaction:
             if self.allocator.available_size() < capacity:
                 raise RuntimeError("insufficient KV capacity for SR tail extend")
         self.allocator_state = self.allocator.backup_state()
-        self.mapping_snapshots = [
-            self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].clone()
-            for p in self.plans
-        ]
+        self.mapping_snapshots = []
+        for p in self.plans:
+            if not p.needs_suffix_alloc:
+                self.mapping_snapshots.append(None)
+                continue
+            self.mapping_snapshots.append(
+                self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].clone()
+            )
         allocated = None
         if additions:
             if page_size == 1:
@@ -1076,6 +1198,8 @@ class SRTailExtendTransaction:
         if self.allocator_state is not None:
             device_module.synchronize()
             for p, previous in zip(self.plans, self.mapping_snapshots):
+                if previous is None:
+                    continue
                 self.mapping[p.req.req_pool_idx, p.alloc_start : p.end].copy_(previous)
             self.allocator.restore_state(self.allocator_state)
             self._clear_installed_copy_markers()

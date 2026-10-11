@@ -31,6 +31,135 @@ class SRTransferUnresolved(RuntimeError):
     """A transfer may still be running and completion cannot be confirmed."""
 
 
+def _pow2_at_least(n: int) -> int:
+    cap = 1
+    while cap < max(int(n), 1):
+        cap *= 2
+    return cap
+
+
+def owned_ints(owner, name, values, dtype, device, retain: bool = True):
+    """Stage integers through a reusable host buffer and a reusable device buffer.
+
+    ``retain=True`` clones the device prefix into storage the caller may keep.
+    The persistent buffer is only the copy source; the next fill waits for that
+    clone. ``retain=False`` returns a view of the persistent buffer. The caller
+    must call ``note_owned_consumer`` after the kernels that read the view, and
+    the next fill waits for that consumer rather than only for this copy.
+
+    Slots are isolated by concrete device and stream. A failed submission keeps
+    both allocations reachable and permanently prevents reuse of that slot.
+    """
+    device = torch.device(device)
+    module = stream = None
+    stream_key = None
+    if device.type != "cpu":
+        module = torch.get_device_module(device.type)
+        if device.index is None:
+            device = torch.device(device.type, module.current_device())
+        stream = module.current_stream(device)
+        for attr in ("stream_id", "cuda_stream", "npu_stream"):
+            value = getattr(stream, attr, None)
+            if value is not None:
+                stream_key = int(value)
+                break
+        if stream_key is None:
+            raise RuntimeError("integer staging requires a stable stream identity")
+    slots = getattr(owner, "_sr_int_staging", None)
+    if slots is None:
+        slots = owner._sr_int_staging = {}
+    key = (name, dtype, device, stream_key)
+    slot = slots.setdefault(
+        key,
+        {
+            "host": None,
+            "device": None,
+            "event": None,
+            "holds": None,
+            "unresolved": False,
+        },
+    )
+    if slot["unresolved"]:
+        raise SRTransferUnresolved("integer staging is unresolved")
+    try:
+        event = slot["event"]
+        if event is not None and not event.query():
+            event.synchronize()
+    except BaseException as exc:
+        slot["unresolved"] = True
+        raise SRTransferUnresolved("integer staging reuse wait failed") from exc
+    slot["holds"] = None
+    n = len(values)
+    cap = _pow2_at_least(n)
+    host = slot["host"]
+    if host is None or host.numel() < n:
+        host, _ = alloc_host((max(cap, 8),), dtype, device)
+        slot["host"] = host
+    # Conversion/validation is entirely before device submission.
+    host[:n].numpy()[:] = values
+    if module is None:
+        if retain:
+            return host[:n].clone()
+        return host[:n]
+    asynchronous = bool(host.is_pinned())
+    event = slot["event"]
+    if asynchronous and event is None:
+        event = module.Event()  # Failure here is a safe, pre-submission error.
+    buf = slot["device"]
+    if buf is None or buf.numel() < n or buf.device != device or buf.dtype != dtype:
+        buf = torch.empty(cap, dtype=dtype, device=device)
+        slot["device"] = buf
+    slot["event"] = event if asynchronous else None
+    slot["holds"] = (host, buf, stream, event)
+    try:
+        buf[:n].copy_(host[:n], non_blocking=asynchronous)
+        # retain clones after the copy so the kept tensor no longer aliases buf.
+        out = buf[:n].clone() if retain else buf[:n]
+        if asynchronous:
+            event.record(stream)
+    except BaseException as exc:
+        slot["unresolved"] = True
+        if isinstance(exc, SRTransferUnresolved):
+            raise
+        raise SRTransferUnresolved("integer upload completion unknown") from exc
+    if not asynchronous:
+        slot["holds"] = None
+    return out
+
+
+def note_owned_consumer(owner, *names: str) -> None:
+    """Record the kernels that still read ``retain=False`` views.
+
+    Replaces the copy event. The next ``owned_ints`` waits for this record.
+    A record failure marks the slot unresolved and does not raise, so a
+    caller's ``finally`` can keep the original exception.
+    """
+    slots = getattr(owner, "_sr_int_staging", None)
+    if not slots or not names:
+        return
+    wanted = set(names)
+    events = {}
+    for key, slot in slots.items():
+        name, _dtype, device, _stream_key = key
+        if name not in wanted or slot.get("unresolved"):
+            continue
+        if device is None or torch.device(device).type == "cpu":
+            continue
+        dev = torch.device(device)
+        event = events.get(dev)
+        if event is None:
+            try:
+                module = torch.get_device_module(dev.type)
+                event = module.Event()
+                event.record(module.current_stream(dev))
+            except Exception:
+                slot["unresolved"] = True
+                continue
+            events[dev] = event
+        slot["event"] = event
+        slot["holds"] = (slot.get("host"), slot.get("device"), event)
+
+
 def _backend_name(device) -> str:
     if device is None:
         return "cpu"

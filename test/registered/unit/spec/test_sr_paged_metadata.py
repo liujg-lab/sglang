@@ -34,6 +34,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     SRTreePagedMetadata,
     build_step_context_lens,
     context_lens_list,
+    paged_draft_step_context,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -380,12 +381,16 @@ class TestPagedMetadata(unittest.TestCase):
             for n in method.body
             if isinstance(n, ast.If) and "view is not None" in ast.unparse(n.test)
         )
-        calls = [
-            n.func.attr
-            for n in ast.walk(fused)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        ]
-        self.assertFalse(set(calls) & {"copy_", "fill_", "zero_"})
+        table_writes = []
+        for n in ast.walk(fused):
+            if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+                continue
+            if n.func.attr not in {"copy_", "fill_", "zero_"}:
+                continue
+            if ast.unparse(n.func.value) != "cpu":
+                table_writes.append(ast.unparse(n))
+        self.assertEqual(table_writes, [])
+        self.assertIn("cpu.copy_", ast.unparse(fused))
 
     def backend_fixture(self):
         # Load the actual backend methods without requiring torch_npu/model
@@ -415,6 +420,7 @@ class TestPagedMetadata(unittest.TestCase):
             SRTreePagedMetadata=SRTreePagedMetadata,
             build_step_context_lens=build_step_context_lens,
             context_lens_list=context_lens_list,
+            paged_draft_step_context=paged_draft_step_context,
             ForwardMetadata=types.SimpleNamespace,
         )
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
@@ -430,12 +436,23 @@ class TestPagedMetadata(unittest.TestCase):
         for name in names:
             setattr(backend, name, types.MethodType(ns[name], backend))
         mapping = torch.arange(5 * 512).reshape(5, 512)
+        rows = 4 * 3
+        captured_lens = torch.ones((rows,), dtype=torch.int32)
         backend.attn_backends = [
             types.SimpleNamespace(
                 req_to_token=mapping,
                 speculative_step_id=i,
                 forward_metadata=None,
                 bind_sr_tree_paged_metadata=Mock(),
+                _sr_tree_paged_meta=SRTreePagedMetadata(
+                    block_tables=torch.zeros((rows, 4), dtype=torch.int32),
+                    active_rows=torch.zeros((rows,), dtype=torch.bool),
+                    context_lens_cpu=captured_lens,
+                    context_lens_list=[1] * rows,
+                    dummy_page=0,
+                    max_pages=4,
+                    impl="paged_fia",
+                ),
             )
             for i in range(4)
         ]

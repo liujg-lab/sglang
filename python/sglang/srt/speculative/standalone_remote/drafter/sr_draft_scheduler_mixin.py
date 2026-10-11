@@ -116,6 +116,12 @@ from sglang.srt.utils import DynamicGradMode
 logger = logging.getLogger(__name__)
 
 
+def _owned_from_ints(owner, name, values, dtype, device, retain: bool = True) -> torch.Tensor:
+    from sglang.srt.speculative.standalone_remote.sr_transfer_staging import owned_ints
+
+    return owned_ints(owner, name, values, dtype, device, retain=retain)
+
+
 def _fix_sampling_params_stop_strs(sp) -> None:
     if not hasattr(sp, "stop_strs") or sp.stop_strs is None:
         sp.stop_strs = []
@@ -274,34 +280,41 @@ class StandaloneRemoteDraftSchedulerMixin:
         HTTP generate reqs on this Draft process must survive. Full radix /
         KV / embedding_cache reset only runs when no HTTP req is alive
         (needed for VL leftover 128 vs 64 embeddings).
+
+        ``_sr_deferred_finish`` is intentionally left alone. A session change
+        must not drop a FINISH that is still waiting on its consumer event.
         """
-        for state in self.sr_state.clear():
-            req = state.req_object
-            if req is None:
-                continue
-            self._sr_remove_req(req)
-            self._sr_release_tree_lease(state.req_id)
-            release_mm_resources(req.multimodal_inputs)
-            req.multimodal_inputs = None
-            req.req_pool_idx = None
-            if not req.finished():
-                req.to_abort = True
-                req.finished_reason = FINISH_ABORT("Target session reset")
-        self.sr_waiting = [
-            r for r in self.sr_waiting if self._sr_is_http_req(r)
-        ]
+        from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+            has_unresolved_resources,
+        )
+
+        unresolved = has_unresolved_resources(self)
+        if unresolved:
+            for state in self.sr_state.clear():
+                if state.req_object is not None:
+                    self._sr_abandon_poisoned_kv(state.req_object)
+        else:
+            for state in self.sr_state.clear():
+                req = state.req_object
+                if req is None:
+                    continue
+                self._sr_finish_rid(state.req_id, state=state)
+        self.sr_waiting = [r for r in self.sr_waiting if self._sr_is_http_req(r)]
         if getattr(self, "draft_paused_reqs", None) is not None:
             self.draft_paused_reqs = [
                 r for r in self.draft_paused_reqs if self._sr_is_http_req(r)
             ]
         http_alive = self._sr_http_alive()
         if http_alive:
+            # Other HTTP requests still own the pools. Do not reset or free.
             self.cur_batch = None
             self.last_batch = None
         else:
             store = getattr(self, "sr_tree_leases", None)
-            if store is not None:
+            if store is not None and not unresolved:
                 store.release_all(self.token_to_kv_pool_allocator)
+            # Unresolved pages are dropped only after a confirmed allocator
+            # reset. Sync failure poisons the worker and does not clear.
             self._sr_reset_scheduler_caches()
         if self.sr_server is not None:
             self.sr_server.last_rpc_seq = -1
@@ -314,6 +327,45 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
 
     def _sr_reset_scheduler_caches(self) -> None:
+        from .sr_resource_quarantine import (
+            _staging_unresolved,
+            drop_confirmed_deferred_finishes,
+            freeze_deferred_finishes,
+            quarantine,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        # Host-only. A failed sync below leaves the queue and these records.
+        freeze_deferred_finishes(self)
+        if getattr(self, "_sr_device_poisoned", False):
+            # Pages stay quarantined until process teardown. Return req rows
+            # on the host and keep this wipe from leaving the event loop.
+            self._sr_reclaim_poisoned_host_rows()
+            self._sr_drop_poisoned_host_queues()
+            return
+        tree_drafter = getattr(self, "sr_tree_drafter", None)
+        bags = [quarantine(self)]
+        if tree_drafter is not None:
+            bags.append(quarantine(tree_drafter))
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        pending_leases = getattr(alloc, "_sr_tree_lease_pending_frees", ())
+        copy_holds = getattr(self, "_sr_pending_copy_holds", ())
+        if (
+            any(bag.records for bag in bags)
+            or pending_leases
+            or copy_holds
+            or _staging_unresolved(self)
+        ):
+            # Explicit full reset only, never a steady-state or FINISH wait.
+            try:
+                if torch.device(self.device).type != "cpu":
+                    torch.get_device_module(self.device).synchronize(self.device)
+            except BaseException as exc:
+                self._sr_device_poisoned = True
+                raise SRTransferUnresolved("cannot reset unresolved KV") from exc
+
         waiting = getattr(self, "waiting_queue", None)
         if waiting is not None:
             waiting.clear()
@@ -331,9 +383,26 @@ class StandaloneRemoteDraftSchedulerMixin:
         pool = getattr(self, "req_to_token_pool", None)
         if pool is not None and hasattr(pool, "clear"):
             pool.clear()
-        alloc = getattr(self, "token_to_kv_pool_allocator", None)
         if alloc is not None and hasattr(alloc, "clear"):
             alloc.clear()
+            alloc.generation = int(getattr(alloc, "generation", 0) or 0) + 1
+        if pending_leases:
+            pending_leases.clear()
+        if copy_holds:
+            copy_holds.clear()
+        for bag in bags:
+            bag.after_allocator_reset(completion_confirmed=True)
+        drop_confirmed_deferred_finishes(self)
+        self._sr_abandoned_kv_reclaimed = getattr(
+            self, "_sr_abandoned_kv_reclaimed", 0
+        ) + getattr(self, "_sr_abandoned_kv_slots", 0)
+        self._sr_abandoned_kv_slots = 0
+        if tree_drafter is not None:
+            view = getattr(
+                tree_drafter.draft_attn_backend, "_sr_draft_paged_view", None
+            )
+            if view is not None:
+                view.workspace.lease_hold = None
         gm = getattr(self, "grammar_manager", None)
         if gm is not None and hasattr(gm, "clear"):
             gm.clear()
@@ -344,6 +413,48 @@ class StandaloneRemoteDraftSchedulerMixin:
                 embedding_cache.clear()
         except Exception:
             pass
+
+    def _sr_handoff_finished_kv(self, req: Req) -> None:
+        """Move pages FINISH will release out of quarantine.
+
+        ``release_all_kv_for_finished_req`` frees every physical page named by
+        the request map. Those pages are removed from quarantine without a
+        second ``free``. Pages the map does not name stay isolated.
+        """
+        from sglang.srt.speculative.standalone_remote.sr_align import kv_release_len
+        from .sr_resource_quarantine import handoff_request_pages
+
+        drafter = getattr(self, "sr_tree_drafter", None)
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None and drafter is not None:
+            alloc = getattr(drafter, "token_to_kv_pool_allocator", None)
+        page_size = 1
+        if alloc is not None:
+            page_size = max(1, int(getattr(alloc, "page_size", 1) or 1))
+        pool = getattr(self, "req_to_token_pool", None)
+        if pool is None and drafter is not None:
+            pool = getattr(drafter, "req_to_token_pool", None)
+        mapping = getattr(pool, "req_to_token", None)
+        idx = getattr(req, "req_pool_idx", None)
+        owned = set()
+        if mapping is not None and idx is not None:
+            length = kv_release_len(
+                getattr(req, "kv_committed_len", 0),
+                getattr(req, "kv_allocated_len", 0),
+            )
+            length = max(0, min(int(length), int(mapping.shape[1])))
+            if length:
+                for slot in mapping[idx, :length].detach().view(-1).tolist():
+                    slot = int(slot)
+                    owned.add(slot if page_size == 1 else slot // page_size)
+        seen = set()
+        for holder in (self, drafter):
+            if holder is None or id(holder) in seen:
+                continue
+            seen.add(id(holder))
+            bag = getattr(holder, "_sr_kv_quarantine", None)
+            if bag is not None:
+                handoff_request_pages(bag, req, owned, page_size)
 
     def _sr_remove_req(self, req: Req) -> None:
         if req in self.sr_waiting:
@@ -514,23 +625,29 @@ class StandaloneRemoteDraftSchedulerMixin:
             forward_mode=ForwardMode.DECODE,
             device=device,
         )
-        batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        batch.req_pool_indices = _owned_from_ints(
+            self, "decode_req_pool", [r.req_pool_idx for r in reqs], torch.int64, device
         )
-        batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
-        batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(
-            seq_lens_list, dtype=torch.int32, device=device
+        batch.seq_lens = _owned_from_ints(
+            self, "decode_seq_lens", seq_lens_list, torch.int64, device
+        )
+        batch.seq_lens_cpu = _owned_from_ints(
+            self, "decode_seq_lens_cpu", seq_lens_list, torch.int64, "cpu"
+        )
+        batch.orig_seq_lens = _owned_from_ints(
+            self, "decode_orig_seq_lens", seq_lens_list, torch.int32, device
         )
         batch.out_cache_loc = None
         batch.seq_lens_sum = sum(seq_lens_list)
-        batch.output_ids = torch.tensor(
+        batch.output_ids = _owned_from_ints(
+            self,
+            "decode_output_ids",
             [
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
                 for r in reqs
             ],
-            dtype=torch.int64,
-            device=device,
+            torch.int64,
+            device,
         )
         batch.return_logprob = any(r.return_logprob for r in reqs)
         batch.top_logprobs_nums = [
@@ -568,30 +685,315 @@ class StandaloneRemoteDraftSchedulerMixin:
         rid: str,
         release_mm: bool = True,
         state: Optional[SRDraftState] = None,
+        entry: Optional[dict] = None,
     ) -> None:
+        from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+            commit_finish_pages,
+            defer_finish,
+            deferred_release_allowed,
+            fail_finish_release,
+            finish_has_device_hold,
+            has_unresolved_resources,
+            note_deferred_finish,
+            prepare_finish_pages,
+            quarantine_stale_deferred,
+            reconcile_request_mapping,
+            request_consumer_unconfirmed,
+        )
+
+        queued = getattr(self, "_sr_deferred_finish", None)
+        if isinstance(queued, dict) and rid in queued:
+            note_deferred_finish(self, rid, None, state, release_mm, 0)
+            return
+        already_left = False
         if state is None:
-            state = self.sr_state.delete(rid)
+            getter = getattr(self.sr_state, "get", None)
+            if callable(getter):
+                state = getter(rid)
+            if state is None:
+                state = self.sr_state.delete(rid)
+                already_left = state is not None
         if state is None:
             return
         req = state.req_object
         if req is None:
             return
+        # A poisoned device, an unresolved upload, or a copy whose completion
+        # is unknown still blocks release. Another request's quarantine does not.
+        if has_unresolved_resources(self, include_quarantine=False):
+            if not already_left:
+                self.sr_state.delete(rid)
+            self._sr_abandon_poisoned_kv(req)
+            req.to_abort = True
+            if not req.finished():
+                req.finished_reason = FINISH_ABORT("Target request finished")
+            return
+        if request_consumer_unconfirmed(self, req):
+            defer_finish(self, req)
+            alloc_gen = getattr(self, "token_to_kv_pool_allocator", None)
+            if alloc_gen is None:
+                drafter_gen = getattr(self, "sr_tree_drafter", None)
+                alloc_gen = getattr(drafter_gen, "token_to_kv_pool_allocator", None)
+            note_deferred_finish(
+                self,
+                rid,
+                req,
+                state,
+                release_mm,
+                int(getattr(alloc_gen, "generation", 0) or 0),
+            )
+            self._sr_remove_req(req)
+            return
+        if entry is not None and not deferred_release_allowed(self, entry):
+            quarantine_stale_deferred(self, entry)
+            queued_again = getattr(self, "_sr_deferred_finish", None)
+            if not isinstance(queued_again, dict):
+                queued_again = {}
+                self._sr_deferred_finish = queued_again
+            queued_again[rid] = entry
+            return
+        reconcile_request_mapping(self, req)
+        drafter = getattr(self, "sr_tree_drafter", None)
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None and drafter is not None:
+            alloc = getattr(drafter, "token_to_kv_pool_allocator", None)
+        page_size = 1
+        generation = 0
+        if alloc is not None:
+            page_size = max(1, int(getattr(alloc, "page_size", 1) or 1))
+            generation = int(getattr(alloc, "generation", 0) or 0)
+        pool = getattr(self, "req_to_token_pool", None)
+        if pool is None and drafter is not None:
+            pool = getattr(drafter, "req_to_token_pool", None)
+        mapping = getattr(pool, "req_to_token", None)
+        idx = getattr(req, "req_pool_idx", None)
+        owned = set()
+        if mapping is not None and idx is not None:
+            from sglang.srt.speculative.standalone_remote.sr_align import (
+                kv_release_len,
+            )
+
+            length = kv_release_len(
+                getattr(req, "kv_committed_len", 0),
+                getattr(req, "kv_allocated_len", 0),
+            )
+            length = max(0, min(int(length), int(mapping.shape[1])))
+            if length:
+                for slot in mapping[idx, :length].detach().view(-1).tolist():
+                    slot = int(slot)
+                    owned.add(slot if page_size == 1 else slot // page_size)
+        if not finish_has_device_hold(self, req):
+            if not already_left:
+                self.sr_state.delete(rid)
+            self._sr_remove_req(req)
+            if not req.finished():
+                req.to_abort = True
+                req.finished_reason = FINISH_ABORT("Target request finished")
+            if release_mm:
+                release_mm_resources(req.multimodal_inputs)
+            req.multimodal_inputs = None
+            return
+        prepare_finish_pages(self, req, owned, page_size, generation)
+        if not already_left:
+            self.sr_state.delete(rid)
         self._sr_remove_req(req)
         if not req.finished():
             req.to_abort = True
             req.finished_reason = FINISH_ABORT("Target request finished")
-        if req.req_pool_idx is not None:
+        try:
             self._sr_release_tree_lease(rid)
-            if getattr(self, "_sr_device_poisoned", False):
-                logger.error(
-                    "[SR] NPU context already poisoned; skip KV release for %s",
-                    rid,
-                )
-            else:
+            if req.req_pool_idx is not None:
                 self.sr_kv.release_all_kv_for_finished_req(req)
+        except Exception as exc:
+            fail_finish_release(self, req, exc)
+        commit_finish_pages(self, req, owned, page_size)
         if release_mm:
             release_mm_resources(req.multimodal_inputs)
         req.multimodal_inputs = None
+
+    def _sr_poll_deferred_finishes(self, limit: int = 8) -> None:
+        """Query deferred consumer events and finish each ready request once.
+
+        Only events already stored on a quarantine record are queried. A
+        missing event, a failed query, or an unknown release stays queued
+        and does not submit another ``free``.
+        """
+        from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+            deferred_release_allowed,
+            pop_deferred_finish,
+            quarantine_stale_deferred,
+            request_consumer_unconfirmed,
+        )
+
+        queue = getattr(self, "_sr_deferred_finish", None)
+        if not isinstance(queue, dict) or not queue:
+            return
+        rids = list(queue)
+        cursor = int(getattr(self, "_sr_deferred_finish_cursor", 0) or 0) % len(rids)
+        ordered = rids[cursor:] + rids[:cursor]
+        checked = 0
+        for rid in ordered:
+            if checked >= limit:
+                break
+            checked += 1
+            entry = queue.get(rid)
+            if not isinstance(entry, dict):
+                continue
+            if not deferred_release_allowed(self, entry):
+                quarantine_stale_deferred(self, entry)
+                continue
+            req = entry.get("req")
+            if req is None or request_consumer_unconfirmed(self, req):
+                continue
+            popped = pop_deferred_finish(self, rid)
+            if not isinstance(popped, dict):
+                continue
+            if not deferred_release_allowed(self, popped):
+                quarantine_stale_deferred(self, popped)
+                queue[rid] = popped
+                continue
+            self._sr_finish_rid(
+                rid,
+                release_mm=bool(popped.get("release_mm", True)),
+                state=popped.get("state"),
+                entry=popped,
+            )
+        self._sr_deferred_finish_cursor = cursor + checked
+
+    def _sr_deferred_step_gate(self, rid: str, action: SRAction, session_id=None):
+        """Keep a deferred request out of inference. FINISH/ABORT only merge.
+
+        A new session does not merge into the old entry and does not create a
+        replacement state while that entry is still queued.
+        """
+        queue = getattr(self, "_sr_deferred_finish", None)
+        if not isinstance(queue, dict) or rid not in queue:
+            return None
+        entry = queue.get(rid)
+        entry_session = entry.get("session_id") if isinstance(entry, dict) else None
+        if (
+            isinstance(entry, dict)
+            and (
+                entry.get("stale")
+                or (
+                    session_id is not None
+                    and entry_session is not None
+                    and entry_session != session_id
+                )
+            )
+        ):
+            return "deferred_finish"
+        if action in (SRAction.FINISH, SRAction.ABORT):
+            self._sr_finish_rid(rid)
+            return "control"
+        return "reject"
+
+    def _sr_release_poisoned_req_row(self, req) -> None:
+        """Return one req-pool row. ``ReqToTokenPool.free`` is host bookkeeping."""
+        if req is None or getattr(req, "req_pool_idx", None) is None:
+            return
+        pool = getattr(self, "req_to_token_pool", None)
+        if pool is None:
+            drafter = getattr(self, "sr_tree_drafter", None)
+            pool = getattr(drafter, "req_to_token_pool", None)
+        free = getattr(pool, "free", None) if pool is not None else None
+        if not callable(free):
+            return
+        free(req)
+
+    def _sr_reclaim_poisoned_host_rows(self) -> None:
+        """Free quarantined req rows without an allocator or device reset."""
+        seen = set()
+        holders = [self]
+        drafter = getattr(self, "sr_tree_drafter", None)
+        if drafter is not None:
+            holders.append(drafter)
+        for holder in holders:
+            bag = getattr(holder, "_sr_kv_quarantine", None)
+            if bag is None:
+                continue
+            for record in list(getattr(bag, "records", ()) or ()):
+                owner = record.owner
+                reqs = []
+                if isinstance(owner, tuple) and owner:
+                    reqs.append(owner[0])
+                elif isinstance(owner, dict):
+                    reqs.extend(owner.get("reqs") or [])
+                else:
+                    if getattr(owner, "req_pool_idx", None) is not None:
+                        reqs.append(owner)
+                    reqs.append(getattr(record, "req", None))
+                for req in reqs:
+                    if req is None or id(req) in seen:
+                        continue
+                    seen.add(id(req))
+                    self._sr_release_poisoned_req_row(req)
+        reclaimed = int(getattr(self, "_sr_abandoned_kv_slots", 0) or 0)
+        self._sr_abandoned_kv_reclaimed = (
+            int(getattr(self, "_sr_abandoned_kv_reclaimed", 0) or 0) + reclaimed
+        )
+        self._sr_abandoned_kv_slots = 0
+        metrics = get_sr_round_metrics(self, "Draft")
+        metrics.counts["abandoned_kv_slots"] = 0
+        metrics.counts["abandoned_kv_slots_total"] = int(
+            getattr(self, "_sr_abandoned_kv_total", 0) or 0
+        )
+        metrics.counts["abandoned_kv_slots_reclaimed"] = self._sr_abandoned_kv_reclaimed
+
+    def _sr_drop_poisoned_host_queues(self) -> None:
+        """Drop scheduler lists without ``filter_batch`` or a device sync."""
+        waiting = getattr(self, "waiting_queue", None)
+        if waiting is not None:
+            waiting.clear()
+        running = getattr(self, "running_batch", None)
+        if running is not None:
+            reqs = getattr(running, "reqs", None)
+            if isinstance(reqs, list):
+                reqs.clear()
+            if hasattr(running, "batch_is_full"):
+                running.batch_is_full = False
+        self.cur_batch = None
+        self.last_batch = None
+        if getattr(self, "chunked_req", None) is not None:
+            self.chunked_req = None
+
+    def _sr_abandon_poisoned_kv(self, req: Req) -> None:
+        from .sr_resource_quarantine import iter_request_records, quarantine, record_belongs_to
+
+        bag = quarantine(self)
+        store = getattr(self, "sr_tree_leases", None)
+        lease = store.pop(req.rid) if store is not None else None
+        already = any(
+            record_belongs_to(record, req)
+            for _holder, _bag, record in iter_request_records(self, req)
+        )
+        if not already:
+            # Retain the request, mappings, MM and copy inputs. Do not call
+            # the KV allocator or any device cleanup in this path.
+            bag.retain((req, lease, getattr(self, "_sr_pending_copy_holds", None)))
+        self._sr_release_poisoned_req_row(req)
+        if getattr(req, "_sr_poison_kv_counted", False):
+            return
+        req._sr_poison_kv_counted = True
+        kv_len = max(
+            int(getattr(req, "kv_allocated_len", 0) or 0),
+            int(getattr(req, "kv_committed_len", 0) or 0),
+        )
+        self._sr_abandoned_kv_slots = (
+            getattr(self, "_sr_abandoned_kv_slots", 0) + kv_len
+        )
+        self._sr_abandoned_kv_total = (
+            getattr(self, "_sr_abandoned_kv_total", 0) + kv_len
+        )
+        metrics = get_sr_round_metrics(self, "Draft")
+        metrics.counts["abandoned_kv_slots"] = self._sr_abandoned_kv_slots
+        metrics.counts["abandoned_kv_slots_total"] = self._sr_abandoned_kv_total
+        metrics.counts["abandoned_kv_slots_reclaimed"] = getattr(
+            self, "_sr_abandoned_kv_reclaimed", 0
+        )
+        logger.error(
+            "[SR] quarantine poisoned request %s (%s KV slots)", req.rid, kv_len
+        )
 
     def _sr_is_finished(self, req: Req) -> bool:
         """Target FINISH/ABORT is the only way a draft req finishes."""
@@ -808,6 +1210,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 "[SR] Draft grammar copy failed for %s: %s", req.rid, e
             )
             req.grammar = None
+            return
 
     def _sr_replay_grammars(self, reqs: List[Req], *, strict: bool = False) -> None:
         for req in reqs:
@@ -830,6 +1233,18 @@ class StandaloneRemoteDraftSchedulerMixin:
                     raise RuntimeError(f"grammar replay failed for {req.rid}") from e
                 logger.warning("[SR] grammar replay failed for %s: %s", req.rid, e)
                 req.grammar = None
+
+    def _sr_note_abandoned_expand(self) -> None:
+        """Poison only when this abandon has no completion event.
+
+        A recorded event can be restored on the next expand. Marking the
+        worker untrusted here rejects every later commit.
+        """
+        drafter = getattr(self, "sr_tree_drafter", None)
+        if getattr(drafter, "_sr_last_abandon_has_event", False):
+            return
+        self._sr_device_poisoned = True
+        self._sr_clear_stamps_after_poison()
 
     def _sr_clear_stamps_after_poison(self) -> None:
         manager = getattr(self, "sr_state", None)
@@ -886,8 +1301,12 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             if last_token_in_kv(fork, committed):
-                if not self.sr_kv.rollback(req, fork, allocated):
-                    self._sr_reprefill(req, target, dreq, state)
+                self._sr_rollback_else_reprefill(
+                    req,
+                    fork,
+                    allocated,
+                    lambda: self._sr_reprefill(req, target, dreq, state),
+                )
             return
         if kind in ("append_one", "append_n"):
             req.output_ids.extend(target[len(local) :])
@@ -895,22 +1314,37 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
-        if kind == "local_rollback" and fork == len(target) and self.sr_kv.rollback(
-            req, fork, allocated
-        ):
-            clear_fill_credential(req)
-            extra = len(local) - fork
-            if extra > 0 and req.output_ids:
-                keep = max(0, len(req.output_ids) - extra)
-                req.output_ids = req.output_ids[:keep]
-            self._sr_clear_prefix_stamp(state)
-            req.sr_tree_seed = None
-            clear_tree_seed_pack(req)
-            req.draft_generation_start_len = len(req.output_ids)
-            req.draft_tokens_target = dreq.num_draft_tokens
+        if kind == "local_rollback" and fork == len(target):
+            if self._sr_rollback_else_reprefill(
+                req,
+                fork,
+                allocated,
+                lambda: self._sr_reprefill(req, target, dreq, state),
+            ):
+                clear_fill_credential(req)
+                extra = len(local) - fork
+                if extra > 0 and req.output_ids:
+                    keep = max(0, len(req.output_ids) - extra)
+                    req.output_ids = req.output_ids[:keep]
+                self._sr_clear_prefix_stamp(state)
+                req.sr_tree_seed = None
+                clear_tree_seed_pack(req)
+                req.draft_generation_start_len = len(req.output_ids)
+                req.draft_tokens_target = dreq.num_draft_tokens
             return
         self._sr_clear_prefix_stamp(state)
         self._sr_reprefill(req, target, dreq, state)
+
+    def _sr_rollback_else_reprefill(self, req, fork, allocated, on_refused) -> bool:
+        """True when the local rollback completed.
+
+        ``False`` is only a refusal made before the allocator is touched.
+        A release whose completion is unknown propagates and does not reprefill.
+        """
+        if self.sr_kv.rollback(req, fork, allocated):
+            return True
+        on_refused()
+        return False
 
     def _sr_run_window_batch(
         self, pairs: List[Tuple[SRDraftRequest, Req]]
@@ -1037,7 +1471,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Drop linear KV bookkeeping and rebuild fill/origin for a full re-prefill."""
         clear_fill_credential(req)
         invalidate_tree_seed(req)
-        self._sr_clear_prefix_stamp(self.sr_state.get(req.rid))
+        manager = getattr(self, "sr_state", None)
+        if manager is not None:
+            self._sr_clear_prefix_stamp(manager.get(req.rid))
         self._sr_remove_req(req)
         if req.req_pool_idx is not None:
             kv = getattr(self, "sr_kv", None)
@@ -1483,7 +1919,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             return self._sr_run_tree_ingest(reqs)
         return self._sr_execute_tree_tails(plans)
 
-    def _sr_execute_tree_tails(self, plans) -> bool:
+    def _sr_execute_tree_tails(self, plans, *, degrade_on_failure: bool = True) -> bool:
         """Run one transaction on final plans. Does not plan, recover, or pin."""
         if not plans:
             return True
@@ -1588,10 +2024,25 @@ class StandaloneRemoteDraftSchedulerMixin:
                 worker_failed = True
                 raise
             metrics.counts["tail_failed_requests"] += len(active)
-            for req in active:
-                self._sr_mark_degraded(req.rid, f"tail extend failed: {e}")
+            if degrade_on_failure:
+                for req in active:
+                    self._sr_mark_degraded(req.rid, f"tail extend failed: {e}")
             return False
         finally:
+            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+                note_owned_consumer,
+            )
+
+            # The forward, or the rollback sync in the except, is already queued.
+            # The next tail fill waits for this rather than only for the H2D copy.
+            note_owned_consumer(
+                self,
+                "tail_input_ids",
+                "tail_seq_lens",
+                "tail_seq_lens_cpu",
+                "tail_orig_seq_lens",
+                "tail_req_pool",
+            )
             if not worker_failed:
                 for req in active:
                     self._sr_pause_req(req)
@@ -1607,12 +2058,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Teacher-force committed tails into linear KV.
 
         Align only appends Target ids onto ``output_ids``. Chain then forwards
-        that last token with ``prepare_for_decode``. Tree used to skip that and
-        expand on prompt KV, so only layer-0 matched (accept len stuck at 2).
-        Short tails go one decode per token (tails may differ in length: each
-        step only runs reqs that still have a token at that offset). A long
-        tail -- Target ran ahead autoregressively -- is folded into a single
-        reprefill so the RPC cannot blow its deadline.
+        each missing token with one decode. One tail EXTEND is not that
+        forward: the captured graph records a zero prefix, so only the first
+        drafted token matches and accept length sticks at 2. Short tails stay
+        one decode per token (tails may differ in length: each step only runs
+        reqs that still have a token at that offset). A long tail -- Target
+        ran ahead autoregressively -- is one reprefill so the RPC cannot blow
+        its deadline. Tree ingest does not use this path.
         """
         if not reqs:
             return
@@ -1636,10 +2088,13 @@ class StandaloneRemoteDraftSchedulerMixin:
             )
         if long_tail:
             self._sr_reprefill_committed(long_tail)
+        if snapshots:
+            self._sr_ingest_chain_decode_steps(snapshots)
+
+    def _sr_ingest_chain_decode_steps(self, snapshots) -> None:
+        """Per-token decode that writes the committed tail and its last-token seed."""
         for t, active_idx in enumerate(
-            ingest_active_indices(
-                [len(tail) for _, _, tail, _ in snapshots]
-            )
+            ingest_active_indices([len(tail) for _, _, tail, _ in snapshots])
         ):
             active: List[Req] = []
             for i in active_idx:
@@ -1697,10 +2152,15 @@ class StandaloneRemoteDraftSchedulerMixin:
         for req in recapture:
             committed = int(getattr(req, "kv_committed_len", 0) or 0)
             allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
-            if committed <= 0 or not self.sr_kv.rollback(
-                req, committed - 1, allocated
-            ):
+            if committed <= 0:
                 failed_recapture.append(req)
+                continue
+            if not self._sr_rollback_else_reprefill(
+                req,
+                committed - 1,
+                allocated,
+                lambda req=req: failed_recapture.append(req),
+            ):
                 continue
             self._sr_ingest_committed_batch([req])
         need_reprefill = reprefill + failed_recapture
@@ -1782,6 +2242,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             with metrics.phase("tree_expand_pack"):
                 got = self.sr_tree_drafter.expand_batch(ready)
         except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
+            self._sr_note_abandoned_expand()
             raise
         except Exception as e:
             if _sr_is_device_context_error(e):
@@ -2175,6 +2636,15 @@ class StandaloneRemoteDraftSchedulerMixin:
         mm: Optional[SRMMPayload],
     ) -> Tuple[Optional[SRDraftReply], Optional[Req], Optional[SRDraftRequest]]:
         """Returns (early_reply, live_req, local_request)."""
+        gate = self._sr_deferred_step_gate(dreq.rid, action, session_id)
+        if gate == "control":
+            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None, None
+        if gate in ("reject", "deferred_finish"):
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="deferred_finish"),
+                None,
+                None,
+            )
         metrics = get_sr_round_metrics(self, "Draft")
         state = self.sr_state.get(dreq.rid)
         current_session = self.sr_state.session_id
@@ -2407,6 +2877,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         last_rpc_seq: int,
     ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
         """CPU decision + align. Returns (early_reply, None) or (None, live_req)."""
+        gate = self._sr_deferred_step_gate(dreq.rid, action, session_id)
+        if gate is not None:
+            empty = self._sr_empty_reply(dreq)
+            empty.status = (
+                SRReplyStatus.OK if gate == "control" else SRReplyStatus.REJECT
+            )
+            return empty, None
         state = self.sr_state.get(dreq.rid)
         req = state.req_object if state is not None else None
         decision = decide_draft_action(
@@ -2593,7 +3070,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             )
             reply_start = time.perf_counter()
             for (i, dreq, req), window in zip(gpu_pairs, windows):
-                wire = getattr(req, "sr_pending_wire_request", None) or dreq
+                pending_wire = getattr(req, "sr_pending_wire_request", None)
+                wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
                 reply = self._sr_stamp_window(
                     wire, window, batch.rpc_seq, batch.session_id
                 )
@@ -2691,6 +3169,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                                 self.sr_server.send_batch(reply)
                 self.last_batch = None
                 self._sr_resume_http_reqs()
+                self._sr_poll_deferred_finishes()
                 continue
             self._sr_cleanup_stale_drafts()
+            self._sr_poll_deferred_finishes()
             self._sr_run_http_batch()

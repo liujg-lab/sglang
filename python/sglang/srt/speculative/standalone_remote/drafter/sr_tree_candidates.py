@@ -282,25 +282,44 @@ class SRTreeCandidateWorkspace:
             self.device
         ).synchronize()
 
+    def _preflight_error(self, exc):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            is_device_context_error,
+        )
+
+        if isinstance(exc, SRTransferUnresolved) or is_device_context_error(exc):
+            self.unresolved = True
+            raise exc
+        try:
+            self._sync()
+        except BaseException as sync_error:
+            self.unresolved = True
+            raise SRTransferUnresolved(
+                f"candidate preflight completion unknown: {sync_error}"
+            ) from exc
+
     def warm(self):
         """Validate out variants on private data before graph/eager submission.
 
         Preflight calls the operators directly. An ``out=`` rejection or numeric
-        mismatch turns that flag off and retries the original operator into the
-        same buffers. It does not mark the workspace unresolved and is not a
-        request retry. Request launch failures still go through ``_submitted``.
+        mismatch turns that flag off only after confirming completion. Fatal
+        or unconfirmed work retains references and disables reuse. This is
+        private startup data, not a retry of a request.
         """
         if self.validated:
             return
         # Deterministic values with ties and near ties, without RNG side effects.
         row = torch.arange(self.vocab, dtype=torch.float32, device=self.device)
+        self.holds = (row,)
         logits = (
             ((row % 97) * 0.03125)
             .to(self.dtype)
             .reshape(1, -1)
             .repeat(self.batch * self.topk, 1)
         )
+        self.holds = (row, logits)
         p = torch.softmax(logits, dim=-1)
+        self.holds = (row, logits, p)
         expected = (
             torch.max(p, dim=-1, keepdim=True)
             if self.topk == 1
@@ -310,8 +329,8 @@ class SRTreeCandidateWorkspace:
         self.probability_out = True
         try:
             values, indices = self._probabilities(logits, 0)
-        except Exception:
-            self.unresolved = False
+        except Exception as exc:
+            self._preflight_error(exc)
             probability_match = False
         else:
             self._sync()
@@ -372,8 +391,8 @@ class SRTreeCandidateWorkspace:
                     score_list, token_list, parent_list, self.width
                 )
                 got = self._finish(self.batch)
-            except Exception:
-                self.unresolved = False
+            except Exception as exc:
+                self._preflight_error(exc)
                 return False
             self._sync()
             for (
@@ -423,7 +442,7 @@ def candidate_workspace(worker, batch, seed, *, graph=False):
     device = seed.device
     if device.type != "npu":
         return None
-    stream = torch.npu.current_stream(device)
+    stream = torch.get_device_module(device.type).current_stream(device)
     from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
         _capturing,
         _stream_key,
@@ -451,9 +470,12 @@ def candidate_workspace(worker, batch, seed, *, graph=False):
             seed.dtype,
             graph=graph,
         )
+        # Retain allocations even when preflight leaves device work unresolved.
+        workspaces[key] = workspace
         try:
             workspace.warm()
-        except Exception:
+        except Exception as exc:
+            workspace._preflight_error(exc)
             logger.warning(
                 "[SR] candidate workspace preflight declined; using original draft assembly",
                 exc_info=True,

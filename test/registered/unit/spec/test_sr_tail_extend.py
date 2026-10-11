@@ -79,6 +79,9 @@ def load_functions(path, names, namespace, *, strip_imports=False, class_name=No
     )
     namespace.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
     namespace.setdefault("SRTransferUnresolved", SRTransferUnresolved)
+    namespace.setdefault(
+        "TailExtendRecoveryRequired", tail.TailExtendRecoveryRequired
+    )
     exec(compile(module, str(path), "exec"), namespace)
     return {name: namespace[name] for name in names}
 
@@ -288,9 +291,9 @@ class TestTailAttention(unittest.TestCase):
                 self.assertEqual(batch.batch_size, 2)
                 self.assertEqual(atb.call_count + fia.call_count, 1)
                 if env_value == "1":
-                    self.assertEqual(
-                        fia.call_args.kwargs["actual_seq_lengths_kv"], [4, 5, 6]
-                    )
+                    lens = fia.call_args.kwargs["actual_seq_lengths_kv"]
+                    self.assertIs(lens, md.context_lens_cpu)
+                    self.assertEqual(lens.tolist(), [4, 5, 6])
                     self.assertEqual(
                         fia.call_args.args[1].data_ptr(), pool.keys[0].data_ptr()
                     )
@@ -667,6 +670,14 @@ class TestTailTransaction(unittest.TestCase):
         self.assertTrue(torch.equal(sel_p, original_p.index_select(0, index)))
         self.assertTrue(torch.equal(sel_ix, original_ix.index_select(0, index)))
         self.assertEqual(sel_v.tolist(), [plans[i].last_token for i in order])
+        self.assertNotEqual(sel_p.data_ptr(), packed_p.data_ptr())
+        self.assertNotEqual(sel_ix.data_ptr(), packed_ix.data_ptr())
+        self.assertNotEqual(sel_v.data_ptr(), txn._root_tokens.data_ptr())
+        held = sel_p._sr_seed_row_indexes[0]
+        self.assertIs(sel_ix._sr_seed_row_indexes[0], held)
+        self.assertIs(sel_v._sr_seed_row_indexes[0], held)
+        self.assertEqual(held.tolist(), order)
+        self.assertFalse(hasattr(same_p, "_sr_seed_row_indexes"))
         legacy = NS(
             sr_tree_seed=(
                 torch.tensor([[9.0, 8.0, 7.0]]),
@@ -784,9 +795,17 @@ class TestTailTransaction(unittest.TestCase):
     def test_scheduler_one_forward_then_reuse_and_failure(self):
         # Execute the production batch construction and scheduler transaction;
         # only runtime dependencies and the model execution are substituted.
+        import numpy as np
+
         from sglang.srt.speculative.standalone_remote.sr_align import (
             apply_tree_seed_topk,
         )
+
+        _owned_from_ints = load_functions(
+            SCHEDULER,
+            ["_owned_from_ints"],
+            {"torch": torch, "np": np},
+        )["_owned_from_ints"]
 
         def init_batch(**kwargs):
             return NS(**kwargs, device="cpu", get_model_worker_batch=lambda: built[0])
@@ -805,6 +824,7 @@ class TestTailTransaction(unittest.TestCase):
                 ),
                 apply_tree_seed_topk=apply_tree_seed_topk,
                 _restore_committed_penalties=tail._restore_committed_penalties,
+                _owned_from_ints=_owned_from_ints,
             ),
             strip_imports=True,
         )["make_tail_extend_batch"]
@@ -897,6 +917,7 @@ class TestTailGraphBuckets(unittest.TestCase):
             "trim_capture_batch_sizes",
             "select_tail_graph_bucket",
             "real_seed_rows",
+            "select_tail_seed_logits",
             "default_tail_graph_buckets",
             "tail_graph_attn_caps",
             "tail_graph_kv_tokens",
@@ -1282,6 +1303,15 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(helpers["real_seed_rows"]([1]), [0])
         with self.assertRaises(ValueError):
             helpers["real_seed_rows"]([2, 0])
+        plan_cls = helpers["TailGraphPlan"]
+        select = helpers["select_tail_seed_logits"]
+        # bs_cap == raw_tokens > raw_bs. Rows are still one last token per
+        # request; token indexes [1, 3] would pick a later request and a dummy.
+        logits = torch.arange(8, dtype=torch.float32).view(4, 2)
+        plan = plan_cls((4, 8, None), 2, 4, 4, [2, 2], [2, 2], 4)
+        chosen = select(logits, plan)
+        torch.testing.assert_close(chosen, logits[:2])
+        self.assertFalse(torch.equal(chosen, logits[[1, 3]]))
 
     def test_dummy_queries_use_slot_zero_and_cannot_see_real_prefix(self):
         tables = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
@@ -1396,7 +1426,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         calls = []
 
-        def helper(update_fn, replay_fn, overlap=False):
+        def helper(update_fn, replay_fn, overlap=False, update_worker=None):
             calls.append({"overlap": overlap, "replay_fn": replay_fn})
             update_fn()
             replay_fn()
@@ -1493,9 +1523,18 @@ class TestTailGraphBuckets(unittest.TestCase):
         devices = []
         state = {"current": lambda: 5}
         previous_npu = getattr(torch, "npu", None)
+        class _Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
         torch.npu = NS(
             current_device=lambda: state["current"](),
             set_device=lambda index: devices.append(index),
+            current_stream=lambda device=None: object(),
+            stream=lambda _stream: _Stream(),
         )
 
         def _restore_npu():
@@ -1608,23 +1647,22 @@ class TestTailGraphBuckets(unittest.TestCase):
             MethodType(fns["_replay_graph"], runner)(graph, [3, 4], bucket=(1, 2))
             self.assertEqual(devices, [])
             self.assertEqual(id(stored), stored_id)
-            self.assertEqual(
-                list(stored),
-                [3, 4],
-            )
+            values = stored.tolist() if torch.is_tensor(stored) else list(stored)
+            self.assertEqual(values, [3, 4])
 
         devices.clear()
         payload = fns["make_tail_graph_cpu_update_payload"](2, use_fia=False)
         stored = payload[0]["context_lens"]
         order = []
-        started = threading.Event()
-        release = threading.Event()
 
         def set_device(index):
             order.append(("set", index))
             devices.append(index)
 
         torch.npu.set_device = set_device
+
+        started = threading.Event()
+        release = threading.Event()
 
         def update(cpu_update_input=None):
             order.append("update")
@@ -1634,7 +1672,7 @@ class TestTailGraphBuckets(unittest.TestCase):
 
         def replay():
             self.assertTrue(started.wait(2))
-            self.assertEqual(order[:2], [("set", 5), "update"])
+            order.append("replay")
             release.set()
 
         graph = NS(update=update, replay=replay)
@@ -1646,26 +1684,35 @@ class TestTailGraphBuckets(unittest.TestCase):
             _npu_sr_tail_update_overlap_requested=True,
             _logged_sr_tail_overlap_submit=False,
         )
-        before = {thread.ident for thread in threading.enumerate()}
+        from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+            close_runner_update_worker,
+        )
+
+        self.addCleanup(lambda: close_runner_update_worker(runner))
         MethodType(fns["_replay_graph"], runner)(graph, [9, 8], bucket=(1, 2))
         self.assertEqual(list(stored), [9, 8])
-        self.assertEqual(devices, [5])
-        self.assertTrue({thread.ident for thread in threading.enumerate()} <= before)
+        self.assertIn(5, devices)
+        self.assertLess(order.index("replay"), len(order))
+        self.assertIn("update", order)
+        self.assertIn("replay", order)
+        self.assertTrue(
+            any("effective=True" in line and "overlap=True" in line for line in logs)
+        )
+        worker = runner._sr_graph_update_worker
+        self.assertIsNotNone(worker)
+        self.assertTrue(worker._thread.is_alive())
 
-        class BoomThread(threading.Thread):
-            def start(self):
-                raise RuntimeError("start failed")
+        def fail_update(cpu_update_input=None):
+            order.append("update-again")
+            raise RuntimeError("update failed")
 
         graph = NS(
-            update=lambda cpu_update_input=None: order.append("update-again"),
+            update=fail_update,
             replay=lambda: order.append("replay-again"),
         )
-        with patch.object(threading, "Thread", BoomThread):
-            with self.assertRaises(RuntimeError) as ctx:
-                MethodType(fns["_replay_graph"], runner)(graph, [1, 1], bucket=(1, 2))
-        self.assertEqual(str(ctx.exception), "start failed")
-        self.assertNotIn("update-again", order)
-        self.assertNotIn("replay-again", order)
+        with self.assertRaises(helper_ns["NpuGraphReplaySubmittedError"]):
+            MethodType(fns["_replay_graph"], runner)(graph, [1, 1], bucket=(1, 2))
+        self.assertIn("update-again", order)
         class Event:
             def __init__(self):
                 self.syncs = 0
@@ -2328,7 +2375,9 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         payload_fn = helpers["tail_graph_cpu_update_payload"]
         fia = payload_fn([3, 4, 1], use_fia=True)
-        self.assertEqual(fia, [{"actual_seq_lengths_kv": [3, 4, 1]}])
+        self.assertEqual(list(fia[0]), ["actual_seq_lengths_kv"])
+        self.assertEqual(str(fia[0]["actual_seq_lengths_kv"].device), "cpu")
+        self.assertEqual(fia[0]["actual_seq_lengths_kv"].tolist(), [3, 4, 1])
         atb = payload_fn([3, 4, 1], use_fia=False)
         self.assertEqual(list(atb[0]), ["context_lens"])
         self.assertEqual(str(atb[0]["context_lens"].device), "cpu")
@@ -2346,12 +2395,12 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIs(captured[0]["context_lens"], lens)
         self.assertEqual(lens.tolist(), [9, 8, 7, 1, 1, 1])
         fia_payload = helpers["make_tail_graph_cpu_update_payload"](3, use_fia=True)
-        fia_list = fia_payload[0]["actual_seq_lengths_kv"]
+        fia_lens = fia_payload[0]["actual_seq_lengths_kv"]
         helpers["fill_tail_graph_cpu_update_payload"](
             fia_payload, [9, 8, 1], use_fia=True
         )
-        self.assertIs(fia_payload[0]["actual_seq_lengths_kv"], fia_list)
-        self.assertEqual(fia_list, [9, 8, 1])
+        self.assertIs(fia_payload[0]["actual_seq_lengths_kv"], fia_lens)
+        self.assertEqual(fia_lens.tolist(), [9, 8, 1])
 
     def test_skip_bucket_log_includes_exception_type(self):
         src = (
@@ -2556,6 +2605,32 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(metrics.paths["ordinary_extend"], 1)
         self.assertEqual(metrics.paths["tail_extend_graph"], 0)
         self.assertEqual(reqs[0].kv_committed_len, 5)
+
+    def test_tail_update_payload_is_captured_context_lens(self):
+        fns = load_functions(
+            ROOT
+            / "python/sglang/srt/hardware_backend/npu/graph_runner/sr_tail_extend_npu_graph_runner.py",
+            [
+                "tail_update_attr_name",
+                "tail_graph_cpu_update_payload_from_captured",
+                "fill_tail_graph_cpu_update_payload",
+            ],
+            {"torch": torch},
+        )
+        captured = torch.ones((4,), dtype=torch.int32)
+        payload = fns["tail_graph_cpu_update_payload_from_captured"](
+            captured, use_fia=True
+        )
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], captured)
+        fns["fill_tail_graph_cpu_update_payload"](
+            payload, [4, 5, 6, 7], use_fia=True
+        )
+        self.assertEqual(captured.tolist(), [4, 5, 6, 7])
+        fns["fill_tail_graph_cpu_update_payload"](
+            payload, [1, 2, 3, 8], use_fia=True
+        )
+        self.assertEqual(captured.tolist(), [1, 2, 3, 8])
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], captured)
 
 
 class TestSeedOnlyForward(unittest.TestCase):
@@ -3218,6 +3293,71 @@ class TestTreeIngestLifecycle(unittest.TestCase):
         self.assertEqual(store.counts["tree_kv_commit_hit"], 0)
         scheduler.tp_worker.forward_batch_generation.assert_called()
         self.assertEqual(scheduler.tp_worker.forward_batch_generation.call_count, 2)
+
+    def test_execute_without_degrade_leaves_request_active(self):
+        reqs = [request(3, (7, 8), 0)]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        scheduler.model_config = NS(vocab_size=32)
+        scheduler.spec_algorithm = "STANDALONE_REMOTE"
+        scheduler.tp_size = 1
+        self._bind(scheduler)
+        scheduler.token_to_kv_pool_allocator.free = lambda slots: None
+        scheduler._sr_replay_grammars = Mock()
+        scheduler._sr_pause_req = Mock()
+        scheduler._sr_mark_degraded = Mock()
+        scheduler._sr_make_tail_extend_batch = lambda ps: NS(
+            is_sr_tail_extend=True,
+            device="cpu",
+            get_model_worker_batch=lambda: NS(),
+        )
+        scheduler.tp_worker = NS(
+            model_runner=NS(model_is_mrope=False, attn_backend=NS()),
+            forward_batch_generation=Mock(side_effect=RuntimeError("tail failed")),
+        )
+        with patch.object(tail.SRTailExtendTransaction, "copy_reused_tree_kv"):
+            committed = scheduler._sr_execute_tree_tails(
+                plans, degrade_on_failure=False
+            )
+        self.assertFalse(committed)
+        scheduler._sr_mark_degraded.assert_not_called()
+
+    def test_chain_short_tail_uses_per_token_decode(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            plan_committed_ingest,
+        )
+
+        fn = load_functions(
+            SCHEDULER,
+            ["_sr_ingest_committed_chain_batch"],
+            dict(
+                clear_fill_credential=lambda req: None,
+                plan_committed_ingest=plan_committed_ingest,
+            ),
+            class_name="StandaloneRemoteDraftSchedulerMixin",
+        )["_sr_ingest_committed_chain_batch"]
+        req = NS(
+            rid="r",
+            origin_input_ids=[1, 2],
+            output_ids=[9],
+            kv_committed_len=2,
+            draft_generation_start_len=0,
+        )
+        decoded = []
+        executed = []
+        scheduler = NS(
+            _sr_max_ingest_decode_steps=lambda: 8,
+            _sr_kv_len=lambda r: int(r.kv_committed_len),
+            _sr_reprefill_committed=lambda reqs: executed.append(("reprefill", reqs)),
+            _sr_execute_tree_tails=lambda *args, **kwargs: executed.append("extend"),
+            _sr_ingest_chain_decode_steps=decoded.append,
+            model_config=NS(vocab_size=32),
+            tp_worker=NS(model_runner=NS(model_is_mrope=False)),
+        )
+        MethodType(fn, scheduler)([req])
+        self.assertEqual(executed, [])
+        self.assertEqual(len(decoded), 1)
+        self.assertIs(decoded[0][0][0], req)
+        self.assertEqual(decoded[0][0][2], [9])
 
     def test_graph_bucket_miss_is_one_eager_forward(self):
         reqs = [request(3, (7, 8), 0), request(5, (9,), 1)]
@@ -4495,6 +4635,92 @@ class TestIncrementalTailFill(unittest.TestCase):
         self.assertEqual(int(lengths[1]), tail._penalty_output_len(plans[1]))
         self.assertEqual(int(lengths[0]), 3)
         self.assertEqual(int(lengths[1]), 2)
+
+
+class TestRecordedSeedPacking(unittest.TestCase):
+    @staticmethod
+    def seeds(offset=0):
+        probs = torch.arange(12, dtype=torch.float32).reshape(4, 3) + offset
+        tokens = torch.arange(12, dtype=torch.int64).reshape(4, 3) + 100 + offset
+        root = torch.arange(4, dtype=torch.int64) + 200 + offset
+        reqs = [
+            NS(
+                sr_tree_seed=(probs, tokens, None, root[i : i + 1]),
+                sr_tree_seed_row=i,
+                sr_tree_seed_root=root,
+            )
+            for i in range(4)
+        ]
+        return reqs, probs, tokens, root
+
+    def test_identity_does_not_create_index_or_fallback_views(self):
+        reqs, p, ix, root = self.seeds()
+        with patch.object(
+            tail.torch, "tensor", side_effect=AssertionError("index upload")
+        ), patch.object(
+            tail, "_matrix_seed_rows", side_effect=AssertionError("fallback")
+        ):
+            got = tail.stack_recorded_seeds(reqs)
+        self.assertIs(got[0], p)
+        self.assertIs(got[1], ix)
+        self.assertIs(got[3], root)
+
+    def test_filter_permutation_and_duplicate_rows_upload_one_index(self):
+        for order in ([2], [3, 1], [2, 0, 3, 1], [2, 2, 0]):
+            with self.subTest(order=order):
+                reqs, p, ix, root = self.seeds()
+                with patch.object(tail.torch, "tensor", wraps=torch.tensor) as upload:
+                    got = tail.stack_recorded_seeds([reqs[i] for i in order])
+                self.assertEqual(upload.call_count, 1)
+                for actual, source in zip((got[0], got[1], got[3]), (p, ix, root)):
+                    torch.testing.assert_close(actual, source[order])
+
+    def test_mixed_root_sources_keep_probability_and_token_order(self):
+        reqs, p, ix, root = self.seeds()
+        reqs[1].sr_tree_seed_root = None
+        reqs[1].sr_tree_seed = (p, ix, None, torch.tensor(999))
+        reqs[2].sr_tree_seed_root = root.clone() + 1000
+        order = [2, 1, 0, 2]
+        with patch.object(tail.torch, "tensor", wraps=torch.tensor) as upload:
+            got = tail.stack_recorded_seeds([reqs[i] for i in order])
+        self.assertEqual(upload.call_count, 1)
+        torch.testing.assert_close(got[0], p[order])
+        torch.testing.assert_close(got[1], ix[order])
+        self.assertEqual(got[3].tolist(), [1202, 999, 200, 1202])
+
+    def test_mixed_batches_use_lazy_concatenation(self):
+        first, p1, ix1, _ = self.seeds()
+        second, p2, ix2, _ = self.seeds(1000)
+        with patch.object(
+            tail.torch, "tensor", side_effect=AssertionError("index upload")
+        ):
+            got = tail.stack_recorded_seeds([first[3], second[0], first[1]])
+        torch.testing.assert_close(got[0], torch.stack((p1[3], p2[0], p1[1])))
+        torch.testing.assert_close(got[1], torch.stack((ix1[3], ix2[0], ix1[1])))
+        self.assertEqual(got[3].tolist(), [203, 1200, 201])
+
+    def test_next_commit_does_not_overwrite_previous_seed_batch(self):
+        reqs = [request(prefix=3, output=(7, 20 + i), slot=i) for i in range(4)]
+        scheduler, plans = transaction_fixture(reqs, 128)
+        txn = tail.SRTailExtendTransaction(scheduler, plans)
+        txn.stage_root_tokens("cpu")
+        p = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        ix = torch.arange(12, dtype=torch.int64).reshape(4, 3)
+        txn.commit(NS(tree_seed_topk_p=p, tree_seed_topk_index=ix))
+        old = tail.stack_recorded_seeds(reqs)
+        selected = tail.stack_recorded_seeds([reqs[2], reqs[0]])
+        expected = [x.clone() if x is not None else None for x in old]
+        p.add_(1000)
+        ix.add_(1000)
+        # Another transaction can commit the same graph-owned result buffers.
+        other = [request(prefix=3, output=(7, 10 + i), slot=i) for i in range(4)]
+        scheduler2, plans2 = transaction_fixture(other, 128)
+        txn2 = tail.SRTailExtendTransaction(scheduler2, plans2)
+        txn2.stage_root_tokens("cpu")
+        txn2.commit(NS(tree_seed_topk_p=p, tree_seed_topk_index=ix))
+        for field in (0, 1, 3):
+            torch.testing.assert_close(old[field], expected[field])
+            torch.testing.assert_close(selected[field], expected[field][[2, 0]])
 
 
 if __name__ == "__main__":

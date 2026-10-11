@@ -29,25 +29,31 @@ def _tail_graph_uses_fia(runner) -> bool:
     return bool(getattr(backend, "use_fia", False))
 
 
+def tail_update_attr_name(use_fia: bool) -> str:
+    return "actual_seq_lengths_kv" if use_fia else "context_lens"
+
+
+def tail_graph_cpu_update_payload_from_captured(context_lens_cpu, *, use_fia: bool):
+    """Update payload is the tensor the tail op captured. Do not allocate another."""
+    if not torch.is_tensor(context_lens_cpu):
+        raise ValueError("tail graph update requires the captured context_lens_cpu")
+    return [{tail_update_attr_name(use_fia): context_lens_cpu}]
+
+
 def make_tail_graph_cpu_update_payload(token_cap: int, *, use_fia: bool):
-    """Captured ATB/FIA payload. Replay mutates it in place."""
+    """Standalone length buffer for tests and replay before capture metadata exists.
+
+    Production capture uses ``tail_graph_cpu_update_payload_from_captured``.
+    The key is inlined so this function can be loaded without its helper.
+    """
     token_cap = int(token_cap)
-    if use_fia:
-        return [{"actual_seq_lengths_kv": [1] * token_cap}]
-    return [{"context_lens": torch.ones((token_cap,), dtype=torch.int32, device="cpu")}]
+    key = "actual_seq_lengths_kv" if use_fia else "context_lens"
+    return [{key: torch.ones((token_cap,), dtype=torch.int32, device="cpu")}]
 
 
 def fill_tail_graph_cpu_update_payload(payload, seq_lens_kv, *, use_fia: bool):
     """Write replay lengths into a captured payload without replacing storage."""
-    if use_fia:
-        dest = payload[0]["actual_seq_lengths_kv"]
-        if torch.is_tensor(seq_lens_kv):
-            values = [int(v) for v in seq_lens_kv.detach().tolist()]
-        else:
-            values = [int(v) for v in seq_lens_kv]
-        dest[:] = values
-        return payload
-    dest = payload[0]["context_lens"]
+    dest = payload[0]["actual_seq_lengths_kv" if use_fia else "context_lens"]
     dest.fill_(1)
     if torch.is_tensor(seq_lens_kv):
         src = seq_lens_kv.detach()
@@ -67,7 +73,7 @@ def fill_tail_graph_cpu_update_payload(payload, seq_lens_kv, *, use_fia: bool):
 
 
 def tail_graph_cpu_update_payload(seq_lens_kv, *, use_fia: bool):
-    """FIA updates actual_seq_lengths_kv lists; ATB/MHA updates context_lens tensors."""
+    """FIA and ATB both update a CPU int32 length tensor before replay."""
     if torch.is_tensor(seq_lens_kv):
         n = int(seq_lens_kv.numel())
     else:
@@ -155,8 +161,17 @@ class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
         super()._capture_bucket(bucket)
         if bucket not in self.graphs:
             return
-        self.update_payloads[bucket] = make_tail_graph_cpu_update_payload(
-            bucket[1], use_fia=_tail_graph_uses_fia(self.model_runner)
+        use_fia = _tail_graph_uses_fia(self.model_runner)
+        captured = getattr(self, "attn_metadata", {}).get(bucket)
+        cpu = None if captured is None else getattr(captured, "context_lens_cpu", None)
+        if not torch.is_tensor(cpu):
+            logger.warning(
+                "NPU SR tail graph bucket=%s has no captured context_lens_cpu",
+                bucket,
+            )
+            return
+        self.update_payloads[bucket] = tail_graph_cpu_update_payload_from_captured(
+            cpu, use_fia=use_fia
         )
 
     def _replay_graph(self, graph, seq_lens_kv, bucket=None):
@@ -219,9 +234,14 @@ class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
                     device_id,
                     overlap,
                 )
-            from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
+            from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+                runner_update_worker,
+            )
+
             run_npu_graph_update_and_replay(
-                update, replay, overlap=overlap,
+                update,
+                replay,
+                overlap=overlap,
                 update_worker=runner_update_worker(self, overlap),
             )
 

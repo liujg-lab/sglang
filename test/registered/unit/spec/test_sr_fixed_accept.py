@@ -41,6 +41,17 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept_kernels i
     gather_commit_slots,
     pack_accept,
 )
+
+
+def _gather(cache, src_index, tgt_index, page_index, page_size):
+    device = cache.device
+    outs = tuple(
+        torch.empty(int(index.numel()), dtype=torch.int64, device=device)
+        for index in (src_index, tgt_index, page_index)
+    )
+    return gather_commit_slots(
+        cache, src_index, tgt_index, page_index, page_size, *outs
+    )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 try:
@@ -595,7 +606,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             return original(dim, index)
 
         cache.index_select = _select
-        _, _, pages = gather_commit_slots(
+        _, _, pages = _gather(
             cache,
             torch.tensor([0, 1, 2]),
             torch.tensor([0, 1, 2]),
@@ -605,7 +616,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(pages.numel(), 0)
         self.assertEqual(pages.device, cache.device)
         with self.assertRaises(RuntimeError):
-            gather_commit_slots(
+            _gather(
                 cache,
                 torch.tensor([0, 1, 2], dtype=torch.int32),
                 torch.tensor([0, 1, 2]),
@@ -927,7 +938,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         for dtype in (torch.int32, torch.int64):
             cache = torch.arange(20, dtype=dtype) + 128
             index = torch.tensor([3, 0, 3, 8])
-            src, dst, pages = gather_commit_slots(
+            src, dst, pages = _gather(
                 cache, index, index.flip(0), torch.tensor([0, 19]), 7
             )
             snapshot = [t.clone() for t in (src, dst, pages)]
@@ -949,27 +960,27 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             self.assertEqual(src.tolist(), [131, 128, 131, 136])
             self.assertEqual(pages.tolist(), [18, 21])
             cache.fill_(777)
-            newer = gather_commit_slots(cache, index, index, index[:0], 7)
+            newer = _gather(cache, index, index, index[:0], 7)
             newer[0].fill_(0)
             for actual, expected in zip((src, dst, pages), snapshot):
                 self.assertTrue(torch.equal(actual, expected))
 
     def test_commit_empty_and_invalid_metadata(self):
         empty = torch.empty(0, dtype=torch.int64)
-        outputs = gather_commit_slots(empty, empty, empty, empty, 128)
+        outputs = _gather(empty, empty, empty, empty, 128)
         self.assertTrue(all(t.numel() == 0 for t in outputs))
         for page in (0, -1):
             with self.assertRaises(RuntimeError):
-                gather_commit_slots(empty, empty, empty, empty, page)
+                _gather(empty, empty, empty, empty, page)
         with self.assertRaises(RuntimeError):
-            gather_commit_slots(torch.arange(4), torch.tensor([0]), empty, empty, 4)
+            _gather(torch.arange(4), torch.tensor([0]), empty, empty, 4)
 
     def test_commit_release_single_page_storage_regression(self):
         for dtype in (torch.int32, torch.int64):
             for n, f in ((0, 0), (0, 3), (1, 0), (1, 1), (6, 1), (6, 3), (513, 3)):
                 cache = (torch.arange(2048, dtype=dtype) // 2 * 128)[::2]
                 index = torch.arange(n)
-                src, dst, pages = gather_commit_slots(
+                src, dst, pages = _gather(
                     cache,
                     index,
                     index,
@@ -1008,7 +1019,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             free_pages=torch.tensor([11]),
             release_pages=torch.tensor([13]),
         )
-        pages = gather_commit_slots(
+        pages = _gather(
             torch.arange(15) + 248,
             torch.arange(6),
             torch.arange(6),

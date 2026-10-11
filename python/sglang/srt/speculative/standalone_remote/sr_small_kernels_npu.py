@@ -1,4 +1,4 @@
-"""Integer-only SR preparation kernels. Imported only on the NPU path."""
+"""Integer-only SR preparation kernels for the accelerator path."""
 
 import triton
 import triton.language as tl

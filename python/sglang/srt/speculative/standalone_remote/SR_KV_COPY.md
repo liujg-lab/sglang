@@ -382,7 +382,7 @@ has been certified by the local CPU results.
 
 ## CUDA Draft tree remap
 
-`prepare_kv_move()` selects `cuda_contiguous_experiment` only when `domain` is
+`prepare_kv_move()` selects `cuda_contiguous` only when `domain` is
 `tree_eager` or `tree_graph` and the pool is separate contiguous CUDA MHA/GQA
 K/V with no `index_k_buffer`. Tail extend, Target fixed-accept, paged, MLA and
 non-contiguous layouts stay on `torch_out` (NPU paged stays `npu_paged6`).
@@ -390,9 +390,9 @@ non-contiguous layouts stay on `torch_out` (NPU paged stays `npu_paged6`).
 CUDA candidate selection still returns its compiled results. Do not restore `cuda_layered`
 or cdc8a5e6e as a bundle.
 
-`sr_kv_copy_cuda_experiment.CudaKVExperiment` accepts separate ordinary MHA/GQA K/V lists with contiguous
+`sr_kv_copy_cuda.CudaContiguousWorkspace` accepts separate ordinary MHA/GQA K/V lists with contiguous
 feature rows, groups by dtype/width/stride, and launches bitwise gather/scatter
-from `sr_kv_copy_kernels_cuda_experiment`. Width and stride are compile-time
+from `sr_kv_copy_kernels_cuda`. Width and stride are compile-time
 geometry; physical slots and parents remain runtime tensors. The feature
 address is `slot * STRIDE + c`, with no runtime head/dimension division.
 All groups and slot chunks gather before any scatter. Identity tasks skip
@@ -404,7 +404,7 @@ Allocate on the intended stream before capture, use `capture_scope()` during
 capture and `workspace.replay(graph)` for correctness tests. Scratch and pointer
 tables are fixed for the workspace lifetime, including eager tests. Growth
 requires a new owner; retain the old owner with all old graphs/consumers. This
-deliberate experimental restriction avoids replacing pointers without completed
+capacity rule avoids replacing pointers without completed
 consumer evidence. Submitted failures poison the pool and park the workspace
 on it; never retry or destroy its holds until completion can be established.
 Pointer-table host staging is retained for the workspace lifetime.
@@ -415,10 +415,10 @@ Use the existing Python/unittest entrypoints, with `PYTHONPATH=python`:
 
 ```bash
 python test/registered/unit/spec/test_sr_kv_copy.py
-python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_explicit_overlap_and_raw_bits
-python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_graph_live_mapping_mask_and_storage
-python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_graph_benchmark_three_alternating_groups
-python test/manual/test_sr_kv_copy_device.py TestCudaKVExperiment.test_eager_benchmark_three_alternating_groups
+python test/manual/test_sr_kv_copy_device.py TestCudaContiguousWorkspace.test_explicit_overlap_and_raw_bits
+python test/manual/test_sr_kv_copy_device.py TestCudaContiguousWorkspace.test_graph_live_mapping_mask_and_storage
+python test/manual/test_sr_kv_copy_device.py TestCudaContiguousWorkspace.test_graph_benchmark_three_alternating_groups
+python test/manual/test_sr_kv_copy_device.py TestCudaContiguousWorkspace.test_eager_benchmark_three_alternating_groups
 ```
 
 The CPU suite checks the actual kernel AST's indexing/masks against complete

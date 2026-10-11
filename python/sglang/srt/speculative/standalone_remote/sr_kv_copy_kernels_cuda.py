@@ -1,4 +1,4 @@
-"""Private CUDA experiment: static contiguous rows, bitwise two-stage copy."""
+"""Contiguous CUDA rows: static geometry, bitwise two-stage copy."""
 
 import triton
 import triton.language as tl

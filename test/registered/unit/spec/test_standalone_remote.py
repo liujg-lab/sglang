@@ -317,7 +317,7 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
             from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
         except ImportError as e:
             self.skipTest(str(e))
-        batch = ScheduleBatch()
+        batch = ScheduleBatch.__new__(ScheduleBatch)
         batch.return_hidden_states = False
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.LAST)
@@ -355,7 +355,7 @@ class TestSRTreeSeedHiddenCapture(CustomTestCase):
             ),
             CaptureHiddenMode.FULL,
         )
-        batch = ScheduleBatch()
+        batch = ScheduleBatch.__new__(ScheduleBatch)
         batch.return_hidden_states = True
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
         self.assertEqual(batch.resolve_capture_hidden_mode(), CaptureHiddenMode.FULL)
@@ -552,6 +552,7 @@ class TestSRTpBroadcast(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.standalone_remote.verifier."
             "sr_target_scheduler_mixin.make_transport_from_server_args",
+            return_value=MagicMock(spec=SRTargetClient),
         ):
             rank0 = _make(0)
             rank0._init_sr_target()
@@ -1139,6 +1140,7 @@ class TestMMPayloadMultipart(CustomTestCase):
         frames = _pack_request(batch, {"r1": payload})
         restored, mm = _unpack_request(frames)
         self.assertEqual(restored.reqs[0].rid, "r1")
+        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
         self.assertIn("r1", mm)
         self.assertEqual(mm["r1"].padded_input_ids, [7, 7])
 
@@ -1308,6 +1310,20 @@ class TestIdempotentWindowCache(CustomTestCase):
 
 
 class TestDraftSessionWipe(CustomTestCase):
+    def _bind_finish_kv(self, mixin):
+        def release_all_kv_for_finished_req(req):
+            req.req_pool_idx = None
+
+        mixin.sr_kv = SimpleNamespace(
+            release_all_kv_for_finished_req=release_all_kv_for_finished_req
+        )
+        alloc = mixin.token_to_kv_pool_allocator
+        alloc.page_size = 1
+        alloc.generation = 0
+        # MagicMock attributes are truthy, which would look like pending frees
+        # and make a resolved wipe synchronize a missing device.
+        alloc._sr_tree_lease_pending_frees = ()
+
     def test_wipe_clears_scheduler_caches_and_waiting_queue(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
@@ -1323,15 +1339,16 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.waiting_queue = []
         mixin.running_batch = MagicMock()
         mixin.running_batch.is_empty.return_value = True
-        mixin.cur_batch = object()
-        mixin.last_batch = object()
-        mixin.chunked_req = object()
+        mixin.cur_batch = SimpleNamespace(is_sr_draft=True)
+        mixin.last_batch = SimpleNamespace(is_sr_draft=True)
+        mixin.chunked_req = SimpleNamespace(is_sr_draft=True)
         mixin.tree_cache = MagicMock()
         mixin.req_to_token_pool = MagicMock()
         mixin.token_to_kv_pool_allocator = MagicMock()
         mixin.grammar_manager = MagicMock()
         mixin.sr_server = MagicMock()
         mixin.sr_server.last_rpc_seq = 9
+        self._bind_finish_kv(mixin)
 
         leftover = MagicMock()
         leftover.req_pool_idx = 3
@@ -1436,8 +1453,10 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.waiting_queue = []
         a = MagicMock()
         a.rid = "a"
+        a.draft_is_paused = False
         b = MagicMock()
         b.rid = "b"
+        b.draft_is_paused = False
         other = MagicMock()
         other.rid = "other"
         other.draft_is_paused = False
@@ -1480,6 +1499,7 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.grammar_manager = MagicMock()
         mixin.sr_server = MagicMock()
         mixin.sr_server.last_rpc_seq = 9
+        self._bind_finish_kv(mixin)
 
         sr_req = MagicMock()
         sr_req.req_pool_idx = 3
@@ -1700,10 +1720,15 @@ class TestTargetPrefillOverlap(CustomTestCase):
             order.append("send")
 
         def recv_batch(session_id, rpc_seq):
+            from sglang.srt.speculative.standalone_remote.sr_commit import (
+                SR_PROTOCOL_VERSION,
+            )
+
             order.append("recv")
             return SRBatchReply(
                 session_id=session_id,
                 rpc_seq=rpc_seq,
+                protocol_version=SR_PROTOCOL_VERSION,
                 reqs=[
                     SRDraftReply(
                         rid=req.rid,
@@ -1792,6 +1817,8 @@ class TestTargetPrefillOverlap(CustomTestCase):
     def test_reset_clears_inflight(self):
         mixin_cls = self._import_mixin()
         mixin = mixin_cls()
+        mixin.tp_size = 1
+        mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 3
         mixin.sr_pending = {"r1": SRPendingEntry(0, 3)}
@@ -1807,6 +1834,8 @@ class TestTargetPrefillOverlap(CustomTestCase):
     def test_reset_resets_breaker(self):
         mixin_cls = self._import_mixin()
         mixin = mixin_cls()
+        mixin.tp_size = 1
+        mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 1
         mixin.sr_pending = {}
@@ -3205,7 +3234,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
             self.skipTest(str(e))
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
-        mixin.sr_state.session_id = "old"
+        mixin.sr_state.session_id = "1"
         mixin.sr_server = MagicMock()
         mixin.sr_server.last_rpc_seq = 9
         wipes = []
@@ -3215,7 +3244,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
             ([1], None, None)
         ] * len(pairs)
         batch = SRBatchRequest(
-            session_id="new",
+            session_id="2",
             rpc_seq=1,
             action=SRAction.STEP,
             reqs=[
@@ -3410,6 +3439,565 @@ class TestSRRpcBreaker(CustomTestCase):
         mixin._sr_observe_rpc(inflight, got_packet=False)
         mixin._sr_observe_rpc(inflight, got_packet=False)
         self.assertFalse(mixin.sr_breaker.should_send())
+
+    def test_open_breaker_cools_down_while_batch_is_oversized(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.sr_breaker = SRRpcBreaker(failure_threshold=1, cooldown_steps=2)
+        mixin.sr_breaker.record_failure()
+        mixin.server_args = SimpleNamespace(standalone_remote_max_batch_size=1)
+        mixin.running_batch = SimpleNamespace(batch_size=lambda: 8)
+        batch = SimpleNamespace(batch_size=lambda: 8)
+        self.assertTrue(mixin._sr_skip_draft_rpc(batch))
+        self.assertEqual(mixin.sr_breaker.state, SRRpcBreaker.OPEN)
+        self.assertEqual(mixin.sr_breaker.steps_in_open, 1)
+        self.assertTrue(mixin._sr_skip_draft_rpc(batch))
+        self.assertEqual(mixin.sr_breaker.state, SRRpcBreaker.HALF_OPEN)
+
+
+class TestSRAbortAndRollback(CustomTestCase):
+    def test_noop_rollback_refuses_so_caller_reprefills(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import (
+                SRKVRollbacker,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        rb = SRKVRollbacker(MagicMock(), MagicMock(), MagicMock(), page_size=1)
+        req = SimpleNamespace(
+            req_pool_idx=3,
+            kv_committed_len=8,
+            kv_allocated_len=8,
+            prefix_indices=None,
+        )
+        self.assertFalse(rb.local_rollback(req, fork_point=8, current_kv_len=8))
+        self.assertEqual(req.kv_committed_len, 8)
+        self.assertEqual(req.kv_allocated_len, 8)
+        self.assertFalse(rb.token_to_kv_pool_allocator.free.called)
+
+    def test_rollback_shorter_than_fork_refuses(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import (
+                SRKVRollbacker,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        rb = SRKVRollbacker(MagicMock(), MagicMock(), MagicMock(), page_size=1)
+        req = SimpleNamespace(
+            req_pool_idx=3,
+            kv_committed_len=4,
+            kv_allocated_len=4,
+            prefix_indices=None,
+        )
+        self.assertFalse(rb.local_rollback(req, fork_point=8, current_kv_len=4))
+        self.assertEqual(req.kv_committed_len, 4)
+        self.assertEqual(req.kv_allocated_len, 4)
+        self.assertFalse(rb.token_to_kv_pool_allocator.free.called)
+
+    def test_abort_batches_only_reqs_already_sent(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        sent = []
+        mixin._sr_send = lambda action, reqs, include_full_context: sent.append(
+            (action, [r.rid for r in reqs], include_full_context)
+        )
+        sent_req = SimpleNamespace(rid="a", sr_sent_commit_version=1)
+        fresh = SimpleNamespace(rid="b")
+        mixin.notify_sr_draft_aborted([sent_req, fresh, sent_req])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], SRAction.ABORT)
+        self.assertEqual(sent[0][1], ["a"])
+        self.assertFalse(sent[0][2])
+
+    def _abort_scheduler(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+            SchedulerStandaloneRemoteTargetMixin,
+        )
+
+        sent = []
+        order = []
+        host = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
+            is_remote_spec_draft=False,
+            waiting_queue=[],
+            enable_hicache_storage=False,
+            send_to_tokenizer=SimpleNamespace(send_output=lambda *a, **k: None),
+            disaggregation_mode=None,
+            grammar_manager=SimpleNamespace(abort_requests=lambda req: None),
+            running_batch=SimpleNamespace(reqs=[]),
+            cur_batch=None,
+            chunked_req=None,
+        )
+
+        def send(action, reqs, include_full_context):
+            sent.append((action, [r.rid for r in reqs], include_full_context))
+            order.append("send")
+
+        def reset():
+            order.append("reset")
+
+        host._sr_send = send
+        host.notify_sr_draft_aborted = (
+            SchedulerStandaloneRemoteTargetMixin.notify_sr_draft_aborted.__get__(host)
+        )
+        host._sr_draft_was_sent = (
+            SchedulerStandaloneRemoteTargetMixin._sr_draft_was_sent.__get__(host)
+        )
+        host.notify_sr_draft_aborted_active = (
+            SchedulerStandaloneRemoteTargetMixin.notify_sr_draft_aborted_active.__get__(
+                host
+            )
+        )
+        host._sr_active_reqs = (
+            SchedulerStandaloneRemoteTargetMixin._sr_active_reqs.__get__(host)
+        )
+        host.reset_standalone_remote_target_state = reset
+        return Scheduler, host, sent, order
+
+    def test_waiting_abort_notifies_sent_rid_without_session_reset(self):
+        try:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            scheduler, host, sent, order = self._abort_scheduler()
+        except ImportError as e:
+            self.skipTest(str(e))
+        sent_req = SimpleNamespace(
+            rid="sent",
+            sr_sent_commit_version=1,
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        fresh = SimpleNamespace(
+            rid="fresh",
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        host.waiting_queue = [sent_req, fresh]
+        scheduler.abort_request(host, AbortReq(rid="sent"))
+        self.assertEqual(sent, [(SRAction.ABORT, ["sent"], False)])
+        self.assertNotIn("reset", order)
+        self.assertEqual(host.waiting_queue, [fresh])
+
+    def test_abort_all_sends_abort_before_session_reset(self):
+        try:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            scheduler, host, sent, order = self._abort_scheduler()
+        except ImportError as e:
+            self.skipTest(str(e))
+        waiting = SimpleNamespace(
+            rid="wait",
+            sr_sent_commit_version=1,
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        running = SimpleNamespace(
+            rid="run",
+            sr_sent_commit_version=2,
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        host.waiting_queue = [waiting]
+        host.running_batch.reqs = [running]
+        scheduler.abort_request(host, AbortReq(rid="", abort_all=True))
+        self.assertEqual(order[:2], ["send", "reset"])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], SRAction.ABORT)
+        self.assertEqual(sent[0][1], ["wait", "run"])
+        self.assertIsNotNone(running.to_finish)
+
+    def test_running_abort_notifies_before_the_extra_decode(self):
+        try:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            scheduler, host, sent, order = self._abort_scheduler()
+        except ImportError as e:
+            self.skipTest(str(e))
+        running = SimpleNamespace(
+            rid="run",
+            sr_sent_commit_version=2,
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        host.running_batch.reqs = [running]
+        scheduler.abort_request(host, AbortReq(rid="run"))
+        self.assertEqual(sent, [(SRAction.ABORT, ["run"], False)])
+        self.assertNotIn("reset", order)
+        self.assertIsNotNone(running.to_finish)
+
+    def test_chunked_req_is_active_and_aborted(self):
+        try:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            scheduler, host, sent, order = self._abort_scheduler()
+        except ImportError as e:
+            self.skipTest(str(e))
+        chunked = SimpleNamespace(
+            rid="chunk",
+            sr_sent_commit_version=3,
+            mamba_pool_idx=None,
+            finished=lambda: False,
+        )
+        host.chunked_req = chunked
+        self.assertIn(chunked, host._sr_active_reqs())
+        scheduler.abort_request(host, AbortReq(rid="chunk"))
+        self.assertEqual(sent, [(SRAction.ABORT, ["chunk"], False)])
+        self.assertNotIn("reset", order)
+        self.assertIsNotNone(chunked.to_finish)
+
+    def test_finish_notifications_flush_as_one_send(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        sent = []
+        mixin._sr_send = lambda action, reqs, include_full_context: sent.append(
+            (action, [r.rid for r in reqs])
+        )
+        mixin.notify_sr_draft_finished(SimpleNamespace(rid="a"))
+        mixin.notify_sr_draft_finished(SimpleNamespace(rid="b"))
+        self.assertEqual(sent, [])
+        mixin._sr_flush_finish_notifications()
+        self.assertEqual(sent, [(SRAction.FINISH, ["a", "b"])])
+        mixin._sr_flush_finish_notifications()
+        self.assertEqual(len(sent), 1)
+
+    def test_poisoned_finish_returns_host_row_without_device_free(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        req = SimpleNamespace(
+            rid="r1",
+            req_pool_idx=4,
+            kv_allocated_len=12,
+            kv_committed_len=10,
+            finished=lambda: True,
+            to_abort=False,
+            finished_reason=None,
+            multimodal_inputs=None,
+        )
+        row_pool = SimpleNamespace(freed=[])
+
+        def free_row(request):
+            row_pool.freed.append(request.req_pool_idx)
+            request.req_pool_idx = None
+
+        row_pool.free = free_row
+        mixin.req_to_token_pool = row_pool
+        mixin.sr_state = SimpleNamespace(delete=lambda rid: SimpleNamespace(req_object=req))
+        mixin._sr_remove_req = lambda req: None
+        mixin._sr_release_tree_lease = lambda rid: None
+        mixin.sr_kv = MagicMock()
+        mixin._sr_device_poisoned = True
+        mixin._sr_finish_rid("r1")
+        mixin.sr_kv.release_all_kv_for_finished_req.assert_not_called()
+        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(row_pool.freed, [4])
+        self.assertEqual(mixin._sr_abandoned_kv_slots, 12)
+        self.assertEqual(mixin._sr_round_metrics.counts["abandoned_kv_slots"], 12)
+
+    def test_poisoned_wipe_returns_host_rows_without_allocator_reset(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+            from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+                quarantine,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        req = SimpleNamespace(
+            rid="r1",
+            req_pool_idx=4,
+            kv_allocated_len=6,
+            kv_committed_len=6,
+        )
+        row_pool = SimpleNamespace(freed=[])
+
+        def free_row(request):
+            row_pool.freed.append(request.req_pool_idx)
+            request.req_pool_idx = None
+
+        row_pool.free = free_row
+        mixin.req_to_token_pool = row_pool
+        mixin._sr_device_poisoned = True
+        mixin._sr_abandoned_kv_slots = 6
+        mixin._sr_abandoned_kv_total = 6
+        mixin.token_to_kv_pool_allocator = MagicMock()
+        mixin.device = "cpu"
+        mixin.waiting_queue = [req]
+        mixin.running_batch = SimpleNamespace(reqs=[req], batch_is_full=True)
+        quarantine(mixin).retain((req, None, None))
+        mixin._sr_reset_scheduler_caches()
+        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(row_pool.freed, [4])
+        self.assertEqual(mixin.waiting_queue, [])
+        self.assertEqual(mixin.running_batch.reqs, [])
+        self.assertFalse(mixin.running_batch.batch_is_full)
+        mixin.token_to_kv_pool_allocator.clear.assert_not_called()
+        mixin.token_to_kv_pool_allocator.free.assert_not_called()
+        self.assertEqual(mixin._sr_abandoned_kv_slots, 0)
+        self.assertEqual(mixin._sr_abandoned_kv_reclaimed, 6)
+        self.assertEqual(
+            mixin._sr_round_metrics.counts["abandoned_kv_slots_reclaimed"], 6
+        )
+        self.assertTrue(mixin._sr_kv_quarantine.records)
+
+    def test_poisoned_session_wipe_stays_in_the_event_loop(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        req = SimpleNamespace(
+            rid="r1",
+            req_pool_idx=9,
+            kv_allocated_len=3,
+            kv_committed_len=3,
+        )
+        row_pool = SimpleNamespace(freed=[])
+
+        def free_row(request):
+            row_pool.freed.append(request.req_pool_idx)
+            request.req_pool_idx = None
+
+        row_pool.free = free_row
+        mixin.req_to_token_pool = row_pool
+        mixin._sr_device_poisoned = True
+        mixin.device = "cpu"
+        mixin.sr_state = SimpleNamespace(
+            clear=lambda: [SimpleNamespace(req_id="r1", req_object=req)]
+        )
+        mixin.sr_waiting = []
+        mixin.draft_paused_reqs = []
+        mixin._sr_is_http_req = lambda r: False
+        mixin._sr_http_alive = lambda: False
+        mixin.sr_server = None
+        mixin.sr_tree_leases = SimpleNamespace(pop=lambda rid: None)
+        mixin.token_to_kv_pool_allocator = MagicMock()
+        mixin._sr_wipe_all()
+        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(row_pool.freed, [9])
+        mixin.token_to_kv_pool_allocator.clear.assert_not_called()
+        mixin.token_to_kv_pool_allocator.free.assert_not_called()
+        self.assertEqual(mixin._sr_abandoned_kv_reclaimed, 3)
+
+    def test_abandoned_lease_reclaims_after_device_confirms(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        from collections import Counter
+
+        slots = MagicMock()
+        slots.numel.return_value = 4
+        lease = {"page_slots": [slots], "completion_event": SimpleNamespace(query=lambda: True)}
+        metrics = SimpleNamespace(counts=Counter())
+        drafter = SimpleNamespace(
+            scheduler=SimpleNamespace(_sr_round_metrics=metrics),
+            token_to_kv_pool_allocator=MagicMock(),
+            draft_attn_backend=SimpleNamespace(
+                _sr_draft_paged_view=SimpleNamespace(
+                    workspace=SimpleNamespace(lease_hold=lease)
+                )
+            ),
+            _try_confirm_tree_completion=lambda: True,
+        )
+        SRTreeDrafter._remember_abandoned_lease(drafter, lease)
+        self.assertEqual(metrics.counts["tree_lease_abandoned_pages"], 4)
+        freed = SRTreeDrafter._reclaim_abandoned_leases(drafter)
+        self.assertEqual(freed, 1)
+        drafter.token_to_kv_pool_allocator.free.assert_called_once_with(slots)
+        self.assertEqual(drafter._sr_kv_quarantine.records, [])
+        self.assertIsNone(drafter.draft_attn_backend._sr_draft_paged_view.workspace.lease_hold)
+
+    def _bind_lease_reclaim(self, drafter):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+            SRTreeDrafter,
+        )
+
+        for name in (
+            "_remember_abandoned_lease",
+            "_reclaim_abandoned_leases",
+            "_restore_abandoned_mapping",
+            "_partition_abandoned_pages",
+            "_abandon_tree_lease",
+        ):
+            setattr(drafter, name, getattr(SRTreeDrafter, name).__get__(drafter, SRTreeDrafter))
+
+    def _mapped_lease(self, slot, req_pool_idx, event, rows=1):
+        if torch is None:
+            self.skipTest("torch is required")
+        mapping = torch.zeros((rows, 4), dtype=torch.int64)
+        mapping[req_pool_idx, 0] = slot
+        req = SimpleNamespace(req_pool_idx=req_pool_idx, kv_committed_len=0)
+        lease = {
+            "page_slots": [torch.tensor([slot], dtype=torch.int64)],
+            "mapping_snaps": [torch.zeros(1, dtype=torch.int64)],
+            "spec_snaps": [torch.tensor([slot], dtype=torch.int64)],
+            "reqs": [req],
+            "starts": [0],
+            "completion_event": event,
+        }
+        return mapping, req, lease
+
+    def test_abandoned_lease_with_snaps_frees_after_event(self):
+        try:
+            from collections import Counter
+
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        event = SimpleNamespace(query=lambda: True)
+        mapping, _req, lease = self._mapped_lease(5, 0, event)
+        alloc = MagicMock()
+        alloc.generation = 0
+        alloc.page_size = 1
+        drafter = SimpleNamespace(
+            scheduler=SimpleNamespace(_sr_round_metrics=SimpleNamespace(counts=Counter())),
+            token_to_kv_pool_allocator=alloc,
+            req_to_token_pool=SimpleNamespace(req_to_token=mapping),
+            draft_attn_backend=SimpleNamespace(
+                _sr_draft_paged_view=SimpleNamespace(
+                    workspace=SimpleNamespace(lease_hold=lease)
+                )
+            ),
+        )
+        self._bind_lease_reclaim(drafter)
+        drafter._remember_abandoned_lease(lease)
+        self.assertIsNone(drafter.draft_attn_backend._sr_draft_paged_view.workspace.lease_hold)
+        freed = drafter._reclaim_abandoned_leases()
+        self.assertEqual(freed, 1)
+        alloc.free.assert_called_once()
+        self.assertEqual(int(alloc.free.call_args.args[0].view(-1)[0]), 5)
+        self.assertEqual(drafter._sr_kv_quarantine.records, [])
+        self.assertEqual(int(mapping[0, 0]), 0)
+
+    def test_abandoned_lease_with_snaps_waits_for_event(self):
+        try:
+            from collections import Counter
+
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        event = SimpleNamespace(query=lambda: False)
+        mapping, _req, lease = self._mapped_lease(5, 0, event)
+        alloc = MagicMock()
+        alloc.generation = 0
+        alloc.page_size = 1
+        drafter = SimpleNamespace(
+            scheduler=SimpleNamespace(_sr_round_metrics=SimpleNamespace(counts=Counter())),
+            token_to_kv_pool_allocator=alloc,
+            req_to_token_pool=SimpleNamespace(req_to_token=mapping),
+            draft_attn_backend=SimpleNamespace(
+                _sr_draft_paged_view=SimpleNamespace(
+                    workspace=SimpleNamespace(lease_hold=lease)
+                )
+            ),
+        )
+        self._bind_lease_reclaim(drafter)
+        drafter._remember_abandoned_lease(lease)
+        freed = drafter._reclaim_abandoned_leases()
+        self.assertEqual(freed, 0)
+        alloc.free.assert_not_called()
+        self.assertEqual(len(drafter._sr_kv_quarantine.records), 1)
+        self.assertEqual(int(mapping[0, 0]), 5)
+
+    def test_second_abandon_reclaims_completed_first_lease(self):
+        try:
+            from collections import Counter
+
+            from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+                SRTreeDrafter,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        if torch is None:
+            self.skipTest("torch is required")
+        first_event = SimpleNamespace(done=False)
+        first_event.query = lambda: first_event.done
+        second_event = SimpleNamespace(query=lambda: False)
+        mapping = torch.zeros((2, 4), dtype=torch.int64)
+        mapping[0, 0] = 5
+        mapping[1, 0] = 6
+        first = {
+            "page_slots": [torch.tensor([5], dtype=torch.int64)],
+            "mapping_snaps": [torch.zeros(1, dtype=torch.int64)],
+            "spec_snaps": [torch.tensor([5], dtype=torch.int64)],
+            "reqs": [SimpleNamespace(req_pool_idx=0, kv_committed_len=0)],
+            "starts": [0],
+            "completion_event": first_event,
+        }
+        second = {
+            "page_slots": [torch.tensor([6], dtype=torch.int64)],
+            "mapping_snaps": [torch.zeros(1, dtype=torch.int64)],
+            "spec_snaps": [torch.tensor([6], dtype=torch.int64)],
+            "reqs": [SimpleNamespace(req_pool_idx=1, kv_committed_len=0)],
+            "starts": [0],
+            "completion_event": second_event,
+        }
+        alloc = MagicMock()
+        alloc.generation = 0
+        alloc.page_size = 1
+        drafter = SimpleNamespace(
+            scheduler=SimpleNamespace(_sr_round_metrics=SimpleNamespace(counts=Counter())),
+            token_to_kv_pool_allocator=alloc,
+            req_to_token_pool=SimpleNamespace(req_to_token=mapping),
+            draft_attn_backend=SimpleNamespace(
+                _sr_draft_paged_view=SimpleNamespace(
+                    workspace=SimpleNamespace(lease_hold=None)
+                )
+            ),
+        )
+        self._bind_lease_reclaim(drafter)
+        drafter._abandon_tree_lease(first)
+        alloc.free.assert_not_called()
+        first_event.done = True
+        drafter._abandon_tree_lease(second)
+        self.assertEqual(alloc.free.call_count, 1)
+        self.assertEqual(int(alloc.free.call_args.args[0].view(-1)[0]), 5)
+        self.assertEqual(len(drafter._sr_kv_quarantine.records), 1)
+        self.assertIs(drafter._sr_kv_quarantine.records[0].owner, second)
+        self.assertIsNone(drafter.draft_attn_backend._sr_draft_paged_view.workspace.lease_hold)
 
 
 class TestSRDraftBusyReject(CustomTestCase):
@@ -5300,6 +5888,26 @@ class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
         self.assertEqual(scheduler.spec_num_draft_tokens, 30)
         self.assertEqual(scheduler.num_generated_tokens, 5)
         self.assertEqual(stats, [{"decode_tokens": 5, "dp_cooperation_info": None}])
+
+
+class TestOwnedFromInts(CustomTestCase):
+    def test_three_calls_do_not_overwrite_earlier_results(self):
+        if torch is None:
+            self.skipTest("torch is required")
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                _owned_from_ints,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        owner = SimpleNamespace()
+        first = _owned_from_ints(owner, "seq", [1, 2, 3], torch.int64, "cpu")
+        second = _owned_from_ints(owner, "seq", [4, 5, 6], torch.int64, "cpu")
+        third = _owned_from_ints(owner, "seq", [7, 8, 9], torch.int64, "cpu")
+        self.assertEqual(first.tolist(), [1, 2, 3])
+        self.assertEqual(second.tolist(), [4, 5, 6])
+        self.assertEqual(third.tolist(), [7, 8, 9])
 
 
 if __name__ == "__main__":

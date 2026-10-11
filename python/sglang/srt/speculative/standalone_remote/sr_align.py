@@ -192,9 +192,15 @@ def snapshot_reprefill_fill_ids(
 
 
 def rollback_free_range(
-    fork_point: int, allocated_len: int, max_len: int
+    fork_point: int,
+    allocated_len: int,
+    max_len: int,
 ) -> Tuple[int, int]:
-    """Slots to free on rollback. Do not page-floor ``allocated_len``."""
+    """Slots to free on rollback. Do not page-floor ``allocated_len``.
+
+    The start is ``fork_point`` itself. A mid-page fork is refused by the
+    rollbacker before this range is used.
+    """
     start = min(max(0, int(fork_point)), int(max_len))
     end = min(max(0, int(allocated_len)), int(max_len))
     return start, end

@@ -34,6 +34,7 @@ from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
 logger = logging.getLogger(__name__)
 
 TAIL_DUMMY_SLOT = 0
+
 TailGraphBucket = Tuple[int, int, Optional[int]]
 
 
@@ -339,6 +340,20 @@ def real_seed_rows(extend_lens: Sequence[int]) -> List[int]:
     return rows
 
 
+def select_tail_seed_logits(logits: torch.Tensor, plan: "TailGraphPlan") -> torch.Tensor:
+    """Return one logit row per real request.
+
+    The replay buffer is ``(bs_cap, vocab)``. The logits processor already
+    stored each request's last extend token in that request's row, including
+    when ``bs_cap`` equals the token count. ``real_seed_rows`` indexes a flat
+    token stream and must not be applied here.
+    """
+    raw_bs = int(plan.raw_bs)
+    if logits is None or raw_bs <= 0:
+        return logits
+    return logits[:raw_bs]
+
+
 @dataclass
 class TailGraphPlan:
     bucket: TailGraphBucket
@@ -480,13 +495,15 @@ class SRTailExtendGraphRunner:
         bs_cap, token_cap, _ = plan.bucket
         raw_bs = plan.raw_bs
         raw_tokens = plan.raw_tokens
-        buffers.input_ids.zero_()
-        buffers.positions.zero_()
-        buffers.out_cache_loc.fill_(TAIL_DUMMY_SLOT)
-        buffers.seq_lens.fill_(1)
-        buffers.seq_lens_cpu.fill_(1)
-        buffers.extend_seq_lens.zero_()
-        buffers.req_pool_indices.fill_(int(self.dummy_req_idx or 0))
+        # Live columns are overwritten below. Only the padding tail is cleared.
+        if raw_tokens < token_cap:
+            buffers.input_ids[raw_tokens:].zero_()
+            buffers.positions[raw_tokens:].zero_()
+            buffers.out_cache_loc[raw_tokens:].fill_(TAIL_DUMMY_SLOT)
+        if raw_bs < bs_cap:
+            buffers.seq_lens[raw_bs:].fill_(1)
+            buffers.seq_lens_cpu[raw_bs:].fill_(1)
+            buffers.req_pool_indices[raw_bs:].fill_(int(self.dummy_req_idx or 0))
         buffers.input_ids[:raw_tokens].copy_(forward_batch.input_ids[:raw_tokens])
         buffers.positions[:raw_tokens].copy_(forward_batch.positions[:raw_tokens])
         buffers.out_cache_loc[:raw_tokens].copy_(
@@ -501,12 +518,27 @@ class SRTailExtendGraphRunner:
                 forward_batch.seq_lens_cpu[:raw_bs].to(device="cpu")
             )
         cpu_extend = buffers.extend_lens_cpu
-        cpu_extend.zero_()
+        bs = int(cpu_extend.numel())
+        full = [0] * bs
         for i, length in enumerate(plan.extend_lens):
-            cpu_extend[i] = int(length)
+            if i >= bs:
+                break
+            full[i] = int(length)
+        if plan.dummy_tokens and raw_bs < bs:
+            full[raw_bs] = int(plan.dummy_tokens)
+        try:
+            cpu_extend.numpy()[:] = full
+        except Exception:
+            for i, length in enumerate(full):
+                cpu_extend[i] = int(length)
+        waste = max(token_cap - raw_tokens, 0)
+        self.padding_waste_tokens = int(getattr(self, "padding_waste_tokens", 0) or 0) + waste
+        scheduler = getattr(getattr(self, "drafter", None), "scheduler", None)
+        metrics = getattr(scheduler, "_sr_round_metrics", None) if scheduler else None
+        if metrics is not None and waste:
+            metrics.counts["tail_graph_padding_tokens"] += waste
         if plan.dummy_tokens:
             buffers.req_pool_indices[raw_bs:bs_cap] = int(self.dummy_req_idx or 0)
-            cpu_extend[raw_bs] = int(plan.dummy_tokens)
             buffers.seq_lens[raw_bs] = plan.dummy_tokens
             buffers.seq_lens_cpu[raw_bs] = plan.dummy_tokens
         buffers.extend_seq_lens.copy_(cpu_extend)
@@ -526,7 +558,7 @@ class SRTailExtendGraphRunner:
         raw_bs = plan.raw_bs
         hidden = output.hidden_states
         return type(output)(
-            next_token_logits=output.next_token_logits[:raw_bs],
+            next_token_logits=select_tail_seed_logits(output.next_token_logits, plan),
             hidden_states=None if hidden is None else hidden[:raw_bs],
         )
 
@@ -544,14 +576,18 @@ class SRTailExtendGraphRunner:
         return ForwardBatch.init_new(worker_batch, self.model_runner)
 
     def _fill_mrope_positions(self, buffers, forward_batch, raw_tokens: int) -> None:
-        buffers.mrope_positions.zero_()
+        width = int(buffers.mrope_positions.shape[1])
         src = getattr(forward_batch, "mrope_positions", None)
         if src is not None and src.ndim == 2 and src.shape[0] == 3:
-            n = min(raw_tokens, int(src.shape[1]), int(buffers.mrope_positions.shape[1]))
-            buffers.mrope_positions[:, :n].copy_(src[:, :n])
-            return
-        n = min(raw_tokens, int(buffers.positions.shape[0]))
+            n = min(raw_tokens, int(src.shape[1]), width)
+        else:
+            n = min(raw_tokens, int(buffers.positions.shape[0]), width)
+        if n < width:
+            buffers.mrope_positions[:, n:].zero_()
         if n <= 0:
+            return
+        if src is not None and src.ndim == 2 and src.shape[0] == 3:
+            buffers.mrope_positions[:, :n].copy_(src[:, :n])
             return
         buffers.mrope_positions[:, :n].copy_(
             buffers.positions[:n].unsqueeze(0).expand(3, -1)
@@ -568,11 +604,15 @@ class SRTailExtendGraphRunner:
         seq_max = max(plan.max_seq, 1)
         page_size = int(getattr(backend, "page_size", self.page_size) or 1)
         tables = buffers.req_page_tables
-        tables.zero_()
+        raw_bs = plan.raw_bs
+        if raw_bs < int(tables.shape[0]):
+            tables[raw_bs:].zero_()
         src = forward_batch.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[: plan.raw_bs], :seq_max:page_size
+            forward_batch.req_pool_indices[:raw_bs], :seq_max:page_size
         ]
         n_pages = min(int(src.shape[1]), int(tables.shape[1]))
+        if raw_bs > 0 and n_pages < int(tables.shape[1]):
+            tables[:raw_bs, n_pages:].zero_()
         if n_pages > 0:
             gathered = src[:, :n_pages]
             if page_size != 1:

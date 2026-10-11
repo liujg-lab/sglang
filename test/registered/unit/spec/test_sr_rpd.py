@@ -895,7 +895,7 @@ class SRRPDTest(unittest.TestCase):
             self.assertTrue(plan.consumed)
             self.assertEqual(reqs[0].output_ids, list(range(10, 16)))
             self.assertTrue(torch.equal(alloc.free_pages, before))
-            self.assertEqual(state.metrics.counts["fixed_accept_slot_output_alloc"], 3)
+            self.assertEqual(state.metrics.counts["fixed_accept_slot_output_alloc"], 1)
             self.assertEqual(
                 state.metrics.counts["fixed_accept_slot_output_bytes"], 104
             )

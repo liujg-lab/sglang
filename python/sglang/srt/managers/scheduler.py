@@ -3043,6 +3043,9 @@ class Scheduler(
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
+        flush_sr = getattr(self, "_sr_flush_finish_notifications", None)
+        if callable(flush_sr):
+            flush_sr()
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
@@ -3420,11 +3423,15 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
         draft_http_abort = bool(getattr(self, "is_remote_spec_draft", False))
-        if (
-            recv_req.abort_all
-            and self.spec_algorithm.is_standalone_remote()
-            and not draft_http_abort
-        ):
+        sr_target_abort = (
+            self.spec_algorithm.is_standalone_remote() and not draft_http_abort
+        )
+        if recv_req.abort_all and sr_target_abort:
+            # Tell Draft to drop KV before the session id rotates. A later
+            # PREFILL on the new session also wipes, but only if one arrives.
+            notify_active = getattr(self, "notify_sr_draft_aborted_active", None)
+            if callable(notify_active):
+                notify_active()
             self.reset_standalone_remote_target_state()
         # Delete requests in the waiting queue
         to_del = []
@@ -3435,11 +3442,13 @@ class Scheduler(
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
+        aborted_waiting = []
         for i in reversed(to_del):
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            aborted_waiting.append(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -3462,6 +3471,11 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if sr_target_abort and not recv_req.abort_all and aborted_waiting:
+            notify_one = getattr(self, "notify_sr_draft_aborted", None)
+            if callable(notify_one):
+                notify_one(aborted_waiting)
 
         if draft_http_abort:
             paused = getattr(self, "draft_paused_reqs", None) or []
@@ -3536,10 +3550,14 @@ class Scheduler(
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
+            reqs = list(self.running_batch.reqs)
         else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+            reqs = list(self.running_batch.reqs) + list(self.cur_batch.reqs)
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and chunked not in reqs:
+            reqs.append(chunked)
 
+        aborted_running = []
         for req in reqs:
             if draft_http_abort and getattr(req, "is_sr_draft", False) is True:
                 continue
@@ -3550,7 +3568,13 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                if sr_target_abort and not recv_req.abort_all:
+                    aborted_running.append(req)
                 req.to_finish = FINISH_ABORT()
+        if aborted_running:
+            notify_running = getattr(self, "notify_sr_draft_aborted", None)
+            if callable(notify_running):
+                notify_running(aborted_running)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

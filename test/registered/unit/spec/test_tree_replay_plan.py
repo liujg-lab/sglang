@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import pathlib
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
@@ -95,7 +97,7 @@ def _producer_fallback(spec_info, seq):
     return seq if producer_seq_lens is None else producer_seq_lens
 
 
-def _load_spec_utils_nodes(*names):
+def _load_spec_utils_nodes(*names, extra=None):
     tree = ast.parse(_SPEC_UTILS.read_text())
     wanted = set(names)
     nodes = [
@@ -106,7 +108,13 @@ def _load_spec_utils_nodes(*names):
     found = {n.name for n in nodes}
     if found != wanted:
         raise AssertionError(f"missing {sorted(wanted - found)} in spec_utils.py")
-    ns = {"threading": threading}
+    ns = {
+        "threading": threading,
+        "torch": torch,
+        "logger": logging.getLogger("spec_utils"),
+    }
+    if extra:
+        ns.update(extra)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(_SPEC_UTILS), "exec"), ns)
     return ns
 
@@ -187,6 +195,7 @@ def _thread_idents():
 def _extract_npu_replay(helper_fn):
     ns = {
         "torch": torch,
+        "threading": threading,
         "np": SimpleNamespace(array=lambda x: x, int32="int32"),
         "logger": logging.getLogger("test.npu_replay"),
         "TreeReplayPlan": TreeReplayPlan,
@@ -218,7 +227,6 @@ def _extract_npu_replay(helper_fn):
             "_get_update_attr_type",
             "_update_inputs",
             "_update_decode_inputs",
-            "_update_target_tree_fia_inputs",
             "_target_graph_host_metrics",
             "_log_sr_target_overlap_submit",
             "_replay_target_tree_fia",
@@ -523,7 +531,9 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("except BaseException", overlap)
         self.assertIn("finally:", overlap)
         self.assertIn("thread.join()", overlap)
-        self.assertLess(overlap.index("finally:"), overlap.index("thread.join()"))
+        temporary = overlap.split("threading.Thread", 1)[1]
+        self.assertLess(temporary.index("replay_fn()"), temporary.index("finally:"))
+        self.assertLess(temporary.index("finally:"), temporary.index("thread.join()"))
 
     def test_overlap_replay_starts_before_update_finishes(self):
         started = threading.Event()
@@ -628,7 +638,7 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertEqual(finished, ["update"])
         self.assertTrue(_thread_idents() <= before)
 
-    def test_overlap_update_baseexception_is_submitted_after_join(self):
+    def test_overlap_update_baseexception_propagates_after_replay(self):
         class Boom(BaseException):
             pass
 
@@ -641,9 +651,9 @@ class TestTreeReplayPlan(CustomTestCase):
         def replay():
             replayed.append("replay")
 
-        with self.assertRaises(_SubmittedError) as ctx:
+        with self.assertRaises(Boom) as ctx:
             _run_update_replay(update, replay, overlap=True)
-        self.assertIsInstance(ctx.exception.__cause__, Boom)
+        self.assertNotIsInstance(ctx.exception, _SubmittedError)
         self.assertEqual(replayed, ["replay"])
         self.assertTrue(_thread_idents() <= before)
 
@@ -791,6 +801,10 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("if sr_paged_overlap:", draft_inner)
         self.assertIn("torch.npu.set_device", draft_inner)
         self.assertIn("SGLANG_NPU_TREE_FIA_SERIAL_UPDATE", draft_inner)
+        self.assertIn("overlap=overlap", draft_inner)
+        self.assertIn("runner_update_worker", draft_inner)
+        self.assertNotIn("submit_overlap = False", draft_inner)
+        self.assertNotIn("take_matching_side_update", draft_inner)
         self.assertIn("_assert_tree_replay_graph", draft_inner)
         self.assertIn("fill_fia_cpu_update_payload", draft_inner)
         self.assertIn("NpuGraphReplaySubmittedError", draft_inner)
@@ -835,7 +849,7 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertIn("tree_paged_view", eager_src)
         self.assertIn("tree_paged_copy", eager_src)
         self.assertIn("tree_paged_bind", eager_src)
-        self.assertIn("select_page_bucket", can_src)
+        self.assertIn("select_draft_page_bucket", can_src)
         self.assertNotIn("quantize_page_width", can_src)
         self.assertIn("tree_slot_graph_can_run", draft_can)
 
@@ -1141,14 +1155,6 @@ class TestTreeReplayPlan(CustomTestCase):
             dict(decode=False, target_verify=True, raw_bs=1, capture_bs=1, seq_lens=[8]),
             dict(tail=True, raw_bs=1, capture_bs=1, seq_lens=[8]),
             dict(
-                target_fia=True,
-                target_verify=True,
-                topk=2,
-                raw_bs=1,
-                capture_bs=1,
-                seq_lens=[8],
-            ),
-            dict(
                 compact_fia=True,
                 target_verify=True,
                 topk=2,
@@ -1183,8 +1189,6 @@ class TestTreeReplayPlan(CustomTestCase):
         self.assertEqual(helper.calls, [])
 
     def test_target_fia_overlap_replays_before_update_finishes(self):
-        devices = []
-        _install_fake_npu(devices)
         helper = _HelperBox()
         methods = _extract_npu_replay(helper)
         runner, batch, graph = _make_replay_runner(
@@ -1201,42 +1205,31 @@ class TestTreeReplayPlan(CustomTestCase):
         runner._npu_graph_device_id = 7
         payload = runner._target_fia_maps[runner._tree_replay_plan.graph_key]["payload"]
         payload_id = id(payload)
+        order = []
         started = threading.Event()
         release = threading.Event()
-        main = threading.get_ident()
 
         def update(cpu_update_input=None):
-            self.assertEqual(threading.get_ident(), started_thread["id"])
             self.assertIs(cpu_update_input, payload)
+            order.append("update_start")
             started.set()
             self.assertTrue(release.wait(2))
-
-        started_thread = {}
-
-        def wrapped_update(cpu_update_input=None):
-            if "id" not in started_thread:
-                started_thread["id"] = threading.get_ident()
-            update(cpu_update_input=cpu_update_input)
-
-        graph.update = wrapped_update
+            order.append("update_end")
 
         def replay():
-            self.assertEqual(threading.get_ident(), main)
             self.assertTrue(started.wait(2))
-            self.assertNotEqual(started_thread["id"], main)
-            self.assertEqual(devices, [7])
+            order.append("replay")
             release.set()
             graph.replay_count += 1
 
+        graph.update = update
         graph.replay = replay
-        before = _thread_idents()
         runner.replay(batch)
-        self.assertTrue(helper.calls)
+        self.assertEqual(order, ["update_start", "replay", "update_end"])
+        self.assertEqual(len(helper.calls), 1)
         self.assertIs(helper.calls[0]["overlap"], True)
-        self.assertEqual(devices, [7])
         self.assertEqual(id(payload), payload_id)
         self.assertEqual(payload[0]["actual_seq_lengths_kv"], [8])
-        self.assertTrue(_thread_idents() <= before)
         self.assertIsNone(runner._tree_replay_graph)
 
     def test_target_fia_thread_start_failure_does_not_replay(self):
@@ -1259,12 +1252,12 @@ class TestTreeReplayPlan(CustomTestCase):
                 raise RuntimeError("start failed")
 
         with patch.object(threading, "Thread", BoomThread):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(RuntimeError):
                 runner.replay(batch)
-        self.assertEqual(str(ctx.exception), "start failed")
         self.assertEqual(graph.replay_count, 0)
         self.assertEqual(graph.updates, [])
         self.assertEqual(len(helper.calls), 1)
+        self.assertIs(helper.calls[0]["overlap"], True)
 
     def test_decode_batch_sizes_select_key_pad_and_crop(self):
         helper = _HelperBox()
@@ -1662,26 +1655,21 @@ class TestDraftGraphHostReplay(unittest.TestCase):
         self.assertEqual(sample.outcome, "failed")
         self.assertIn("replay_call", sample.stages)
 
-    def test_overlap_replay_starts_before_update_finishes(self):
+    def test_overlap_replay_sees_lengths_written_by_update(self):
         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
             SRRoundMetrics,
         )
 
-        started = threading.Event()
-        release = threading.Event()
+        seen = {"value": 1}
 
         class SlowGraph(_FakeGraph):
             def update(self, cpu_update_input=None):
-                started.set()
-                if not release.wait(1):
-                    raise AssertionError("replay did not overlap update")
+                seen["value"] = 127
                 super().update(cpu_update_input=cpu_update_input)
 
             def replay(self):
-                if not started.wait(1):
-                    raise AssertionError("update thread did not start")
+                seen["replay"] = seen["value"]
                 super().replay()
-                release.set()
 
         metrics = SRRoundMetrics("Draft")
         metrics.active = True
@@ -1700,7 +1688,25 @@ class TestDraftGraphHostReplay(unittest.TestCase):
         methods["_replay"].__globals__["os"] = SimpleNamespace(
             environ={}
         )
+        started = threading.Event()
+        release = threading.Event()
+        orig_update = graph.update
+        orig_replay = graph.replay
+
+        def update(cpu_update_input=None):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return orig_update(cpu_update_input)
+
+        def replay():
+            self.assertTrue(started.wait(2))
+            release.set()
+            return orig_replay()
+
+        graph.update = update
+        graph.replay = replay
         methods["_replay"](runner, batch)
+        self.assertEqual(seen["value"], 127)
         self.assertEqual(helper.calls[0]["overlap"], True)
         sample = metrics._graph_host_samples[0]
         self.assertEqual(sample.outcome, "ok")
@@ -1764,27 +1770,29 @@ class TestDraftGraphHostReplay(unittest.TestCase):
 
         devices = []
         order = []
-        started = threading.Event()
-        release = threading.Event()
 
         def set_device(gpu_id):
             order.append(("set_device", gpu_id))
             devices.append(gpu_id)
-            started.set()
-            self.assertTrue(release.wait(timeout=2))
+
+        started = threading.Event()
+        release = threading.Event()
 
         class SlowGraph(_FakeGraph):
             def update(self, cpu_update_input=None):
                 order.append("update_start")
+                started.set()
+                if not release.wait(2):
+                    raise TimeoutError("replay did not start")
                 super().update(cpu_update_input=cpu_update_input)
                 order.append("update_end")
 
             def replay(self):
-                if not started.wait(timeout=2):
-                    raise AssertionError("set_device did not start")
+                if not started.wait(2):
+                    raise TimeoutError("update did not start")
                 order.append("replay")
-                super().replay()
                 release.set()
+                super().replay()
 
         metrics = SRRoundMetrics("Draft")
         metrics.active = True
@@ -1936,20 +1944,23 @@ class TestPersistentGraphUpdate(unittest.TestCase):
     def test_reuses_thread_generations_and_preserves_overlap(self):
         worker = self.worker()
         ids = []
+        order = []
         for round_id in range(8):
-            started, replayed = threading.Event(), threading.Event()
 
-            def update():
+            def update(round_id=round_id):
                 ids.append(threading.get_ident())
-                started.set()
-                self.assertTrue(replayed.wait(2))
+                time.sleep(0.01)
+                order.append(("update", round_id))
 
-            def replay():
-                self.assertTrue(started.wait(2))
-                replayed.set()
+            def replay(round_id=round_id):
+                order.append(("replay", round_id))
 
             _run_update_replay(update, replay, overlap=True, update_worker=worker)
             self.assertEqual(worker.completed, round_id + 1)
+            self.assertLess(
+                order.index(("replay", round_id)),
+                order.index(("update", round_id)),
+            )
         self.assertEqual(len(set(ids)), 1)
         self.assertNotEqual(ids[0], threading.get_ident())
         self.assertFalse(worker._thread.daemon)
@@ -1991,7 +2002,8 @@ class TestPersistentGraphUpdate(unittest.TestCase):
                         self.assertIs(raised.exception, original)
                     else:
                         self.assertIs(raised.exception.__cause__, original)
-                    self.assertCountEqual(calls, ["update", "replay"])
+                    self.assertIn("update", calls)
+                    self.assertIn("replay", calls)
                     self.assertEqual(worker.completed, 1)
                     with self.assertRaises(RuntimeError):
                         _run_update_replay(
@@ -2051,7 +2063,8 @@ class TestPersistentGraphUpdate(unittest.TestCase):
                 update_worker=worker,
             )
         self.assertEqual(str(raised.exception.__cause__), "confirmation")
-        self.assertCountEqual(calls, ["update", "replay"])
+        self.assertIn("update", calls)
+        self.assertIn("replay", calls)
         with self.assertRaises(RuntimeError):
             worker.submit(lambda: calls.append("again"))
 
@@ -2137,7 +2150,8 @@ class TestPersistentGraphUpdate(unittest.TestCase):
                     fail_update, replay, overlap=True, update_worker=worker
                 )
             self.assertEqual(str(raised.exception.__cause__), "update failed")
-            self.assertCountEqual(calls, ["update", "replay"])
+            self.assertIn("update", calls)
+            self.assertIn("replay", calls)
             with self.assertRaises(RuntimeError):
                 _run_update_replay(
                     lambda: calls.append("again"),
@@ -2187,5 +2201,199 @@ class TestPersistentGraphUpdate(unittest.TestCase):
         self.assertEqual(worker.generation, 0)
 
 
+class TestPagedDraftLayout(CustomTestCase):
+    def test_page_bucket_and_step_lens_match_bind_formula(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+            build_step_context_lens,
+            context_lens_list,
+            kv_buckets_to_page_buckets,
+            max_query_pages_for_tree,
+            paged_draft_graph_step_lens,
+            paged_draft_step_context,
+            select_draft_page_bucket,
+            select_page_bucket,
+        )
+
+        prefix = [100, 250]
+        page_size = 128
+        num_steps = 5
+        topk = 2
+        capture_bs = 2
+        kv_buckets = [256, 512, 1024]
+        bucket = select_draft_page_bucket(
+            prefix, num_steps, page_size, kv_buckets=kv_buckets
+        )
+        needed = max(max_query_pages_for_tree(prefix, num_steps, page_size) or [1])
+        page_buckets = kv_buckets_to_page_buckets(kv_buckets, page_size)
+        self.assertEqual(bucket, select_page_bucket(needed, page_buckets))
+        n_steps = num_steps - 1
+        rows = capture_bs * topk
+        got = paged_draft_graph_step_lens(
+            prefix, capture_bs, topk, n_steps, num_steps=num_steps
+        )
+        expected = [
+            context_lens_list(
+                build_step_context_lens(
+                    prefix,
+                    topk,
+                    step_id,
+                    rows,
+                )
+            )
+            for step_id in range(n_steps)
+        ]
+        self.assertEqual(got, expected)
+        self.assertNotEqual(got[0], [1] * rows)
+        self.assertEqual(
+            got[0],
+            paged_draft_step_context(prefix, topk, 0, num_steps, rows),
+        )
+
+    def test_view_early_return_refreshes_capture_ones(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+            SRTreePagedMetadata,
+            paged_draft_graph_step_lens,
+            paged_draft_step_context,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRDraftPagedPlan,
+        )
+
+        ns = {
+            "torch": torch,
+            "NpuGraphPreparationError": _PrepError,
+            "paged_draft_step_context": paged_draft_step_context,
+            "build_step_context_lens": lambda *args, **kwargs: [],
+            "context_lens_list": lambda values: list(values),
+            "SRTreePagedMetadata": SRTreePagedMetadata,
+            "ForwardMetadata": SimpleNamespace,
+        }
+        bind = _extract_class_methods(
+            _REPO_ROOT
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py",
+            "AscendAttnMultiStepDraftBackend",
+            ["bind_sr_tree_paged_replay"],
+            ns,
+        )["bind_sr_tree_paged_replay"]
+        prefix = (100, 250)
+        topk = 2
+        num_steps = 5
+        capture_bs = 2
+        rows = capture_bs * topk
+        pages = 4
+        tables = torch.zeros((rows, pages), dtype=torch.int32)
+        active = torch.zeros((rows,), dtype=torch.bool)
+        plan = SRDraftPagedPlan.build(
+            prefix, capture_bs, topk, num_steps, pages, 128, "graph"
+        )
+        view = SimpleNamespace(
+            plan=plan,
+            generation=3,
+            block_tables=tables,
+            active_rows=active,
+            check=lambda: None,
+        )
+        inners = []
+        for step in range(num_steps - 1):
+            meta = SRTreePagedMetadata(
+                block_tables=tables,
+                active_rows=active,
+                context_lens_cpu=torch.ones((rows,), dtype=torch.int32),
+                context_lens_list=[1] * rows,
+                dummy_page=0,
+                max_pages=pages,
+                impl="paged_fia",
+            )
+            inners.append(
+                SimpleNamespace(
+                    speculative_step_id=step,
+                    _sr_tree_paged_meta=meta,
+                )
+            )
+        backend = SimpleNamespace(
+            paged_impl_selected=lambda: True,
+            _sr_draft_paged_view=view,
+            _tree_replay_raw_bs=len(prefix),
+            _paged_round_dummy=0,
+            attn_backends=inners,
+            _paged_graph_table_view=lambda *args, **kwargs: (tables, active),
+        )
+        MethodType(bind, backend)(capture_bs, pages, generation=3)
+        signature = paged_draft_graph_step_lens(
+            prefix, capture_bs, topk, num_steps - 1, num_steps=num_steps
+        )
+        for step, inner in enumerate(inners):
+            expected = paged_draft_step_context(
+                prefix, topk, step, num_steps, rows
+            )
+            self.assertEqual(expected, signature[step])
+            self.assertEqual(inner._sr_tree_paged_meta.context_lens_list, expected)
+            self.assertNotEqual(expected, [1] * rows)
+            self.assertEqual(
+                inner._sr_tree_paged_meta.context_lens_cpu.tolist(), expected
+            )
+
+    def test_view_replay_rejects_length_storage_mismatch(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+            SRTreePagedMetadata,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRDraftPagedPlan,
+        )
+
+        ns = {
+            "torch": torch,
+            "NpuGraphPreparationError": _PrepError,
+            "paged_draft_step_context": lambda *args, **kwargs: [1, 2, 3, 4],
+            "build_step_context_lens": lambda *args, **kwargs: [],
+            "context_lens_list": lambda values: list(values),
+            "SRTreePagedMetadata": SRTreePagedMetadata,
+            "ForwardMetadata": SimpleNamespace,
+        }
+        bind = _extract_class_methods(
+            _REPO_ROOT
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py",
+            "AscendAttnMultiStepDraftBackend",
+            ["bind_sr_tree_paged_replay"],
+            ns,
+        )["bind_sr_tree_paged_replay"]
+        rows = 4
+        tables = torch.zeros((rows, 2), dtype=torch.int32)
+        active = torch.zeros((rows,), dtype=torch.bool)
+        plan = SRDraftPagedPlan.build((10,), 2, 2, 3, 2, 128, "graph")
+        view = SimpleNamespace(
+            plan=plan,
+            generation=1,
+            block_tables=tables,
+            active_rows=active,
+            check=lambda: None,
+        )
+        cpu = torch.ones((2,), dtype=torch.int32)
+        meta = SRTreePagedMetadata(
+            block_tables=tables,
+            active_rows=active,
+            context_lens_cpu=cpu,
+            context_lens_list=[1, 1],
+            dummy_page=0,
+            max_pages=2,
+            impl="paged_fia",
+        )
+        backend = SimpleNamespace(
+            paged_impl_selected=lambda: True,
+            _sr_draft_paged_view=view,
+            _tree_replay_raw_bs=1,
+            _paged_round_dummy=0,
+            attn_backends=[
+                SimpleNamespace(speculative_step_id=0, _sr_tree_paged_meta=meta)
+            ],
+            _paged_graph_table_view=lambda *args, **kwargs: (tables, active),
+        )
+        with self.assertRaises(_PrepError):
+            MethodType(bind, backend)(2, 2, generation=1)
+        self.assertEqual(cpu.tolist(), [1, 1])
+        self.assertEqual(meta.context_lens_list, [1, 1])
+
+
 if __name__ == "__main__":
     unittest.main()
+

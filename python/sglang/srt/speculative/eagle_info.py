@@ -91,6 +91,14 @@ def select_hidden_states_for_draft(
     return hidden_states[index]
 
 
+def _bump_seq_lens_sum(batch, accept_length_list) -> None:
+    """Add ``accept_length + 1`` per request next to an in-place CPU update."""
+    current = getattr(batch, "seq_lens_sum", None)
+    if not isinstance(current, int):
+        return
+    batch.seq_lens_sum = current + sum(int(length) + 1 for length in accept_length_list)
+
+
 def _eagle_output_from_fixed(raw, batch, topk: int):
     """Wrap a workspace-stable fixed-accept result in the V1 output types.
 
@@ -812,6 +820,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+            _bump_seq_lens_sum(batch, accept_length_list)
 
             draft_input = EagleDraftInput(
                 hidden_states=select_hidden_states_for_draft(
@@ -850,6 +859,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
                 batch.seq_lens.add_(accept_length + 1)
                 batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+                _bump_seq_lens_sum(batch, accept_length_list)
 
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
@@ -873,6 +883,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.seq_lens,
                     )
                     batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+                    _bump_seq_lens_sum(batch, accept_length_list)
                     filter_finished_cache_loc_kernel[(bs,)](
                         batch.out_cache_loc,
                         tgt_cache_loc,

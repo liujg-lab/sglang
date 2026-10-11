@@ -149,8 +149,8 @@ class DraftPacketPlan:
         chain_parents: torch.Tensor,
         chain_indices: torch.Tensor,
         token_rows: Sequence,
-        parsed_parents: Sequence[Optional[torch.Tensor]],
-        parsed_indices: Sequence[Optional[torch.Tensor]],
+        parsed_parents: Sequence,
+        parsed_indices: Sequence,
     ) -> None:
         self.bs = int(bs)
         self.token_width = int(token_width)
@@ -184,8 +184,8 @@ def plan_draft_rows(
     bs = len(token_rows)
     token_width = max(int(num_draft_tokens) - 1, 1)
     chain_parents, chain_indices = cached_chain_template(num_draft_tokens, spec_steps)
-    parsed_parents: List[Optional[torch.Tensor]] = [None] * bs
-    parsed_indices: List[Optional[torch.Tensor]] = [None] * bs
+    parsed_parents: List[Optional[Sequence[int]]] = [None] * bs
+    parsed_indices: List[Optional[Sequence[int]]] = [None] * bs
     n_tree = 0
     if int(topk) > 1:
         for i in range(bs):
@@ -194,17 +194,17 @@ def plan_draft_rows(
             if parent is None or index is None:
                 continue
             n_tree += 1
-            parsed_parents[i] = torch.as_tensor(parent, dtype=torch.int64)
-            parsed_indices[i] = torch.as_tensor(index, dtype=torch.int64)
+            parsed_parents[i] = parent
+            parsed_indices[i] = index
     chain_only = int(topk) <= 1 or n_tree == 0
     parent_w = int(chain_parents.numel())
     index_w = int(chain_indices.numel())
     if not chain_only:
         for parent, index in zip(parsed_parents, parsed_indices):
             if parent is not None:
-                parent_w = max(parent_w, int(parent.numel()))
+                parent_w = max(parent_w, len(parent))
             if index is not None:
-                index_w = max(index_w, int(index.numel()))
+                index_w = max(index_w, len(index))
     return DraftPacketPlan(
         bs,
         token_width,
@@ -270,6 +270,25 @@ def slice_decode_batch_row(
     return None
 
 
+def _assign_ints(dest: torch.Tensor, values) -> None:
+    """Write a host integer sequence into ``dest`` without a fresh tensor."""
+    if torch.is_tensor(values):
+        flat = values.detach().reshape(-1)
+        n = min(int(flat.numel()), int(dest.numel()))
+        if n:
+            dest[:n].copy_(flat[:n].to(dtype=torch.int64, device=dest.device))
+        return
+    n = min(len(values), int(dest.numel()))
+    if n <= 0:
+        return
+    chunk = dest[:n]
+    seq = values[:n]
+    try:
+        chunk.numpy()[:] = seq
+    except Exception:
+        chunk.copy_(torch.as_tensor(seq, dtype=torch.int64))
+
+
 def copy_tokens_into_row(
     dest: torch.Tensor, src, token_width: int
 ) -> None:
@@ -285,7 +304,7 @@ def copy_tokens_into_row(
         return
     n = min(len(src), token_width)
     if n:
-        dest[:n] = torch.as_tensor(src[:n], dtype=torch.int64)
+        _assign_ints(dest[:n], src[:n])
 
 
 def _export_assembled_rows(
@@ -325,6 +344,82 @@ def _copy_vector_into_row(dest_row: torch.Tensor, vector: torch.Tensor) -> None:
         dest_row[:count].copy_(vector[:count])
 
 
+def _numpy_prefix(row, values) -> None:
+    if values is None:
+        return
+    if torch.is_tensor(values):
+        flat = values.detach().reshape(-1).cpu().numpy()
+        n = min(int(flat.shape[0]), int(row.shape[0]))
+        if n:
+            row[:n] = flat[:n]
+        return
+    n = min(len(values), int(row.shape[0]))
+    if n:
+        row[:n] = values[:n]
+
+
+def _try_write_draft_numpy(
+    tokens: torch.Tensor,
+    parents: torch.Tensor,
+    indices: torch.Tensor,
+    plan: DraftPacketPlan,
+) -> bool:
+    """One numpy store per region. A failure falls back before publishing."""
+    if any(tensor.device.type != "cpu" for tensor in (tokens, parents, indices)):
+        return False
+    try:
+        return _write_draft_numpy(tokens, parents, indices, plan)
+    except Exception:
+        return False
+
+
+def _write_draft_numpy(
+    tokens: torch.Tensor,
+    parents: torch.Tensor,
+    indices: torch.Tensor,
+    plan: DraftPacketPlan,
+) -> bool:
+    import numpy as np
+
+    token_np = np.zeros((plan.bs, plan.token_width), dtype=np.int64)
+    for i in range(plan.bs):
+        src = plan.token_rows[i] if i < len(plan.token_rows) else None
+        if plan.token_width > 0:
+            _numpy_prefix(token_np[i], src)
+    if plan.chain_only:
+        parent_np = np.zeros((plan.bs, plan.parent_w), dtype=np.int64)
+        index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
+        if plan.bs and plan.parent_w:
+            _numpy_prefix(parent_np[0], plan.chain_parents)
+            parent_np[:] = parent_np[0].copy()
+        if plan.bs and plan.index_w:
+            _numpy_prefix(index_np[0], plan.chain_indices)
+            index_np[:] = index_np[0].copy()
+    else:
+        parent_np = np.full((plan.bs, plan.parent_w), -1, dtype=np.int64)
+        index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
+        for i, (parent, index) in enumerate(
+            zip(plan.parsed_parents, plan.parsed_indices)
+        ):
+            if parent is None or index is None:
+                _numpy_prefix(parent_np[i], plan.chain_parents)
+                _numpy_prefix(index_np[i], plan.chain_indices)
+                continue
+            _numpy_prefix(parent_np[i], parent)
+            _numpy_prefix(index_np[i], index)
+    written = []
+    for tensor, mat in (
+        (tokens, token_np),
+        (parents, parent_np),
+        (indices, index_np),
+    ):
+        if tensor.numel():
+            written.append((tensor.numpy(), mat))
+    for view, mat in written:
+        view[:] = mat
+    return True
+
+
 def write_draft_regions(
     tokens: torch.Tensor,
     parents: torch.Tensor,
@@ -335,9 +430,12 @@ def write_draft_regions(
 
     Tokens, parents, and indices start as ``0 / -1 / 0`` when the chain
     template does not already cover the whole row. Chain templates are only
-    read. ``torch.as_tensor`` for present rows happens in ``plan_draft_rows``.
+    read. Present rows stay host sequences; ``plan_draft_rows`` does not
+    build a tensor per row.
     """
     if plan.bs == 0:
+        return
+    if _try_write_draft_numpy(tokens, parents, indices, plan):
         return
     tokens.zero_()
     for i in range(plan.bs):
@@ -356,8 +454,8 @@ def write_draft_regions(
             _copy_vector_into_row(parents[i], plan.chain_parents)
             _copy_vector_into_row(indices[i], plan.chain_indices)
             continue
-        _copy_vector_into_row(parents[i], parent.reshape(-1))
-        _copy_vector_into_row(indices[i], index.reshape(-1))
+        _assign_ints(parents[i], parent)
+        _assign_ints(indices[i], index)
 
 
 def devices_compatible(stored: torch.device, requested: torch.device) -> bool:
@@ -518,8 +616,7 @@ class VerifyInputPacket:
         self.ensure(plan.used, device, metrics)
         fill_start = time.perf_counter()
         verified, tokens, parents, indices = packet_segment_views(self.host_packet, plan)
-        for i, value in enumerate(verified_ids):
-            verified[i] = int(value)
+        _assign_ints(verified, verified_ids)
         write_draft_regions(tokens, parents, indices, plan)
         used = plan.used
         if rpd_vocab is not None:

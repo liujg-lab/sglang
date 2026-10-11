@@ -21,6 +21,17 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept_kernels i
     gather_commit_slots,
     pack_accept,
 )
+
+
+def _gather(cache, src_index, tgt_index, page_index, page_size):
+    device = cache.device
+    outs = tuple(
+        torch.empty(int(index.numel()), dtype=torch.int64, device=device)
+        for index in (src_index, tgt_index, page_index)
+    )
+    return gather_commit_slots(
+        cache, src_index, tgt_index, page_index, page_size, *outs
+    )
 from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
     apply_free_unique_pages,
 )
@@ -49,7 +60,7 @@ def _sort_storage_probe(variant):
     if variant == "independent":
         index = torch.arange(6, device="npu", dtype=torch.int64)
         cache = torch.arange(15, device="npu", dtype=torch.int64) + 248
-        pages = gather_commit_slots(
+        pages = _gather(
             cache, index, index, torch.tensor([8], device="npu"), 128
         )[2]
     else:
@@ -150,11 +161,11 @@ class TestNPUSmallKernels(unittest.TestCase):
                 src = torch.arange(2 * n)[::2] % 1024
                 dst = src.flip(0)
                 pages = torch.arange(2 * f)[::2]
-                expected = gather_commit_slots(cache, src, dst, pages, 128)
+                expected = _gather(cache, src, dst, pages, 128)
                 with patch.object(
                     kernels, "_commit", LaunchRecorder(kernels._commit)
                 ) as launch:
-                    actual = gather_commit_slots(
+                    actual = _gather(
                         cache_device,
                         src.to("npu"),
                         dst.to("npu"),
@@ -191,7 +202,7 @@ class TestNPUSmallKernels(unittest.TestCase):
                         sorted_pages + [9001] if need_sort else [9001],
                     )
                 # A later call must not overwrite a retained earlier output.
-                gather_commit_slots(
+                _gather(
                     (cache + 7).to("npu"),
                     src.to("npu"),
                     dst.to("npu"),
@@ -300,8 +311,8 @@ class TestCUDAGenericPreparation(unittest.TestCase):
             torch.tensor([0, 1, 2]),
             torch.tensor([20]),
         )
-        expected = gather_commit_slots(*inputs, 8)
-        actual = gather_commit_slots(*(t.cuda() for t in inputs), 8)
+        expected = _gather(*inputs, 8)
+        actual = _gather(*(t.cuda() for t in inputs), 8)
         for a, e in zip(actual, expected):
             self.assertTrue(torch.equal(a.cpu(), e))
             self.assertEqual(a.storage_offset(), 0)

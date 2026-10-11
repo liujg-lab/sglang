@@ -44,10 +44,11 @@ _DEFAULT_DRAFT = {
 
 
 def _req_committed_len(req) -> int:
-    committed = int(getattr(req, "kv_committed_len", 0) or 0)
-    if committed > 0:
-        return committed
-    return max(0, len(req.origin_input_ids) + len(req.output_ids))
+    from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+        target_verify_cpu_prefix,
+    )
+
+    return target_verify_cpu_prefix(req)
 
 
 def _snapshot_seq_lens_cpu(batch: ScheduleBatch) -> Optional[torch.Tensor]:
@@ -85,25 +86,68 @@ def _sync_kv_from_cpu_lengths(
         req.kv_allocated_len = committed
 
 
+def _host_len_cache(batch, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
+    cache = getattr(batch, name, None)
+    if (
+        cache is None
+        or cache.numel() < n
+        or cache.dtype != dtype
+        or cache.device.type != "cpu"
+    ):
+        cache = torch.empty(max(n, 1), dtype=dtype, device="cpu")
+        setattr(batch, name, cache)
+    return cache
+
+
+def _write_host_values(dest: torch.Tensor, values) -> None:
+    n = len(values)
+    if n <= 0:
+        return
+    chunk = dest[:n]
+    try:
+        chunk.numpy()[:] = values
+    except Exception:
+        for i, value in enumerate(values):
+            chunk[i] = int(value)
+
+
+def _copy_committed_lens(dest: torch.Tensor, host: torch.Tensor, n: int) -> torch.Tensor:
+    view = host[:n]
+    if dest.shape == view.shape and dest.dtype == view.dtype:
+        dest.copy_(view)
+        return dest
+    # Same device and dtype make ``to`` return the cache view. A later
+    # in-place update of seq_lens would then overwrite the staging buffer.
+    moved = view.to(device=dest.device, dtype=dest.dtype)
+    if moved.data_ptr() == view.data_ptr():
+        return moved.clone()
+    return moved
+
+
 def _align_seq_lens_to_committed(batch: ScheduleBatch) -> None:
-    device = batch.seq_lens.device
     committed = [_req_committed_len(req) for req in batch.reqs]
-    new_lens = torch.tensor(committed, dtype=batch.seq_lens.dtype, device=device)
-    if batch.seq_lens.shape == new_lens.shape:
-        batch.seq_lens.copy_(new_lens)
+    n = len(committed)
+    host = _host_len_cache(batch, "_sr_committed_len_host", n, batch.seq_lens.dtype)
+    _write_host_values(host, committed)
+    try:
+        filled = host[:n].numpy() if n else committed
+    except Exception:
+        filled = committed
+    batch.seq_lens = _copy_committed_lens(batch.seq_lens, host, n)
+    cpu_host = _host_len_cache(batch, "_sr_committed_len_cpu", n, torch.int64)
+    if cpu_host.data_ptr() != host.data_ptr():
+        _write_host_values(cpu_host, filled)
+    if batch.seq_lens_cpu is not None:
+        batch.seq_lens_cpu = _copy_committed_lens(batch.seq_lens_cpu, cpu_host, n)
     else:
-        batch.seq_lens = new_lens
-    cpu_lens = torch.tensor(committed, dtype=torch.int64)
-    if batch.seq_lens_cpu is not None and batch.seq_lens_cpu.shape == cpu_lens.shape:
-        batch.seq_lens_cpu.copy_(cpu_lens)
-    else:
-        batch.seq_lens_cpu = cpu_lens
+        batch.seq_lens_cpu = cpu_host[:n].clone()
     if batch.orig_seq_lens is not None:
-        orig = torch.tensor(committed, dtype=batch.orig_seq_lens.dtype, device=device)
-        if batch.orig_seq_lens.shape == orig.shape:
-            batch.orig_seq_lens.copy_(orig)
-        else:
-            batch.orig_seq_lens = orig
+        orig_host = _host_len_cache(
+            batch, "_sr_committed_len_orig", n, batch.orig_seq_lens.dtype
+        )
+        if orig_host.data_ptr() != host.data_ptr():
+            _write_host_values(orig_host, filled)
+        batch.orig_seq_lens = _copy_committed_lens(batch.orig_seq_lens, orig_host, n)
     batch.seq_lens_sum = int(sum(committed))
 
 
@@ -281,11 +325,17 @@ class StandaloneRemoteWorker:
         topk = self.topk
         token_width = max(num_draft_tokens - 1, 1)
 
-        if batch.seq_lens_cpu is not None:
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        else:
-            batch.seq_lens_cpu = batch.seq_lens.cpu()
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        cpu_lens = batch.seq_lens_cpu
+        if (
+            cpu_lens is None
+            or not torch.is_tensor(cpu_lens)
+            or cpu_lens.device.type != "cpu"
+        ):
+            batch.seq_lens_cpu = batch.seq_lens.detach().to("cpu")
+            cpu_lens = batch.seq_lens_cpu
+        # The verify tree mask is sized by this sum. Recompute it from the
+        # CPU lengths every round so a stale Python int cannot shorten it.
+        batch.seq_lens_sum = int(sum(int(x) for x in cpu_lens.tolist()[:bs]))
 
         verified_id, parent_list, top_scores_index, draft_tokens = (
             self._assemble_draft_tensors(
@@ -369,13 +419,6 @@ class StandaloneRemoteWorker:
         )
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
-        if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
-            draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
-            ).cpu()
-
         if metrics:
             metrics.add_host("verify_prepare", time.perf_counter() - prepare_start)
         graph_runner = getattr(
@@ -424,6 +467,12 @@ class StandaloneRemoteWorker:
 
         vocab_mask = None
         if batch.has_grammar:
+            # D2H after the verify forward so the copy does not delay launch.
+            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrive_next_token.shape
+            ).cpu()
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
                 spec_info,

@@ -31,6 +31,34 @@ from sglang.srt.speculative.standalone_remote.sr_warmup import (
 
 logger = logging.getLogger(__name__)
 
+# Production alloc/mapping methods read these. The warmup host is not a
+# SRTreeDrafter, so the span buffer has to live here or lease/ordinary warmup
+# raises AttributeError and reports allocation=[].
+_SPAN_METHOD_NAMES = (
+    "_pack_device_rows",
+    "_span_reusable",
+    "_wait_span_consumer",
+    "_grow_span_cap",
+    "_reuse_long",
+    "_note_span_consumer",
+    "_seal_raw_cache",
+    "_release_mapping_snap",
+    "_capture_abandoned_spec_image",
+)
+
+
+def _bind_drafter_method(name: str):
+    def _bound(self, *args, **kwargs):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+            SRTreeDrafter,
+        )
+
+        return getattr(SRTreeDrafter, name)(self, *args, **kwargs)
+
+    _bound.__name__ = name
+    _bound.__qualname__ = f"SRDraftWarmupHost.{name}"
+    return _bound
+
 
 class SRDraftWarmupHost:
     def __init__(self, drafter, adapter, scratch_pool, cache, *, lease_supported: bool):
@@ -44,6 +72,15 @@ class SRDraftWarmupHost:
         self._lease_flag = bool(lease_supported)
         self.extend_lens = None
         self.num_new_pages_per_topk = None
+        self._span_caps = {}
+        self._span_hosts = {}
+        self._span_host_pinned = {}
+        self._span_events = {}
+        self._span_blocked = set()
+        self._span_hold = {}
+        self._raw_cache_inflight = False
+        self._raw_cache_shared = False
+        self._raw_cache_owner = None
 
     def _lease_supported(self) -> bool:
         return self._lease_flag
@@ -82,6 +119,10 @@ class SRDraftWarmupHost:
         )
 
         return SRTreeDrafter._free_lease_alloc(self, lease_state)
+
+
+for _span_name in _SPAN_METHOD_NAMES:
+    setattr(SRDraftWarmupHost, _span_name, _bind_drafter_method(_span_name))
 
 
 def _dummy_reqs(prefixes: Sequence[int]):

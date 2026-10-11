@@ -675,7 +675,6 @@ class TestTreeFailureHandling(unittest.TestCase):
             "_init_cuda_graphs",
             "_pack_tree_windows",
             "_d2h_tree_outputs",
-            "_acquire_host_staging",
             "_tree_phase",
             "_count_tree",
             "_tree_result_slots",
@@ -694,8 +693,7 @@ class TestTreeFailureHandling(unittest.TestCase):
         helper_nodes = [
             n
             for n in tree.body
-            if isinstance(n, ast.FunctionDef)
-            and n.name in {"_as_2d", "_wait_d2h_event", "_ensure_host_staging_slot"}
+            if isinstance(n, ast.FunctionDef) and n.name == "_as_2d"
         ]
         exec(
             compile(
@@ -707,6 +705,13 @@ class TestTreeFailureHandling(unittest.TestCase):
             ),
             helper_ns,
         )
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+            KVMoveSubmittedError,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
         functions = methods(
             src_path,
             "SRTreeDrafter",
@@ -715,12 +720,12 @@ class TestTreeFailureHandling(unittest.TestCase):
                 logger=self.logger,
                 is_device_context_error=is_device_context_error,
                 NpuGraphReplaySubmittedError=self.submitted_error,
+                KVMoveSubmittedError=KVMoveSubmittedError,
+                SRTransferUnresolved=SRTransferUnresolved,
                 device_backend_key=lambda _: "cuda",
                 nullcontext=nullcontext,
                 torch=torch,
                 _as_2d=helper_ns["_as_2d"],
-                _wait_d2h_event=helper_ns["_wait_d2h_event"],
-                _ensure_host_staging_slot=helper_ns["_ensure_host_staging_slot"],
             ),
         )
         md = shared.SharedPrefixMetadata.allocate(1, 3, 256, 15, 5, "cpu")
@@ -744,6 +749,8 @@ class TestTreeFailureHandling(unittest.TestCase):
             setattr(self.drafter, name, MethodType(fn, self.drafter))
         self.drafter._publish_tree_leases = lambda *a, **k: None
         self.drafter._free_lease_alloc = lambda *a, **k: None
+        self.drafter._remember_abandoned_lease = lambda *a, **k: None
+        self.drafter._reclaim_abandoned_leases = lambda: 0
         self.drafter._pending_lease_state = None
         self.req = NS(rid="request", req_pool_idx=0, sr_tree_seed=(None,) * 4)
 
@@ -1008,7 +1015,8 @@ class TestTreeFailureHandling(unittest.TestCase):
                     return self
 
                 def tolist(self):
-                    return [1]
+                    # One batch row. Packing calls tolist once, then splits rows.
+                    return [[1]]
 
             def forward(*args):
                 trace.append("forward")
@@ -1029,6 +1037,13 @@ class TestTreeFailureHandling(unittest.TestCase):
                 tree_graph_replay_count=0,
             )
             self.drafter._draft_forward = forward
+            from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
+                KVMoveSubmittedError,
+            )
+            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+                SRTransferUnresolved,
+            )
+
             fn = methods(
                 ROOT
                 / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
@@ -1047,6 +1062,8 @@ class TestTreeFailureHandling(unittest.TestCase):
                     ),
                     NpuGraphReplaySubmittedError=self.submitted_error,
                     NpuGraphPreparationError=ValueError,
+                    KVMoveSubmittedError=KVMoveSubmittedError,
+                    SRTransferUnresolved=SRTransferUnresolved,
                     record_tree_expand_admission=lambda *args, **kwargs: False,
                 ),
             )["_expand_tree"]

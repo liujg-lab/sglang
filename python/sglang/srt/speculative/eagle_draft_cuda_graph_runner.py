@@ -406,6 +406,7 @@ class EAGLEDraftCudaGraphRunner:
                 if identity_ws is not None:
                     self.eagle_worker._capture_identity_workspace = identity_ws
                 self.eagle_worker._capture_candidate_workspace = candidate_ws
+                self.eagle_worker._capture_candidate_selected = True
                 try:
                     ret = self.eagle_worker.draft_forward(forward_batch)
                 finally:
@@ -414,6 +415,7 @@ class EAGLEDraftCudaGraphRunner:
                     if identity_ws is not None:
                         self.eagle_worker._capture_identity_workspace = None
                     self.eagle_worker._capture_candidate_workspace = None
+                    self.eagle_worker._capture_candidate_selected = False
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup

@@ -30,6 +30,7 @@ IMPL_TREE_PAGED_FIA = "tree_paged_fia"
 TARGET_TREE_FIA_PAGE_SIZE = 128
 TARGET_TREE_FIA_HEAD_DIMS = (64, 128)
 TARGET_TREE_FIA_KV_ATTR = "actual_seq_lengths_kv"
+TARGET_TREE_FIA_Q_ATTR = "actual_seq_lengths"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -108,6 +109,24 @@ def maybe_select_target_tree_fia(
             f"page_size={int(page_size)} not {TARGET_TREE_FIA_PAGE_SIZE}"
         )
     return IMPL_TREE_PAGED_FIA, None
+
+
+def target_verify_cpu_prefix(req) -> int:
+    """CPU prefix shared by verify prefetch and the committed-length cursor.
+
+    ``kv_committed_len > 0`` is that cursor. Otherwise the prefix is the
+    tokens already stored on the request. ``req.seqlen`` is not a substitute:
+    it can stay at a stale length after the request has grown.
+    """
+    committed = int(getattr(req, "kv_committed_len", 0) or 0)
+    if committed > 0:
+        return committed
+    return max(0, len(req.origin_input_ids) + len(req.output_ids))
+
+
+def target_verify_update_signature(graph_key, kv_lens):
+    """Signature shared by Target prefetch and Target replay."""
+    return (graph_key, tuple(int(x) for x in kv_lens))
 
 
 def plan_target_tree_fia_lengths(
@@ -242,8 +261,28 @@ class SRTargetTreeFiaMetadata:
         self.active_rows.zero_()
         bs = int(self.block_tables.shape[0])
         queries = int(self.blocked_mask.shape[2])
-        self.kv_lens_cpu = [1] * bs
-        self.q_lens_cpu = [queries] * bs
+        assign_captured_lens(self.kv_lens_cpu, [1] * bs, "kv_lens_cpu")
+        assign_captured_lens(self.q_lens_cpu, [queries] * bs, "q_lens_cpu")
+
+
+def assign_captured_lens(dest, values, what: str):
+    """Write lengths into the list or tensor graph capture already holds.
+
+    Replacing the object leaves replay on the capture-time values. A length
+    mismatch is rejected instead of swapping in a new buffer.
+    """
+    seq = [int(x) for x in values]
+    if isinstance(dest, list):
+        if len(dest) != len(seq):
+            raise ValueError(f"{what} length {len(dest)} != {len(seq)}")
+        dest[:] = seq
+        return dest
+    if torch.is_tensor(dest):
+        if int(dest.numel()) != len(seq):
+            raise ValueError(f"{what} numel {int(dest.numel())} != {len(seq)}")
+        dest.copy_(torch.tensor(seq, dtype=dest.dtype, device=dest.device))
+        return dest
+    raise TypeError(f"{what} must be the captured list or tensor")
 
 
 def prime_target_tree_fia_capture_(
@@ -404,8 +443,8 @@ def fill_target_tree_fia_metadata_(
         dummy_page=dummy_page,
     )
     fill_target_tree_fia_mask_(md, custom_mask, prefixes, queries)
-    md.kv_lens_cpu = list(kv_lens)
-    md.q_lens_cpu = list(q_lens)
+    assign_captured_lens(md.kv_lens_cpu, kv_lens, "kv_lens_cpu")
+    assign_captured_lens(md.q_lens_cpu, q_lens, "q_lens_cpu")
     md.active_rows.zero_()
     if raw_bs:
         md.active_rows[: int(raw_bs)] = True

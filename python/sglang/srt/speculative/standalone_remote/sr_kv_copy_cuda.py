@@ -13,7 +13,7 @@ from sglang.srt.speculative.standalone_remote import sr_kv_copy as kv
 def continuous_groups(layout):
     """Validate the entire layout before allocation; group static geometry."""
     if layout.kind != "token":
-        raise kv.UnsupportedKVMoveLayout("experiment requires token-major KV")
+        raise kv.UnsupportedKVMoveLayout("contiguous CUDA remap requires token-major KV")
     groups = {}
     for i, b in enumerate(layout.buffers):
         t = b.tensor
@@ -27,43 +27,43 @@ def continuous_groups(layout):
             or t.element_size() not in (1, 2, 4, 8)
         ):
             raise kv.UnsupportedKVMoveLayout(
-                "experiment requires disjoint contiguous [H,D] token rows"
+                "contiguous CUDA remap requires disjoint contiguous [H,D] token rows"
             )
         key = (t.dtype, t.shape[1] * t.shape[2], tuple(t.stride()))
         groups.setdefault(key, []).append(i)
     return tuple((key, tuple(indices)) for key, indices in groups.items())
 
 
-class CudaKVExperiment(kv.KVMoveWorkspace):
+class CudaContiguousWorkspace(kv.KVMoveWorkspace):
     """Fixed-capacity scratch with the shared submission/poisoning contract."""
 
     def __init__(self, pool, capacity, *, graph=False):
         if int(capacity) <= 0:
-            raise ValueError("experiment capacity must be positive")
+            raise ValueError("contiguous CUDA capacity must be positive")
         layout = kv.KVMoveLayout.from_pool(pool)
         groups = continuous_groups(layout)
         if layout.device.type != "cuda":
-            raise kv.UnsupportedKVMoveLayout("experiment requires CUDA")
+            raise kv.UnsupportedKVMoveLayout("contiguous CUDA remap requires CUDA")
         if kv._capturing(layout.device):
-            raise RuntimeError("prepare CUDA experiment before capture")
+            raise RuntimeError("prepare contiguous CUDA remap before capture")
         if (
             not isinstance(getattr(pool, "k_buffer", None), (list, tuple))
             or not isinstance(getattr(pool, "v_buffer", None), (list, tuple))
             or getattr(pool, "index_k_buffer", None) is not None
         ):
             raise kv.UnsupportedKVMoveLayout(
-                "experiment requires separate MHA K/V lists"
+                "contiguous CUDA remap requires separate MHA K/V lists"
             )
         from sglang.srt.speculative.standalone_remote import (
-            sr_kv_copy_kernels_cuda_experiment,
+            sr_kv_copy_kernels_cuda,
         )
 
         super().__init__(pool, layout, graph=graph)
         self.reserve(capacity)
-        self.backend = "cuda_contiguous_experiment"
+        self.backend = "cuda_contiguous"
         self.tables = []
         self._pointer_hosts = []
-        self.launcher = sr_kv_copy_kernels_cuda_experiment.launch
+        self.launcher = sr_kv_copy_kernels_cuda.launch
         # Retain partial uploads too if a later pointer upload/record fails.
         try:
             for (_, width, strides), indices in groups:
@@ -91,7 +91,7 @@ class CudaKVExperiment(kv.KVMoveWorkspace):
         except BaseException as exc:
             self._poison()
             # The failed constructor cannot otherwise return ownership.
-            pool._kv_experiment_unresolved_hold = self
+            pool._kv_contiguous_unresolved_hold = self
             raise kv.KVMoveSubmittedError(
                 "CUDA pointer upload completion unknown"
             ) from exc
@@ -104,13 +104,13 @@ class CudaKVExperiment(kv.KVMoveWorkspace):
         if expected is not None and expected != tuple(
             kv._source_signature(t) for t in self.scratch
         ):
-            raise RuntimeError("experiment scratch storage changed")
+            raise RuntimeError("contiguous CUDA scratch storage changed")
 
     def _poison(self):
         super()._poison()
         # Keep pointer tables, indices and scratch reachable even if a test's
         # local workspace variable unwinds after a submitted failure.
-        self.pool._kv_experiment_unresolved_hold = self
+        self.pool._kv_contiguous_unresolved_hold = self
 
     def replay(self, graph):
         """Use this wrapper to validate storage/stream before test graph replay."""
@@ -121,7 +121,7 @@ class CudaKVExperiment(kv.KVMoveWorkspace):
             self._poison()
             self._failed_graph = graph
             raise kv.KVMoveSubmittedError(
-                "experiment graph completion unknown"
+                "contiguous CUDA graph completion unknown"
             ) from exc
 
     def _submit(self, inputs, **kwargs):
@@ -130,7 +130,7 @@ class CudaKVExperiment(kv.KVMoveWorkspace):
 
     def move(self, src, dst):
         if src.ndim != 1 or dst.ndim != 1:
-            raise ValueError("experiment slot indices must be vectors")
+            raise ValueError("contiguous CUDA slot indices must be vectors")
         src, dst = kv._indices(self, src, dst)
         if src is None:
             return

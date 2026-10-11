@@ -66,7 +66,7 @@ def read_sr_tree_update_overlap_env(env=None) -> bool:
     """Read once during SR Draft init; default on.
 
     Gates paged-tree ``graph.update`` / ``graph.replay`` overlap on NPU Draft.
-    Set 0 to keep serial. Not a runtime toggle. Compact-FIA keeps
+    Set 0 to keep that pair serial. Not a runtime toggle. Compact-FIA keeps
     ``SGLANG_NPU_TREE_FIA_SERIAL_UPDATE``.
     """
     environ = os.environ if env is None else env
@@ -806,6 +806,35 @@ def tree_paged_shape_key(
     )
 
 
+def captured_paged_cpu_update_payload(attn_backends, step_ids, attr_name):
+    """One update record per captured op, aliasing that step's ``context_lens_cpu``.
+
+    ``graph.update`` must receive the tensor the paged op captured. A fresh
+    list or ``torch.ones`` buffer is a second length and stays invisible to
+    replay, or races with the captured tensor.
+    """
+    if not attr_name:
+        raise ValueError("paged update attr_name must not be empty")
+    if attn_backends is None:
+        raise ValueError("paged attention backends are missing")
+    payload = []
+    for index, step in enumerate(step_ids):
+        step = int(step)
+        if step < 0 or step >= len(attn_backends):
+            raise ValueError(
+                f"paged step_ids[{index}]={step} outside "
+                f"{len(attn_backends)} attention backends"
+            )
+        meta = getattr(attn_backends[step], "_sr_tree_paged_meta", None)
+        cpu = None if meta is None else getattr(meta, "context_lens_cpu", None)
+        if not torch.is_tensor(cpu):
+            raise ValueError(
+                f"paged step {step} context_lens_cpu is not the captured tensor"
+            )
+        payload.append({attr_name: cpu})
+    return payload
+
+
 def fill_paged_cpu_update_payload(payload, step_lens_list, step_ids, attr_name):
     """Copy independent per-step CPU lengths into captured update records.
 
@@ -885,6 +914,71 @@ def max_query_pages_for_tree(
     prefixes = _as_int_list(prefix_lens_cpu)
     last_step = max(int(num_steps) - 2, 0)
     return [query_page_count(p, last_step, page_size) for p in prefixes]
+
+
+def select_draft_page_bucket(
+    prefix_lens_cpu: SeqLens,
+    num_steps: int,
+    page_size: int,
+    kv_buckets: Optional[Sequence[int]] = None,
+    max_pages: Optional[int] = None,
+) -> Optional[int]:
+    """Page bucket ``tree_slot_graph_can_run`` stores for this draft prefix."""
+    needed_pages = max(
+        max_query_pages_for_tree(prefix_lens_cpu, num_steps, page_size) or [1]
+    )
+    buckets = list(kv_buckets) if kv_buckets else None
+    page_buckets = (
+        kv_buckets_to_page_buckets(buckets, page_size) if buckets else None
+    )
+    if not page_buckets and max_pages is not None:
+        page_buckets = [max(int(max_pages), 1)]
+    if not page_buckets:
+        return None
+    return select_page_bucket(needed_pages, page_buckets)
+
+
+def paged_draft_clamped_step(step_id: int, num_steps: int) -> int:
+    """Same step index as ``bind_sr_tree_paged_replay``."""
+    n_fwd = max(int(num_steps) - 1, 0)
+    step = int(step_id)
+    if n_fwd:
+        return min(step, n_fwd - 1)
+    return step
+
+
+def paged_draft_step_context(
+    prefix_lens_cpu: SeqLens,
+    topk: int,
+    step_id: int,
+    num_steps: int,
+    n_rows: int,
+) -> list[int]:
+    """One backend's KV lengths for a paged draft graph."""
+    step = paged_draft_clamped_step(step_id, num_steps)
+    return context_lens_list(
+        build_step_context_lens(prefix_lens_cpu, topk, step, n_rows)
+    )
+
+
+def paged_draft_graph_step_lens(
+    prefix_lens_cpu: SeqLens,
+    capture_bs: int,
+    topk: int,
+    n_steps: int,
+    num_steps: Optional[int] = None,
+) -> list[list[int]]:
+    """FIA step list replay reads after the paged context lengths are refreshed.
+
+    ``n_steps`` is the FIA map length. ``num_steps`` is ``speculative_num_steps``
+    and supplies the bind-time clamp.
+    """
+    steps = int(n_steps if num_steps is None else num_steps)
+    rows = int(capture_bs) * max(int(topk), 1)
+    return [
+        paged_draft_step_context(prefix_lens_cpu, topk, step_id, steps, rows)
+        for step_id in range(int(n_steps))
+    ]
 
 
 def prepare_tree_paged_view(

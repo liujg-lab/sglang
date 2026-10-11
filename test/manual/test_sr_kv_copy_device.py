@@ -454,7 +454,7 @@ class TestNPUCandidates(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and Triton")
-class TestCudaKVExperiment(unittest.TestCase):
+class TestCudaContiguousWorkspace(unittest.TestCase):
     """Private pools only. These checks never enable production admission."""
 
     def pool(self, dtype=torch.float16, layers=3, width=67, slots=512):
@@ -480,14 +480,14 @@ class TestCudaKVExperiment(unittest.TestCase):
         )
 
     def test_explicit_overlap_and_raw_bits(self):
-        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
-            CudaKVExperiment,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda import (
+            CudaContiguousWorkspace,
         )
 
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             pool = self.pool(dtype)
             dev = pool.k_buffer[0].device
-            ws = CudaKVExperiment(pool, 257)
+            ws = CudaContiguousWorkspace(pool, 257)
             tensors = pool.k_buffer + pool.v_buffer
             for t in tensors:
                 t[0, 0, 0] = float("nan")
@@ -507,13 +507,13 @@ class TestCudaKVExperiment(unittest.TestCase):
             )
 
     def test_graph_live_mapping_mask_and_storage(self):
-        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
-            CudaKVExperiment,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda import (
+            CudaContiguousWorkspace,
         )
 
         pool = self.pool()
         dev = pool.k_buffer[0].device
-        ws = CudaKVExperiment(pool, 36, graph=True)
+        ws = CudaContiguousWorkspace(pool, 36, graph=True)
         # Real non-contiguous strides for both mappings.
         slots = torch.arange(60, device=dev).reshape(12, 5).T
         parent_backing = torch.arange(24, device=dev)
@@ -554,8 +554,8 @@ class TestCudaKVExperiment(unittest.TestCase):
         """Component timing, NOT whole-model admission. 3 x 500 per B/version."""
         import json
         import time
-        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
-            CudaKVExperiment,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda import (
+            CudaContiguousWorkspace,
         )
 
         for batch in (1, 2, 3, 4):
@@ -565,7 +565,7 @@ class TestCudaKVExperiment(unittest.TestCase):
                 pool = self.pool(layers=28, width=512, slots=256)
                 dev = pool.k_buffer[0].device
                 ws = (
-                    CudaKVExperiment(pool, rows * 3, graph=use_graph)
+                    CudaContiguousWorkspace(pool, rows * 3, graph=use_graph)
                     if experimental
                     else kv.prepare_kv_move(
                         pool, rows * 3, domain="private_benchmark", graph=use_graph

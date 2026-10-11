@@ -84,6 +84,9 @@ from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
     remap_tree_kv_,
     warm_private_slot_move,
 )
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    SRTransferUnresolved,
+)
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     advance_tree_draft_positions_for_step,
 )
@@ -118,57 +121,6 @@ def _as_2d(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _wait_d2h_event(device, host: dict) -> None:
-    """Block until the batched D2H into ``host`` is visible on CPU."""
-    host["event"] = None
-    if device is None:
-        return
-    dev_type = getattr(device, "type", None) or str(device)
-    if dev_type == "cpu":
-        return
-    try:
-        module = torch.get_device_module(dev_type)
-        event = module.Event()
-        event.record()
-        event.synchronize()
-        host["event"] = event
-    except Exception:
-        # CPU tests and missing device modules still have finished copy_ data.
-        return
-
-
-def _ensure_host_staging_slot(
-    slots, idx: int, bs: int, token_w: int, parent_w: int, index_w: int, slot_w: int = 0
-):
-    host = slots[idx]
-    token_w = max(int(token_w), 0)
-    parent_w = max(int(parent_w), 0)
-    index_w = max(int(index_w), 0)
-    slot_w = max(int(slot_w), 0)
-    bs = max(int(bs), 1)
-    need_new = host is None
-    if not need_new:
-        need_new = (
-            host["tokens"].shape[0] < bs
-            or host["tokens"].shape[1] < token_w
-            or host["parents"].shape[1] < parent_w
-            or host["indices"].shape[1] < index_w
-            or host.get("slots") is None
-            or host["slots"].shape[1] < max(slot_w, 1)
-        )
-    if need_new:
-        host = {
-            "tokens": torch.zeros((bs, max(token_w, 1)), dtype=torch.int64),
-            "parents": torch.zeros((bs, max(parent_w, 1)), dtype=torch.int64),
-            "indices": torch.zeros((bs, max(index_w, 1)), dtype=torch.int64),
-            "slots": torch.full((bs, max(slot_w, 1)), -1, dtype=torch.int64),
-            "event": None,
-            "in_use": False,
-        }
-        slots[idx] = host
-    return host
-
-
 class SRTreeDrafter:
     def __init__(self, scheduler) -> None:
         self.scheduler = scheduler
@@ -191,6 +143,14 @@ class SRTreeDrafter:
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        # Capacity tensors stay here. Public attributes are views of ``[:n]``.
+        self._span_caps = {}
+        self._span_hosts = {}
+        self._span_host_pinned = {}
+        self._span_events = {}
+        self._span_blocked = set()
+        self._span_hold = {}
+        self._raw_cache_inflight = False
         self.draft_attn_backend = None
         self.cuda_graph_runner = None
         self._tree_failure_counts = {}
@@ -199,10 +159,6 @@ class SRTreeDrafter:
         self._seen_tree_graph_keys = set()
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
-        # Two host stagings so a later replay cannot overwrite a D2H that has
-        # not yet been split into RPC lists.
-        self._host_staging = [None, None]
-        self._staging_index = 0
         self._last_out_cache_loc = None
         self._last_candidate_slots = None
         max_bs = max(int(getattr(self.server_args, "cuda_graph_max_bs", 0) or 8), 8)
@@ -407,7 +363,7 @@ class SRTreeDrafter:
                 if getattr(self, "_identity_graph", None) is not None:
                     self._freeze_identity_table()
             logger.info("[SR] Capture tree draft graph end.")
-        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -440,7 +396,7 @@ class SRTreeDrafter:
                 "[SR] tail EXTEND graphs captured: buckets=%s",
                 list(runner.graphs),
             )
-        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -723,7 +679,7 @@ class SRTreeDrafter:
         if not read_sr_tree_warmup_env():
             logger.info("[SR] tree shape warmup skipped: %s=0", SR_TREE_WARMUP_ENV)
             return
-        if not self.sr_tree_paged:
+        if not getattr(self, "sr_tree_paged", False):
             return
         t0 = time.perf_counter()
         combos = []
@@ -810,7 +766,7 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 keep, *self._stack_seeds(keep)
             )
-        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -850,7 +806,7 @@ class SRTreeDrafter:
             parent_list, top_scores_index, draft_tokens = self._expand_tree(
                 [req], *self._stack_seeds([req])
             )
-        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             raise
         except Exception as e:
             if is_device_context_error(e):
@@ -884,13 +840,12 @@ class SRTreeDrafter:
         tokens_cpu, parents_cpu, indices_cpu, slots_cpu = self._d2h_tree_outputs(
             draft_tokens, parent_list, top_scores_index
         )
+        token_rows = tokens_cpu.tolist()
+        parent_rows = parents_cpu.tolist()
+        index_rows = indices_cpu.tolist()
         packed = []
         for j, idx in enumerate(keep_idx):
-            window = (
-                tokens_cpu[j].tolist(),
-                parents_cpu[j].tolist(),
-                indices_cpu[j].tolist(),
-            )
+            window = (token_rows[j], parent_rows[j], index_rows[j])
             windows[idx] = window
             packed.append(window)
         self._publish_tree_leases(reqs or [], packed, slots_cpu)
@@ -906,6 +861,7 @@ class SRTreeDrafter:
             self._free_lease_alloc(lease_state)
             return
         unpublished = set(range(len(lease_state["page_slots"])))
+        slot_rows = slots_cpu.tolist() if slots_cpu is not None else None
         try:
             for j, req in enumerate(lease_state["reqs"]):
                 tokens, pl, ix = windows[j] if j < len(windows) else ([], None, None)
@@ -913,11 +869,12 @@ class SRTreeDrafter:
                     self.token_to_kv_pool_allocator.free(lease_state["page_slots"][j])
                     unpublished.discard(j)
                     continue
-                if slots_cpu is not None and j < slots_cpu.shape[0]:
-                    cand = [int(x) for x in slots_cpu[j].tolist()]
+                if slot_rows is not None and j < len(slot_rows):
+                    cand = slot_rows[j]
                     if len(cand) < len(ix):
                         cand = cand + [-1] * (len(ix) - len(cand))
-                    cand = cand[: len(ix)]
+                    elif len(cand) > len(ix):
+                        cand = cand[: len(ix)]
                 else:
                     cand = [-1] * len(ix)
                 base = int(getattr(req, "kv_committed_len", 0) or 0)
@@ -937,10 +894,10 @@ class SRTreeDrafter:
                     ),
                     page_ids=[],
                     page_slots=lease_state["page_slots"][j],
-                    candidate_slots=list(cand),
-                    parent_list=list(pl),
-                    top_scores_index=list(ix),
-                    draft_tokens=list(tokens),
+                    candidate_slots=cand,
+                    parent_list=pl,
+                    top_scores_index=ix,
+                    draft_tokens=tokens,
                     page_count=int(lease_state["page_counts"][j]),
                 )
                 prev = store.pop(req.rid)
@@ -1163,28 +1120,6 @@ class SRTreeDrafter:
             views.get("candidate_slots"),
         )
 
-    def _acquire_host_staging(
-        self, bs: int, token_w: int, parent_w: int, index_w: int, slot_w: int = 0
-    ):
-        slots = getattr(self, "_host_staging", None)
-        if not slots:
-            self._host_staging = [None, None]
-            self._staging_index = 0
-            slots = self._host_staging
-        idx = int(getattr(self, "_staging_index", 0) or 0) % 2
-        other = slots[idx]
-        if other is not None and other.get("in_use"):
-            event = other.get("event")
-            if event is not None:
-                event.synchronize()
-            other["in_use"] = False
-        host = _ensure_host_staging_slot(
-            slots, idx, bs, token_w, parent_w, index_w, slot_w
-        )
-        host["in_use"] = True
-        self._staging_index = (idx + 1) % 2
-        return host
-
     def _stack_seeds(
         self, reqs: List["Req"]
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
@@ -1203,6 +1138,9 @@ class SRTreeDrafter:
         verified_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del hidden_states
+        self._sr_last_abandon_has_event = False
+        # A previous abandon may already have a completed consumer event.
+        self._reclaim_abandoned_leases()
         scheduler = self.scheduler
         metrics = getattr(scheduler, "_sr_round_metrics", None)
         with metrics.phase("tree_make_batch") if metrics else nullcontext():
@@ -1246,8 +1184,13 @@ class SRTreeDrafter:
                     return (not self.in_flight()) or self.completion_confirmed
 
         txn = txn_cls()
+        self._sr_last_abandon_has_event = False
         with metrics.phase("tree_alloc_kv") if metrics else nullcontext():
             token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
+        # Captured here so a later private pack cannot change the seal decision.
+        # AST tests bind this method onto a namespace that does not carry the helper.
+        shared_raw = bool(getattr(self, "_raw_cache_shared", False))
+        seal_raw_cache = getattr(self, "_seal_raw_cache", None)
         txn.allocation_owned = True
         txn.lease_state = lease_state
         txn.allocator_backup = token_to_kv_pool_state_backup
@@ -1347,7 +1290,7 @@ class SRTreeDrafter:
                         parent_list, top_scores_index, draft_tokens = (
                             self.cuda_graph_runner.replay(forward_batch)
                         )
-                    except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+                    except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
                         self.cuda_graph_runner = None
                         graph_submitted = True
                         raise
@@ -1388,7 +1331,9 @@ class SRTreeDrafter:
                 finish_paged_metadata(self.draft_attn_backend)
             exec_s = time.perf_counter() - t_exec
             txn.completion_confirmed = True
-        except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):
+            if callable(seal_raw_cache):
+                seal_raw_cache(shared_raw)
+        except (NpuGraphReplaySubmittedError, SRTransferUnresolved):
             from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
                 poison_paged_metadata,
             )
@@ -1414,10 +1359,13 @@ class SRTreeDrafter:
                 if not confirm():
                     poison_paged_metadata(self.draft_attn_backend)
                     graph_submitted = True
-                    raise NpuGraphReplaySubmittedError(
+                    raise SRTransferUnresolved(
                         "tree expand in-flight; refuse rollback"
                     ) from e
                 txn.completion_confirmed = True
+                # Device sync finished the forward that still reads raw slots.
+                if callable(seal_raw_cache):
+                    seal_raw_cache(shared_raw)
                 # A successful device confirmation also closes metadata use on
                 # this recoverable error path, before rollback frees pages.
                 finish_paged_metadata(self.draft_attn_backend)
@@ -1436,10 +1384,21 @@ class SRTreeDrafter:
             abandon = graph_submitted or (
                 txn.in_flight() and not txn.completion_confirmed
             )
+            if (
+                not abandon
+                and not getattr(txn, "tree_compute_submitted", False)
+                and getattr(self, "_raw_cache_inflight", False)
+            ):
+                # Assign already queued, and no forward was submitted.
+                # A private pack must not clear an older shared inflight.
+                if callable(seal_raw_cache):
+                    seal_raw_cache(shared_raw)
             if abandon:
-                view = getattr(self.draft_attn_backend, "_sr_draft_paged_view", None)
-                if view is not None:
-                    view.workspace.lease_hold = lease_state
+                # A missing helper must not replace the replay exception already
+                # in flight. AST tests bind expand onto a namespace without it.
+                abandon_lease = getattr(self, "_abandon_tree_lease", None)
+                if callable(abandon_lease):
+                    abandon_lease(lease_state)
                 self._pending_lease_state = None
             elif txn.rolled_back:
                 pass
@@ -1449,6 +1408,8 @@ class SRTreeDrafter:
                 self.token_to_kv_pool_allocator.restore_state(
                     token_to_kv_pool_state_backup
                 )
+        if not abandon:
+            self._reclaim_abandoned_leases()
         runner = self.cuda_graph_runner
         replay_n = getattr(runner, "tree_graph_replay_count", 0) if runner else 0
         self._tree_forward_calls = getattr(self, "_tree_forward_calls", 0) + 1
@@ -1459,7 +1420,7 @@ class SRTreeDrafter:
             else (getattr(runner, "_last_can_run_reject", None) or "graph_unavailable")
         )
         if calls <= 1 or calls % 8 == 0:
-            logger.info(
+            logger.debug(
                 "[SR] tree draft timings: prepare_host=%.3fs "
                 "forward_call_host=%.3fs graph=%s "
                 "replay=%s eager_fallback=%s reason=%s",
@@ -1557,6 +1518,7 @@ class SRTreeDrafter:
         num_seqs = batch.batch_size()
         token_to_kv_pool_state_backup = None
         lease_state = None
+        self._raw_cache_shared = False
         pool_len = batch.req_to_token_pool.req_to_token.shape[1]
         if not paged_tree_mapping_fits(
             seq_lens_cpu_for_host(batch),
@@ -1573,12 +1535,22 @@ class SRTreeDrafter:
         leased = self._try_alloc_lease_tree_kv(batch)
         if leased is not None:
             raw_cache_loc, lease_state = leased
+            shared_raw = bool(getattr(self, "_raw_cache_shared", False))
+            if shared_raw:
+                self._raw_cache_owner = lease_state
             try:
                 self._apply_tree_mapping(batch, raw_cache_loc)
+                # The speculative image is saved before any device work. The
+                # abandon path must not clone again.
+                self._capture_abandoned_spec_image(lease_state)
                 return None, lease_state
             except Exception:
                 self._restore_tree_mapping(batch, lease_state)
                 self._free_lease_alloc(lease_state)
+                if getattr(self, "_raw_cache_inflight", False) and getattr(
+                    self, "_raw_cache_owner", None
+                ) is lease_state:
+                    self._seal_raw_cache(shared_raw)
                 raise
         if self.page_size == 1:
             alloc_len = self.speculative_num_steps * self.topk
@@ -1674,18 +1646,20 @@ class SRTreeDrafter:
             if store is not None:
                 store.counts["tree_lease_skip_budget"] += 1
             return None
+        lease_state = {
+            "reqs": list(batch.reqs),
+            "starts": [],
+            "extend": layout.extend_lens,
+            "mapping_snaps": [],
+            "page_counts": [],
+            "page_slots": [],
+            "remainders": layout.remainders,
+        }
         try:
             mapping = batch.req_to_token_pool.req_to_token
             raw_parts = []
-            lease_state = {
-                "reqs": list(batch.reqs),
-                "starts": [],
-                "extend": layout.extend_lens,
-                "mapping_snaps": [],
-                "page_counts": [],
-                "page_slots": [],
-                "remainders": layout.remainders,
-            }
+            snap_rows = []
+            row_meta = []
             offset = 0
             ps = int(self.page_size)
             for b, req in enumerate(batch.reqs):
@@ -1694,22 +1668,36 @@ class SRTreeDrafter:
                 offset += n_pages
                 r = layout.remainders[b]
                 raw_parts.append(chunk[r:])
-                start = layout.prefix_lens[b]
-                ext = layout.extend_lens[b]
-                snap = mapping[req.req_pool_idx, start : start + ext].clone()
+                start = int(layout.prefix_lens[b])
+                ext = int(layout.extend_lens[b])
+                snap_rows.append(mapping[req.req_pool_idx, start : start + ext])
+                row_meta.append((start, n_pages, chunk))
+            raw_cache_loc, _, _ = self._pack_device_rows(
+                "raw_cache_loc",
+                raw_parts,
+                allocated.device,
+                dtype=allocated.dtype,
+            )
+            _, snap_views, shared = self._pack_device_rows(
+                "mapping_snap", snap_rows, mapping.device
+            )
+            if shared:
+                self._span_hold["mapping_snap"] = lease_state
+            for (start, n_pages, chunk), snap in zip(row_meta, snap_views):
                 lease_state["starts"].append(start)
                 lease_state["mapping_snaps"].append(snap)
                 lease_state["page_counts"].append(n_pages)
                 lease_state["page_slots"].append(chunk)
-            raw_cache_loc = torch.cat(raw_parts) if raw_parts else allocated[:0]
-            self.extend_lens = torch.tensor(
-                layout.extend_lens, dtype=torch.int64, device=self.device
+            self.extend_lens = self._reuse_long(
+                "extend_lens", layout.extend_lens, self.device
             )
-            self.num_new_pages_per_topk = torch.tensor(
-                layout.pages_per_branch, dtype=torch.int64, device=self.device
+            self.num_new_pages_per_topk = self._reuse_long(
+                "num_new_pages_per_topk", layout.pages_per_branch, self.device
             )
             return raw_cache_loc, lease_state
         except Exception:
+            if self._span_hold.get("mapping_snap") is lease_state:
+                self._span_hold["mapping_snap"] = None
             self.token_to_kv_pool_allocator.free(allocated)
             raise
 
@@ -1722,33 +1710,41 @@ class SRTreeDrafter:
             self.speculative_num_steps,
             self.page_size,
         )
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            raw_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-        )
-        if self.page_size > 1 and self.topk > 1:
-            draft_cache_loc = build_paged_draft_cache_locs(
-                batch.req_to_token_pool.req_to_token,
+        # Mark the shared raw buffer live before either kernel is queued, so a
+        # failure halfway through still refuses to overwrite it.
+        if getattr(self, "_raw_cache_shared", False):
+            self._raw_cache_inflight = True
+        try:
+            assign_draft_cache_locs[(num_seqs,)](
                 batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
                 batch.seq_lens,
-                self.num_new_pages_per_topk,
+                self.extend_lens,
+                raw_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
                 self.topk,
                 self.speculative_num_steps,
                 self.page_size,
+                next_power_of_2(num_seqs),
             )
-        batch.out_cache_loc = draft_cache_loc
-        batch.seq_lens_sum = seq_lens_sum_from_batch(batch)
-        batch.spec_info.positions = batch.seq_lens.repeat_interleave(
-            self.topk, dim=0
-        )
+            if self.page_size > 1 and self.topk > 1:
+                draft_cache_loc = build_paged_draft_cache_locs(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.num_new_pages_per_topk,
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.page_size,
+                )
+            batch.out_cache_loc = draft_cache_loc
+            batch.seq_lens_sum = seq_lens_sum_from_batch(batch)
+            batch.spec_info.positions = batch.seq_lens.repeat_interleave(
+                self.topk, dim=0
+            )
+        finally:
+            # Covers assign/build even when the second kernel raises.
+            self._note_span_consumer("extend_lens", "num_new_pages_per_topk")
 
     def _restore_tree_mapping(self, batch: "ScheduleBatch", lease_state) -> None:
         if not lease_state:
@@ -1760,6 +1756,201 @@ class SRTreeDrafter:
             if req.req_pool_idx is None:
                 continue
             mapping[req.req_pool_idx, start : start + snap.numel()].copy_(snap)
+        release = getattr(self, "_release_mapping_snap", None)
+        if callable(release):
+            release(lease_state)
+
+    def _restore_abandoned_mapping(self, lease_state) -> None:
+        """Undo an abandoned window without aliasing committed pages.
+
+        A slot that still names the abandoned speculative page holds draft-tree
+        KV, including rejected siblings. Write that slot back to the pre-expand
+        snapshot even when it sits below ``kv_committed_len``. A slot that no
+        longer matches the speculative image was written by a later tail and
+        stays. Without an image, the whole snap is restored.
+
+        ``copy_`` is queued on the mapping device. The copy is finished before
+        return so a following free cannot recycle the pages while a reader
+        still observes the abandoned ids.
+        """
+        pool = getattr(self, "req_to_token_pool", None)
+        mapping = getattr(pool, "req_to_token", None)
+        if mapping is None:
+            raise RuntimeError("abandoned tree mapping is missing")
+        specs = lease_state.get("spec_snaps") if lease_state else None
+        if not specs:
+            self._restore_tree_mapping(
+                SimpleNamespace(req_to_token_pool=pool), lease_state
+            )
+        else:
+            rows = zip(
+                lease_state.get("reqs") or [],
+                lease_state.get("starts") or [],
+                lease_state.get("mapping_snaps") or [],
+                specs,
+            )
+            for req, start, snap, spec in rows:
+                if req.req_pool_idx is None:
+                    continue
+                n = int(snap.numel())
+                view = mapping[req.req_pool_idx, start : start + n]
+                image = spec.to(device=view.device, dtype=view.dtype)
+                saved = snap.to(device=view.device, dtype=view.dtype)
+                if image.numel() != n or saved.numel() != n or view.numel() != n:
+                    continue
+                speculative = view.eq(image)
+                view.copy_(torch.where(speculative, saved, view))
+        device = mapping.device
+        if getattr(device, "type", "cpu") != "cpu":
+            module = torch.get_device_module(device.type)
+            try:
+                module.synchronize(device)
+            except TypeError:
+                module.synchronize()
+        release = getattr(self, "_release_mapping_snap", None)
+        if callable(release):
+            release(lease_state)
+
+    def _release_mapping_snap(self, lease_state) -> None:
+        """Return the shared snap buffer after its restore copy has been queued."""
+        if not lease_state:
+            return
+        lease_state["mapping_restored"] = True
+        if self._span_hold.get("mapping_snap") is lease_state:
+            self._span_hold["mapping_snap"] = None
+            self._note_span_consumer("mapping_snap")
+
+    def _span_reusable(self, name: str) -> bool:
+        if name in self._span_blocked:
+            raise SRTransferUnresolved(f"{name} staging is unresolved")
+        if name == "raw_cache_loc" and getattr(self, "_raw_cache_inflight", False):
+            return False
+        hold = self._span_hold.get(name)
+        if hold is not None and not hold.get("mapping_restored"):
+            return False
+        return True
+
+    def _wait_span_consumer(self, name: str) -> None:
+        if name in self._span_blocked:
+            raise SRTransferUnresolved(f"{name} staging is unresolved")
+        event = self._span_events.get(name)
+        if event is None:
+            return
+        try:
+            done = bool(event.query())
+        except Exception as exc:
+            self._span_blocked.add(name)
+            raise SRTransferUnresolved(f"{name} consumer query failed") from exc
+        if done:
+            return
+        try:
+            event.synchronize()
+        except Exception as exc:
+            self._span_blocked.add(name)
+            raise SRTransferUnresolved(f"{name} consumer wait failed") from exc
+
+    def _note_span_consumer(self, *names: str) -> None:
+        from .sr_tree_kv_lease import record_device_event
+
+        event = record_device_event(getattr(self, "device", None), required=False)
+        dev = getattr(self, "device", None)
+        dev_type = getattr(dev, "type", None) or (str(dev) if dev is not None else "cpu")
+        if event is None and dev_type != "cpu" and "cpu" not in str(dev_type):
+            for name in names:
+                self._span_blocked.add(name)
+            return
+        for name in names:
+            self._span_events[name] = event
+
+    def _seal_raw_cache(self, shared_raw: bool) -> None:
+        """Record the raw-slot consumer for this expand.
+
+        ``shared_raw`` is the pack that owns the shared cap, captured before a
+        later private pack can clear ``_raw_cache_shared``. A private note must
+        leave an older inflight set.
+        """
+        self._note_span_consumer("raw_cache_loc")
+        if shared_raw:
+            self._raw_cache_inflight = False
+
+    def _grow_span_cap(self, name: str, n: int, device, dtype) -> torch.Tensor:
+        caps = self._span_caps
+        cap = caps.get(name)
+        dev = torch.device(device)
+        if (
+            not torch.is_tensor(cap)
+            or int(cap.numel()) < int(n)
+            or cap.device != dev
+            or cap.dtype != dtype
+        ):
+            cap = torch.empty(max(int(n), 1), dtype=dtype, device=dev)
+            caps[name] = cap
+        return cap
+
+    def _pack_device_rows(self, name: str, rows, device, dtype=None):
+        """Copy device rows into one buffer at offsets. Views share that buffer.
+
+        A shared cap is reused only after the previous consumer event. A lease
+        that still owns the cap, or an in-flight raw buffer, gets a private
+        tensor so the previous reader is not overwritten.
+        """
+        rows = list(rows)
+        dev = torch.device(device)
+        if rows:
+            dtype = rows[0].dtype
+            dev = rows[0].device
+        elif dtype is None:
+            dtype = torch.int64
+        total = sum(int(row.numel()) for row in rows)
+        shared = self._span_reusable(name)
+        if name == "raw_cache_loc":
+            self._raw_cache_shared = shared
+        if shared:
+            self._wait_span_consumer(name)
+            backing = self._grow_span_cap(name, max(total, 1), dev, dtype)
+        else:
+            backing = torch.empty(max(total, 1), dtype=dtype, device=dev)
+        offset = 0
+        views = []
+        for row in rows:
+            n = int(row.numel())
+            if n:
+                src = row
+                if src.device != dev or src.dtype != dtype:
+                    src = src.to(device=dev, dtype=dtype)
+                backing[offset : offset + n].copy_(src)
+            views.append(backing[offset : offset + n])
+            offset += n
+        return backing[:total], views, shared
+
+    def _reuse_long(self, name, values, device) -> torch.Tensor:
+        """Copy a host list into ``_span_caps[name]`` and return a ``[:n]`` view.
+
+        The capacity tensor is not the returned view. The next call waits for
+        the consumer recorded by ``_note_span_consumer`` before writing again.
+        """
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            alloc_host,
+        )
+
+        self._wait_span_consumer(name)
+        n = len(values)
+        dev = torch.device(device)
+        cap = self._grow_span_cap(name, max(n, 1), dev, torch.int64)
+        host = self._span_hosts.get(name)
+        pinned = bool(self._span_host_pinned.get(name, False))
+        if host is None or int(host.numel()) < n or host.dtype != torch.int64:
+            host, pinned = alloc_host((max(n, 1),), torch.int64, dev)
+            self._span_hosts[name] = host
+            self._span_host_pinned[name] = pinned
+        if n:
+            try:
+                host[:n].numpy()[:] = values
+            except Exception:
+                for i, value in enumerate(values):
+                    host[i] = int(value)
+            cap[:n].copy_(host[:n], non_blocking=bool(pinned and dev.type != "cpu"))
+        return cap[:n]
 
     def _free_lease_alloc(self, lease_state) -> None:
         if not lease_state:
@@ -1767,8 +1958,294 @@ class SRTreeDrafter:
         for slots in lease_state["page_slots"]:
             self.token_to_kv_pool_allocator.free(slots)
 
+    def _capture_abandon_event(self):
+        """Record the consumer that still owns these pages. Failure poisons."""
+        from .sr_resource_quarantine import HostCompletion
+
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None and getattr(scheduler, "_sr_device_poisoned", False):
+            return None
+        device = getattr(self, "device", None)
+        dev_type = getattr(device, "type", None) or (
+            str(device) if device is not None else "cpu"
+        )
+        if device is None or "cpu" in str(dev_type):
+            return HostCompletion()
+        try:
+            from .sr_tree_kv_lease import record_device_event
+
+            return record_device_event(device, required=True)
+        except BaseException:
+            if scheduler is not None:
+                scheduler._sr_device_poisoned = True
+            return None
+
+    def _capture_abandoned_spec_image(self, lease_state) -> None:
+        """Clone the mapping slice the abandoned expand currently occupies."""
+        if not lease_state or lease_state.get("spec_snaps") is not None:
+            return
+        pool = getattr(self, "req_to_token_pool", None)
+        mapping = getattr(pool, "req_to_token", None)
+        snaps = lease_state.get("mapping_snaps")
+        if mapping is None or not snaps:
+            return
+        images = []
+        rows = zip(
+            lease_state.get("reqs") or [],
+            lease_state.get("starts") or [],
+            snaps,
+        )
+        for req, start, snap in rows:
+            n = int(snap.numel())
+            idx = getattr(req, "req_pool_idx", None)
+            if idx is None:
+                images.append(snap.detach().clone())
+                continue
+            images.append(mapping[idx, start : start + n].detach().clone())
+        lease_state["spec_snaps"] = images
+
+    def _abandon_tree_lease(self, lease_state) -> None:
+        """Retain this lease, then free earlier ones whose events have completed."""
+        import sys
+
+        if lease_state:
+            self._remember_abandoned_lease(lease_state)
+        unwinding = sys.exc_info()[0] is not None
+        try:
+            self._reclaim_abandoned_leases()
+        except BaseException:
+            if not unwinding:
+                raise
+
+    def _remember_abandoned_lease(self, lease_state) -> None:
+        if not lease_state:
+            return
+        from .sr_resource_quarantine import quarantine
+
+        # Retain the lease, pages and request row before any further device
+        # work. A clone or event failure must not erase this record or replace
+        # the exception already in flight.
+        bag = quarantine(self)
+        before = len(bag.records)
+        record = bag.retain(
+            lease_state,
+            lease_state.get("page_slots") or [],
+            lease_state.get("completion_event"),
+        )
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        generation = (
+            int(getattr(alloc, "generation", 0) or 0) if alloc is not None else 0
+        )
+        identity = [
+            (id(req), getattr(req, "req_pool_idx", None))
+            for req in lease_state.get("reqs") or []
+        ]
+        lease_state["alloc_generation"] = generation
+        lease_state["row_identity"] = identity
+        record.alloc_generation = generation
+        record.row_identity = identity
+        try:
+            event = lease_state.get("completion_event")
+            if event is None:
+                event = self._capture_abandon_event()
+                if event is not None:
+                    lease_state["completion_event"] = event
+            record.event = event
+            self._sr_last_abandon_has_event = event is not None
+        except BaseException:
+            record.event = None
+            self._sr_last_abandon_has_event = False
+        if len(bag.records) != before:
+            metrics = getattr(
+                getattr(self, "scheduler", None), "_sr_round_metrics", None
+            )
+            if metrics is not None:
+                metrics.counts["tree_lease_abandoned_pages"] += sum(
+                    int(slots.numel()) for slots in lease_state.get("page_slots") or []
+                )
+        # The quarantine record retains the lease. Do not also pin it here.
+        backend = getattr(self, "draft_attn_backend", None)
+        view = (
+            getattr(backend, "_sr_draft_paged_view", None)
+            if backend is not None
+            else None
+        )
+        if view is not None:
+            view.workspace.lease_hold = None
+
+    def _partition_abandoned_pages(self, record) -> None:
+        """Free abandoned KV by physical page.
+
+        ``page_size == 1`` keeps the slot-level split. A larger page is kept
+        or released as a whole: any committed-prefix slot on that page retains
+        it, and physical page 0 is never released. The same page is queued
+        once. A unit whose pages are all unreferenced stays the original
+        object. A failed release is left untouched.
+        """
+        from .sr_resource_quarantine import release_unknown
+
+        if release_unknown(record):
+            return
+        owner = record.owner
+        if not isinstance(owner, dict) or "mapping_snaps" not in owner:
+            return
+        pool = getattr(self, "req_to_token_pool", None)
+        mapping = getattr(pool, "req_to_token", None)
+        if mapping is None:
+            return
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        page_size = max(1, int(getattr(alloc, "page_size", 1) or 1))
+
+        def page_of(slot):
+            slot = int(slot)
+            return slot if page_size == 1 else slot // page_size
+
+        def flat_ids(unit):
+            if torch.is_tensor(unit):
+                return [int(x) for x in unit.detach().view(-1).tolist()]
+            return [int(x) for x in unit]
+
+        def take_ids(unit, ids):
+            if torch.is_tensor(unit):
+                return torch.tensor(ids, dtype=unit.dtype, device=unit.device)
+            return list(ids)
+
+        live_pages = {0}
+        width = int(mapping.shape[1])
+        starts = owner.get("starts") or []
+        for row, req in enumerate(owner.get("reqs") or []):
+            idx = getattr(req, "req_pool_idx", None)
+            if idx is None:
+                return
+            committed = getattr(req, "kv_committed_len", None)
+            if committed is None:
+                committed = int(starts[row]) if row < len(starts) else width
+            committed = max(0, min(int(committed), width))
+            if committed:
+                for slot in mapping[idx, :committed].detach().view(-1).tolist():
+                    live_pages.add(page_of(slot))
+        states = list(record.states)
+        if len(states) < len(record.units):
+            states.extend(["unsubmitted"] * (len(record.units) - len(states)))
+        unknown = []
+        releasable = []
+        retained = []
+        queued_pages = set()
+        for unit, state in zip(record.units, states):
+            if state == "unknown":
+                unknown.append(unit)
+                continue
+            if unit is None or state == "done":
+                continue
+            ids = flat_ids(unit)
+            drop = []
+            keep = []
+            for slot in ids:
+                page = page_of(slot)
+                if page in live_pages:
+                    keep.append(slot)
+                elif page in queued_pages:
+                    continue
+                else:
+                    drop.append(slot)
+            for slot in drop:
+                queued_pages.add(page_of(slot))
+            if keep and drop:
+                releasable.append(take_ids(unit, drop))
+                retained.append(take_ids(unit, keep))
+            elif drop:
+                releasable.append(unit)
+            elif keep:
+                retained.append(unit)
+        record.units = unknown + releasable + retained
+        record.states = (
+            ["unknown"] * len(unknown)
+            + ["unsubmitted"] * len(releasable)
+            + ["held"] * len(retained)
+        )
+
+    def _reclaim_abandoned_leases(self) -> int:
+        from .sr_resource_quarantine import quarantine
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        scheduler = getattr(self, "scheduler", None)
+        # A poisoned device still rejects new speculation, but a finished
+        # consumer can be rolled back. Skipping this reclaim would leave the
+        # request map pointing at pages the allocator is about to reuse.
+        bag = quarantine(self)
+        for record in list(bag.records):
+            event = record.event
+            # A missing event means the consumer may still be writing. Do not
+            # restore and do not free; poison stays set by the capture path.
+            if event is None:
+                record.completion_done = None
+                continue
+            try:
+                done = bool(event.query())
+            except BaseException as exc:
+                record.event = None
+                record.completion_done = None
+                if scheduler is not None:
+                    scheduler._sr_device_poisoned = True
+                raise SRTransferUnresolved(
+                    "quarantined KV completion unknown"
+                ) from exc
+            record.completion_done = done
+            if not done:
+                continue
+            if (
+                getattr(self, "_raw_cache_inflight", False)
+                and record.owner is getattr(self, "_raw_cache_owner", None)
+            ):
+                # This record's event is the shared cap's consumer. Clear
+                # inflight directly; a later private pack has already set
+                # ``_raw_cache_shared`` false, so note() must not decide.
+                self._raw_cache_inflight = False
+            owner = record.owner
+            if not isinstance(owner, dict) or "mapping_snaps" not in owner:
+                continue
+            from .sr_resource_quarantine import record_may_release
+
+            # No trusted speculative image, a failed release, or a stale
+            # generation/row: leave the pages quarantined.
+            if "spec_snaps" not in owner or not record_may_release(
+                record, self.token_to_kv_pool_allocator
+            ):
+                continue
+            if owner.get("mapping_restored"):
+                self._partition_abandoned_pages(record)
+                continue
+            try:
+                self._restore_abandoned_mapping(owner)
+                self._partition_abandoned_pages(record)
+            except BaseException as exc:
+                record.event = None
+                record.completion_done = None
+                if scheduler is not None:
+                    scheduler._sr_device_poisoned = True
+                raise SRTransferUnresolved(
+                    "abandoned tree mapping restore failed"
+                ) from exc
+            owner["mapping_restored"] = True
+        freed = bag.reclaim(self.token_to_kv_pool_allocator)
+        backend = getattr(self, "draft_attn_backend", None)
+        view = (
+            getattr(backend, "_sr_draft_paged_view", None)
+            if backend is not None
+            else None
+        )
+        if view is not None:
+            hold = getattr(view.workspace, "lease_hold", None)
+            if hold is not None and not any(r.owner is hold for r in bag.records):
+                view.workspace.lease_hold = None
+        return freed
+
     def _draft_forward(self, forward_batch: ForwardBatch):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import candidate_workspace
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            candidate_workspace,
+        )
 
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -1787,7 +2264,7 @@ class SRTreeDrafter:
         )
         rows = int(out_cache_loc.shape[1])
         candidates = getattr(self, "_capture_candidate_workspace", None)
-        if candidates is None:
+        if not getattr(self, "_capture_candidate_selected", False):
             candidates = candidate_workspace(self, forward_batch.batch_size, topk_p)
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         self._active_tree_kv_workspace = getattr(

@@ -59,19 +59,43 @@ def pack_accept(
     out[:bs, path_cap * 2 + 1] = err.any(dim=1).to(dtype=torch.int64)
 
 
+def owned_span(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor whose storage byte size matches its logical size.
+
+    A 1-D slice is contiguous, so ``contiguous()`` keeps the parent allocation.
+    NPU ``aclnnSort`` uses that parent element count as the source and the
+    logical length as the destination.
+    """
+    needed = tensor.numel() * tensor.element_size()
+    storage = tensor.untyped_storage()
+    if (
+        tensor.storage_offset() == 0
+        and tensor.is_contiguous()
+        and storage.nbytes() == needed
+    ):
+        return tensor
+    return tensor.clone()
+
+
 def gather_commit_slots(
     out_cache_loc: torch.Tensor,
     src_index: torch.Tensor,
     tgt_index: torch.Tensor,
     page_index: torch.Tensor,
     page_size: int,
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    pages: torch.Tensor,
 ):
     """Gather source slots, destination slots, and page ids of known lengths.
 
     Indexes are already on ``out_cache_loc``'s device. An empty page list does
-    not read cache slots. Each output owns independent, zero-offset storage.
-    Besides preserving results across rounds, this avoids passing a small tail
-    view of a larger allocation to NPU sort during page release.
+    not read cache slots. ``src``, ``tgt``, and ``pages`` are caller-owned
+    int64 buffers; this function does not allocate them. Returned prefixes are
+    the live lengths. ``pages`` must already have storage whose byte size
+    equals ``page_index.numel() * 8`` so NPU sort sees an exact descriptor.
+    ``src`` and ``tgt`` may be prefixes of a larger scratch and are invalid
+    after the next gather into that scratch.
     """
     cache = out_cache_loc.reshape(-1)
     n_out = int(src_index.numel())
@@ -92,23 +116,45 @@ def gather_commit_slots(
             or index.ndim != 1
         ):
             raise RuntimeError(f"fixed accept {name} must be int64 on the cache device")
-    src = torch.empty(n_out, dtype=torch.int64, device=cache.device)
-    tgt = torch.empty(n_tgt, dtype=torch.int64, device=cache.device)
-    pages = torch.empty(n_free, dtype=torch.int64, device=cache.device)
+    for name, buf, need in (
+        ("src", src, n_out),
+        ("tgt", tgt, n_tgt),
+        ("pages", pages, n_free),
+    ):
+        if (
+            buf.device != cache.device
+            or buf.dtype != torch.int64
+            or buf.ndim != 1
+            or not buf.is_contiguous()
+            or int(buf.numel()) < need
+        ):
+            raise RuntimeError(
+                f"fixed accept {name} output must be a contiguous int64 buffer"
+            )
+    src_out = src[:n_out]
+    tgt_out = tgt[:n_tgt]
+    page_out = pages[:n_free]
     if cache.device.type == "npu":
         from sglang.srt.speculative.standalone_remote import sr_small_kernels_npu
 
         # Logical indexes are range-checked on CPU while constructing the
         # commit packet; the device kernel never discovers output lengths.
         sr_small_kernels_npu.gather_commit_slots(
-            cache, src_index, tgt_index, page_index, int(page_size), src, tgt, pages
+            cache,
+            src_index,
+            tgt_index,
+            page_index,
+            int(page_size),
+            src_out,
+            tgt_out,
+            page_out,
         )
     else:
         if n_out:
-            src.copy_(cache.index_select(0, src_index))
-            tgt.copy_(cache.index_select(0, tgt_index))
+            src_out.copy_(cache.index_select(0, src_index))
+            tgt_out.copy_(cache.index_select(0, tgt_index))
         if n_free:
-            pages.copy_(
+            page_out.copy_(
                 cache.index_select(0, page_index).to(torch.int64) // int(page_size)
             )
-    return src, tgt, pages
+    return src_out, tgt_out, page_out

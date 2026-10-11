@@ -18,6 +18,7 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     SR_TARGET_TREE_FIA_ENV,
     SRTargetTreeFiaMetadata,
     TARGET_TREE_FIA_KV_ATTR,
+    assign_captured_lens,
     dense_target_tree_fia_reference,
     fill_target_tree_fia_metadata_,
     maybe_select_target_tree_fia,
@@ -353,6 +354,7 @@ class TestTargetTreeFiaLayout(CustomTestCase):
         pages = pages_for_s_cap(512, page)
         md = SRTargetTreeFiaMetadata.allocate(2, queries, pages, page, "cpu")
         ptrs = (md.block_tables.data_ptr(), md.blocked_mask.data_ptr())
+        kv_id, q_id = id(md.kv_lens_cpu), id(md.q_lens_cpu)
         table = _req_to_token([[3, 8], [1, 5, 9]], page)
         pool = torch.tensor([0, 1], dtype=torch.int64)
         for prefixes, raw_bs, pool_now in (
@@ -372,11 +374,23 @@ class TestTargetTreeFiaLayout(CustomTestCase):
             self.assertEqual(
                 (md.block_tables.data_ptr(), md.blocked_mask.data_ptr()), ptrs
             )
+            self.assertEqual(id(md.kv_lens_cpu), kv_id)
+            self.assertEqual(id(md.q_lens_cpu), q_id)
+            self.assertEqual(md.kv_lens_cpu[:raw_bs], [p + queries for p in prefixes])
+            self.assertTrue(all(v == 1 for v in md.kv_lens_cpu[raw_bs:]))
             if raw_bs == 1:
                 self.assertEqual(md.kv_lens_cpu[1], 1)
                 self.assertTrue((md.block_tables[1] == 0).all())
                 self.assertFalse(bool(md.blocked_mask[1, 0, 0, 0]))
                 self.assertTrue(bool(md.blocked_mask[1, 0, :, 1:].all()))
+
+    def test_length_mismatch_does_not_replace_captured_list(self):
+        md = SRTargetTreeFiaMetadata.allocate(2, 4, 2, 128, "cpu")
+        kv_id = id(md.kv_lens_cpu)
+        with self.assertRaises(ValueError):
+            assign_captured_lens(md.kv_lens_cpu, [1, 2, 3], "kv_lens_cpu")
+        self.assertEqual(id(md.kv_lens_cpu), kv_id)
+        self.assertEqual(md.kv_lens_cpu, [1, 1])
 
     def test_rejects_before_any_write(self):
         page = 128
@@ -545,7 +559,12 @@ class TestTargetTreeFiaWiring(CustomTestCase):
     def test_graph_runner_source_guards(self):
         one = _fn_source(_RUNNER, "NPUGraphRunner", "capture_one_batch_size")
         self.assertIn("_bind_target_tree_fia_payload", one)
-        self.assertIn("expand_fia_cpu_update_inputs", _fn_source(_RUNNER, "NPUGraphRunner", "_bind_target_tree_fia_payload"))
+        bind_payload = _fn_source(
+            _RUNNER, "NPUGraphRunner", "_bind_target_tree_fia_payload"
+        )
+        self.assertNotIn("expand_fia_cpu_update_inputs", bind_payload)
+        self.assertIn("kv_lens_cpu", bind_payload)
+        self.assertIn("q_lens_cpu", bind_payload)
         replay = _fn_source(_RUNNER, "NPUGraphRunner", "replay")
         self.assertIn("not compact_fia and not target_fia", replay)
         self.assertIn("_replay_target_tree_fia", replay)
@@ -559,11 +578,32 @@ class TestTargetTreeFiaWiring(CustomTestCase):
             target_call.find("_replay_target_tree_fia"),
         )
         submit = _fn_source(_RUNNER, "NPUGraphRunner", "_replay_target_tree_fia")
-        self.assertIn("_update_target_tree_fia_inputs", submit)
-        self.assertIn("overlap=False", submit)
-        self.assertIn("overlap=True", submit)
-        self.assertIn("torch.npu.set_device", submit)
+        self.assertIn("fill_fia_cpu_update_payload", submit)
+        self.assertIn("run_npu_graph_update_and_replay", submit)
+        self.assertIn("overlap=overlap", submit)
+        self.assertIn("runner_update_worker", submit)
+        self.assertIn("payload_fill", submit)
+        self.assertIn("update_call", submit)
+        self.assertIn("replay_call", submit)
+        self.assertIn("submit_envelope", submit)
         self.assertIn("prepare_submit", submit)
+        self.assertLess(submit.find("payload_fill"), submit.find("submit_envelope"))
+        body = submit.split('"""', 2)[-1]
+        self.assertLess(body.find("fill_fia_cpu_update_payload"), body.find("graph.update"))
+        self.assertNotIn("torch.npu.synchronize", submit)
+        self.assertNotIn("wait_stream", submit)
+        self.assertNotIn("update_stream.synchronize", submit)
+        bind = _fn_source(_RUNNER, "NPUGraphRunner", "_bind_target_tree_fia_payload")
+        self.assertNotIn("read_sr_target_shared_kv_env", bind)
+        self.assertNotIn("expand_fia_cpu_update_inputs", bind)
+        self.assertIn("kv_lens_cpu", bind)
+        self.assertIn("q_lens_cpu", bind)
+        enable = _fn_source(
+            _RUNNER, "NPUGraphRunner", "_maybe_enable_sr_target_update_overlap"
+        )
+        self.assertIn("_npu_sr_target_update_overlap = True", enable)
+        self.assertIn("current_device", enable)
+        self.assertNotIn("target tree FIA replay is serial", enable)
         init = _fn_source(_RUNNER, "NPUGraphRunner", "__init__")
         self.assertLess(
             init.find("_npu_sr_target_update_overlap = False"),
@@ -772,11 +812,19 @@ class TestTargetUpdateOverlapGate(CustomTestCase):
 
     def test_requested_sr_target_with_map_enables(self):
         runner = self._runner()
-        logs = self._enable(runner, True, lambda: 3)
+        seen = []
+
+        def current_device():
+            seen.append("device")
+            return 3
+
+        logs = self._enable(runner, True, current_device)
         self.assertTrue(runner._npu_sr_target_update_overlap)
         self.assertEqual(runner._npu_graph_device_id, 3)
+        self.assertEqual(seen, ["device"])
+        self.assertIn("requested=True", logs[0])
         self.assertIn("effective=True", logs[0])
-        self.assertIn("device=3", logs[0])
+        self.assertNotIn("reason=", logs[0])
 
     def test_unrequested_stays_off_without_log(self):
         runner = self._runner()
@@ -802,17 +850,21 @@ class TestTargetUpdateOverlapGate(CustomTestCase):
         runner = self._runner()
 
         def boom():
-            raise RuntimeError("no device")
-
-        logs = self._enable(runner, True, boom)
-        self.assertFalse(runner._npu_sr_target_update_overlap)
-        self.assertIn("current_device failed", logs[0])
-
-        def poisoned():
             raise _NPUError("poison")
 
         with self.assertRaises(_NPUError):
-            self._enable(runner, True, poisoned)
+            self._enable(runner, True, boom)
+        self.assertFalse(runner._npu_sr_target_update_overlap)
+        self.assertIsNone(runner._npu_graph_device_id)
+
+        def ordinary():
+            raise RuntimeError("no device")
+
+        logs = self._enable(runner, True, ordinary)
+        self.assertFalse(runner._npu_sr_target_update_overlap)
+        self.assertIsNone(runner._npu_graph_device_id)
+        self.assertIn("effective=False", logs[0])
+        self.assertIn("current_device failed", logs[0])
 
 
 class TestPrimeCapture(CustomTestCase):

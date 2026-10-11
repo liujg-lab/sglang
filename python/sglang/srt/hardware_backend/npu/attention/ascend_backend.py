@@ -44,11 +44,12 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     kv_buckets_to_page_buckets,
     make_dummy_block_tables,
     max_query_pages_for_tree,
+    paged_draft_step_context,
     prepare_tree_paged_view,
+    select_draft_page_bucket,
     quantize_page_width,
     read_sr_tree_paged_env,
     resolve_eager_page_buckets,
-    select_page_bucket,
 )
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
@@ -999,26 +1000,26 @@ class AscendAttnBackend(AttentionBackend):
                         else seq
                     )
                 ][: int(getattr(forward_batch, "batch_size", len(seq)))]
-            needed_pages = max(
-                max_query_pages_for_tree(
-                    prefixes, self.draft_num_steps, self.page_size
-                )
-                or [1]
+            chosen = select_draft_page_bucket(
+                prefixes,
+                self.draft_num_steps,
+                self.page_size,
+                kv_buckets=buckets,
+                max_pages=getattr(self, "_paged_graph_max_pages", None),
             )
-            page_buckets = (
-                kv_buckets_to_page_buckets(buckets, self.page_size)
-                if buckets
-                else None
-            )
-            if not page_buckets:
-                max_pages = getattr(self, "_paged_graph_max_pages", None)
-                if max_pages is not None:
-                    page_buckets = [max(int(max_pages), 1)]
-            if not page_buckets:
-                self._replay_tree_s_cap = None
-                return False
-            chosen = select_page_bucket(needed_pages, page_buckets)
             if chosen is None:
+                page_buckets = (
+                    kv_buckets_to_page_buckets(buckets, self.page_size)
+                    if buckets
+                    else None
+                )
+                if not page_buckets:
+                    max_pages = getattr(self, "_paged_graph_max_pages", None)
+                    if max_pages is not None:
+                        page_buckets = [max(int(max_pages), 1)]
+                if not page_buckets:
+                    self._replay_tree_s_cap = None
+                    return False
                 self.tree_capacity_fallback_count += 1
                 self._log_tree_fallback_once(
                     "capacity",
@@ -2571,7 +2572,9 @@ class AscendAttnBackend(AttentionBackend):
                 atten_mask=None,
                 block_size=self.page_size,
                 block_table=metadata.block_tables,
-                actual_seq_lengths_kv=metadata.context_lens_list,
+                # Same storage the replay plan fills before the graph runs.
+                # A captured Python list stays at the prefix-0 lengths.
+                actual_seq_lengths_kv=metadata.context_lens_cpu,
                 scale=layer.scaling,
             )
         else:
@@ -2627,7 +2630,9 @@ class AscendAttnBackend(AttentionBackend):
                 atten_mask=None,
                 block_size=self.page_size,
                 block_table=metadata.block_tables,
-                actual_seq_lengths_kv=metadata.context_lens_list,
+                # Same storage ``fill_tail_attention_metadata_`` updates before
+                # replay. A captured Python list stays at the prefix-0 lengths.
+                actual_seq_lengths_kv=metadata.context_lens_cpu,
                 scale=layer.scaling,
             )
         else:
@@ -4638,8 +4643,41 @@ class AscendAttnMultiStepDraftBackend:
                 raise NpuGraphPreparationError(
                     "paged metadata replay storage mismatch", scope="graph"
                 )
-            # Already filled directly in the captured outputs. CPU step lengths
-            # were bound during preparation; no clear/copy/second upload here.
+            # Block tables were filled during preparation. Refresh CPU step
+            # lengths here; capture left them as ones, and a second upload of
+            # the tables is not needed.
+            n_rows = int(tables.shape[0])
+            for inner in self.attn_backends:
+                meta = getattr(inner, "_sr_tree_paged_meta", None)
+                if meta is None:
+                    raise NpuGraphPreparationError(
+                        "paged replay missing captured context lengths",
+                        scope="graph",
+                    )
+                values = paged_draft_step_context(
+                    p.prefixes,
+                    int(p.topk),
+                    int(inner.speculative_step_id),
+                    int(p.steps),
+                    n_rows,
+                )
+                dest = meta.context_lens_list
+                cpu = meta.context_lens_cpu
+                cpu_n = int(cpu.numel()) if torch.is_tensor(cpu) else None
+                if (
+                    not isinstance(dest, list)
+                    or len(dest) != len(values)
+                    or not torch.is_tensor(cpu)
+                    or cpu_n != len(values)
+                ):
+                    raise NpuGraphPreparationError(
+                        "paged replay context length storage "
+                        f"list={len(dest) if isinstance(dest, list) else None} "
+                        f"tensor={cpu_n} != {len(values)}",
+                        scope="graph",
+                    )
+                dest[:] = values
+                cpu.copy_(torch.tensor(values, dtype=cpu.dtype))
             return
         (
             prefix,

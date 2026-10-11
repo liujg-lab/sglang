@@ -470,8 +470,14 @@ def fill_target_paged_metadata_(md, mapping, pool, mask, plan, dummy=0):
         raise SRPagedMetadataSubmittedError(
             "target paged metadata kernel failed"
         ) from exc
-    md.kv_lens_cpu = list(plan.kv_lens)
-    md.q_lens_cpu = [plan.queries] * plan.capacity
+    from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+        assign_captured_lens,
+    )
+
+    assign_captured_lens(md.kv_lens_cpu, plan.kv_lens, "kv_lens_cpu")
+    assign_captured_lens(
+        md.q_lens_cpu, [plan.queries] * plan.capacity, "q_lens_cpu"
+    )
 
 
 def fill_draft_paged_metadata_(view, mapping, pool, slots, plan, dummy=0):

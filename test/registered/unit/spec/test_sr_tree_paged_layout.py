@@ -29,6 +29,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     build_step_context_lens,
     context_lens_list,
     fill_active_rows,
+    captured_paged_cpu_update_payload,
     fill_paged_cpu_update_payload,
     fill_prefix_tail_copy_slots,
     kv_buckets_to_page_buckets,
@@ -1066,6 +1067,43 @@ class TestPagedGraphRecords(CustomTestCase):
         self.assertEqual(n_sh, [0])
         self.assertEqual(tuple(shared.shape), (1, 0))
 
+    def test_captured_payload_aliases_context_lens_and_second_fill(self):
+        rows = 4
+        step0 = torch.ones((rows,), dtype=torch.int32)
+        step1 = torch.ones((rows,), dtype=torch.int32)
+        backends = [
+            SimpleNamespace(
+                _sr_tree_paged_meta=SimpleNamespace(context_lens_cpu=step0)
+            ),
+            SimpleNamespace(
+                _sr_tree_paged_meta=SimpleNamespace(context_lens_cpu=step1)
+            ),
+        ]
+        payload = captured_paged_cpu_update_payload(
+            backends, [0, 0, 1, 1], "actual_seq_lengths_kv"
+        )
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], step0)
+        self.assertIs(payload[1]["actual_seq_lengths_kv"], step0)
+        self.assertIs(payload[2]["actual_seq_lengths_kv"], step1)
+        self.assertIs(payload[3]["actual_seq_lengths_kv"], step1)
+        fill_paged_cpu_update_payload(
+            payload,
+            [[2, 3, 4, 5], [6, 7, 8, 9]],
+            [0, 0, 1, 1],
+            "actual_seq_lengths_kv",
+        )
+        self.assertEqual(step0.tolist(), [2, 3, 4, 5])
+        self.assertEqual(step1.tolist(), [6, 7, 8, 9])
+        fill_paged_cpu_update_payload(
+            payload,
+            [[9, 8, 7, 6], [1, 1, 1, 1]],
+            [0, 0, 1, 1],
+            "actual_seq_lengths_kv",
+        )
+        self.assertEqual(step0.tolist(), [9, 8, 7, 6])
+        self.assertEqual(step1.tolist(), [1, 1, 1, 1])
+        self.assertIs(payload[0]["actual_seq_lengths_kv"], step0)
+
 
 class TestSourceGuards(CustomTestCase):
     def test_bind_validates_before_buffer_write(self):
@@ -1075,14 +1113,17 @@ class TestSourceGuards(CustomTestCase):
         self.assertNotIn("or []", validate_src)
         self.assertNotIn("rows = min", bind_src)
         self.assertNotIn("cols = min", bind_src)
-        self.assertLess(
-            bind_src.find("_validate_sr_tree_paged_replay"),
-            bind_src.find("fill_"),
+        view_src, fallback_src = bind_src.split(
+            "_validate_sr_tree_paged_replay", 1
         )
         self.assertLess(
-            bind_src.find("_validate_sr_tree_paged_replay"),
-            bind_src.find("copy_"),
+            view_src.find("paged replay context length storage"),
+            view_src.find("dest[:]"),
         )
+        self.assertLess(view_src.find("dest[:]"), view_src.find("cpu.copy_"))
+        self.assertGreater(fallback_src.find("fill_"), 0)
+        self.assertGreater(fallback_src.find("copy_"), 0)
+        self.assertLess(fallback_src.find("fill_"), fallback_src.find("copy_"))
         for banned in (".cpu()", ".item()", ".tolist()"):
             self.assertNotIn(banned, validate_src)
         replay_src = _fn_source(_RUNNER, "replay")
@@ -1225,15 +1266,9 @@ class TestSourceGuards(CustomTestCase):
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
         self.assertIn('not getattr(runner, "_tree_paged", False)', can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
-        self.assertIn(
-            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
-            batch_src,
-        )
+        self.assertIn("SRTransferUnresolved", batch_src)
         one_src = _fn_source(_DRAFTER, "_expand_one")
-        self.assertIn(
-            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
-            one_src,
-        )
+        self.assertIn("SRTransferUnresolved", one_src)
         ctor_src = _fn_source(_DRAFTER, "__init__")
         self.assertIn("read_sr_tree_update_overlap_env", ctor_src)
         self.assertLess(
@@ -1244,6 +1279,73 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("_try_confirm_tree_completion", expand_src)
         confirm_src = _fn_source(_DRAFTER, "_try_confirm_tree_completion")
         self.assertIn("synchronize()", confirm_src)
+
+    def test_expand_batch_reraises_unresolved_without_per_request_retry(self):
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        tree = ast.parse(_DRAFTER.read_text(encoding="utf-8"))
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "SRTreeDrafter"
+        )
+        methods = [
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in ("expand_batch", "_expand_one")
+        ]
+        probe_cls = ast.ClassDef(
+            name="Probe",
+            bases=[],
+            keywords=[],
+            body=methods,
+            decorator_list=[],
+        )
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        ns = dict(
+            NpuGraphReplaySubmittedError=type("GraphError", (RuntimeError,), {}),
+            SRTransferUnresolved=SRTransferUnresolved,
+            is_device_context_error=lambda e: False,
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[future, probe_cls], type_ignores=[])
+                ),
+                str(_DRAFTER),
+                "exec",
+            ),
+            ns,
+        )
+        error = SRTransferUnresolved("uncertain completion")
+        calls = []
+
+        class Drafter(ns["Probe"]):
+            def _stack_seeds(self, reqs):
+                return (None, None, None, None)
+
+            def _expand_tree(self, reqs, *seeds):
+                calls.append(len(reqs))
+                raise error
+
+            def _log_tree_failure(self, *args):
+                raise AssertionError("must not be treated as recoverable")
+
+        reqs = [SimpleNamespace(req_pool_idx=i, sr_tree_seed=object()) for i in range(3)]
+        for run in (
+            lambda d: d.expand_batch(reqs),
+            lambda d: d._expand_one(reqs[0]),
+        ):
+            calls.clear()
+            with self.assertRaises(SRTransferUnresolved) as raised:
+                run(Drafter())
+            self.assertIs(raised.exception, error)
+            self.assertEqual(len(calls), 1)
 
     def test_does_not_call_build_tree_draft_block_tables_for_paged(self):
         init_src = _fn_source(_BACKEND, "init_forward_metadata")
@@ -2036,6 +2138,98 @@ class TestSRWarmup(CustomTestCase):
         )
         self.assertIn('coverage["unreachable_jump"] = True', src)
         self.assertNotIn('coverage["skipped"] = "unreachable', src)
+
+    def test_warmup_host_span_methods_reuse_captured_buffers(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            record_device_event,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_warmup import (
+            SRDraftWarmupHost,
+            _SPAN_METHOD_NAMES,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        names = {
+            "_span_reusable",
+            "_wait_span_consumer",
+            "_grow_span_cap",
+            "_note_span_consumer",
+            "_pack_device_rows",
+        }
+        tree = ast.parse(_DRAFTER.read_text(encoding="utf-8"))
+        klass = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "SRTreeDrafter"
+        )
+        nodes = []
+        for node in klass.body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                node = ast.fix_missing_locations(node)
+                node.body = [
+                    stmt
+                    for stmt in node.body
+                    if not isinstance(stmt, (ast.Import, ast.ImportFrom))
+                ]
+                nodes.append(node)
+        self.assertEqual({n.name for n in nodes}, names)
+        ns = {
+            "torch": torch,
+            "SRTransferUnresolved": SRTransferUnresolved,
+            "record_device_event": record_device_event,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=nodes, type_ignores=[])
+                ),
+                str(_DRAFTER),
+                "exec",
+            ),
+            ns,
+        )
+        drafter = SimpleNamespace(
+            page_size=128,
+            topk=3,
+            speculative_num_steps=5,
+            device=torch.device("cpu"),
+        )
+        host = SRDraftWarmupHost(
+            drafter, None, None, None, lease_supported=True
+        )
+        for name in _SPAN_METHOD_NAMES:
+            self.assertTrue(callable(getattr(SRDraftWarmupHost, name)), name)
+        for name in (
+            "_lease_supported",
+            "_try_alloc_lease_tree_kv",
+            "_alloc_tree_kv",
+            "_apply_tree_mapping",
+            "_restore_tree_mapping",
+            "_free_lease_alloc",
+        ):
+            self.assertTrue(callable(getattr(SRDraftWarmupHost, name)), name)
+        for name in names:
+            setattr(host, name, MethodType(ns[name], host))
+        self.assertTrue(host._span_reusable("extend_lens"))
+        host._note_span_consumer("extend_lens", "num_new_pages_per_topk")
+        self.assertIn("extend_lens", host._span_events)
+        self.assertIn("num_new_pages_per_topk", host._span_events)
+        packed, views, shared = host._pack_device_rows(
+            "raw_cache_loc",
+            [torch.tensor([4, 5, 6], dtype=torch.int64)],
+            torch.device("cpu"),
+        )
+        self.assertTrue(shared)
+        self.assertEqual(packed.tolist(), [4, 5, 6])
+        self.assertEqual(views[0].tolist(), [4, 5, 6])
+        self.assertEqual(
+            packed.untyped_storage().data_ptr(),
+            views[0].untyped_storage().data_ptr(),
+        )
+        host._span_hold["mapping_snap"] = {"mapping_restored": False}
+        self.assertFalse(host._span_reusable("mapping_snap"))
 
 
 if __name__ == "__main__":

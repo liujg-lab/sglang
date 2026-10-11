@@ -18,7 +18,6 @@ from __future__ import annotations
 import bisect
 import logging
 import os
-import threading
 from typing import TYPE_CHECKING, Callable, Dict, Union
 
 import torch
@@ -49,6 +48,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     IMPL_PAGED_ATB,
     IMPL_PAGED_FIA,
     build_step_context_lens,
+    captured_paged_cpu_update_payload,
     context_lens_list,
     fill_paged_cpu_update_payload,
     kv_buckets_to_page_buckets,
@@ -646,18 +646,17 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 n_records, step_ids = validate_tree_draft_fia_records(
                     records, n_steps, num_layers, self.update_attr_name
                 )
-            n_lens = int(num_seqs) * max(int(self.topk), 1)
-            placeholder = [1] * n_lens
-            step_lens_list = [list(placeholder) for _ in range(n_steps)]
-            if getattr(self, "_tree_paged", False) and impl == IMPL_PAGED_ATB:
-                payload = [
-                    {
-                        "context_lens": torch.ones((n_lens,), dtype=torch.int32)
-                    }
-                    for step_lens in step_lens_list
-                    for _ in range(num_layers)
-                ]
+            if getattr(self, "_tree_paged", False):
+                try:
+                    payload = captured_paged_cpu_update_payload(
+                        inners, step_ids, self.update_attr_name
+                    )
+                except ValueError as e:
+                    raise NpuGraphPreparationError(str(e), scope="graph") from e
             else:
+                n_lens = int(num_seqs) * max(int(self.topk), 1)
+                placeholder = [1] * n_lens
+                step_lens_list = [list(placeholder) for _ in range(n_steps)]
                 payload = expand_fia_cpu_update_inputs(
                     step_lens_list, num_layers, self.update_attr_name
                 )
@@ -1013,6 +1012,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         payload, step_lens_list, fia_map["step_ids"], attr_name
                     )
 
+            def _call_replay():
+                if sample is None:
+                    graph.replay()
+                else:
+                    measure_call(sample, "replay_call", graph.replay)
+
             _measure("payload_fill", _fill_payload)
             log_key = graph_key
             if log_key not in self._logged_tree_fia_update_bs:
@@ -1042,31 +1047,20 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         lambda: graph.update(cpu_update_input=payload),
                     )
 
-            def _call_replay():
-                if sample is None:
-                    graph.replay()
-                else:
-                    measure_call(sample, "replay_call", graph.replay)
+            from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+                runner_update_worker,
+            )
 
-            from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
             update_worker = runner_update_worker(self, sr_paged_overlap)
-            if sample is None:
-                run_npu_graph_update_and_replay(
+            _measure(
+                "submit_envelope",
+                lambda: run_npu_graph_update_and_replay(
                     _call_update,
                     _call_replay,
                     overlap=overlap,
                     update_worker=update_worker,
-                )
-            else:
-                _measure(
-                    "submit_envelope",
-                    lambda: run_npu_graph_update_and_replay(
-                        _call_update,
-                        _call_replay,
-                        overlap=overlap,
-                        update_worker=update_worker,
-                    ),
-                )
+                ),
+            )
             self.tree_graph_replay_count += 1
             if self.tree_graph_replay_count == 1 or self.tree_graph_replay_count % 32 == 0:
                 logger.info(

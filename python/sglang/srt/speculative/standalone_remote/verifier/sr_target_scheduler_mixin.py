@@ -172,6 +172,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         self.sr_rpc_seq = 0
         self.sr_pending = {}
         self._sr_inflight = None
+        self._sr_finish_pending = []
         self.sr_speculation_stopped = False
         self.sr_seen_generation = None
         client = getattr(self, "sr_client", None)
@@ -221,6 +222,9 @@ class SchedulerStandaloneRemoteTargetMixin:
             for req in getattr(batch, "reqs", None) or []:
                 if req is not None and not _is_health_check(req):
                     found.append(req)
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and not _is_health_check(chunked):
+            found.append(chunked)
         return found
 
     def _sr_sync_connection(self) -> None:
@@ -551,9 +555,13 @@ class SchedulerStandaloneRemoteTargetMixin:
             return {}
         if getattr(self, "sr_speculation_stopped", False):
             return {}
-        live = [req for req in reqs if not getattr(req, "sr_stop_spec", False)]
+        live = [
+            req for req in reqs if getattr(req, "sr_stop_spec", False) is not True
+        ]
         if not live:
             return {}
+        # This RPC does not update the target graph. Lengths are still written
+        # by graph.update immediately before replay.
         replies = self._sr_rpc(SRAction.STEP, live, include_full_context=False)
         if getattr(self, "sr_speculation_stopped", False):
             return {}
@@ -578,7 +586,44 @@ class SchedulerStandaloneRemoteTargetMixin:
     def notify_sr_draft_finished(self, req: Req, action: SRAction = SRAction.FINISH) -> None:
         if _is_health_check(req):
             return
-        self._sr_rpc(action, [req], include_full_context=False)
+        if action != SRAction.FINISH:
+            self._sr_send(action, [req], include_full_context=False)
+            return
+        pending = getattr(self, "_sr_finish_pending", None)
+        if pending is None:
+            self._sr_finish_pending = pending = []
+        pending.append(req)
+
+    def _sr_flush_finish_notifications(self) -> None:
+        pending = getattr(self, "_sr_finish_pending", None) or []
+        if not pending:
+            return
+        self._sr_finish_pending = []
+        self._sr_send(SRAction.FINISH, pending, include_full_context=False)
+
+    def _sr_draft_was_sent(self, req: Req) -> bool:
+        return getattr(req, "sr_sent_commit_version", None) is not None
+
+    def notify_sr_draft_aborted(self, reqs: List[Req]) -> None:
+        """One ABORT for every rid whose PREFILL/STEP already reached Draft."""
+        live: List[Req] = []
+        seen = set()
+        for req in reqs:
+            if req is None or _is_health_check(req) or req.rid in seen:
+                continue
+            if not self._sr_draft_was_sent(req):
+                continue
+            seen.add(req.rid)
+            live.append(req)
+        if live:
+            self._sr_send(SRAction.ABORT, live, include_full_context=False)
+
+    def notify_sr_draft_aborted_active(self) -> None:
+        reqs: List[Req] = []
+        waiting = getattr(self, "waiting_queue", None) or []
+        reqs.extend(waiting)
+        reqs.extend(self._sr_active_reqs())
+        self.notify_sr_draft_aborted(reqs)
 
     def _sr_shift_prefill_replies(
         self, reqs: List[Req], replies: Dict[str, SRDraftReply]
@@ -648,13 +693,13 @@ class SchedulerStandaloneRemoteTargetMixin:
         return current_bsz > self.server_args.standalone_remote_max_batch_size
 
     def _sr_skip_draft_rpc(self, batch: ScheduleBatch) -> bool:
-        if self._sr_is_high_overhead(batch):
-            return True
+        # High batch size used to return before the breaker saw the skipped
+        # step, so OPEN never reached HALF_OPEN while the batch stayed large.
         breaker = getattr(self, "sr_breaker", None)
         if breaker is not None and not breaker.should_send():
             breaker.note_skipped_step()
             return True
-        return False
+        return self._sr_is_high_overhead(batch)
 
     def _sr_chain_mode(self) -> bool:
         return int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1) <= 1

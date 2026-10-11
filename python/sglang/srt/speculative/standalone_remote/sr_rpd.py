@@ -140,6 +140,10 @@ def build_sr_rpd_input(
     sibling = torch.full_like(nxt, -1)
     for b, (pp, ss) in enumerate(zip(parents.tolist(), selected.tolist())):
         parent_of = [-1] * width
+        pos_of = {}
+        for node_i, node in enumerate(ss):
+            if node not in pos_of:
+                pos_of[node] = node_i
         for i in range(width - 1, 0, -1):
             if ss[i - 1] < 0:
                 return None
@@ -148,10 +152,10 @@ def build_sr_rpd_input(
             if parent_tb > 0:
                 if parent_tb >= len(pp):
                     return None
-                try:
-                    pos = ss.index(pp[parent_tb]) + 1
-                except ValueError:
+                found = pos_of.get(pp[parent_tb])
+                if found is None:
                     continue
+                pos = found + 1
             parent_of[i] = pos
             sibling[b, i] = nxt[b, pos]
             nxt[b, pos] = i
@@ -364,6 +368,21 @@ class SRRPDWorkspace:
         return host_star.reshape(bs, width), host_stats if edges else None
 
 
+def _host_array(value):
+    """Host array for selection. Avoids a nested Python ``tolist`` copy.
+
+    bfloat16 has no NumPy scalar type here. It is the high 16 bits of float32,
+    so the cast matches the Python ``float()`` values used by selection.
+    """
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.dtype == torch.bfloat16:
+            value = value.to(torch.float32)
+        return value.detach().cpu().contiguous().numpy()
+    return value
+
+
 def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
     """Consume a prepared context once, returning no intermediate device output."""
     gap = rpd_gap_max(tau)
@@ -376,8 +395,8 @@ def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
     star, stats = workspace.statistics(logits, context)
     rows, lengths, folded = _rpd_select_host(
         context.topology,
-        star.tolist(),
-        None if stats is None else stats.tolist(),
+        _host_array(star),
+        None if stats is None else _host_array(stats),
         gap,
         float(tau) == 0.0,
         path_cap,

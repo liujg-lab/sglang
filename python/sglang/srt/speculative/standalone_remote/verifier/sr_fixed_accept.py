@@ -222,7 +222,11 @@ def apply_free_unique_pages(allocator, page_ids: torch.Tensor) -> None:
         return
     if not bool(getattr(allocator, "is_not_in_free_group", False)):
         raise RuntimeError("free_unique_pages is forbidden inside a free group")
-    sorted_pages, _ = torch.sort(page_ids)
+    from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept_kernels import (
+        owned_span,
+    )
+
+    sorted_pages, _ = torch.sort(owned_span(page_ids))
     if allocator.need_sort:
         sorted_pages = sorted_pages.to(dtype=allocator.release_pages.dtype)
         allocator.release_pages = torch.cat((sorted_pages, allocator.release_pages))
@@ -566,6 +570,19 @@ class SRFixedAcceptState:
         self.index_buf = torch.empty(
             (self.N_cap,), dtype=torch.int64, device=self.device
         )
+        slot_cap = self.B_cap * self.W
+        # Slot gathers write these prefixes and consume them before the next
+        # gather. out_cache_buf is a separate stable cache-loc buffer.
+        self.slot_src_scratch = torch.empty(
+            (slot_cap,), dtype=torch.int64, device=self.device
+        )
+        self.slot_tgt_scratch = torch.empty(
+            (slot_cap,), dtype=torch.int64, device=self.device
+        )
+        self.out_cache_buf = torch.empty(
+            (slot_cap,), dtype=torch.int64, device=self.device
+        )
+        self._page_exact = None
         self._staging_noted = False
         self._d2h_count = 0
         self._h2d_count = 0
@@ -692,6 +709,25 @@ class SRFixedAcceptState:
         accept_length.zero_()
         return predict, accept_index, accept_length
 
+    def _exact_pages(self, n_free: int):
+        """Page ids whose storage byte size equals the live length.
+
+        NPU sort reads that storage size. Reallocate only when the length
+        changes; a same-length round copies into the existing buffer.
+        """
+        n_free = int(n_free)
+        buf = self._page_exact
+        if (
+            buf is None
+            or int(buf.numel()) != n_free
+            or buf.dtype != torch.int64
+            or buf.device != self.device
+        ):
+            buf = torch.empty(n_free, dtype=torch.int64, device=self.device)
+            self._page_exact = buf
+            return buf, True
+        return buf, False
+
     def warmup_scratch(self, kv_pool=None) -> None:
         """Warm accept packing and production KV geometry using private storage."""
         bs = 1
@@ -738,8 +774,16 @@ class SRFixedAcceptState:
                 page_index = torch.tensor(
                     [7, 1, 4][:f], dtype=torch.int64, device=self.device
                 )
+                pages, _ = self._exact_pages(f)
                 src, dst, pages = self.kernels.gather_commit_slots(
-                    cache, index, index, page_index, self.page_size
+                    cache,
+                    index,
+                    index,
+                    page_index,
+                    self.page_size,
+                    self.slot_src_scratch,
+                    self.slot_tgt_scratch,
+                    pages,
                 )
                 for need_sort in (False, True):
                     # Never borrow the live allocator's free/release lists.
@@ -1118,20 +1162,36 @@ class SRFixedAcceptState:
             raise RuntimeError("fixed accept commit packet exceeds capacity")
 
         def _fill_packet():
-            flat = (
-                src_index
-                + tgt_index
-                + page_index
-                + verified_values
-                + [int(count) for count in accepted]
-                + unfinished
+            parts = (
+                src_index,
+                tgt_index,
+                page_index,
+                verified_values,
+                [int(count) for count in accepted],
+                unfinished,
             )
-            if len(flat) != layout.used:
+            used = layout.used
+            if sum(len(part) for part in parts) != used:
                 raise RuntimeError("fixed accept packet length mismatch")
-            if flat:
-                self.commit_host[: layout.used].copy_(
-                    torch.tensor(flat, dtype=torch.int64)
-                )
+            if used == 0:
+                return
+            host = self.commit_host[:used]
+            try:
+                arr = host.numpy()
+            except Exception:
+                arr = None
+            if arr is None:
+                flat = []
+                for part in parts:
+                    flat.extend(part)
+                host.copy_(torch.tensor(flat, dtype=torch.int64))
+                return
+            cursor = 0
+            for part in parts:
+                n = len(part)
+                if n:
+                    arr[cursor : cursor + n] = part
+                cursor += n
 
         _timed(self.metrics, "fixed_accept_packet_cpu", _fill_packet, device=False)
         if self.inject_error == "h2d_submit":
@@ -1144,6 +1204,9 @@ class SRFixedAcceptState:
                 device=False,
             )
         packet = self.commit_device
+        if compact > self.slot_src_scratch.numel():
+            raise RuntimeError("fixed accept slot gather exceeds scratch")
+        page_buf, page_alloc = self._exact_pages(n_free)
         src, tgt, pages = _timed(
             self.metrics,
             "fixed_accept_slot_gather",
@@ -1153,14 +1216,16 @@ class SRFixedAcceptState:
                 packet[layout.tgt : layout.page],
                 packet[layout.page : layout.tokens],
                 self.page_size,
+                self.slot_src_scratch,
+                self.slot_tgt_scratch,
+                page_buf,
             ),
             device=True,
         )
         if int(pages.numel()) != n_free:
             raise RuntimeError("fixed accept page count mismatch")
-        self._count(
-            "fixed_accept_slot_output_alloc", 2 * int(compact > 0) + int(n_free > 0)
-        )
+        if page_alloc:
+            self._count("fixed_accept_slot_output_alloc")
         self._count("fixed_accept_slot_output_bytes", (2 * compact + n_free) * 8)
         if self.device.type == "npu" and compact + n_free:
             self._count("fixed_accept_slot_kernel_calls")
@@ -1183,7 +1248,9 @@ class SRFixedAcceptState:
 
         if src.numel() > 0:
             move_kv_slots_(workspace, src, tgt)
-        allocator.free_unique_pages(pages)
+        # pages aliases the reusable page buffer. Free must keep its own copy
+        # so the next gather cannot change which pages this round releases.
+        allocator.free_unique_pages(pages.clone())
         return result
 
     def _submit_commit_packet(self, used: int) -> None:
@@ -1246,6 +1313,7 @@ class SRFixedAcceptState:
         if mode == "all":
             batch.seq_lens.add_(counts_dev.to(dtype=batch.seq_lens.dtype))
             batch.seq_lens_cpu.add_(counts_host.to(dtype=batch.seq_lens_cpu.dtype))
+            _bump_seq_lens_sum(batch, sum(int(count) for count in accepted))
         verified = token_dev.to(dtype=torch.int32)
         flat_index = src_index_dev.clone()
         unfinished = [i for i, flag in enumerate(finished) if not flag]
@@ -1259,7 +1327,7 @@ class SRFixedAcceptState:
             draft_req = None
             returned_cpu = list(accept_length_list)
         elif len(unfinished) == len(finished):
-            batch.out_cache_loc = tgt
+            batch.out_cache_loc = self._stage_out_cache(tgt)
             draft_verified = verified
             draft_length = length_tensor
             draft_length_cpu = list(accept_length_list)
@@ -1268,17 +1336,11 @@ class SRFixedAcceptState:
             draft_req = batch.req_pool_indices.clone()
             returned_cpu = draft_length_cpu
         else:
-            pieces = []
-            cursor = 0
-            unfinished_set = set(unfinished)
-            for i, count in enumerate(accepted):
-                if i in unfinished_set:
-                    pieces.append(tgt[cursor : cursor + int(count)])
-                cursor += int(count)
-            batch.out_cache_loc = torch.cat(pieces) if pieces else tgt[:0]
-            draft_verified = _select_rows(
-                verified, accepted, unfinished, verified.device
+            kept = sum(int(accepted[i]) for i in unfinished)
+            batch.out_cache_loc = compact_kept_slots(
+                tgt, counts_dev, unfinished_dev, self.out_cache_buf, kept
             )
+            draft_verified = _select_rows(verified, accepted, unfinished, verified.device)
             draft_length = length_tensor.index_select(0, unfinished_dev)
             draft_length_cpu = [accept_length_list[i] for i in unfinished]
             draft_seq = batch.seq_lens.index_select(0, unfinished_dev)
@@ -1300,6 +1362,71 @@ class SRFixedAcceptState:
             idle=idle,
             logits_output=logits_output,
         )
+
+    def _stage_out_cache(self, tgt: torch.Tensor) -> torch.Tensor:
+        """Copy live destination slots, then return storage the next commit cannot overwrite."""
+        total = int(tgt.numel())
+        if total > self.out_cache_buf.numel():
+            raise RuntimeError("fixed accept kept slots exceed out_cache_buf")
+        if total:
+            self.out_cache_buf[:total].copy_(tgt)
+        # The next commit overwrites out_cache_buf. The batch must keep a copy.
+        return self.out_cache_buf[:total].clone()
+
+
+def _bump_seq_lens_sum(batch, delta: int) -> None:
+    """Keep the Python length sum next to an in-place ``seq_lens_cpu`` update."""
+    current = getattr(batch, "seq_lens_sum", None)
+    if isinstance(current, int):
+        batch.seq_lens_sum = current + int(delta)
+
+
+def compact_kept_slots(
+    values: torch.Tensor,
+    counts: torch.Tensor,
+    unfinished_index: torch.Tensor,
+    out: torch.Tensor,
+    total: int,
+) -> torch.Tensor:
+    """Write unfinished packed segments into ``out[:total]``.
+
+    ``counts`` is the per-request packed length. ``total`` is the host sum of
+    the kept counts, so this does not read a device reduction back to decide
+    the output length. ``out`` is only the gather destination. The returned
+    tensor is a clone, so the next commit can reuse ``out``.
+    """
+    total = int(total)
+    if total < 0 or total > int(out.numel()):
+        raise RuntimeError("fixed accept kept slots exceed out_cache_buf")
+    if values.device != out.device:
+        raise RuntimeError("fixed accept out_cache_buf device mismatch")
+    if total == 0:
+        return out[:0].clone()
+    counts = counts.to(dtype=torch.int64).reshape(-1)
+    if counts.device != values.device:
+        counts = counts.to(device=values.device)
+    keep = torch.zeros(int(counts.shape[0]), dtype=torch.int64, device=values.device)
+    index = unfinished_index.to(device=values.device, dtype=torch.int64).reshape(-1)
+    if int(index.numel()):
+        keep.index_fill_(0, index, 1)
+    kept = counts * keep
+    ends = torch.cumsum(counts, dim=0)
+    in_starts = ends - counts
+    out_starts = torch.cumsum(kept, dim=0) - kept
+    n = int(values.numel())
+    if n == 0:
+        raise RuntimeError("fixed accept kept slots are missing")
+    positions = torch.arange(n, device=values.device)
+    req = torch.bucketize(positions, ends, right=True)
+    local = positions - in_starts[req]
+    dest = out_starts[req] + local
+    mask = keep[req].bool()
+    chosen = positions[mask]
+    dest = dest[mask]
+    if int(chosen.numel()) != total:
+        raise RuntimeError("fixed accept kept slot count mismatch")
+    out.index_copy_(0, dest, values.index_select(0, chosen))
+    return out[:total].clone()
 
 
 def _prefix_lengths(batch, bs: int) -> List[int]:

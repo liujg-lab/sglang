@@ -217,8 +217,6 @@ def _load_sr_tree_expand_methods():
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in {
             "_as_2d",
-            "_wait_d2h_event",
-            "_ensure_host_staging_slot",
         }:
             helper_nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter":
@@ -228,7 +226,6 @@ def _load_sr_tree_expand_methods():
                     "_expand_one",
                     "_pack_tree_windows",
                     "_d2h_tree_outputs",
-                    "_acquire_host_staging",
                     "_tree_phase",
                     "_count_tree",
                     "_tree_result_slots",
@@ -471,12 +468,26 @@ class TestRemoteSpecDevice(CustomTestCase):
         )
         self.assertFalse(rb.can_local_rollback(req, fork_point=5))
         self.assertTrue(rb.can_local_rollback(req, fork_point=8))
-        ok = rb.local_rollback(req, fork_point=8, current_kv_len=12)
+        ok = rb.local_rollback(req, fork_point=5, current_kv_len=12)
+        self.assertFalse(ok)
+        allocator.free.assert_not_called()
+        self.assertEqual(req.kv_committed_len, 12)
+        self.assertEqual(req.kv_allocated_len, 12)
+
+        aligned = SimpleNamespace(
+            prefix_indices=[],
+            req_pool_idx=0,
+            kv_allocated_len=12,
+            kv_committed_len=12,
+            rid="r1",
+        )
+        allocator.free.reset_mock()
+        ok = rb.local_rollback(aligned, fork_point=8, current_kv_len=12)
         self.assertTrue(ok)
-        allocator.free.assert_called_once()
         freed = allocator.free.call_args[0][0]
         self.assertEqual(freed.tolist(), [8, 9, 10, 11])
-        self.assertEqual(req.kv_committed_len, 8)
+        self.assertEqual(aligned.kv_committed_len, 8)
+        self.assertEqual(aligned.kv_allocated_len, 8)
 
     def test_device_context_error_classifier(self):
         try:
@@ -544,6 +555,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             ns,
         )
         released = []
+        abandoned = []
         req = SimpleNamespace(
             finished=lambda: True,
             req_pool_idx=0,
@@ -554,16 +566,19 @@ class TestRemoteSpecDevice(CustomTestCase):
             sr_state=SimpleNamespace(delete=lambda rid: SimpleNamespace(req_object=req)),
             _sr_remove_req=lambda r: None,
             _sr_release_tree_lease=lambda rid: None,
+            _sr_abandon_poisoned_kv=lambda r: abandoned.append(r),
             sr_kv=SimpleNamespace(
                 release_all_kv_for_finished_req=lambda r: released.append(r)
             ),
         )
         MethodType(ns["_sr_finish_rid"], scheduler)("rid-1")
         self.assertEqual(released, [])
+        self.assertEqual(abandoned, [req])
 
         scheduler._sr_device_poisoned = False
         MethodType(ns["_sr_finish_rid"], scheduler)("rid-1")
         self.assertEqual(released, [req])
+        self.assertEqual(abandoned, [req])
 
     def test_npu_graph_runner_replay_uses_make_graph_key(self):
         src = (
@@ -1142,6 +1157,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             req.output_ids or []
         )
         mixin._sr_mark_degraded = lambda *_a, **_k: None
+        mixin._sr_clear_stamps_after_poison = lambda: None
         mixin.last_batch = object()
         req = SimpleNamespace(
             req_pool_idx=0,
@@ -1183,6 +1199,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             req.output_ids or []
         )
         mixin._sr_mark_degraded = lambda *_a, **_k: None
+        mixin._sr_clear_stamps_after_poison = lambda: None
         mixin.last_batch = object()
         req = SimpleNamespace(
             req_pool_idx=0,
@@ -1403,10 +1420,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         ).read_text()
         self.assertIn("NpuGraphReplaySubmittedError", drafter_src)
         self.assertIn("NpuGraphPreparationError", drafter_src)
-        self.assertIn(
-            "except (NpuGraphReplaySubmittedError, KVMoveSubmittedError):\n            raise",
-            drafter_src,
-        )
+        # Unresolved expand errors are re-raised by test_sr_tree_paged_layout.
         self.assertNotIn("skipping per-req retry", drafter_src)
         self.assertIn("falling back to eager", drafter_src)
         self.assertIn("graph_submitted", drafter_src)
@@ -1418,12 +1432,9 @@ class TestRemoteSpecDevice(CustomTestCase):
             _REPO
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
         ).read_text()
-        self.assertIn(
-            "except (NpuGraphReplaySubmittedError, SRTransferUnresolved):\n            raise",
-            mixin_src,
-        )
+        # Fatal propagation is tested with the actual handler above.
         self.assertIn("self._sr_device_poisoned = True", mixin_src)
-        self.assertIn("NPU context already poisoned; skip KV release", mixin_src)
+        self.assertIn("self._sr_abandon_poisoned_kv(req)", mixin_src)
 
     def test_npu_tree_draft_fia_alignment_source_guards(self):
         src = (
@@ -2410,19 +2421,21 @@ class TestSRTreeCandidates(unittest.TestCase):
         self.assertFalse(workspace.unresolved)
         self.assertFalse(workspace.validated)
 
-    def test_candidate_factory_skips_cpu_cuda_and_failed_preflight(self):
+    def test_candidate_factory_skips_cpu_and_failed_preflight(self):
         from sglang.srt.speculative.standalone_remote.drafter import (
             sr_tree_candidates as candidates,
         )
 
         self.assertIsNone(candidates.candidate_workspace(object(), 1, torch.zeros(1, 2)))
-        cuda_seed = SimpleNamespace(device=SimpleNamespace(type="cuda"))
-        self.assertIsNone(candidates.candidate_workspace(object(), 1, cuda_seed))
+        other = SimpleNamespace(device=SimpleNamespace(type="meta"))
+        self.assertIsNone(candidates.candidate_workspace(object(), 1, other))
 
         calls = {"warm": 0}
 
         def init(self, device, batch, topk, steps, width, vocab, dtype, graph=False):
             self.batch = batch
+            self.device = torch.device("cpu")
+            self.unresolved = False
 
         def warm(self):
             calls["warm"] += 1
@@ -2437,8 +2450,16 @@ class TestSRTreeCandidates(unittest.TestCase):
         )
         seed = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.float32)
         npu = SimpleNamespace(current_stream=lambda device: SimpleNamespace())
+
+        def get_device_module(device_type):
+            if device_type == "npu":
+                return npu
+            return torch_get_device_module(device_type)
+
+        torch_get_device_module = torch.get_device_module
         with (
             unittest.mock.patch.object(torch, "npu", npu, create=True),
+            unittest.mock.patch.object(torch, "get_device_module", get_device_module),
             unittest.mock.patch(
                 "sglang.srt.speculative.standalone_remote.sr_kv_copy._capturing",
                 return_value=False,

@@ -18,7 +18,6 @@ from __future__ import annotations
 import bisect
 import logging
 import os
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -38,7 +37,6 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
-    expand_fia_cpu_update_inputs,
     fill_fia_cpu_update_payload,
     run_npu_graph_update_and_replay,
 )
@@ -52,6 +50,7 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     IMPL_TREE_PAGED_FIA,
     TARGET_TREE_FIA_KV_ATTR,
+    TARGET_TREE_FIA_Q_ATTR,
     read_sr_target_update_overlap_env,
     validate_target_tree_fia_records,
 )
@@ -436,10 +435,31 @@ class NPUGraphRunner(CudaGraphRunner):
             n_records, step_ids = validate_target_tree_fia_records(
                 records, num_layers, self.update_attr_name
             )
-            placeholder = [1] * int(bs)
-            payload = expand_fia_cpu_update_inputs(
-                [placeholder], num_layers, self.update_attr_name
+            backend = getattr(self.model_runner, "attn_backend", None)
+            md = getattr(
+                getattr(backend, "forward_metadata", None),
+                "sr_target_tree_fia",
+                None,
             )
+            kv = None if md is None else getattr(md, "kv_lens_cpu", None)
+            q_lens = None if md is None else getattr(md, "q_lens_cpu", None)
+            if (
+                not isinstance(kv, list)
+                or len(kv) != int(bs)
+                or not isinstance(q_lens, list)
+                or len(q_lens) != int(bs)
+            ):
+                raise NpuGraphPreparationError(
+                    "target tree FIA lengths are not the captured lists",
+                    scope="graph",
+                )
+            payload = [
+                {
+                    self.update_attr_name: kv,
+                    TARGET_TREE_FIA_Q_ATTR: q_lens,
+                }
+                for _ in range(n_records)
+            ]
             self._fia_payloads[key] = payload
             self._target_fia_maps[key] = {
                 "n_records": n_records,
@@ -453,7 +473,9 @@ class NPUGraphRunner(CudaGraphRunner):
             self._target_fia_maps[key] = None
 
     def _maybe_enable_sr_target_update_overlap(self, requested: bool) -> None:
-        """Enable overlap only for an SR Target tree_paged_fia graph."""
+        """Enable overlap for SR target tree FIA after graphs, a map, and a device id exist."""
+        if not requested:
+            return
         runner = self.model_runner
         args = getattr(runner, "server_args", None)
         algo = getattr(runner, "spec_algorithm", None)
@@ -469,9 +491,16 @@ class NPUGraphRunner(CudaGraphRunner):
         )
         maps = getattr(self, "_target_fia_maps", None) or {}
         has_map = any(info is not None for info in maps.values())
-        graphs_ok = bool(getattr(self, "graphs", None)) and has_map
         reason = None
-        if requested and is_sr_target and target_fia and graphs_ok:
+        if not is_sr_target:
+            reason = "not sr target"
+        elif not target_fia:
+            reason = "not tree_paged_fia"
+        elif not getattr(self, "graphs", None):
+            reason = "no graphs"
+        elif not has_map:
+            reason = "no target fia map"
+        else:
             try:
                 device_id = int(torch.npu.current_device())
             except Exception as exc:
@@ -481,18 +510,8 @@ class NPUGraphRunner(CudaGraphRunner):
             else:
                 self._npu_graph_device_id = device_id
                 self._npu_sr_target_update_overlap = True
-        elif requested and not is_sr_target:
-            reason = "not sr target"
-        elif requested and not target_fia:
-            reason = "not tree_paged_fia"
-        elif requested and not getattr(self, "graphs", None):
-            reason = "no graphs"
-        elif requested and not has_map:
-            reason = "no target fia map"
-        if not requested:
-            return
-        extra = f" reason={reason}" if reason else ""
         impl = getattr(backend, "tree_attention_impl", None)
+        extra = f" reason={reason}" if reason else ""
         logger.info(
             "NPU SR target update/replay overlap requested=%s effective=%s "
             "implementation=%s device=%s%s",
@@ -501,28 +520,6 @@ class NPUGraphRunner(CudaGraphRunner):
             impl,
             self._npu_graph_device_id,
             extra,
-        )
-
-    def _update_target_tree_fia_inputs(self, info, kv_lens, sample=None):
-        def _fill():
-            fill_fia_cpu_update_payload(
-                info["payload"],
-                [list(kv_lens)],
-                info["step_ids"],
-                info["attr_name"],
-            )
-
-        measure_call(sample, "payload_fill", _fill)
-        graph = self._tree_replay_graph
-        if graph is None:
-            raise NpuGraphPreparationError(
-                "target tree FIA replay graph missing", scope="graph"
-            )
-        payload = info["payload"]
-        measure_call(
-            sample,
-            "update_call",
-            lambda: graph.update(cpu_update_input=payload),
         )
 
     def _target_graph_host_metrics(self):
@@ -551,8 +548,15 @@ class NPUGraphRunner(CudaGraphRunner):
         )
 
     def _replay_target_tree_fia(self, info, kv_lens, graph, graph_key, kv_bucket):
-        """Fill on the caller thread, then update/replay through the shared helper."""
+        """Fill this round's lengths, then update and replay the same graph.
+
+        Overlap submits ``graph.update`` on the caller stream and queues
+        ``graph.replay`` before that update returns. Captured events keep the
+        dynamic operators behind the update. The caller joins this generation
+        before the next payload fill.
+        """
         overlap = bool(getattr(self, "_npu_sr_target_update_overlap", False))
+        device_id = getattr(self, "_npu_graph_device_id", None)
         metrics = self._target_graph_host_metrics()
         sample = None
         if metrics is not None:
@@ -571,54 +575,44 @@ class NPUGraphRunner(CudaGraphRunner):
                 )
             except Exception:
                 sample = None
-        payload = info["payload"]
-        device_id = getattr(self, "_npu_graph_device_id", None)
 
-        def _serial_submit():
-            self._log_sr_target_overlap_submit(False)
-            run_npu_graph_update_and_replay(
-                lambda: self._update_target_tree_fia_inputs(info, kv_lens, sample),
-                lambda: measure_call(sample, "replay_call", graph.replay),
-                overlap=False,
+        def _fill():
+            fill_fia_cpu_update_payload(
+                info["payload"],
+                [list(kv_lens)],
+                info["step_ids"],
+                info["attr_name"],
             )
 
-        def _overlap_submit():
-            def _fill():
-                fill_fia_cpu_update_payload(
-                    payload,
-                    [list(kv_lens)],
-                    info["step_ids"],
-                    info["attr_name"],
-                )
-
-            measure_call(sample, "payload_fill", _fill)
-
-            def update():
+        def update():
+            if overlap:
                 torch.npu.set_device(device_id)
-                measure_call(
-                    sample,
-                    "update_call",
-                    lambda: graph.update(cpu_update_input=payload),
-                )
+            payload = info["payload"]
+            measure_call(
+                sample,
+                "update_call",
+                lambda: graph.update(cpu_update_input=payload),
+            )
 
-            def replay():
-                measure_call(sample, "replay_call", graph.replay)
+        def replay():
+            measure_call(sample, "replay_call", graph.replay)
 
-            def _submit():
-                self._log_sr_target_overlap_submit(True)
-                from sglang.srt.speculative.standalone_remote.sr_graph_update import runner_update_worker
-                run_npu_graph_update_and_replay(
-                    update, replay, overlap=True,
-                    update_worker=runner_update_worker(self, True),
-                )
+        def _submit():
+            self._log_sr_target_overlap_submit(overlap)
+            from sglang.srt.speculative.standalone_remote.sr_graph_update import (
+                runner_update_worker,
+            )
 
-            measure_call(sample, "submit_envelope", _submit)
+            run_npu_graph_update_and_replay(
+                update,
+                replay,
+                overlap=overlap,
+                update_worker=runner_update_worker(self, overlap),
+            )
 
         def _prepare():
-            if overlap:
-                _overlap_submit()
-            else:
-                measure_call(sample, "submit_envelope", _serial_submit)
+            measure_call(sample, "payload_fill", _fill)
+            measure_call(sample, "submit_envelope", _submit)
 
         try:
             measure_call(sample, "prepare_submit", _prepare)

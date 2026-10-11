@@ -221,9 +221,10 @@ def run_npu_graph_update_and_replay(
 ):
     """Run graph.update then graph.replay.
 
-    Default is serial. Plain AR DECODE enables overlap explicitly;
-    compact-FIA tree keeps the existing env-var policy. Draft paged tree,
-    Target ``tree_paged_fia``, and SR tail EXTEND overlap by default. Set
+    ``overlap=False`` updates and replays on the caller, in that order.
+    ``overlap=True`` starts update on the caller stream, submits replay, then
+    joins. The captured graph waits on the update event, so replay can be
+    queued while update is still recording it. Set
     ``SGLANG_NPU_SR_TREE_UPDATE_OVERLAP=0``,
     ``SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP=0``, or
     ``SGLANG_NPU_SR_TAIL_UPDATE_OVERLAP=0`` for the corresponding serial path.
@@ -231,15 +232,29 @@ def run_npu_graph_update_and_replay(
 
     After replay has been invoked, or if update fails, wrap ordinary
     ``Exception`` as ``NpuGraphReplaySubmittedError`` so callers do not free
-    in-flight graph slots. Replay ``BaseException`` (for example
-    ``KeyboardInterrupt``) joins the update thread and then propagates the
-    original interrupt. Overlap uses a non-daemon thread that must be joined.
-    SR runners can supply their single-flight persistent ``update_worker``.
-    It binds the caller stream and confirms the current generation before
-    return. Other callers keep the temporary-thread implementation.
-    Thread construct/start failure does not call replay and is not wrapped as
-    submitted; callers keep their in-flight confirmation path.
+    in-flight graph slots. A replay ``BaseException`` joins the update and
+    then propagates itself. Overlap uses a non-daemon thread that must be
+    joined. SR runners can supply their single-flight persistent
+    ``update_worker``. It binds the caller stream. Other callers keep the
+    temporary thread. Thread construct/start failure does not call replay
+    and is not wrapped as submitted.
     """
+
+    def _raise_finished(error):
+        if not isinstance(error, Exception):
+            raise error
+        if isinstance(error, NpuGraphReplaySubmittedError):
+            raise error
+        from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+            SRTransferUnresolved,
+        )
+
+        if isinstance(error, SRTransferUnresolved):
+            raise error
+        raise NpuGraphReplaySubmittedError(
+            "NPU graph update/replay failed"
+        ) from error
+
     if not overlap:
         try:
             update_fn()
@@ -260,7 +275,6 @@ def run_npu_graph_update_and_replay(
         except BaseException as exc:
             replay_error = exc
         finally:
-            # Interrupts must also confirm the current update's completion.
             try:
                 update_error = update_worker.wait(generation)
             except BaseException as exc:
@@ -273,19 +287,7 @@ def run_npu_graph_update_and_replay(
         if replay_error is not None or update_error is not None:
             update_worker.poison()
             error = replay_error if replay_error is not None else update_error
-            if not isinstance(error, Exception):
-                raise error
-            if isinstance(error, NpuGraphReplaySubmittedError):
-                raise error
-            from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
-                SRTransferUnresolved,
-            )
-
-            if isinstance(error, SRTransferUnresolved):
-                raise error
-            raise NpuGraphReplaySubmittedError(
-                "NPU graph update/replay failed"
-            ) from error
+            _raise_finished(error)
         return
 
     errors = []
@@ -306,13 +308,9 @@ def run_npu_graph_update_and_replay(
     finally:
         thread.join()
     if replay_error is not None:
-        raise NpuGraphReplaySubmittedError(
-            "NPU graph update/replay failed"
-        ) from replay_error
+        _raise_finished(replay_error)
     if errors:
-        raise NpuGraphReplaySubmittedError(
-            "NPU graph update/replay failed"
-        ) from errors[0]
+        _raise_finished(errors[0])
 
 
 def normalize_fia_op_name(name):

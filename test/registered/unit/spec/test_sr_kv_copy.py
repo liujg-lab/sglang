@@ -976,7 +976,7 @@ class TestKVMove(unittest.TestCase):
 
 class TestCudaExperimentContracts(unittest.TestCase):
     def test_static_contiguous_groups_and_layout_rejection(self):
-        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda import (
             continuous_groups,
         )
 
@@ -997,7 +997,7 @@ class TestCudaExperimentContracts(unittest.TestCase):
                 continuous_groups(bad)
 
     def test_experimental_launch_global_boundary_and_static_addressing(self):
-        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda_experiment.py")
+        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda.py")
         tree = ast.parse(path.read_text())
         launch = next(
             n
@@ -1052,33 +1052,38 @@ class TestCudaExperimentContracts(unittest.TestCase):
         production = Path(kv.__file__).read_text(encoding="utf-8")
         self.assertNotIn("cuda_layered", production)
         self.assertNotIn("ReplayActiveRows", production)
+        allowed = {
+            "sr_kv_copy.py",
+            "sr_kv_copy_cuda.py",
+            "sr_kv_copy_kernels_cuda.py",
+        }
         for path in root.rglob("*.py"):
-            if "experiment" in path.name or path.name == "sr_kv_copy.py":
+            if path.name in allowed:
                 continue
             text = path.read_text(encoding="utf-8")
-            self.assertNotIn("sr_kv_copy_cuda_experiment", text, str(path))
+            self.assertNotIn("sr_kv_copy_cuda", text, str(path))
             self.assertNotIn("ReplayActiveRows", text, str(path))
 
         rows = torch.empty(8, 2, 4)
         token = NS(k_buffer=[rows], v_buffer=[rows.clone()])
         layout = kv.KVMoveLayout.from_pool(token)
-        self.assertFalse(kv.cuda_tree_experiment_eligible(token, layout, "tree_eager"))
+        self.assertFalse(kv.cuda_tree_contiguous_eligible(token, layout, "tree_eager"))
         cuda_layout = NS(kind="token", device=NS(type="cuda"), buffers=layout.buffers)
         self.assertTrue(
-            kv.cuda_tree_experiment_eligible(token, cuda_layout, "tree_eager")
+            kv.cuda_tree_contiguous_eligible(token, cuda_layout, "tree_eager")
         )
         self.assertTrue(
-            kv.cuda_tree_experiment_eligible(token, cuda_layout, "tree_graph")
+            kv.cuda_tree_contiguous_eligible(token, cuda_layout, "tree_graph")
         )
         for domain in ("eager", "lease_copy", "fixed_accept", "other"):
             self.assertFalse(
-                kv.cuda_tree_experiment_eligible(token, cuda_layout, domain), domain
+                kv.cuda_tree_contiguous_eligible(token, cuda_layout, domain), domain
             )
         indexed = NS(
             k_buffer=[rows], v_buffer=[rows.clone()], index_k_buffer=[rows.clone()]
         )
         self.assertFalse(
-            kv.cuda_tree_experiment_eligible(indexed, cuda_layout, "tree_eager")
+            kv.cuda_tree_contiguous_eligible(indexed, cuda_layout, "tree_eager")
         )
         sliced = torch.empty(8, 2, 8)[..., ::2]
         bad = NS(
@@ -1086,7 +1091,7 @@ class TestCudaExperimentContracts(unittest.TestCase):
             device=NS(type="cuda"),
             buffers=(kv.KVMoveBuffer(sliced, 0), kv.KVMoveBuffer(rows, 0)),
         )
-        self.assertFalse(kv.cuda_tree_experiment_eligible(token, bad, "tree_eager"))
+        self.assertFalse(kv.cuda_tree_contiguous_eligible(token, bad, "tree_eager"))
         paged_pool = paged()
         self.assertEqual(
             kv.prepare_kv_move(paged_pool, 4, domain="tree_eager").backend, "torch_out"
@@ -1105,7 +1110,7 @@ class TestCudaExperimentContracts(unittest.TestCase):
             def __init__(self, pool, capacity, *, graph=False):
                 super().__init__(pool, kv.KVMoveLayout.from_pool(pool), graph=graph)
                 self.reserve(int(capacity))
-                self.backend = "cuda_contiguous_experiment"
+                self.backend = "cuda_contiguous"
                 self.frozen = True
                 self.remaps = []
 
@@ -1127,20 +1132,20 @@ class TestCudaExperimentContracts(unittest.TestCase):
             return domain in ("tree_eager", "tree_graph")
 
         with (
-            patch.object(kv, "cuda_tree_experiment_eligible", side_effect=eligible),
+            patch.object(kv, "cuda_tree_contiguous_eligible", side_effect=eligible),
             patch.object(kv.KVMoveWorkspace, "_record_event", record),
             patch(
-                "sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment.CudaKVExperiment",
+                "sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda.CudaContiguousWorkspace",
                 FakeExperiment,
             ),
         ):
             eager = kv.prepare_kv_move(pool, 3, domain="tree_eager")
-            self.assertEqual(eager.backend, "cuda_contiguous_experiment")
+            self.assertEqual(eager.backend, "cuda_contiguous")
             self.assertEqual(eager.capacity, 4)
             grown = kv.prepare_kv_move(pool, 5, domain="tree_eager")
             self.assertIsNot(grown, eager)
             self.assertEqual(grown.capacity, 8)
-            self.assertIs(pool._kv_tree_experiment_retired[0][1], eager)
+            self.assertIs(pool._kv_tree_retired[0][1], eager)
             tail = kv.prepare_kv_move(pool, 4, domain="lease_copy")
             target = kv.prepare_kv_move(pool, 4, domain="fixed_accept")
             self.assertEqual(tail.backend, "torch_out")
@@ -1166,7 +1171,7 @@ class TestCudaExperimentContracts(unittest.TestCase):
     def test_actual_cuda_kernel_body_against_snapshot(self):
         # CPU execution of the real AST checks address/mask semantics, not
         # Triton compilation. Pointer-table loads resolve into private tensors.
-        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda_experiment.py")
+        path = Path(kv.__file__).with_name("sr_kv_copy_kernels_cuda.py")
         tree = ast.parse(path.read_text())
         stage = next(
             n
@@ -1292,8 +1297,8 @@ class TestCudaExperimentContracts(unittest.TestCase):
                 self.assertEqual(access["pool", "write"], moved)
 
     def test_submission_failure_preserves_holds_and_blocks_retry(self):
-        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda_experiment import (
-            CudaKVExperiment,
+        from sglang.srt.speculative.standalone_remote.sr_kv_copy_cuda import (
+            CudaContiguousWorkspace,
         )
 
         pool = NS(k_buffer=[torch.ones(8, 2, 7)], v_buffer=[torch.ones(8, 2, 7)])
@@ -1313,7 +1318,7 @@ class TestCudaExperimentContracts(unittest.TestCase):
         )
         graph = NS(replay=lambda: (_ for _ in ()).throw(failure))
         with self.assertRaises(kv.KVMoveSubmittedError):
-            CudaKVExperiment.replay(ws2, graph)
+            CudaContiguousWorkspace.replay(ws2, graph)
         self.assertIs(ws2._failed_graph, graph)
 
 

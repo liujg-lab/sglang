@@ -23,7 +23,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
-        self.roundup = page_size - 1
 
     def alloc_extend(
         self,
@@ -39,12 +38,13 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
-        num_new_pages = (
-            (seq_lens + self.roundup) // self.page_size
-            - (prefix_lens + self.roundup) // self.page_size
-        ).sum()
-        num_new_pages_item = num_new_pages.item()
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
+        # Count pages from CPU lengths without reading accelerator scalars.
+        num_new_pages_item = _new_pages_from_cpu(
+            prefix_lens_cpu, seq_lens_cpu, self.page_size
+        )
+        free_before = len(self.free_pages)
+        release_before = len(self.release_pages)
+        if num_new_pages_item > free_before and release_before > 0:
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
@@ -160,3 +160,16 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         )
 
         apply_free_unique_pages(self, page_ids)
+
+
+def _new_pages_from_cpu(prefix_lens_cpu, seq_lens_cpu, page_size: int) -> int:
+    prefix = torch.as_tensor(prefix_lens_cpu, dtype=torch.int64).reshape(-1)
+    seq = torch.as_tensor(seq_lens_cpu, dtype=torch.int64).reshape(-1)
+    if prefix.device.type != "cpu" or seq.device.type != "cpu":
+        raise ValueError("paged allocation requires CPU length metadata")
+    if prefix.shape != seq.shape or page_size <= 0:
+        raise ValueError("invalid paged allocation lengths")
+    if bool((prefix < 0).any()) or bool((seq < prefix).any()):
+        raise ValueError("invalid paged allocation range")
+    pages = (seq + page_size - 1) // page_size - (prefix + page_size - 1) // page_size
+    return int(pages.sum())

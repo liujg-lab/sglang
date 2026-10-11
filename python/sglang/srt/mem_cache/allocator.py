@@ -81,8 +81,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
-            self.free_pages = torch.cat((self.free_pages, self.release_pages))
-            self.free_pages, _ = torch.sort(self.free_pages)
+            merged = torch.cat((self.free_pages, self.release_pages))
+            # ``cat`` is contiguous, but a later slice of ``free_pages`` is a
+            # view of a larger storage. Sort only a buffer whose storage size
+            # matches the logical length; NPU aclnnSort rejects the mismatch.
+            needed = merged.numel() * merged.element_size()
+            if (
+                merged.storage_offset() != 0
+                or not merged.is_contiguous()
+                or merged.untyped_storage().nbytes() != needed
+            ):
+                merged = merged.clone()
+            self.free_pages, _ = torch.sort(merged)
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
@@ -502,6 +512,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    def free_unique_pages(self, page_ids: torch.Tensor):
+        """Prepend already-unique page ids. Does not read them back or dedup.
+
+        ``free`` is unchanged. Calling this inside a free group is rejected.
+        """
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            apply_free_unique_pages,
+        )
+
+        apply_free_unique_pages(self, page_ids)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
