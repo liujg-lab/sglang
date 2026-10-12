@@ -4,6 +4,7 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -94,6 +95,67 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     )
                     self.k_buffer.append(k_buffer_layer)
                     self.v_buffer.append(v_buffer_layer)
+            # Fresh pool storage is ND. NZ (format 29) cannot share the ATB
+            # paged write with FIA's BSND read.
+            self._fia_kv_nd = self.use_fia and (
+                int(torch_npu.get_npu_format(self.kv_buffer))
+                != int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+            )
+
+    def _fia_kv_use_reshape_and_cache(
+        self,
+        k_scale: Optional[float],
+        v_scale: Optional[float],
+    ) -> bool:
+        """Paged FIA reads ND BSND cache, so the ATB slot write can fill it.
+
+        Quantized storage and scale paths keep scatter. MLA has its own pool.
+        """
+        if k_scale is not None or v_scale is not None:
+            return False
+        if self.store_dtype != self.dtype:
+            return False
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        return bool(getattr(self, "_fia_kv_nd", False))
+
+    def _scatter_fia_kv(self, k_buffer_layer, v_buffer_layer, loc, cache_k, cache_v):
+        torch_npu.npu_scatter_nd_update_(
+            k_buffer_layer,
+            loc.view(-1, 1),
+            cache_k.view(-1, 1, self.head_num, self.head_dim),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            v_buffer_layer,
+            loc.view(-1, 1),
+            cache_v.view(-1, 1, self.head_num, self.head_dim),
+        )
+
+    def _reshape_and_cache_fia_kv(
+        self, k_buffer_layer, v_buffer_layer, loc, cache_k, cache_v
+    ):
+        key = cache_k.reshape(-1, self.head_num, self.head_dim)
+        value = cache_v.reshape(-1, self.head_num, self.head_dim)
+        if not key.is_contiguous():
+            key = key.contiguous()
+        if not value.is_contiguous():
+            value = value.contiguous()
+        slots = loc.reshape(-1)
+        if slots.dtype != torch.int32:
+            slots = slots.to(dtype=torch.int32)
+        elif not slots.is_contiguous():
+            slots = slots.contiguous()
+        torch_npu._npu_reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=k_buffer_layer.view(
+                -1, self.page_size, self.head_num, self.head_dim
+            ),
+            value_cache=v_buffer_layer.view(
+                -1, self.page_size, self.head_num, self.head_dim
+            ),
+            slot_indices=slots,
+        )
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -160,17 +222,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
-
-            torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer,
-                loc.view(-1, 1),
-                cache_k.view(-1, 1, self.head_num, self.head_dim),
-            )
-            torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer,
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.head_num, self.head_dim),
-            )
+            if self._fia_kv_use_reshape_and_cache(k_scale, v_scale):
+                self._reshape_and_cache_fia_kv(
+                    k_buffer_layer, v_buffer_layer, loc, cache_k, cache_v
+                )
+            else:
+                self._scatter_fia_kv(
+                    k_buffer_layer, v_buffer_layer, loc, cache_k, cache_v
+                )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(

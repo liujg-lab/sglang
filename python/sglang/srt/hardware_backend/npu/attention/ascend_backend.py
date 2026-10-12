@@ -2551,6 +2551,106 @@ class AscendAttnBackend(AttentionBackend):
     def bind_sr_tree_paged_metadata(self, meta: SRTreePagedMetadata) -> None:
         self._sr_tree_paged_meta = meta
 
+    def _sr_tree_paged_fia_buffers(self, query, k_cache, v_cache, fia_kwargs):
+        """Workspace and 1-element LSE for draft-tree paged FIA.
+
+        Eager reuses the output buffer across layers of one shape. Graph
+        capture still allocates a distinct output per layer so captured ops
+        do not share storage. ``get_max_workspace`` follows tensor shapes.
+        """
+        rows = int(query.shape[0])
+        q_heads = int(query.shape[2])
+        v_dim = int(fia_kwargs["v_head_dim"])
+        key = (
+            rows,
+            q_heads,
+            v_dim,
+            query.dtype,
+            query.device,
+            tuple(k_cache.shape),
+            tuple(v_cache.shape),
+        )
+        slot = getattr(self, "_sr_tree_paged_fia_slot", None)
+        if slot is None or slot[0] != key:
+            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query,
+                k_cache,
+                v_cache,
+                num_heads=fia_kwargs["num_heads"],
+                num_key_value_heads=fia_kwargs["num_key_value_heads"],
+                input_layout=fia_kwargs["input_layout"],
+                atten_mask=fia_kwargs["atten_mask"],
+                block_size=fia_kwargs["block_size"],
+                block_table=fia_kwargs["block_table"],
+                actual_seq_lengths_kv=fia_kwargs["actual_seq_lengths_kv"],
+                scale=fia_kwargs["scale"],
+            )
+            softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+            output = None
+            if not self.graph_mode:
+                output = torch.empty(
+                    (rows, 1, q_heads, v_dim),
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+            self._sr_tree_paged_fia_slot = (key, workspace, softmax_lse, output)
+        else:
+            _, workspace, softmax_lse, output = slot
+        if output is None or self.graph_mode:
+            output = torch.empty(
+                (rows, 1, q_heads, v_dim),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            if not self.graph_mode:
+                self._sr_tree_paged_fia_slot = (key, workspace, softmax_lse, output)
+        return workspace, output, softmax_lse
+
+    def _run_sr_tree_paged_fia(self, query, k_cache, v_cache, layer, metadata):
+        q_fia = query.unsqueeze(1)
+        if not q_fia.is_contiguous():
+            q_fia = q_fia.contiguous()
+        k_fia = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+        )
+        v_fia = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+        )
+        fia_kwargs = dict(
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="BSND",
+            atten_mask=None,
+            block_size=self.page_size,
+            block_table=metadata.block_tables,
+            # Same storage the replay plan fills before the graph runs.
+            # A captured Python list stays at the prefix-0 lengths.
+            actual_seq_lengths_kv=metadata.context_lens_cpu,
+            scale=layer.scaling,
+            v_head_dim=layer.v_head_dim,
+        )
+        workspace, output, softmax_lse = self._sr_tree_paged_fia_buffers(
+            q_fia, k_fia, v_fia, fia_kwargs
+        )
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_fia,
+            k_fia,
+            v_fia,
+            num_heads=fia_kwargs["num_heads"],
+            num_key_value_heads=fia_kwargs["num_key_value_heads"],
+            input_layout=fia_kwargs["input_layout"],
+            atten_mask=fia_kwargs["atten_mask"],
+            block_size=fia_kwargs["block_size"],
+            block_table=fia_kwargs["block_table"],
+            actual_seq_lengths_kv=fia_kwargs["actual_seq_lengths_kv"],
+            scale=fia_kwargs["scale"],
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+        return output.reshape(
+            int(query.shape[0]), layer.tp_q_head_num * layer.v_head_dim
+        )
+
     def _run_sr_tree_paged_attention(self, q, k_cache, v_cache, layer):
         """Read raw paged cache. Caller already wrote this step's K/V."""
         metadata = None
@@ -2562,20 +2662,8 @@ class AscendAttnBackend(AttentionBackend):
         if metadata is None or query.shape[0] != int(metadata.block_tables.shape[0]):
             raise ValueError("SR tree paged attention query/metadata row mismatch")
         if self.use_fia:
-            output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                query.unsqueeze(1),
-                k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
-                v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSND",
-                atten_mask=None,
-                block_size=self.page_size,
-                block_table=metadata.block_tables,
-                # Same storage the replay plan fills before the graph runs.
-                # A captured Python list stays at the prefix-0 lengths.
-                actual_seq_lengths_kv=metadata.context_lens_cpu,
-                scale=layer.scaling,
+            return self._run_sr_tree_paged_fia(
+                query, k_cache, v_cache, layer, metadata
             )
         else:
             output = query.new_empty(

@@ -2263,6 +2263,11 @@ class SRTreeDrafter:
             self.speculative_num_steps, -1
         )
         rows = int(out_cache_loc.shape[1])
+        # One int32 conversion for every layer of every step. Remap and the
+        # saved loc stay on the original int64 tensor.
+        kv_slots = out_cache_loc
+        if kv_slots.dtype != torch.int32:
+            kv_slots = kv_slots.to(dtype=torch.int32)
         candidates = getattr(self, "_capture_candidate_workspace", None)
         if not getattr(self, "_capture_candidate_selected", False):
             candidates = candidate_workspace(self, forward_batch.batch_size, topk_p)
@@ -2313,7 +2318,7 @@ class SRTreeDrafter:
                     later_forward_node_ids(node_ids)[:rows]
                 )
             forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.out_cache_loc = kv_slots[i]
             advance_tree_draft_positions_for_step(
                 i,
                 forward_batch.positions,
