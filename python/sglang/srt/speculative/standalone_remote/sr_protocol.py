@@ -13,6 +13,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+# Only a real int 2 is the v2 protocol. Missing, bool, float, and str stay unsupported.
+SR_PROTOCOL_VERSION = 2
+
+
+def parse_protocol_version(value: Any) -> Optional[int]:
+    """Keep a wire integer unchanged. Do not coerce other types into a version."""
+    if type(value) is int:
+        return value
+    return None
+
 
 class SRAction(Enum):
     PREFILL = "prefill"
@@ -95,8 +105,7 @@ class SRDraftRequest:
     commit_tree_version: Optional[int] = None
     commit_tree_base_committed_len: Optional[int] = None
     commit_candidate_indices: Optional[List[int]] = None
-    # Incremental commit. Absent on v1 requests. ``commit_mode`` is "snapshot"
-    # or "delta"; missing protocol_version on the batch stays v1.
+    # Incremental commit. ``commit_mode`` is "snapshot" or "delta".
     commit_mode: Optional[str] = None
     commit_version: Optional[int] = None
     base_commit_version: Optional[int] = None
@@ -189,19 +198,18 @@ class SRBatchRequest:
     rpc_seq: int
     action: SRAction
     reqs: List[SRDraftRequest] = field(default_factory=list)
-    # Missing means the historical protocol. Do not default this to 2.
-    protocol_version: Optional[int] = None
+    # Local batches default to v2. from_dict passes an explicit value so a
+    # missing or non-int wire field stays unsupported instead of becoming 2.
+    protocol_version: Optional[int] = SR_PROTOCOL_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
-        result = {
+        return {
             "session_id": self.session_id,
             "rpc_seq": self.rpc_seq,
             "action": self.action.value,
             "reqs": [r.to_dict() for r in self.reqs],
+            "protocol_version": self.protocol_version,
         }
-        if self.protocol_version is not None:
-            result["protocol_version"] = self.protocol_version
-        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SRBatchRequest":
@@ -212,13 +220,12 @@ class SRBatchRequest:
             SRDraftRequest.from_dict(x) if isinstance(x, dict) else x
             for x in (d.get("reqs") or [])
         ]
-        version = d.get("protocol_version", None)
         return cls(
             session_id=d["session_id"],
             rpc_seq=int(d["rpc_seq"]),
             action=action,
             reqs=reqs,
-            protocol_version=None if version is None else int(version),
+            protocol_version=parse_protocol_version(d.get("protocol_version", None)),
         )
 
 
@@ -228,16 +235,15 @@ class SRBatchReply:
     rpc_seq: int
     reqs: List[SRDraftReply] = field(default_factory=list)
     draft_residence_ns: Optional[int] = None
-    protocol_version: Optional[int] = None
+    protocol_version: Optional[int] = SR_PROTOCOL_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_id": self.session_id,
             "rpc_seq": self.rpc_seq,
             "reqs": [r.to_dict() for r in self.reqs],
+            "protocol_version": self.protocol_version,
         }
-        if self.protocol_version is not None:
-            result["protocol_version"] = self.protocol_version
         if type(self.draft_residence_ns) is int and self.draft_residence_ns >= 0:
             result["draft_residence_ns"] = self.draft_residence_ns
         return result
@@ -248,7 +254,6 @@ class SRBatchReply:
             SRDraftReply.from_dict(x) if isinstance(x, dict) else x
             for x in (d.get("reqs") or [])
         ]
-        version = d.get("protocol_version", None)
         return cls(
             session_id=d["session_id"],
             rpc_seq=int(d["rpc_seq"]),
@@ -256,7 +261,7 @@ class SRBatchReply:
             # Preserve malformed optional telemetry for transport validation;
             # it must never prevent an otherwise valid reply from being used.
             draft_residence_ns=d.get("draft_residence_ns"),
-            protocol_version=None if version is None else int(version),
+            protocol_version=parse_protocol_version(d.get("protocol_version", None)),
         )
 
 

@@ -375,7 +375,6 @@ class SRDraftServer(_CommEndpoint):
         sock.bind(self._url)
         self._socket = sock
         self._last_identity = None
-        self.last_rpc_seq = -1
         logger.info("[SR] Draft ROUTER bound on %s", self._url)
 
     def close(self) -> None:
@@ -450,9 +449,6 @@ class SRDraftServer(_CommEndpoint):
         if batch.action in (SRAction.FINISH, SRAction.ABORT):
             self._finish_comm("receive_only")
         return batch, mm
-
-    def remember(self, batch: SRBatchRequest) -> None:
-        self.last_rpc_seq = batch.rpc_seq
 
     def send_batch(self, batch: SRBatchReply, identity: Optional[Any] = None) -> None:
         ident = identity if identity is not None else self._last_identity

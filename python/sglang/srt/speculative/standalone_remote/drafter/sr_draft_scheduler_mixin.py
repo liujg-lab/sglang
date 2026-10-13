@@ -52,11 +52,9 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
     DEFAULT_MAX_INGEST_DECODE_STEPS,
-    DraftDecision,
     apply_tree_seed_topk,
     broadcast_sr_obj,
     committed_tail_not_in_kv,
-    decide_draft_action,
     draft_needed_max_new_tokens,
     ingest_active_indices,
     is_device_context_error,
@@ -85,6 +83,7 @@ from sglang.srt.speculative.standalone_remote.sr_commit import (
     rebuild_committed_output,
     retarget_stamp_version,
     route_snapshot_recovery,
+    supported_protocol,
 )
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import SRKVRollbacker
@@ -312,7 +311,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             # reset. Sync failure poisons the worker and does not clear.
             self._sr_reset_scheduler_caches()
         if self.sr_server is not None:
-            self.sr_server.last_rpc_seq = -1
             drain = getattr(self.sr_server, "drain", None)
             if callable(drain):
                 drain()
@@ -2323,8 +2321,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         window: SRWindow,
         session_id: str,
         status: Optional[SRReplyStatus] = None,
-        *,
-        publish: bool = True,
     ) -> SRDraftReply:
         tokens, pl, ix = window
         if status is None:
@@ -2336,14 +2332,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             st.last_base_committed_len = dreq.base_committed_len
             st.session_id = session_id
             st.last_updated_time = time.time()
-            # v1 publishes here. v2 waits until the commit is confirmed.
-            if publish:
-                st.cached_reply = SRCachedReply(
-                    draft_tokens=freeze_tokens(tokens),
-                    parent_list=freeze_ids(pl),
-                    top_scores_index=freeze_ids(ix),
-                    tree_version=tree_version,
-                )
         return SRDraftReply(
             rid=dreq.rid,
             step_id=dreq.step_id,
@@ -2594,13 +2582,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             )
         self._sr_drop_unconfirmed_commit(state)
         req = state.req_object if state is not None else None
-        if state is not None and state.completion_unknown:
-            return (
-                self._sr_v2_reply(
-                    dreq, SRReplyStatus.REJECT, reason="completion_unknown"
-                ),
-                None,
-            )
         verdict = inspect_commit(
             dreq,
             action=action,
@@ -2611,16 +2592,34 @@ class StandaloneRemoteDraftSchedulerMixin:
             has_state=state is not None and req is not None,
             state_trusted=True if state is None else state.commit_trusted,
         )
+        # Legal control enters cleanup before completion, poison, or degraded
+        # short-circuits. Unresolved device work stays in deferred/quarantine.
+        if action in (SRAction.FINISH, SRAction.ABORT):
+            if verdict.outcome == CommitOutcome.CONTROL:
+                self._sr_finish_rid(dreq.rid)
+                return self._sr_v2_reply(dreq, SRReplyStatus.OK), None
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason=verdict.reason),
+                None,
+            )
+        if state is not None and state.completion_unknown:
+            return (
+                self._sr_v2_reply(
+                    dreq, SRReplyStatus.REJECT, reason="completion_unknown"
+                ),
+                None,
+            )
+        if state is not None and state.degraded:
+            return (
+                self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="degraded"),
+                None,
+            )
         poisoned = bool(getattr(self, "_sr_device_poisoned", False))
         if poisoned and verdict.outcome in (CommitOutcome.APPLY, CommitOutcome.CACHE):
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
                 None,
             )
-        if verdict.outcome == CommitOutcome.CONTROL:
-            if action in (SRAction.FINISH, SRAction.ABORT):
-                self._sr_finish_rid(dreq.rid)
-            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None
         if verdict.outcome == CommitOutcome.CACHE:
             cached = self._sr_cached_reply(dreq, state)
             note_commit_result(metrics, "commit_idempotent_hits")
@@ -2797,105 +2796,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             ],
         )
 
-    def _sr_prepare_one(
-        self,
-        dreq: SRDraftRequest,
-        action: SRAction,
-        session_id: str,
-        rpc_seq: int,
-        mm: Optional[SRMMPayload],
-        last_session_id: Optional[str],
-        last_rpc_seq: int,
-    ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
-        """CPU decision + align. Returns (early_reply, None) or (None, live_req)."""
-        gate = self._sr_deferred_step_gate(dreq.rid, action, session_id)
-        if gate is not None:
-            empty = self._sr_empty_reply(dreq)
-            empty.status = (
-                SRReplyStatus.OK if gate == "control" else SRReplyStatus.REJECT
-            )
-            return empty, None
-        state = self.sr_state.get(dreq.rid)
-        req = state.req_object if state is not None else None
-        decision = decide_draft_action(
-            action=action,
-            session_id=session_id,
-            rpc_seq=rpc_seq,
-            last_session_id=last_session_id,
-            last_rpc_seq=last_rpc_seq,
-            last_step_id=state.last_step_id if state is not None else -1,
-            last_base_committed_len=(
-                state.last_base_committed_len if state is not None else -1
-            ),
-            step_id=dreq.step_id,
-            base_committed_len=dreq.base_committed_len,
-            has_state=state is not None and req is not None,
-        )
-        empty = self._sr_empty_reply(dreq)
-        if decision in (
-            DraftDecision.DROP_OLD_SESSION,
-            DraftDecision.DROP_STALE_SEQ,
-        ):
-            empty.status = SRReplyStatus.REJECT
-            return empty, None
-        if decision == DraftDecision.FINISH:
-            self._sr_finish_rid(dreq.rid)
-            empty.status = SRReplyStatus.OK
-            return empty, None
-        if decision == DraftDecision.IDEMPOTENT:
-            cached = None if state is None else state.cached_reply
-            if cached is not None:
-                return (
-                    SRDraftReply(
-                        rid=dreq.rid,
-                        step_id=dreq.step_id,
-                        base_committed_len=dreq.base_committed_len,
-                        draft_tokens=list(cached.draft_tokens),
-                        status=SRReplyStatus.IDEMPOTENT,
-                        parent_list=thaw_ids(cached.parent_list),
-                        top_scores_index=thaw_ids(cached.top_scores_index),
-                        tree_version=self._sr_reply_tree_version(dreq.rid),
-                    ),
-                    None,
-                )
-            return empty, None
-        if decision == DraftDecision.HARD_RESET:
-            # A fresh req replaces the broken KV, so speculation can resume.
-            if state is not None:
-                state.degraded = False
-            req = self._sr_create_req(dreq, mm, session_id)
-            if req is None:
-                return empty, None
-        elif decision == DraftDecision.WIPE_NEW_SESSION:
-            # Batch-level wipe already ran for this session_id; do not wipe
-            # siblings created earlier in the same RPC.
-            if self.sr_state.session_id != session_id:
-                self._sr_wipe_all()
-                self.sr_state.session_id = session_id
-            if dreq.padded_input_ids:
-                req = self._sr_create_req(dreq, mm, session_id)
-                if req is None:
-                    return empty, None
-            else:
-                return empty, None
-        else:
-            if req is None:
-                if dreq.padded_input_ids:
-                    req = self._sr_create_req(dreq, mm, session_id)
-                    if req is None:
-                        return empty, None
-                else:
-                    return empty, None
-            elif state is not None and state.degraded:
-                # Broken Draft state: stay off the GPU, let Target autoregress.
-                return empty, None
-            else:
-                self._sr_align(req, dreq, state)
-
-        if req is None:
-            return empty, None
-        return None, req
-
     def _sr_produce_windows(
         self,
         action: SRAction,
@@ -2934,15 +2834,8 @@ class StandaloneRemoteDraftSchedulerMixin:
         metrics = get_sr_round_metrics(self, "Draft")
         prepare_start = time.perf_counter()
         last_session = self.sr_state.session_id
-        last_rpc = self.sr_server.last_rpc_seq if self.sr_server is not None else -1
-        wiped_this_batch = (
-            last_session is not None and batch.session_id > last_session
-        )
-        if wiped_this_batch:
+        if last_session is not None and batch.session_id > last_session:
             self._sr_wipe_all()
-            # New session resets Target rpc_seq to 0. Do not apply the previous
-            # session's last_rpc_seq to this batch or PREFILL is DROP_STALE_SEQ.
-            last_rpc = -1
         self.sr_state.session_id = batch.session_id
         self._sr_cleanup_stale_drafts(keep_rids={d.rid for d in batch.reqs})
         if (
@@ -2957,6 +2850,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             return SRBatchReply(
                 session_id=batch.session_id,
                 rpc_seq=batch.rpc_seq,
+                protocol_version=SR_PROTOCOL_VERSION,
                 reqs=[
                     self._sr_empty_reply(d, status=SRReplyStatus.REJECT)
                     for d in batch.reqs
@@ -2965,28 +2859,10 @@ class StandaloneRemoteDraftSchedulerMixin:
         n = len(batch.reqs)
         replies: List[Optional[SRDraftReply]] = [None] * n
         gpu_pairs: List[Tuple[int, SRDraftRequest, Req]] = []
-        use_v2 = batch.protocol_version == SR_PROTOCOL_VERSION
-        # After a batch-level wipe, later rids must see the new session so
-        # decide_draft_action does not WIPE_NEW_SESSION again and drop siblings.
-        prepare_last_session = (
-            batch.session_id if wiped_this_batch else last_session
-        )
-        prepare_last_rpc = -1 if wiped_this_batch else last_rpc
         for i, dreq in enumerate(batch.reqs):
-            if use_v2:
-                reply, req = self._sr_prepare_v2(
-                    dreq, batch.action, batch.session_id, mm_by_rid.get(dreq.rid)
-                )
-            else:
-                reply, req = self._sr_prepare_one(
-                    dreq,
-                    batch.action,
-                    batch.session_id,
-                    batch.rpc_seq,
-                    mm_by_rid.get(dreq.rid),
-                    prepare_last_session,
-                    prepare_last_rpc,
-                )
+            reply, req = self._sr_prepare_v2(
+                dreq, batch.action, batch.session_id, mm_by_rid.get(dreq.rid)
+            )
             if reply is not None:
                 replies[i] = reply
             else:
@@ -3001,21 +2877,15 @@ class StandaloneRemoteDraftSchedulerMixin:
             for (i, dreq, req), window in zip(gpu_pairs, windows):
                 pending_wire = getattr(req, "sr_pending_wire_request", None)
                 wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
-                reply = self._sr_stamp_window(
-                    wire, window, batch.session_id, publish=not use_v2
-                )
-                if use_v2:
-                    reply = self._sr_finalize_v2_commit(wire, req, reply)
-                replies[i] = reply
+                reply = self._sr_stamp_window(wire, window, batch.session_id)
+                replies[i] = self._sr_finalize_v2_commit(wire, req, reply)
             if metrics.active:
                 metrics.add_host("reply_prepare", time.perf_counter() - reply_start)
-        if self.sr_server is not None:
-            self.sr_server.remember(batch)
         self._sr_note_handled(batch)
         return SRBatchReply(
             session_id=batch.session_id,
             rpc_seq=batch.rpc_seq,
-            protocol_version=SR_PROTOCOL_VERSION if use_v2 else None,
+            protocol_version=SR_PROTOCOL_VERSION,
             reqs=[r if r is not None else self._sr_empty_reply(d) for r, d in zip(replies, batch.reqs)],
         )
 
@@ -3026,7 +2896,9 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_batch_is_stale(self, batch: SRBatchRequest) -> bool:
         """Same decision on every TP rank. Do not read rank 0's server cursor."""
         last_session = getattr(self, "sr_handled_session", None)
-        last_rpc = int(getattr(self, "sr_handled_rpc", -1) or -1)
+        # 0 is a real rpc. ``or -1`` would treat a handled rpc 0 as unset.
+        raw_rpc = getattr(self, "sr_handled_rpc", -1)
+        last_rpc = -1 if raw_rpc is None else int(raw_rpc)
         if last_session is not None and batch.session_id < last_session:
             return True
         if last_session == batch.session_id and int(batch.rpc_seq) <= last_rpc:
@@ -3083,10 +2955,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                     metrics = get_sr_round_metrics(self, "Draft")
                     measure = self._sr_tree_mode() and batch.action == SRAction.STEP
                     with metrics.round() if measure else nullcontext():
-                        if (
-                            batch.protocol_version is not None
-                            and batch.protocol_version != SR_PROTOCOL_VERSION
-                        ):
+                        if not supported_protocol(batch.protocol_version):
                             reply = self._sr_protocol_mismatch_reply(batch)
                             self._sr_note_handled(batch)
                         else:

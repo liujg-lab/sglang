@@ -63,7 +63,7 @@ class SRDraftState:
     cached_reply: Optional[SRCachedReply] = None
     req_object: Optional["Req"] = None
     # Sticky: this rid hit unrecoverable Draft state (half-ingested KV, broken
-    # VL tensors). Reply EMPTY without touching the GPU until Target FINISHes.
+    # VL tensors). Reply REJECT/degraded with no ACK until Target FINISHes.
     degraded: bool = False
     last_updated_time: float = field(default_factory=time.time)
     # Authoritative committed output, without prompt and without draft tokens.

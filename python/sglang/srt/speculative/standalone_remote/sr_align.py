@@ -2,26 +2,13 @@
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
-
 
 class SRWarmupFatalError(RuntimeError):
     """Abort initialization: sync failed, ownership unknown, or restore failed."""
-
-
-class DraftDecision(Enum):
-    DROP_OLD_SESSION = "drop_old_session"
-    WIPE_NEW_SESSION = "wipe_new_session"
-    DROP_STALE_SEQ = "drop_stale_seq"
-    IDEMPOTENT = "idempotent"
-    FULL_REALIGN = "full_realign"
-    HARD_RESET = "hard_reset"
-    FINISH = "finish"
 
 
 def find_fork_point(draft_ids: Sequence[int], target_ids: Sequence[int]) -> Tuple[bool, int]:
@@ -53,40 +40,6 @@ def classify_prefix_alignment(
     if fork == len(target) and fork < len(local) and fork >= prefix_len:
         return "local_rollback"
     return "reprefill"
-
-
-def decide_draft_action(
-    action: SRAction,
-    session_id: str,
-    rpc_seq: int,
-    last_session_id: Optional[str],
-    last_rpc_seq: int,
-    last_step_id: int,
-    last_base_committed_len: int,
-    step_id: int,
-    base_committed_len: int,
-    has_state: bool,
-) -> DraftDecision:
-    if action in (SRAction.FINISH, SRAction.ABORT):
-        return DraftDecision.FINISH
-    if last_session_id is not None and session_id < last_session_id:
-        return DraftDecision.DROP_OLD_SESSION
-    if last_session_id is not None and session_id > last_session_id:
-        if action == SRAction.PREFILL:
-            return DraftDecision.HARD_RESET
-        return DraftDecision.WIPE_NEW_SESSION
-    if last_session_id is not None and rpc_seq <= last_rpc_seq:
-        return DraftDecision.DROP_STALE_SEQ
-    if action == SRAction.PREFILL:
-        return DraftDecision.HARD_RESET
-    if not has_state:
-        return DraftDecision.FULL_REALIGN
-    if (
-        step_id == last_step_id
-        and base_committed_len == last_base_committed_len
-    ):
-        return DraftDecision.IDEMPOTENT
-    return DraftDecision.FULL_REALIGN
 
 
 def draft_token_budget(num_draft_tokens: Optional[int], spec_steps: Optional[int]) -> int:

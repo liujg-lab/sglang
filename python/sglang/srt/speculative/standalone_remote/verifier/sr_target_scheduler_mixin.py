@@ -351,7 +351,10 @@ class SchedulerStandaloneRemoteTargetMixin:
     ) -> Optional[SRInflight]:
         if not reqs:
             return None
-        if getattr(self, "sr_speculation_stopped", False) and action == SRAction.STEP:
+        if getattr(self, "sr_speculation_stopped", False) and action in (
+            SRAction.PREFILL,
+            SRAction.STEP,
+        ):
             return None
         self._sr_sync_connection()
 
@@ -517,6 +520,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                 "unrecoverable_mm",
                 "completion_unknown",
                 "untrusted_kv",
+                "degraded",
             ):
                 req.sr_stop_spec = True
                 _clear_draft(req)
@@ -562,7 +566,7 @@ class SchedulerStandaloneRemoteTargetMixin:
             SRAction.STEP, retry, include_full_context=True
         )
         if getattr(self, "sr_speculation_stopped", False):
-            return replies
+            return {}
         again = self._sr_apply_commit_acks(retry, snap, snap_pending)
         metrics = get_sr_round_metrics(self, "Target")
         note_commit_result(metrics, "commit_resend_ok", len(retry) - len(again))
@@ -660,8 +664,12 @@ class SchedulerStandaloneRemoteTargetMixin:
         self, reqs: List[Req], replies: Dict[str, SRDraftReply]
     ) -> int:
         n_ok = 0
+        session_stopped = getattr(self, "sr_speculation_stopped", False)
         for req in reqs:
             if _is_health_check(req):
+                continue
+            if session_stopped or getattr(req, "sr_stop_spec", False):
+                _clear_draft(req)
                 continue
             reply = replies.get(req.rid)
             if (

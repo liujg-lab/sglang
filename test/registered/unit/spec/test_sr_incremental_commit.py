@@ -67,17 +67,26 @@ def _delta(history, new, prompt_len, base_version, version, step=2):
 
 class TestSRIncrementalCommit(unittest.TestCase):
     def test_missing_protocol_version_is_not_v2(self):
-        raw = SRBatchRequest(
+        local = SRBatchRequest(
             session_id="s", rpc_seq=1, action=SRAction.STEP, reqs=[]
-        ).to_dict()
-        self.assertNotIn("protocol_version", raw)
-        loaded = SRBatchRequest.from_dict(raw)
-        self.assertIsNone(loaded.protocol_version)
-        self.assertFalse(supported_protocol(loaded.protocol_version))
-        raw["protocol_version"] = SR_PROTOCOL_VERSION
-        self.assertTrue(
-            supported_protocol(SRBatchRequest.from_dict(raw).protocol_version)
         )
+        raw = local.to_dict()
+        self.assertEqual(raw["protocol_version"], SR_PROTOCOL_VERSION)
+        self.assertTrue(supported_protocol(SRBatchRequest.from_dict(raw).protocol_version))
+        wire = {
+            "session_id": "s",
+            "rpc_seq": 1,
+            "action": "step",
+            "reqs": [],
+        }
+        for value in (None, 2.5, "2", True, 1):
+            sample = dict(wire)
+            if value is not None:
+                sample["protocol_version"] = value
+            loaded = SRBatchRequest.from_dict(sample)
+            self.assertFalse(supported_protocol(loaded.protocol_version))
+            self.assertEqual(loaded.session_id, "s")
+            self.assertEqual(loaded.rpc_seq, 1)
 
     def test_snapshot_and_delta_roundtrip_and_exclusion(self):
         prompt, output = [1, 2], [9]
@@ -270,8 +279,15 @@ class TestSRIncrementalCommit(unittest.TestCase):
         self.assertFalse(
             reply_stops_speculation(SR_PROTOCOL_VERSION, session_rpc_matched=True)
         )
+        self.assertTrue(reply_stops_speculation(2.5, session_rpc_matched=True))
+        self.assertTrue(reply_stops_speculation(True, session_rpc_matched=True))
         reply = SRBatchReply(session_id="s", rpc_seq=1, reqs=[])
-        self.assertIsNone(SRBatchReply.from_dict(reply.to_dict()).protocol_version)
+        self.assertEqual(
+            SRBatchReply.from_dict(reply.to_dict()).protocol_version,
+            SR_PROTOCOL_VERSION,
+        )
+        missing = {"session_id": "s", "rpc_seq": 1, "reqs": []}
+        self.assertIsNone(SRBatchReply.from_dict(missing).protocol_version)
 
     def test_chain_grammar_uses_authoritative_history(self):
         # Snapshot folded the committed output into origin and cleared output.

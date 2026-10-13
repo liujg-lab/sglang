@@ -2,8 +2,8 @@
 
 The wire delta is the suffix appended since the last ACK. A trusted delta whose
 local prefix stamp matches appends in place. Every other legal commit still
-rebuilds history and uses the existing align path. A missing protocol version
-is the historical protocol and must not be read as version 2.
+rebuilds history and uses the existing align path. Only integer protocol
+version 2 may be installed. A missing or non-int version is unsupported.
 """
 
 from __future__ import annotations
@@ -13,11 +13,11 @@ from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    SR_PROTOCOL_VERSION,
     SRAction,
     SRReplyStatus,
 )
 
-SR_PROTOCOL_VERSION = 2
 PROTOCOL_MISMATCH = "protocol_mismatch"
 
 _CONTROL = (SRAction.FINISH, SRAction.ABORT)
@@ -112,13 +112,14 @@ class CommittedPrefixView:
 
 
 def supported_protocol(version: Optional[int]) -> bool:
-    return version == SR_PROTOCOL_VERSION
+    """Only a real integer 2. Float 2.0 and bool must not compare equal."""
+    return type(version) is int and version == SR_PROTOCOL_VERSION
 
 
 def reply_stops_speculation(
     protocol_version: Optional[int], *, session_rpc_matched: bool
 ) -> bool:
-    """Old or missing versions stop the session only after session/rpc match."""
+    """Unsupported versions stop the session only after session/rpc match."""
     if not session_rpc_matched:
         return False
     return not supported_protocol(protocol_version)

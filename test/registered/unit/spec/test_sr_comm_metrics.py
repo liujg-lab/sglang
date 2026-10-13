@@ -273,9 +273,7 @@ class TestCommTransport(unittest.TestCase):
         )
         self.assertIsNone(self.server._comm_pending)
         self.server._socket.incoming.append(frames)
-        batch, _ = self.server.recv_batch()
-        self.server.remember(batch)
-        self.assertEqual(self.server.last_rpc_seq, batch.rpc_seq)
+        self.server.recv_batch()
         self.server._socket.incoming.append(frames)
         self.server.recv_batch()
         self.server.close()
@@ -385,7 +383,7 @@ class TestCommTransport(unittest.TestCase):
                 self.assertEqual(pending.start_ns, start)
                 self.assertEqual(pending.key, (request.session_id, request.rpc_seq))
                 self.assertEqual(pending.identity, b"current")
-                self.assertEqual(self.server.last_rpc_seq, -1)
+                self.assertFalse(hasattr(self.server, "last_rpc_seq"))
                 self.assertFalse(self.server._socket.incoming)
                 self.clock.advance(170)
                 self.server.send_batch(
@@ -442,7 +440,9 @@ class TestCommTransport(unittest.TestCase):
 class TestCommMetrics(unittest.TestCase):
     def test_protocol_compatibility(self):
         old = {"session_id": "s", "rpc_seq": 1, "reqs": []}
-        self.assertEqual(SRBatchReply.from_dict(old).to_dict(), old)
+        loaded = SRBatchReply.from_dict(old)
+        self.assertIsNone(loaded.protocol_version)
+        self.assertIsNone(loaded.to_dict()["protocol_version"])
         new = dict(old, draft_residence_ns=123, future_field="ignored")
         self.assertEqual(SRBatchReply.from_dict(new).draft_residence_ns, 123)
         for invalid in (-1, True, "bad"):

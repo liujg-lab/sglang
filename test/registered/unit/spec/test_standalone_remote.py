@@ -20,13 +20,11 @@ from sglang.srt.speculative.spec_info import (
     resolve_cuda_graph_capture_hidden_mode,
 )
 from sglang.srt.speculative.standalone_remote.sr_align import (
-    DraftDecision,
     apply_tree_seed_topk,
     broadcast_sr_obj,
     capture_tree_seed_topk,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
-    decide_draft_action,
     draft_needed_max_new_tokens,
     draft_token_budget,
     drop_duplicate_root_draft,
@@ -853,181 +851,6 @@ class TestSRTreeSeedSourceGuard(CustomTestCase):
         self.assertIn("kv_release_len", src)
 
 
-class TestDraftDecision(CustomTestCase):
-    def test_old_session_dropped(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="0001_a",
-            rpc_seq=2,
-            last_session_id="0002_b",
-            last_rpc_seq=1,
-            last_step_id=0,
-            last_base_committed_len=4,
-            step_id=1,
-            base_committed_len=4,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.DROP_OLD_SESSION)
-
-    def test_new_session_wipes(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="0003_c",
-            rpc_seq=1,
-            last_session_id="0002_b",
-            last_rpc_seq=9,
-            last_step_id=4,
-            last_base_committed_len=8,
-            step_id=0,
-            base_committed_len=8,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.WIPE_NEW_SESSION)
-
-    def test_prefill_hard_resets(self):
-        d = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="s",
-            rpc_seq=3,
-            last_session_id="s",
-            last_rpc_seq=2,
-            last_step_id=4,
-            last_base_committed_len=8,
-            step_id=0,
-            base_committed_len=8,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.HARD_RESET)
-
-    def test_prefill_after_flush_new_session_is_hard_reset(self):
-        """flush_cache: Target new session_id + rpc_seq=1 vs Draft last_rpc from
-        the previous session. Passing the old session_id (and/or last_rpc=-1)
-        must HARD_RESET, not DROP_STALE_SEQ — otherwise the next generate is AR.
-        """
-        kwargs = dict(
-            last_step_id=4,
-            last_base_committed_len=8,
-            step_id=0,
-            base_committed_len=8,
-            has_state=False,
-        )
-        d = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="0002_new",
-            rpc_seq=1,
-            last_session_id="0001_old",
-            last_rpc_seq=5,
-            **kwargs,
-        )
-        self.assertEqual(d, DraftDecision.HARD_RESET)
-
-        d_after_wipe = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="0002_new",
-            rpc_seq=1,
-            last_session_id="0001_old",
-            last_rpc_seq=-1,
-            **kwargs,
-        )
-        self.assertEqual(d_after_wipe, DraftDecision.HARD_RESET)
-
-        d_same_session_reset_seq = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="0002_new",
-            rpc_seq=1,
-            last_session_id="0002_new",
-            last_rpc_seq=-1,
-            **kwargs,
-        )
-        self.assertEqual(d_same_session_reset_seq, DraftDecision.HARD_RESET)
-
-        # Buggy mixin wiring: new session as last_session_id + old last_rpc.
-        d_bug = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="0002_new",
-            rpc_seq=1,
-            last_session_id="0002_new",
-            last_rpc_seq=5,
-            **kwargs,
-        )
-        self.assertEqual(d_bug, DraftDecision.DROP_STALE_SEQ)
-
-    def test_stale_rpc_seq_dropped(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=2,
-            last_session_id="s",
-            last_rpc_seq=2,
-            last_step_id=1,
-            last_base_committed_len=4,
-            step_id=2,
-            base_committed_len=5,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.DROP_STALE_SEQ)
-
-    def test_idempotent_replay(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=5,
-            last_session_id="s",
-            last_rpc_seq=4,
-            last_step_id=2,
-            last_base_committed_len=10,
-            step_id=2,
-            base_committed_len=10,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.IDEMPOTENT)
-
-    def test_next_step_full_realign(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=5,
-            last_session_id="s",
-            last_rpc_seq=4,
-            last_step_id=2,
-            last_base_committed_len=10,
-            step_id=3,
-            base_committed_len=14,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.FULL_REALIGN)
-
-    def test_base_len_mismatch_full_realign(self):
-        d = decide_draft_action(
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=5,
-            last_session_id="s",
-            last_rpc_seq=4,
-            last_step_id=2,
-            last_base_committed_len=10,
-            step_id=3,
-            base_committed_len=11,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.FULL_REALIGN)
-
-    def test_finish(self):
-        d = decide_draft_action(
-            SRAction.FINISH,
-            session_id="s",
-            rpc_seq=9,
-            last_session_id="s",
-            last_rpc_seq=8,
-            last_step_id=2,
-            last_base_committed_len=10,
-            step_id=3,
-            base_committed_len=11,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.FINISH)
-
-
 class TestMMPayloadMultipart(CustomTestCase):
     def test_serialize_roundtrip_and_multipart(self):
         if torch is None:
@@ -1408,49 +1231,6 @@ class TestZmqStaleReply(CustomTestCase):
         server.close()
 
 
-class TestIdempotentWindowCache(CustomTestCase):
-    def test_cached_window_not_advanced(self):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
-            SRCachedReply,
-            SRDraftState,
-            SRDraftStateManager,
-        )
-
-        mgr = SRDraftStateManager()
-        cached = SRCachedReply(draft_tokens=(7, 8, 9))
-        st = SRDraftState(
-            req_id="r",
-            session_id="s",
-            last_step_id=2,
-            last_base_committed_len=10,
-            cached_reply=cached,
-        )
-        mock_req = MagicMock()
-        mock_req.origin_input_ids = [1, 2]
-        mock_req.output_ids = [3, 4, 7, 8, 9]
-        mock_req.req_pool_idx = 0
-        mock_req.kv_committed_len = 7
-        st.req_object = mock_req
-        mgr.set("r", st)
-
-        kv_before = mock_req.kv_committed_len
-        decision = decide_draft_action(
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=4,
-            last_session_id="s",
-            last_rpc_seq=3,
-            last_step_id=st.last_step_id,
-            last_base_committed_len=st.last_base_committed_len,
-            step_id=2,
-            base_committed_len=10,
-            has_state=True,
-        )
-        self.assertEqual(decision, DraftDecision.IDEMPOTENT)
-        self.assertEqual(st.cached_reply.draft_tokens, (7, 8, 9))
-        self.assertEqual(mock_req.kv_committed_len, kv_before)
-
-
 class TestDraftSessionWipe(CustomTestCase):
     def _bind_finish_kv(self, mixin):
         def release_all_kv_for_finished_req(req):
@@ -1489,7 +1269,6 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.token_to_kv_pool_allocator = MagicMock()
         mixin.grammar_manager = MagicMock()
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = 9
         self._bind_finish_kv(mixin)
 
         leftover = MagicMock()
@@ -1515,7 +1294,6 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.req_to_token_pool.clear.assert_called_once()
         mixin.token_to_kv_pool_allocator.clear.assert_called_once()
         mixin.grammar_manager.clear.assert_called_once()
-        self.assertEqual(mixin.sr_server.last_rpc_seq, -1)
         mixin.sr_server.drain.assert_called_once()
         self.assertIsNone(leftover.req_pool_idx)
 
@@ -1640,7 +1418,6 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.token_to_kv_pool_allocator = MagicMock()
         mixin.grammar_manager = MagicMock()
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = 9
         self._bind_finish_kv(mixin)
 
         sr_req = MagicMock()
@@ -1669,7 +1446,6 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin.tree_cache.reset.assert_not_called()
         mixin.req_to_token_pool.clear.assert_not_called()
         mixin.token_to_kv_pool_allocator.clear.assert_not_called()
-        self.assertEqual(mixin.sr_server.last_rpc_seq, -1)
         mixin.sr_server.drain.assert_called_once()
 
     def test_resume_http_reqs_after_isolate(self):
@@ -2048,23 +1824,6 @@ class TestOverlappedPrefillShift(CustomTestCase):
             drop_duplicate_root_draft(10, [11, 12, 13], include_root=True),
             [11, 12, 13],
         )
-
-
-class TestPrefillHardResetRidReuse(CustomTestCase):
-    def test_prefill_always_hard_reset(self):
-        d = decide_draft_action(
-            SRAction.PREFILL,
-            session_id="s",
-            rpc_seq=10,
-            last_session_id="s",
-            last_rpc_seq=9,
-            last_step_id=8,
-            last_base_committed_len=20,
-            step_id=0,
-            base_committed_len=4,
-            has_state=True,
-        )
-        self.assertEqual(d, DraftDecision.HARD_RESET)
 
 
 class TestStandaloneRemoteTree(CustomTestCase):
@@ -3319,7 +3078,6 @@ class TestStandaloneRemoteTree(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = -1
         mixin.sr_tree_drafter = None
         produce_calls = []
 
@@ -3332,7 +3090,8 @@ class TestStandaloneRemoteTree(CustomTestCase):
             produce_calls.append((action, [req.rid for _, req in pairs]))
             return [([10, 11], None, None)] * len(pairs)
 
-        mixin._sr_prepare_one = fake_prepare
+        mixin._sr_prepare_v2 = fake_prepare
+        mixin._sr_finalize_v2_commit = lambda dreq, req, reply: reply
         mixin._sr_produce_windows = fake_produce
         batch = SRBatchRequest(
             session_id="s",
@@ -3352,6 +3111,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual([r.rid for r in reply.reqs], ["a", "b"])
         self.assertEqual(reply.reqs[0].draft_tokens, [10, 11])
         self.assertEqual(reply.reqs[1].draft_tokens, [10, 11])
+        self.assertEqual(reply.protocol_version, 2)
 
     def test_new_session_batch_wipes_once(self):
         try:
@@ -3364,10 +3124,10 @@ class TestStandaloneRemoteTree(CustomTestCase):
         mixin.sr_state = SRDraftStateManager()
         mixin.sr_state.session_id = "1"
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = 9
         wipes = []
         mixin._sr_wipe_all = lambda: wipes.append("wipe")
-        mixin._sr_prepare_one = lambda dreq, *_a, **_k: (None, MagicMock(rid=dreq.rid))
+        mixin._sr_prepare_v2 = lambda dreq, *_a, **_k: (None, MagicMock(rid=dreq.rid))
+        mixin._sr_finalize_v2_commit = lambda dreq, req, reply: reply
         mixin._sr_produce_windows = lambda action, pairs: [
             ([1], None, None)
         ] * len(pairs)
@@ -4160,12 +3920,11 @@ class TestSRDraftBusyReject(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = -1
         mixin.sr_tree_drafter = None
         mixin._sr_draft_busy = lambda: True
         produce_calls = []
         mixin._sr_produce_windows = lambda *_a, **_k: produce_calls.append(1) or []
-        mixin._sr_prepare_one = lambda *_a, **_k: (None, MagicMock())
+        mixin._sr_prepare_v2 = lambda *_a, **_k: (None, MagicMock())
         batch = SRBatchRequest(
             session_id="s",
             rpc_seq=1,
@@ -4181,6 +3940,8 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertEqual(len(reply.reqs), 1)
         self.assertEqual(reply.reqs[0].status, SRReplyStatus.REJECT)
         self.assertEqual(reply.reqs[0].draft_tokens, [])
+        self.assertEqual(reply.protocol_version, 2)
+        self.assertNotEqual(reply.reqs[0].reason, "protocol_mismatch")
 
     def test_busy_still_handles_finish(self):
         try:
@@ -4192,7 +3953,6 @@ class TestSRDraftBusyReject(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
         mixin.sr_server = MagicMock()
-        mixin.sr_server.last_rpc_seq = -1
         mixin._sr_draft_busy = lambda: True
         prepare_calls = []
 
@@ -4200,7 +3960,7 @@ class TestSRDraftBusyReject(CustomTestCase):
             prepare_calls.append(dreq.rid)
             return mixin._sr_empty_reply(dreq), None
 
-        mixin._sr_prepare_one = fake_prepare
+        mixin._sr_prepare_v2 = fake_prepare
         mixin._sr_produce_windows = lambda *_a, **_k: (_ for _ in ()).throw(
             AssertionError("produce must not run")
         )
@@ -4811,38 +4571,138 @@ class TestSRDegradedRequests(CustomTestCase):
         self.assertEqual(windows, [([], None, None)])
         self.assertTrue(mixin.sr_state.get("a").degraded)
 
-    def test_degraded_rid_replies_empty_without_align(self):
+    def _degraded_state(self, mixin):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+            SRCachedReply,
+        )
+
+        mixin.sr_state = SRDraftStateManager()
+        mixin.sr_state.session_id = "s"
+        req = MagicMock()
+        req.rid = "a"
+        req.origin_input_ids = [1, 2]
+        req.output_ids = [9]
+        req.sr_padded_ids = [1, 2]
+        state = SRDraftState(req_id="a", session_id="s", req_object=req)
+        state.degraded = True
+        state.commit_trusted = True
+        state.acked_output_ids = [9]
+        state.acked_version = 1
+        state.prompt_len = 2
+        state.cached_reply = SRCachedReply(draft_tokens=(7, 8))
+        mixin.sr_state.set("a", state)
+        mixin._sr_align = MagicMock()
+        mixin._sr_prepare_delta_fast = MagicMock()
+        return req, state
+
+    def _assert_degraded_reject(self, mixin, dreq):
+        reply, live = mixin._sr_prepare_v2(dreq, SRAction.STEP, "s", None)
+        self.assertIsNone(live)
+        self.assertEqual(reply.status, SRReplyStatus.REJECT)
+        self.assertEqual(reply.reason, "degraded")
+        self.assertEqual(reply.draft_tokens, [])
+        self.assertIsNone(reply.ack_commit_version)
+        self.assertIsNone(reply.ack_output_len)
+        mixin._sr_align.assert_not_called()
+        mixin._sr_prepare_delta_fast.assert_not_called()
+
+    def test_degraded_snapshot_cache_and_delta_reject_without_ack(self):
+        from sglang.srt.speculative.standalone_remote.sr_commit import (
+            commit_fingerprint,
+        )
+
+        mixin = self._mixin()
+        _req, state = self._degraded_state(mixin)
+        snapshot = SRDraftRequest(
+            rid="a",
+            step_id=2,
+            base_committed_len=3,
+            committed_ids=[9, 10],
+            padded_input_ids=[1, 2],
+            sampling_params={"temperature": 0},
+            commit_mode="snapshot",
+            commit_version=2,
+            num_draft_tokens=4,
+        )
+        self._assert_degraded_reject(mixin, snapshot)
+
+        _req, state = self._degraded_state(mixin)
+        cached = SRDraftRequest(
+            rid="a",
+            step_id=2,
+            base_committed_len=3,
+            commit_mode="delta",
+            commit_version=1,
+            base_commit_version=0,
+            base_output_len=1,
+            delta_ids=[9],
+            num_draft_tokens=4,
+        )
+        state.last_commit_fingerprint = commit_fingerprint(cached)
+        self._assert_degraded_reject(mixin, cached)
+
+        _req, _state = self._degraded_state(mixin)
+        delta = SRDraftRequest(
+            rid="a",
+            step_id=3,
+            base_committed_len=4,
+            commit_mode="delta",
+            commit_version=2,
+            base_commit_version=1,
+            base_output_len=1,
+            delta_ids=[3],
+            num_draft_tokens=4,
+        )
+        self._assert_degraded_reject(mixin, delta)
+
+        _req, _state = self._degraded_state(mixin)
+        empty_delta = SRDraftRequest(
+            rid="a",
+            step_id=3,
+            base_committed_len=3,
+            commit_mode="delta",
+            commit_version=2,
+            base_commit_version=1,
+            base_output_len=1,
+            delta_ids=[],
+            num_draft_tokens=4,
+        )
+        self._assert_degraded_reject(mixin, empty_delta)
+
+    def test_finish_enters_cleanup_before_completion_unknown(self):
         mixin = self._mixin()
         mixin.sr_state = SRDraftStateManager()
+        mixin.sr_state.session_id = "s"
         req = MagicMock()
         req.rid = "a"
         state = SRDraftState(req_id="a", session_id="s", req_object=req)
+        state.completion_unknown = True
         state.degraded = True
-        state.last_step_id = 0
-        state.last_base_committed_len = 3
         mixin.sr_state.set("a", state)
-        mixin._sr_align = MagicMock()
+        finished = []
+        mixin._sr_finish_rid = lambda rid, *args, **kwargs: finished.append(rid)
 
-        dreq = SRDraftRequest(
-            rid="a",
-            step_id=1,
-            base_committed_len=4,
-            committed_ids=[10],
-            num_draft_tokens=4,
-        )
-        reply, live = mixin._sr_prepare_one(
-            dreq,
-            SRAction.STEP,
-            session_id="s",
-            rpc_seq=2,
-            mm=None,
-            last_session_id="s",
-            last_rpc_seq=1,
-        )
+        finish = SRDraftRequest(rid="a", step_id=4, base_committed_len=3, num_draft_tokens=0)
+        reply, live = mixin._sr_prepare_v2(finish, SRAction.FINISH, "s", None)
         self.assertIsNone(live)
-        self.assertEqual(reply.status, SRReplyStatus.EMPTY)
-        self.assertEqual(reply.draft_tokens, [])
-        mixin._sr_align.assert_not_called()
+        self.assertEqual(finished, ["a"])
+        self.assertEqual(reply.status, SRReplyStatus.OK)
+
+        finished.clear()
+        step = SRDraftRequest(
+            rid="a",
+            step_id=5,
+            base_committed_len=3,
+            commit_mode="delta",
+            commit_version=2,
+            base_commit_version=1,
+            base_output_len=0,
+            delta_ids=[1],
+        )
+        blocked, live = mixin._sr_prepare_v2(step, SRAction.STEP, "s", None)
+        self.assertIsNone(live)
+        self.assertEqual(finished, [])
+        self.assertEqual(blocked.reason, "completion_unknown")
 
     def test_mm_embed_error_detects_released_features(self):
         mixin = self._mixin()
@@ -6035,6 +5895,225 @@ class TestOwnedFromInts(CustomTestCase):
         self.assertEqual(first.tolist(), [1, 2, 3])
         self.assertEqual(second.tolist(), [4, 5, 6])
         self.assertEqual(third.tolist(), [7, 8, 9])
+
+
+class TestSRV2StopAndVersion(CustomTestCase):
+    def _draft(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+                StandaloneRemoteDraftSchedulerMixin,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        mixin = StandaloneRemoteDraftSchedulerMixin()
+        mixin.sr_state = SRDraftStateManager()
+        mixin.tp_size = 1
+        mixin.tp_rank = 0
+        return mixin
+
+    def _target(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SRInflight,
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.tp_size = 1
+        mixin.tp_rank = 0
+        mixin.sr_session_id = "s"
+        mixin.sr_rpc_seq = 0
+        mixin.sr_speculation_stopped = False
+        mixin.current_scheduler_metrics_enabled = False
+        mixin.sr_breaker = None
+        return mixin, SRInflight
+
+    def test_rpc_zero_is_fresh_until_handled(self):
+        mixin = self._draft()
+        fresh = SRBatchRequest(session_id="s", rpc_seq=0, action=SRAction.STEP, reqs=[])
+        self.assertFalse(mixin._sr_batch_is_stale(fresh))
+        mixin._sr_note_handled(fresh)
+        self.assertTrue(mixin._sr_batch_is_stale(fresh))
+        nxt = SRBatchRequest(session_id="s", rpc_seq=1, action=SRAction.STEP, reqs=[])
+        self.assertFalse(mixin._sr_batch_is_stale(nxt))
+
+    def test_illegal_version_does_not_wipe_align_or_run_gpu(self):
+        mixin = self._draft()
+        mixin.sr_state.session_id = "1"
+        mixin._init_sr_draft = lambda: None
+        wipes, aligns, gpus = [], [], []
+        sent = []
+        mixin._sr_wipe_all = lambda: wipes.append(1)
+        mixin._sr_align = lambda *args, **kwargs: aligns.append(1)
+        mixin._sr_produce_windows = lambda *args, **kwargs: gpus.append(1) or []
+        mixin._sr_resume_http_reqs = lambda: None
+        mixin._sr_poll_deferred_finishes = lambda: None
+        mixin._sr_cleanup_stale_drafts = lambda *args, **kwargs: None
+        mixin.sr_server = SimpleNamespace(send_batch=lambda reply: sent.append(reply))
+        calls = {"n": 0}
+
+        def recv_requests():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("stop-loop")
+            return []
+
+        mixin.recv_requests = recv_requests
+        mixin.process_input_requests = lambda reqs: None
+        bad = SRBatchRequest.from_dict(
+            {
+                "session_id": "2",
+                "rpc_seq": 0,
+                "action": "step",
+                "reqs": [{"rid": "a", "step_id": 1, "base_committed_len": 1}],
+                "protocol_version": 2.5,
+            }
+        )
+        packets = [(bad, {})]
+        mixin._sr_recv_packet = lambda: packets.pop(0) if packets else None
+        mixin._sr_run_http_batch = lambda: (_ for _ in ()).throw(RuntimeError("stop-loop"))
+        with self.assertRaisesRegex(RuntimeError, "stop-loop"):
+            mixin.event_loop_normal_standalone_remote_draft()
+        self.assertEqual(wipes, [])
+        self.assertEqual(aligns, [])
+        self.assertEqual(gpus, [])
+        self.assertEqual(mixin.sr_state.session_id, "1")
+        self.assertEqual(sent[0].protocol_version, 2)
+        self.assertEqual(sent[0].reqs[0].reason, "protocol_mismatch")
+        self.assertEqual(mixin.sr_handled_rpc, 0)
+
+    def test_stopped_session_blocks_prefill_and_step_only(self):
+        mixin, _inflight = self._target()
+        mixin.sr_speculation_stopped = True
+        req = SimpleNamespace(rid="a", origin_input_ids=[1])
+        self.assertIsNone(mixin._sr_send(SRAction.PREFILL, [req], True))
+        self.assertIsNone(mixin._sr_send(SRAction.STEP, [req], False))
+        mixin._sr_sync_connection = lambda: None
+        mixin._build_sr_request = lambda request, action, full: (
+            SRDraftRequest(
+                rid=request.rid, step_id=0, base_committed_len=0, num_draft_tokens=0
+            ),
+            None,
+        )
+        sent = []
+        mixin.sr_client = SimpleNamespace(
+            send_batch=lambda batch, mm=None: sent.append(batch.action)
+        )
+        self.assertIsNotNone(mixin._sr_send(SRAction.FINISH, [req], False))
+        self.assertIsNotNone(
+            mixin._sr_send(
+                SRAction.ABORT,
+                [SimpleNamespace(rid="b", origin_input_ids=[1])],
+                False,
+            )
+        )
+        self.assertEqual(sent, [SRAction.FINISH, SRAction.ABORT])
+
+    def test_attach_skips_stopped_session_and_rid(self):
+        mixin, _inflight = self._target()
+        reply = SRDraftReply(
+            rid="a",
+            step_id=1,
+            base_committed_len=2,
+            draft_tokens=[9],
+            status=SRReplyStatus.OK,
+        )
+        mixin.sr_speculation_stopped = True
+        session_req = SimpleNamespace(rid="a", cur_drafts=[1], sr_stop_spec=False)
+        mixin._sr_attach_replies([session_req], {"a": reply})
+        self.assertEqual(session_req.cur_drafts, [])
+
+        mixin.sr_speculation_stopped = False
+        rid_req = SimpleNamespace(rid="a", cur_drafts=[1], sr_stop_spec=True)
+        mixin._sr_attach_replies([rid_req], {"a": reply})
+        self.assertEqual(rid_req.cur_drafts, [])
+
+    def test_snapshot_retry_stop_drops_first_replies(self):
+        mixin, _inflight = self._target()
+
+        def rpc(action, reqs, include_full_context):
+            if include_full_context:
+                mixin.sr_speculation_stopped = True
+            reply = SRDraftReply(
+                rid=reqs[0].rid,
+                step_id=1,
+                base_committed_len=2,
+                draft_tokens=[9],
+                status=SRReplyStatus.OK,
+            )
+            return {reqs[0].rid: reply}, {}
+
+        mixin._sr_rpc = rpc
+        mixin._sr_apply_commit_acks = lambda reqs, replies, pending: list(reqs)
+        result = mixin.rpc_next_draft([SimpleNamespace(rid="a", sr_stop_spec=False)])
+        self.assertEqual(result, {})
+        self.assertTrue(mixin.sr_speculation_stopped)
+
+    def test_busy_reject_does_not_stop_session_and_missing_ack_holds_cursor(self):
+        mixin, inflight_cls = self._target()
+        pending = SRPendingEntry(
+            step_id=1, base_committed_len=4, commit_version=4, sent_output_len=2
+        )
+        busy = SRBatchReply(
+            session_id="s",
+            rpc_seq=1,
+            protocol_version=2,
+            reqs=[
+                SRDraftReply(
+                    rid="a",
+                    step_id=1,
+                    base_committed_len=4,
+                    draft_tokens=[],
+                    status=SRReplyStatus.REJECT,
+                )
+            ],
+        )
+        mixin.sr_client = SimpleNamespace(recv_batch=lambda session, rpc: busy)
+        inflight = inflight_cls(
+            session_id="s", rpc_seq=1, pending={"a": pending}, wait_reply=True
+        )
+        result, _pending = mixin._sr_recv(inflight)
+        self.assertFalse(mixin.sr_speculation_stopped)
+        self.assertIn("a", result)
+        self.assertNotEqual(result["a"].reason, "protocol_mismatch")
+
+        req = SimpleNamespace(
+            rid="a",
+            sr_next_commit_version=5,
+            sr_ack_commit_version=3,
+            sr_ack_output_len=1,
+            sr_force_snapshot=False,
+            sr_stop_spec=False,
+            origin_input_ids=[1],
+            cur_drafts=[4],
+        )
+        no_ack = SRDraftReply(
+            rid="a",
+            step_id=1,
+            base_committed_len=4,
+            status=SRReplyStatus.OK,
+            draft_tokens=[],
+        )
+        mixin._sr_apply_commit_acks([req], {"a": no_ack}, {"a": pending})
+        self.assertEqual(req.sr_ack_commit_version, 3)
+        self.assertEqual(req.sr_ack_output_len, 1)
+        self.assertTrue(req.sr_force_snapshot)
+
+        degraded = SRDraftReply(
+            rid="a",
+            step_id=1,
+            base_committed_len=4,
+            status=SRReplyStatus.REJECT,
+            reason="degraded",
+            draft_tokens=[],
+        )
+        req.sr_force_snapshot = False
+        mixin._sr_apply_commit_acks([req], {"a": degraded}, {"a": pending})
+        self.assertTrue(req.sr_stop_spec)
+        self.assertFalse(req.sr_force_snapshot)
+        self.assertEqual(req.cur_drafts, [])
+        self.assertEqual(req.sr_ack_commit_version, 3)
 
 
 if __name__ == "__main__":

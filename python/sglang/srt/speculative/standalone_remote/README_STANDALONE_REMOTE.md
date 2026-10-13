@@ -482,7 +482,7 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | request `rid` | 单个生成请求的身份 |
 | request `step_id` | 该请求的投机步骤身份 |
 | request `base_committed_len` | `len(origin_input_ids) + len(output_ids)`，包含 prompt 的完整已提交长度 |
-| batch `protocol_version` | 缺失表示旧协议。当前增量提交是 2。旧回复或显式 `protocol_mismatch` 会停止该 session 的投机；旧 session/rpc 仍先按 stale 丢弃 |
+| batch `protocol_version` | 只有整数 2 合法。本地构造默认写出 2。入站缺失、`None`、浮点、字符串或 bool 都不支持，且不会被转换成 2。session/rpc 仍可识别时回 `protocol_mismatch`；该回复自身携带版本 2，只表示拒绝包由 v2 发出。匹配后的非 2 或 `protocol_mismatch` 停止该 session 的 PREFILL/STEP，FINISH/ABORT 仍发送。旧 session/rpc 仍先按 stale 丢弃，不停止当前会话。版本为 2 之后还要核对请求身份、status，再分别推进 ACK 和安装草稿 |
 | request `commit_mode` | `snapshot` 带完整输出历史；`delta` 只带自上次 ACK 以来的新增 token。FINISH/ABORT 不带提交内容 |
 | request `committed_ids` | 仅 snapshot：不含 prompt 的完整 `output_ids`。delta 不带这个字段 |
 | request `delta_ids` | 仅 delta：从 `base_output_len` 起新增的已提交输出，允许空列表。正常包不随历史变长。stamp 有效时 Draft 原地追加；否则再重建完整历史并对齐 |
