@@ -4,6 +4,7 @@ import ast
 import copy
 import unittest
 import unittest.mock
+from collections import Counter
 from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
@@ -224,6 +225,7 @@ def _load_sr_tree_expand_methods():
                 if isinstance(item, ast.FunctionDef) and item.name in {
                     "expand_batch",
                     "_expand_one",
+                    "_expand_and_pack",
                     "_pack_tree_windows",
                     "_d2h_tree_outputs",
                     "_tree_phase",
@@ -949,6 +951,7 @@ class TestRemoteSpecDevice(CustomTestCase):
 
         drafter._expand_tree = boom
         drafter._expand_one = expand_one
+        drafter._expand_and_pack = MethodType(methods._expand_and_pack, drafter)
         drafter._stack_seeds = lambda _reqs: (None, None, None, None)
         req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
         with self.assertRaises(NPUError):
@@ -984,6 +987,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         drafter = SimpleNamespace(_pending_lease_state=None)
         for name in (
             "expand_batch",
+            "_expand_and_pack",
             "_pack_tree_windows",
             "_d2h_tree_outputs",
             "_tree_phase",
@@ -1005,6 +1009,12 @@ class TestRemoteSpecDevice(CustomTestCase):
         drafter._expand_tree = lambda reqs, *seed: (parent, index, tokens)
         drafter._publish_tree_leases = lambda *args, **kwargs: None
         drafter._free_lease_alloc = lambda *args, **kwargs: None
+        tree_counts = Counter()
+        drafter.scheduler = SimpleNamespace(
+            _sr_round_metrics=SimpleNamespace(
+                counts=tree_counts, phase=lambda *args, **kwargs: nullcontext()
+            )
+        )
         req = SimpleNamespace(req_pool_idx=0, sr_tree_seed=object(), rid="r0")
         copies = {"cross": 0, "device": 0}
         orig = torch.Tensor.copy_
@@ -1022,9 +1032,9 @@ class TestRemoteSpecDevice(CustomTestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(copies["cross"], 1)
         self.assertEqual(copies["device"], 0)
-        self.assertEqual(drafter._tree_host_payload_submits, 1)
-        self.assertEqual(drafter._tree_cross_device_d2h, 1)
-        self.assertEqual(drafter._tree_device_pack_copies, 1)
+        self.assertEqual(tree_counts["tree_host_payload_submits"], 1)
+        self.assertEqual(tree_counts["tree_cross_device_d2h"], 1)
+        self.assertEqual(tree_counts["tree_device_pack_copies"], 1)
 
     def test_tree_reply_pack_matches_cpu_oracle(self):
         device = None

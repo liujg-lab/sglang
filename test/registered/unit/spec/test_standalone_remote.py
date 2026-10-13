@@ -4,6 +4,8 @@ import inspect
 import threading
 import time
 import unittest
+from collections import Counter
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -885,7 +887,6 @@ class TestMMPayloadMultipart(CustomTestCase):
 
         payload = SRMMPayload(
             rid="vl1",
-            padded_input_ids=[1, 1_000_042, 1_000_042, 2],
             mm_items=[serialize_mm_item(item)],
             im_token_id=151655,
         )
@@ -894,7 +895,7 @@ class TestMMPayloadMultipart(CustomTestCase):
         self.assertTrue(all(isinstance(b, memoryview) for b in bufs))
         again = SRMMPayload.from_multipart(meta, bufs)
         self.assertEqual(again.rid, "vl1")
-        self.assertEqual(again.padded_input_ids, [])
+        self.assertFalse(hasattr(again, "padded_input_ids"))
         mm = again.to_multimodal_inputs()
         self.assertEqual(mm.mm_items[0].pad_value, 1_000_042)
         self.assertTrue(torch.equal(mm.mm_items[0].feature, feature))
@@ -945,7 +946,6 @@ class TestMMPayloadMultipart(CustomTestCase):
         )
         payload = SRMMPayload(
             rid="r1",
-            padded_input_ids=[7, 7],
             mm_items=[serialize_mm_item(item)],
         )
         batch = SRBatchRequest(
@@ -966,7 +966,7 @@ class TestMMPayloadMultipart(CustomTestCase):
         self.assertEqual(restored.reqs[0].rid, "r1")
         self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
         self.assertIn("r1", mm)
-        self.assertEqual(mm["r1"].padded_input_ids, [])
+        self.assertFalse(hasattr(mm["r1"], "padded_input_ids"))
         got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
         self.assertTrue(torch.equal(got, torch.ones(2, 2)))
 
@@ -997,7 +997,6 @@ class TestMMPayloadMultipart(CustomTestCase):
         )
         payload = SRMMPayload(
             rid="r1",
-            padded_input_ids=[7, 7],
             mm_items=[serialize_mm_item(item)],
             im_token_id=11,
         )
@@ -1029,7 +1028,6 @@ class TestMMPayloadMultipart(CustomTestCase):
         ):
             restored, mm = _unpack_request(views)
         self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
-        self.assertEqual(mm["r1"].padded_input_ids, [])
         got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
         self.assertTrue(torch.equal(got, feature))
 
@@ -1256,7 +1254,6 @@ class TestDraftSessionWipe(CustomTestCase):
 
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
-        mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         mixin.waiting_queue = []
         mixin.running_batch = MagicMock()
@@ -1277,7 +1274,6 @@ class TestDraftSessionWipe(CustomTestCase):
         leftover.finished.return_value = False
         leftover.is_sr_draft = True
         mixin.waiting_queue.append(leftover)
-        mixin.sr_waiting.append(leftover)
         mixin.sr_state.set(
             "old",
             SRDraftState(req_id="old", session_id="s1", req_object=leftover),
@@ -1286,7 +1282,7 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin._sr_wipe_all()
 
         self.assertEqual(mixin.waiting_queue, [])
-        self.assertEqual(mixin.sr_waiting, [])
+        self.assertEqual(mixin.sr_state.active, {})
         self.assertIsNone(mixin.last_batch)
         self.assertIsNone(mixin.cur_batch)
         self.assertIsNone(mixin.chunked_req)
@@ -1306,7 +1302,6 @@ class TestDraftSessionWipe(CustomTestCase):
             self.skipTest(str(e))
 
         mixin = StandaloneRemoteDraftSchedulerMixin()
-        mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         req = MagicMock()
         other = MagicMock()
@@ -1405,7 +1400,6 @@ class TestDraftSessionWipe(CustomTestCase):
 
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.sr_state = SRDraftStateManager()
-        mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         mixin.waiting_queue = []
         mixin.running_batch = MagicMock()
@@ -1431,7 +1425,7 @@ class TestDraftSessionWipe(CustomTestCase):
         http_req.finished.return_value = False
         http_req.is_sr_draft = False
         mixin.waiting_queue.extend([sr_req, http_req])
-        mixin.sr_waiting.append(sr_req)
+        mixin.draft_paused_reqs.append(http_req)
         mixin.sr_state.set(
             "old",
             SRDraftState(req_id="old", session_id="s1", req_object=sr_req),
@@ -1440,7 +1434,8 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin._sr_wipe_all()
 
         self.assertEqual(mixin.waiting_queue, [http_req])
-        self.assertEqual(mixin.sr_waiting, [])
+        self.assertEqual(mixin.draft_paused_reqs, [http_req])
+        self.assertEqual(mixin.sr_state.active, {})
         self.assertIsNone(mixin.last_batch)
         self.assertIsNone(mixin.cur_batch)
         mixin.tree_cache.reset.assert_not_called()
@@ -1459,7 +1454,6 @@ class TestDraftSessionWipe(CustomTestCase):
         mixin = StandaloneRemoteDraftSchedulerMixin()
         mixin.draft_paused_reqs = []
         mixin.waiting_queue = []
-        mixin.sr_waiting = []
         http = MagicMock()
         http.rid = "http"
         http.is_sr_draft = False
@@ -1951,10 +1945,20 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(windows[1][1], [-1, 1])
 
-        drafter._tree_slot_trace = []
-        drafter._tree_device_pack_copies = 0
-        drafter._tree_host_payload_submits = 0
-        drafter._tree_cross_device_d2h = 0
+        slot_trace = []
+        mark_slot = drafter._mark_tree_slot
+
+        def traced_mark(slot, state):
+            mark_slot(slot, state)
+            slot_trace.append(state)
+
+        drafter._mark_tree_slot = traced_mark
+        tree_counts = Counter()
+        drafter.scheduler = SimpleNamespace(
+            _sr_round_metrics=SimpleNamespace(
+                counts=tree_counts, phase=lambda *args, **kwargs: nullcontext()
+            )
+        )
         copies = {"cpu": 0, "cross": 0}
         orig_copy = torch.Tensor.copy_
         order = []
@@ -1987,14 +1991,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
         ):
             drafter.expand_batch([r0, r1])
         self.assertEqual(order, ["submit", "wait"])
-        self.assertEqual(drafter._tree_host_payload_submits, 1)
-        self.assertEqual(drafter._tree_device_pack_copies, 1)
-        self.assertEqual(drafter._tree_cross_device_d2h, 0)
+        self.assertEqual(tree_counts["tree_host_payload_submits"], 1)
+        self.assertEqual(tree_counts["tree_device_pack_copies"], 1)
+        self.assertEqual(tree_counts["tree_cross_device_d2h"], 0)
         self.assertEqual(copies["cross"], 0)
         self.assertEqual(copies["cpu"], 1)
-        self.assertEqual(
-            drafter._tree_slot_trace, ["free", "in_flight", "consuming", "free"]
-        )
+        self.assertEqual(slot_trace, ["free", "in_flight", "consuming", "free"])
 
     def test_unresolved_tree_transfer_keeps_lease(self):
         try:
@@ -3685,7 +3687,6 @@ class TestSRAbortAndRollback(CustomTestCase):
         mixin.sr_state = SimpleNamespace(
             clear=lambda: [SimpleNamespace(req_id="r1", req_object=req)]
         )
-        mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         mixin._sr_is_http_req = lambda r: False
         mixin._sr_http_alive = lambda: False
@@ -3980,7 +3981,6 @@ class TestSRDraftBusyReject(CustomTestCase):
         )
 
         mixin = StandaloneRemoteDraftSchedulerMixin()
-        mixin.sr_waiting = []
         mixin.draft_paused_reqs = []
         mixin.waiting_queue = []
         mixin.running_batch = MagicMock()

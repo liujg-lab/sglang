@@ -228,7 +228,7 @@ class QuarantineTest(unittest.TestCase):
 
                 owner = NS(
                     sr_state=NS(clear=lambda: [state]),
-                    sr_waiting=[req, http],
+                    draft_paused_reqs=[req, http],
                     _sr_int_staging={"slot": {"unresolved": unknown}},
                     _sr_finish_rid=lambda rid, state: released.append(state.req_object),
                     _sr_abandon_poisoned_kv=held.append,
@@ -240,7 +240,7 @@ class QuarantineTest(unittest.TestCase):
                 env["_sr_wipe_all"](owner)
                 self.assertEqual(released, [] if unknown else [req])
                 self.assertEqual(held, [req] if unknown else [])
-                self.assertIn(http, owner.sr_waiting)
+                self.assertEqual(owner.draft_paused_reqs, [http])
 
     def test_wipe_without_http_resets_quarantine_only_after_sync(self):
         path = (
@@ -280,7 +280,6 @@ class QuarantineTest(unittest.TestCase):
                 owner = NS(
                     device="cuda:1",
                     sr_state=NS(clear=lambda: []),
-                    sr_waiting=[],
                     draft_paused_reqs=[],
                     _sr_is_http_req=lambda r: False,
                     _sr_http_alive=lambda: False,
@@ -1796,7 +1795,6 @@ class QuarantineTest(unittest.TestCase):
                 get=lambda rid: None,
                 delete=lambda rid: None,
             ),
-            sr_waiting=[],
             _sr_remove_req=lambda item: None,
             _sr_release_tree_lease=leases.append,
             sr_kv=NS(release_all_kv_for_finished_req=released.append),
@@ -1817,7 +1815,7 @@ class QuarantineTest(unittest.TestCase):
         alloc.generation = 3
         mapping[0, 0] = 99
         newbie = NS(rid="new", req_pool_idx=0)
-        owner.sr_waiting = [newbie]
+        owner.sr_state.active = {"new": NS(req_object=newbie)}
         self.assertFalse(deferred_release_allowed(owner, entry))
         owner._sr_poll_deferred_finishes()
         self.assertEqual(counted.reads, 0)

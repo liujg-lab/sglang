@@ -201,7 +201,6 @@ def release_mm_resources(mm: Optional[MultimodalInputs]) -> None:
 @dataclass
 class SRMMPayload:
     rid: str
-    padded_input_ids: List[int]
     mm_items: List[Dict[str, Any]]
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
@@ -213,14 +212,12 @@ class SRMMPayload:
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
     mm_inputs: Optional[MultimodalInputs] = field(default=None, repr=False)
-    attached: bool = field(default=False, repr=False)
 
     @classmethod
     def from_req(cls, req) -> "SRMMPayload":
         mm: MultimodalInputs = req.multimodal_inputs
         return cls(
             rid=req.rid,
-            padded_input_ids=list(req.origin_input_ids),
             mm_items=[serialize_mm_item(item) for item in mm.mm_items],
             im_token_id=mm.im_token_id,
             im_start_id=mm.im_start_id,
@@ -256,7 +253,6 @@ class SRMMPayload:
         items = [serialize_mm_item(item) for item in mm.mm_items]
         return {
             "rid": self.rid,
-            "padded_input_ids": self.padded_input_ids,
             "mm_items": items,
             "im_token_id": self.im_token_id,
             "im_start_id": self.im_start_id,
@@ -277,7 +273,6 @@ class SRMMPayload:
         ]
         payload = cls(
             rid=data["rid"],
-            padded_input_ids=list(data.get("padded_input_ids") or []),
             mm_items=items,
             im_token_id=data.get("im_token_id"),
             im_start_id=data.get("im_start_id"),

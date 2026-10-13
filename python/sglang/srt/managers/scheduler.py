@@ -2482,13 +2482,16 @@ class Scheduler(
     def get_num_allocatable_reqs(self, running_bs):
         paused_count = 0
         if self.is_remote_spec_draft:
-            lock = getattr(self, "paused_reqs_lock", None)
-            if lock is not None:
-                with lock:
-                    if hasattr(self, "paused_reqs"):
-                        paused_count = len(self.paused_reqs)
-            elif hasattr(self, "paused_reqs"):
-                paused_count = len(self.paused_reqs)
+            if self.spec_algorithm.is_standalone_remote():
+                paused_count = len(getattr(self, "draft_paused_reqs", None) or [])
+            else:
+                lock = getattr(self, "paused_reqs_lock", None)
+                if lock is not None:
+                    with lock:
+                        if hasattr(self, "paused_reqs"):
+                            paused_count = len(self.paused_reqs)
+                elif hasattr(self, "paused_reqs"):
+                    paused_count = len(self.paused_reqs)
 
         # Total occupied slots = running + paused
         total_occupied = running_bs + paused_count
@@ -3195,9 +3198,6 @@ class Scheduler(
             paused = getattr(self, "draft_paused_reqs", None)
             if paused:
                 idle &= len(paused) == 0
-            sr_waiting = getattr(self, "sr_waiting", None)
-            if sr_waiting:
-                idle &= len(sr_waiting) == 0
 
         return idle
 

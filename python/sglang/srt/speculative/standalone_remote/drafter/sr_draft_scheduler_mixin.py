@@ -135,15 +135,6 @@ def _fix_sampling_params_stop_strs(sp) -> None:
         sp.stop_regex_strs = [sp.stop_regex_strs]
 
 
-def _padded_ids_mismatch(a: List[int], b: List[int]) -> Optional[int]:
-    if len(a) != len(b):
-        return 0
-    for i, (x, y) in enumerate(zip(a, b)):
-        if x != y:
-            return i
-    return None
-
-
 @dataclass
 class _SRTreePlanDraft:
     req: Req
@@ -171,9 +162,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             server = make_transport_from_server_args(self.server_args)
             assert isinstance(server, SRDraftServer)
             self.sr_server = server
-        self.sr_waiting: List[Req] = []
         self.draft_paused_reqs: List[Req] = []
-        self.paused_reqs = self.draft_paused_reqs
         self.sr_tree_drafter: Optional[SRTreeDrafter] = None
         self.sr_tree_leases = SRTreeLeaseStore()
         self._sr_device_poisoned = False
@@ -293,7 +282,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                 if req is None:
                     continue
                 self._sr_finish_rid(state.req_id, state=state)
-        self.sr_waiting = [r for r in self.sr_waiting if self._sr_is_http_req(r)]
         if getattr(self, "draft_paused_reqs", None) is not None:
             self.draft_paused_reqs = [
                 r for r in self.draft_paused_reqs if self._sr_is_http_req(r)
@@ -408,8 +396,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             pass
 
     def _sr_remove_req(self, req: Req) -> None:
-        if req in self.sr_waiting:
-            self.sr_waiting.remove(req)
         if req in self.draft_paused_reqs:
             self.draft_paused_reqs.remove(req)
         waiting = getattr(self, "waiting_queue", None)
@@ -463,38 +449,44 @@ class StandaloneRemoteDraftSchedulerMixin:
             else:
                 self._sr_park_in_running_many([req])
 
-    def _sr_park_sr_reqs(self) -> None:
-        """Keep Target RPC reqs out of the HTTP get_next_batch_to_run path."""
+    def _sr_pause_unless(self, keep) -> None:
+        """Pause every running or waiting request that fails ``keep``."""
         running = getattr(self, "running_batch", None)
         if running is not None and not running.is_empty():
-            keep: List[int] = []
+            keep_idx: List[int] = []
             to_pause: List[Req] = []
-            for i, r in enumerate(running.reqs):
-                if getattr(r, "is_sr_draft", False) is True:
-                    to_pause.append(r)
+            for i, req in enumerate(running.reqs):
+                if keep(req):
+                    keep_idx.append(i)
                 else:
-                    keep.append(i)
-            if len(keep) != len(running.reqs):
-                running.filter_batch(keep_indices=keep)
-            for r in to_pause:
-                r.draft_is_paused = True
-                if r not in self.draft_paused_reqs:
-                    self.draft_paused_reqs.append(r)
+                    to_pause.append(req)
+            if len(keep_idx) != len(running.reqs):
+                running.filter_batch(keep_indices=keep_idx)
+            for req in to_pause:
+                req.draft_is_paused = True
+                if req not in self.draft_paused_reqs:
+                    self.draft_paused_reqs.append(req)
         waiting = getattr(self, "waiting_queue", None)
         if waiting:
             stay = []
-            for r in list(waiting):
-                if getattr(r, "is_sr_draft", False) is True:
-                    r.draft_is_paused = True
-                    if r not in self.draft_paused_reqs:
-                        self.draft_paused_reqs.append(r)
+            for req in list(waiting):
+                if keep(req):
+                    stay.append(req)
                 else:
-                    stay.append(r)
+                    req.draft_is_paused = True
+                    if req not in self.draft_paused_reqs:
+                        self.draft_paused_reqs.append(req)
             waiting[:] = stay
         last = getattr(self, "last_batch", None)
         if last is not None and not getattr(last, "is_empty", lambda: True)():
-            if any(getattr(r, "is_sr_draft", False) is True for r in last.reqs):
+            if any(not keep(req) for req in last.reqs):
                 self.last_batch = None
+
+    def _sr_park_sr_reqs(self) -> None:
+        """Keep Target RPC reqs out of the HTTP get_next_batch_to_run path."""
+        self._sr_pause_unless(
+            lambda req: getattr(req, "is_sr_draft", False) is not True
+        )
 
     def _sr_run_http_batch(self) -> None:
         """One ordinary generate tick for Draft HTTP reqs (no RPC this loop)."""
@@ -523,36 +515,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         VL M-RoPE / KV gather. Sibling rids of the **same** RPC belong in
         ``need_rids`` so they share one fused forward.
         """
-        running = getattr(self, "running_batch", None)
-        if running is not None and not running.is_empty():
-            keep: List[int] = []
-            to_pause: List[Req] = []
-            for i, r in enumerate(running.reqs):
-                if r.rid in need_rids:
-                    keep.append(i)
-                else:
-                    to_pause.append(r)
-            if len(keep) != len(running.reqs):
-                running.filter_batch(keep_indices=keep)
-            for r in to_pause:
-                r.draft_is_paused = True
-                if r not in self.draft_paused_reqs:
-                    self.draft_paused_reqs.append(r)
-        waiting = getattr(self, "waiting_queue", None)
-        if waiting:
-            stay = []
-            for r in list(waiting):
-                if r.rid in need_rids:
-                    stay.append(r)
-                else:
-                    r.draft_is_paused = True
-                    if r not in self.draft_paused_reqs:
-                        self.draft_paused_reqs.append(r)
-            waiting[:] = stay
-        last = getattr(self, "last_batch", None)
-        if last is not None and not getattr(last, "is_empty", lambda: True)():
-            if any(getattr(r, "rid", None) not in need_rids for r in last.reqs):
-                self.last_batch = None
+        self._sr_pause_unless(lambda req: getattr(req, "rid", None) in need_rids)
 
     def _sr_make_decode_batch(self, reqs: List[Req]) -> ScheduleBatch:
         device = getattr(self, "device", None)
@@ -1027,15 +990,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_finish_rid(rid, release_mm=False)
 
         input_ids = list(dreq.padded_input_ids or [])
-        if mm is not None and mm.padded_input_ids:
-            mismatch = _padded_ids_mismatch(input_ids, list(mm.padded_input_ids))
-            if mismatch is not None:
-                logger.warning(
-                    "[SR] padded_input_ids mismatch for %s at %s; skip spec",
-                    rid,
-                    mismatch,
-                )
-                return None
         if not input_ids:
             logger.warning("[SR] PREFILL without padded_input_ids for %s", rid)
             return None
@@ -1092,12 +1046,10 @@ class StandaloneRemoteDraftSchedulerMixin:
         if mm is not None:
             mm_inputs = mm.to_multimodal_inputs()
             req.extend_image_inputs(mm_inputs)
-            mm.attached = True
             self._maybe_compute_mrope_positions(req)
 
         self._sr_attach_grammar(req)
 
-        self.sr_waiting.append(req)
         self.sr_state.set(
             rid,
             SRDraftState(
@@ -1466,8 +1418,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_mark_degraded(req.rid, "mrope width != fill_ids")
                 return False
         self._sr_resume_req(req)
-        if req not in self.sr_waiting:
-            self.sr_waiting.append(req)
         waiting = getattr(self, "waiting_queue", None)
         if waiting is not None and req not in waiting:
             waiting.append(req)
@@ -1500,8 +1450,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                     continue
             else:
                 self._sr_resume_req(req)
-                if req not in self.sr_waiting:
-                    self.sr_waiting.append(req)
                 waiting = getattr(self, "waiting_queue", None)
                 if waiting is not None and req not in waiting:
                     waiting.append(req)
@@ -2244,8 +2192,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                         need.pop(req.rid, None)
                         continue
                 else:
-                    if req not in self.sr_waiting:
-                        self.sr_waiting.append(req)
                     waiting = getattr(self, "waiting_queue", None)
                     if waiting is not None and req not in waiting:
                         waiting.append(req)

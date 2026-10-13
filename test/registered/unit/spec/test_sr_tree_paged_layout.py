@@ -1130,7 +1130,7 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("_snapshot_paged_eager_metadata", replay_src)
         self.assertIn("_restore_paged_eager_metadata", replay_src)
         self.assertIn("_paged_eager_restore_valid", replay_src)
-        batch_src = _fn_source(_DRAFTER, "expand_batch")
+        batch_src = _fn_source(_DRAFTER, "_expand_and_pack")
         self.assertLess(
             batch_src.find("_tree_batch_isolate_count"),
             batch_src.find("_log_tree_failure"),
@@ -1247,12 +1247,14 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("prepare_sr_tree_paged_eager", layout_src)
         self.assertIn("ALLOC_LEASE", layout_src)
         self.assertIn("ALLOC_ORDINARY", layout_src)
-        self.assertIn("torch.arange", layout_src)
         self.assertIn("_sr_clear_paged_round_state", layout_src)
-        self.assertIn("for shared in range(max_shared + 1)", layout_src)
-        self.assertIn("for rem in rem_choices", layout_src)
-        self.assertIn("max(page - steps + 1, 1)", layout_src)
+        self.assertIn("_iter_layout_warmup_cases", layout_src)
         self.assertNotIn("prepare_tree_paged_view", layout_src)
+        case_src = _fn_source(_DRAFTER, "_iter_layout_warmup_cases")
+        self.assertIn("torch.arange", case_src)
+        self.assertIn("for shared in range(max_shared + 1)", case_src)
+        self.assertIn("for rem in rem_choices", case_src)
+        self.assertIn("max(page - steps + 1, 1)", case_src)
         builder_src = _fn_source(_DRAFTER, "_sr_warm_layout_shapes_builders")
         self.assertIn("prepare_tree_paged_view", builder_src)
         init_src = _fn_source(_DRAFTER, "_init_cuda_graphs")
@@ -1263,9 +1265,12 @@ class TestSourceGuards(CustomTestCase):
         can_src = _fn_source(_DRAFTER, "_can_run_tree_graph")
         self.assertIn('not getattr(runner, "_tree_paged", False)', can_src)
         batch_src = _fn_source(_DRAFTER, "expand_batch")
-        self.assertIn("SRTransferUnresolved", batch_src)
+        self.assertIn("_expand_and_pack", batch_src)
+        self.assertIn("_expand_one", batch_src)
+        pack_src = _fn_source(_DRAFTER, "_expand_and_pack")
+        self.assertIn("SRTransferUnresolved", pack_src)
         one_src = _fn_source(_DRAFTER, "_expand_one")
-        self.assertIn("SRTransferUnresolved", one_src)
+        self.assertIn("_expand_and_pack", one_src)
         ctor_src = _fn_source(_DRAFTER, "__init__")
         self.assertIn("read_sr_tree_update_overlap_env", ctor_src)
         self.assertLess(
@@ -1292,7 +1297,7 @@ class TestSourceGuards(CustomTestCase):
             n
             for n in cls.body
             if isinstance(n, ast.FunctionDef)
-            and n.name in ("expand_batch", "_expand_one")
+            and n.name in ("expand_batch", "_expand_one", "_expand_and_pack")
         ]
         probe_cls = ast.ClassDef(
             name="Probe",

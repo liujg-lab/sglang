@@ -374,7 +374,7 @@ def _row_taken_by_other(owner, req, saved_idx) -> bool:
     candidates = []
     if isinstance(active, dict):
         candidates.extend(active.values())
-    for name in ("sr_waiting", "draft_paused_reqs", "waiting_queue"):
+    for name in ("draft_paused_reqs", "waiting_queue"):
         items = getattr(owner, name, None)
         if isinstance(items, list):
             candidates.extend(items)

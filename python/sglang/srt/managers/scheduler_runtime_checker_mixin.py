@@ -277,7 +277,6 @@ class SchedulerRuntimeCheckerMixin:
                 or len(getattr(self, "draft_paused_reqs", [])) > 0
                 or len(getattr(getattr(self, "draft_batch", None), "reqs", [])) > 0
                 or len(getattr(self, "draft_waiting_queue", [])) > 0
-                or len(getattr(self, "sr_waiting", [])) > 0
                 or len(getattr(getattr(self, "sr_state", None), "active", {})) > 0
             )
             if has_active_draft_reqs:

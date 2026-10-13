@@ -373,7 +373,6 @@ class TestCommTransport(unittest.TestCase):
                     )
                 scheduler = SimpleNamespace(
                     sr_state=SimpleNamespace(clear=lambda: []),
-                    sr_waiting=[],
                     sr_server=self.server,
                     _sr_http_alive=lambda: False,
                     _sr_reset_scheduler_caches=lambda: self.clock.advance(20),

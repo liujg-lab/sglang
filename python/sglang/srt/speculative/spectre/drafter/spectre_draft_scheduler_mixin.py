@@ -1917,18 +1917,21 @@ class SpectreDraftSchedulerMixin:
             logger.debug("[Draft] Sent REJECT to Target (high load)")
 
     def get_num_allocatable_reqs(self, running_bs: int) -> int:
-        paused_id_set: set = set()
-        paused_reqs_lock = getattr(self, "paused_reqs_lock", None)
-        if paused_reqs_lock is not None and hasattr(self, "paused_reqs"):
-            try:
-                with paused_reqs_lock:
-                    paused_id_set.update(id(r) for r in self.paused_reqs)
-            except Exception:
-                pass
-        if hasattr(self, "draft_paused_reqs"):
-            paused_id_set.update(id(r) for r in self.draft_paused_reqs)
-
-        paused_count = len(paused_id_set)
+        algo = getattr(self, "spec_algorithm", None)
+        if algo is not None and algo.is_standalone_remote():
+            paused_count = len(getattr(self, "draft_paused_reqs", None) or [])
+        else:
+            paused_id_set: set = set()
+            paused_reqs_lock = getattr(self, "paused_reqs_lock", None)
+            if paused_reqs_lock is not None and hasattr(self, "paused_reqs"):
+                try:
+                    with paused_reqs_lock:
+                        paused_id_set.update(id(r) for r in self.paused_reqs)
+                except Exception:
+                    pass
+            if hasattr(self, "draft_paused_reqs"):
+                paused_id_set.update(id(r) for r in self.draft_paused_reqs)
+            paused_count = len(paused_id_set)
         total_occupied = running_bs + paused_count
 
         res = self.server_args.pp_max_micro_batch_size - total_occupied

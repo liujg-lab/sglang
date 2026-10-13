@@ -674,6 +674,7 @@ class TestTreeFailureHandling(unittest.TestCase):
         names = [
             "expand_batch",
             "_expand_one",
+            "_expand_and_pack",
             "_log_tree_failure",
             "_init_cuda_graphs",
             "_pack_tree_windows",
@@ -783,11 +784,20 @@ class TestTreeFailureHandling(unittest.TestCase):
         self.drafter._expand_tree = Mock(return_value=(parent, index, tokens))
         expand_one = Mock(side_effect=AssertionError("isolate"))
         self.drafter._expand_one = expand_one
-        self.drafter.scheduler = NS(_sr_round_metrics=None)
-        self.drafter._tree_slot_trace = []
-        self.drafter._tree_device_pack_copies = 0
-        self.drafter._tree_host_payload_submits = 0
-        self.drafter._tree_cross_device_d2h = 0
+        slot_trace = []
+        mark_slot = self.drafter._mark_tree_slot
+
+        def traced_mark(slot, state):
+            mark_slot(slot, state)
+            slot_trace.append(state)
+
+        self.drafter._mark_tree_slot = traced_mark
+        tree_counts = Counter()
+        self.drafter.scheduler = NS(
+            _sr_round_metrics=NS(
+                counts=tree_counts, phase=lambda *args, **kwargs: nullcontext()
+            )
+        )
         copies = {"cpu": 0, "cross": 0}
         orig = torch.Tensor.copy_
 
@@ -804,15 +814,12 @@ class TestTreeFailureHandling(unittest.TestCase):
         self.assertEqual(windows[1][0], [20, 21, 22])
         self.assertEqual(windows[0][1], [-1, 0])
         self.assertEqual(windows[1][2], [3, 4, 5])
-        self.assertEqual(self.drafter._tree_host_payload_submits, 1)
-        self.assertEqual(self.drafter._tree_device_pack_copies, 1)
-        self.assertEqual(self.drafter._tree_cross_device_d2h, 0)
+        self.assertEqual(tree_counts["tree_host_payload_submits"], 1)
+        self.assertEqual(tree_counts["tree_device_pack_copies"], 1)
+        self.assertEqual(tree_counts["tree_cross_device_d2h"], 0)
         self.assertEqual(copies["cross"], 0)
-        self.assertEqual(copies["cpu"], self.drafter._tree_host_payload_submits)
-        self.assertEqual(
-            self.drafter._tree_slot_trace,
-            ["free", "in_flight", "consuming", "free"],
-        )
+        self.assertEqual(copies["cpu"], tree_counts["tree_host_payload_submits"])
+        self.assertEqual(slot_trace, ["free", "in_flight", "consuming", "free"])
         self.assertEqual(self.drafter._active_tree_slot, None)
         self.assertEqual(self.drafter._tree_batch_isolate_count, 0)
         self.drafter._expand_one.assert_not_called()
