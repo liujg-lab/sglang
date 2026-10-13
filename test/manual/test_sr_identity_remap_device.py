@@ -10,8 +10,8 @@ import torch
 
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     IdentityRemapWorkspace,
-    remap_slot_node_ids,
 )
+from sglang.test.sr_reference import remap_slot_node_ids
 
 try:
     import torch_npu

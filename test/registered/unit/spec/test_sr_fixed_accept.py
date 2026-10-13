@@ -33,7 +33,6 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
     multimodal_accept_reject_reason,
     num_free_pages,
     read_sr_fixed_accept_env,
-    run_accept_stages,
     static_disable_reason,
     validate_packed_rows,
 )
@@ -273,35 +272,26 @@ class FixedAcceptRouteTest(CustomTestCase):
             accept_control_decision(True, "target_only", False), "v1_workspace"
         )
         self.assertEqual(accept_control_decision(True, "rpd", False), "v1_workspace")
-        calls = []
-
-        def penalty():
-            calls.append("penalty")
-
-        def verify():
-            calls.append("verify")
-            return "target_only"
-
-        def v1():
-            calls.append("append")
-            return "v1"
-
-        def finalizer():
-            calls.append("finalizer")
-            return "fast"
-
-        self.assertEqual(
-            run_accept_stages(
-                admitted=True,
-                simulate=False,
-                penalty=penalty,
-                verify=verify,
-                v1=v1,
-                finalizer=finalizer,
-            ),
-            "v1",
+        eagle = (_REPO / "python/sglang/srt/speculative/eagle_info.py").read_text(
+            encoding="utf-8"
         )
-        self.assertEqual(calls, ["penalty", "verify", "append"])
+        tree = ast.parse(eagle)
+        verify = next(
+            child
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "EagleVerifyInput"
+            for child in node.body
+            if isinstance(child, ast.FunctionDef) and child.name == "verify"
+        )
+        src = ast.get_source_segment(eagle, verify)
+        self.assertEqual(src.count("penalizer_orchestrator.apply"), 1)
+        self.assertEqual(src.count("fixed_decision("), 1)
+        self.assertEqual(src.count("sr_accept_state.finalize("), 1)
+        finalize_at = src.index("sr_accept_state.finalize(")
+        return_at = src.index("return _eagle_output_from_fixed", finalize_at)
+        loop_at = src.index("for i, (req, accept_index_row)")
+        self.assertLess(finalize_at, return_at)
+        self.assertLess(return_at, loop_at)
 
     def test_pre_alloc_reject_reasons(self):
         state = SRFixedAcceptState(2, 4, 4, 4, "cpu")
@@ -850,7 +840,6 @@ class FixedAcceptFinalizeTest(CustomTestCase):
 
     def test_publish_runs_before_kv_move(self):
         state = SRFixedAcceptState(1, 2, 4, 4, "cpu")
-        state.control_buf.fill_(-7)
         predict, accept_index, accept_length = state.bind_verify_buffers(1)
         accept_index.fill_(-1)
         accept_index[0, 0] = 0
@@ -896,9 +885,6 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(result.verified_id.tolist(), [10, 11])
         state.commit_device.fill_(123)
         self.assertEqual(result.verified_id.tolist(), [10, 11])
-        self.assertTrue(
-            torch.equal(state.control_buf, torch.full_like(state.control_buf, -7))
-        )
 
     def test_pack_masks_invalid_indexes(self):
         accept_index = torch.tensor([[0, -1], [4, 1]], dtype=torch.int32)

@@ -41,6 +41,10 @@ _SR_TREE = (
     _REPO_ROOT
     / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
 )
+_SR_TREE_WARMUP = (
+    _REPO_ROOT
+    / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_warmup.py"
+)
 _ATTENTION_REGISTRY = (
     _REPO_ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
 )
@@ -596,11 +600,9 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertNotIn("prepare_tree_paged_view", layout_src)
         builder_src = _function_source(_SR_TREE, "_sr_warm_layout_shapes_builders")
         self.assertIn("prepare_tree_paged_view", builder_src)
-        alloc_src = _function_source(_SR_TREE, "_sr_warm_allocator_shapes")
-        self.assertIn("get_last_loc_large_page_size_large_top_k", alloc_src)
-        self.assertIn("alloc_paged_token_slots_extend", alloc_src)
-        self.assertIn("backup_state=True", alloc_src)
-        self.assertIn("restore_state", alloc_src)
+        alloc_src = _function_source(_SR_TREE_WARMUP, "warm_draft_alloc_mapping")
+        self.assertIn("clone_page_lists", alloc_src)
+        self.assertIn("restore_page_lists", alloc_src)
         init_src = _function_source(_SR_TREE, "_init_cuda_graphs")
         self.assertIn("_sr_warm_tree_shapes", init_src)
         self.assertGreater(

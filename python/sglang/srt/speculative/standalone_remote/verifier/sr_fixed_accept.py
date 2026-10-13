@@ -13,7 +13,7 @@ import os
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -54,24 +54,6 @@ def accept_control_decision(
     if resolved_verify == "greedy" and not simulate:
         return "finalizer"
     return "v1_workspace"
-
-
-def run_accept_stages(
-    *,
-    admitted: bool,
-    simulate: bool,
-    penalty: Callable[[], None],
-    verify: Callable[[], str],
-    v1: Callable[[], object],
-    finalizer: Callable[[], object],
-):
-    """Penalty, verify, then exactly one postprocess. No second pass."""
-    penalty()
-    resolved = verify()
-    decision = accept_control_decision(admitted, resolved, simulate)
-    if decision == "finalizer":
-        return finalizer()
-    return v1()
 
 
 def first_free_pos(committed_end: int, page_size: int) -> int:
@@ -550,9 +532,6 @@ class SRFixedAcceptState:
             (self.B_cap, self.L * 2 + 2), torch.int64, self.device
         )
         self.accept_d2h_event = None
-        self.control_buf = torch.empty(
-            (self.B_cap, 6), dtype=torch.int64, device=self.device
-        )
         self.N_cap, self.F_cap, self.packet_cap = commit_capacity(
             self.B_cap, self.L, self.W, self.page_size
         )
@@ -567,9 +546,6 @@ class SRFixedAcceptState:
         )
         self.commit_h2d_event = None
         self._commit_unresolved = False
-        self.index_buf = torch.empty(
-            (self.N_cap,), dtype=torch.int64, device=self.device
-        )
         slot_cap = self.B_cap * self.W
         # Slot gathers write these prefixes and consume them before the next
         # gather. out_cache_buf is a separate stable cache-loc buffer.
@@ -1066,12 +1042,6 @@ class SRFixedAcceptState:
             raise
         self.commit_h2d_event = None
 
-    def _readback(self, packed: torch.Tensor) -> torch.Tensor:
-        """Compatibility wrapper. Prefer submit then wait around host metadata."""
-        self._submit_accept_readback(packed)
-        self._wait_accept_readback()
-        return self.accept_host[: int(packed.shape[0])]
-
     def _export_paths(self, batch, truncated) -> None:
         """Record this round's paths.
 
@@ -1272,27 +1242,6 @@ class SRFixedAcceptState:
         self._count("fixed_accept_h2d_count")
         self._count("fixed_accept_h2d_bytes", int(used) * 8)
 
-    def _copy_control(self, bs, accepted, finished, prefixes) -> None:
-        """Device control rows. The hot path does not call this."""
-        rows = []
-        compact = 0
-        for i, count in enumerate(accepted):
-            rows.append(
-                (
-                    int(count),
-                    compact,
-                    0 if finished[i] else 1,
-                    num_free_pages(prefixes[i], count, self.W, self.page_size),
-                    first_free_pos(prefixes[i] + count, self.page_size),
-                    int(count) - 1,
-                )
-            )
-            compact += int(count)
-        control = torch.tensor(rows, dtype=torch.int64, device="cpu")
-        if control.numel() == 0:
-            return
-        self.control_buf[:bs].copy_(control.to(self.device))
-
     def _publish(
         self,
         batch,
@@ -1450,30 +1399,6 @@ def _parse_pack(cpu_pack: torch.Tensor, bs: int, path_cap: int):
         pre.append(int(cpu_pack[i, path_cap * 2]))
         errors.append(int(cpu_pack[i, path_cap * 2 + 1]))
     return rows, tokens, pre, errors
-
-
-def _compact_tokens(token_rows, truncated, device) -> torch.Tensor:
-    values = []
-    for tokens, row in zip(token_rows, truncated):
-        for j, idx in enumerate(row):
-            if int(idx) < 0:
-                break
-            values.append(int(tokens[j]))
-    if not values:
-        return torch.empty((0,), dtype=torch.int32, device=device)
-    return torch.tensor(values, dtype=torch.int32, device=device)
-
-
-def _compact_indices(truncated, device) -> torch.Tensor:
-    values = []
-    for row in truncated:
-        for idx in row:
-            if int(idx) < 0:
-                break
-            values.append(int(idx))
-    if not values:
-        return torch.empty((0,), dtype=torch.int64, device=device)
-    return torch.tensor(values, dtype=torch.int64, device=device)
 
 
 def _select_rows(verified, accepted, unfinished, device) -> torch.Tensor:

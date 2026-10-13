@@ -103,12 +103,6 @@ def pages_per_branch(prefix_remainder: int, steps: int, page_size: int) -> int:
     return int(math.ceil((int(prefix_remainder) + int(steps)) / page))
 
 
-def max_query_context_len(prefix_len: int, num_steps: int) -> int:
-    """Last tree-forward context: ``P + (S-2) + 1 == P + S - 1`` for S>=1."""
-    steps = max(int(num_steps), 1)
-    return max(int(prefix_len), 0) + steps - 1
-
-
 def query_page_count(prefix_len: int, step_id: int, page_size: int) -> int:
     page = max(int(page_size), 1)
     ctx = max(int(prefix_len), 0) + int(step_id) + 1
@@ -1060,41 +1054,6 @@ class SRTreeExpandTxn:
 
     def may_rollback(self) -> bool:
         return (not self.in_flight()) or self.completion_confirmed
-
-
-def visible_token_slots_from_pages(
-    shared_pages: torch.Tensor,
-    branch_pages: torch.Tensor,
-    prefix_lens_cpu: SeqLens,
-    step_id: int,
-    page_size: int,
-    dummy_page: int = 0,
-) -> list[list[int]]:
-    """Oracle visible slots for one step. Host-side, for CPU tests."""
-    prefixes = _as_int_list(prefix_lens_cpu)
-    page = max(int(page_size), 1)
-    topk = int(branch_pages.shape[1]) if branch_pages.dim() == 3 else 1
-    shared = shared_pages.detach().cpu()
-    branch = branch_pages.detach().cpu()
-    rows = []
-    for b, prefix in enumerate(prefixes):
-        ctx = prefix + int(step_id) + 1
-        n_sh = shared_page_count(prefix, page)
-        for k in range(topk):
-            slots = []
-            for t in range(ctx):
-                if t < n_sh * page:
-                    page_id = int(shared[b, t // page])
-                else:
-                    bj = (t // page) - n_sh
-                    page_id = (
-                        int(branch[b, k, bj])
-                        if bj < int(branch.shape[2])
-                        else int(dummy_page)
-                    )
-                slots.append(page_id * page + (t % page))
-            rows.append(slots)
-    return rows
 
 
 def validate_tree_draft_paged_records(

@@ -19,6 +19,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sglang.srt.speculative import tree_shared_prefix as shared
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     SR_TREE_PAGED_ENV,
+    SRTreeExpandTxn,
     SRTreePagedMetadata,
     build_step_context_lens,
     context_lens_list,
@@ -1064,6 +1065,7 @@ class TestTreeFailureHandling(unittest.TestCase):
                     NpuGraphPreparationError=ValueError,
                     KVMoveSubmittedError=KVMoveSubmittedError,
                     SRTransferUnresolved=SRTransferUnresolved,
+                    SRTreeExpandTxn=SRTreeExpandTxn,
                     record_tree_expand_admission=lambda *args, **kwargs: False,
                 ),
             )["_expand_tree"]

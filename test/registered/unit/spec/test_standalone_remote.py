@@ -2352,9 +2352,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
     def test_assemble_keeps_organized_token_width(self):
         if torch is None:
             self.skipTest("torch not available")
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            assemble_draft_rows,
-        )
+        from sglang.test.sr_reference import assemble_draft_rows
 
         tokens = list(range(100, 107))
         parents, indices, dt = assemble_draft_rows(
@@ -2374,9 +2372,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         if torch is None:
             self.skipTest("torch not available")
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            assemble_draft_rows,
             chain_tree_structure,
         )
+        from sglang.test.sr_reference import assemble_draft_rows
 
         parents, indices, dt = assemble_draft_rows(
             [[11, 12, 13]],
@@ -2395,9 +2393,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
     def test_assemble_writes_out_buffers(self):
         if torch is None:
             self.skipTest("torch not available")
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            assemble_draft_rows,
-        )
+        from sglang.test.sr_reference import assemble_draft_rows
 
         out_tokens = torch.full((2, 4), 7, dtype=torch.int64)
         out_parents = torch.full((2, 4), 9, dtype=torch.int64)
@@ -2424,9 +2420,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         if torch is None:
             self.skipTest("torch not available")
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            assemble_draft_rows,
             cached_chain_template,
         )
+        from sglang.test.sr_reference import assemble_draft_rows
 
         parents, indices, tokens = assemble_draft_rows(
             [[11, 12, 13]],

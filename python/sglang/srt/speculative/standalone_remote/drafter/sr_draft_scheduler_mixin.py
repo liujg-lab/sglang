@@ -54,7 +54,6 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     committed_tail_not_in_kv,
     decide_draft_action,
     draft_needed_max_new_tokens,
-    find_fork_point,
     ingest_active_indices,
     is_device_context_error,
     last_token_in_kv,
@@ -413,48 +412,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                 embedding_cache.clear()
         except Exception:
             pass
-
-    def _sr_handoff_finished_kv(self, req: Req) -> None:
-        """Move pages FINISH will release out of quarantine.
-
-        ``release_all_kv_for_finished_req`` frees every physical page named by
-        the request map. Those pages are removed from quarantine without a
-        second ``free``. Pages the map does not name stay isolated.
-        """
-        from sglang.srt.speculative.standalone_remote.sr_align import kv_release_len
-        from .sr_resource_quarantine import handoff_request_pages
-
-        drafter = getattr(self, "sr_tree_drafter", None)
-        alloc = getattr(self, "token_to_kv_pool_allocator", None)
-        if alloc is None and drafter is not None:
-            alloc = getattr(drafter, "token_to_kv_pool_allocator", None)
-        page_size = 1
-        if alloc is not None:
-            page_size = max(1, int(getattr(alloc, "page_size", 1) or 1))
-        pool = getattr(self, "req_to_token_pool", None)
-        if pool is None and drafter is not None:
-            pool = getattr(drafter, "req_to_token_pool", None)
-        mapping = getattr(pool, "req_to_token", None)
-        idx = getattr(req, "req_pool_idx", None)
-        owned = set()
-        if mapping is not None and idx is not None:
-            length = kv_release_len(
-                getattr(req, "kv_committed_len", 0),
-                getattr(req, "kv_allocated_len", 0),
-            )
-            length = max(0, min(int(length), int(mapping.shape[1])))
-            if length:
-                for slot in mapping[idx, :length].detach().view(-1).tolist():
-                    slot = int(slot)
-                    owned.add(slot if page_size == 1 else slot // page_size)
-        seen = set()
-        for holder in (self, drafter):
-            if holder is None or id(holder) in seen:
-                continue
-            seen.add(id(holder))
-            bag = getattr(holder, "_sr_kv_quarantine", None)
-            if bag is not None:
-                handoff_request_pages(bag, req, owned, page_size)
 
     def _sr_remove_req(self, req: Req) -> None:
         if req in self.sr_waiting:
@@ -1357,17 +1314,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         if reqs:
             self._sr_run_until_ready(reqs)
 
-    def _sr_token_lens_for_seed(self, reqs: List[Req], batch) -> Optional[List[int]]:
-        if batch is None:
-            return None
-        lens = getattr(batch, "extend_lens", None)
-        if lens is not None and len(lens) == len(reqs):
-            return [int(x) for x in lens]
-        fallback = [int(getattr(r, "extend_input_len", 0) or 0) for r in reqs]
-        if fallback and all(x > 0 for x in fallback):
-            return fallback
-        return None
-
     def _sr_cache_tree_seeds(
         self, reqs: List[Req], result, batch=None
     ) -> None:
@@ -1913,11 +1859,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             return committed
         finally:
             self._sr_release_held_leases(held)
-
-    def _sr_ingest_tree_tails(self, reqs: List[Req], plans=None):
-        if plans is None:
-            return self._sr_run_tree_ingest(reqs)
-        return self._sr_execute_tree_tails(plans)
 
     def _sr_execute_tree_tails(self, plans, *, degrade_on_failure: bool = True) -> bool:
         """Run one transaction on final plans. Does not plan, recover, or pin."""

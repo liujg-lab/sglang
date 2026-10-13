@@ -1036,9 +1036,7 @@ class TestRemoteSpecDevice(CustomTestCase):
                 device = torch.device("npu")
         if device is None:
             self.skipTest("no CUDA or NPU device")
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
-            lookup_candidate_slots,
-        )
+        from sglang.test.sr_reference import lookup_candidate_slots
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
             pack_tree_reply,
         )

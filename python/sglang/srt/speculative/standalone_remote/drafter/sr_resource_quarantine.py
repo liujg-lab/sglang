@@ -164,22 +164,6 @@ def handoff_request_pages(bag, req, owned_pages, page_size) -> None:
     page_size = max(1, int(page_size or 1))
     owned = {int(page) for page in owned_pages}
 
-    def page_of(slot):
-        slot = int(slot)
-        return slot if page_size == 1 else slot // page_size
-
-    def flat_ids(unit):
-        detach = getattr(unit, "detach", None)
-        if callable(detach):
-            return [int(x) for x in unit.detach().view(-1).tolist()]
-        return [int(x) for x in unit]
-
-    def take_ids(unit, ids):
-        new_tensor = getattr(unit, "new_tensor", None)
-        if callable(new_tensor):
-            return unit.new_tensor(ids)
-        return list(ids)
-
     for record in list(bag.records):
         if release_unknown(record):
             continue
@@ -192,10 +176,10 @@ def handoff_request_pages(bag, req, owned_pages, page_size) -> None:
         for unit, state in zip(record.units, record.states):
             if unit is None or state == "done":
                 continue
-            ids = flat_ids(unit)
+            ids = _flat_ids(unit)
             pages = {}
             for slot in ids:
-                pages.setdefault(page_of(slot), []).append(slot)
+                pages.setdefault(_page_of(slot, page_size), []).append(slot)
             keep = []
             for page, slots in pages.items():
                 if page in owned:
@@ -207,7 +191,7 @@ def handoff_request_pages(bag, req, owned_pages, page_size) -> None:
                 units.append(unit)
                 states.append(state)
             else:
-                units.append(take_ids(unit, keep))
+                units.append(_take_ids(unit, keep))
                 states.append(state)
         record.units = units
         record.states = states

@@ -21,9 +21,11 @@ except ImportError:
 
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     SRTargetTreeFiaMetadata,
-    dense_target_tree_fia_reference,
     fill_target_tree_fia_metadata_,
     pages_for_s_cap,
+)
+from sglang.test.sr_reference import (
+    dense_target_tree_fia_reference,
     prefix_columns_visible,
 )
 from sglang.srt.speculative.tree_attn_mask import full_mask_numel

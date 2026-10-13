@@ -7,9 +7,8 @@ These constants are experimental policy, not performance conclusions.
 from __future__ import annotations
 
 import logging
-import math
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -82,61 +81,11 @@ class SRTreeKVLease:
 
 
 def pages_per_branch(remainder: int, steps: int, page_size: int) -> int:
-    page_size = max(int(page_size), 1)
-    return int(math.ceil((int(remainder) + int(steps)) / page_size))
-
-
-def tree_raw_span_len(remainder: int, topk: int, steps: int, page_size: int) -> int:
-    nnp = pages_per_branch(remainder, steps, page_size)
-    return int(topk) * nnp * int(page_size) - int(remainder)
-
-
-def physical_tree_slot(
-    page_ids: Sequence[int],
-    branch: int,
-    step: int,
-    remainder: int,
-    nnp: int,
-    page_size: int,
-) -> int:
-    offset = int(remainder) + int(step)
-    page_index = int(branch) * int(nnp) + offset // int(page_size)
-    return int(page_ids[page_index]) * int(page_size) + offset % int(page_size)
-
-
-def build_tree_raw_slots(
-    page_ids: Sequence[int],
-    remainder: int,
-    topk: int,
-    steps: int,
-    page_size: int,
-    dtype=torch.int64,
-    device=None,
-) -> torch.Tensor:
-    """Full logical expand span from r to the last exclusive page end."""
-    nnp = pages_per_branch(remainder, steps, page_size)
-    span = tree_raw_span_len(remainder, topk, steps, page_size)
-    r = int(remainder)
-    ps = int(page_size)
-    col = torch.arange(span, dtype=torch.int64)
-    abs_off = r + col
-    branch_span = nnp * ps
-    branch = torch.div(abs_off, branch_span, rounding_mode="floor")
-    within = abs_off % branch_span
-    page_index = branch * nnp + torch.div(within, ps, rounding_mode="floor")
-    ids = torch.as_tensor(list(page_ids), dtype=torch.int64)
-    slots = ids.index_select(0, page_index) * ps + (within % ps)
-    return slots.to(dtype=dtype, device=device)
-
-
-def build_lease_page_slots(
-    page_ids: Sequence[int], page_size: int, dtype=torch.int64, device=None
-) -> torch.Tensor:
-    ps = int(page_size)
-    ids = torch.as_tensor(list(page_ids), dtype=dtype, device=device)
-    return (ids.unsqueeze(1) * ps + torch.arange(ps, dtype=dtype, device=device)).reshape(
-        -1
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+        pages_per_branch as layout_pages_per_branch,
     )
+
+    return layout_pages_per_branch(remainder, steps, page_size)
 
 
 def plan_paged_tree_layout(
@@ -238,29 +187,21 @@ class IdentityRemapSubmittedError(KVMoveSubmittedError):
 
 
 def _identity_stream(device):
-    if device.type == "cpu":
-        return None
-    return torch.get_device_module(device.type).current_stream(device)
+    from sglang.srt.speculative.standalone_remote.sr_kv_copy import _stream
+
+    return _stream(device)
 
 
 def _identity_stream_key(device):
-    stream = _identity_stream(device)
-    if stream is None:
-        return None
-    for name in ("stream_id", "cuda_stream", "npu_stream"):
-        value = getattr(stream, name, None)
-        if value is not None:
-            return int(value)
-    raise RuntimeError("backend stream does not expose a stable identity")
+    from sglang.srt.speculative.standalone_remote.sr_kv_copy import _stream_key
+
+    return _stream_key(_identity_stream(device))
 
 
 def _identity_capturing(device):
-    if device.type == "cpu":
-        return False
-    fn = getattr(
-        torch.get_device_module(device.type), "is_current_stream_capturing", None
-    )
-    return bool(fn and fn())
+    from sglang.srt.speculative.standalone_remote.sr_kv_copy import _capturing
+
+    return _capturing(device)
 
 
 def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -319,25 +260,6 @@ def _execute_identity_remap(slot_node_ids, parent_rows, depth, scratch) -> None:
     )
 
     remap_identity(slot_node_ids, scratch, parent_rows, depth, rows)
-
-
-def remap_slot_node_ids(
-    slot_node_ids: torch.Tensor,
-    parent_rows: torch.Tensor,
-    n_prev_steps: int,
-    scratch: torch.Tensor,
-) -> None:
-    """Gather every historical identity, then scatter it back.
-
-    ``scratch`` is ``[depth_capacity, row_capacity]``. Only ``[:depth, :rows]``
-    is written. Padding columns past ``rows`` stay untouched, and there is no
-    active-row mask.
-    """
-    depth = int(n_prev_steps)
-    if depth <= 0:
-        return
-    _validate_identity_remap(slot_node_ids, parent_rows, depth, scratch)
-    _execute_identity_remap(slot_node_ids, parent_rows, depth, scratch)
 
 
 class IdentityRemapWorkspace:
@@ -509,59 +431,6 @@ class IdentityRemapWorkspace:
         )
 
 
-def lookup_candidate_slots(
-    slot_node_ids: torch.Tensor,
-    physical_slots: torch.Tensor,
-    top_scores_index: torch.Tensor,
-    batch_size: int,
-    topk: int,
-) -> torch.Tensor:
-    """Map reply indices to still-live physical slots; missing -> -1.
-
-    CPU reference for tests and kernel checks. The reply path does not call
-    this. Lookup is confined to each request's own ``topk`` columns and keeps
-    the first match in ``step`` then ``branch`` order. A node id of ``-1``
-    still compares equal; it is not a special miss.
-    """
-    steps = int(slot_node_ids.shape[0])
-    bs = int(batch_size)
-    k = int(topk)
-    rows = bs * k
-    cands = top_scores_index
-    if cands.dim() == 1:
-        cands = cands.unsqueeze(0)
-    if cands.dim() != 2:
-        raise RuntimeError("candidate indices must be rank 1 or 2")
-    n_cand = int(cands.shape[-1])
-    if bs == 0 or n_cand == 0:
-        return torch.empty((bs, n_cand), dtype=torch.int64, device=cands.device)
-    if int(cands.shape[0]) not in (bs, 1):
-        raise RuntimeError("candidate batch does not match requests")
-    ids = slot_node_ids[:, :rows].reshape(steps, bs, k).tolist()
-    phys = physical_slots[:, :rows].reshape(steps, bs, k).tolist()
-    cand_rows = cands.tolist()
-    if len(cand_rows) == 1 and bs != 1:
-        cand_rows = cand_rows * bs
-    out = []
-    for request in range(bs):
-        row = []
-        for target in cand_rows[request]:
-            target = int(target)
-            found = -1
-            for step in range(steps):
-                matched = False
-                for branch in range(k):
-                    if int(ids[step][request][branch]) == target:
-                        found = int(phys[step][request][branch])
-                        matched = True
-                        break
-                if matched:
-                    break
-            row.append(found)
-        out.append(row)
-    return torch.tensor(out, dtype=torch.int64, device=cands.device)
-
-
 def live_accept_prefix(
     candidate_slots: Sequence[int], accept_indices: Sequence[int]
 ) -> List[int]:
@@ -719,11 +588,6 @@ class SRTreeLeaseStore:
             return None
         lease.in_use = True
         return lease
-
-    def unpin(self, rid: str) -> None:
-        stored = self._leases.get(rid)
-        if stored is not None:
-            stored.in_use = False
 
     def unpin_lease(self, lease: Optional[SRTreeKVLease]) -> None:
         if lease is None:

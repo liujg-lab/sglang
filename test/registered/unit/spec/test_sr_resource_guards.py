@@ -1201,7 +1201,7 @@ class QuarantineTest(unittest.TestCase):
             ROOT
             / "python/sglang/srt/speculative/standalone_remote/drafter/sr_draft_scheduler_mixin.py"
         )
-        names = {"_sr_finish_rid", "_sr_handoff_finished_kv"}
+        names = {"_sr_finish_rid"}
         funcs = [
             n
             for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
@@ -1260,7 +1260,6 @@ class QuarantineTest(unittest.TestCase):
             sr_state=NS(delete=lambda rid: NS(req_object=req)),
             sr_kv=NS(release_all_kv_for_finished_req=released.append),
         )
-        owner._sr_handoff_finished_kv = env["_sr_handoff_finished_kv"].__get__(owner)
         env["_sr_finish_rid"](owner, "r")
         self.assertEqual(released, [req])
         self.assertEqual(freed, [])

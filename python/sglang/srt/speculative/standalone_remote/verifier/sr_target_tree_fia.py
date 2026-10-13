@@ -8,7 +8,6 @@ and do not use ``nonzero()`` or data-dependent shapes.
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
@@ -122,11 +121,6 @@ def target_verify_cpu_prefix(req) -> int:
     if committed > 0:
         return committed
     return max(0, len(req.origin_input_ids) + len(req.output_ids))
-
-
-def target_verify_update_signature(graph_key, kv_lens):
-    """Signature shared by Target prefetch and Target replay."""
-    return (graph_key, tuple(int(x) for x in kv_lens))
 
 
 def plan_target_tree_fia_lengths(
@@ -450,16 +444,6 @@ def fill_target_tree_fia_metadata_(
         md.active_rows[: int(raw_bs)] = True
 
 
-def prefix_columns_visible(blocked_mask: torch.Tensor, prefixes: Sequence[int]) -> bool:
-    """True when every prefix column of every query is unmasked."""
-    for b, prefix in enumerate(prefixes):
-        if int(prefix) <= 0:
-            continue
-        if blocked_mask[b, 0, :, : int(prefix)].any():
-            return False
-    return True
-
-
 def validate_target_tree_fia_records(
     records,
     num_layers,
@@ -473,60 +457,3 @@ def validate_target_tree_fia_records(
         kv_attr,
         IMPL_PAGED_FIA,
     )
-
-
-def dense_target_tree_fia_reference(
-    query: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    kv_lens: Sequence[int],
-    blocked_mask: torch.Tensor,
-    *,
-    scale: float,
-    page_size: int,
-    n_kv_heads: int,
-) -> torch.Tensor:
-    """FP32 dense softmax reference for one BSND paged tree call.
-
-    ``query`` is ``[B,Q,Hq,D]``. Caches are ``[n_pages, page_size, Hkv*D]``.
-    """
-    bs, queries, n_q, dim = query.shape
-    page = max(int(page_size), 1)
-    group = n_q // int(n_kv_heads)
-    q = query.float()
-    k = k_cache.float().view(-1, page, int(n_kv_heads), dim)
-    v = v_cache.float().view(-1, page, int(n_kv_heads), dim)
-    blocked = blocked_mask.reshape(bs, queries, -1)
-    outs = []
-    for b in range(bs):
-        kv_len = int(kv_lens[b])
-        tokens = []
-        for s in range(kv_len):
-            page_id = int(block_tables[b, s // page])
-            tokens.append(k[page_id, s % page])
-        keys = torch.stack(tokens, dim=0) if tokens else k.new_zeros((0, int(n_kv_heads), dim))
-        vals = (
-            torch.stack(
-                [
-                    v[int(block_tables[b, s // page]), s % page]
-                    for s in range(kv_len)
-                ],
-                dim=0,
-            )
-            if tokens
-            else v.new_zeros((0, int(n_kv_heads), dim))
-        )
-        keys = keys.repeat_interleave(group, dim=1)
-        vals = vals.repeat_interleave(group, dim=1)
-        row_block = blocked[b, :, :kv_len]
-        for r in range(queries):
-            scores = torch.einsum("hd,shd->hs", q[b, r], keys) * float(scale)
-            scores = scores.masked_fill(row_block[r].to(dtype=torch.bool), -math.inf)
-            finite = torch.isfinite(scores)
-            if not finite.any():
-                outs.append(q.new_zeros((n_q, dim)))
-                continue
-            weights = torch.softmax(scores, dim=-1)
-            outs.append(torch.einsum("hs,shd->hd", weights, vals))
-    return torch.stack(outs, dim=0).reshape(bs * queries, n_q * dim)

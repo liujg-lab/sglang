@@ -199,9 +199,6 @@ class SchedulerStandaloneRemoteTargetMixin:
             return None
         return getattr(self, "metrics_collector", None)
 
-    def _sr_committed_ids(self, req: Req) -> List[int]:
-        return list(req.output_ids or [])
-
     def _sr_ensure_cursor(self, req: Req) -> None:
         if not isinstance(getattr(req, "sr_next_commit_version", None), int):
             req.sr_next_commit_version = 1

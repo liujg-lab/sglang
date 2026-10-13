@@ -23,7 +23,6 @@ from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
-    copy_tail_attention_metadata_,
     fill_tail_attention_metadata_,
     pad_tail_attention_metadata,
     tail_graph_fits_pages,
@@ -36,15 +35,6 @@ logger = logging.getLogger(__name__)
 TAIL_DUMMY_SLOT = 0
 
 TailGraphBucket = Tuple[int, int, Optional[int]]
-
-
-def default_tail_token_caps(speculative_num_steps: int) -> Tuple[int, ...]:
-    caps = {1, 2, 4}
-    steps = max(int(speculative_num_steps or 0), 0)
-    if steps:
-        caps.add(steps)
-        caps.add(steps + 1)
-    return tuple(sorted(c for c in caps if c > 0))
 
 
 def tail_max_per_request(speculative_num_steps: int) -> int:
@@ -211,20 +201,6 @@ def tail_token_caps_for_bs(
     if bs <= 1:
         return tuple(sorted(c for c in {1, 2, 4, max_per_req} if c > 0))
     return tuple(range(bs, bs * max_per_req + 1))
-
-
-def default_tail_graph_buckets(
-    capture_bs: Sequence[int],
-    token_caps: Sequence[int],
-    attn_caps: Sequence[Optional[int]] = (None,),
-) -> List[TailGraphBucket]:
-    buckets: List[TailGraphBucket] = []
-    for bs in trim_capture_batch_sizes(capture_bs):
-        for token_cap in sorted(set(int(c) for c in token_caps if int(c) > 0)):
-            for attn_cap in attn_caps:
-                cap = None if attn_cap is None else int(attn_cap)
-                buckets.append((int(bs), int(token_cap), cap))
-    return buckets
 
 
 def packed_tail_graph_buckets(

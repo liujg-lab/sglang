@@ -13,18 +13,20 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
+from sglang.test.sr_reference import (
+    dense_target_tree_fia_reference,
+    prefix_columns_visible,
+)
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     IMPL_TREE_PAGED_FIA,
     SR_TARGET_TREE_FIA_ENV,
     SRTargetTreeFiaMetadata,
     TARGET_TREE_FIA_KV_ATTR,
     assign_captured_lens,
-    dense_target_tree_fia_reference,
     fill_target_tree_fia_metadata_,
     maybe_select_target_tree_fia,
     pages_for_s_cap,
     plan_target_tree_fia_lengths,
-    prefix_columns_visible,
     prime_target_tree_fia_capture_,
     SR_TARGET_UPDATE_OVERLAP_ENV,
     read_sr_target_tree_fia_env,

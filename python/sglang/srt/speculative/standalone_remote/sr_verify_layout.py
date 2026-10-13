@@ -678,36 +678,3 @@ class VerifyInputPacket:
             self.rpd_input.edge_index = device_buf[plan.used : used].view(2, -1)
         verified, tokens, parents, indices = packet_segment_views(device_buf, plan)
         return verified, parents, indices, tokens
-
-
-def assemble_draft_rows(
-    token_rows: Sequence,
-    parent_rows: Sequence[Optional[Sequence[int]]],
-    index_rows: Sequence[Optional[Sequence[int]]],
-    topk: int,
-    spec_steps: int,
-    num_draft_tokens: int,
-    device=None,
-    out_tokens: Optional[torch.Tensor] = None,
-    out_parents: Optional[torch.Tensor] = None,
-    out_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (parent_list, top_scores_index, draft_tokens). Never fakes a bush."""
-    dev = device if device is not None else torch.device("cpu")
-    plan = plan_draft_rows(
-        token_rows,
-        parent_rows,
-        index_rows,
-        topk,
-        spec_steps,
-        num_draft_tokens,
-    )
-    draft_cpu = torch.empty((plan.bs, plan.token_width), dtype=torch.int64)
-    parents_cpu = torch.empty((plan.bs, plan.parent_w), dtype=torch.int64)
-    indices_cpu = torch.empty((plan.bs, plan.index_w), dtype=torch.int64)
-    write_draft_regions(draft_cpu, parents_cpu, indices_cpu, plan)
-    return (
-        _export_assembled_rows(parents_cpu, out_parents, dev),
-        _export_assembled_rows(indices_cpu, out_indices, dev),
-        _export_assembled_rows(draft_cpu, out_tokens, dev),
-    )

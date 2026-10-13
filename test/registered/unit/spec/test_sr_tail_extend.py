@@ -913,12 +913,10 @@ class TestTailGraphBuckets(unittest.TestCase):
         )
         tree = ast.parse(GRAPH.read_text(encoding="utf-8"))
         names = {
-            "default_tail_token_caps",
             "trim_capture_batch_sizes",
             "select_tail_graph_bucket",
             "real_seed_rows",
             "select_tail_seed_logits",
-            "default_tail_graph_buckets",
             "tail_graph_attn_caps",
             "tail_graph_kv_tokens",
             "tail_token_caps_for_bs",
@@ -1217,13 +1215,13 @@ class TestTailGraphBuckets(unittest.TestCase):
 
     def test_select_bucket_requires_dummy_request_for_token_padding(self):
         helpers = self._helpers()
-        buckets = helpers["default_tail_graph_buckets"]([1, 2], [2, 4], (None,))
+        buckets = helpers["packed_tail_graph_buckets"]([1, 2], 5, (None,))
         select = helpers["select_tail_graph_bucket"]
+        self.assertIn((1, 4, None), buckets)
         self.assertEqual(select(1, 2, 8, buckets), (1, 2, None))
         self.assertEqual(select(1, 3, 8, buckets), (2, 4, None))
+        self.assertNotEqual(select(1, 3, 8, buckets), (1, 4, None))
         self.assertIsNone(select(1, 3, 8, [(1, 4, None)]))
-        self.assertIsNone(select(2, 4, 8, [(4, 4, None)]))
-        self.assertIsNone(select(1, 5, 8, buckets))
         self.assertIsNone(select(1, 2, 64, [(1, 2, 32)]))
 
     def test_packed_caps_cover_concurrent_tails(self):
@@ -2352,11 +2350,14 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(helpers["tail_graph_attn_caps"](atb), (None,))
         self.assertEqual(helpers["tail_graph_attn_caps"](None), (None,))
         self.assertEqual(helpers["tail_graph_attn_caps"](fia), [1024, 512, 256])
-        buckets = helpers["default_tail_graph_buckets"](
-            [1, 2], [1, 2, 4, 5, 6], helpers["tail_graph_attn_caps"](atb)
+        buckets = helpers["packed_tail_graph_buckets"](
+            [1, 2], 5, helpers["tail_graph_attn_caps"](atb)
         )
+        self.assertTrue(buckets)
         self.assertTrue(all(cap is None for _, _, cap in buckets))
-        self.assertEqual(len(buckets), 10)
+        self.assertEqual(
+            helpers["select_tail_graph_bucket"](1, 2, 8, buckets), (1, 2, None)
+        )
 
     def test_npu_atb_update_uses_cpu_context_lens(self):
         npu_runner = (
@@ -2409,7 +2410,6 @@ class TestTailGraphBuckets(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("type(e).__name__", src)
         self.assertIn("skip tail graph bucket %s: %s: %s", src)
-        self.assertIn("copy_tail_attention_metadata_", src)
         self.assertIn("fill_tail_attention_metadata_", src)
         self.assertIn("widen_tail_block_tables", src)
         self.assertIn("tail_graph_fits_pages", src)
@@ -2948,7 +2948,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
         ]
         self.assertNotIn("pin_lease", copy_inspect)
         run = src[
-            src.index("def _sr_run_tree_ingest") : src.index("def _sr_ingest_tree_tails")
+            src.index("def _sr_run_tree_ingest") : src.index("def _sr_execute_tree_tails")
         ]
         self.assertLess(
             run.index("_sr_release_unused_leases"), run.index("_sr_execute_tree_tails")

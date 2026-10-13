@@ -160,7 +160,6 @@ class SRTreeDrafter:
         self.tree_graph_capture_succeeded = False
         self.tree_graph_disabled_reason = None
         self._last_out_cache_loc = None
-        self._last_candidate_slots = None
         max_bs = max(int(getattr(self.server_args, "cuda_graph_max_bs", 0) or 8), 8)
         self._identity_rows = max(max_bs, 1) * max(self.topk, 1)
         id_dev = self.device
@@ -618,61 +617,6 @@ class SRTreeDrafter:
             if clear is not None:
                 clear()
         return combos
-
-    def _sr_warm_allocator_shapes(self) -> list[int]:
-        if self.page_size <= 1 or self.topk <= 1:
-            return []
-        tree_cache = getattr(self.scheduler, "tree_cache", None)
-        if tree_cache is None:
-            return []
-        device = self.device
-        req_to_token = self.req_to_token_pool.req_to_token
-        warmed = []
-        for bs in self._sr_warmup_raw_batch_sizes() or self._sr_warmup_capture_bs():
-            prefix = int(self.page_size)
-            req_pool = torch.zeros((int(bs),), dtype=torch.int64, device=device)
-            seq_lens = torch.full(
-                (int(bs),), prefix, dtype=torch.int64, device=device
-            )
-            seq_lens_cpu = torch.full((int(bs),), prefix, dtype=torch.int64)
-            (
-                prefix_lens,
-                seq_lens_out,
-                last_loc,
-                _num_new_pages,
-                _extend_lens,
-                _last_page_lens,
-            ) = get_last_loc_large_page_size_large_top_k(
-                req_to_token,
-                req_pool,
-                seq_lens,
-                self.speculative_num_steps,
-                self.topk,
-                self.page_size,
-            )
-            last_page_lens_cpu = seq_lens_cpu % self.page_size
-            num_new_pages = (
-                last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
-            ) // self.page_size
-            seq_lens_cpu_out = (
-                seq_lens_cpu // self.page_size * self.page_size
-                + num_new_pages * (self.page_size * self.topk)
-            )
-            extend_num_tokens = int(torch.sum(seq_lens_cpu_out - seq_lens_cpu).item())
-            _out, backup = alloc_paged_token_slots_extend(
-                tree_cache,
-                prefix_lens,
-                seq_lens_cpu,
-                seq_lens_out,
-                seq_lens_cpu_out,
-                last_loc,
-                extend_num_tokens,
-                backup_state=True,
-            )
-            if backup is not None:
-                self.token_to_kv_pool_allocator.restore_state(backup)
-            warmed.append(int(bs))
-        return warmed
 
     def _sr_warm_tree_shapes(self) -> None:
         """Prime layout, alloc, and mapping before the first request."""
@@ -1156,34 +1100,7 @@ class SRTreeDrafter:
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.spec_info = spec_info
         batch.return_hidden_states = False
-        txn_cls = globals().get("SRTreeExpandTxn")
-        if txn_cls is None:
-
-            class txn_cls:
-                def __init__(self):
-                    self.allocation_owned = False
-                    self.prefix_copy_submitted = False
-                    self.tree_compute_submitted = False
-                    self.completion_confirmed = False
-                    self.rolled_back = False
-                    self.lease_state = None
-                    self.allocator_backup = None
-
-                def mark_copy_begin(self):
-                    self.prefix_copy_submitted = True
-
-                def mark_compute_begin(self):
-                    self.tree_compute_submitted = True
-
-                def in_flight(self):
-                    return (
-                        self.prefix_copy_submitted or self.tree_compute_submitted
-                    ) and not self.completion_confirmed
-
-                def may_rollback(self):
-                    return (not self.in_flight()) or self.completion_confirmed
-
-        txn = txn_cls()
+        txn = SRTreeExpandTxn()
         self._sr_last_abandon_has_event = False
         with metrics.phase("tree_alloc_kv") if metrics else nullcontext():
             token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)

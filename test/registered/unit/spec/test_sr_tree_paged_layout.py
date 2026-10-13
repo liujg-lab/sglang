@@ -53,8 +53,8 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     shared_page_count,
     tree_paged_shape_key,
     validate_tree_draft_paged_records,
-    visible_token_slots_from_pages,
 )
+from sglang.test.sr_reference import visible_token_slots_from_pages
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.test.ci.ci_register import register_cpu_ci
 
