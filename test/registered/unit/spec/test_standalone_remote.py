@@ -1777,7 +1777,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "sess"
         mixin.sr_rpc_seq = 0
-        mixin.sr_pending = {}
         mixin._sr_inflight = None
         mixin._engine_paused = False
         mixin.current_scheduler_metrics_enabled = False
@@ -1902,14 +1901,12 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 3
-        mixin.sr_pending = {"r1": SRPendingEntry(0, 3)}
         mixin._sr_inflight = object()
         client = MagicMock()
         mixin.sr_client = client
         mixin.reset_standalone_remote_target_state()
         self.assertIsNone(mixin._sr_inflight)
         self.assertEqual(mixin.sr_rpc_seq, 0)
-        self.assertEqual(mixin.sr_pending, {})
         client._drain.assert_called_once()
 
     def test_reset_resets_breaker(self):
@@ -1919,7 +1916,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 1
-        mixin.sr_pending = {}
         mixin._sr_inflight = None
         mixin.sr_client = None
         mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
@@ -4076,6 +4072,27 @@ class TestSRAbortAndRollback(CustomTestCase):
         self.assertIs(drafter._sr_kv_quarantine.records[0].owner, second)
         self.assertIsNone(drafter.draft_attn_backend._sr_draft_paged_view.workspace.lease_hold)
 
+    def test_cuda_context_error_helper(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_align import (
+                is_device_context_error,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+        self.assertTrue(
+            is_device_context_error(
+                RuntimeError("CUDA error: an illegal memory access was encountered")
+            )
+        )
+        self.assertFalse(is_device_context_error(ValueError("shape mismatch")))
+        if torch is not None and hasattr(torch, "AcceleratorError"):
+            try:
+                err = torch.AcceleratorError("cuda boom")
+            except TypeError:
+                err = None
+            if err is not None:
+                self.assertTrue(is_device_context_error(err))
+
 
 class TestSRDraftBusyReject(CustomTestCase):
     def test_busy_rejects_without_producing_windows(self):
@@ -4465,7 +4482,7 @@ class TestSRDraftBusyReject(CustomTestCase):
             ),
             "slice_decode_batch_row": slice_decode_batch_row,
             "stamp_tree_seed": stamp_tree_seed,
-            "_sr_is_device_context_error": lambda _e: False,
+            "is_device_context_error": lambda _e: False,
         }
         exec(compile(mod, str(src_path), "exec"), ns)
         mixin = ns["LoadedMixin"]()
@@ -4578,27 +4595,6 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertIsNone(req.sr_tree_seed)
         mixin.sr_kv.rollback.assert_not_called()
         mixin._sr_reprefill.assert_not_called()
-
-    def test_cuda_context_error_helper(self):
-        try:
-            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
-                _sr_is_cuda_context_error,
-            )
-        except ImportError as e:
-            self.skipTest(str(e))
-        self.assertTrue(
-            _sr_is_cuda_context_error(
-                RuntimeError("CUDA error: an illegal memory access was encountered")
-            )
-        )
-        self.assertFalse(_sr_is_cuda_context_error(ValueError("shape mismatch")))
-        if torch is not None and hasattr(torch, "AcceleratorError"):
-            try:
-                err = torch.AcceleratorError("cuda boom")
-            except TypeError:
-                err = None
-            if err is not None:
-                self.assertTrue(_sr_is_cuda_context_error(err))
 
 
 class TestPlanCommittedIngest(CustomTestCase):
@@ -4767,7 +4763,6 @@ class TestSRDegradedRequests(CustomTestCase):
         req.rid = "a"
         state = SRDraftState(req_id="a", session_id="s", req_object=req)
         state.degraded = True
-        state.last_rpc_seq = 1
         state.last_step_id = 0
         state.last_base_committed_len = 3
         mixin.sr_state.set("a", state)

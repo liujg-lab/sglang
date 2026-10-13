@@ -560,8 +560,6 @@ class SRFixedAcceptState:
         )
         self._page_exact = None
         self._staging_noted = False
-        self._d2h_count = 0
-        self._h2d_count = 0
         self.rpd_workspace = None
         self._rpd_fallback_logged = set()
 
@@ -1019,7 +1017,6 @@ class SRFixedAcceptState:
             raise RuntimeError("fixed accept readback failed")
         dst = self.accept_host[: int(packed.shape[0])]
         self.accept_d2h_event = submit_copy(dst, packed)
-        self._d2h_count += 1
         self._count("fixed_accept_d2h_count")
         self._count("fixed_accept_d2h_bytes", int(packed.numel()) * 8)
 
@@ -1238,7 +1235,6 @@ class SRFixedAcceptState:
             # treating a missing event as proof that the source is reusable.
             self._commit_unresolved = True
             raise
-        self._h2d_count += 1
         self._count("fixed_accept_h2d_count")
         self._count("fixed_accept_h2d_bytes", int(used) * 8)
 

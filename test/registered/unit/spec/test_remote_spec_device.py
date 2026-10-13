@@ -491,8 +491,8 @@ class TestRemoteSpecDevice(CustomTestCase):
 
     def test_device_context_error_classifier(self):
         try:
-            from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
-                _sr_is_device_context_error,
+            from sglang.srt.speculative.standalone_remote.sr_align import (
+                is_device_context_error,
             )
         except Exception as e:
             self.skipTest(f"sglang runtime deps missing: {e}")
@@ -500,22 +500,22 @@ class TestRemoteSpecDevice(CustomTestCase):
         class NPUError(Exception):
             pass
 
-        self.assertTrue(_sr_is_device_context_error(NPUError("illegal memory access")))
-        self.assertTrue(_sr_is_device_context_error(RuntimeError("NPU error: illegal")))
+        self.assertTrue(is_device_context_error(NPUError("illegal memory access")))
+        self.assertTrue(is_device_context_error(RuntimeError("NPU error: illegal")))
         self.assertTrue(
-            _sr_is_device_context_error(
+            is_device_context_error(
                 RuntimeError("ACL stream synchronize failed, error code:507011")
             )
         )
         self.assertTrue(
-            _sr_is_device_context_error(RuntimeError("Model execution failed."))
+            is_device_context_error(RuntimeError("Model execution failed."))
         )
         self.assertTrue(
-            _sr_is_device_context_error(
+            is_device_context_error(
                 RuntimeError("rtStreamSynchronize execution failed")
             )
         )
-        self.assertFalse(_sr_is_device_context_error(RuntimeError("rpc timeout")))
+        self.assertFalse(is_device_context_error(RuntimeError("rpc timeout")))
 
     def test_finish_rid_skips_kv_release_when_poisoned(self):
         mixin = (
@@ -1122,7 +1122,7 @@ class TestRemoteSpecDevice(CustomTestCase):
             ),
             "committed_tail_not_in_kv": lambda *args: [],
             "NpuGraphReplaySubmittedError": type("Submitted", (Exception,), {}),
-            "_sr_is_device_context_error": is_device_context_error,
+            "is_device_context_error": is_device_context_error,
             "SRWindow": tuple,
             "List": list,
             "Req": object,
@@ -1156,6 +1156,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         )
         mixin._sr_mark_degraded = lambda *_a, **_k: None
         mixin._sr_clear_stamps_after_poison = lambda: None
+        mixin._sr_note_abandoned_expand = lambda: None
         mixin.last_batch = object()
         req = SimpleNamespace(
             req_pool_idx=0,

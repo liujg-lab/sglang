@@ -305,24 +305,13 @@ def build_tail_graph_plan(
     )
 
 
-def real_seed_rows(extend_lens: Sequence[int]) -> List[int]:
-    rows = []
-    offset = 0
-    for length in extend_lens:
-        if int(length) <= 0:
-            raise ValueError("SR tail seed requires a nonempty real tail")
-        offset += int(length)
-        rows.append(offset - 1)
-    return rows
-
-
 def select_tail_seed_logits(logits: torch.Tensor, plan: "TailGraphPlan") -> torch.Tensor:
     """Return one logit row per real request.
 
     The replay buffer is ``(bs_cap, vocab)``. The logits processor already
     stored each request's last extend token in that request's row, including
-    when ``bs_cap`` equals the token count. ``real_seed_rows`` indexes a flat
-    token stream and must not be applied here.
+    when ``bs_cap`` equals the token count. A flat token-stream index must
+    not be applied here.
     """
     raw_bs = int(plan.raw_bs)
     if logits is None or raw_bs <= 0:

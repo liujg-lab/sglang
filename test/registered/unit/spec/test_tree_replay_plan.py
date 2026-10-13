@@ -2208,11 +2208,11 @@ class TestPagedDraftLayout(CustomTestCase):
             context_lens_list,
             kv_buckets_to_page_buckets,
             max_query_pages_for_tree,
-            paged_draft_graph_step_lens,
             paged_draft_step_context,
             select_draft_page_bucket,
             select_page_bucket,
         )
+        from sglang.test.sr_reference import paged_draft_graph_step_lens
 
         prefix = [100, 250]
         page_size = 128
@@ -2252,9 +2252,9 @@ class TestPagedDraftLayout(CustomTestCase):
     def test_view_early_return_refreshes_capture_ones(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
             SRTreePagedMetadata,
-            paged_draft_graph_step_lens,
             paged_draft_step_context,
         )
+        from sglang.test.sr_reference import paged_draft_graph_step_lens
         from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
             SRDraftPagedPlan,
         )

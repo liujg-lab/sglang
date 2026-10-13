@@ -307,22 +307,6 @@ def copy_tokens_into_row(
         _assign_ints(dest[:n], src[:n])
 
 
-def _export_assembled_rows(
-    cpu_tensor: torch.Tensor,
-    out: Optional[torch.Tensor],
-    device,
-) -> torch.Tensor:
-    bs, width = int(cpu_tensor.shape[0]), int(cpu_tensor.shape[1])
-    if out is not None and out.shape[0] >= bs and out.shape[1] >= width:
-        view = out[:bs, :width]
-        if width:
-            view.copy_(cpu_tensor, non_blocking=view.device.type != "cpu")
-        return view
-    if device is None or torch.device(device).type == "cpu":
-        return cpu_tensor
-    return cpu_tensor.to(device=device, non_blocking=True)
-
-
 def _copy_vector_into_rows(dest: torch.Tensor, vector: torch.Tensor) -> None:
     """Copy a read-only 1D template into every row, or into a prefix."""
     if dest.numel() == 0 or vector.numel() == 0 or dest.dim() != 2:

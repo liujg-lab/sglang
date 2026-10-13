@@ -7,6 +7,7 @@ import copy
 import pathlib
 import sys
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -762,8 +763,17 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(state.packet_cap, 3 * 8 + 4 + 4)
 
     def test_rounds_keep_storage_when_batch_shrinks_and_grows(self):
+        from sglang.srt.speculative.standalone_remote.verifier import sr_fixed_accept
+
         state = SRFixedAcceptState(2, 2, 4, 4, "cpu")
+        state.metrics = SimpleNamespace(counts=Counter())
         held = []
+        copies = []
+        real_copy = sr_fixed_accept.submit_copy
+
+        def spy(dst, src):
+            copies.append(1)
+            return real_copy(dst, src)
 
         def run(bs, token):
             predict, accept_index, accept_length = state.bind_verify_buffers(bs)
@@ -799,11 +809,13 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             )
             return result
 
-        run(2, 10)
-        run(1, 30)
-        run(2, 50)
-        self.assertEqual(state._d2h_count, 3)
-        self.assertEqual(state._h2d_count, 3)
+        with patch.object(sr_fixed_accept, "submit_copy", spy):
+            run(2, 10)
+            run(1, 30)
+            run(2, 50)
+        self.assertEqual(len(copies), 6)
+        self.assertEqual(state.metrics.counts["fixed_accept_d2h_count"], 3)
+        self.assertEqual(state.metrics.counts["fixed_accept_h2d_count"], 3)
         state.commit_device.fill_(-1)
         state.commit_host.fill_(-1)
         state.accept_host.fill_(-1)
@@ -815,7 +827,17 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         self.assertEqual(held[0][2], [[10], [11]])
 
     def test_empty_batch_submits_no_transfer(self):
+        from sglang.srt.speculative.standalone_remote.verifier import sr_fixed_accept
+
         state = SRFixedAcceptState(1, 2, 4, 4, "cpu")
+        state.metrics = SimpleNamespace(counts=Counter())
+        copies = []
+        real_copy = sr_fixed_accept.submit_copy
+
+        def spy(dst, src):
+            copies.append(1)
+            return real_copy(dst, src)
+
         predict, accept_index, accept_length = state.bind_verify_buffers(0)
         alloc = NPUPagedTokenToKVPoolAllocator(4)
         batch = SimpleNamespace(
@@ -830,11 +852,13 @@ class FixedAcceptFinalizeTest(CustomTestCase):
                 think_end_id=None, hidden_size=1, dtype=torch.float32
             ),
         )
-        result = state.finalize(
-            batch, None, 4, 2, alloc, accept_index, predict, accept_length
-        )
-        self.assertEqual(state._d2h_count, 0)
-        self.assertEqual(state._h2d_count, 0)
+        with patch.object(sr_fixed_accept, "submit_copy", spy):
+            result = state.finalize(
+                batch, None, 4, 2, alloc, accept_index, predict, accept_length
+            )
+        self.assertEqual(copies, [])
+        self.assertEqual(state.metrics.counts["fixed_accept_d2h_count"], 0)
+        self.assertEqual(state.metrics.counts["fixed_accept_h2d_count"], 0)
         self.assertEqual(result.verified_id.numel(), 0)
         self.assertTrue(result.idle)
 

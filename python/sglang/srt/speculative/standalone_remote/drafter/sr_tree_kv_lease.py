@@ -478,16 +478,6 @@ def prefix_window_tokens(
     return tuple(out)
 
 
-def prefix_window_from_committed(
-    committed: Sequence[int],
-    base: int,
-    window: int = LEASE_PREFIX_WINDOW,
-) -> Tuple[int, ...]:
-    base = max(int(base), 0)
-    start = max(0, base - int(window))
-    return tuple(int(x) for x in committed[start:base])
-
-
 def validate_lease_commit(
     lease: SRTreeKVLease,
     *,
@@ -576,9 +566,6 @@ class SRTreeLeaseStore:
         self.counts["tree_lease_created"] += 1
         self.counts["tree_lease_pages"] += lease_page_count(lease)
 
-    def pin(self, rid: str) -> Optional[SRTreeKVLease]:
-        return self.pin_lease(self._leases.get(rid))
-
     def pin_lease(self, lease: Optional[SRTreeKVLease]) -> Optional[SRTreeKVLease]:
         """Pin this exact object if it is still the stored version."""
         if lease is None or lease.released:
@@ -588,13 +575,6 @@ class SRTreeLeaseStore:
             return None
         lease.in_use = True
         return lease
-
-    def unpin_lease(self, lease: Optional[SRTreeKVLease]) -> None:
-        if lease is None:
-            return
-        stored = self._leases.get(lease.rid)
-        if stored is lease:
-            lease.in_use = False
 
     def pop(self, rid: str) -> Optional[SRTreeKVLease]:
         return self._leases.pop(rid, None)
@@ -706,14 +686,6 @@ def _free_lease_pages(allocator, lease: SRTreeKVLease) -> None:
         allocator.free(slots)
     except Exception:
         logger.warning("[SR] tree lease free failed for %s", lease.rid, exc_info=True)
-
-
-def page_ids_from_alloc(allocated: torch.Tensor, page_size: int) -> List[int]:
-    ps = int(page_size)
-    if allocated is None or allocated.numel() == 0:
-        return []
-    pages = allocated.view(-1, ps)[:, 0] // ps
-    return [int(x) for x in pages.detach().to("cpu").tolist()]
 
 
 def immediate_free_pages(allocator) -> int:

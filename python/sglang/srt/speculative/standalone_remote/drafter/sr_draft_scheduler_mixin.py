@@ -150,14 +150,6 @@ class _SRTreePlanDraft:
     miss: Optional[str] = None
 
 
-def _sr_is_device_context_error(exc: BaseException) -> bool:
-    return is_device_context_error(exc)
-
-
-# Backward-compatible alias.
-_sr_is_cuda_context_error = _sr_is_device_context_error
-
-
 class StandaloneRemoteDraftSchedulerMixin:
     def _init_sr_draft(self) -> None:
         ttl = float(
@@ -1379,7 +1371,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                     n,
                 )
         except Exception as e:
-            if _sr_is_device_context_error(e):
+            if is_device_context_error(e):
                 self._sr_device_poisoned = True
                 self._sr_clear_stamps_after_poison()
                 logger.error(
@@ -1942,7 +1934,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 return True
         except Exception as e:
             copy_submitted = bool(getattr(transaction, "copy_submitted", False))
-            if _sr_is_device_context_error(e):
+            if is_device_context_error(e):
                 self._sr_device_poisoned = True
                 self._sr_clear_stamps_after_poison()
             if (
@@ -2186,7 +2178,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_note_abandoned_expand()
             raise
         except Exception as e:
-            if _sr_is_device_context_error(e):
+            if is_device_context_error(e):
                 self._sr_device_poisoned = True
                 self._sr_clear_stamps_after_poison()
                 logger.error(
@@ -2325,7 +2317,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         self,
         dreq: SRDraftRequest,
         window: SRWindow,
-        rpc_seq: int,
         session_id: str,
         status: Optional[SRReplyStatus] = None,
     ) -> SRDraftReply:
@@ -2334,7 +2325,6 @@ class StandaloneRemoteDraftSchedulerMixin:
         if st is not None:
             st.last_step_id = dreq.step_id
             st.last_base_committed_len = dreq.base_committed_len
-            st.last_rpc_seq = rpc_seq
             st.last_window = window
             st.session_id = session_id
             st.last_updated_time = time.time()
@@ -3013,9 +3003,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             for (i, dreq, req), window in zip(gpu_pairs, windows):
                 pending_wire = getattr(req, "sr_pending_wire_request", None)
                 wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
-                reply = self._sr_stamp_window(
-                    wire, window, batch.rpc_seq, batch.session_id
-                )
+                reply = self._sr_stamp_window(wire, window, batch.session_id)
                 if use_v2:
                     reply = self._sr_finalize_v2_commit(wire, req, reply)
                 replies[i] = reply

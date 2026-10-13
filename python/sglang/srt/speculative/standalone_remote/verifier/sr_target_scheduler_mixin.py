@@ -143,7 +143,6 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _init_sr_target(self) -> None:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
-        self.sr_pending: Dict[str, SRPendingEntry] = {}
         self._sr_inflight: Optional[SRInflight] = None
         self.sr_client: Optional[SRTargetClient] = None
         self.sr_breaker = SRRpcBreaker(
@@ -170,7 +169,6 @@ class SchedulerStandaloneRemoteTargetMixin:
     def reset_standalone_remote_target_state(self) -> None:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
-        self.sr_pending = {}
         self._sr_inflight = None
         self._sr_finish_pending = []
         self.sr_speculation_stopped = False
@@ -388,7 +386,6 @@ class SchedulerStandaloneRemoteTargetMixin:
 
         self.sr_rpc_seq += 1
         rpc_seq = self.sr_rpc_seq
-        self.sr_pending = pending
         wait_reply = action not in (SRAction.FINISH, SRAction.ABORT)
         batch = SRBatchRequest(
             session_id=self.sr_session_id,

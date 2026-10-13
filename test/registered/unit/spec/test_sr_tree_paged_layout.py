@@ -614,7 +614,6 @@ class TestOncePerRoundAndTxn(CustomTestCase):
 
         def expand(fail_after_submit=True):
             txn = SRTreeExpandTxn()
-            txn.allocation_owned = True
             try:
                 txn.mark_copy_begin()
                 txn.mark_compute_begin()
@@ -644,7 +643,6 @@ class TestOncePerRoundAndTxn(CustomTestCase):
 
         restored.clear()
         txn = SRTreeExpandTxn()
-        txn.allocation_owned = True
         txn.completion_confirmed = True
         restored.append("success-restore")
         self.assertEqual(restored, ["success-restore"])
@@ -652,7 +650,7 @@ class TestOncePerRoundAndTxn(CustomTestCase):
 
     def test_thread_start_failure_after_copy_refuses_rollback_when_confirm_fails(self):
         expand_src = _fn_source(_DRAFTER, "_expand_tree")
-        self.assertLess(expand_src.find("mark_copy_begin"), expand_src.find("replay"))
+        self.assertLess(expand_src.find("mark_copy_begin"), expand_src.find(".replay("))
         self.assertIn("_try_confirm_tree_completion", expand_src)
         self.assertIn("tree expand in-flight; refuse rollback", expand_src)
 
@@ -691,7 +689,6 @@ class TestOncePerRoundAndTxn(CustomTestCase):
         graph_submitted = False
         try:
             txn = SRTreeExpandTxn()
-            txn.allocation_owned = True
             txn.lease_state = {"page_slots": [7]}
             try:
                 txn.mark_copy_begin()
@@ -1219,7 +1216,7 @@ class TestSourceGuards(CustomTestCase):
         self.assertLess(
             src.find("mark_copy_begin"), src.find("_prepare_paged_tree_round")
         )
-        self.assertLess(src.find("mark_compute_begin"), src.find("replay"))
+        self.assertLess(src.find("mark_compute_begin"), src.find(".replay("))
         self.assertIn("NpuGraphReplaySubmittedError", src)
         self.assertIn("abandon", src)
         self.assertIn("record_tree_expand_admission", src)

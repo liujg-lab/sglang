@@ -955,26 +955,6 @@ def paged_draft_step_context(
     )
 
 
-def paged_draft_graph_step_lens(
-    prefix_lens_cpu: SeqLens,
-    capture_bs: int,
-    topk: int,
-    n_steps: int,
-    num_steps: Optional[int] = None,
-) -> list[list[int]]:
-    """FIA step list replay reads after the paged context lengths are refreshed.
-
-    ``n_steps`` is the FIA map length. ``num_steps`` is ``speculative_num_steps``
-    and supplies the bind-time clamp.
-    """
-    steps = int(n_steps if num_steps is None else num_steps)
-    rows = int(capture_bs) * max(int(topk), 1)
-    return [
-        paged_draft_step_context(prefix_lens_cpu, topk, step_id, steps, rows)
-        for step_id in range(int(n_steps))
-    ]
-
-
 def prepare_tree_paged_view(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -1033,7 +1013,6 @@ class SRTreeExpandTxn:
     """Allocation/copy/compute lifetime for one tree expand."""
 
     def __init__(self):
-        self.allocation_owned = False
         self.prefix_copy_submitted = False
         self.tree_compute_submitted = False
         self.completion_confirmed = False

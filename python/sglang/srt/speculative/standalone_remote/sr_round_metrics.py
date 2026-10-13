@@ -6,6 +6,8 @@ import time
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 
+from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
+
 logger = logging.getLogger(__name__)
 
 GRAPH_HOST_STAGES = (
@@ -245,10 +247,6 @@ class SRRoundMetrics:
         self._graph_host_samples = []
 
     def _timing_failure(self, where, exc):
-        from sglang.srt.speculative.standalone_remote.sr_align import (
-            is_device_context_error,
-        )
-
         if is_device_context_error(exc):
             raise exc
         self.counts["device_timing_dropped_" + where] += 1

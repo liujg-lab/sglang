@@ -247,6 +247,22 @@ def lookup_candidate_slots(
     return torch.tensor(out, dtype=torch.int64, device=cands.device)
 
 
+def _export_assembled_rows(
+    cpu_tensor: torch.Tensor,
+    out: Optional[torch.Tensor],
+    device,
+) -> torch.Tensor:
+    bs, width = int(cpu_tensor.shape[0]), int(cpu_tensor.shape[1])
+    if out is not None and out.shape[0] >= bs and out.shape[1] >= width:
+        view = out[:bs, :width]
+        if width:
+            view.copy_(cpu_tensor, non_blocking=view.device.type != "cpu")
+        return view
+    if device is None or torch.device(device).type == "cpu":
+        return cpu_tensor
+    return cpu_tensor.to(device=device, non_blocking=True)
+
+
 def assemble_draft_rows(
     token_rows: Sequence,
     parent_rows: Sequence[Optional[Sequence[int]]],
@@ -261,7 +277,6 @@ def assemble_draft_rows(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (parent_list, top_scores_index, draft_tokens). Never fakes a bush."""
     from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-        _export_assembled_rows,
         plan_draft_rows,
         write_draft_regions,
     )
@@ -284,3 +299,51 @@ def assemble_draft_rows(
         _export_assembled_rows(indices_cpu, out_indices, dev),
         _export_assembled_rows(draft_cpu, out_tokens, dev),
     )
+
+
+def prefix_window_from_committed(
+    committed: Sequence[int],
+    base: int,
+    window: Optional[int] = None,
+) -> Tuple[int, ...]:
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+        LEASE_PREFIX_WINDOW,
+    )
+
+    if window is None:
+        window = LEASE_PREFIX_WINDOW
+    base = max(int(base), 0)
+    start = max(0, base - int(window))
+    return tuple(int(x) for x in committed[start:base])
+
+
+def page_ids_from_alloc(allocated: torch.Tensor, page_size: int) -> list[int]:
+    ps = int(page_size)
+    if allocated is None or allocated.numel() == 0:
+        return []
+    pages = allocated.view(-1, ps)[:, 0] // ps
+    return [int(x) for x in pages.detach().to("cpu").tolist()]
+
+
+def paged_draft_graph_step_lens(
+    prefix_lens_cpu,
+    capture_bs: int,
+    topk: int,
+    n_steps: int,
+    num_steps: Optional[int] = None,
+) -> list[list[int]]:
+    """FIA step list replay reads after the paged context lengths are refreshed.
+
+    ``n_steps`` is the FIA map length. ``num_steps`` is ``speculative_num_steps``
+    and supplies the bind-time clamp from production ``paged_draft_step_context``.
+    """
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+        paged_draft_step_context,
+    )
+
+    steps = int(n_steps if num_steps is None else num_steps)
+    rows = int(capture_bs) * max(int(topk), 1)
+    return [
+        paged_draft_step_context(prefix_lens_cpu, topk, step_id, steps, rows)
+        for step_id in range(int(n_steps))
+    ]

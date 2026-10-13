@@ -20,19 +20,19 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     lease_budget_ok,
     lease_page_count,
     live_accept_prefix,
-    page_ids_from_alloc,
     pages_per_branch,
     plan_paged_tree_layout,
     prefix_window_tokens,
     record_device_event,
-    prefix_window_from_committed,
     snapshot_sr_align,
     validate_lease_commit,
 )
 from sglang.test.sr_reference import (
     build_tree_raw_slots,
     lookup_candidate_slots,
+    page_ids_from_alloc,
     physical_tree_slot,
+    prefix_window_from_committed,
     remap_slot_node_ids,
     tree_raw_span_len,
 )
@@ -765,7 +765,7 @@ class TestLeaseLifecycle(unittest.TestCase):
         )
         store.register(first)
         self.assertIs(store.pin_lease(first), first)
-        store.unpin_lease(first)
+        first.in_use = False
         second = SRTreeKVLease(
             rid="p",
             version=2,
@@ -782,10 +782,7 @@ class TestLeaseLifecycle(unittest.TestCase):
         store.register(second)
         self.assertIsNone(store.pin_lease(first))
         self.assertIs(store.pin_lease(second), second)
-        store.unpin_lease(first)
         self.assertTrue(second.in_use)
-        store.unpin_lease(second)
-        self.assertFalse(second.in_use)
 
     def test_event_without_query_stays_pending(self):
         store = SRTreeLeaseStore()

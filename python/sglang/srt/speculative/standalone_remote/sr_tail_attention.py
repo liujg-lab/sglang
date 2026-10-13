@@ -65,27 +65,6 @@ def widen_tail_block_tables(tables, max_pages):
     return torch.cat([tables, pad], dim=1)
 
 
-def copy_tail_attention_metadata_(dst, src):
-    """Copy ``src`` into captured ``dst`` tensors. Graph replay needs the same storage."""
-    if src.block_tables.shape[0] != dst.block_tables.shape[0]:
-        raise ValueError("SR tail graph query row mismatch")
-    if src.block_tables.shape[1] > dst.block_tables.shape[1]:
-        raise ValueError("SR tail graph page table is too narrow")
-    if src.context_lens_cpu.numel() != dst.context_lens_cpu.numel():
-        raise ValueError("SR tail graph context length row mismatch")
-    if len(src.context_lens_list) != len(dst.context_lens_list):
-        raise ValueError("SR tail graph context length list mismatch")
-    dst.block_tables.zero_()
-    n_pages = src.block_tables.shape[1]
-    dst.block_tables[:, :n_pages].copy_(src.block_tables)
-    dst.context_lens_cpu.copy_(
-        src.context_lens_cpu.to(
-            dtype=dst.context_lens_cpu.dtype, device=dst.context_lens_cpu.device
-        )
-    )
-    dst.context_lens_list[:] = list(src.context_lens_list)
-
-
 def fill_tail_attention_metadata_(dst, prefix_lens, extend_lens, req_tables, dummy_slot=0):
     """Write query rows into captured ``dst`` without allocating a padded copy."""
     if dummy_slot != 0:

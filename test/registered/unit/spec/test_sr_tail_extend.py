@@ -30,7 +30,6 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
-    copy_tail_attention_metadata_,
     fill_tail_attention_metadata_,
     pad_tail_attention_metadata,
     tail_graph_fits_pages,
@@ -839,7 +838,7 @@ class TestTailTransaction(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
@@ -915,7 +914,6 @@ class TestTailGraphBuckets(unittest.TestCase):
         names = {
             "trim_capture_batch_sizes",
             "select_tail_graph_bucket",
-            "real_seed_rows",
             "select_tail_seed_logits",
             "tail_graph_attn_caps",
             "tail_graph_kv_tokens",
@@ -1295,12 +1293,8 @@ class TestTailGraphBuckets(unittest.TestCase):
             4096,
         )
 
-    def test_seed_rows_are_last_real_tokens(self):
+    def test_seed_logits_are_per_request_not_token_index(self):
         helpers = self._helpers()
-        self.assertEqual(helpers["real_seed_rows"]([2, 1]), [1, 2])
-        self.assertEqual(helpers["real_seed_rows"]([1]), [0])
-        with self.assertRaises(ValueError):
-            helpers["real_seed_rows"]([2, 0])
         plan_cls = helpers["TailGraphPlan"]
         select = helpers["select_tail_seed_logits"]
         # bs_cap == raw_tokens > raw_bs. Rows are still one last token per
@@ -1333,26 +1327,6 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertEqual(tail_graph_max_pages(8192, 128), 64)
         self.assertIs(widen_tail_block_tables(wide, 4), wide)
 
-    def test_copy_keeps_captured_storage(self):
-        dst = SRTailAttentionMetadata(
-            torch.zeros((4, 4), dtype=torch.int32),
-            torch.ones(4, dtype=torch.int32),
-            [1, 1, 1, 1],
-        )
-        src = SRTailAttentionMetadata(
-            torch.tensor([[5, 6], [7, 8], [0, 0], [0, 0]], dtype=torch.int32),
-            torch.tensor([129, 130, 1, 1], dtype=torch.int32),
-            [129, 130, 1, 1],
-        )
-        tables_id = id(dst.block_tables)
-        lens_id = id(dst.context_lens_cpu)
-        copy_tail_attention_metadata_(dst, src)
-        self.assertEqual(id(dst.block_tables), tables_id)
-        self.assertEqual(id(dst.context_lens_cpu), lens_id)
-        self.assertEqual(dst.block_tables.tolist(), [[5, 6, 0, 0], [7, 8, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
-        self.assertEqual(dst.context_lens_cpu.tolist(), [129, 130, 1, 1])
-        self.assertEqual(dst.context_lens_list, [129, 130, 1, 1])
-
     def test_fill_tail_attention_keeps_captured_storage(self):
         dst = SRTailAttentionMetadata(
             torch.zeros((6, 2), dtype=torch.int32),
@@ -1374,19 +1348,15 @@ class TestTailGraphBuckets(unittest.TestCase):
         with self.assertRaises(ValueError):
             fill_tail_attention_metadata_(dst, [3, 5], [2, 1], tables, dummy_slot=3)
 
-    def test_copy_and_plan_reject_too_many_pages(self):
+    def test_fill_rejects_page_table_wider_than_capture(self):
         dst = SRTailAttentionMetadata(
             torch.zeros((2, 1), dtype=torch.int32),
             torch.ones(2, dtype=torch.int32),
             [1, 1],
         )
-        src = SRTailAttentionMetadata(
-            torch.tensor([[5, 6], [7, 8]], dtype=torch.int32),
-            torch.tensor([129, 130], dtype=torch.int32),
-            [129, 130],
-        )
+        tables = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
         with self.assertRaises(ValueError):
-            copy_tail_attention_metadata_(dst, src)
+            fill_tail_attention_metadata_(dst, [0, 0], [1, 1], tables)
         self.assertTrue(tail_graph_fits_pages(129, 64, 128))
         self.assertFalse(tail_graph_fits_pages(129, 1, 128))
         helpers = self._helpers()
@@ -2428,7 +2398,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=submitted,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
             ),
@@ -2490,7 +2460,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
@@ -2556,7 +2526,7 @@ class TestTailGraphBuckets(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
@@ -2871,7 +2841,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
@@ -3403,7 +3373,7 @@ class TestTreeIngestLifecycle(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=tail.SRTailExtendTransaction,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),
@@ -3997,7 +3967,7 @@ class TestBatchedKvCopy(unittest.TestCase):
                 TailExtendRecoveryRequired=tail.TailExtendRecoveryRequired,
                 tree_seed_is_current=tail.tree_seed_is_current,
                 SRTailExtendTransaction=txn_cls,
-                _sr_is_device_context_error=lambda exc: False,
+                is_device_context_error=lambda exc: False,
                 NpuGraphReplaySubmittedError=type("Submitted", (Exception,), {}),
                 KVMoveSubmittedError=KVMoveSubmittedError,
                 NpuGraphPreparationError=type("Prep", (Exception,), {}),

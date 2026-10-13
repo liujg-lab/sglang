@@ -849,7 +849,6 @@ class SRTreeDrafter:
                     store.release(prev, allocator=self.token_to_kv_pool_allocator)
                 store.register(lease)
                 unpublished.discard(j)
-                req.sr_tree_version = lease.version
         except Exception:
             for j in unpublished:
                 self.token_to_kv_pool_allocator.free(lease_state["page_slots"][j])
@@ -1108,7 +1107,6 @@ class SRTreeDrafter:
         # AST tests bind this method onto a namespace that does not carry the helper.
         shared_raw = bool(getattr(self, "_raw_cache_shared", False))
         seal_raw_cache = getattr(self, "_seal_raw_cache", None)
-        txn.allocation_owned = True
         txn.lease_state = lease_state
         txn.allocator_backup = token_to_kv_pool_state_backup
         self._pending_lease_state = lease_state
@@ -1381,7 +1379,6 @@ class SRTreeDrafter:
         elif txn.allocator_backup is not None:
             self.token_to_kv_pool_allocator.restore_state(txn.allocator_backup)
         txn.rolled_back = True
-        txn.allocation_owned = False
 
     def _prepare_paged_tree_round(
         self, forward_batch, batch, leased: bool, metrics=None

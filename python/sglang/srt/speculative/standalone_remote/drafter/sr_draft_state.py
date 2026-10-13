@@ -27,14 +27,12 @@ class SRDraftState:
     session_id: str
     last_step_id: int = -1
     last_base_committed_len: int = -1
-    last_rpc_seq: int = -1
     last_window: Optional[SRWindow] = None
     req_object: Optional["Req"] = None
     # Sticky: this rid hit unrecoverable Draft state (half-ingested KV, broken
     # VL tensors). Reply EMPTY without touching the GPU until Target FINISHes.
     degraded: bool = False
     last_updated_time: float = field(default_factory=time.time)
-    created_time: float = field(default_factory=time.time)
     # Authoritative committed output, without prompt and without draft tokens.
     acked_output_ids: List[int] = field(default_factory=list)
     acked_version: Optional[int] = None
@@ -63,12 +61,6 @@ class SRDraftStateManager:
         with self._lock:
             state.last_updated_time = time.time()
             self.active[req_id] = state
-
-    def touch(self, req_id: str) -> None:
-        with self._lock:
-            state = self.active.get(req_id)
-            if state is not None:
-                state.last_updated_time = time.time()
 
     def delete(self, req_id: str) -> Optional[SRDraftState]:
         with self._lock:

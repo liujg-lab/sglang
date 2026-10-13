@@ -310,6 +310,7 @@ class TestNpuRpdCompact(unittest.TestCase):
                     batch.seq_lens = batch.seq_lens.to(device)
                     batch.req_pool_indices = batch.req_pool_indices.to(device)
                     state = SRFixedAcceptState(bs, 4, 4, 4, device)
+                    state.metrics = SimpleNamespace(counts=Counter())
                     expected = fixtures.FixedAcceptFinalizeTest()._run(
                         plan.rows,
                         plan.tokens,
@@ -327,7 +328,7 @@ class TestNpuRpdCompact(unittest.TestCase):
                         result = state.finalize_from_host(
                             batch, SimpleNamespace(), 4, 2, alloc, plan
                         )
-                    self.assertEqual(state._h2d_count, 1)
+                    self.assertEqual(state.metrics.counts["fixed_accept_h2d_count"], 1)
                     self.assertEqual(
                         [req.output_ids for req in reqs],
                         [req.output_ids for req in expected[3]],

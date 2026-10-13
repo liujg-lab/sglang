@@ -193,7 +193,6 @@ class SRTargetClient(_CommEndpoint):
         self.timeout_ms = max(1, int(timeout_ms))
         self.drop_callback = drop_callback
         self.rebuild_on_timeout = rebuild_on_timeout
-        self._zmq = zmq
         self._ctx = zmq.Context.instance()
         self._identity = b"sr-target-" + uuid.uuid4().hex[:8].encode()
         self._socket = None
@@ -374,7 +373,6 @@ class SRDraftServer(_CommEndpoint):
 
         self.addr = addr
         self.port = port
-        self._zmq = zmq
         self._ctx = zmq.Context.instance()
         self._url, transport = sr_endpoint(addr, port, bind=True)
         self.comm_metrics = SRCommMetrics("Draft", transport)
@@ -387,7 +385,6 @@ class SRDraftServer(_CommEndpoint):
         self._socket = sock
         self._last_identity = None
         self.last_rpc_seq = -1
-        self.last_session_id: Optional[str] = None
         logger.info("[SR] Draft ROUTER bound on %s", self._url)
 
     def close(self) -> None:
@@ -463,24 +460,7 @@ class SRDraftServer(_CommEndpoint):
             self._finish_comm("receive_only")
         return batch, mm
 
-    def is_stale(self, batch: SRBatchRequest) -> bool:
-        stale = self.last_session_id is not None and (
-            batch.session_id < self.last_session_id
-            or (
-                batch.session_id == self.last_session_id
-                and batch.rpc_seq <= self.last_rpc_seq
-            )
-        )
-        if (
-            stale
-            and self._comm_pending is not None
-            and self._comm_pending.key == (batch.session_id, batch.rpc_seq)
-        ):
-            self._finish_comm("stale_request")
-        return stale
-
     def remember(self, batch: SRBatchRequest) -> None:
-        self.last_session_id = batch.session_id
         self.last_rpc_seq = batch.rpc_seq
 
     def send_batch(self, batch: SRBatchReply, identity: Optional[Any] = None) -> None:
