@@ -2197,17 +2197,58 @@ class CandidateGuardsTest(unittest.TestCase):
                         c.candidate_workspace(worker, 1, seed)
                     self.assertEqual(warm.call_count, 1)
 
-    def test_cuda_production_does_not_allocate_candidate_workspace(self):
+    def test_cuda_candidate_preflight_decline_is_cached(self):
         from sglang.srt.speculative.standalone_remote.drafter import (
             sr_tree_candidates as c,
         )
 
+        calls = {"init": 0, "warm": 0}
+        seen = {}
+
+        def init(self, device, batch, topk, steps, width, vocab, dtype, graph=False):
+            calls["init"] += 1
+            seen["device"] = device
+            self.batch = batch
+            self.device = torch.device("cpu")
+            self.unresolved = False
+
+        def warm(self):
+            calls["warm"] += 1
+            raise RuntimeError("declined")
+
+        worker = NS(
+            topk=2,
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            model_config=NS(vocab_size=8),
+            scheduler=None,
+        )
+        seed = NS(device=NS(type="cuda"), dtype=torch.float32)
         with patch.object(
-            c, "SRTreeCandidateWorkspace", side_effect=AssertionError("allocated")
+            torch,
+            "get_device_module",
+            return_value=NS(current_stream=lambda d: NS()),
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.sr_kv_copy._capturing",
+            return_value=False,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.sr_kv_copy._stream_key",
+            return_value=1,
+        ), patch.object(
+            c.SRTreeCandidateWorkspace, "__init__", init
+        ), patch.object(
+            c.SRTreeCandidateWorkspace, "warm", warm
+        ), patch.object(
+            c.SRTreeCandidateWorkspace,
+            "check",
+            side_effect=AssertionError("declined workspace reused"),
         ):
-            self.assertIsNone(
-                c.candidate_workspace(NS(), 1, NS(device=torch.device("cuda:1")))
-            )
+            self.assertIsNone(c.candidate_workspace(worker, 2, seed, graph=False))
+            self.assertIsNone(c.candidate_workspace(worker, 2, seed, graph=False))
+        self.assertEqual(calls["init"], 1)
+        self.assertEqual(calls["warm"], 1)
+        self.assertEqual(seen["device"].type, "cuda")
+        self.assertEqual(list(worker._candidate_workspaces.values()), [None])
 
     def test_graph_decline_never_selects_eager_workspace(self):
         path = (

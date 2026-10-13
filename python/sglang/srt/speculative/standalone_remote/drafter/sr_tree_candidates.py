@@ -440,7 +440,8 @@ class SRTreeCandidateWorkspace:
 
 def candidate_workspace(worker, batch, seed, *, graph=False):
     device = seed.device
-    if device.type != "npu":
+    # Buffer reuse only. CPU and meta keep the original per-step assembly.
+    if device.type not in ("cuda", "npu"):
         return None
     stream = torch.get_device_module(device.type).current_stream(device)
     from sglang.srt.speculative.standalone_remote.sr_kv_copy import (

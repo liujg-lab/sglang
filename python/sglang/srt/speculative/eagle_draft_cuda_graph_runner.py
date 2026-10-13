@@ -516,6 +516,9 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.raw_bs = raw_bs
         self.bs = bs
+        candidate_ws = getattr(self, "_sr_candidate_workspaces", {}).get(self.bs)
+        if candidate_ws is not None:
+            candidate_ws.check(self.bs, check_stream=False)
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay

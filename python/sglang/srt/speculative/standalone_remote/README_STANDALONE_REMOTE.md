@@ -40,6 +40,21 @@ NPU Target/Draft 分页元数据融合、工作区生命周期和设备验收说
 与 [SPECTRE](../../../../../README_SPECTRE.md) 的文档结构相似，但不能照搬其时序和通信配置：
 SR 不需要 SPECTRE 的 C++ ZMQ 扩展，没有独立视觉 PUB/SUB 旁路，也不使用 SPECTRE 的跨窗口流水线。
 
+```mermaid
+sequenceDiagram
+    participant T as Target
+    participant D as Draft
+    T->>T: verify forward
+    T->>T: "accept: D2H wait + host Python"
+    T->>T: KV commit
+    T->>D: "STEP(commit delta + 请求下一窗)"
+    Note over T: GPU 空闲等待 RTT
+    D->>D: "align / tail ingest(Python plan + torch.tensor H2D)"
+    D->>D: tree expand
+    D->>D: "pack + D2H wait + tolist"
+    D->>T: REPLY
+```
+
 ### 模型与平台范围
 
 所有配对首先要求 **tokenizer、词表及 token ID 语义兼容**；SR 不做跨 tokenizer 映射。

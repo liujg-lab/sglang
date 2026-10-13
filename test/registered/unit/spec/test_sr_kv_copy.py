@@ -1042,12 +1042,8 @@ class TestCudaExperimentContracts(unittest.TestCase):
         self.assertIn("slot * STRIDE + c", ast.unparse(stage))
 
     def test_no_production_admission_or_candidate_copies(self):
-        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
-            candidate_workspace,
-        )
-
-        # No CUDA runtime or tensor work is allowed for this rejection.
-        self.assertIsNone(candidate_workspace(NS(), 1, NS(device=NS(type="cuda"))))
+        # Candidate buffer reuse is admitted separately. This test still
+        # forbids the rolled-back KV fusion symbols.
         root = Path(kv.__file__).parent
         production = Path(kv.__file__).read_text(encoding="utf-8")
         self.assertNotIn("cuda_layered", production)
