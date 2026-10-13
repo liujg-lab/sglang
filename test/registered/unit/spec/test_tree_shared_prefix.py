@@ -4,6 +4,7 @@ import ast
 import logging
 import math
 import os
+import sys
 import threading
 import time
 import unittest
@@ -24,6 +25,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     build_step_context_lens,
     context_lens_list,
     read_sr_tree_paged_env,
+    resolve_ascend_use_fia,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
     IMPL_TREE_PAGED_FIA,
@@ -1671,6 +1673,75 @@ class TestPagedReplayRestore(unittest.TestCase):
         with self.assertRaises(self.PrepError):
             runner.replay(batch)
         self._assert_eager_restored(inners, eager, had_fm=False)
+
+
+class TestAscendUseFiaDefault(unittest.TestCase):
+    def _args(self, **kwargs):
+        base = dict(standalone_remote_role=None, spectre_role=None)
+        base.update(kwargs)
+        return NS(**base)
+
+    def test_unset_draft_is_fia_and_others_stay_atb(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ASCEND_USE_FIA", None)
+            self.assertTrue(
+                resolve_ascend_use_fia(self._args(standalone_remote_role="draft"))
+            )
+            self.assertTrue(resolve_ascend_use_fia(self._args(spectre_role="draft")))
+            self.assertFalse(
+                resolve_ascend_use_fia(self._args(standalone_remote_role="target"))
+            )
+            self.assertFalse(
+                resolve_ascend_use_fia(self._args(spectre_role="target"))
+            )
+            self.assertFalse(resolve_ascend_use_fia(self._args()))
+
+    def test_explicit_env_wins(self):
+        draft = self._args(standalone_remote_role="draft")
+        target = self._args(standalone_remote_role="target")
+        with patch.dict(os.environ, {"ASCEND_USE_FIA": "0"}):
+            self.assertFalse(resolve_ascend_use_fia(draft))
+        with patch.dict(os.environ, {"ASCEND_USE_FIA": "false"}):
+            self.assertFalse(resolve_ascend_use_fia(draft))
+        with patch.dict(os.environ, {"ASCEND_USE_FIA": "1"}):
+            self.assertTrue(resolve_ascend_use_fia(draft))
+            self.assertTrue(resolve_ascend_use_fia(target))
+
+    def test_missing_global_args_stays_atb(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ASCEND_USE_FIA", None)
+            saved = sys.modules.pop("sglang.srt.server_args", None)
+            try:
+                self.assertFalse(resolve_ascend_use_fia())
+            finally:
+                if saved is not None:
+                    sys.modules["sglang.srt.server_args"] = saved
+
+    def test_loaded_global_args_unset_stays_atb(self):
+        fake = NS(get_global_server_args=Mock(side_effect=ValueError("unset")))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ASCEND_USE_FIA", None)
+            with patch.dict(sys.modules, {"sglang.srt.server_args": fake}):
+                self.assertFalse(resolve_ascend_use_fia())
+
+    def test_global_draft_args_default_fia(self):
+        fake = NS(
+            get_global_server_args=lambda: self._args(standalone_remote_role="draft")
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ASCEND_USE_FIA", None)
+            with patch.dict(sys.modules, {"sglang.srt.server_args": fake}):
+                self.assertTrue(resolve_ascend_use_fia())
+
+    def test_call_sites_use_resolver(self):
+        for rel in (
+            "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py",
+            "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py",
+            "python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py",
+        ):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("resolve_ascend_use_fia", text)
+            self.assertNotIn('get_bool_env_var("ASCEND_USE_FIA"', text)
 
 
 if __name__ == "__main__":

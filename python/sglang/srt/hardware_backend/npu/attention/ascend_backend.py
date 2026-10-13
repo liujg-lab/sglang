@@ -49,6 +49,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     select_draft_page_bucket,
     quantize_page_width,
     read_sr_tree_paged_env,
+    resolve_ascend_use_fia,
     resolve_eager_page_buckets,
 )
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
@@ -106,7 +107,6 @@ from sglang.srt.speculative.tree_shared_prefix import (
     shared_prefix_attention,
     shared_prefix_layer_supported,
 )
-from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -376,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = resolve_ascend_use_fia(model_runner.server_args)
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens

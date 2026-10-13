@@ -278,10 +278,12 @@ Draft 编译失败或降级不能代替 Target 约束。`return_logprob` 按实�
 
 NPU 对能力检查通过的 SR 普通 MHA/GQA 树路径，在图捕获前固定选择实现：
 合格 NPU Draft（`topk>1` 且 `page_size>1`）**默认**使用原生分页树 attention
-（`paged_atb` / `paged_fia`），无需设置 `SGLANG_NPU_SR_TREE_PAGED=1`。
-启动前设置 `SGLANG_NPU_SR_TREE_PAGED=0` 可恢复 compact-FIA；该变量只在 Draft
-初始化时读取，不是运行时热切换。`ASCEND_USE_FIA` 决定 Draft 分页树走 ATB 还是 FIA，
-与 tail 的 FIA 开关是不同维度。该默认值不影响 Target、CUDA 和 tail EXTEND。
+`paged_fia`，无需设置 `SGLANG_NPU_SR_TREE_PAGED=1`，也不需要手动
+`export ASCEND_USE_FIA=1`。启动前设置 `SGLANG_NPU_SR_TREE_PAGED=0` 可恢复
+compact-FIA；该变量只在 Draft 初始化时读取，不是运行时热切换。
+`ASCEND_USE_FIA` 未设置时，Draft 的分页树、tail 和 KV 都走 page FIA；显式
+`0`/`false` 才回到 page ATB；显式 `1`/`true` 仍是 FIA。这个默认只作用于
+Draft 角色（`STANDALONE_REMOTE` 或 `SPECTRE`），不影响 Target 和 CUDA。
 eager 分页树能力不受草稿图捕获 batch 上限约束：`prepare_sr_tree_paged_eager`
 只绑定本轮新建的页表，图缓冲区归 `bind_sr_tree_paged_replay` 所有。
 eager 只量化 `block_tables` 的 query 宽度：`page_buckets` 由 `tree_kv_buckets`
@@ -425,8 +427,10 @@ TBO / PDMux 等首版未覆盖组合，保留当前 Target 选择并记录原因
 共享 prefix 与 Target FIA 的首版能力范围包括 FP16/BF16、普通可 view 的 MHA/GQA cache、
 同维 K/V、head dimension 64/128；实际是否启用还取决于所有相关层的能力检查。
 
-`ASCEND_USE_FIA` 未设置或为 `0` 时，当前 NPU 普通 MHA/GQA 的 tail 使用 paged ATB；
-为 `1` 时使用 paged FIA。**tail 的这个开关与树 attention 的实现选择是不同维度**。
+Target 与普通 NPU 服务在 `ASCEND_USE_FIA` 未设置或为 `0` 时，普通 MHA/GQA 的
+tail 使用 paged ATB；为 `1` 时使用 paged FIA。Draft 未设置该变量时，tail 与分页树
+一样默认 paged FIA，显式 `0` 才使用 paged ATB。Target 的 `tree_paged_fia`
+不依赖 `ASCEND_USE_FIA`。
 `shared_prefix_torch` replay 跳过 FIA 长度 update；`tree_paged_fia` 按层更新 B 个
 `P+Q` 长度；compact-FIA 保留相应更新和 scratch。
 两端 page size 是本地 KV/backend 配置，不在 SR 协议中交换；示例使用相同值便于排查，
@@ -662,7 +666,7 @@ python -m sglang.launch_server \
 这组命令允许图捕获；做 eager 对照时在**两端**追加 `--disable-cuda-graph`，再移除比较。
 `--cuda-graph-max-bs 1` 控制捕获规模，不代表所有 prefix 长度都有相应图。
 确认日志中的实际 `implementation`、`tree_graph_captured`、replay 计数和 fallback，
-不要只看 `disable_cuda_graph=False`。普通 NPU tail 默认走 paged ATB；不需要为树图强制设置 `ASCEND_USE_FIA=1`。
+不要只看 `disable_cuda_graph=False`。Draft 未设置 `ASCEND_USE_FIA` 时树和 tail 默认 page FIA；显式 `=0` 才回到 page ATB。不需要再手动 `export ASCEND_USE_FIA=1`。
 
 ### 跨机 TCP
 
@@ -1012,7 +1016,7 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `tree warmup layout=... allocation=... mapping=... elapsed=...` | SR Draft 图外预热完成。`layout` 是量化后的 `(bs, shared_w, nnp_w, width)`；`allocation` / `mapping` 是 host 实际打到的 `(lease\|ordinary, bs, prefixes)`，三者分别报告，不能用单个 `alloc_bs` 代表全覆盖。`elapsed` 若仍远小于 100ms，说明没有打到首次 tiling 代价。`tree shape warmup skipped` 表示 `SGLANG_NPU_SR_TREE_WARMUP=0`；普通失败只 warn，`SRWarmupFatalError` / 设备上下文 / `NpuGraphReplaySubmittedError` 中止 init |
 | `target warmup allocation=... mapping=... kernels=... filter=... greedy=...` | SR Target 图外 kernel 预热覆盖。`filter` 只应出现 `partial`。`greedy` 是独立 greedy 核验 scratch 预热，不依赖图捕获或 `page_size>1 && topk>1`。`path=npu_kernel` 才表示设备 kernel 已预热；`path=cpu_reference` 只说明走了 reference，不能记成设备成功。`SGLANG_NPU_SR_TREE_WARMUP=0` 时 greedy 与 paged 预热一起 skip |
 | `Speculative greedy verify path` | greedy 核验实际路径：`npu_kernel` / `cpu_reference`（含 reason）/ CUDA 上的 `cuda_kernel`。与 RPD 路径日志独立 |
-| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 默认 `paged_atb` 或 `paged_fia`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
+| `NPU SR tree attention implementation=... fallback_reason=...` | 捕获前实际选择；`paged_atb/paged_fia/tree_paged_fia/shared_prefix_torch/compact_fia/chunked` 代表不同实现。合格 NPU Draft 未设置 `ASCEND_USE_FIA` 时默认 `paged_fia`，显式 `=0` 时为 `paged_atb`；`SGLANG_NPU_SR_TREE_PAGED=0` 时 Draft 回 `compact_fia`。合格 NPU Target 默认 `tree_paged_fia`；`SGLANG_NPU_SR_TARGET_TREE_FIA=0` 时 Target 回 `shared_prefix_torch`。reason 可以是性能策略而非报错 |
 | `tree draft timings: prepare_host=... forward_call_host=...` | 单次抽样主机耗时，单位秒；不是设备模型运行总耗时 |
 | `[SR Draft graph host]` | NPU SR Draft `_replay()` 五段主机调用窗口。主机墙钟而非设备图时间；`submit_envelope` 不可与 update/replay 相加；失败调用的已采集耗时不进成功分位数。`overlap=True` 只表示 SR 分页实验重叠或原有 compact-FIA 重叠，不表示设备图已结束 |
 | `NPU SR tree update/replay overlap requested=... effective=...` | Draft NPU runner 初始化时各打一次。`requested` 是环境变量请求；`effective` 仅在分页树、图可用且拿到设备号后为 true。图不可用时不得把 effective 打成 true |

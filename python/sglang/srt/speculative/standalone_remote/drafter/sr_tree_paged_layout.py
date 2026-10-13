@@ -7,8 +7,10 @@ use device boolean indexing that yields a dynamic shape.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
@@ -17,6 +19,7 @@ import torch
 
 SeqLens = Union[torch.Tensor, Sequence[int]]
 
+ASCEND_USE_FIA_ENV = "ASCEND_USE_FIA"
 SR_TREE_PAGED_ENV = "SGLANG_NPU_SR_TREE_PAGED"
 SR_TREE_WARMUP_ENV = "SGLANG_NPU_SR_TREE_WARMUP"
 SR_TREE_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TREE_UPDATE_OVERLAP"
@@ -42,6 +45,9 @@ PAGED_ATB_OP_NAMES = frozenset(
 )
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_BOOL_TRUTHY = frozenset({"true", "1"})
+_BOOL_FALSY = frozenset({"false", "0"})
+logger = logging.getLogger(__name__)
 
 
 def read_sr_tree_paged_env(env=None) -> bool:
@@ -49,6 +55,55 @@ def read_sr_tree_paged_env(env=None) -> bool:
     environ = os.environ if env is None else env
     raw = environ.get(SR_TREE_PAGED_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
+
+
+def _optional_global_server_args():
+    """Return scheduler args only when that module is already imported.
+
+    Do not import ``server_args`` here. KV pool setup runs after
+    ``set_global_server_args_for_scheduler``; a missing module means the
+    default page-ATB path.
+    """
+    mod = sys.modules.get("sglang.srt.server_args")
+    getter = getattr(mod, "get_global_server_args", None) if mod is not None else None
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except ValueError:
+        return None
+
+
+def _env_flag(name: str, default: str) -> bool:
+    """Same truth table as ``get_bool_env_var`` without importing ``srt.utils``."""
+    value = os.environ.get(name, default).lower()
+    if value not in _BOOL_TRUTHY and value not in _BOOL_FALSY:
+        logger.warning(
+            "resolve_ascend_use_fia(%s) encountered unrecognized value=%s "
+            "and will treat as false",
+            name,
+            value,
+        )
+    return value in _BOOL_TRUTHY
+
+
+def resolve_ascend_use_fia(server_args=None) -> bool:
+    """Read ``ASCEND_USE_FIA`` once. Draft defaults to page FIA.
+
+    Unset and role ``draft`` (``STANDALONE_REMOTE`` or ``SPECTRE``) selects
+    page FIA. Unset for any other role, or when global server args are not
+    set yet, stays page ATB. Explicit ``0``/``false`` keeps ATB; explicit
+    ``1``/``true`` keeps FIA. Not a runtime toggle.
+    """
+    if server_args is None:
+        server_args = _optional_global_server_args()
+    role = None
+    if server_args is not None:
+        role = getattr(server_args, "standalone_remote_role", None) or getattr(
+            server_args, "spectre_role", None
+        )
+    default = "true" if role == "draft" else "false"
+    return _env_flag(ASCEND_USE_FIA_ENV, default)
 
 
 def read_sr_tree_warmup_env(env=None) -> bool:

@@ -40,6 +40,9 @@ from sglang.srt.speculative.spec_utils import (
     fill_fia_cpu_update_payload,
     run_npu_graph_update_and_replay,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    resolve_ascend_use_fia,
+)
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     begin_graph_host_sample,
@@ -60,7 +63,6 @@ from sglang.srt.speculative.tree_attn_fallback import (
 )
 from sglang.srt.utils import (
     empty_context,
-    get_bool_env_var,
     get_compiler_backend,
     is_npu,
 )
@@ -130,7 +132,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
             self._init_arch_map()
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = resolve_ascend_use_fia(model_runner.server_args)
         self._clear_tree_replay_plan()
         self._maybe_enable_sr_target_update_overlap(target_overlap_requested)
 

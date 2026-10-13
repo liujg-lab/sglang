@@ -10,11 +10,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    resolve_ascend_use_fia,
+)
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
     move_kv_slots_,
     prepare_kv_move,
 )
-from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -37,7 +39,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = resolve_ascend_use_fia()
         # Keep enable_kv_cache_copy in the signature (mixin still passes True
         # for speculative decoding). NPU page-physical KV cannot use CUDA
         # Triton tiled copy; tree last-page fork uses move_kv_cache() instead.
