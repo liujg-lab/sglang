@@ -756,11 +756,17 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         )
 
     def test_page_capacity_matches_new_bound(self):
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            commit_capacity,
+        )
+
+        n_cap, f_cap, packet_cap = commit_capacity(2, 4, 128, 128)
+        self.assertEqual((n_cap, f_cap, packet_cap), (8, 4, 3 * 8 + 4 + 4))
         state = SRFixedAcceptState(2, 4, 128, 128, "cpu")
-        self.assertEqual(state.F_cap, 4)
+        self.assertEqual(state.packet_cap, packet_cap)
+        self.assertFalse(hasattr(state, "N_cap"))
+        self.assertFalse(hasattr(state, "F_cap"))
         self.assertFalse(hasattr(state, "page_buf"))
-        self.assertEqual(state.N_cap, 8)
-        self.assertEqual(state.packet_cap, 3 * 8 + 4 + 4)
 
     def test_rounds_keep_storage_when_batch_shrinks_and_grows(self):
         from sglang.srt.speculative.standalone_remote.verifier import sr_fixed_accept

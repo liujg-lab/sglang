@@ -21,7 +21,6 @@ class IsolatedKV:
     row_identity: object = None
     # Sealed pages are reclaimed from the saved ids. The live pool row may be gone.
     sealed: bool = False
-    finish_deferred: bool = False
     req: object = None
     # A deferred FINISH whose session, generation, or pool row no longer matches.
     stale: bool = False
@@ -281,7 +280,6 @@ def request_consumer_unconfirmed(owner, req) -> bool:
 def defer_finish(owner, req) -> None:
     found = False
     for _holder, _bag, record in iter_request_records(owner, req):
-        record.finish_deferred = True
         record.req = req
         found = True
     if found:
@@ -289,7 +287,6 @@ def defer_finish(owner, req) -> None:
     bag = quarantine(owner)
     hold = bag.retain(("sr-finish-deferred", req), (), None)
     hold.req = req
-    hold.finish_deferred = True
 
 
 def note_deferred_finish(owner, rid, req, state, release_mm, generation) -> None:

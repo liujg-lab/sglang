@@ -80,7 +80,6 @@ class SRPendingEntry:
     base_committed_len: int
     commit_version: Optional[int] = None
     sent_output_len: Optional[int] = None
-    protocol_version: Optional[int] = None
 
 
 @dataclass

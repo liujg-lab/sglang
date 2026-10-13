@@ -18,9 +18,13 @@ from sglang.srt.speculative.spec_utils import (
     NpuGraphReplaySubmittedError,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+    SRCachedReply,
     SRDraftState,
     SRDraftStateManager,
     SRWindow,
+    freeze_ids,
+    freeze_tokens,
+    thaw_ids,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
     SRTailExtendTransaction,
@@ -2319,29 +2323,39 @@ class StandaloneRemoteDraftSchedulerMixin:
         window: SRWindow,
         session_id: str,
         status: Optional[SRReplyStatus] = None,
+        *,
+        publish: bool = True,
     ) -> SRDraftReply:
         tokens, pl, ix = window
+        if status is None:
+            status = SRReplyStatus.OK if tokens else SRReplyStatus.EMPTY
+        tree_version = self._sr_reply_tree_version(dreq.rid)
         st = self.sr_state.get(dreq.rid)
         if st is not None:
             st.last_step_id = dreq.step_id
             st.last_base_committed_len = dreq.base_committed_len
-            st.last_window = window
             st.session_id = session_id
             st.last_updated_time = time.time()
-        if status is None:
-            status = SRReplyStatus.OK if tokens else SRReplyStatus.EMPTY
+            # v1 publishes here. v2 waits until the commit is confirmed.
+            if publish:
+                st.cached_reply = SRCachedReply(
+                    draft_tokens=freeze_tokens(tokens),
+                    parent_list=freeze_ids(pl),
+                    top_scores_index=freeze_ids(ix),
+                    tree_version=tree_version,
+                )
         return SRDraftReply(
             rid=dreq.rid,
             step_id=dreq.step_id,
             base_committed_len=dreq.base_committed_len,
             draft_tokens=list(tokens),
             status=status,
-            parent_list=pl,
-            top_scores_index=ix,
-            tree_version=self._sr_reply_tree_version(dreq.rid, status),
+            parent_list=thaw_ids(pl),
+            top_scores_index=thaw_ids(ix),
+            tree_version=tree_version,
         )
 
-    def _sr_reply_tree_version(self, rid: str, status: SRReplyStatus):
+    def _sr_reply_tree_version(self, rid: str):
         store = getattr(self, "sr_tree_leases", None)
         if store is None:
             return None
@@ -2368,8 +2382,8 @@ class StandaloneRemoteDraftSchedulerMixin:
             base_committed_len=dreq.base_committed_len,
             draft_tokens=list(tokens),
             status=status,
-            parent_list=parent_list,
-            top_scores_index=top_index,
+            parent_list=thaw_ids(parent_list),
+            top_scores_index=thaw_ids(top_index),
             tree_version=tree_version,
             ack_commit_version=ack_version,
             ack_output_len=ack_len,
@@ -2377,20 +2391,20 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
 
     def _sr_cached_reply(self, dreq: SRDraftRequest, state: SRDraftState) -> Optional[SRDraftReply]:
-        cached = state.last_reply
-        if not cached:
+        cached = state.cached_reply
+        if cached is None:
             return None
         return SRDraftReply(
             rid=dreq.rid,
             step_id=dreq.step_id,
             base_committed_len=dreq.base_committed_len,
-            draft_tokens=list(cached.get("draft_tokens") or []),
+            draft_tokens=list(cached.draft_tokens),
             status=SRReplyStatus.IDEMPOTENT,
-            parent_list=cached.get("parent_list"),
-            top_scores_index=cached.get("top_scores_index"),
-            tree_version=cached.get("tree_version"),
-            ack_commit_version=cached.get("ack_commit_version"),
-            ack_output_len=cached.get("ack_output_len"),
+            parent_list=thaw_ids(cached.parent_list),
+            top_scores_index=thaw_ids(cached.top_scores_index),
+            tree_version=cached.tree_version,
+            ack_commit_version=cached.ack_commit_version,
+            ack_output_len=cached.ack_output_len,
         )
 
     def _sr_remember_commit(
@@ -2407,18 +2421,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         state.last_num_draft_tokens = int(dreq.num_draft_tokens or 0)
         state.last_step_id = dreq.step_id
         state.last_base_committed_len = dreq.base_committed_len
-        state.last_reply = {
-            "draft_tokens": list(reply.draft_tokens or []),
-            "parent_list": reply.parent_list,
-            "top_scores_index": reply.top_scores_index,
-            "tree_version": reply.tree_version,
-            "ack_commit_version": reply.ack_commit_version,
-            "ack_output_len": reply.ack_output_len,
-        }
-        state.last_window = (
-            list(reply.draft_tokens or []),
-            reply.parent_list,
-            reply.top_scores_index,
+        state.cached_reply = SRCachedReply(
+            draft_tokens=freeze_tokens(reply.draft_tokens),
+            parent_list=freeze_ids(reply.parent_list),
+            top_scores_index=freeze_ids(reply.top_scores_index),
+            tree_version=reply.tree_version,
+            ack_commit_version=reply.ack_commit_version,
+            ack_output_len=reply.ack_output_len,
         )
 
     def _sr_mm_can_restore(self, req: Optional[Req], dreq: SRDraftRequest, mm) -> bool:
@@ -2438,7 +2447,7 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_reuse_zero_delta(self, dreq, req, state, verdict) -> bool:
         if verdict.outcome != CommitOutcome.APPLY or verdict.delta_ids != ():
             return False
-        if state is None or state.last_window is None or state.pending_commit is not None:
+        if state is None or state.cached_reply is None or state.pending_commit is not None:
             return False
         if (
             not state.commit_trusted
@@ -2565,15 +2574,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         action: SRAction,
         session_id: str,
         mm: Optional[SRMMPayload],
-    ) -> Tuple[Optional[SRDraftReply], Optional[Req], Optional[SRDraftRequest]]:
-        """Returns (early_reply, live_req, local_request)."""
+    ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
+        """Returns (early_reply, live_req)."""
         gate = self._sr_deferred_step_gate(dreq.rid, action, session_id)
         if gate == "control":
-            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None, None
+            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None
         if gate in ("reject", "deferred_finish"):
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="deferred_finish"),
-                None,
                 None,
             )
         metrics = get_sr_round_metrics(self, "Draft")
@@ -2583,7 +2591,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="stale_session"),
                 None,
-                None,
             )
         self._sr_drop_unconfirmed_commit(state)
         req = state.req_object if state is not None else None
@@ -2592,7 +2599,6 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_v2_reply(
                     dreq, SRReplyStatus.REJECT, reason="completion_unknown"
                 ),
-                None,
                 None,
             )
         verdict = inspect_commit(
@@ -2610,12 +2616,11 @@ class StandaloneRemoteDraftSchedulerMixin:
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
                 None,
-                None,
             )
         if verdict.outcome == CommitOutcome.CONTROL:
             if action in (SRAction.FINISH, SRAction.ABORT):
                 self._sr_finish_rid(dreq.rid)
-            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None, None
+            return self._sr_v2_reply(dreq, SRReplyStatus.OK), None
         if verdict.outcome == CommitOutcome.CACHE:
             cached = self._sr_cached_reply(dreq, state)
             note_commit_result(metrics, "commit_idempotent_hits")
@@ -2623,13 +2628,11 @@ class StandaloneRemoteDraftSchedulerMixin:
                 return (
                     self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="missing_cache"),
                     None,
-                    None,
                 )
-            return cached, None, None
+            return cached, None
         if verdict.outcome == CommitOutcome.REJECT:
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason=verdict.reason),
-                None,
                 None,
             )
         if verdict.outcome == CommitOutcome.NEED_SNAPSHOT:
@@ -2639,20 +2642,20 @@ class StandaloneRemoteDraftSchedulerMixin:
                     dreq, SRReplyStatus.NEED_SNAPSHOT, reason=verdict.reason
                 ),
                 None,
-                None,
             )
 
         if self._sr_reuse_zero_delta(dreq, req, state, verdict):
+            cached = state.cached_reply
             reply = self._sr_v2_reply(
                 dreq,
-                SRReplyStatus.OK if state.last_window[0] else SRReplyStatus.EMPTY,
-                window=state.last_window,
-                tree_version=(state.last_reply or {}).get("tree_version"),
+                SRReplyStatus.OK if cached.draft_tokens else SRReplyStatus.EMPTY,
+                window=(cached.draft_tokens, cached.parent_list, cached.top_scores_index),
+                tree_version=cached.tree_version,
                 ack_version=int(dreq.commit_version),
                 ack_len=len(state.acked_output_ids),
             )
             self._sr_confirm_zero_delta(dreq, req, state, reply)
-            return reply, None, None
+            return reply, None
         if delta_fast_allowed(
             verdict,
             req=req,
@@ -2661,7 +2664,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             poisoned=poisoned,
         ):
             self._sr_prepare_delta_fast(dreq, req, state, verdict, metrics)
-            return None, req, dreq
+            return None, req
 
         output_ids = (
             rebuild_committed_output(
@@ -2690,7 +2693,6 @@ class StandaloneRemoteDraftSchedulerMixin:
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
                 None,
-                None,
             )
         if not self._sr_mm_can_restore(req, dreq, mm) and (
             req is None or route == RecoveryRoute.REPREFILL
@@ -2700,12 +2702,10 @@ class StandaloneRemoteDraftSchedulerMixin:
                     dreq, SRReplyStatus.REJECT, reason="unrecoverable_mm"
                 ),
                 None,
-                None,
             )
         if req is None and dreq.commit_mode != "snapshot":
             return (
                 self._sr_v2_reply(dreq, SRReplyStatus.NEED_SNAPSHOT, reason="no_req"),
-                None,
                 None,
             )
         note_commit_result(metrics, "commit_slow_apply")
@@ -2714,7 +2714,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         if req is None:
             req = self._sr_create_req(dreq, mm, session_id)
             if req is None:
-                return self._sr_v2_reply(dreq, SRReplyStatus.EMPTY), None, None
+                return self._sr_v2_reply(dreq, SRReplyStatus.EMPTY), None
             state = self.sr_state.get(dreq.rid)
         elif route == RecoveryRoute.REPREFILL:
             fill = list(prompt) + list(output_ids)
@@ -2726,7 +2726,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         )
         if state is not None and dreq.commit_mode == "snapshot":
             state.prompt_len = len(prompt)
-        return None, req, local
+        return None, req
 
     def _sr_finalize_v2_commit(
         self,
@@ -2843,20 +2843,18 @@ class StandaloneRemoteDraftSchedulerMixin:
             empty.status = SRReplyStatus.OK
             return empty, None
         if decision == DraftDecision.IDEMPOTENT:
-            if state is not None and state.last_window is not None:
-                tokens, pl, ix = state.last_window
+            cached = None if state is None else state.cached_reply
+            if cached is not None:
                 return (
                     SRDraftReply(
                         rid=dreq.rid,
                         step_id=dreq.step_id,
                         base_committed_len=dreq.base_committed_len,
-                        draft_tokens=list(tokens),
+                        draft_tokens=list(cached.draft_tokens),
                         status=SRReplyStatus.IDEMPOTENT,
-                        parent_list=pl,
-                        top_scores_index=ix,
-                        tree_version=self._sr_reply_tree_version(
-                            dreq.rid, SRReplyStatus.IDEMPOTENT
-                        ),
+                        parent_list=thaw_ids(cached.parent_list),
+                        top_scores_index=thaw_ids(cached.top_scores_index),
+                        tree_version=self._sr_reply_tree_version(dreq.rid),
                     ),
                     None,
                 )
@@ -2976,7 +2974,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         prepare_last_rpc = -1 if wiped_this_batch else last_rpc
         for i, dreq in enumerate(batch.reqs):
             if use_v2:
-                reply, req, _local = self._sr_prepare_v2(
+                reply, req = self._sr_prepare_v2(
                     dreq, batch.action, batch.session_id, mm_by_rid.get(dreq.rid)
                 )
             else:
@@ -3003,7 +3001,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             for (i, dreq, req), window in zip(gpu_pairs, windows):
                 pending_wire = getattr(req, "sr_pending_wire_request", None)
                 wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
-                reply = self._sr_stamp_window(wire, window, batch.session_id)
+                reply = self._sr_stamp_window(
+                    wire, window, batch.session_id, publish=not use_v2
+                )
                 if use_v2:
                     reply = self._sr_finalize_v2_commit(wire, req, reply)
                 replies[i] = reply

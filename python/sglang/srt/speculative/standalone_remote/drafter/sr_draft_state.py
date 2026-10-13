@@ -21,13 +21,46 @@ SRWindow = Tuple[
 ]
 
 
+def freeze_ids(seq: Optional[List[int]]) -> Optional[Tuple[int, ...]]:
+    if seq is None:
+        return None
+    return tuple(int(x) for x in seq)
+
+
+def freeze_tokens(seq: Optional[List[int]]) -> Tuple[int, ...]:
+    if not seq:
+        return ()
+    return tuple(int(x) for x in seq)
+
+
+def thaw_ids(seq: Optional[Tuple[int, ...]]) -> Optional[List[int]]:
+    if seq is None:
+        return None
+    return list(seq)
+
+
+@dataclass(frozen=True)
+class SRCachedReply:
+    """One confirmed draft window. ``None`` on the state means no cache.
+
+    An empty ``draft_tokens`` is a cached empty window, not a missing cache.
+    """
+
+    draft_tokens: Tuple[int, ...] = ()
+    parent_list: Optional[Tuple[int, ...]] = None
+    top_scores_index: Optional[Tuple[int, ...]] = None
+    tree_version: Optional[int] = None
+    ack_commit_version: Optional[int] = None
+    ack_output_len: Optional[int] = None
+
+
 @dataclass
 class SRDraftState:
     req_id: str
     session_id: str
     last_step_id: int = -1
     last_base_committed_len: int = -1
-    last_window: Optional[SRWindow] = None
+    cached_reply: Optional[SRCachedReply] = None
     req_object: Optional["Req"] = None
     # Sticky: this rid hit unrecoverable Draft state (half-ingested KV, broken
     # VL tensors). Reply EMPTY without touching the GPU until Target FINISHes.
@@ -40,7 +73,6 @@ class SRDraftState:
     commit_trusted: bool = True
     completion_unknown: bool = False
     last_commit_fingerprint: Optional[Tuple] = None
-    last_reply: Optional[dict] = None
     last_num_draft_tokens: int = 0
     local_prefix_stamp: Optional[LocalPrefixStamp] = None
     pending_commit: Optional[PendingCommit] = None

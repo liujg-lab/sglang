@@ -532,7 +532,7 @@ class SRFixedAcceptState:
             (self.B_cap, self.L * 2 + 2), torch.int64, self.device
         )
         self.accept_d2h_event = None
-        self.N_cap, self.F_cap, self.packet_cap = commit_capacity(
+        _, _, self.packet_cap = commit_capacity(
             self.B_cap, self.L, self.W, self.page_size
         )
         self.commit_host, self.commit_pinned = alloc_host(

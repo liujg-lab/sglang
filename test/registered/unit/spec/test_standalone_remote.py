@@ -62,7 +62,6 @@ from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRTargetClient,
     _pack_request,
     _unpack_request,
-    stale_drop_counts,
 )
 
 try:
@@ -1252,13 +1251,25 @@ class TestMMPayloadMultipart(CustomTestCase):
 
 
 class TestZmqStaleReply(CustomTestCase):
+    @staticmethod
+    def _record_drops(client):
+        drops = []
+        client.drop_callback = lambda reason, n: drops.append((reason, n))
+        return drops
+
+    @staticmethod
+    def _stale_replies(client) -> int:
+        window = client.comm_metrics.windows.get("step")
+        if window is None:
+            return 0
+        return window["counts"]["stale_reply"]
+
     def test_late_reply_dropped_by_rpc_seq(self):
         port = f"srtest{int(time.time() * 1000) % 100000}"
         server = SRDraftServer("127.0.0.1", port)
         client = SRTargetClient("127.0.0.1", port, timeout_ms=2000)
+        drops = self._record_drops(client)
         time.sleep(0.05)
-
-        before = stale_drop_counts.get("rpc_seq", 0)
 
         def serve_once():
             got = server.recv_batch(timeout_ms=2000)
@@ -1308,7 +1319,8 @@ class TestZmqStaleReply(CustomTestCase):
         self.assertIsNotNone(reply)
         self.assertEqual(reply.rpc_seq, 5)
         self.assertEqual(reply.reqs[0].draft_tokens, [1, 2, 3])
-        self.assertGreaterEqual(stale_drop_counts.get("rpc_seq", 0), before + 1)
+        self.assertEqual(drops, [("rpc_seq", 1)])
+        self.assertEqual(self._stale_replies(client), 1)
         client.close()
         server.close()
 
@@ -1316,8 +1328,8 @@ class TestZmqStaleReply(CustomTestCase):
         port = f"srtest{int(time.time() * 1000) % 100000 + 1}"
         server = SRDraftServer("127.0.0.1", port)
         client = SRTargetClient("127.0.0.1", port, timeout_ms=1500)
+        drops = self._record_drops(client)
         time.sleep(0.05)
-        before = stale_drop_counts.get("session", 0)
 
         def serve_once():
             got = server.recv_batch(timeout_ms=2000)
@@ -1343,7 +1355,55 @@ class TestZmqStaleReply(CustomTestCase):
         t.join(timeout=3)
         self.assertIsNotNone(reply)
         self.assertEqual(reply.session_id, "new_session")
-        self.assertGreaterEqual(stale_drop_counts.get("session", 0), before + 1)
+        self.assertEqual(drops, [("session", 1)])
+        self.assertEqual(self._stale_replies(client), 1)
+        client.close()
+        server.close()
+
+    def test_drain_counts_each_unread_reply(self):
+        port = f"srtest{int(time.time() * 1000) % 100000 + 2}"
+        server = SRDraftServer("127.0.0.1", port)
+        client = SRTargetClient("127.0.0.1", port, timeout_ms=2000)
+        drops = self._record_drops(client)
+        time.sleep(0.05)
+        first_done = threading.Event()
+        extras_sent = threading.Event()
+
+        def serve():
+            got = server.recv_batch(timeout_ms=2000)
+            self.assertIsNotNone(got)
+            batch, _ = got
+            server.send_batch(
+                SRBatchReply(
+                    session_id=batch.session_id, rpc_seq=batch.rpc_seq, reqs=[]
+                )
+            )
+            self.assertTrue(first_done.wait(timeout=2))
+            for seq in (1, 2):
+                server.send_batch(
+                    SRBatchReply(session_id="stale", rpc_seq=seq, reqs=[])
+                )
+            extras_sent.set()
+            self.assertIsNotNone(server.recv_batch(timeout_ms=2000))
+
+        t = threading.Thread(target=serve)
+        t.start()
+        req1 = SRBatchRequest(
+            session_id="s", rpc_seq=1, action=SRAction.STEP, reqs=[]
+        )
+        client.send_batch(req1)
+        reply = client.recv_batch(req1.session_id, req1.rpc_seq)
+        self.assertIsNotNone(reply)
+        first_done.set()
+        self.assertTrue(extras_sent.wait(timeout=2))
+        time.sleep(0.05)
+        req2 = SRBatchRequest(
+            session_id="s", rpc_seq=2, action=SRAction.STEP, reqs=[]
+        )
+        client.send_batch(req2)
+        self.assertEqual(drops, [("rpc_seq", 2)])
+        self.assertEqual(self._stale_replies(client), 2)
+        t.join(timeout=3)
         client.close()
         server.close()
 
@@ -1351,18 +1411,19 @@ class TestZmqStaleReply(CustomTestCase):
 class TestIdempotentWindowCache(CustomTestCase):
     def test_cached_window_not_advanced(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+            SRCachedReply,
             SRDraftState,
             SRDraftStateManager,
         )
 
         mgr = SRDraftStateManager()
-        window = ([7, 8, 9], None, None)
+        cached = SRCachedReply(draft_tokens=(7, 8, 9))
         st = SRDraftState(
             req_id="r",
             session_id="s",
             last_step_id=2,
             last_base_committed_len=10,
-            last_window=window,
+            cached_reply=cached,
         )
         mock_req = MagicMock()
         mock_req.origin_input_ids = [1, 2]
@@ -1386,7 +1447,7 @@ class TestIdempotentWindowCache(CustomTestCase):
             has_state=True,
         )
         self.assertEqual(decision, DraftDecision.IDEMPOTENT)
-        self.assertEqual(st.last_window[0], [7, 8, 9])
+        self.assertEqual(st.cached_reply.draft_tokens, (7, 8, 9))
         self.assertEqual(mock_req.kv_committed_len, kv_before)
 
 
@@ -1777,7 +1838,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "sess"
         mixin.sr_rpc_seq = 0
-        mixin._sr_inflight = None
         mixin._engine_paused = False
         mixin.current_scheduler_metrics_enabled = False
         mixin.last_batch = None
@@ -1883,7 +1943,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         with self.assertRaises(mixin.recv_requests.StopLoop):
             mixin.event_loop_normal_standalone_remote_target()
         self.assertEqual(order, ["send", "gpu", "recv"])
-        self.assertIsNone(mixin._sr_inflight)
 
     def test_step_stays_blocking_send_recv(self):
         order = []
@@ -1892,7 +1951,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         with self.assertRaises(mixin.recv_requests.StopLoop):
             mixin.event_loop_normal_standalone_remote_target()
         self.assertEqual(order, ["send", "recv", "gpu", "send", "recv"])
-        self.assertIsNone(mixin._sr_inflight)
 
     def test_reset_clears_inflight(self):
         mixin_cls = self._import_mixin()
@@ -1901,11 +1959,9 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 3
-        mixin._sr_inflight = object()
         client = MagicMock()
         mixin.sr_client = client
         mixin.reset_standalone_remote_target_state()
-        self.assertIsNone(mixin._sr_inflight)
         self.assertEqual(mixin.sr_rpc_seq, 0)
         client._drain.assert_called_once()
 
@@ -1916,7 +1972,6 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.tp_rank = 0
         mixin.sr_session_id = "old"
         mixin.sr_rpc_seq = 1
-        mixin._sr_inflight = None
         mixin.sr_client = None
         mixin.sr_breaker = SRRpcBreaker(failure_threshold=3, cooldown_steps=4)
         for _ in range(3):

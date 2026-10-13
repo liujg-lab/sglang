@@ -21,6 +21,12 @@ from sglang.srt.speculative.standalone_remote.sr_commit import (
     stamp_matches,
     supported_protocol,
 )
+from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+    SRCachedReply,
+    freeze_ids,
+    freeze_tokens,
+    thaw_ids,
+)
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
     SRBatchReply,
@@ -243,7 +249,6 @@ class TestSRIncrementalCommit(unittest.TestCase):
             base_committed_len=6,
             commit_version=4,
             sent_output_len=2,
-            protocol_version=SR_PROTOCOL_VERSION,
         )
         good = SRDraftReply(
             rid="r",
@@ -695,6 +700,10 @@ class TestSRDeltaFastPath(unittest.TestCase):
             "replace": __import__("dataclasses").replace,
             "SRReplyStatus": protocol.SRReplyStatus,
             "SRDraftReply": protocol.SRDraftReply,
+            "SRCachedReply": SRCachedReply,
+            "freeze_ids": freeze_ids,
+            "freeze_tokens": freeze_tokens,
+            "thaw_ids": thaw_ids,
             "Optional": __import__("typing").Optional,
             "Tuple": __import__("typing").Tuple,
             "List": __import__("typing").List,
@@ -725,7 +734,7 @@ class TestSRDeltaFastPath(unittest.TestCase):
         state.prompt_len = 2
         state.commit_trusted = True
         state.local_prefix_stamp = make_prefix_stamp(req, 1)
-        state.last_window = ([4], None, None)
+        state.cached_reply = SRCachedReply(draft_tokens=(4,))
         state.last_step_id = 3
         state.last_base_committed_len = 2 + len(output)
         state.last_num_draft_tokens = 4
@@ -738,7 +747,7 @@ class TestSRDeltaFastPath(unittest.TestCase):
         zero = _delta([9], [], prompt_len=2, base_version=1, version=2, step=3)
         zero.num_draft_tokens = 4
         zero.base_committed_len = 3
-        reply, live, _local = mixin._sr_prepare_v2(zero, SRAction.STEP, "s", None)
+        reply, live = mixin._sr_prepare_v2(zero, SRAction.STEP, "s", None)
         self.assertIsNotNone(reply)
         self.assertIsNone(live)
         self.assertEqual(state.acked_version, 2)
@@ -747,10 +756,9 @@ class TestSRDeltaFastPath(unittest.TestCase):
         self.assertIsNone(state.pending_commit)
         nxt = _delta([9], [3, 4], prompt_len=2, base_version=2, version=3, step=4)
         nxt.num_draft_tokens = 4
-        reply, live, wire = mixin._sr_prepare_v2(nxt, SRAction.STEP, "s", None)
+        reply, live = mixin._sr_prepare_v2(nxt, SRAction.STEP, "s", None)
         self.assertIsNone(reply)
         self.assertIs(live, req)
-        self.assertIs(wire, nxt)
         self.assertEqual(req.output_ids, [9, 3, 4])
         self.assertEqual(state.acked_output_ids, [9])
         self.assertEqual(mixin._sr_round_metrics.counts["commit_fast_apply"], 1)
@@ -799,7 +807,7 @@ class TestSRDeltaFastPath(unittest.TestCase):
         self.assertFalse(state.commit_trusted)
         self.assertTrue(state.completion_unknown)
         self.assertIsNone(state.pending_commit)
-        again, _live, _wire = mixin._sr_prepare_v2(delta, SRAction.STEP, "s", None)
+        again, _live = mixin._sr_prepare_v2(delta, SRAction.STEP, "s", None)
         self.assertEqual(again.status, SRReplyStatus.REJECT)
         self.assertEqual(again.reason, "completion_unknown")
         self.assertEqual(req.output_ids, [9, 5])

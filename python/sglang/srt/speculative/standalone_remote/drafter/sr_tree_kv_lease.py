@@ -52,7 +52,6 @@ class PagedTreeLayout:
     pages_per_branch: List[int]
     pages_per_req: List[int]
     extend_lens: List[int]
-    logical_seq_lens: List[int]
     prefix_lens: List[int]
 
 
@@ -108,7 +107,6 @@ def plan_paged_tree_layout(
         pages_per_branch=nnp,
         pages_per_req=per_req,
         extend_lens=extend,
-        logical_seq_lens=logical,
         prefix_lens=prefix,
     )
 

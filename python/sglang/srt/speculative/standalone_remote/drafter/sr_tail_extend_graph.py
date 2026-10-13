@@ -424,7 +424,6 @@ class SRTailExtendGraphRunner:
         self.buckets: List[TailGraphBucket] = []
         self.dummy_req_idx = None
         self.disabled_reason = None
-        self.replay_count = 0
         self.eager_fallback_count = 0
         self.page_size = 1
         self.captured_pages = 0
@@ -518,7 +517,6 @@ class SRTailExtendGraphRunner:
             : plan.bucket[0]
         ].tolist()
         self._replay_graph(graph, kv_lens, plan.bucket)
-        self.replay_count += 1
         output = self.output_buffers[plan.bucket]
         raw_bs = plan.raw_bs
         hidden = output.hidden_states

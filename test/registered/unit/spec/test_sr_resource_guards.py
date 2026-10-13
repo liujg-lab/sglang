@@ -1597,7 +1597,6 @@ class QuarantineTest(unittest.TestCase):
         self.assertEqual(released, [])
         self.assertEqual(deleted, [])
         self.assertEqual(req.req_pool_idx, 3)
-        self.assertTrue(drafter._sr_kv_quarantine.records[0].finish_deferred)
         self.assertEqual(len(drafter._sr_kv_quarantine.records), 1)
 
         quarantine(owner).retain(

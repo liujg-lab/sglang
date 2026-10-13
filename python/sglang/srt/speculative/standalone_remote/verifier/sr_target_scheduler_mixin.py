@@ -143,7 +143,6 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _init_sr_target(self) -> None:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
-        self._sr_inflight: Optional[SRInflight] = None
         self.sr_client: Optional[SRTargetClient] = None
         self.sr_breaker = SRRpcBreaker(
             failure_threshold=int(
@@ -169,7 +168,6 @@ class SchedulerStandaloneRemoteTargetMixin:
     def reset_standalone_remote_target_state(self) -> None:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
-        self._sr_inflight = None
         self._sr_finish_pending = []
         self.sr_speculation_stopped = False
         self.sr_seen_generation = None
@@ -182,15 +180,10 @@ class SchedulerStandaloneRemoteTargetMixin:
         if self.tp_rank == 0:
             logger.info("[SR] Target flushed, new session_id=%s", self.sr_session_id)
 
-    def _sr_note_stale(self, reason: str) -> None:
-        from sglang.srt.speculative.standalone_remote.sr_transport import (
-            note_stale_drop,
-        )
-
-        note_stale_drop(reason)
+    def _sr_note_stale(self, reason: str, n: int = 1) -> None:
         metrics = self._sr_metrics()
         if metrics is not None:
-            metrics.increment_sr_stale_replies_dropped(reason=reason)
+            metrics.increment_sr_stale_replies_dropped(n=n, reason=reason)
 
     def _sr_metrics(self):
         if not getattr(self, "current_scheduler_metrics_enabled", False):
@@ -301,7 +294,6 @@ class SchedulerStandaloneRemoteTargetMixin:
         req.sr_next_commit_version = version + 1
         sent_len = len(req.output_ids or [])
         req.sr_sent_commit_version = version
-        req.sr_sent_output_len = sent_len
         mm_items = getattr(getattr(req, "multimodal_inputs", None), "mm_items", None)
         requires_mm = isinstance(mm_items, list) and len(mm_items) > 0
         if snapshot:
@@ -375,8 +367,8 @@ class SchedulerStandaloneRemoteTargetMixin:
                 step_id=dreq.step_id,
                 base_committed_len=dreq.base_committed_len,
                 commit_version=dreq.commit_version,
-                sent_output_len=getattr(req, "sr_sent_output_len", None),
-                protocol_version=SR_PROTOCOL_VERSION,
+                sent_output_len=dreq.base_committed_len
+                - len(req.origin_input_ids or []),
             )
             if mm is not None:
                 mm_by_rid[req.rid] = mm
@@ -417,15 +409,13 @@ class SchedulerStandaloneRemoteTargetMixin:
             wait_reply=wait_reply,
             send_ok=send_ok,
         )
-        self._sr_inflight = inflight
         return inflight
 
-    def _sr_recv(self, inflight: Optional[SRInflight]) -> Dict[str, SRDraftReply]:
+    def _sr_recv(
+        self, inflight: Optional[SRInflight]
+    ) -> Tuple[Dict[str, SRDraftReply], Dict[str, SRPendingEntry]]:
         if inflight is None:
-            return {}
-        self._sr_ack_pending = inflight.pending
-        if getattr(self, "_sr_inflight", None) is inflight:
-            self._sr_inflight = None
+            return {}, {}
 
         reply: Optional[SRBatchReply] = None
         if inflight.wait_reply and inflight.send_ok:
@@ -446,17 +436,18 @@ class SchedulerStandaloneRemoteTargetMixin:
 
         result: Dict[str, SRDraftReply] = {}
         got_packet = reply is not None
+        pending = inflight.pending
         if reply is None:
             self._sr_observe_rpc(inflight, got_packet=False)
-            return result
+            return result, pending
         if reply.session_id != self.sr_session_id:
             self._sr_note_stale("session")
             self._sr_observe_rpc(inflight, got_packet=True)
-            return result
+            return result, pending
         if reply.rpc_seq != inflight.rpc_seq:
             self._sr_note_stale("rpc_seq")
             self._sr_observe_rpc(inflight, got_packet=True)
-            return result
+            return result, pending
         if reply_stops_speculation(
             reply.protocol_version, session_rpc_matched=True
         ) or any(
@@ -468,8 +459,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                 else "protocol_version"
             )
             self._sr_observe_rpc(inflight, got_packet=True)
-            return result
-        pending = inflight.pending
+            return result, pending
         for item in reply.reqs:
             pending_entry = pending.get(item.rid)
             if pending_entry is None:
@@ -480,7 +470,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                 continue
             result[item.rid] = item
         self._sr_observe_rpc(inflight, got_packet=got_packet)
-        return result
+        return result, pending
 
     def _sr_observe_rpc(self, inflight: SRInflight, *, got_packet: bool) -> None:
         if not inflight.wait_reply:
@@ -498,15 +488,17 @@ class SchedulerStandaloneRemoteTargetMixin:
         action: SRAction,
         reqs: List[Req],
         include_full_context: bool,
-    ) -> Dict[str, SRDraftReply]:
+    ) -> Tuple[Dict[str, SRDraftReply], Dict[str, SRPendingEntry]]:
         inflight = self._sr_send(action, reqs, include_full_context)
         return self._sr_recv(inflight)
 
     def _sr_apply_commit_acks(
-        self, reqs: List[Req], replies: Dict[str, SRDraftReply]
+        self,
+        reqs: List[Req],
+        replies: Dict[str, SRDraftReply],
+        pending: Dict[str, SRPendingEntry],
     ) -> List[Req]:
         """Advance cursors. Returns rids that asked for one snapshot retry."""
-        pending = getattr(self, "_sr_ack_pending", {}) or {}
         metrics = get_sr_round_metrics(self, "Target")
         retry: List[Req] = []
         for req in reqs:
@@ -556,18 +548,22 @@ class SchedulerStandaloneRemoteTargetMixin:
             return {}
         # This RPC does not update the target graph. Lengths are still written
         # by graph.update immediately before replay.
-        replies = self._sr_rpc(SRAction.STEP, live, include_full_context=False)
+        replies, pending = self._sr_rpc(
+            SRAction.STEP, live, include_full_context=False
+        )
         if getattr(self, "sr_speculation_stopped", False):
             return {}
-        retry = self._sr_apply_commit_acks(live, replies)
+        retry = self._sr_apply_commit_acks(live, replies, pending)
         if not retry:
             return replies
         for req in retry:
             req.sr_force_snapshot = True
-        snap = self._sr_rpc(SRAction.STEP, retry, include_full_context=True)
+        snap, snap_pending = self._sr_rpc(
+            SRAction.STEP, retry, include_full_context=True
+        )
         if getattr(self, "sr_speculation_stopped", False):
             return replies
-        again = self._sr_apply_commit_acks(retry, snap)
+        again = self._sr_apply_commit_acks(retry, snap, snap_pending)
         metrics = get_sr_round_metrics(self, "Target")
         note_commit_result(metrics, "commit_resend_ok", len(retry) - len(again))
         note_commit_result(metrics, "commit_resend_fail", len(again))
@@ -745,9 +741,9 @@ class SchedulerStandaloneRemoteTargetMixin:
                         self.process_batch_result(batch, result)
                     finally:
                         if inflight is not None:
-                            replies = self._sr_recv(inflight)
+                            replies, pending = self._sr_recv(inflight)
                             still = [r for r in live if not r.finished()]
-                            self._sr_apply_commit_acks(still, replies)
+                            self._sr_apply_commit_acks(still, replies, pending)
                             self._sr_maybe_align_chain_replies(
                                 still, replies, prefill=True
                             )

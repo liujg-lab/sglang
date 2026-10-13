@@ -53,13 +53,6 @@ class _CommEndpoint:
         self.comm_metrics.count(call.action if call else "unknown", event, n)
 
 
-stale_drop_counts = {"session": 0, "rpc_seq": 0, "step": 0, "base_len": 0}
-
-
-def note_stale_drop(reason: str) -> None:
-    stale_drop_counts[reason] = stale_drop_counts.get(reason, 0) + 1
-
-
 def _as_bytes(frame) -> bytes:
     if isinstance(frame, (bytes, bytearray)):
         return bytes(frame)
@@ -183,7 +176,7 @@ class SRTargetClient(_CommEndpoint):
         addr: str,
         port: str,
         timeout_ms: int = 5000,
-        drop_callback: Optional[Callable[[str], None]] = None,
+        drop_callback: Optional[Callable[[str, int], None]] = None,
         rebuild_on_timeout: bool = True,
     ):
         import zmq
@@ -245,12 +238,13 @@ class SRTargetClient(_CommEndpoint):
                 break
         return n
 
-    def _note_drop(self, reason: str) -> None:
-        if self.drop_callback is not None:
-            try:
-                self.drop_callback(reason)
-            except Exception:
-                pass
+    def _note_drop(self, reason: str, n: int = 1) -> None:
+        if n <= 0 or self.drop_callback is None:
+            return
+        try:
+            self.drop_callback(reason, n)
+        except Exception:
+            pass
 
     def send_batch(
         self,
@@ -261,8 +255,7 @@ class SRTargetClient(_CommEndpoint):
         drained = self._drain()
         if drained:
             self.comm_metrics.count(batch.action, "stale_reply", drained)
-            self._note_drop("rpc_seq")
-            note_stale_drop("rpc_seq")
+            self._note_drop("rpc_seq", drained)
             logger.info("[SR] Target drained %d stale frames before send", drained)
         call = _CommCall(
             (batch.session_id, batch.rpc_seq), batch.action, time.perf_counter_ns()
@@ -329,7 +322,6 @@ class SRTargetClient(_CommEndpoint):
             if reply.session_id != session_id:
                 self._count_comm("stale_reply")
                 self._note_drop("session")
-                note_stale_drop("session")
                 logger.info(
                     "[SR] drop stale reply session=%s expected=%s",
                     reply.session_id,
@@ -339,7 +331,6 @@ class SRTargetClient(_CommEndpoint):
             if reply.rpc_seq != rpc_seq:
                 self._count_comm("stale_reply")
                 self._note_drop("rpc_seq")
-                note_stale_drop("rpc_seq")
                 logger.info(
                     "[SR] drop stale reply rpc_seq=%s expected=%s",
                     reply.rpc_seq,
