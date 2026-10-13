@@ -3109,12 +3109,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         if self.tp_size == 1 or self.tp_rank == 0:
             if self.sr_server is not None:
                 packet = self.sr_server.recv_batch(timeout_ms=50)
+                if packet is not None and self.tp_size == 1:
+                    return packet
                 if packet is not None:
                     batch, mm = packet
-                    mm_pickled = {
-                        rid: p.to_pickleable() for rid, p in mm.items()
-                    }
-                    packet = (batch.to_dict(), mm_pickled)
+                    packet = (
+                        batch.to_dict(),
+                        {rid: p.to_pickleable() for rid, p in mm.items()},
+                    )
         if self.tp_size > 1:
             packet = broadcast_sr_obj(
                 packet,

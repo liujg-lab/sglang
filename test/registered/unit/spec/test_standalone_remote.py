@@ -1068,9 +1068,11 @@ class TestMMPayloadMultipart(CustomTestCase):
             im_token_id=151655,
         )
         meta, bufs = payload.to_multipart()
-        again = SRMMPayload.from_multipart(meta, [bytes(b) for b in bufs])
+        self.assertNotIn("padded_input_ids", meta)
+        self.assertTrue(all(isinstance(b, memoryview) for b in bufs))
+        again = SRMMPayload.from_multipart(meta, bufs)
         self.assertEqual(again.rid, "vl1")
-        self.assertEqual(again.padded_input_ids, [1, 1_000_042, 1_000_042, 2])
+        self.assertEqual(again.padded_input_ids, [])
         mm = again.to_multimodal_inputs()
         self.assertEqual(mm.mm_items[0].pad_value, 1_000_042)
         self.assertTrue(torch.equal(mm.mm_items[0].feature, feature))
@@ -1142,7 +1144,86 @@ class TestMMPayloadMultipart(CustomTestCase):
         self.assertEqual(restored.reqs[0].rid, "r1")
         self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
         self.assertIn("r1", mm)
-        self.assertEqual(mm["r1"].padded_input_ids, [7, 7])
+        self.assertEqual(mm["r1"].padded_input_ids, [])
+        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
+        self.assertTrue(torch.equal(got, torch.ones(2, 2)))
+
+    def test_unpack_keeps_buffer_frames_as_views(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        try:
+            from sglang.srt.managers.schedule_batch import (
+                Modality,
+                MultimodalDataItem,
+                MultimodalInputFormat,
+            )
+            from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
+                SRMMPayload,
+                serialize_mm_item,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        feature = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=3,
+            pad_value=7,
+            offsets=[0, 1],
+            format=MultimodalInputFormat.NORMAL,
+            feature=feature,
+        )
+        payload = SRMMPayload(
+            rid="r1",
+            padded_input_ids=[7, 7],
+            mm_items=[serialize_mm_item(item)],
+            im_token_id=11,
+        )
+        batch = SRBatchRequest(
+            session_id="s",
+            rpc_seq=1,
+            action=SRAction.PREFILL,
+            reqs=[
+                SRDraftRequest(
+                    rid="r1",
+                    padded_input_ids=[7, 7],
+                    has_mm=True,
+                    num_draft_tokens=2,
+                )
+            ],
+        )
+        frames = _pack_request(batch, {"r1": payload})
+        views = [
+            frame if isinstance(frame, memoryview) else memoryview(frame)
+            for frame in frames
+        ]
+
+        def _refuse_copy(*_args, **_kwargs):
+            raise AssertionError("unpack copied a frame")
+
+        with patch(
+            "sglang.srt.speculative.standalone_remote.sr_transport._as_bytes",
+            side_effect=_refuse_copy,
+        ):
+            restored, mm = _unpack_request(views)
+        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
+        self.assertEqual(mm["r1"].padded_input_ids, [])
+        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
+        self.assertTrue(torch.equal(got, feature))
+
+        try:
+            import zmq
+        except ImportError:
+            return
+        wrapped = [zmq.Frame(bytes(view)) for view in views]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.sr_transport._as_bytes",
+            side_effect=_refuse_copy,
+        ):
+            restored, mm = _unpack_request(wrapped)
+        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
+        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
+        self.assertTrue(torch.equal(got, feature))
 
     def test_walk_treats_tensor_placeholder_as_leaf(self):
         try:

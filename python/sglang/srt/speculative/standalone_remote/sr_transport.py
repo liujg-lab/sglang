@@ -71,6 +71,22 @@ def _as_bytes(frame) -> bytes:
     return bytes(frame)
 
 
+def _frame_view(frame) -> memoryview:
+    """Zero-copy view. Do not use this to materialize tensor buffers."""
+    if isinstance(frame, memoryview):
+        return frame
+    buf = getattr(frame, "buffer", None)
+    if buf is not None:
+        return memoryview(buf)
+    return memoryview(frame)
+
+
+def _is_magic(frame, magic: bytes) -> bool:
+    view = _frame_view(frame)
+    # memoryview == bytes is always false; compare the short magic only.
+    return view.nbytes == len(magic) and view.tobytes() == magic
+
+
 def _load_mm_payload():
     from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
 
@@ -117,19 +133,20 @@ def _pack_request(
 def _unpack_request(frames: List[Any]) -> Tuple[SRBatchRequest, Dict[str, Any]]:
     if not frames:
         raise ValueError("empty STANDALONE_REMOTE frames")
-    raw = [_as_bytes(f) for f in frames]
     offset = 0
-    if raw[0] != _CTRL_FRAME:
-        if len(raw) >= 2 and raw[1] == _CTRL_FRAME:
+    if not _is_magic(frames[0], _CTRL_FRAME):
+        if len(frames) >= 2 and _is_magic(frames[1], _CTRL_FRAME):
             offset = 1
         else:
-            return SRBatchRequest.from_dict(pickle.loads(raw[0])), {}
-    batch = SRBatchRequest.from_dict(pickle.loads(raw[offset + 1]))
+            return SRBatchRequest.from_dict(pickle.loads(_frame_view(frames[0]))), {}
+    batch = SRBatchRequest.from_dict(pickle.loads(_frame_view(frames[offset + 1])))
     mm_by_rid: Dict[str, Any] = {}
-    rest = raw[offset + 2 :]
-    if rest and rest[0] == _MM_FRAME:
-        metas = pickle.loads(rest[1])
-        bufs = rest[2:]
+    rest_at = offset + 2
+    if rest_at < len(frames) and _is_magic(frames[rest_at], _MM_FRAME):
+        metas = pickle.loads(_frame_view(frames[rest_at + 1]))
+        # Tensor frames stay as memoryview/ZMQ buffers. from_multipart clones
+        # them before this list is dropped, so the ZMQ frame can be released.
+        bufs = frames[rest_at + 2 :]
         for meta in metas:
             if not meta:
                 continue

@@ -312,20 +312,21 @@ class SRMMPayload:
                 "dtype": str(tensor.dtype).replace("torch.", ""),
             }
 
-        pickled = self.to_pickleable()
+        # mm_items is already the serialized dict tree from from_req. Walking it
+        # here avoids a to_pickleable round-trip. Prompt ids stay on the control
+        # request and are not repeated in this meta.
         meta = {
-            "rid": pickled["rid"],
-            "padded_input_ids": pickled["padded_input_ids"],
-            "mm_items": _walk_and_transform(pickled["mm_items"], replace_tensor),
-            "im_token_id": pickled["im_token_id"],
-            "im_start_id": pickled["im_start_id"],
-            "im_end_id": pickled["im_end_id"],
-            "video_token_id": pickled["video_token_id"],
-            "audio_token_id": pickled["audio_token_id"],
-            "audio_start_id": pickled["audio_start_id"],
-            "audio_end_id": pickled["audio_end_id"],
-            "slice_start_id": pickled["slice_start_id"],
-            "slice_end_id": pickled["slice_end_id"],
+            "rid": self.rid,
+            "mm_items": _walk_and_transform(self.mm_items, replace_tensor),
+            "im_token_id": self.im_token_id,
+            "im_start_id": self.im_start_id,
+            "im_end_id": self.im_end_id,
+            "video_token_id": self.video_token_id,
+            "audio_token_id": self.audio_token_id,
+            "audio_start_id": self.audio_start_id,
+            "audio_end_id": self.audio_end_id,
+            "slice_start_id": self.slice_start_id,
+            "slice_end_id": self.slice_end_id,
         }
         return meta, buffers
 

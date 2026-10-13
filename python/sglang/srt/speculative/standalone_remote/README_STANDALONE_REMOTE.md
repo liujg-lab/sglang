@@ -498,7 +498,7 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | reply item `status` | `ok` 正常、`empty` 空窗、`idempotent` 复用已生成窗口、`reject` 拒绝；Target 接入草稿要求 ok/idempotent 且 token 非空 |
 | reply item `draft_tokens` | 草稿 token ID；空窗允许 Target 降级 |
 | reply item `parent_list/top_scores_index` | 树拓扑与候选选择索引，Target 据此重建树；不是分数或完整 logits |
-| mm `rid/padded_input_ids/mm_items` | 请求身份、已 pad 的 prompt、图像/视频等 item 列表 |
+| mm `rid/mm_items` | 请求身份、图像/视频等 item 列表。已 pad 的 prompt 只在控制请求的 `padded_input_ids` 里，不在 MM meta 中重复 |
 | mm item | modality、format、hash、pad_value、offsets、feature、precomputed_embeddings、model_specific_data |
 | mm 特殊 token | image/video/audio/slice 等标记 ID；音频字段存在不证明完整音频路径可用 |
 
