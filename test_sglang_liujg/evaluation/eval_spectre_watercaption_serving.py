@@ -7,6 +7,18 @@
     eval_spectre_rsteller_serving.py 相同，只换 WaterCaption 默认数据与输出路径。
     请求构造复用 eval_spectre_rsteller.prepare_request（Qwen3-VL chat 模板 + image_data）。
     结束后调用 eval_rsteller_metrics.py，按 model_output / ground_truth 补 BLEU / ROUGE。
+    本入口不新增参数。时间口径在共享 serving 里计算，全部使用客户端
+    time.perf_counter：
+
+        t_send                 t_first                t_last          t_end
+        发起 HTTP ──────────── 首次 token 事件 ────── 最后新增 token ── 响应结束
+                  TTFT                   Decode Time
+
+    TTFT = t_first - t_send。Decode Time = t_last - t_first。
+    Client E2E = t_end - t_send。Server E2E 单独保存，不与 TTFT 相减。
+    吞吐分子是 N-K：K 是首个 token 事件的累计 token 数，N 是最后一次增长的累计数。
+    串行时 Decode tok/s 适合比较 AR/SR 的输出阶段；并发时它是请求级合并速度，
+    不是服务器聚合吞吐。整场墙钟吞吐看 Output tok/s (wall)。
 
 数据集（4039 条 JSON 数组）
     --data-file  .../test_WaterCaption/json/test/test_WaterCaption.json

@@ -23,20 +23,29 @@
       <|im_start|>assistant
 
 并发
-    batch-size=1  串行；stream=true，第一条 token 的墙钟为 prefill（TTFT）。
-    batch-size>=2 线程池同时发 N 条单请求 POST；服务端 continuous batching
-                  收成 GPU batch。不是一条 HTTP 里塞 text[]。
+    主请求全部 stream=true，含 batch_size>=2。warmup 仍非流式并丢弃。
+    batch-size=1  串行，一个 chunk 一条。
+    batch-size>=2 线程池同时发 N 条独立 POST，各自读 SSE；服务端 continuous
+                  batching 收成 GPU batch。不是一条 HTTP 里塞 text[]。
+                  一组全部返回后再发下一组。
+
+单条时间轴（全部使用客户端 time.perf_counter，与 WaterCaption serving 相同）
+    t_send              t_first                 t_last           t_end
+    发起 HTTP ────────── 首次 token 事件 ──────── 最后新增 token ── 响应结束
+              TTFT                  Decode Time
+    TTFT = t_first - t_send。Decode Time = t_last - t_first。
+    Client E2E = t_end - t_send。Server E2E 单独保存，不与 TTFT 相减。
+    吞吐分子是 N-K。Decode tok/s = sum(N-K) / sum(decode_s)，与墙钟定义无关。
+    Output tok/s (wall) 的分母是各 chunk 墙钟之和，不是开放到达的整段墙钟。
 
 jsonl 每条字段（在原始 sample 上追加）
-    model_output              生成文本
-    completion_tokens         生成 token 数
-    e2e_latency               服务端端到端时延（秒）；缺则用客户端墙钟
-    prefill_s                 TTFT（秒）；仅 serial stream 有值
-    decode_s                  e2e - prefill（无 TTFT 则为空）
-    decode_tok_s              该条 completion_tokens / decode_s
-    e2e_tok_s                 该条 completion_tokens / e2e_latency
-    output_ids / token_ids_complete  服务端 token IDs 及完整性校验结果
-    finish_reason / response_meta_info  结束原因及服务端原始元数据
+    model_output / output_ids / token_ids_complete / finish_reason
+    response_meta_info        服务端原始元数据
+    completion_tokens         生成 token 数；计数不可用时为空
+    ttft_s / first_text_s / first_chunk_tokens
+    decode_s / decode_tokens / decode_tok_s
+    client_e2e_s / server_e2e_s
+    token_events / itl        交付间隔估计，不表示 chunk 内部生成时间
     request_fingerprint       prompt、图片内容和采样参数的 SHA256
     request_started_at / request_finished_at  客户端 UTC 请求时间
     run_id / cache_policy / cache_flush / warmup_enabled / batch_size
@@ -46,20 +55,19 @@ jsonl 每条字段（在原始 sample 上追加）
     spec_draft_token_num      草稿 token 总数（verify × (num_draft_tokens-1)）
     draft_tokens_per_verify   每步草稿长度 = spec_draft_token_num / verify
     batch_wall_s / chunk_index / global_index
-    error                     缺图或 HTTP 失败时有；精度脚本会跳过
+    error                     缺图、HTTP 失败或流在 finish_reason 之前断开；精度脚本会跳过
 
 CSV 汇总列含义
     Test Time                     评测结束墙钟
     batch_size / mode             并发度；serial 或 concurrent
     Total Items                   实际跑的条数（含失败）
-    Total Generated Tokens        成功条 completion_tokens 之和
-    Avg Prefill (ms)              prefill_s 均值×1000；bs>1 无 TTFT 时常为空
-    End-to-end tok/s              sum(completion_tokens) / 各 chunk 墙钟之和
-    Avg Accept Length             spec_accept_length 均值（toks/verify）
-    Avg Accept Rate               spec_accept_rate 均值
-                                  = 猜中 draft / (verify × (num_draft_tokens-1))
-    Avg Draft Tokens per Verify   draft_tokens_per_verify 均值
-    Total Verify                  spec_verify_ct 之和
+    Total Generated Tokens        成功且 completion_tokens 有值的条之和
+    其余时间列与 WaterCaption serving 相同：
+    Output tok/s (wall)           sum(completion_tokens) / 各 chunk 墙钟之和
+    Mean/P99 TTFT、Mean/P99 Decode Time、Decode tok/s、Decode Samples、
+    Mean TPOT、Mean Post-first Delivery、客户端 E2E 百分位、Mean Server E2E。
+    旧表头的 CSV 会拒绝追加。
+    Avg Accept Length / Rate、Avg Draft Tokens per Verify、Total Verify
     Avg BLEU / ROUGE-1/2/L        本脚本先留空，精度脚本补上
 
 运行（仓库根目录，Target + Draft 已启动）
@@ -112,23 +120,20 @@ DEFAULT_IMG_DIR = Path(
     "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/USFM_UAV_training_data"
 )
 DEFAULT_RESULT_DIR = HERE.parent / "result"
-CSV_FIELDS = [
+CLOSED_CSV_PREFIX = [
     "Test Time",
     "batch_size",
     "mode",
     "Total Items",
     "Total Generated Tokens",
-    "Avg Prefill (ms)",
-    "End-to-end tok/s",
-    "Avg Accept Length",
-    "Avg Accept Rate",
-    "Avg Draft Tokens per Verify",
-    "Total Verify",
-    "Avg BLEU",
-    "Avg ROUGE-1",
-    "Avg ROUGE-2",
-    "Avg ROUGE-L",
 ]
+
+
+def closed_csv_fields() -> list[str]:
+    """Closed-loop traffic columns plus the shared client-clock metric columns."""
+    from eval_spectre_rsteller_serving import METRIC_CSV_FIELDS
+
+    return [*CLOSED_CSV_PREFIX, *METRIC_CSV_FIELDS]
 
 
 def strip_image_tag(question: str) -> str:
@@ -185,20 +190,40 @@ def _as_result_list(raw: Any) -> list[dict[str, Any]]:
     return [raw]
 
 
-def parse_sse_chunk(line: str) -> dict[str, Any] | None:
-    line = line.strip()
-    if not line.startswith("data:"):
-        return None
-    data = line[5:].strip()
-    if not data or data == "[DONE]":
-        return None
-    return json.loads(data)
+def _load_serving_metrics():
+    """Import after this module finishes loading. rsteller_serving imports us."""
+    from eval_spectre_rsteller_serving import (
+        StreamAccumulator,
+        _blank_stream_fields,
+        apply_stream_observation,
+        parse_sse_payload,
+    )
+
+    return (
+        StreamAccumulator,
+        apply_stream_observation,
+        parse_sse_payload,
+        _blank_stream_fields,
+    )
 
 
-def post_generate_stream(
-    url: str, payload: dict[str, Any], timeout: float
-) -> tuple[dict[str, Any], float]:
-    """Return (final generate result, TTFT seconds)."""
+def consume_sse_lines(
+    lines: list[tuple[float, str]], client_e2e_s: float
+) -> Any:
+    """Fold already-timed SSE lines with the shared client-clock accumulator."""
+    StreamAccumulator, _, parse_sse_payload, _ = _load_serving_metrics()
+    acc = StreamAccumulator()
+    for t_rel, line in lines:
+        payload = parse_sse_payload(line)
+        if payload is None:
+            continue
+        acc.add_event(t_rel, payload)
+    return acc.finish(client_e2e_s)
+
+
+def post_generate_stream(url: str, payload: dict[str, Any], timeout: float) -> Any:
+    """Stream /generate and return a client-clock StreamObservation."""
+    StreamAccumulator, _, parse_sse_payload, _ = _load_serving_metrics()
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -206,44 +231,16 @@ def post_generate_stream(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    acc = StreamAccumulator()
     t0 = time.perf_counter()
-    ttft: float | None = None
-    last: dict[str, Any] | None = None
-    output_ids: list[int] = []
-    output_text = ""
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="replace")
-            parsed = parse_sse_chunk(line)
+            parsed = parse_sse_payload(line)
             if parsed is None:
                 continue
-            if "error" in parsed:
-                raise RuntimeError(f"server error: {parsed['error']}")
-            if ttft is None:
-                ttft = time.perf_counter() - t0
-            ids = parsed.get("output_ids")
-            count = (parsed.get("meta_info") or {}).get("completion_tokens")
-            if isinstance(ids, list) and isinstance(count, int):
-                if len(ids) == count:
-                    output_ids = list(ids)
-                    output_text = parsed.get("text", "")
-                elif len(output_ids) + len(ids) == count:
-                    output_ids.extend(ids)
-                    output_text += parsed.get("text", "")
-                else:
-                    # Do not label a suffix or a gapped stream as complete.
-                    output_ids = []
-                    output_text = parsed.get("text", "")
-            else:
-                output_ids = list(ids) if isinstance(ids, list) else []
-                output_text = parsed.get("text", "")
-            last = parsed
-    if last is None:
-        raise RuntimeError("empty streaming generate response")
-    if "error" in last:
-        raise RuntimeError(f"server error: {last['error']}")
-    last = dict(last, output_ids=output_ids, text=output_text)
-    return last, float(ttft if ttft is not None else time.perf_counter() - t0)
+            acc.add_event(time.perf_counter() - t0, parsed)
+    return acc.finish(time.perf_counter() - t0)
 
 
 def post_generate(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -369,23 +366,9 @@ def _fmt(value: Any, digits: int = 3) -> str:
 
 
 def print_item(idx: int, rec: dict[str, Any]) -> None:
-    label = rec.get("image") or rec.get("id") or str(idx)
-    text = (rec.get("model_output") or "").replace("\n", " ").strip()
-    if len(text) > 80:
-        text = text[:77] + "..."
-    err = rec.get("error")
-    if err:
-        print(f"  [{idx}] {label}  ERROR {err}")
-        return
-    print(
-        f"  [{idx}] toks={_fmt(rec.get('completion_tokens'), 0):>4s}  "
-        f"prefill={_fmt(rec.get('prefill_s')):>6s}s  "
-        f"e2e={_fmt(rec.get('e2e_latency')):>6s}s  "
-        f"accept={_fmt(rec.get('spec_accept_rate')):>6s}  "
-        f"alen={_fmt(rec.get('spec_accept_length')):>6s}  "
-        f"verify={_fmt(rec.get('spec_verify_ct'), 0):>4s}  "
-        f"text={text!r}"
-    )
+    from eval_spectre_rsteller_serving import print_serving_item
+
+    print_serving_item(idx, rec)
 
 
 def append_jsonl(path: Path, rec: dict[str, Any]) -> None:
@@ -412,6 +395,8 @@ def run_one(
         rec = dict(item)
         rec["error"] = extra
         rec["model_output"] = ""
+        _, _, _, blank_stream_fields = _load_serving_metrics()
+        blank_stream_fields(rec)
         return rec
     payload = one_payload(prompt, extra, sampling, stream=stream)
     evidence = {
@@ -429,9 +414,15 @@ def run_one(
     t0 = time.perf_counter()
     try:
         if stream:
-            result, ttft = post_generate_stream(generate_url, payload, timeout)
-            client_e2e = time.perf_counter() - t0
-            rec = extract_perf(item, result, ttft_s=ttft, client_e2e_s=client_e2e)
+            obs = post_generate_stream(generate_url, payload, timeout)
+            _, apply_stream_observation, _, _ = _load_serving_metrics()
+            result = {
+                "text": obs.text,
+                "output_ids": obs.output_ids,
+                "meta_info": obs.meta_info,
+            }
+            rec = extract_perf(item, result, ttft_s=None, client_e2e_s=None)
+            rec = apply_stream_observation(rec, obs)
         else:
             result = post_generate(generate_url, payload, timeout)
             client_e2e = time.perf_counter() - t0
@@ -440,7 +431,11 @@ def run_one(
         rec = dict(item)
         rec["error"] = str(e)
         rec["model_output"] = ""
-        rec["e2e_latency"] = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
+        rec["e2e_latency"] = elapsed
+        _, _, _, blank_stream_fields = _load_serving_metrics()
+        blank_stream_fields(rec)
+        rec["client_e2e_s"] = elapsed
     rec.update(evidence)
     rec["request_finished_at"] = datetime.now(timezone.utc).isoformat()
     return rec
@@ -458,7 +453,7 @@ def run_chunk_concurrent(
 
     def work(local_i: int) -> tuple[int, dict[str, Any]]:
         idx, item = chunk[local_i]
-        rec = run_one(generate_url, item, img_dir, sampling, timeout, stream=False)
+        rec = run_one(generate_url, item, img_dir, sampling, timeout, stream=True)
         return local_i, rec
 
     t0 = time.perf_counter()
@@ -473,10 +468,19 @@ def run_chunk_concurrent(
 
 
 def write_csv_row(csv_path: Path, row: dict[str, Any]) -> None:
+    fields = closed_csv_fields()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    if file_exists:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), None)
+        if header != fields:
+            raise SystemExit(
+                f"CSV header in {csv_path} does not match the current columns. "
+                "Refusing to append. Use a new --output-csv."
+            )
     with csv_path.open("a" if file_exists else "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
@@ -606,52 +610,6 @@ def compare_records(
                 )
         comparisons.append(entry)
     return comparisons
-
-
-def summarize(records: list[dict[str, Any]], total_wall_s: float) -> dict[str, Any]:
-    ok = [r for r in records if not r.get("error")]
-    toks = [
-        r["completion_tokens"]
-        for r in ok
-        if isinstance(r.get("completion_tokens"), (int, float))
-    ]
-    prefills = [
-        r["prefill_s"] for r in ok if isinstance(r.get("prefill_s"), (int, float))
-    ]
-    alens = [
-        r["spec_accept_length"]
-        for r in ok
-        if isinstance(r.get("spec_accept_length"), (int, float))
-    ]
-    rates = [
-        r["spec_accept_rate"]
-        for r in ok
-        if isinstance(r.get("spec_accept_rate"), (int, float))
-    ]
-    drafts = [
-        r["draft_tokens_per_verify"]
-        for r in ok
-        if isinstance(r.get("draft_tokens_per_verify"), (int, float))
-    ]
-    verifies = [
-        r["spec_verify_ct"]
-        for r in ok
-        if isinstance(r.get("spec_verify_ct"), (int, float))
-    ]
-    total_toks = sum(toks)
-    avg_prefill_ms = (mean(prefills) * 1000.0) if prefills else None
-    e2e_tok_s = (total_toks / total_wall_s) if total_wall_s > 0 and total_toks else None
-    return {
-        "n_ok": len(ok),
-        "n_total": len(records),
-        "total_tokens": total_toks,
-        "avg_prefill_ms": avg_prefill_ms,
-        "e2e_tok_s": e2e_tok_s,
-        "avg_alen": mean(alens),
-        "avg_accept": mean(rates),
-        "avg_draft_per_verify": mean(drafts),
-        "total_verify": sum(verifies) if verifies else 0.0,
-    }
 
 
 def call_metrics_script(jsonl: Path, csv_path: Path) -> None:
@@ -841,48 +799,26 @@ def main() -> int:
             f"  chunk wall={wall:.3f}s  toks={toks}  tok/s={toks / wall if wall else 0:.2f}"
         )
 
-    stats = summarize(records, total_wall)
-    test_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    from eval_spectre_rsteller_serving import (
+        format_serving_summary,
+        metric_csv_values,
+        summarize_serving,
+    )
+
+    stats = summarize_serving(records, total_wall)
     row = {
-        "Test Time": test_time,
+        "Test Time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "batch_size": args.batch_size,
         "mode": mode,
-        "Total Items": stats["n_total"],
-        "Total Generated Tokens": f"{stats['total_tokens']:.0f}",
-        "Avg Prefill (ms)": (
-            f"{stats['avg_prefill_ms']:.2f}"
-            if stats["avg_prefill_ms"] is not None
-            else ""
-        ),
-        "End-to-end tok/s": (
-            f"{stats['e2e_tok_s']:.2f}" if stats["e2e_tok_s"] is not None else ""
-        ),
-        "Avg Accept Length": (
-            f"{stats['avg_alen']:.4f}" if stats["avg_alen"] is not None else ""
-        ),
-        "Avg Accept Rate": (
-            f"{stats['avg_accept']:.4f}" if stats["avg_accept"] is not None else ""
-        ),
-        "Avg Draft Tokens per Verify": (
-            f"{stats['avg_draft_per_verify']:.4f}"
-            if stats["avg_draft_per_verify"] is not None
-            else ""
-        ),
-        "Total Verify": f"{stats['total_verify']:.0f}",
-        "Avg BLEU": "",
-        "Avg ROUGE-1": "",
-        "Avg ROUGE-2": "",
-        "Avg ROUGE-L": "",
     }
+    row.update(metric_csv_values(stats))
     write_csv_row(args.output_csv, row)
     print(
-        f"summary items={stats['n_ok']}/{stats['n_total']}  "
-        f"toks={stats['total_tokens']:.0f}  wall={total_wall:.3f}s  "
-        f"e2e_tok/s={_fmt(stats['e2e_tok_s'])}  "
-        f"prefill_ms={_fmt(stats['avg_prefill_ms'], 2)}  "
-        f"accept={_fmt(stats['avg_accept'])}  "
-        f"alen={_fmt(stats['avg_alen'])}  "
-        f"draft/verify={_fmt(stats['avg_draft_per_verify'])}"
+        format_serving_summary(stats, total_wall).replace(
+            "summary ",
+            f"summary mode={mode} batch_size={args.batch_size}  ",
+            1,
+        )
     )
     print(f"wrote {args.output_jsonl}")
     print(f"wrote {args.output_csv}")
