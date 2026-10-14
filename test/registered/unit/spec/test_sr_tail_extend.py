@@ -1217,7 +1217,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         select = helpers["select_tail_graph_bucket"]
         self.assertIn((1, 4, None), buckets)
         self.assertEqual(select(1, 2, 8, buckets), (1, 2, None))
-        self.assertEqual(select(1, 3, 8, buckets), (2, 4, None))
+        self.assertEqual(select(1, 3, 8, buckets), (1, 3, None))
         self.assertNotEqual(select(1, 3, 8, buckets), (1, 4, None))
         self.assertIsNone(select(1, 3, 8, [(1, 4, None)]))
         self.assertIsNone(select(1, 2, 64, [(1, 2, 32)]))
@@ -1226,7 +1226,7 @@ class TestTailGraphBuckets(unittest.TestCase):
         helpers = self._helpers()
         buckets = helpers["packed_tail_graph_buckets"]([1, 2], 5, (None,))
         select = helpers["select_tail_graph_bucket"]
-        self.assertEqual(select(1, 3, 8, buckets), (2, 4, None))
+        self.assertEqual(select(1, 3, 8, buckets), (1, 3, None))
         self.assertEqual(select(1, 6, 8, buckets), (1, 6, None))
         self.assertEqual(select(2, 6, 8, buckets), (2, 6, None))
         self.assertEqual(select(2, 8, 8, buckets), (2, 8, None))
@@ -1235,6 +1235,27 @@ class TestTailGraphBuckets(unittest.TestCase):
         self.assertIn((2, 8, None), buckets)
         self.assertIn((3, 8, None), buckets)
         self.assertIn((3, 4, None), buckets)
+
+    def test_bs1_lengths_hit_exact_buckets(self):
+        helpers = self._helpers()
+        buckets = helpers["packed_tail_graph_buckets"]([1, 2, 4], 6, (None,))
+        select = helpers["select_tail_graph_bucket"]
+        plan_fn = helpers["build_tail_graph_plan"]
+        bs1 = sorted(token for bs, token, cap in buckets if bs == 1 and cap is None)
+        self.assertEqual(bs1, list(range(1, 8)))
+        graphs = {bucket: object() for bucket in buckets}
+        for n in (3, 5, 6):
+            self.assertEqual(select(1, n, 8, buckets), (1, n, None))
+            plan, reason = plan_fn(
+                NS(extend_lens=[n], prefix_lens=[1], extend_num_tokens=n),
+                graphs,
+                buckets,
+                captured_pages=8,
+                page_size=1,
+            )
+            self.assertEqual(reason, "ok")
+            self.assertEqual(plan.bucket, (1, n, None))
+            self.assertEqual(plan.dummy_tokens, 0)
 
     def test_plan_miss_reasons_pages_and_no_bucket(self):
         helpers = self._helpers()
@@ -2785,6 +2806,83 @@ class TestTreeIngestLifecycle(unittest.TestCase):
         self.evict.start()
         self.addCleanup(self.evict.stop)
 
+    def test_lease_store_follows_lease_supported(self):
+        drafter_py = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        lease_supported = load_functions(
+            drafter_py,
+            ["_lease_supported"],
+            {},
+            class_name="SRTreeDrafter",
+        )["_lease_supported"]
+
+        class Server:
+            pass
+
+        class Drafter:
+            def __init__(self, scheduler):
+                self.page_size = int(scheduler.server_args.page_size or 1)
+                self.topk = max(
+                    1, int(scheduler.server_args.speculative_eagle_topk or 1)
+                )
+
+            _lease_supported = lease_supported
+
+        stores = []
+
+        def make_store():
+            store = object()
+            stores.append(store)
+            return store
+
+        init = load_functions(
+            SCHEDULER,
+            ["_init_sr_draft"],
+            dict(
+                logger=logging.getLogger("test_lease_store"),
+                SRDraftStateManager=lambda **kwargs: NS(),
+                SRKVRollbacker=lambda **kwargs: NS(),
+                make_transport_from_server_args=lambda args: Server(),
+                SRDraftServer=Server,
+                SRTreeLeaseStore=make_store,
+                SRTreeDrafter=Drafter,
+            ),
+            class_name="StandaloneRemoteDraftSchedulerMixin",
+        )["_init_sr_draft"]
+
+        def host(page_size, topk):
+            obj = NS(
+                server_args=NS(
+                    standalone_remote_draft_ttl_s=1.0,
+                    page_size=page_size,
+                    speculative_eagle_topk=topk,
+                ),
+                token_to_kv_pool_allocator=object(),
+                req_to_token_pool=object(),
+                tree_cache=object(),
+                tp_rank=0,
+                tp_size=1,
+            )
+            MethodType(init, obj)()
+            return obj
+
+        cuda = host(1, 4)
+        self.assertIsNotNone(cuda.sr_tree_drafter)
+        self.assertIsNone(cuda.sr_tree_leases)
+        self.assertEqual(stores, [])
+
+        npu = host(128, 4)
+        self.assertIsNotNone(npu.sr_tree_drafter)
+        self.assertIs(npu.sr_tree_leases, stores[-1])
+        self.assertEqual(len(stores), 1)
+
+        ar = host(128, 1)
+        self.assertIsNone(ar.sr_tree_drafter)
+        self.assertIsNone(ar.sr_tree_leases)
+        self.assertEqual(len(stores), 1)
+
     def _lease(self, rid, version=1):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             SRTreeKVLease,
@@ -3392,7 +3490,7 @@ class TestBatchedKvCopy(unittest.TestCase):
         self.evict.start()
         self.addCleanup(self.evict.stop)
 
-    def _drafter(self, pool, copies, node_ids=None):
+    def _drafter(self, pool, copies, node_ids=None, lease_supported=True):
         from sglang.srt.speculative.standalone_remote import sr_kv_copy as kv_copy
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             IdentityRemapWorkspace,
@@ -3428,6 +3526,7 @@ class TestBatchedKvCopy(unittest.TestCase):
             _identity_eager=IdentityRemapWorkspace(
                 "cpu", 4, 8, graph=False, domain="tree_eager"
             ),
+            _lease_supported=lambda: lease_supported,
         )
         obj._remap_tree_kv_to_parents = MethodType(
             fns["_remap_tree_kv_to_parents"], obj
@@ -3548,6 +3647,38 @@ class TestBatchedKvCopy(unittest.TestCase):
         parent2 = torch.tensor([0, 1], dtype=torch.int64)
         drafter._remap_tree_kv_to_parents(loc_nc, parent2, 2)
         self.assertEqual(copies[0][0].tolist(), [5, 6, 7, 8])
+
+    def test_remap_skips_identity_without_lease(self):
+        k = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+        pool = NS(kv_buffer=None, k_buffer=k.clone(), v_buffer=k.clone() + 1)
+        copies = []
+        drafter = self._drafter(pool, copies, lease_supported=False)
+        before = drafter._slot_node_ids.clone()
+        loc = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+        parent = torch.tensor([1, 0], dtype=torch.int64)
+        drafter._remap_tree_kv_to_parents(loc, parent, 2)
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][0].tolist(), [6, 5, 8, 7])
+        torch.testing.assert_close(pool.k_buffer, self._staged_gold(k, loc, parent, 2))
+        torch.testing.assert_close(drafter._slot_node_ids, before)
+
+    def test_prepare_identity_remap_graph_skips_without_lease(self):
+        fns = load_functions(
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py",
+            ["_lease_supported", "prepare_identity_remap_graph"],
+            dict(torch=torch),
+            class_name="SRTreeDrafter",
+        )
+        obj = NS(page_size=1, topk=4, speculative_num_steps=6)
+        obj._lease_supported = MethodType(fns["_lease_supported"], obj)
+        obj.prepare_identity_remap_graph = MethodType(
+            fns["prepare_identity_remap_graph"], obj
+        )
+        self.assertIsNone(obj.prepare_identity_remap_graph(8))
+        obj.page_size = 128
+        obj.speculative_num_steps = 2
+        self.assertIsNone(obj.prepare_identity_remap_graph(8))
 
     def test_identity_table_stays_put_after_graph_bind(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (

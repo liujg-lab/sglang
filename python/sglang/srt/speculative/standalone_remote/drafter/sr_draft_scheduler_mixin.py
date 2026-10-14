@@ -164,11 +164,16 @@ class StandaloneRemoteDraftSchedulerMixin:
             self.sr_server = server
         self.draft_paused_reqs: List[Req] = []
         self.sr_tree_drafter: Optional[SRTreeDrafter] = None
-        self.sr_tree_leases = SRTreeLeaseStore()
         self._sr_device_poisoned = False
         topk = int(self.server_args.speculative_eagle_topk or 1)
         if topk > 1:
             self.sr_tree_drafter = SRTreeDrafter(self)
+        self.sr_tree_leases = (
+            SRTreeLeaseStore()
+            if self.sr_tree_drafter is not None
+            and self.sr_tree_drafter._lease_supported()
+            else None
+        )
         logger.info(
             "[SR] Draft scheduler ready (tree_configured=%s topk=%s "
             "tree_graph_captured=%s tree_graph_disabled_reason=%s)",

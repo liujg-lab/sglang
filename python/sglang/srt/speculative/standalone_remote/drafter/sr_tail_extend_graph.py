@@ -199,7 +199,7 @@ def tail_token_caps_for_bs(
         packed = max(int(max_bs), 1) * max_per_req
         return tuple(sorted(c for c in {4, 6, 8, packed} if c > 0))
     if bs <= 1:
-        return tuple(sorted(c for c in {1, 2, 4, max_per_req} if c > 0))
+        return tuple(range(1, max_per_req + 1))
     return tuple(range(bs, bs * max_per_req + 1))
 
 

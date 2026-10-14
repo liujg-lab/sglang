@@ -2182,8 +2182,10 @@ class SRTreeDrafter:
                         getattr(self, "scheduler", None), "_sr_round_metrics", None
                     ),
                 )
-        self._ensure_identity_capacity(rows)
-        self._slot_node_ids.fill_(-1)
+        maintain_identity = self._lease_supported()
+        if maintain_identity:
+            self._ensure_identity_capacity(rows)
+            self._slot_node_ids.fill_(-1)
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
@@ -2203,12 +2205,13 @@ class SRTreeDrafter:
                 break
             if i > 0 and self.topk > 1 and parent_rows is not None:
                 self._remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)
-            if i == 0:
-                self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
-            else:
-                self._slot_node_ids[i, :rows].copy_(
-                    later_forward_node_ids(node_ids)[:rows]
-                )
+            if maintain_identity:
+                if i == 0:
+                    self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
+                else:
+                    self._slot_node_ids[i, :rows].copy_(
+                        later_forward_node_ids(node_ids)[:rows]
+                    )
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = kv_slots[i]
             advance_tree_draft_positions_for_step(
@@ -2261,6 +2264,8 @@ class SRTreeDrafter:
         )
 
     def prepare_identity_remap_graph(self, batch_cap):
+        if not self._lease_supported():
+            return None
         if self.topk <= 1 or self.speculative_num_steps <= 2:
             return None
         rows = int(batch_cap) * int(self.topk)
@@ -2293,15 +2298,16 @@ class SRTreeDrafter:
         rows = int(out_cache_loc.shape[1])
         if int(parent_rows.numel()) != rows:
             raise RuntimeError("parent_rows width must match out_cache_loc rows")
-        check = getattr(self, "_check_identity_table", None)
-        if callable(check):
-            check()
-        workspace = getattr(self, "_active_identity_workspace", None)
-        if workspace is None:
-            workspace = getattr(self, "_identity_eager", None)
-        if workspace is None:
-            raise RuntimeError("identity remap workspace is not prepared")
-        workspace.remap(self._slot_node_ids, parent_rows, n_prev_steps)
+        if self._lease_supported():
+            check = getattr(self, "_check_identity_table", None)
+            if callable(check):
+                check()
+            workspace = getattr(self, "_active_identity_workspace", None)
+            if workspace is None:
+                workspace = getattr(self, "_identity_eager", None)
+            if workspace is None:
+                raise RuntimeError("identity remap workspace is not prepared")
+            workspace.remap(self._slot_node_ids, parent_rows, n_prev_steps)
         kv_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
         if kv_pool is None:
             return
