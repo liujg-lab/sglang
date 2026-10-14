@@ -1888,6 +1888,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         src = inspect.getsource(worker_cls._forward_normal_decode)
         self.assertIn("_forward_target_eager", src)
         self.assertIn("can_run_cuda_graph=False", src)
+        self.assertIn("sr_accepted_tree_candidate_indices = None", src)
+        self.assertIn("sr_draft_tree_version = None", src)
+        self.assertIn("sr_draft_tree_base_committed_len = None", src)
         eager_src = inspect.getsource(worker_cls._forward_target_eager)
         self.assertIn("graph_runner = None", eager_src)
 
@@ -3155,6 +3158,52 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(dreq.num_draft_tokens, 8)
         dreq_f, _ = mixin._build_sr_request(req, SRAction.FINISH, include_full_context=False)
         self.assertEqual(dreq_f.num_draft_tokens, 0)
+
+    def test_delta_consumes_tree_path_once(self):
+        mixin_cls = self._import_mixin()
+        mixin = mixin_cls()
+        mixin.server_args = SimpleNamespace(
+            speculative_num_steps=4,
+            speculative_num_draft_tokens=8,
+        )
+        req = SimpleNamespace(
+            rid="r1",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[10, 11, 12],
+            sr_step_id=2,
+            sampling_params=None,
+            multimodal_inputs=None,
+            sr_next_commit_version=4,
+            sr_ack_commit_version=3,
+            sr_ack_output_len=1,
+            sr_force_snapshot=False,
+            sr_draft_tree_version=9,
+            sr_draft_tree_base_committed_len=4,
+            sr_accepted_tree_candidate_indices=[0, 1],
+        )
+        first, _mm = mixin._build_sr_request(
+            req, SRAction.STEP, include_full_context=False
+        )
+        self.assertEqual(first.commit_mode, "delta")
+        self.assertEqual(first.commit_tree_version, 9)
+        self.assertEqual(first.commit_tree_base_committed_len, 4)
+        self.assertEqual(first.commit_candidate_indices, [0, 1])
+        self.assertIsNone(req.sr_accepted_tree_candidate_indices)
+
+        second, _mm = mixin._build_sr_request(
+            req, SRAction.STEP, include_full_context=False
+        )
+        self.assertEqual(second.commit_mode, "delta")
+        self.assertIsNone(second.commit_candidate_indices)
+        self.assertIsNone(second.commit_tree_version)
+
+        req.sr_accepted_tree_candidate_indices = [0, 1]
+        snap, _mm = mixin._build_sr_request(
+            req, SRAction.STEP, include_full_context=True
+        )
+        self.assertEqual(snap.commit_mode, "snapshot")
+        self.assertIsNone(snap.commit_candidate_indices)
+        self.assertIsNone(req.sr_accepted_tree_candidate_indices)
 
     def test_ingest_committed_runs_one_chain_decode_per_missing_token(self):
         try:

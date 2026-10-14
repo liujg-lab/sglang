@@ -305,6 +305,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                 has_mm = True
                 mm_payload = SRMMPayload.from_req(req)
             note_commit_send(metrics, "snapshot", len(committed))
+            req.sr_accepted_tree_candidate_indices = None
             return (
                 SRDraftRequest(
                     rid=req.rid,
@@ -324,6 +325,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         acked = int(req.sr_ack_output_len or 0)
         delta_ids = list((req.output_ids or [])[acked:sent_len])
         tree_version, tree_base, path = self._sr_candidate_path(req, delta_ids)
+        req.sr_accepted_tree_candidate_indices = None
         note_commit_send(metrics, "delta", len(delta_ids))
         return (
             SRDraftRequest(

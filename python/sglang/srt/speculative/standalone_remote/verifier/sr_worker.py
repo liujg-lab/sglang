@@ -789,6 +789,9 @@ class StandaloneRemoteWorker:
                 req.check_finished()
             req.cur_drafts = []
             req.draft_tokens_and_logits = _default_draft()
+            req.sr_accepted_tree_candidate_indices = None
+            req.sr_draft_tree_version = None
+            req.sr_draft_tree_base_committed_len = None
             req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
             req.sr_step_id = int(getattr(req, "sr_step_id", 0) or 0) + 1
             req.len_output_ids = len(req.output_ids)
