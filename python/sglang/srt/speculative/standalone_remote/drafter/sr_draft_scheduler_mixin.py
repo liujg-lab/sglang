@@ -99,6 +99,7 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftReply,
     SRDraftRequest,
     SRReplyStatus,
+    local_spec_shape,
 )
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     get_sr_round_metrics,
@@ -2729,6 +2730,44 @@ class StandaloneRemoteDraftSchedulerMixin:
         self._sr_remember_commit(state, dreq, reply, fingerprint)
         return reply
 
+    def _sr_spec_shape_rejected(self, batch: SRBatchRequest) -> bool:
+        """True when a new Target's tree shape does not match this Draft.
+
+        A missing ``spec_shape`` is an old Target and is left alone. FINISH and
+        ABORT still run so a mismatch cannot skip KV release.
+        """
+        if batch.action not in (SRAction.PREFILL, SRAction.STEP):
+            return False
+        if batch.spec_shape is None:
+            return False
+        local = local_spec_shape(getattr(self, "server_args", None))
+        return tuple(batch.spec_shape) != local
+
+    def _sr_spec_shape_mismatch_reply(self, batch: SRBatchRequest) -> SRBatchReply:
+        local = local_spec_shape(getattr(self, "server_args", None))
+        logger.warning(
+            "[SR] spec_shape_mismatch local=%s request=%s",
+            local,
+            tuple(batch.spec_shape) if batch.spec_shape is not None else None,
+        )
+        return SRBatchReply(
+            session_id=batch.session_id,
+            rpc_seq=batch.rpc_seq,
+            protocol_version=SR_PROTOCOL_VERSION,
+            reqs=[
+                SRDraftReply(
+                    rid=dreq.rid,
+                    step_id=dreq.step_id,
+                    base_committed_len=dreq.base_committed_len,
+                    draft_tokens=[],
+                    status=SRReplyStatus.REJECT,
+                    reason="spec_shape_mismatch",
+                    spec_shape=local,
+                )
+                for dreq in batch.reqs
+            ],
+        )
+
     def _sr_protocol_mismatch_reply(self, batch: SRBatchRequest) -> SRBatchReply:
         return SRBatchReply(
             session_id=batch.session_id,
@@ -2908,6 +2947,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                     with metrics.round() if measure else nullcontext():
                         if not supported_protocol(batch.protocol_version):
                             reply = self._sr_protocol_mismatch_reply(batch)
+                            self._sr_note_handled(batch)
+                        elif self._sr_spec_shape_rejected(batch):
+                            reply = self._sr_spec_shape_mismatch_reply(batch)
                             self._sr_note_handled(batch)
                         else:
                             reply = self._sr_handle_batch(batch, mm)

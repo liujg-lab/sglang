@@ -24,6 +24,37 @@ def parse_protocol_version(value: Any) -> Optional[int]:
     return None
 
 
+def local_spec_shape(server_args) -> Tuple[int, int, int]:
+    """``(topk, num_steps, num_draft_tokens)`` from one process's server args.
+
+    Matches the widths the draft tree, verify kernel, and packet stride use.
+    A missing draft width becomes ``steps + 1``.
+    """
+    topk = max(1, int(getattr(server_args, "speculative_eagle_topk", 1) or 1))
+    steps = max(1, int(getattr(server_args, "speculative_num_steps", 1) or 1))
+    width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    if width <= 0:
+        width = steps + 1
+    return (topk, steps, width)
+
+
+def parse_spec_shape(value: Any) -> Optional[Tuple[int, ...]]:
+    """Parse a wire spec shape.
+
+    ``None`` means the peer omitted the field. A present value that is not
+    three real ints becomes an empty tuple so it cannot match a local shape.
+    """
+    if value is None:
+        return None
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(type(item) is int for item in value)
+    ):
+        return (value[0], value[1], value[2])
+    return ()
+
+
 class SRAction(Enum):
     PREFILL = "prefill"
     STEP = "step"
@@ -158,6 +189,8 @@ class SRDraftReply:
     ack_commit_version: Optional[int] = None
     ack_output_len: Optional[int] = None
     reason: Optional[str] = None
+    # Draft local (topk, num_steps, num_draft_tokens), set on spec_shape_mismatch.
+    spec_shape: Optional[Tuple[int, ...]] = None
 
     def matches(self, pending: SRPendingEntry) -> Tuple[bool, Optional[str]]:
         if self.step_id != pending.step_id:
@@ -187,6 +220,8 @@ class SRDraftReply:
                 continue
             if k == "status" and not isinstance(val, SRReplyStatus):
                 kwargs[k] = SRReplyStatus(val)
+            elif k == "spec_shape":
+                kwargs[k] = parse_spec_shape(val)
             else:
                 kwargs[k] = val
         return cls(**kwargs)
@@ -201,15 +236,20 @@ class SRBatchRequest:
     # Local batches default to v2. from_dict passes an explicit value so a
     # missing or non-int wire field stays unsupported instead of becoming 2.
     protocol_version: Optional[int] = SR_PROTOCOL_VERSION
+    # (topk, num_steps, num_draft_tokens). Omitted on the wire by old Targets.
+    spec_shape: Optional[Tuple[int, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "session_id": self.session_id,
             "rpc_seq": self.rpc_seq,
             "action": self.action.value,
             "reqs": [r.to_dict() for r in self.reqs],
             "protocol_version": self.protocol_version,
         }
+        if self.spec_shape is not None:
+            result["spec_shape"] = [int(x) for x in self.spec_shape]
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SRBatchRequest":
@@ -226,6 +266,9 @@ class SRBatchRequest:
             action=action,
             reqs=reqs,
             protocol_version=parse_protocol_version(d.get("protocol_version", None)),
+            spec_shape=(
+                parse_spec_shape(d["spec_shape"]) if "spec_shape" in d else None
+            ),
         )
 
 

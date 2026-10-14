@@ -30,25 +30,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="stage-a-test-cpu")
 
 
-def reference_tree(parents, selected, seq_lens, topk, steps, width):
-    """Pad a short normalized parent row so the CPU reference accepts it.
-
-    Missing columns are the same ``-1`` fill the packet uses. In-range parent
-    lookups do not read the padding, so the tree matches the unpadded packet.
-    """
-    expected = topk * (steps - 1) + 1
-    if int(parents.shape[1]) < expected:
-        pad = torch.full(
-            (int(parents.shape[0]), expected - int(parents.shape[1])),
-            -1,
-            dtype=parents.dtype,
-        )
-        parents = torch.cat((parents, pad), dim=1)
-    return build_tree_kernel_efficient_ref(
-        parents, selected, seq_lens, topk, steps, width
-    )
-
-
 def packet_input(bs=2, packet=None, reqs=None, vocab=32):
     packet = packet or VerifyInputPacket()
     pp = [[-1, 0, 1, 2, 3] for _ in range(bs)]
@@ -135,7 +116,7 @@ class SRRPDTest(unittest.TestCase):
         )
         for name, parents, selected in cases:
             packet = VerifyInputPacket()
-            _, pp, ss, _tokens = packet.load(
+            _, pp, ss, tokens = packet.load(
                 [2],
                 [[3]],
                 [parents],
@@ -148,12 +129,26 @@ class SRRPDTest(unittest.TestCase):
             )
             context = packet.rpd_input
             self.assertIsNotNone(context)
-            ref = reference_tree(pp, ss, torch.tensor([0]), 2, 3, 6)
-            for actual, expected in zip(context.tree[1:], ref[2:]):
-                torch.testing.assert_close(actual, expected)
-            self.assertEqual(context.tree[0, 0].tolist(), [2, 3, 0, 0, 0, 0])
+            self.assertEqual(packet.no_draft_rows, (True,))
+            self.assertEqual(pp.tolist(), [[-1, -1, -1, -1, -1]])
+            self.assertEqual(ss.tolist(), [[0, 0, 0, 0, 0]])
+            self.assertEqual(context.tree[2, 0].tolist(), [-1, -1, -1, -1, -1, -1])
+            if name == "missing":
+                self.assertEqual(tokens.tolist(), [[3, 0, 0, 0, 0]])
+                self.assertEqual(context.tree[0, 0].tolist(), [2, 3, 0, 0, 0, 0])
+            else:
+                self.assertEqual(tokens.tolist(), [[0, 0, 0, 0, 0]])
+                self.assertEqual(context.tree[0, 0].tolist(), [2, 0, 0, 0, 0, 0])
+            logits = torch.zeros(6, 32)
+            logits[:, 3] = 10
+            workspace = SRRPDWorkspace()
+            workspace.prepare(logits, context)
+            plan = verify_sr_rpd_host(logits, context, workspace, 0.0, 4)
+            self.assertEqual(plan.pre_lengths, [0])
             trees[name] = context.tree[2, 0].tolist()
-        self.assertNotEqual(trees["missing"], trees["empty"])
+        self.assertEqual(trees["missing"], trees["empty"])
+        self.assertEqual(trees["empty"], trees["short"])
+        self.assertEqual(trees["short"], trees["padded"])
 
     def test_cycle_declines_and_missing_parent_is_disconnected(self):
         owner = SimpleNamespace(generation=1, unresolved=False)
@@ -450,7 +445,7 @@ class SRRPDTest(unittest.TestCase):
                 for delta in (-1e-3, 0.0, 1e-3):
                     packet = VerifyInputPacket()
                     packet.load(
-                        [0], [[1, 1]], [[-1]], [[0, 1]], 2, 1, 3, "cpu", rpd_vocab=4
+                        [0], [[1, 1]], [[]], [[0, 1]], 2, 1, 3, "cpu", rpd_vocab=4
                     )
                     context = packet.rpd_input
                     logits = torch.zeros(3, 4, dtype=dtype)

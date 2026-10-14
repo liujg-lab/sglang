@@ -31,6 +31,8 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
 )
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     VerifyInputPacket,
+    clear_no_draft_retrieve_links,
+    unlink_disconnected_retrieve_nodes,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
     conservative_mode_reason,
@@ -376,6 +378,16 @@ class StandaloneRemoteWorker:
             num_verify_tokens=num_draft_tokens,
             tree_mask_buf=tree_mask_buf,
             position_buf=position_buf,
+        )
+        clear_no_draft_retrieve_links(
+            retrive_next_token,
+            retrive_next_sibling,
+            self._verify_packet.no_draft_rows,
+        )
+        unlink_disconnected_retrieve_nodes(
+            retrive_next_token,
+            retrive_next_sibling,
+            self._verify_packet.disconnected_slots,
         )
 
         spec_info = EagleVerifyInput(

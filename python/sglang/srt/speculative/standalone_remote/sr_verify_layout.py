@@ -136,6 +136,165 @@ def cached_chain_template(
     return cached
 
 
+def kernel_parent_width(topk: int, steps: int) -> int:
+    """Column stride of ``build_tree_efficient``: ``topk * (depth - 1) + 1``."""
+    if int(steps) <= 1:
+        return 1
+    return int(topk) * (int(steps) - 1) + 1
+
+
+def organized_parent_len(topk: int, steps: int) -> int:
+    """Parent-row length produced by ``organize_draft_results``.
+
+    ``steps == 1`` drops the only parent tensor and yields an empty row. Longer
+    trees keep every parent tensor except the last, which is ``topk * (steps - 1) + 1``.
+    """
+    if int(steps) <= 1:
+        return 0
+    return int(topk) * (int(steps) - 1) + 1
+
+
+def draft_index_limit(topk: int, steps: int) -> int:
+    """Candidate-pool size indexed by ``top_scores_index``."""
+    topk = int(topk)
+    steps = max(int(steps), 1)
+    return topk + (steps - 1) * topk * topk
+
+
+def _as_int_list(values) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if torch.is_tensor(values):
+        flat = values.detach().reshape(-1)
+        try:
+            return [int(x) for x in flat.tolist()]
+        except (TypeError, ValueError):
+            return None
+    try:
+        return [int(x) for x in values]
+    except (TypeError, ValueError):
+        return None
+
+
+def tree_row_valid(tokens, parents, indices, topk: int, steps: int, num_draft_tokens: int) -> bool:
+    """Whether one supplied tree row matches the verify kernel's fixed stride.
+
+    Callers skip rows whose parent or index is ``None``. An empty list is
+    present topology and is checked here. A selected child whose parent
+    candidate was not selected is a normal EAGLE row: the kernel skips that
+    token, so the row stays valid. A parent token of ``-1`` at ``parent_tb > 0``
+    does not stop the mask thread and is invalid.
+    """
+    token_row = _as_int_list(tokens)
+    parent_row = _as_int_list(parents)
+    index_row = _as_int_list(indices)
+    if token_row is None or parent_row is None or index_row is None:
+        return False
+    topk = int(topk)
+    steps = int(steps)
+    width = int(num_draft_tokens)
+    if topk < 1 or steps < 1 or width < 1:
+        return False
+    if len(token_row) != width - 1 or len(index_row) != width - 1:
+        return False
+    if len(parent_row) != organized_parent_len(topk, steps):
+        return False
+    limit = draft_index_limit(topk, steps)
+    for idx in index_row:
+        if idx < 0 or idx >= limit:
+            return False
+        parent_tb = idx // topk
+        if parent_tb <= 0:
+            continue
+        if parent_tb >= len(parent_row):
+            return False
+        if parent_row[parent_tb] == -1:
+            return False
+    # Same parent walk as the mask thread. A missing parent is disconnected
+    # and stops at the root. A cycle never reaches the root.
+    pos_of: Dict[int, int] = {}
+    for node_i, node in enumerate(index_row):
+        if node not in pos_of:
+            pos_of[node] = node_i
+    parent_of = [0] * width
+    for i, idx in enumerate(index_row):
+        parent_tb = idx // topk
+        if parent_tb <= 0:
+            continue
+        parent_token = parent_row[parent_tb]
+        if parent_token == -1:
+            return False
+        found = pos_of.get(parent_token)
+        if found is None:
+            continue
+        parent_of[i + 1] = found + 1
+    for start in range(width):
+        seen = set()
+        node = start
+        while node > 0:
+            if node in seen:
+                return False
+            seen.add(node)
+            node = parent_of[node]
+    return True
+
+
+def repair_ungrounded_parents(
+    parents, indices, topk: int
+) -> Tuple[List[int], List[int], List[int]]:
+    """Point missing parents at a grounded node so the mask thread can stop.
+
+    A node is grounded when ``parent_tb == 0``, or its parent token is a
+    grounded selected id. Other nodes stay in the row, but their parent column
+    is rewritten to the first grounded root-child id. The mask thread finds
+    that id and stops on the next ``parent_tb == 0``. When nothing is grounded,
+    every index becomes 0 and the mask thread does not read ``parent_list``.
+
+    Returns copied ``(parents, indices, ungrounded draft slots)``. The caller's
+    sequences are not modified. The ungrounded slots must not be accepted.
+    """
+    parent_row = _as_int_list(parents) or []
+    index_row = _as_int_list(indices) or []
+    topk = int(topk)
+    grounded = [idx // topk <= 0 for idx in index_row]
+    pos_of: Dict[int, int] = {}
+    for slot, node in enumerate(index_row):
+        if node not in pos_of:
+            pos_of[node] = slot
+    changed = True
+    while changed:
+        changed = False
+        for slot, idx in enumerate(index_row):
+            if grounded[slot]:
+                continue
+            parent_tb = idx // topk
+            if parent_tb <= 0 or parent_tb >= len(parent_row):
+                continue
+            found = pos_of.get(parent_row[parent_tb])
+            if found is not None and grounded[found]:
+                grounded[slot] = True
+                changed = True
+    ungrounded = [slot for slot, flag in enumerate(grounded) if not flag]
+    if not ungrounded:
+        return parent_row, index_row, []
+    if not any(grounded):
+        return parent_row, [0] * len(index_row), ungrounded
+    anchor = next(
+        index_row[slot]
+        for slot, flag in enumerate(grounded)
+        if flag and index_row[slot] // topk <= 0
+    )
+    grounded_ids = {index_row[slot] for slot, flag in enumerate(grounded) if flag}
+    rewritten = list(parent_row)
+    for slot in ungrounded:
+        parent_tb = index_row[slot] // topk
+        if parent_tb <= 0 or parent_tb >= len(rewritten):
+            continue
+        if rewritten[parent_tb] not in grounded_ids:
+            rewritten[parent_tb] = anchor
+    return rewritten, index_row, ungrounded
+
+
 class DraftPacketPlan:
     """This round's widths. Capacity elsewhere may be larger."""
 
@@ -151,6 +310,9 @@ class DraftPacketPlan:
         token_rows: Sequence,
         parsed_parents: Sequence,
         parsed_indices: Sequence,
+        invalid_tree_rows: int = 0,
+        no_draft: Optional[Sequence[bool]] = None,
+        disconnected: Optional[Sequence[Sequence[int]]] = None,
     ) -> None:
         self.bs = int(bs)
         self.token_width = int(token_width)
@@ -162,6 +324,15 @@ class DraftPacketPlan:
         self.token_rows = token_rows
         self.parsed_parents = parsed_parents
         self.parsed_indices = parsed_indices
+        self.invalid_tree_rows = int(invalid_tree_rows)
+        if no_draft is None:
+            self.no_draft = [False] * self.bs
+        else:
+            self.no_draft = [bool(flag) for flag in no_draft]
+        if disconnected is None:
+            self.disconnected = [[] for _ in range(self.bs)]
+        else:
+            self.disconnected = [list(slots) for slots in disconnected]
 
     @property
     def used(self) -> int:
@@ -178,44 +349,66 @@ def plan_draft_rows(
 ) -> DraftPacketPlan:
     """Choose this round's row widths without writing a destination buffer.
 
-    ``topk <= 1`` ignores supplied topology. A row uses chain when parent or
-    index is ``None``. An empty list is present topology, not ``None``.
+    Widths follow the verify kernel, not the longest supplied row:
+    ``token_width == index_w == max(W - 1, 0)`` and
+    ``parent_w == topk * (steps - 1) + 1`` (1 when ``steps == 1``).
+
+    ``topk <= 1`` ignores supplied topology and uses the chain template.
+    ``topk > 1`` keeps a valid tree. A child whose parent was not selected stays
+    in the row; ``repair_ungrounded_parents`` rewrites that parent column so the
+    mask thread can stop, and records the draft slot in ``disconnected``.
+    A missing topology or a row that fails ``tree_row_valid`` is ``no_draft``:
+    parents stay ``-1`` and indices stay ``0``, with no chain template. Only a
+    failed row clears tokens and increments ``invalid_tree_rows``.
     """
     bs = len(token_rows)
-    token_width = max(int(num_draft_tokens) - 1, 1)
+    width = int(num_draft_tokens)
+    topk_i = int(topk)
+    steps_i = int(spec_steps)
+    token_width = max(width - 1, 0)
+    index_w = token_width
+    parent_w = kernel_parent_width(topk_i, steps_i)
     chain_parents, chain_indices = cached_chain_template(num_draft_tokens, spec_steps)
     parsed_parents: List[Optional[Sequence[int]]] = [None] * bs
     parsed_indices: List[Optional[Sequence[int]]] = [None] * bs
-    n_tree = 0
-    if int(topk) > 1:
+    token_rows_out: List = list(token_rows)
+    no_draft = [False] * bs
+    disconnected: List[List[int]] = [[] for _ in range(bs)]
+    cleared = (0,) * token_width
+    invalid = 0
+    if topk_i > 1:
         for i in range(bs):
             parent = parent_rows[i] if i < len(parent_rows) else None
             index = index_rows[i] if i < len(index_rows) else None
             if parent is None or index is None:
+                no_draft[i] = True
                 continue
-            n_tree += 1
-            parsed_parents[i] = parent
-            parsed_indices[i] = index
-    chain_only = int(topk) <= 1 or n_tree == 0
-    parent_w = int(chain_parents.numel())
-    index_w = int(chain_indices.numel())
-    if not chain_only:
-        for parent, index in zip(parsed_parents, parsed_indices):
-            if parent is not None:
-                parent_w = max(parent_w, len(parent))
-            if index is not None:
-                index_w = max(index_w, len(index))
+            tokens = token_rows[i] if i < len(token_rows) else None
+            if not tree_row_valid(tokens, parent, index, topk_i, steps_i, width):
+                invalid += 1
+                token_rows_out[i] = cleared
+                no_draft[i] = True
+                continue
+            repaired_parents, repaired_indices, slots = repair_ungrounded_parents(
+                parent, index, topk_i
+            )
+            parsed_parents[i] = repaired_parents
+            parsed_indices[i] = repaired_indices
+            disconnected[i] = slots
     return DraftPacketPlan(
         bs,
         token_width,
         parent_w,
         index_w,
-        chain_only,
+        topk_i <= 1,
         chain_parents,
         chain_indices,
-        token_rows,
+        token_rows_out,
         parsed_parents,
         parsed_indices,
+        invalid,
+        no_draft,
+        disconnected,
     )
 
 
@@ -371,7 +564,8 @@ def _write_draft_numpy(
         if plan.token_width > 0:
             _numpy_prefix(token_np[i], src)
     if plan.chain_only:
-        parent_np = np.zeros((plan.bs, plan.parent_w), dtype=np.int64)
+        # ``topk <= 1`` only. Chain parents are a prefix of the kernel stride.
+        parent_np = np.full((plan.bs, plan.parent_w), -1, dtype=np.int64)
         index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
         if plan.bs and plan.parent_w:
             _numpy_prefix(parent_np[0], plan.chain_parents)
@@ -380,14 +574,14 @@ def _write_draft_numpy(
             _numpy_prefix(index_np[0], plan.chain_indices)
             index_np[:] = index_np[0].copy()
     else:
+        # Valid tree rows are copied. ``no_draft`` rows stay parent=-1, index=0
+        # so ``idx // topk`` never reads a parent column.
         parent_np = np.full((plan.bs, plan.parent_w), -1, dtype=np.int64)
         index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
         for i, (parent, index) in enumerate(
             zip(plan.parsed_parents, plan.parsed_indices)
         ):
             if parent is None or index is None:
-                _numpy_prefix(parent_np[i], plan.chain_parents)
-                _numpy_prefix(index_np[i], plan.chain_indices)
                 continue
             _numpy_prefix(parent_np[i], parent)
             _numpy_prefix(index_np[i], index)
@@ -426,6 +620,10 @@ def write_draft_regions(
         src = plan.token_rows[i] if i < len(plan.token_rows) else None
         copy_tokens_into_row(tokens[i], src, plan.token_width)
     if plan.chain_only:
+        if parents.numel():
+            parents.fill_(-1)
+        if indices.numel():
+            indices.zero_()
         _copy_vector_into_rows(parents, plan.chain_parents)
         _copy_vector_into_rows(indices, plan.chain_indices)
         return
@@ -435,11 +633,77 @@ def write_draft_regions(
         indices.zero_()
     for i, (parent, index) in enumerate(zip(plan.parsed_parents, plan.parsed_indices)):
         if parent is None or index is None:
-            _copy_vector_into_row(parents[i], plan.chain_parents)
-            _copy_vector_into_row(indices[i], plan.chain_indices)
             continue
         _assign_ints(parents[i], parent)
         _assign_ints(indices[i], index)
+
+
+def unlink_disconnected_retrieve_nodes(
+    retrive_next_token: Optional[torch.Tensor],
+    retrive_next_sibling: Optional[torch.Tensor],
+    disconnected: Optional[Sequence[Sequence[int]]],
+) -> None:
+    """Drop ungrounded draft nodes from the retrieve child and sibling lists.
+
+    ``disconnected[row]`` holds draft slots. Tree position ``slot + 1`` is the
+    node the verify kernel linked after the parent column was rewritten. Splicing
+    it out leaves grounded nodes reachable and the ungrounded node unreachable.
+    """
+    if not disconnected or retrive_next_token is None or retrive_next_token.numel() == 0:
+        return
+    for row, slots in enumerate(disconnected):
+        if not slots or row >= int(retrive_next_token.shape[0]):
+            continue
+        removed = {int(slot) + 1 for slot in slots}
+        old_next = [int(node) for node in retrive_next_token[row].detach().tolist()]
+        if retrive_next_sibling is None or row >= int(retrive_next_sibling.shape[0]):
+            old_sib = [-1] * len(old_next)
+            sibling_row = None
+        else:
+            sibling_row = retrive_next_sibling[row]
+            old_sib = [int(node) for node in sibling_row.detach().tolist()]
+
+        def skip(node: int) -> int:
+            seen = set()
+            while node in removed:
+                if node < 0 or node in seen or node >= len(old_sib):
+                    return -1
+                seen.add(node)
+                node = int(old_sib[node])
+            return node
+
+        def write_row(dest: torch.Tensor, values: Sequence[int]) -> None:
+            dest.copy_(
+                torch.tensor(list(values), dtype=dest.dtype, device=dest.device)
+            )
+
+        write_row(retrive_next_token[row], [skip(node) for node in old_next])
+        if sibling_row is not None:
+            write_row(sibling_row, [skip(node) for node in old_sib])
+
+
+def clear_no_draft_retrieve_links(
+    retrive_next_token: Optional[torch.Tensor],
+    retrive_next_sibling: Optional[torch.Tensor],
+    no_draft: Optional[Sequence[bool]],
+) -> None:
+    """Drop draft children on rows that must not accept speculative tokens.
+
+    The tree kernel still links index 0 to the root. Clearing both retrieve
+    rows leaves only the root bonus for those requests.
+    """
+    if not no_draft:
+        return
+    rows = [i for i, flag in enumerate(no_draft) if flag]
+    if not rows:
+        return
+    for tensor in (retrive_next_token, retrive_next_sibling):
+        if tensor is None or tensor.numel() == 0:
+            continue
+        limit = int(tensor.shape[0])
+        for row in rows:
+            if row < limit:
+                tensor[row].fill_(-1)
 
 
 def devices_compatible(stored: torch.device, requested: torch.device) -> bool:
@@ -483,6 +747,8 @@ class VerifyInputPacket:
         self.unresolved = False
         self.generation = 0
         self.rpd_input = None
+        self.no_draft_rows: Tuple[bool, ...] = ()
+        self.disconnected_slots: Tuple[Tuple[int, ...], ...] = ()
 
     def _raise_if_unresolved(self) -> None:
         if self.unresolved:
@@ -594,6 +860,10 @@ class VerifyInputPacket:
             spec_steps,
             num_draft_tokens,
         )
+        self.no_draft_rows = tuple(plan.no_draft)
+        self.disconnected_slots = tuple(tuple(slots) for slots in plan.disconnected)
+        if plan.invalid_tree_rows:
+            self._note(metrics, "counts", "sr_invalid_tree_rows", plan.invalid_tree_rows)
         if plan.bs == 0:
             return self._empty_views(plan, device)
         self.wait_for_host(metrics)
@@ -620,6 +890,8 @@ class VerifyInputPacket:
                 owner=self,
                 generation=self.generation,
                 batch_key=rpd_batch_key,
+                no_draft=plan.no_draft,
+                disconnected=plan.disconnected,
             )
             if context is not None:
                 used += int(context.edge_index_cpu.numel())

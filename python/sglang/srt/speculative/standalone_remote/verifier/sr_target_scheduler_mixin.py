@@ -31,6 +31,7 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRPendingEntry,
     SRReplyStatus,
     is_health_check_req as _is_health_check,
+    local_spec_shape,
 )
 from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRTargetClient,
@@ -388,6 +389,7 @@ class SchedulerStandaloneRemoteTargetMixin:
             action=action,
             reqs=draft_reqs,
             protocol_version=SR_PROTOCOL_VERSION,
+            spec_shape=local_spec_shape(getattr(self, "server_args", None)),
         )
 
         send_ok = True
@@ -451,16 +453,30 @@ class SchedulerStandaloneRemoteTargetMixin:
             self._sr_note_stale("rpc_seq")
             self._sr_observe_rpc(inflight, got_packet=True)
             return result, pending
-        if reply_stops_speculation(
-            reply.protocol_version, session_rpc_matched=True
-        ) or any(
+        shape_mismatch = [
+            item for item in reply.reqs if item.reason == "spec_shape_mismatch"
+        ]
+        protocol_mismatch = any(
             item.reason == "protocol_mismatch" for item in reply.reqs
-        ):
-            self._sr_stop_speculation(
-                "protocol_mismatch"
-                if any(item.reason == "protocol_mismatch" for item in reply.reqs)
-                else "protocol_version"
+        )
+        if (
+            reply_stops_speculation(
+                reply.protocol_version, session_rpc_matched=True
             )
+            or protocol_mismatch
+            or shape_mismatch
+        ):
+            if shape_mismatch:
+                logger.warning(
+                    "[SR] spec_shape_mismatch target=%s draft=%s",
+                    local_spec_shape(getattr(self, "server_args", None)),
+                    shape_mismatch[0].spec_shape,
+                )
+                self._sr_stop_speculation("spec_shape_mismatch")
+            else:
+                self._sr_stop_speculation(
+                    "protocol_mismatch" if protocol_mismatch else "protocol_version"
+                )
             self._sr_observe_rpc(inflight, got_packet=True)
             return result, pending
         for item in reply.reqs:

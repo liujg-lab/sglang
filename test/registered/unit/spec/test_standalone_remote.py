@@ -618,6 +618,45 @@ class TestSRProtocolRoundTrip(CustomTestCase):
         self.assertEqual(bad_step.matches(pending)[1], "step")
         self.assertEqual(bad_len.matches(pending)[1], "base_len")
 
+    def test_spec_shape_roundtrip_ignores_missing_field(self):
+        from sglang.srt.speculative.standalone_remote.sr_protocol import local_spec_shape
+
+        batch = SRBatchRequest(
+            session_id="sess",
+            rpc_seq=7,
+            action=SRAction.STEP,
+            reqs=[SRDraftRequest(rid="r1")],
+            spec_shape=(2, 3, 4),
+        )
+        raw = batch.to_dict()
+        self.assertEqual(raw["spec_shape"], [2, 3, 4])
+        self.assertEqual(SRBatchRequest.from_dict(raw).spec_shape, (2, 3, 4))
+        raw.pop("spec_shape")
+        self.assertIsNone(SRBatchRequest.from_dict(raw).spec_shape)
+        raw["spec_shape"] = "bad"
+        self.assertEqual(SRBatchRequest.from_dict(raw).spec_shape, ())
+        reply = SRDraftReply(
+            rid="r1",
+            status=SRReplyStatus.REJECT,
+            reason="spec_shape_mismatch",
+            spec_shape=(2, 3, 4),
+        )
+        restored = SRBatchReply.from_dict(
+            SRBatchReply(session_id="s", rpc_seq=1, reqs=[reply]).to_dict()
+        )
+        self.assertEqual(restored.reqs[0].spec_shape, (2, 3, 4))
+        self.assertEqual(restored.reqs[0].reason, "spec_shape_mismatch")
+        self.assertEqual(
+            local_spec_shape(
+                SimpleNamespace(
+                    speculative_eagle_topk=0,
+                    speculative_num_steps=None,
+                    speculative_num_draft_tokens=0,
+                )
+            ),
+            (1, 1, 2),
+        )
+
 
 class TestForkPointAlign(CustomTestCase):
     def test_identical(self):
@@ -2167,9 +2206,10 @@ class TestStandaloneRemoteTree(CustomTestCase):
         from sglang.test.sr_reference import assemble_draft_rows
 
         tokens = list(range(100, 107))
+        parent_row = [-1, 0, 1, 2, 3]
         parents, indices, dt = assemble_draft_rows(
             [tokens],
-            [[-1, 0, 1, 2]],
+            [parent_row],
             [list(range(7))],
             topk=2,
             spec_steps=3,
@@ -2177,15 +2217,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
         )
         self.assertEqual(list(dt.shape), [1, 7])
         self.assertEqual(dt[0].tolist(), tokens)
-        self.assertEqual(parents[0, :4].tolist(), [-1, 0, 1, 2])
-        self.assertEqual(indices[0, :7].tolist(), list(range(7)))
+        self.assertEqual(parents[0].tolist(), parent_row)
+        self.assertEqual(indices[0].tolist(), list(range(7)))
 
-    def test_missing_topology_uses_chain_not_repeated_tokens(self):
+    def test_missing_topology_keeps_tokens_without_chain(self):
         if torch is None:
             self.skipTest("torch not available")
-        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-            chain_tree_structure,
-        )
         from sglang.test.sr_reference import assemble_draft_rows
 
         parents, indices, dt = assemble_draft_rows(
@@ -2197,9 +2234,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
             num_draft_tokens=4,
         )
         self.assertEqual(dt[0].tolist(), [11, 12, 13])
-        chain_p, chain_i = chain_tree_structure(4, 3)
-        self.assertEqual(parents[0].tolist(), chain_p.tolist())
-        self.assertEqual(indices[0].tolist(), chain_i.tolist())
+        self.assertEqual(parents[0].tolist(), [-1, -1, -1, -1, -1])
+        self.assertEqual(indices[0].tolist(), [0, 0, 0])
+        self.assertTrue(all(int(idx) // 2 == 0 for idx in indices[0].tolist()))
         self.assertNotEqual(dt[0, 0].item(), dt[0, 1].item())
 
     def test_assemble_writes_out_buffers(self):
@@ -2208,12 +2245,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
         from sglang.test.sr_reference import assemble_draft_rows
 
         out_tokens = torch.full((2, 4), 7, dtype=torch.int64)
-        out_parents = torch.full((2, 4), 9, dtype=torch.int64)
+        out_parents = torch.full((2, 5), 9, dtype=torch.int64)
         out_indices = torch.full((2, 4), 8, dtype=torch.int64)
         parents, indices, dt = assemble_draft_rows(
             [[11, 12, 13], [21, 22, 23]],
-            [[-1, 0], [-1, 1]],
-            [[0, 1, 2], [3, 4, 5]],
+            [[-1, 0, 1, 2, 3], [-1, 0, 1, 4, 5]],
+            [[0, 1, 2], [0, 1, 4]],
             topk=2,
             spec_steps=3,
             num_draft_tokens=4,
@@ -2223,10 +2260,13 @@ class TestStandaloneRemoteTree(CustomTestCase):
             out_indices=out_indices,
         )
         self.assertEqual(dt[0].tolist(), [11, 12, 13])
+        self.assertEqual(dt[1].tolist(), [21, 22, 23])
         self.assertEqual(dt.shape, (2, 3))
         self.assertEqual(dt.data_ptr(), out_tokens.data_ptr())
-        self.assertEqual(parents[0, :2].tolist(), [-1, 0])
-        self.assertEqual(indices[1, :3].tolist(), [3, 4, 5])
+        self.assertEqual(parents[0].tolist(), [-1, 0, 1, 2, 3])
+        self.assertEqual(parents.data_ptr(), out_parents.data_ptr())
+        self.assertEqual(indices[1].tolist(), [0, 1, 4])
+        self.assertEqual(indices.data_ptr(), out_indices.data_ptr())
 
     def test_assemble_chain_tree_and_empty_list_expected(self):
         if torch is None:
@@ -2245,8 +2285,8 @@ class TestStandaloneRemoteTree(CustomTestCase):
             num_draft_tokens=4,
         )
         self.assertEqual(tokens.tolist(), [[11, 12, 13]])
-        self.assertEqual(parents.tolist(), [[-1, 0, 1]])
-        self.assertEqual(indices.tolist(), [[0, 1, 2]])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 0, 0]])
 
         parents, indices, tokens = assemble_draft_rows(
             [[11, 12, 13]],
@@ -2268,21 +2308,21 @@ class TestStandaloneRemoteTree(CustomTestCase):
             spec_steps=3,
             num_draft_tokens=4,
         )
-        self.assertEqual(tokens.tolist(), [[11, 12, 0]])
-        self.assertEqual(parents.tolist(), [[-1, -1, -1]])
+        self.assertEqual(tokens.tolist(), [[0, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
         self.assertEqual(indices.tolist(), [[0, 0, 0]])
 
         parents, indices, tokens = assemble_draft_rows(
-            [[11, 12, 13], [21]],
-            [[-1, 4, 5, 6], None],
-            [[8, 7, 6, 5], [1]],
+            [[11, 12, 13], [21, 22, 23]],
+            [[-1, 0, 1, 2, 3], [-1, 9, 9, 9, 9, 9]],
+            [[0, 1, 2], [0, 1, 2]],
             topk=2,
             spec_steps=3,
             num_draft_tokens=4,
         )
-        self.assertEqual(tokens.tolist(), [[11, 12, 13], [21, 0, 0]])
-        self.assertEqual(parents.tolist(), [[-1, 4, 5, 6], [-1, 0, 1, -1]])
-        self.assertEqual(indices.tolist(), [[8, 7, 6, 5], [0, 1, 2, 0]])
+        self.assertEqual(tokens.tolist(), [[11, 12, 13], [0, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3], [-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2], [0, 0, 0]])
 
         first_parents, first_indices = cached_chain_template(4, 3)
         parent_ptr = first_parents.data_ptr()
@@ -2318,35 +2358,204 @@ class TestStandaloneRemoteTree(CustomTestCase):
             [-1, 0, 1, 2, 3, 4],
             [9, 8, 7, 6, 5, 4, 3, 2],
         )
-        self.assertEqual(wide.used, 18)
-        self.assertEqual(wide.parent_w, 6)
-        self.assertEqual(wide.index_w, 8)
+        self.assertEqual(wide.used, 12)
+        self.assertEqual(wide.parent_w, 5)
+        self.assertEqual(wide.index_w, 3)
+        self.assertEqual(wide.token_width, 3)
+        self.assertEqual(wide.invalid_tree_rows, 1)
+        self.assertEqual(wide.no_draft, [True])
         self.assertEqual(verified.tolist(), [5])
-        self.assertEqual(tokens.tolist(), [[11, 12, 13]])
-        self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3, 4]])
-        self.assertEqual(indices.tolist(), [[9, 8, 7, 6, 5, 4, 3, 2]])
+        self.assertEqual(tokens.tolist(), [[0, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 0, 0]])
 
         chain, verified, tokens, parents, indices = fill([21, 22], None, None)
-        self.assertEqual(chain.used, 10)
-        self.assertEqual(chain.parent_w, 3)
+        self.assertEqual(chain.used, 12)
+        self.assertEqual(chain.parent_w, 5)
         self.assertEqual(chain.index_w, 3)
-        self.assertEqual(list(parents.shape), [1, 3])
-        self.assertEqual(parents.tolist(), [[-1, 0, 1]])
-        self.assertEqual(indices.tolist(), [[0, 1, 2]])
+        self.assertEqual(chain.invalid_tree_rows, 0)
+        self.assertEqual(chain.no_draft, [True])
+        self.assertEqual(list(parents.shape), [1, 5])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 0, 0]])
         self.assertEqual(tokens.tolist(), [[21, 22, 0]])
         self.assertNotIn(4, parents.reshape(-1).tolist())
         self.assertNotIn(9, indices.reshape(-1).tolist())
 
         wide, verified, tokens, parents, indices = fill(
             [31, 32, 33],
-            [-1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1, 1],
+            [-1, 0, 1, 2, 3],
+            [0, 1, 2],
         )
-        self.assertEqual(wide.used, 18)
+        self.assertEqual(wide.used, 12)
+        self.assertEqual(wide.invalid_tree_rows, 0)
         self.assertEqual(storage.numel(), 64)
-        self.assertEqual(parents.tolist(), [[-1, 1, 1, 1, 1, 1]])
-        self.assertEqual(indices.tolist(), [[1, 1, 1, 1, 1, 1, 1, 1]])
+        self.assertTrue(torch.all(storage[wide.used :] == 99))
+        self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2]])
         self.assertEqual(tokens.tolist(), [[31, 32, 33]])
+
+    def test_invalid_tree_row_is_cleared_and_counted(self):
+        if torch is None:
+            self.skipTest("torch not available")
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            VerifyInputPacket,
+            clear_no_draft_retrieve_links,
+            unlink_disconnected_retrieve_nodes,
+            tree_row_valid,
+        )
+
+        self.assertTrue(
+            tree_row_valid([11, 12, 13], [-1, 0, 1, 2, 3], [0, 1, 2], 2, 3, 4)
+        )
+        self.assertTrue(tree_row_valid([1, 1], [], [0, 1], 2, 1, 3))
+        self.assertFalse(tree_row_valid([1, 1], [-1], [0, 1], 2, 1, 3))
+        self.assertTrue(
+            tree_row_valid([11, 12, 13], [-1, 9, 1, 2, 3], [0, 1, 2], 2, 3, 4)
+        )
+        self.assertFalse(
+            tree_row_valid([11, 12, 13], [-1, -1, 1, 2, 3], [0, 1, 2], 2, 3, 4)
+        )
+        self.assertFalse(tree_row_valid([1, 2], [-1, 4, 2], [2, 4], 2, 2, 3))
+
+        packet = VerifyInputPacket()
+        metrics = SRRoundMetrics("Target")
+        verified, parents, indices, tokens = packet.load(
+            [5, 6],
+            [[11, 12, 13], [21, 22, 23]],
+            [[-1, 0, 1, 2, 3], [-1, 9, 9, 9, 9, 9]],
+            [[0, 1, 2], [0, 1, 2]],
+            2,
+            3,
+            4,
+            "cpu",
+            metrics,
+        )
+        self.assertEqual(metrics.counts["sr_invalid_tree_rows"], 1)
+        self.assertEqual(packet.no_draft_rows, (False, True))
+        self.assertEqual(tokens.tolist(), [[11, 12, 13], [0, 0, 0]])
+        self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3], [-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2], [0, 0, 0]])
+        self.assertEqual(verified.tolist(), [5, 6])
+
+        kept, kept_parents, kept_indices, kept_tokens = packet.load(
+            [7],
+            [[11, 12, 13]],
+            [[-1, 9, 1, 2, 3]],
+            [[0, 1, 2]],
+            2,
+            3,
+            4,
+            "cpu",
+            metrics,
+        )
+        self.assertEqual(metrics.counts["sr_invalid_tree_rows"], 1)
+        self.assertEqual(packet.no_draft_rows, (False,))
+        self.assertEqual(packet.disconnected_slots, ((2,),))
+        self.assertEqual(kept_tokens.tolist(), [[11, 12, 13]])
+        self.assertEqual(kept_parents.tolist(), [[-1, 0, 1, 2, 3]])
+        self.assertEqual(kept_indices.tolist(), [[0, 1, 2]])
+        self.assertEqual(kept.tolist(), [7])
+        rpd_packet = VerifyInputPacket()
+        rpd_packet.load(
+            [7],
+            [[11, 12, 13]],
+            [[-1, 9, 1, 2, 3]],
+            [[0, 1, 2]],
+            2,
+            3,
+            4,
+            "cpu",
+            rpd_vocab=32,
+        )
+        nxt = rpd_packet.rpd_input.tree[2, 0].tolist()
+        sibling = rpd_packet.rpd_input.tree[3, 0].tolist()
+        seen = set()
+        pending = [nxt[0]]
+        while pending:
+            node = pending.pop()
+            if node < 0 or node in seen:
+                continue
+            seen.add(node)
+            pending.append(nxt[node])
+            pending.append(sibling[node])
+        self.assertNotIn(3, seen)
+        self.assertIn(1, seen)
+        self.assertIn(2, seen)
+
+        _, shallow_parents, shallow_indices, shallow_tokens = packet.load(
+            [8],
+            [[1, 2, 3]],
+            [[-1]],
+            [[0, 1, 2]],
+            2,
+            1,
+            4,
+            "cpu",
+        )
+        self.assertEqual(packet.no_draft_rows, (True,))
+        self.assertEqual(shallow_tokens.tolist(), [[0, 0, 0]])
+        self.assertEqual(shallow_parents.tolist(), [[-1]])
+        self.assertEqual(shallow_indices.tolist(), [[0, 0, 0]])
+        self.assertTrue(
+            all(int(idx) // 2 == 0 for idx in shallow_indices.reshape(-1).tolist())
+        )
+
+        _, deep_parents, deep_indices, deep_tokens = packet.load(
+            [9],
+            [[1, 2, 3, 4, 5]],
+            [None],
+            [None],
+            2,
+            2,
+            6,
+            "cpu",
+        )
+        self.assertEqual(packet.no_draft_rows, (True,))
+        self.assertEqual(deep_tokens.tolist(), [[1, 2, 3, 4, 5]])
+        self.assertEqual(deep_parents.tolist(), [[-1, -1, -1]])
+        self.assertEqual(deep_indices.tolist(), [[0, 0, 0, 0, 0]])
+        self.assertTrue(
+            all(int(idx) // 2 < deep_parents.shape[1] for idx in deep_indices[0].tolist())
+        )
+        self.assertNotIn(0, deep_parents.reshape(-1).tolist())
+
+        nxt = torch.tensor([[1, 2, -1], [3, -1, -1]], dtype=torch.int64)
+        sibling = torch.tensor([[-1, 0, -1], [1, -1, -1]], dtype=torch.int64)
+        clear_no_draft_retrieve_links(nxt, sibling, [False, True])
+        self.assertEqual(nxt.tolist(), [[1, 2, -1], [-1, -1, -1]])
+        self.assertEqual(sibling.tolist(), [[-1, 0, -1], [-1, -1, -1]])
+
+        linked = torch.tensor([[3, -1, -1, -1]], dtype=torch.int64)
+        linked_sib = torch.tensor([[-1, 2, -1, 1]], dtype=torch.int64)
+        unlink_disconnected_retrieve_nodes(linked, linked_sib, ((2,),))
+        self.assertEqual(linked.tolist(), [[1, -1, -1, -1]])
+        self.assertEqual(linked_sib.tolist(), [[-1, 2, -1, 1]])
+        child = torch.tensor([[1, 3, -1, -1]], dtype=torch.int64)
+        child_sib = torch.tensor([[-1, 2, -1, -1]], dtype=torch.int64)
+        unlink_disconnected_retrieve_nodes(child, child_sib, ((2,),))
+        self.assertEqual(child.tolist(), [[1, -1, -1, -1]])
+        self.assertEqual(child_sib.tolist(), [[-1, 2, -1, -1]])
+
+        _, loose_parents, loose_indices, loose_tokens = packet.load(
+            [4],
+            [[8, 9]],
+            [[-1, 9, 8, 0, 0]],
+            [[2, 4]],
+            2,
+            3,
+            3,
+            "cpu",
+        )
+        self.assertEqual(packet.no_draft_rows, (False,))
+        self.assertEqual(packet.disconnected_slots, ((0, 1),))
+        self.assertEqual(loose_tokens.tolist(), [[8, 9]])
+        self.assertEqual(loose_indices.tolist(), [[0, 0]])
+        self.assertEqual(loose_parents.tolist(), [[-1, 9, 8, 0, 0]])
+        self.assertTrue(all(int(idx) // 2 == 0 for idx in loose_indices.reshape(-1).tolist()))
 
     def _packet_worker(self):
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
@@ -2429,9 +2638,13 @@ class TestStandaloneRemoteTree(CustomTestCase):
                 ),
             )
             self.assertEqual(verified.tolist(), [10, 20])
-            self.assertEqual(tokens.tolist(), [[11, 12, 13], [21, 22, 0]])
-            self.assertEqual(parents.tolist(), [[-1, 4, 5, 6], [-1, 0, 1, -1]])
-            self.assertEqual(indices.tolist(), [[8, 7, 6, 5], [0, 1, 2, 0]])
+            self.assertEqual(tokens.tolist(), [[0, 0, 0], [21, 22, 0]])
+            self.assertEqual(
+                parents.tolist(), [[-1, -1, -1, -1, -1], [-1, -1, -1, -1, -1]]
+            )
+            self.assertEqual(indices.tolist(), [[0, 0, 0], [0, 0, 0]])
+            self.assertEqual(packet.no_draft_rows, (True, True))
+            self.assertEqual(metrics.counts["sr_invalid_tree_rows"], 1)
             host_ptr = packet.host_packet.data_ptr()
             capacity = packet.capacity
 
@@ -2441,7 +2654,8 @@ class TestStandaloneRemoteTree(CustomTestCase):
             )
             self.assertEqual(verified.tolist(), [30])
             self.assertEqual(tokens.tolist(), [[7, 0, 0]])
-            self.assertEqual(parents.tolist(), [[-1, 0, 1]])
+            self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
+            self.assertEqual(indices.tolist(), [[0, 0, 0]])
             self.assertNotIn(20, verified.tolist())
             self.assertEqual(packet.host_packet.data_ptr(), host_ptr)
             self.assertEqual(packet.capacity, capacity)
@@ -2458,7 +2672,8 @@ class TestStandaloneRemoteTree(CustomTestCase):
             )
         self.assertEqual(verified.tolist(), [40, 50])
         self.assertEqual(tokens.tolist(), [[8, 9, 0], [6, 0, 0]])
-        self.assertEqual(parents.tolist(), [[-1, 0, 1], [-1, 0, 1]])
+        self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1], [-1, -1, -1, -1, -1]])
+        self.assertEqual(indices.tolist(), [[0, 0, 0], [0, 0, 0]])
         self.assertEqual(metrics.counts["verify_packet_upload"], 0)
         self.assertGreaterEqual(metrics.counts["verify_packet_grow"], 1)
         self.assertGreater(metrics.host["verify_packet_fill"], 0)
@@ -2501,12 +2716,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
             layout_mod, "submit_copy", fake_submit
         ), patch.object(layout_mod, "wait_event", fake_wait):
             verified, parents, indices, tokens = self._assemble(packet, batch)
-            self.assertEqual(uploads, [(10, 11)])
+            self.assertEqual(uploads, [(12, 11)])
             self.assertEqual(metrics.counts["verify_packet_upload"], 1)
             self.assertEqual(verified.tolist(), [11])
             self.assertEqual(tokens.tolist(), [[1, 2, 3]])
-            self.assertEqual(parents.tolist(), [[-1, 0, 1]])
-            self.assertEqual(indices.tolist(), [[0, 1, 2]])
+            self.assertEqual(parents.tolist(), [[-1, -1, -1, -1, -1]])
+            self.assertEqual(indices.tolist(), [[0, 0, 0]])
             self.assertEqual(waits, [])
 
             empty = self._packet_batch([], metrics)
@@ -6114,6 +6329,108 @@ class TestSRV2StopAndVersion(CustomTestCase):
         self.assertFalse(req.sr_force_snapshot)
         self.assertEqual(req.cur_drafts, [])
         self.assertEqual(req.sr_ack_commit_version, 3)
+
+    def test_spec_shape_mismatch_rejects_step_and_keeps_finish(self):
+        mixin = self._draft()
+        mixin.server_args = SimpleNamespace(
+            speculative_eagle_topk=2,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+        mixin._init_sr_draft = lambda: None
+        handled = []
+
+        def handle(batch, mm):
+            handled.append(batch.action)
+            return SRBatchReply(
+                session_id=batch.session_id, rpc_seq=batch.rpc_seq, reqs=[]
+            )
+
+        mixin._sr_handle_batch = handle
+        mixin._sr_wipe_all = lambda: None
+        mixin._sr_resume_http_reqs = lambda: None
+        mixin._sr_poll_deferred_finishes = lambda: None
+        mixin._sr_cleanup_stale_drafts = lambda *args, **kwargs: None
+        sent = []
+        mixin.sr_server = SimpleNamespace(send_batch=lambda reply: sent.append(reply))
+
+        def one(action, shape, rpc):
+            return (
+                SRBatchRequest(
+                    session_id="s",
+                    rpc_seq=rpc,
+                    action=action,
+                    protocol_version=2,
+                    spec_shape=shape,
+                    reqs=[SRDraftRequest(rid="a", step_id=1, base_committed_len=1)],
+                ),
+                {},
+            )
+
+        packets = [
+            one(SRAction.STEP, (4, 5, 8), 0),
+            one(SRAction.STEP, None, 1),
+            one(SRAction.FINISH, (9, 9, 9), 2),
+        ]
+        mixin.recv_requests = lambda: []
+        mixin.process_input_requests = lambda reqs: None
+        mixin._sr_recv_packet = lambda: packets.pop(0) if packets else None
+        mixin._sr_run_http_batch = lambda: (_ for _ in ()).throw(RuntimeError("stop-loop"))
+        with self.assertLogs(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin",
+            level="WARNING",
+        ) as logs:
+            with self.assertRaisesRegex(RuntimeError, "stop-loop"):
+                mixin.event_loop_normal_standalone_remote_draft()
+        self.assertEqual(handled, [SRAction.STEP, SRAction.FINISH])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0].reqs[0].reason, "spec_shape_mismatch")
+        self.assertEqual(sent[0].reqs[0].status, SRReplyStatus.REJECT)
+        self.assertEqual(sent[0].reqs[0].spec_shape, (2, 3, 4))
+        self.assertEqual(sent[1].reqs, [])
+        self.assertIn("(2, 3, 4)", "\n".join(logs.output))
+        self.assertIn("(4, 5, 8)", "\n".join(logs.output))
+
+    def test_spec_shape_mismatch_stops_target(self):
+        mixin, inflight_cls = self._target()
+        mixin.server_args = SimpleNamespace(
+            speculative_eagle_topk=4,
+            speculative_num_steps=5,
+            speculative_num_draft_tokens=8,
+        )
+        pending = SRPendingEntry(
+            step_id=1, base_committed_len=4, commit_version=4, sent_output_len=2
+        )
+        reply = SRBatchReply(
+            session_id="s",
+            rpc_seq=1,
+            protocol_version=2,
+            reqs=[
+                SRDraftReply(
+                    rid="a",
+                    step_id=1,
+                    base_committed_len=4,
+                    draft_tokens=[],
+                    status=SRReplyStatus.REJECT,
+                    reason="spec_shape_mismatch",
+                    spec_shape=(2, 3, 4),
+                )
+            ],
+        )
+        mixin.sr_client = SimpleNamespace(recv_batch=lambda session, rpc: reply)
+        inflight = inflight_cls(
+            session_id="s", rpc_seq=1, pending={"a": pending}, wait_reply=True
+        )
+        with self.assertLogs(
+            "sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin",
+            level="WARNING",
+        ) as logs:
+            result, _pending = mixin._sr_recv(inflight)
+        self.assertEqual(result, {})
+        self.assertTrue(mixin.sr_speculation_stopped)
+        text = "\n".join(logs.output)
+        self.assertIn("(4, 5, 8)", text)
+        self.assertIn("(2, 3, 4)", text)
 
 
 if __name__ == "__main__":

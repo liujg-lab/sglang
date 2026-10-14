@@ -111,16 +111,21 @@ def build_sr_rpd_input(
     owner,
     generation,
     batch_key=(),
+    no_draft=None,
+    disconnected=None,
 ):
     """Build only topology, matching build_tree_efficient's reverse insertion.
 
     Unsupported/malformed layouts decline the optimization before upload. Missing
     selected parents stay disconnected, exactly as in the existing tree builder.
+    ``no_draft`` rows skip linking so their ``nxt`` stays ``-1``.
+    ``disconnected`` draft slots are ungrounded nodes and are not linked.
     """
     bs = int(verified.numel())
-    # Parent width follows the normalized packet, including the chain template
-    # (``spec_steps`` columns) and zero-filled empty rows. Only an index that
-    # addresses past that row declines the batch.
+    # Parent width is the verify-kernel stride ``topk * (steps - 1) + 1``
+    # (1 when ``steps == 1``), including chain-template prefixes and -1 fill.
+    # It is not the longest raw row. An index that addresses past that stride
+    # declines the batch.
     if (
         topk <= 1
         or width < 1
@@ -138,13 +143,20 @@ def build_sr_rpd_input(
     retr = torch.arange(bs * width, dtype=torch.int64).reshape(bs, width)
     nxt = torch.full((bs, width), -1, dtype=torch.int64)
     sibling = torch.full_like(nxt, -1)
+    skipped = list(no_draft) if no_draft is not None else []
+    loose = list(disconnected) if disconnected is not None else []
     for b, (pp, ss) in enumerate(zip(parents.tolist(), selected.tolist())):
+        if b < len(skipped) and skipped[b]:
+            continue
+        loose_slots = set(loose[b]) if b < len(loose) else set()
         parent_of = [-1] * width
         pos_of = {}
         for node_i, node in enumerate(ss):
             if node not in pos_of:
                 pos_of[node] = node_i
         for i in range(width - 1, 0, -1):
+            if (i - 1) in loose_slots:
+                continue
             if ss[i - 1] < 0:
                 return None
             parent_tb = ss[i - 1] // topk
