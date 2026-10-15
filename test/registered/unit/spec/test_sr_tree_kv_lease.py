@@ -326,7 +326,7 @@ class TestTreeReplyPack(unittest.TestCase):
             scores, tokens, parents, steps + 1
         )
         self.assertEqual(tuple(parent_list.shape), (batch, 0))
-        self.assertEqual(parent_list.dtype, torch.float32)
+        self.assertEqual(parent_list.dtype, torch.int64)
 
         drafter = SRTreeDrafter.__new__(SRTreeDrafter)
         drafter.topk = topk
@@ -343,6 +343,34 @@ class TestTreeReplyPack(unittest.TestCase):
         self.assertEqual(parents_cpu.numel(), 0)
         self.assertEqual(parents_cpu.dtype, torch.int64)
         self.assertIsNone(slots_cpu)
+
+        drafter._release_tree_slot()
+        windows = [([], None, None) for _ in range(batch)]
+        drafter._pack_tree_windows(
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            list(range(batch)),
+            windows,
+        )
+        for row, window in enumerate(windows):
+            self.assertEqual(window[0], draft_tokens[row].tolist())
+            self.assertEqual(window[1], [])
+            self.assertEqual(window[2], top_scores_index[row].tolist())
+
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            plan_draft_rows,
+        )
+
+        plan = plan_draft_rows(
+            [window[0] for window in windows],
+            [window[1] for window in windows],
+            [window[2] for window in windows],
+            topk,
+            steps,
+            steps + 1,
+        )
+        self.assertEqual(plan.no_draft, [False, False])
 
     def test_pack_matches_oracle_for_duplicates_and_isolation(self):
         batch, topk, steps = 2, 2, 2

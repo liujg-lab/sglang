@@ -255,7 +255,8 @@ class SRBatchRequest:
     # Local batches default to v2. from_dict passes an explicit value so a
     # missing or non-int wire field stays unsupported instead of becoming 2.
     protocol_version: Optional[int] = SR_PROTOCOL_VERSION
-    # (topk, num_steps, num_draft_tokens). Omitted on the wire by old Targets.
+    # (topk, num_steps, num_draft_tokens). v2 Target always sends this.
+    # Draft rejects PREFILL/STEP when it is missing.
     spec_shape: Optional[Tuple[int, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:

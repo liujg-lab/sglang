@@ -2731,15 +2731,16 @@ class StandaloneRemoteDraftSchedulerMixin:
         return reply
 
     def _sr_spec_shape_rejected(self, batch: SRBatchRequest) -> bool:
-        """True when a new Target's tree shape does not match this Draft.
+        """True when a v2 Target's tree shape does not match this Draft.
 
-        A missing ``spec_shape`` is an old Target and is left alone. FINISH and
-        ABORT still run so a mismatch cannot skip KV release.
+        Protocol v2 always sends ``spec_shape``. A missing field on PREFILL or
+        STEP is rejected as a mismatch. FINISH and ABORT still run so a
+        mismatch cannot skip KV release.
         """
         if batch.action not in (SRAction.PREFILL, SRAction.STEP):
             return False
         if batch.spec_shape is None:
-            return False
+            return True
         local = local_spec_shape(getattr(self, "server_args", None))
         return tuple(batch.spec_shape) != local
 

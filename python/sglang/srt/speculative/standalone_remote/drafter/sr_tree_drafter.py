@@ -775,9 +775,14 @@ class SRTreeDrafter:
         tokens_cpu, parents_cpu, indices_cpu, slots_cpu = self._d2h_tree_outputs(
             draft_tokens, parent_list, top_scores_index
         )
-        token_rows = tokens_cpu.tolist()
-        parent_rows = parents_cpu.tolist()
-        index_rows = indices_cpu.tolist()
+
+        def _rows(tensor, n):
+            return tensor.tolist() if tensor.numel() else [[] for _ in range(n)]
+
+        n = len(keep_idx)
+        token_rows = _rows(tokens_cpu, n)
+        parent_rows = _rows(parents_cpu, n)
+        index_rows = _rows(indices_cpu, n)
         packed = []
         for j, idx in enumerate(keep_idx):
             window = (token_rows[j], parent_rows[j], index_rows[j])
@@ -934,8 +939,6 @@ class SRTreeDrafter:
             )
         tokens = _as_2d(draft_tokens.detach())
         parents = _as_2d(parent_list.detach())
-        if parents.numel() == 0 and parents.dtype != torch.int64:
-            parents = parents.to(torch.int64)
         indices = _as_2d(top_scores_index.detach())
         lease_state = getattr(self, "_pending_lease_state", None)
         compact = None

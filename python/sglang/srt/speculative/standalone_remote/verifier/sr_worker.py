@@ -932,6 +932,7 @@ class StandaloneRemoteWorker:
             num_draft_tokens,
             device,
             metrics,
+            vocab=int(batch.sampling_info.vocab_size),
             **rpd_kwargs,
         )
 

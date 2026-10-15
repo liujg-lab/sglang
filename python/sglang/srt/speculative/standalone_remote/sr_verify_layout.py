@@ -226,7 +226,15 @@ def _as_int_list(values) -> Optional[List[int]]:
         return None
 
 
-def tree_row_valid(tokens, parents, indices, topk: int, steps: int, num_draft_tokens: int) -> bool:
+def tree_row_valid(
+    tokens,
+    parents,
+    indices,
+    topk: int,
+    steps: int,
+    num_draft_tokens: int,
+    vocab: Optional[int] = None,
+) -> bool:
     """Whether one supplied tree row matches the verify kernel's fixed stride.
 
     ``tokens``, ``parents``, and ``indices`` are already int sequences. An empty
@@ -239,6 +247,9 @@ def tree_row_valid(tokens, parents, indices, topk: int, steps: int, num_draft_to
     A selected parent must have a candidate id strictly less than the child.
     Draft trees number candidates by step, so every real edge decreases the id
     and cannot form a cycle.
+
+    When ``vocab`` is set, every draft token must satisfy ``0 <= token < vocab``.
+    A missing vocab keeps the topology check only.
     """
     topk = int(topk)
     steps = int(steps)
@@ -267,6 +278,11 @@ def tree_row_valid(tokens, parents, indices, topk: int, steps: int, num_draft_to
             return False
         if parent_token in pos_of and parent_token >= idx:
             return False
+    if vocab is not None:
+        vocab_limit = int(vocab)
+        for token in tokens:
+            if token < 0 or token >= vocab_limit:
+                return False
     return True
 
 
@@ -378,6 +394,7 @@ def plan_draft_rows(
     topk: int,
     spec_steps: int,
     num_draft_tokens: int,
+    vocab: Optional[int] = None,
 ) -> DraftPacketPlan:
     """Choose this round's row widths without writing a destination buffer.
 
@@ -391,7 +408,8 @@ def plan_draft_rows(
     mask thread can stop, and records the draft slot in ``disconnected``.
     A missing topology or a row that fails ``tree_row_valid`` is ``no_draft``:
     parents stay ``-1`` and indices stay ``0``, with no chain template. Only a
-    failed row clears tokens and increments ``invalid_tree_rows``.
+    failed row clears tokens and increments ``invalid_tree_rows``. When
+    ``vocab`` is set, a token outside ``[0, vocab)`` fails that check.
     """
     bs = len(token_rows)
     width = int(num_draft_tokens)
@@ -424,7 +442,13 @@ def plan_draft_rows(
                 or parent_row is None
                 or index_row is None
                 or not tree_row_valid(
-                    token_row, parent_row, index_row, topk_i, steps_i, width
+                    token_row,
+                    parent_row,
+                    index_row,
+                    topk_i,
+                    steps_i,
+                    width,
+                    vocab,
                 )
             ):
                 invalid += 1
@@ -848,6 +872,7 @@ class VerifyInputPacket:
         device,
         metrics=None,
         *,
+        vocab=None,
         rpd_vocab=None,
         rpd_batch_key=(),
     ):
@@ -867,6 +892,7 @@ class VerifyInputPacket:
             topk,
             spec_steps,
             num_draft_tokens,
+            vocab,
         )
         self.no_draft_rows = tuple(plan.no_draft)
         self.disconnected_slots = tuple(tuple(slots) for slots in plan.disconnected)

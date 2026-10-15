@@ -2519,6 +2519,15 @@ class TestStandaloneRemoteTree(CustomTestCase):
         )
         self.assertFalse(tree_row_valid([1, 2], [-1, 4, 2], [2, 4], 2, 2, 3))
         self.assertFalse(tree_row_valid([1, 2], [-1, 4, 0], [2, 4], 2, 2, 3))
+        self.assertTrue(
+            tree_row_valid([11, 12, 13], [-1, 0, 1, 2, 3], [0, 1, 2], 2, 3, 4, vocab=14)
+        )
+        self.assertFalse(
+            tree_row_valid([11, 12, 13], [-1, 0, 1, 2, 3], [0, 1, 2], 2, 3, 4, vocab=13)
+        )
+        self.assertFalse(
+            tree_row_valid([-1, 12, 13], [-1, 0, 1, 2, 3], [0, 1, 2], 2, 3, 4, vocab=100)
+        )
 
         parents = [-1, 0, 0, 2, 0]
         indices = [6, 2, 0]
@@ -2550,6 +2559,28 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(parents.tolist(), [[-1, 0, 1, 2, 3], [-1, -1, -1, -1, -1]])
         self.assertEqual(indices.tolist(), [[0, 1, 2], [0, 0, 0]])
         self.assertEqual(verified.tolist(), [5, 6])
+
+        oob_packet = VerifyInputPacket()
+        oob_metrics = SRRoundMetrics("Target")
+        _, oob_parents, oob_indices, oob_tokens = oob_packet.load(
+            [5, 6],
+            [[11, 12, 13], [11, 12, 100]],
+            [[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]],
+            [[0, 1, 2], [0, 1, 2]],
+            2,
+            3,
+            4,
+            "cpu",
+            oob_metrics,
+            vocab=100,
+        )
+        self.assertEqual(oob_metrics.counts["sr_invalid_tree_rows"], 1)
+        self.assertEqual(oob_packet.no_draft_rows, (False, True))
+        self.assertEqual(oob_tokens.tolist(), [[11, 12, 13], [0, 0, 0]])
+        self.assertEqual(
+            oob_parents.tolist(), [[-1, 0, 1, 2, 3], [-1, -1, -1, -1, -1]]
+        )
+        self.assertEqual(oob_indices.tolist(), [[0, 1, 2], [0, 0, 0]])
 
         kept, kept_parents, kept_indices, kept_tokens = packet.load(
             [7],
@@ -6768,14 +6799,16 @@ class TestSRV2StopAndVersion(CustomTestCase):
         ) as logs:
             with self.assertRaisesRegex(RuntimeError, "stop-loop"):
                 mixin.event_loop_normal_standalone_remote_draft()
-        self.assertEqual(handled, [SRAction.STEP, SRAction.FINISH])
+        self.assertEqual(handled, [SRAction.FINISH])
         self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[0].reqs[0].reason, "spec_shape_mismatch")
-        self.assertEqual(sent[0].reqs[0].status, SRReplyStatus.REJECT)
-        self.assertEqual(sent[0].reqs[0].spec_shape, (2, 3, 4))
-        self.assertEqual(sent[1].reqs, [])
-        self.assertIn("(2, 3, 4)", "\n".join(logs.output))
-        self.assertIn("(4, 5, 8)", "\n".join(logs.output))
+        for reply in sent:
+            self.assertEqual(reply.reqs[0].reason, "spec_shape_mismatch")
+            self.assertEqual(reply.reqs[0].status, SRReplyStatus.REJECT)
+            self.assertEqual(reply.reqs[0].spec_shape, (2, 3, 4))
+        log_text = "\n".join(logs.output)
+        self.assertIn("(2, 3, 4)", log_text)
+        self.assertIn("(4, 5, 8)", log_text)
+        self.assertIn("request=None", log_text)
 
     def test_spec_shape_mismatch_stops_target(self):
         mixin, inflight_cls = self._target()
