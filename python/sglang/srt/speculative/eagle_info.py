@@ -348,8 +348,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            server_args = None
+        verify_mode = getattr(server_args, "speculative_verify_mode", "auto") or "auto"
         fixed_bound = False
         rpd_host_bound = False
+        rpd_live_batch_key = None
         fixed_detach = None
         fixed_decision = None
         if sr_accept_state is not None:
@@ -361,16 +367,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             fixed_detach = detach_verify_output
             fixed_decision = accept_control_decision
-            try:
-                early_args = get_global_server_args()
-            except ValueError:
-                early_args = None
-            early_mode = (
-                getattr(early_args, "speculative_verify_mode", "auto") or "auto"
-            )
             rpd_context = getattr(self, "sr_rpd_input", None)
-            rpd_live_batch_key = None
-            if early_mode == "rpd":
+            if verify_mode == "rpd":
                 from sglang.srt.speculative.standalone_remote.sr_rpd import (
                     rpd_batch_key,
                 )
@@ -378,7 +376,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 rpd_live_batch_key = rpd_batch_key(batch.reqs)
             reject_reason = sr_accept_state.reject_before_alloc(
                 bs=bs,
-                verify_mode=early_mode,
+                verify_mode=verify_mode,
                 is_all_greedy=bool(sampling_info.is_all_greedy),
                 has_grammar=bool(getattr(batch, "has_grammar", False)),
                 vocab_mask=vocab_mask,
@@ -399,7 +397,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 rpd_host_input=rpd_context,
                 rpd_live_batch_key=rpd_live_batch_key,
             )
-            if reject_reason is None and early_mode == "rpd":
+            if reject_reason is None and verify_mode == "rpd":
                 rpd_host_bound = True
             elif reject_reason is None:
                 try:
@@ -411,7 +409,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sr_accept_state.note_path("fixed_accept_noncontiguous")
             else:
                 sr_accept_state.note_path("fixed_accept_" + reject_reason)
-                if early_mode == "rpd":
+                if verify_mode == "rpd":
                     sr_accept_state.note_rpd_fallback(reject_reason)
         if not fixed_bound and not rpd_host_bound:
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
@@ -460,11 +458,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Sample tokens. SPECTRE/SR must not silently fall back to greedy.
         is_all_greedy = sampling_info.is_all_greedy
-        try:
-            server_args = get_global_server_args()
-        except ValueError:
-            server_args = None
-        verify_mode = getattr(server_args, "speculative_verify_mode", "auto") or "auto"
         want_sampling = verify_mode == "target_only" or (
             verify_mode == "auto" and not is_all_greedy
         )
@@ -517,6 +510,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.topk,
                     token_to_kv_pool_allocator,
                     host_plan,
+                    batch_key=rpd_live_batch_key,
                 )
                 return _eagle_output_from_fixed(raw, batch, self.topk)
             predict, accept_index, accept_length = verify_tree_rpd(

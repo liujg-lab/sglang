@@ -895,7 +895,7 @@ class SRFixedAcceptState:
         )
 
     def finalize_from_host(
-        self, batch, logits_output, page_size, topk, allocator, plan
+        self, batch, logits_output, page_size, topk, allocator, plan, batch_key=None
     ):
         """RPD already owns CPU tokens. Never pack or read device accept results."""
         from sglang.srt.speculative.standalone_remote.sr_rpd import (
@@ -904,9 +904,11 @@ class SRFixedAcceptState:
         )
 
         bs = len(batch.reqs)
+        if batch_key is None:
+            batch_key = rpd_batch_key(batch.reqs)
         if not isinstance(plan, SRRPDHostPlan) or plan.consumed:
             raise RuntimeError("invalid or consumed RPD host plan")
-        if plan.batch_key != rpd_batch_key(batch.reqs):
+        if plan.batch_key != batch_key:
             raise RuntimeError("RPD host plan request order or generation changed")
         if not (len(plan.rows) == len(plan.tokens) == len(plan.pre_lengths) == bs):
             raise RuntimeError("RPD host plan batch mismatch")
@@ -914,12 +916,8 @@ class SRFixedAcceptState:
             raise RuntimeError("RPD host plan capacity or layout mismatch")
         if batch.out_cache_loc.numel() != bs * self.W:
             raise RuntimeError("RPD host plan cache slots mismatch")
-        for b, (row, tokens) in enumerate(zip(plan.rows, plan.tokens)):
-            if len(row) != self.L or len(tokens) != self.L:
-                raise RuntimeError("RPD host plan path capacity mismatch")
+        for row, tokens in zip(plan.rows, plan.tokens):
             for idx, tok in zip(row, tokens):
-                if idx != -1 and not b * self.W <= idx < (b + 1) * self.W:
-                    raise RuntimeError("RPD host plan index outside request slots")
                 if idx >= 0 and not 0 <= tok < plan.vocab:
                     raise RuntimeError("RPD host plan token outside vocabulary")
         validate_packed_rows(plan.rows, plan.pre_lengths, [0] * bs)

@@ -91,6 +91,25 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(lengths, [1, 1])
         self.assertEqual(folded, {0: 4, 1: 8, 4: 10})
 
+    def test_select_host_rejects_overlong_path_and_retrieve_outside_rows(self):
+        tree = torch.tensor(
+            [
+                [[1, 3, 3], [2, 4, 4]],
+                [[0, 1, 2], [0, 4, 5]],
+                [[1, -1, -1], [1, -1, -1]],
+                [[-1, 2, -1], [-1, 2, -1]],
+            ]
+        )
+        edges = [(0, 1, 0), (0, 2, 0), (1, 1, 0), (1, 2, 0)]
+        topology = rpd._rpd_host_topology(tree, edges)
+        star = [[3, 8, 9], [4, 10, 11]]
+        stats = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
+        with self.assertRaises(RuntimeError):
+            rpd._rpd_select_host(topology, star, stats, 0.0, True, 1, 6, 7)
+        topology.retrieve[0][0] = 6
+        with self.assertRaises(ValueError):
+            rpd._rpd_select_host(topology, star, stats, 0.0, True, 3, 6, 7)
+
     def test_topology_matches_reference_and_survives_packet_reuse(self):
         packet, (_, parents, indices, _) = packet_input()
         context = packet.rpd_input
@@ -99,6 +118,18 @@ class SRRPDTest(unittest.TestCase):
         )
         for actual, expected in zip(context.tree[1:], reference[2:]):
             torch.testing.assert_close(actual, expected)
+        rows = int(context.tree.shape[1] * context.tree.shape[2])
+        ref_edges, ref_index = rpd._rpd_compact_edges(context.tree, rows, context.vocab)
+        ref_topo = rpd._rpd_host_topology(context.tree, ref_edges)
+        self.assertEqual(context.topology.candidates, ref_topo.candidates)
+        self.assertEqual(context.topology.retrieve, ref_topo.retrieve)
+        self.assertEqual(context.topology.children, ref_topo.children)
+        self.assertEqual(context.topology.edges, ref_topo.edges)
+        self.assertEqual(context.topology.edge_pos, ref_topo.edge_pos)
+        if ref_index is None:
+            self.assertEqual(tuple(context.edge_index_cpu.shape), (2, 0))
+        else:
+            torch.testing.assert_close(context.edge_index_cpu, ref_index)
         self.assertTrue(context.current())
         saved = context.tree.clone()
         packet_input(1, packet)
@@ -363,19 +394,15 @@ class SRRPDTest(unittest.TestCase):
     def test_statistics_preflight_failures_do_not_submit_or_poison(self):
         import sglang.srt.speculative.standalone_remote.sr_rpd as module
 
-        for case in ("logits", "capacity", "index", "buffer", "kernel"):
+        for case in ("capacity", "buffer", "kernel"):
             with self.subTest(case=case):
                 packet, _ = packet_input()
                 context = packet.rpd_input
                 ws = SRRPDWorkspace()
                 logits = torch.zeros(12, 32)
                 ws.prepare(logits, context)
-                if case == "logits":
-                    logits = logits[:, :-1]
-                elif case == "capacity":
+                if case == "capacity":
                     ws.rows_cap = 1
-                elif case == "index":
-                    context.edge_index = context.edge_index.int()
                 elif case == "buffer":
                     ws.argmax = ws.argmax.int()
                 with (
@@ -636,6 +663,7 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(result, "committed")
         penalizer.apply.assert_called_once()
         finalize.assert_called_once()
+        self.assertEqual(finalize.call_args.kwargs["batch_key"], rpd_batch_key(reqs))
 
         class LegacyExit(RuntimeError):
             pass
@@ -754,7 +782,7 @@ class SRRPDTest(unittest.TestCase):
     def test_host_validation_rejects_whole_batch_before_append(self):
         import test_sr_fixed_accept as fixed
 
-        for kind in ("tokens", "indices", "lengths", "order"):
+        for kind in ("lengths", "order"):
             reqs = [fixed._Req(), fixed._Req()]
             state = SRFixedAcceptState(2, 4, 4, 4, "cpu")
             alloc = fixed.NPUPagedTokenToKVPoolAllocator(4)
@@ -768,10 +796,6 @@ class SRRPDTest(unittest.TestCase):
                 32,
                 rpd_batch_key(reqs),
             )
-            if kind == "tokens":
-                plan.tokens[1] = []
-            if kind == "indices":
-                plan.rows[1][0] = 8
             if kind == "lengths":
                 plan.pre_lengths[1] = 2
             if kind == "order":

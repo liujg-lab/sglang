@@ -15,8 +15,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.speculative.rpd_verify import (
-    _rpd_compact_edges,
-    _rpd_host_topology,
+    _RPDHostTopology,
     _rpd_select_host,
     rpd_gap_max,
 )
@@ -143,13 +142,21 @@ def build_sr_rpd_input(
     retr = torch.arange(bs * width, dtype=torch.int64).reshape(bs, width)
     nxt = torch.full((bs, width), -1, dtype=torch.int64)
     sibling = torch.full_like(nxt, -1)
+    cand_rows = cand.tolist()
+    rows = bs * width
+    edges: list = []
+    parent_rows: list = []
+    child_tokens: list = []
+    batch_children: list = []
     skipped = list(no_draft) if no_draft is not None else []
     loose = list(disconnected) if disconnected is not None else []
     for b, (pp, ss) in enumerate(zip(parents.tolist(), selected.tolist())):
+        children = [[] for _ in range(width)]
+        parent_of = [-1] * width
         if b < len(skipped) and skipped[b]:
+            batch_children.append(children)
             continue
         loose_slots = set(loose[b]) if b < len(loose) else set()
-        parent_of = [-1] * width
         pos_of = {}
         for node_i, node in enumerate(ss):
             if node not in pos_of:
@@ -169,6 +176,7 @@ def build_sr_rpd_input(
                     continue
                 pos = found + 1
             parent_of[i] = pos
+            children[pos].append(i)
             sibling[b, i] = nxt[b, pos]
             nxt[b, pos] = i
         # Never let a malformed input turn the CPU DFS into an infinite loop.
@@ -180,10 +188,36 @@ def build_sr_rpd_input(
                     return None
                 seen.add(u)
                 u = parent_of[u]
+        # Reverse insertion prepends, so append order is opposite sibling order.
+        for kids in children:
+            kids.reverse()
+        batch_children.append(children)
+        row_tokens = cand_rows[b]
+        for v, p in enumerate(parent_of):
+            if p < 0:
+                continue
+            parent_flat = b * width + p
+            child_tok = int(row_tokens[v])
+            if parent_flat < 0 or parent_flat >= rows:
+                continue
+            if child_tok < 0 or child_tok >= vocab:
+                continue
+            edges.append((b, v, p))
+            parent_rows.append(parent_flat)
+            child_tokens.append(child_tok)
     tree = torch.stack((cand, retr, nxt, sibling))
-    edges, index = _rpd_compact_edges(tree, bs * width, vocab)
-    if index is None:
+    if edges:
+        index = torch.tensor([parent_rows, child_tokens], dtype=torch.int64)
+    else:
         index = torch.empty((2, 0), dtype=torch.int64)
+    retrieve = [[b * width + v for v in range(width)] for b in range(bs)]
+    topology = _RPDHostTopology(
+        cand_rows,
+        retrieve,
+        batch_children,
+        {(b, v): i for i, (b, v, _parent) in enumerate(edges)},
+        tuple(edges),
+    )
     return SRRPDHostInput(
         tree,
         edges,
@@ -192,7 +226,7 @@ def build_sr_rpd_input(
         owner,
         generation,
         batch_key,
-        _rpd_host_topology(tree, edges),
+        topology,
     )
 
 
@@ -283,24 +317,9 @@ class SRRPDWorkspace:
         rows, edges = bs * width, len(context.edges)
         # Metadata checks and lazy imports must finish before the first device
         # operation. An import failure does not imply an in-flight reduction.
-        if (
-            self.key is None
-            or rows > self.rows_cap
-            or edges > self.edges_cap
-            or tuple(logits.shape) != (rows, context.vocab)
-            or logits.dtype != self.key[1]
-            or not logits.is_contiguous()
-        ):
+        if self.key is None or rows > self.rows_cap or edges > self.edges_cap:
             raise RuntimeError("RPD statistics logits or prepared capacity mismatch")
         index = context.edge_index
-        if (
-            index is None
-            or tuple(index.shape) != (2, edges)
-            or index.dtype != torch.int64
-            or index.device != logits.device
-            or not index.is_contiguous()
-        ):
-            raise RuntimeError("RPD statistics edge layout mismatch")
         for tensor, dtype, shape in (
             (self.values, logits.dtype, (self.rows_cap,)),
             (self.argmax, torch.int64, (self.rows_cap,)),

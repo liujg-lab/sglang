@@ -7,9 +7,9 @@ non-root edge is valid, the longest path is committed. Ties break by
 smaller sum of gaps, then leftmost sibling order.
 
 Torch-only so CPU unit tests can import it without the rest of sglang.srt.
-NPU and CUDA keep the vocab reduction and paired edge logits on device and
-still choose the longest path on CPU. Every other device, including CPU,
-uses the reference.
+Production verification on NPU, CUDA, and CPU uses the compact path: the vocab
+reduction and paired edge logits stay on device, and the longest path is still
+chosen on CPU. ``_verify_tree_rpd_cpu`` is an independent reference for tests.
 """
 
 from __future__ import annotations
@@ -25,9 +25,24 @@ logger = logging.getLogger(__name__)
 _logged_rpd_path = False
 _logged_rpd_npu_path = False
 _logged_rpd_cuda_path = False
-_compact_cross_device_bytes = 0
-_compact_stat_waits = 0
 _COMPACT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@dataclass
+class _CompactStats:
+    """Test-facing counters for compact transfers. Production does not read them."""
+
+    cross_device_bytes: int = 0
+    stat_waits: int = 0
+
+    def note_bytes(self, tensor: torch.Tensor) -> None:
+        self.cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
+
+    def note_wait(self) -> None:
+        self.stat_waits += 1
+
+
+_compact_stats = _CompactStats()
 
 
 def rpd_gap_max(tau: float) -> float:
@@ -41,7 +56,7 @@ def rpd_gap_max(tau: float) -> float:
 
 
 def edge_valid_from_logits(z_star: float, z_c: float, tau: float) -> bool:
-    """Accept the edge iff the parent logit gap is within the RPD threshold.
+    """Test-only gap check. Production selection does not call this helper.
 
     tau=0 requires exact equality of the two logits only when they correspond
     to the same argmax token; callers that have token ids should use
@@ -128,6 +143,7 @@ def _verify_tree_rpd_cpu(
     gap_max: float,
     use_equality: bool,
 ) -> None:
+    """Independent reference for tests. Production CPU verification uses compact."""
     bs, n = candidates.shape
     logits_f32 = _prepare_logits(logits).float()
     target_predict = torch.argmax(logits_f32, dim=-1)
@@ -188,39 +204,35 @@ def _verify_tree_rpd_cpu(
 
 def compact_cross_device_bytes() -> int:
     """Bytes moved by the compact helpers between two different devices."""
-    return _compact_cross_device_bytes
+    return _compact_stats.cross_device_bytes
 
 
 def reset_compact_cross_device_bytes() -> None:
-    global _compact_cross_device_bytes
-    _compact_cross_device_bytes = 0
+    _compact_stats.cross_device_bytes = 0
 
 
 def compact_stat_waits() -> int:
     """How many times argmax and edge scalars were waited on together."""
-    return _compact_stat_waits
+    return _compact_stats.stat_waits
 
 
 def reset_compact_stat_waits() -> None:
-    global _compact_stat_waits
-    _compact_stat_waits = 0
+    _compact_stats.stat_waits = 0
 
 
 def _compact_host_read(tensor: torch.Tensor) -> torch.Tensor:
     """Logical D2H. A tensor that is already on CPU is not a cross-device copy."""
-    global _compact_cross_device_bytes
     if tensor.device.type == "cpu":
         return tensor
-    _compact_cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
+    _compact_stats.note_bytes(tensor)
     return tensor.detach().to(device="cpu")
 
 
 def _compact_device_write(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Logical H2D. Same-device tensors, including CPU copies, are not counted."""
-    global _compact_cross_device_bytes
     if tensor.device == device:
         return tensor
-    _compact_cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
+    _compact_stats.note_bytes(tensor)
     return tensor.detach().to(device=device)
 
 
@@ -380,16 +392,14 @@ def _record_stream_event(device: torch.device):
 
 
 def _note_cross_device_bytes(tensor: torch.Tensor) -> None:
-    global _compact_cross_device_bytes
-    _compact_cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
+    _compact_stats.note_bytes(tensor)
 
 
 def _compact_await_stats(
     argmax: torch.Tensor, edge_values: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Bring argmax and optional edge scalars to the host with one wait."""
-    global _compact_stat_waits
-    _compact_stat_waits += 1
+    _compact_stats.note_wait()
     pending = [argmax] if edge_values is None else [argmax, edge_values]
     if all(tensor.device.type == "cpu" for tensor in pending):
         argmax_cpu = _compact_host_read(argmax)
@@ -687,22 +697,19 @@ def verify_tree_rpd(
         use_equality=use_equality,
     )
     backend = _rpd_backend_name(logits.device.type, bool(logits.is_cuda))
+    _verify_tree_rpd_compact(**kwargs)
     if backend == "npu":
-        _verify_tree_rpd_compact(**kwargs)
         if not _logged_rpd_npu_path:
             _logged_rpd_npu_path = True
             logger.info("Speculative RPD verify path: npu_compact_cpu_path")
-        return predicts, accept_index, accept_token_num
-    if backend == "cuda":
-        _verify_tree_rpd_compact(**kwargs)
+    elif backend == "cuda":
         if not _logged_rpd_cuda_path:
             _logged_rpd_cuda_path = True
             logger.info("Speculative RPD verify path: cuda_compact_cpu_path")
-        return predicts, accept_index, accept_token_num
-    if not _logged_rpd_path:
+    elif not _logged_rpd_path:
         _logged_rpd_path = True
         logger.info(
-            "Speculative RPD verify path: cpu_reference device=%s", logits.device
+            "Speculative RPD verify path: cpu_compact_cpu_path device=%s",
+            logits.device,
         )
-    _verify_tree_rpd_cpu(**kwargs)
     return predicts, accept_index, accept_token_num

@@ -962,19 +962,25 @@ class TestRpdCompactTransfers(CustomTestCase):
         self.assertEqual(_rpd_backend_name("cpu", False), "cpu")
 
         called = []
-        original = rpd._verify_tree_rpd_compact
+        original_compact = rpd._verify_tree_rpd_compact
+        original_cpu = rpd._verify_tree_rpd_cpu
 
-        def boom(**kwargs):
-            called.append(1)
-            raise AssertionError("cpu dispatch entered compact")
+        def watch_compact(**kwargs):
+            called.append("compact")
+            original_compact(**kwargs)
 
-        rpd._verify_tree_rpd_compact = boom
+        def forbid_cpu(**kwargs):
+            raise AssertionError("cpu dispatch entered reference")
+
+        rpd._verify_tree_rpd_compact = watch_compact
+        rpd._verify_tree_rpd_cpu = forbid_cpu
         try:
             case = TestRpdLongestPath()._branching_tree()
             _run_rpd(*case, tau=0.2)
         finally:
-            rpd._verify_tree_rpd_compact = original
-        self.assertEqual(called, [])
+            rpd._verify_tree_rpd_compact = original_compact
+            rpd._verify_tree_rpd_cpu = original_cpu
+        self.assertEqual(called, ["compact"])
 
     def test_cuda_backend_uses_compact_not_reference(self):
         called = []
@@ -1011,7 +1017,24 @@ class TestRpdCompactTransfers(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "cuda not available")
     def test_cuda_compact_matches_cpu_reference(self):
         cpu_case = TestRpdLongestPath()._branching_tree()
-        cpu_predicts, cpu_index, cpu_length = _run_rpd(*cpu_case, tau=0.2)
+        candidates, retrive_index, next_token, sibling, logits = cpu_case
+        bs, width = candidates.shape
+        total = int(retrive_index.max().item()) + 1
+        cpu_predicts = torch.full((total,), -1, dtype=torch.int32)
+        cpu_index = torch.full((bs, width), -1, dtype=torch.int32)
+        cpu_length = torch.zeros((bs,), dtype=torch.int32)
+        _verify_tree_rpd_cpu(
+            cpu_predicts,
+            cpu_index,
+            cpu_length,
+            candidates,
+            retrive_index,
+            next_token,
+            sibling,
+            logits,
+            rpd_gap_max(0.2),
+            False,
+        )
         case = [tensor.cuda() for tensor in cpu_case]
         batch, width = case[0].shape
         total = int(case[1].max().item()) + 1
