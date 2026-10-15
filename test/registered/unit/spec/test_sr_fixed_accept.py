@@ -23,6 +23,7 @@ from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
 from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
     SR_FIXED_ACCEPT_ENV,
     SRFixedAcceptState,
+    _parse_pack,
     accept_control_decision,
     apply_cpu_acceptance,
     apply_free_unique_pages,
@@ -425,6 +426,24 @@ class FixedAcceptCpuLoopTest(CustomTestCase):
         self.assertEqual(accepted, [2, 3])
         self.assertEqual(finished, [True, True])
         self.assertEqual(cancel[0].finished_reason, "cancel")
+
+    def test_parse_pack_slices_one_host_table(self):
+        path_cap = 3
+        pack = torch.tensor(
+            [
+                [0, 5, -1, 10, 11, 12, 1, 0, 99],
+                [1, -1, -1, 20, 0, 0, 0, 2, 99],
+                [7, 8, 9, 1, 2, 3, 4, 5, 6],
+            ],
+            dtype=torch.int64,
+        )
+        rows, tokens, pre, errors = _parse_pack(pack, 2, path_cap)
+        self.assertEqual(rows, [[0, 5, -1], [1, -1, -1]])
+        self.assertEqual(tokens, [[10, 11, 12], [20, 0, 0]])
+        self.assertEqual(pre, [1, 0])
+        self.assertEqual(errors, [0, 2])
+        self.assertIsInstance(rows[0][0], int)
+        self.assertIsInstance(pre[0], int)
 
     def test_validate_rejects_the_batch_before_any_append(self):
         with self.assertRaises(RuntimeError):

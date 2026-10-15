@@ -721,7 +721,13 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        seq_lens_pre_verify = batch.seq_lens.clone()
+        runner = self.target_worker.model_runner
+        mamba_verify = (
+            runner.hybrid_gdn_config is not None
+            or runner.mamba2_config is not None
+            or runner.hybrid_lightning_config is not None
+        )
+        seq_lens_pre_verify = batch.seq_lens.clone() if mamba_verify else None
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -791,11 +797,7 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
+        if mamba_verify:
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
             )

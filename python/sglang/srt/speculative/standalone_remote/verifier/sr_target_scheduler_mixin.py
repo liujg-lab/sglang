@@ -32,13 +32,13 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRReplyStatus,
     is_health_check_req as _is_health_check,
     local_spec_shape,
+    make_draft_tokens_and_logits,
 )
 from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRTargetClient,
     make_transport_from_server_args,
 )
 from sglang.srt.utils import DynamicGradMode
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +57,10 @@ def _mm_features_alive(req: Req) -> bool:
 
 def _apply_reply_to_req(req: Req, reply: SRDraftReply) -> None:
     tokens = list(reply.draft_tokens or [])
-    req.cur_drafts = list(tokens)
-    req.draft_tokens_and_logits = {
-        "draft_tokens": torch.tensor(tokens, dtype=torch.int64)
-        if tokens
-        else torch.tensor([0], dtype=torch.int64),
-        "parent_list": reply.parent_list,
-        "top_scores_index": reply.top_scores_index,
-    }
+    req.cur_drafts = tokens
+    req.draft_tokens_and_logits = make_draft_tokens_and_logits(
+        tokens, reply.parent_list, reply.top_scores_index
+    )
     req.sr_draft_tree_version = reply.tree_version
     req.sr_draft_tree_base_committed_len = (
         int(reply.base_committed_len) if reply.tree_version is not None else None
@@ -73,11 +69,7 @@ def _apply_reply_to_req(req: Req, reply: SRDraftReply) -> None:
 
 def _clear_draft(req: Req) -> None:
     req.cur_drafts = []
-    req.draft_tokens_and_logits = {
-        "draft_tokens": torch.tensor([0], dtype=torch.int64),
-        "parent_list": None,
-        "top_scores_index": None,
-    }
+    req.draft_tokens_and_logits = make_draft_tokens_and_logits(None)
     req.sr_draft_tree_version = None
     req.sr_draft_tree_base_committed_len = None
     req.sr_accepted_tree_candidate_indices = None

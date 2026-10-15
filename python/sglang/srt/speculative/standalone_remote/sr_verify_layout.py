@@ -482,45 +482,6 @@ def _assign_ints(dest: torch.Tensor, values) -> None:
         chunk.copy_(torch.as_tensor(seq, dtype=torch.int64))
 
 
-def copy_tokens_into_row(
-    dest: torch.Tensor, src, token_width: int
-) -> None:
-    if src is None or token_width <= 0:
-        return
-    if isinstance(src, torch.Tensor):
-        flat = src.detach().reshape(-1)
-        if flat.device != dest.device:
-            flat = flat.to(dest.device)
-        n = min(int(flat.numel()), token_width)
-        if n:
-            dest[:n] = flat[:n]
-        return
-    n = min(len(src), token_width)
-    if n:
-        _assign_ints(dest[:n], src[:n])
-
-
-def _copy_vector_into_rows(dest: torch.Tensor, vector: torch.Tensor) -> None:
-    """Copy a read-only 1D template into every row, or into a prefix."""
-    if dest.numel() == 0 or vector.numel() == 0 or dest.dim() != 2:
-        return
-    width = int(dest.shape[1])
-    count = min(width, int(vector.numel()))
-    if count == 0:
-        return
-    source = vector[:count].unsqueeze(0).expand(int(dest.shape[0]), count)
-    if count == width:
-        dest.copy_(source)
-    else:
-        dest[:, :count].copy_(source)
-
-
-def _copy_vector_into_row(dest_row: torch.Tensor, vector: torch.Tensor) -> None:
-    count = min(int(dest_row.numel()), int(vector.numel()))
-    if count:
-        dest_row[:count].copy_(vector[:count])
-
-
 def _numpy_prefix(row, values) -> None:
     if values is None:
         return
@@ -535,67 +496,14 @@ def _numpy_prefix(row, values) -> None:
         row[:n] = values[:n]
 
 
-def _try_write_draft_numpy(
-    tokens: torch.Tensor,
-    parents: torch.Tensor,
-    indices: torch.Tensor,
-    plan: DraftPacketPlan,
-) -> bool:
-    """One numpy store per region. A failure falls back before publishing."""
-    if any(tensor.device.type != "cpu" for tensor in (tokens, parents, indices)):
-        return False
-    try:
-        return _write_draft_numpy(tokens, parents, indices, plan)
-    except Exception:
-        return False
-
-
-def _write_draft_numpy(
-    tokens: torch.Tensor,
-    parents: torch.Tensor,
-    indices: torch.Tensor,
-    plan: DraftPacketPlan,
-) -> bool:
-    import numpy as np
-
-    token_np = np.zeros((plan.bs, plan.token_width), dtype=np.int64)
-    for i in range(plan.bs):
-        src = plan.token_rows[i] if i < len(plan.token_rows) else None
-        if plan.token_width > 0:
-            _numpy_prefix(token_np[i], src)
-    if plan.chain_only:
-        # ``topk <= 1`` only. Chain parents are a prefix of the kernel stride.
-        parent_np = np.full((plan.bs, plan.parent_w), -1, dtype=np.int64)
-        index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
-        if plan.bs and plan.parent_w:
-            _numpy_prefix(parent_np[0], plan.chain_parents)
-            parent_np[:] = parent_np[0].copy()
-        if plan.bs and plan.index_w:
-            _numpy_prefix(index_np[0], plan.chain_indices)
-            index_np[:] = index_np[0].copy()
-    else:
-        # Valid tree rows are copied. ``no_draft`` rows stay parent=-1, index=0
-        # so ``idx // topk`` never reads a parent column.
-        parent_np = np.full((plan.bs, plan.parent_w), -1, dtype=np.int64)
-        index_np = np.zeros((plan.bs, plan.index_w), dtype=np.int64)
-        for i, (parent, index) in enumerate(
-            zip(plan.parsed_parents, plan.parsed_indices)
-        ):
-            if parent is None or index is None:
-                continue
-            _numpy_prefix(parent_np[i], parent)
-            _numpy_prefix(index_np[i], index)
-    written = []
-    for tensor, mat in (
-        (tokens, token_np),
-        (parents, parent_np),
-        (indices, index_np),
-    ):
-        if tensor.numel():
-            written.append((tensor.numpy(), mat))
-    for view, mat in written:
-        view[:] = mat
-    return True
+def _broadcast_cpu_prefix(dest, vector: torch.Tensor) -> None:
+    """Write a read-only 1D CPU template into every row prefix."""
+    if dest.size == 0 or vector.numel() == 0:
+        return
+    flat = vector.detach().reshape(-1).numpy()
+    n = min(int(flat.shape[0]), int(dest.shape[1]))
+    if n:
+        dest[:, :n] = flat[:n]
 
 
 def write_draft_regions(
@@ -606,36 +514,40 @@ def write_draft_regions(
 ) -> None:
     """Initialize this round's active region, then copy each row.
 
-    Tokens, parents, and indices start as ``0 / -1 / 0`` when the chain
-    template does not already cover the whole row. Chain templates are only
-    read. Present rows stay host sequences; ``plan_draft_rows`` does not
-    build a tensor per row.
+    The three regions are contiguous CPU tensors. Writes go through their
+    ``numpy`` views, so a reused host packet is cleared before prefixes are
+    filled. Tokens, parents, and indices start as ``0 / -1 / 0``. Chain
+    templates are only read and broadcast into every row. Present rows stay
+    host sequences; ``plan_draft_rows`` does not build a tensor per row.
+    ``no_draft`` rows keep parent ``-1`` and index ``0``.
     """
     if plan.bs == 0:
         return
-    if _try_write_draft_numpy(tokens, parents, indices, plan):
-        return
-    tokens.zero_()
-    for i in range(plan.bs):
-        src = plan.token_rows[i] if i < len(plan.token_rows) else None
-        copy_tokens_into_row(tokens[i], src, plan.token_width)
+    token_view = tokens.numpy()
+    parent_view = parents.numpy()
+    index_view = indices.numpy()
+    if token_view.size:
+        token_view.fill(0)
+        for i in range(plan.bs):
+            src = plan.token_rows[i] if i < len(plan.token_rows) else None
+            _numpy_prefix(token_view[i], src)
     if plan.chain_only:
-        if parents.numel():
-            parents.fill_(-1)
-        if indices.numel():
-            indices.zero_()
-        _copy_vector_into_rows(parents, plan.chain_parents)
-        _copy_vector_into_rows(indices, plan.chain_indices)
+        if parent_view.size:
+            parent_view.fill(-1)
+            _broadcast_cpu_prefix(parent_view, plan.chain_parents)
+        if index_view.size:
+            index_view.fill(0)
+            _broadcast_cpu_prefix(index_view, plan.chain_indices)
         return
-    if parents.numel():
-        parents.fill_(-1)
-    if indices.numel():
-        indices.zero_()
+    if parent_view.size:
+        parent_view.fill(-1)
+    if index_view.size:
+        index_view.fill(0)
     for i, (parent, index) in enumerate(zip(plan.parsed_parents, plan.parsed_indices)):
         if parent is None or index is None:
             continue
-        _assign_ints(parents[i], parent)
-        _assign_ints(indices[i], index)
+        _numpy_prefix(parent_view[i], parent)
+        _numpy_prefix(index_view[i], index)
 
 
 def unlink_disconnected_retrieve_nodes(

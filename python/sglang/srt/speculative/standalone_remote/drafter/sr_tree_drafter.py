@@ -1479,15 +1479,16 @@ class SRTreeDrafter:
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                last_page_lens_cpu = prefix_lens_cpu % self.page_size
-                num_new_pages_per_topk = (
-                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
-                ) // self.page_size
-                seq_lens_cpu = (
-                    prefix_lens_cpu // self.page_size * self.page_size
-                    + num_new_pages_per_topk * (self.page_size * self.topk)
+                layout = plan_paged_tree_layout(
+                    prefix_lens_cpu.tolist(),
+                    self.page_size,
+                    self.topk,
+                    self.speculative_num_steps,
                 )
-                extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
+                seq_lens_cpu = prefix_lens_cpu + torch.tensor(
+                    layout.extend_lens, dtype=prefix_lens_cpu.dtype
+                )
+                extend_num_tokens = sum(layout.extend_lens)
 
             out_cache_loc, token_to_kv_pool_state_backup = (
                 alloc_paged_token_slots_extend(

@@ -661,48 +661,40 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
         sr_eos_cut = [None] * len(accept_index_cpu) if export_sr_paths else None
 
+        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+            append_verify_row,
+        )
+
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            num_accepted = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                num_accepted += 1
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
-                if req.require_reasoning and think_end_id is not None:
-                    req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
-                if req.finished():
-                    has_finished = True
-                    # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1 :] = -1
-                    if sr_eos_cut is not None:
-                        sr_eos_cut[i] = j + 1
-                    break
-                else:
-                    if req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
-                            raise e
-            # Update KV cache tracking for the accepted tokens
-            req.kv_committed_len += num_accepted
-            req.kv_allocated_len = req.kv_committed_len
+            token_row = [
+                predict_cpu[idx] if idx != -1 else None for idx in accept_index_row
+            ]
+            grammar = req.grammar
+            try:
+                _appended, eos_cut, sentinel_col = append_verify_row(
+                    req,
+                    accept_index_row,
+                    token_row,
+                    think_end_id,
+                    on_token=grammar.accept_token if grammar is not None else None,
+                )
+            except ValueError as e:
+                logger.info(f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n")
+                raise e
+            if eos_cut is not None:
+                has_finished = True
+                # set all tokens after finished token to -1
+                accept_index[i, eos_cut:] = -1
+                if sr_eos_cut is not None:
+                    sr_eos_cut[i] = eos_cut
             if not req.finished():
                 unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
+                if sentinel_col is not None:
+                    unfinished_accept_index.append(accept_index[i, :sentinel_col])
                 else:
                     unfinished_accept_index.append(accept_index[i])
-            req.spec_verify_ct += 1
-            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_accepted_tokens += accepted_draft_tokens
-            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1

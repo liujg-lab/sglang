@@ -275,6 +275,48 @@ def validate_packed_rows(
             raise RuntimeError(f"packed accept length {pre} disagrees with row {row_i}")
 
 
+def append_verify_row(req, indices, token_row, think_end_id, *, on_token=None):
+    """Append one verify row until ``-1`` or EOS.
+
+    Returns ``(appended, eos_cut, sentinel_col)``. ``eos_cut`` is the column
+    after the finishing token, or ``None``. ``sentinel_col`` is the ``-1``
+    column that stopped the walk, or ``None`` when the row has no ``-1``.
+
+    Histogram and ``spec_accepted_tokens`` count the original index row,
+    including positions after an EOS cut. ``kv_committed_len`` grows by the
+    appended count only. The index row is not modified. ``on_token`` runs for
+    each kept token that does not finish the request. A ``ValueError`` from
+    that hook leaves the counters unchanged.
+    """
+    appended = 0
+    eos_cut = None
+    sentinel_col = None
+    for j, idx in enumerate(indices):
+        if idx == -1:
+            sentinel_col = j
+            break
+        appended += 1
+        token = token_row[j]
+        req.output_ids.append(token)
+        if getattr(req, "require_reasoning", False) and think_end_id is not None:
+            req.update_reasoning_tokens(token, think_end_id)
+        req.check_finished()
+        if req.finished():
+            eos_cut = j + 1
+            break
+        if on_token is not None:
+            on_token(token)
+    req.kv_committed_len = int(getattr(req, "kv_committed_len", 0) or 0) + appended
+    req.kv_allocated_len = req.kv_committed_len
+    req.spec_verify_ct = int(getattr(req, "spec_verify_ct", 0) or 0) + 1
+    raw_draft = sum(1 for idx in indices if idx != -1) - 1
+    req.spec_accepted_tokens = (
+        int(getattr(req, "spec_accepted_tokens", 0) or 0) + raw_draft
+    )
+    req.update_spec_acceptance_histogram(raw_draft)
+    return appended, eos_cut, sentinel_col
+
+
 def apply_cpu_acceptance(
     reqs,
     rows: Sequence[Sequence[int]],
@@ -293,32 +335,13 @@ def apply_cpu_acceptance(
     finished = []
     truncated = []
     for req, row, token_row in zip(reqs, rows, tokens):
-        original = [int(idx) for idx in row]
-        appended = 0
-        cut = None
-        for j, idx in enumerate(original):
-            if idx == -1:
-                break
-            appended += 1
-            token = int(token_row[j])
-            req.output_ids.append(token)
-            if getattr(req, "require_reasoning", False) and think_end_id is not None:
-                req.update_reasoning_tokens(token, think_end_id)
-            req.check_finished()
-            if req.finished():
-                cut = j + 1
-                break
-        req.kv_committed_len = int(getattr(req, "kv_committed_len", 0) or 0) + appended
-        req.kv_allocated_len = req.kv_committed_len
-        req.spec_verify_ct = int(getattr(req, "spec_verify_ct", 0) or 0) + 1
-        raw_draft = sum(1 for idx in original if idx != -1) - 1
-        req.spec_accepted_tokens = (
-            int(getattr(req, "spec_accepted_tokens", 0) or 0) + raw_draft
+        original = list(row)
+        appended, eos_cut, _sentinel = append_verify_row(
+            req, original, token_row, think_end_id
         )
-        req.update_spec_acceptance_histogram(raw_draft)
         copied = list(original)
-        if cut is not None:
-            for k in range(cut, len(copied)):
+        if eos_cut is not None:
+            for k in range(eos_cut, len(copied)):
                 copied[k] = -1
         accepted.append(appended)
         finished.append(bool(req.finished()))
@@ -1383,17 +1406,18 @@ def _prefix_lengths(batch, bs: int) -> List[int]:
 
 
 def _parse_pack(cpu_pack: torch.Tensor, bs: int, path_cap: int):
+    """Split one host pack. ``tolist()`` already yields Python ints."""
+    table = cpu_pack[:bs].tolist()
     rows = []
     tokens = []
     pre = []
     errors = []
-    for i in range(bs):
-        row = cpu_pack[i, :path_cap].tolist()
-        token_row = cpu_pack[i, path_cap : path_cap * 2].tolist()
-        rows.append([int(v) for v in row])
-        tokens.append([int(v) for v in token_row])
-        pre.append(int(cpu_pack[i, path_cap * 2]))
-        errors.append(int(cpu_pack[i, path_cap * 2 + 1]))
+    length_at = path_cap * 2
+    for line in table:
+        rows.append(line[:path_cap])
+        tokens.append(line[path_cap:length_at])
+        pre.append(line[length_at])
+        errors.append(line[length_at + 1])
     return rows, tokens, pre, errors
 
 

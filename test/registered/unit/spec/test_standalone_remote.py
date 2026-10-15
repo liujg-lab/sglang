@@ -1894,6 +1894,99 @@ class TestStandaloneRemoteTree(CustomTestCase):
         eager_src = inspect.getsource(worker_cls._forward_target_eager)
         self.assertIn("graph_runner = None", eager_src)
 
+    def test_draft_tokens_stay_lists(self):
+        import ast
+        from pathlib import Path
+
+        from sglang.srt.speculative.standalone_remote.sr_protocol import (
+            SRDraftReply,
+            make_draft_tokens_and_logits,
+        )
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_target_scheduler_mixin.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in {"_apply_reply_to_req", "_clear_draft"}
+        ]
+        ns = {
+            "Req": object,
+            "SRDraftReply": SRDraftReply,
+            "make_draft_tokens_and_logits": make_draft_tokens_and_logits,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=nodes, type_ignores=[])
+                ),
+                str(path),
+                "exec",
+            ),
+            ns,
+        )
+        _apply_reply_to_req = ns["_apply_reply_to_req"]
+        _clear_draft = ns["_clear_draft"]
+
+        req = SimpleNamespace()
+        reply = SRDraftReply(
+            rid="a",
+            draft_tokens=[11, 12],
+            parent_list=[-1, 0],
+            top_scores_index=[0, 1],
+            tree_version=3,
+            base_committed_len=4,
+        )
+        _apply_reply_to_req(req, reply)
+        stored = req.draft_tokens_and_logits["draft_tokens"]
+        self.assertEqual(req.cur_drafts, [11, 12])
+        self.assertEqual(stored, [11, 12])
+        self.assertIsInstance(stored, list)
+        self.assertIsNot(stored, req.cur_drafts)
+        self.assertIs(req.draft_tokens_and_logits["parent_list"], reply.parent_list)
+        self.assertIs(req.draft_tokens_and_logits["top_scores_index"], reply.top_scores_index)
+
+        empty_req = SimpleNamespace()
+        empty_reply = SRDraftReply(
+            rid="b",
+            draft_tokens=[],
+            parent_list=[-1],
+            top_scores_index=[0],
+        )
+        _apply_reply_to_req(empty_req, empty_reply)
+        empty_tokens = empty_req.draft_tokens_and_logits["draft_tokens"]
+        self.assertEqual(empty_req.cur_drafts, [])
+        self.assertEqual(empty_tokens, [0])
+        self.assertIs(empty_req.draft_tokens_and_logits["parent_list"], empty_reply.parent_list)
+        self.assertIs(
+            empty_req.draft_tokens_and_logits["top_scores_index"],
+            empty_reply.top_scores_index,
+        )
+
+        cleared = SimpleNamespace()
+        _clear_draft(cleared)
+        cleared_tokens = cleared.draft_tokens_and_logits["draft_tokens"]
+        self.assertEqual(cleared.cur_drafts, [])
+        self.assertEqual(cleared_tokens, [0])
+        self.assertIsNone(cleared.draft_tokens_and_logits["parent_list"])
+        self.assertIsNone(cleared.draft_tokens_and_logits["top_scores_index"])
+        self.assertIsNone(cleared.sr_draft_tree_version)
+        self.assertIsNone(cleared.sr_draft_tree_base_committed_len)
+        self.assertIsNone(cleared.sr_accepted_tree_candidate_indices)
+        self.assertIsNot(cleared_tokens, empty_tokens)
+
+        first = make_draft_tokens_and_logits(None)
+        second = make_draft_tokens_and_logits(None)
+        self.assertEqual(first["draft_tokens"], [0])
+        self.assertIsNone(first["parent_list"])
+        self.assertIsNone(first["top_scores_index"])
+        self.assertIsNot(first["draft_tokens"], second["draft_tokens"])
+        self.assertIsNot(first["draft_tokens"], cleared_tokens)
+
     def test_advance_tree_draft_positions_increments_mrope(self):
         if torch is None:
             self.skipTest("torch not available")

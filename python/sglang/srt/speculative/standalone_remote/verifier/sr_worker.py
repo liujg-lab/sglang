@@ -24,6 +24,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     is_health_check_req as _is_health_check,
+    make_draft_tokens_and_logits,
 )
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     bind_graph_host_metrics,
@@ -39,10 +40,6 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
 )
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_DRAFT = {
-    "draft_tokens": torch.tensor([0], dtype=torch.int64, device="cpu"),
-}
 
 
 def _req_committed_len(req) -> int:
@@ -414,7 +411,13 @@ class StandaloneRemoteWorker:
         metrics = getattr(batch, "sr_round_metrics", None)
         prepare_start = time.perf_counter()
         prepare_hidden = self._need_target_hidden(batch)
-        seq_lens_pre_verify = batch.seq_lens.clone()
+        runner = self.target_worker.model_runner
+        mamba_verify = (
+            runner.hybrid_gdn_config is not None
+            or runner.mamba2_config is not None
+            or runner.hybrid_lightning_config is not None
+        )
+        seq_lens_pre_verify = batch.seq_lens.clone() if mamba_verify else None
         seq_lens_cpu_pre = _snapshot_seq_lens_cpu(batch)
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = spec_info.draft_token_num
@@ -561,11 +564,7 @@ class StandaloneRemoteWorker:
                 res.accepted_indices
             ]
 
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
+        if mamba_verify:
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
@@ -788,7 +787,7 @@ class StandaloneRemoteWorker:
                         )
                 req.check_finished()
             req.cur_drafts = []
-            req.draft_tokens_and_logits = _default_draft()
+            req.draft_tokens_and_logits = make_draft_tokens_and_logits(None)
             req.sr_accepted_tree_candidate_indices = None
             req.sr_draft_tree_version = None
             req.sr_draft_tree_base_committed_len = None
@@ -989,9 +988,3 @@ def _add_ar_fallback_logprobs(
             req.output_token_ids_logprobs_idx.append(_row_to_list(tok_idx, i))
 
 
-def _default_draft() -> dict:
-    return {
-        "draft_tokens": _DEFAULT_DRAFT["draft_tokens"].clone(),
-        "parent_list": None,
-        "top_scores_index": None,
-    }

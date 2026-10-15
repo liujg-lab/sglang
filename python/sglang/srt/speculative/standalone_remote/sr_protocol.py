@@ -38,6 +38,25 @@ def local_spec_shape(server_args) -> Tuple[int, int, int]:
     return (topk, steps, width)
 
 
+def make_draft_tokens_and_logits(
+    tokens: Optional[List[int]],
+    parent_list: Optional[List[int]] = None,
+    top_scores_index: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Host draft row stored on a request.
+
+    Tokens stay a list. ``cur_drafts`` already holds the same ids, so this
+    does not build a tensor. An empty row is a fresh ``[0]`` sentinel, not a
+    shared list.
+    """
+    row = list(tokens) if tokens else [0]
+    return {
+        "draft_tokens": row,
+        "parent_list": parent_list,
+        "top_scores_index": top_scores_index,
+    }
+
+
 def parse_spec_shape(value: Any) -> Optional[Tuple[int, ...]]:
     """Parse a wire spec shape.
 
