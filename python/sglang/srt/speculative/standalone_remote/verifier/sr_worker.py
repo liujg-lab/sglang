@@ -1,6 +1,5 @@
 import logging
 import time
-from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import torch
@@ -33,6 +32,7 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
 )
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     bind_graph_host_metrics,
+    metrics_phase,
     restore_graph_host_metrics,
 )
 from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
@@ -230,7 +230,7 @@ class StandaloneRemoteWorker:
         A tree-decode round stores ``(batch, result)`` on ``_sr_hidden_round``
         so construct and verify share one request scan.
         """
-        cached = getattr(self, "_sr_hidden_round", None)
+        cached = self._sr_hidden_round
         if cached is not None and cached[0] is batch:
             return cached[1]
         if getattr(self.server_args, "enable_return_hidden_states", False):
@@ -274,7 +274,7 @@ class StandaloneRemoteWorker:
         metrics = getattr(batch, "sr_round_metrics", None)
         self._sr_hidden_round = (batch, self._need_target_hidden(batch))
         try:
-            with metrics.phase("construct_tree") if metrics else nullcontext():
+            with metrics_phase(metrics, "construct_tree"):
                 spec_info = self.construct_draft_input(
                     batch, draft_num_tokens, spec_steps
                 )
@@ -444,11 +444,7 @@ class StandaloneRemoteWorker:
         if paged_backend is not None:
             paged_backend._sr_paged_metrics = metrics
         try:
-            with (
-                metrics.phase("verify_forward", device=True)
-                if metrics
-                else nullcontext()
-            ):
+            with metrics_phase(metrics, "verify_forward", device=True):
                 batch_result = self.target_worker.forward_batch_generation(
                     model_worker_batch, is_verify=True
                 )
@@ -915,7 +911,7 @@ class StandaloneRemoteWorker:
             index_rows.append(None if dtl is None else dtl.get("top_scores_index"))
         rpd_kwargs = {}
         if (
-            getattr(self, "_fixed_accept_state", None) is not None
+            self._fixed_accept_state is not None
             and getattr(self.server_args, "speculative_verify_mode", None) == "rpd"
         ):
             rpd_kwargs = dict(

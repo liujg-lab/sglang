@@ -4,11 +4,19 @@ import logging
 import math
 import time
 from collections import Counter, defaultdict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 
 logger = logging.getLogger(__name__)
+
+
+def metrics_phase(metrics, name, *, device=False, stream=None):
+    """Return ``metrics.phase`` or an empty context when metrics are absent."""
+    phase = getattr(metrics, "phase", None)
+    if not callable(phase):
+        return nullcontext()
+    return phase(name, device=device, stream=stream)
 
 GRAPH_HOST_STAGES = (
     "lengths",

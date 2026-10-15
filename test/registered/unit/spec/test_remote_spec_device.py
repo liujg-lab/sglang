@@ -1049,6 +1049,7 @@ class TestRemoteSpecDevice(CustomTestCase):
         from sglang.test.sr_reference import lookup_candidate_slots
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
             pack_tree_reply,
+            prepare_tree_reply,
         )
 
         batch, topk, steps = 2, 2, 2
@@ -1063,8 +1064,16 @@ class TestRemoteSpecDevice(CustomTestCase):
             [[4, 4, 1, 2], [4, 9, 1, 8]], dtype=torch.int64, device=device
         )
         compact = torch.arange(batch * topk * steps, dtype=torch.int64, device=device)
-        needed = (
-            tokens.numel() + parents.numel() + indices.numel() + indices.numel()
+        segments, needed = prepare_tree_reply(
+            tokens,
+            parents,
+            indices,
+            node_ids,
+            compact,
+            batch=batch,
+            topk=topk,
+            steps=steps,
+            write_slots=True,
         )
         buf = torch.empty(needed, dtype=torch.int64, device=device)
         pack_tree_reply(
@@ -1074,6 +1083,8 @@ class TestRemoteSpecDevice(CustomTestCase):
             indices,
             node_ids,
             compact,
+            segments,
+            needed,
             batch=batch,
             topk=topk,
             steps=steps,
@@ -2243,7 +2254,7 @@ class TestSRTreeCandidates(unittest.TestCase):
         parents = (
             torch.cat(parent_list[:-1], 1)
             if workspace.steps > 1
-            else torch.empty((batch, 0))
+            else torch.empty((batch, 0), dtype=torch.int64)
         )
         expected = parents, selected, torch.gather(tokens, 1, selected)
         actual = workspace.finish(batch)

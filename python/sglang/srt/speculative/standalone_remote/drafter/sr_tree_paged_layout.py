@@ -11,7 +11,6 @@ import logging
 import math
 import os
 import sys
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -312,6 +311,9 @@ class PrefixTailCopyBuffers:
         from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
             KVMoveSubmittedError,
         )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            metrics_phase,
+        )
         from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
             alloc_host,
             submit_copy,
@@ -333,16 +335,11 @@ class PrefixTailCopyBuffers:
                 "prefix-tail CPU preparation must run outside graph capture"
             )
 
-        def phase(name, device=False):
-            return (
-                metrics.phase(name, device=device, stream=stream)
-                if metrics is not None
-                else nullcontext()
-            )
-
         try:
             # Host source reuse only. Device consumers are ordered on stream.
-            with phase("prefix_tail_metadata_reuse_wait"):
+            with metrics_phase(
+                metrics, "prefix_tail_metadata_reuse_wait", stream=stream
+            ):
                 wait_event(self.meta_event)
             self.meta_event = None
             self.retired = [(e, refs) for e, refs in self.retired if not e.query()]
@@ -389,7 +386,7 @@ class PrefixTailCopyBuffers:
             if metrics is not None:
                 metrics.counts["prefix_tail_workspace_grow"] += 1
         self.stream = stream
-        with phase("prefix_tail_plan_cpu"):
+        with metrics_phase(metrics, "prefix_tail_plan_cpu", stream=stream):
             offset = 0
             for b, prefix in enumerate(prefixes):
                 rem = prefix % page
@@ -412,11 +409,13 @@ class PrefixTailCopyBuffers:
             for tensor in (req, pool, branch):
                 tensor.record_stream(stream)
         try:
-            with phase("prefix_tail_metadata_h2d"):
+            with metrics_phase(metrics, "prefix_tail_metadata_h2d", stream=stream):
                 self.meta_event = submit_copy(
                     self.meta_device[:bs], self.meta_host[:bs]
                 )
-            with phase("prefix_tail_slot_kernel", device=True):
+            with metrics_phase(
+                metrics, "prefix_tail_slot_kernel", device=True, stream=stream
+            ):
                 sr_small_kernels_npu.prefix_tail(
                     req,
                     pool,

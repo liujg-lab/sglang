@@ -267,6 +267,8 @@ class TestTreeReplyPack(unittest.TestCase):
                 indices,
                 node_ids,
                 compact,
+                segments,
+                needed,
                 batch=batch,
                 topk=topk,
                 steps=steps,

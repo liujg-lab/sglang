@@ -86,6 +86,8 @@ def pack_tree_reply(
     indices,
     node_ids,
     compact,
+    segments,
+    needed,
     *,
     batch: int,
     topk: int,
@@ -93,17 +95,6 @@ def pack_tree_reply(
     write_slots: bool,
 ) -> None:
     """Write one reply into ``buf`` (1-D int64). Raises before any launch."""
-    segments, needed = prepare_tree_reply(
-        tokens,
-        parents,
-        indices,
-        node_ids,
-        compact,
-        batch=batch,
-        topk=topk,
-        steps=steps,
-        write_slots=write_slots,
-    )
     del segments
     if buf.ndim != 1 or buf.dtype != torch.int64 or not buf.is_contiguous():
         raise RuntimeError("tree reply buffer must be a contiguous int64 vector")
@@ -166,32 +157,40 @@ def warm_tree_reply_pack(device, topk: int, steps: int, num_draft_tokens: int):
     indices = torch.topk(scores, k=width, dim=-1).indices
     node_ids = torch.zeros((steps, topk), dtype=torch.int64, device=dev)
     compact = torch.zeros((topk * steps,), dtype=torch.int64, device=dev)
-    needed = tokens.numel() + parents.numel() + indices.numel()
-    buf = torch.empty(needed + indices.numel(), dtype=torch.int64, device=dev)
-    pack_tree_reply(
-        buf,
-        tokens,
-        parents,
-        indices,
-        None,
-        None,
-        batch=1,
-        topk=topk,
-        steps=steps,
-        write_slots=False,
+    buf = torch.empty(
+        tokens.numel() + parents.numel() + 2 * indices.numel(),
+        dtype=torch.int64,
+        device=dev,
     )
-    pack_tree_reply(
-        buf,
-        tokens,
-        parents,
-        indices,
-        node_ids,
-        compact,
-        batch=1,
-        topk=topk,
-        steps=steps,
-        write_slots=True,
-    )
+    for slots, ids, table in (
+        (False, None, None),
+        (True, node_ids, compact),
+    ):
+        segments, needed = prepare_tree_reply(
+            tokens,
+            parents,
+            indices,
+            ids,
+            table,
+            batch=1,
+            topk=topk,
+            steps=steps,
+            write_slots=slots,
+        )
+        pack_tree_reply(
+            buf,
+            tokens,
+            parents,
+            indices,
+            ids,
+            table,
+            segments,
+            needed,
+            batch=1,
+            topk=topk,
+            steps=steps,
+            write_slots=slots,
+        )
     return [buf, tokens, parents, indices, node_ids, compact]
 
 

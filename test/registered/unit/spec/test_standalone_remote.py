@@ -1792,6 +1792,7 @@ class TestTargetPrefillOverlap(CustomTestCase):
         mixin.sr_rpc_seq = 3
         client = MagicMock()
         mixin.sr_client = client
+        mixin.sr_breaker = None
         mixin.reset_standalone_remote_target_state()
         self.assertEqual(mixin.sr_rpc_seq, 0)
         client._drain.assert_called_once()

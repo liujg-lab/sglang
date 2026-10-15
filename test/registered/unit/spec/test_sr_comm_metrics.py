@@ -25,6 +25,7 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     begin_graph_host_sample,
     bind_graph_host_metrics,
     measure_call,
+    metrics_phase,
     record_graph_host_sample_safely,
     restore_graph_host_metrics,
 )
@@ -655,6 +656,20 @@ class TestSRRoundMetrics(unittest.TestCase):
             metrics.host_max["tree_alloc_kv"], metrics.host["tree_alloc_kv"]
         )
         self.assertGreater(metrics.host["tree_alloc_kv"], 0.02)
+
+    def test_metrics_phase_skips_missing_and_records_like_phase(self):
+        with metrics_phase(None, "construct_tree"):
+            pass
+        metrics = SRRoundMetrics("Draft")
+        self.assertFalse(metrics.host)
+        with metrics.round():
+            with metrics.phase("tree_alloc_kv"):
+                pass
+            recorded = metrics.host["tree_alloc_kv"]
+            with metrics_phase(metrics, "tree_alloc_kv"):
+                pass
+        self.assertGreater(recorded, 0)
+        self.assertGreater(metrics.host["tree_alloc_kv"], recorded)
 
     def test_repeated_calls_missing_phase_and_window_reset(self):
         metrics = SRRoundMetrics("Draft")

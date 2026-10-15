@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import logging
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import metrics_phase
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
 )
@@ -588,13 +589,12 @@ class KVMoveWorkspace:
                     tensor.record_stream(stream)
                 for tensor in self.scratch:
                     tensor.record_stream(stream)
-            phase = getattr(self.metrics, "phase", None)
-            scope = (
-                phase("kv_move_eager", device=True, stream=stream)
-                if callable(phase) and not self._inside_capture
-                else nullcontext()
-            )
-            with scope:
+            with metrics_phase(
+                None if self._inside_capture else self.metrics,
+                "kv_move_eager",
+                device=True,
+                stream=stream,
+            ):
                 run()
         except BaseException as exc:
             self._poison()

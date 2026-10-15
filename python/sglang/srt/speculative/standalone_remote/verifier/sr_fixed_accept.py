@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import metrics_phase
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
     alloc_host,
@@ -351,38 +351,8 @@ def apply_cpu_acceptance(
 
 def _timed(metrics, name, fn, device=False):
     """Account a stage without retrying ``fn`` or replacing its exception."""
-    start = time.perf_counter()
-    event_pair = None
-    try:
-        if (
-            device
-            and metrics is not None
-            and getattr(metrics, "active", False)
-            and getattr(metrics, "device_module", None) is not None
-            and int(getattr(metrics, "rounds", 0)) % 32 == 0
-            and len(getattr(metrics, "pending", ())) < 16
-        ):
-            factory = metrics.device_module.Event
-            ev_start = factory(enable_timing=True)
-            ev_end = factory(enable_timing=True)
-            ev_start.record()
-            event_pair = (ev_start, ev_end)
-    except Exception:
-        event_pair = None
-    completed = False
-    try:
-        result = fn()
-        completed = True
-        return result
-    finally:
-        try:
-            if metrics is not None and getattr(metrics, "active", False):
-                metrics.add_host(name, time.perf_counter() - start)
-            if event_pair is not None and completed:
-                event_pair[1].record()
-                metrics.pending.append((name, event_pair[0], event_pair[1]))
-        except Exception:
-            pass
+    with metrics_phase(metrics, name, device=device):
+        return fn()
 
 
 def _allocator_supported(allocator) -> Optional[str]:
@@ -895,21 +865,14 @@ class SRFixedAcceptState:
         )
 
     def finalize_from_host(
-        self, batch, logits_output, page_size, topk, allocator, plan, batch_key=None
+        self, batch, logits_output, page_size, topk, allocator, plan
     ):
         """RPD already owns CPU tokens. Never pack or read device accept results."""
-        from sglang.srt.speculative.standalone_remote.sr_rpd import (
-            SRRPDHostPlan,
-            rpd_batch_key,
-        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import SRRPDHostPlan
 
         bs = len(batch.reqs)
-        if batch_key is None:
-            batch_key = rpd_batch_key(batch.reqs)
         if not isinstance(plan, SRRPDHostPlan) or plan.consumed:
             raise RuntimeError("invalid or consumed RPD host plan")
-        if plan.batch_key != batch_key:
-            raise RuntimeError("RPD host plan request order or generation changed")
         if not (len(plan.rows) == len(plan.tokens) == len(plan.pre_lengths) == bs):
             raise RuntimeError("RPD host plan batch mismatch")
         if bs > self.B_cap or int(page_size) != self.page_size or int(topk) <= 1:

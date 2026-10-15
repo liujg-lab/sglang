@@ -513,6 +513,9 @@ class Scheduler(
         role = self.server_args.standalone_remote_role
         if role not in ("target", "draft"):
             raise ValueError(f"Invalid STANDALONE_REMOTE role: {role}")
+        self.sr_client = None
+        self.sr_breaker = None
+        self.sr_speculation_stopped = False
         if role == "draft":
             self.paused_reqs: List[Req] = []
             self.paused_reqs_lock = threading.RLock()

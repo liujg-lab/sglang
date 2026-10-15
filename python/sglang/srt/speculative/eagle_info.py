@@ -510,7 +510,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.topk,
                     token_to_kv_pool_allocator,
                     host_plan,
-                    batch_key=rpd_live_batch_key,
                 )
                 return _eagle_output_from_fixed(raw, batch, self.topk)
             predict, accept_index, accept_length = verify_tree_rpd(

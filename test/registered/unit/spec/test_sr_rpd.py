@@ -404,7 +404,7 @@ class SRRPDTest(unittest.TestCase):
                 if case == "capacity":
                     ws.rows_cap = 1
                 elif case == "buffer":
-                    ws.argmax = ws.argmax.int()
+                    context.edge_index = context.edge_index.clone()
                 with (
                     patch.object(torch, "max") as maximum,
                     patch.object(
@@ -663,7 +663,6 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(result, "committed")
         penalizer.apply.assert_called_once()
         finalize.assert_called_once()
-        self.assertEqual(finalize.call_args.kwargs["batch_key"], rpd_batch_key(reqs))
 
         class LegacyExit(RuntimeError):
             pass
@@ -782,28 +781,43 @@ class SRRPDTest(unittest.TestCase):
     def test_host_validation_rejects_whole_batch_before_append(self):
         import test_sr_fixed_accept as fixed
 
-        for kind in ("lengths", "order"):
-            reqs = [fixed._Req(), fixed._Req()]
-            state = SRFixedAcceptState(2, 4, 4, 4, "cpu")
-            alloc = fixed.NPUPagedTokenToKVPoolAllocator(4)
-            batch, _ = fixed.FixedAcceptFinalizeTest()._batch(
-                reqs, [1, 1], torch.arange(8), alloc.kv_buffer
+        reqs = [fixed._Req(), fixed._Req()]
+        state = SRFixedAcceptState(2, 4, 4, 4, "cpu")
+        alloc = fixed.NPUPagedTokenToKVPoolAllocator(4)
+        batch, _ = fixed.FixedAcceptFinalizeTest()._batch(
+            reqs, [1, 1], torch.arange(8), alloc.kv_buffer
+        )
+        plan = SRRPDHostPlan(
+            [[0, -1, -1, -1], [4, -1, -1, -1]],
+            [[1, 0, 0, 0], [2, 0, 0, 0]],
+            [0, 0],
+            32,
+            rpd_batch_key(reqs),
+        )
+        plan.pre_lengths[1] = 2
+        with self.assertRaises(RuntimeError):
+            state.finalize_from_host(batch, SimpleNamespace(), 4, 2, alloc, plan)
+        self.assertEqual([r.output_ids for r in reqs], [[], []])
+        self.assertEqual(alloc.freed, [])
+
+        reqs = [fixed._Req(), fixed._Req()]
+        state = SRFixedAcceptState(2, 4, 6, 4, "cpu")
+        alloc = fixed.NPUPagedTokenToKVPoolAllocator(4)
+        packet, _ = packet_input(reqs=reqs)
+        swapped = rpd_batch_key(list(reversed(reqs)))
+        reason = state.reject_before_alloc(
+            **fixed._admit_kwargs(
+                state,
+                verify_mode="rpd",
+                logits=torch.zeros(12, 32),
+                allocator=alloc,
+                rpd_host_input=packet.rpd_input,
+                rpd_live_batch_key=swapped,
             )
-            plan = SRRPDHostPlan(
-                [[0, -1, -1, -1], [4, -1, -1, -1]],
-                [[1, 0, 0, 0], [2, 0, 0, 0]],
-                [0, 0],
-                32,
-                rpd_batch_key(reqs),
-            )
-            if kind == "lengths":
-                plan.pre_lengths[1] = 2
-            if kind == "order":
-                batch.reqs.reverse()
-            with self.assertRaises(RuntimeError):
-                state.finalize_from_host(batch, SimpleNamespace(), 4, 2, alloc, plan)
-            self.assertEqual([r.output_ids for r in reqs], [[], []])
-            self.assertEqual(alloc.freed, [])
+        )
+        self.assertEqual(reason, "rpd_batch_key")
+        self.assertEqual([r.output_ids for r in reqs], [[], []])
+        self.assertEqual(alloc.freed, [])
 
     def test_kv_scratch_preflight_and_submitted_failure(self):
         import test_sr_fixed_accept as fixed

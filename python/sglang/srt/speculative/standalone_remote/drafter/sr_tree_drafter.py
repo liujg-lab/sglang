@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -84,6 +83,7 @@ from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
     remap_tree_kv_,
     warm_private_slot_move,
 )
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import metrics_phase
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
 )
@@ -220,7 +220,7 @@ class SRTreeDrafter:
         self._identity_table_key = self._identity_storage_key()
 
     def _check_identity_table(self) -> None:
-        if not getattr(self, "_identity_table_frozen", False):
+        if not self._identity_table_frozen:
             return
         if self._identity_storage_key() != self._identity_table_key:
             raise RuntimeError(
@@ -236,7 +236,7 @@ class SRTreeDrafter:
             if not capturing:
                 self._identity_eager.reserve_rows(rows)
             return
-        if capturing or getattr(self, "_identity_table_frozen", False):
+        if capturing or self._identity_table_frozen:
             raise RuntimeError(
                 "identity table cannot grow during capture or after graph binding"
             )
@@ -651,7 +651,7 @@ class SRTreeDrafter:
             warmup_synchronize(self.device)
             reply_pack_s = time.perf_counter() - t_pack
             del reply_holds
-            if getattr(self, "sr_tree_paged", False):
+            if self.sr_tree_paged:
                 combos = self._sr_warm_layout_shapes()
                 coverage = warm_draft_alloc_mapping(self)
                 alloc_keys = coverage.get("allocation") or []
@@ -714,7 +714,7 @@ class SRTreeDrafter:
             getattr(scheduler, "_sr_round_metrics", None) if scheduler is not None else None
         )
         try:
-            with metrics.phase("tree_result_wait_pack") if metrics else nullcontext():
+            with metrics_phase(metrics, "tree_result_wait_pack"):
                 self._pack_tree_windows(
                     parent_list,
                     top_scores_index,
@@ -855,12 +855,8 @@ class SRTreeDrafter:
             raise
 
     def _tree_phase(self, name, device=False):
-        from contextlib import nullcontext
-
         metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
-        if metrics is None or not hasattr(metrics, "phase"):
-            return nullcontext()
-        return metrics.phase(name, device=device)
+        return metrics_phase(metrics, name, device=device)
 
     def _count_tree(self, name: str, value: int = 1) -> None:
         metrics = getattr(getattr(self, "scheduler", None), "_sr_round_metrics", None)
@@ -994,6 +990,8 @@ class SRTreeDrafter:
                         indices,
                         node_ids if write_slots else None,
                         compact if write_slots else None,
+                        segments,
+                        needed,
                         batch=batch,
                         topk=topk,
                         steps=steps,
@@ -1079,7 +1077,7 @@ class SRTreeDrafter:
         self._reclaim_abandoned_leases()
         scheduler = self.scheduler
         metrics = getattr(scheduler, "_sr_round_metrics", None)
-        with metrics.phase("tree_make_batch") if metrics else nullcontext():
+        with metrics_phase(metrics, "tree_make_batch"):
             batch = scheduler._sr_make_decode_batch(reqs)
         spec_info = EagleDraftInput(
             topk_p=topk_p,
@@ -1094,7 +1092,7 @@ class SRTreeDrafter:
         batch.return_hidden_states = False
         txn = SRTreeExpandTxn()
         self._sr_last_abandon_has_event = False
-        with metrics.phase("tree_alloc_kv") if metrics else nullcontext():
+        with metrics_phase(metrics, "tree_alloc_kv"):
             token_to_kv_pool_state_backup, lease_state = self._alloc_tree_kv(batch)
         # Captured here so a later private pack cannot change the seal decision.
         # AST tests bind this method onto a namespace that does not carry the helper.
@@ -1119,7 +1117,7 @@ class SRTreeDrafter:
             t_paged = time.perf_counter()
             paged_graph_selected = None
             if (
-                getattr(self, "sr_tree_paged", False)
+                self.sr_tree_paged
                 and batch.out_cache_loc.device.type == "npu"
             ):
                 # Admission reads CPU lengths and captured geometry only. Select
@@ -1152,7 +1150,7 @@ class SRTreeDrafter:
                                 "paged_metadata_draft_admission_fallback"
                             ] += 1
                 forward_batch._sr_paged_replay_plan = plan
-            if getattr(self, "sr_tree_paged", False):
+            if self.sr_tree_paged:
                 txn.mark_copy_begin()
                 prepare = getattr(self, "_prepare_paged_tree_round", None)
                 if prepare is not None:
@@ -1189,9 +1187,7 @@ class SRTreeDrafter:
                     metrics.counts["tree_graph_key_first_use"] += 1
                     metrics.counts[f"tree_graph_first_{key}"] += 1
             t_exec = time.perf_counter()
-            with (
-                metrics.phase("tree_forward", device=True) if metrics else nullcontext()
-            ):
+            with metrics_phase(metrics, "tree_forward", device=True):
                 txn.mark_compute_begin()
                 if can_cuda_graph:
                     try:
@@ -1990,7 +1986,7 @@ class SRTreeDrafter:
         once. A unit whose pages are all unreferenced stays the original
         object. A failed release is left untouched.
         """
-        from .sr_resource_quarantine import release_unknown
+        from .sr_resource_quarantine import _page_of, release_unknown
 
         if release_unknown(record):
             return
@@ -2003,10 +1999,6 @@ class SRTreeDrafter:
             return
         alloc = getattr(self, "token_to_kv_pool_allocator", None)
         page_size = max(1, int(getattr(alloc, "page_size", 1) or 1))
-
-        def page_of(slot):
-            slot = int(slot)
-            return slot if page_size == 1 else slot // page_size
 
         def flat_ids(unit):
             if torch.is_tensor(unit):
@@ -2031,7 +2023,7 @@ class SRTreeDrafter:
             committed = max(0, min(int(committed), width))
             if committed:
                 for slot in mapping[idx, :committed].detach().view(-1).tolist():
-                    live_pages.add(page_of(slot))
+                    live_pages.add(_page_of(slot, page_size))
         states = list(record.states)
         if len(states) < len(record.units):
             states.extend(["unsubmitted"] * (len(record.units) - len(states)))
@@ -2049,7 +2041,7 @@ class SRTreeDrafter:
             drop = []
             keep = []
             for slot in ids:
-                page = page_of(slot)
+                page = _page_of(slot, page_size)
                 if page in live_pages:
                     keep.append(slot)
                 elif page in queued_pages:
@@ -2057,7 +2049,7 @@ class SRTreeDrafter:
                 else:
                     drop.append(slot)
             for slot in drop:
-                queued_pages.add(page_of(slot))
+                queued_pages.add(_page_of(slot, page_size))
             if keep and drop:
                 releasable.append(take_ids(unit, drop))
                 retained.append(take_ids(unit, keep))
@@ -2334,7 +2326,7 @@ class SRTreeDrafter:
                 kv_pool, rows * n_prev_steps, domain="tree_eager"
             )
         active = None
-        if getattr(self, "sr_tree_paged", False):
+        if self.sr_tree_paged:
             inners = getattr(self.draft_attn_backend, "attn_backends", ())
             meta = (
                 getattr(

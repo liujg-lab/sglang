@@ -297,7 +297,7 @@ def warm_sr_target_kernels(worker) -> dict:
             "[SR] target greedy verify warmup skipped: %s=0", SR_TREE_WARMUP_ENV
         )
         return coverage
-    fixed_state = getattr(worker, "_fixed_accept_state", None)
+    fixed_state = worker._fixed_accept_state
     if fixed_state is not None:
         try:
             runner = getattr(

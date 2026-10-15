@@ -175,10 +175,10 @@ class SchedulerStandaloneRemoteTargetMixin:
         self._sr_hold_finish_flush = False
         self.sr_speculation_stopped = False
         self.sr_seen_generation = None
-        client = getattr(self, "sr_client", None)
+        client = self.sr_client
         if client is not None:
             client._drain()
-        breaker = getattr(self, "sr_breaker", None)
+        breaker = self.sr_breaker
         if breaker is not None:
             breaker.reset()
         if self.tp_rank == 0:
@@ -222,7 +222,7 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_sync_connection(self) -> None:
         generation = None
         if self.tp_size == 1 or self.tp_rank == 0:
-            client = getattr(self, "sr_client", None)
+            client = self.sr_client
             generation = getattr(client, "connection_generation", None)
         if self.tp_size > 1:
             generation = self._sr_broadcast_obj(generation)
@@ -237,7 +237,7 @@ class SchedulerStandaloneRemoteTargetMixin:
             req.sr_force_snapshot = True
 
     def _sr_stop_speculation(self, reason: str) -> None:
-        if getattr(self, "sr_speculation_stopped", False):
+        if self.sr_speculation_stopped:
             return
         self.sr_speculation_stopped = True
         logger.warning("[SR] stop speculation for session: %s", reason)
@@ -357,7 +357,7 @@ class SchedulerStandaloneRemoteTargetMixin:
     ) -> Optional[SRInflight]:
         if not reqs:
             return None
-        if getattr(self, "sr_speculation_stopped", False) and action in (
+        if self.sr_speculation_stopped and action in (
             SRAction.PREFILL,
             SRAction.STEP,
         ):
@@ -499,7 +499,7 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_observe_rpc(self, inflight: SRInflight, *, got_packet: bool) -> None:
         if not inflight.wait_reply:
             return
-        breaker = getattr(self, "sr_breaker", None)
+        breaker = self.sr_breaker
         if breaker is None:
             return
         if inflight.send_ok and got_packet:
@@ -563,10 +563,10 @@ class SchedulerStandaloneRemoteTargetMixin:
         return retry
 
     def _sr_step_candidates(self, reqs: List[Req]) -> List[Req]:
-        breaker = getattr(self, "sr_breaker", None)
+        breaker = self.sr_breaker
         if breaker is not None and not breaker.should_send():
             return []
-        if getattr(self, "sr_speculation_stopped", False):
+        if self.sr_speculation_stopped:
             return []
         return [
             req for req in reqs if getattr(req, "sr_stop_spec", False) is not True
@@ -578,7 +578,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         replies: Dict[str, SRDraftReply],
         pending: Dict[str, SRPendingEntry],
     ) -> Dict[str, SRDraftReply]:
-        if getattr(self, "sr_speculation_stopped", False):
+        if self.sr_speculation_stopped:
             return {}
         retry = self._sr_apply_commit_acks(reqs, replies, pending)
         if not retry:
@@ -588,7 +588,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         snap, snap_pending = self._sr_rpc(
             SRAction.STEP, retry, include_full_context=True
         )
-        if getattr(self, "sr_speculation_stopped", False):
+        if self.sr_speculation_stopped:
             return {}
         again = self._sr_apply_commit_acks(retry, snap, snap_pending)
         metrics = get_sr_round_metrics(self, "Target")
@@ -702,7 +702,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         self, reqs: List[Req], replies: Dict[str, SRDraftReply]
     ) -> int:
         n_ok = 0
-        session_stopped = getattr(self, "sr_speculation_stopped", False)
+        session_stopped = self.sr_speculation_stopped
         for req in reqs:
             if _is_health_check(req):
                 continue
@@ -731,7 +731,7 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_skip_draft_rpc(self, batch: ScheduleBatch) -> bool:
         # High batch size used to return before the breaker saw the skipped
         # step, so OPEN never reached HALF_OPEN while the batch stayed large.
-        breaker = getattr(self, "sr_breaker", None)
+        breaker = self.sr_breaker
         if breaker is not None and not breaker.should_send():
             breaker.note_skipped_step()
             return True

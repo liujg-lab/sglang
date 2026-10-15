@@ -241,6 +241,7 @@ class SRRPDWorkspace:
         self.holds = None
         self.logged = False
         self.metrics = None
+        self.edge_index = None
 
     def count(self, name, value=1):
         if self.metrics is not None:
@@ -308,6 +309,7 @@ class SRRPDWorkspace:
             self.rows_cap, self.edges_cap, self.key = rc, ec, key
             self.event = event
             self.count("rpd_host_workspace_grow")
+        self.edge_index = index
         return None
 
     def statistics(self, logits, context):
@@ -320,28 +322,8 @@ class SRRPDWorkspace:
         if self.key is None or rows > self.rows_cap or edges > self.edges_cap:
             raise RuntimeError("RPD statistics logits or prepared capacity mismatch")
         index = context.edge_index
-        for tensor, dtype, shape in (
-            (self.values, logits.dtype, (self.rows_cap,)),
-            (self.argmax, torch.int64, (self.rows_cap,)),
-            (self.edge_values, logits.dtype, (2, self.edges_cap)),
-        ):
-            if (
-                tensor.device != logits.device
-                or tensor.dtype != dtype
-                or tuple(tensor.shape) != shape
-                or not tensor.is_contiguous()
-            ):
-                raise RuntimeError("RPD statistics device buffer layout mismatch")
-        for tensor, dtype, shape in (
-            (self.star_host, torch.int64, (self.rows_cap,)),
-            (self.stats_host, logits.dtype, (2, self.edges_cap)),
-        ):
-            if (
-                tensor.dtype != dtype
-                or tuple(tensor.shape) != shape
-                or not tensor.is_contiguous()
-            ):
-                raise RuntimeError("RPD statistics host buffer layout mismatch")
+        if index is not self.edge_index:
+            raise RuntimeError("RPD statistics edge index changed")
         gather = _edge_gather_impl(logits) if edges else None
         if rows == 0:
             return self.star_host[:0].reshape(bs, width), None
