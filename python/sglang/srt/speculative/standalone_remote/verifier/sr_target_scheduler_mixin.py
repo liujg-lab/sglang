@@ -137,6 +137,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
         self.sr_client: Optional[SRTargetClient] = None
+        self._sr_hold_finish_flush = False
         self.sr_breaker = SRRpcBreaker(
             failure_threshold=int(
                 getattr(self.server_args, "standalone_remote_breaker_failures", 3)
@@ -162,6 +163,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
         self._sr_finish_pending = []
+        self._sr_hold_finish_flush = False
         self.sr_speculation_stopped = False
         self.sr_seen_generation = None
         client = getattr(self, "sr_client", None)
@@ -549,25 +551,25 @@ class SchedulerStandaloneRemoteTargetMixin:
             req.sr_force_snapshot = True
         return retry
 
-    def rpc_next_draft(self, reqs: List[Req]) -> Dict[str, SRDraftReply]:
+    def _sr_step_candidates(self, reqs: List[Req]) -> List[Req]:
         breaker = getattr(self, "sr_breaker", None)
         if breaker is not None and not breaker.should_send():
-            return {}
+            return []
         if getattr(self, "sr_speculation_stopped", False):
-            return {}
-        live = [
+            return []
+        return [
             req for req in reqs if getattr(req, "sr_stop_spec", False) is not True
         ]
-        if not live:
-            return {}
-        # This RPC does not update the target graph. Lengths are still written
-        # by graph.update immediately before replay.
-        replies, pending = self._sr_rpc(
-            SRAction.STEP, live, include_full_context=False
-        )
+
+    def _sr_complete_step_replies(
+        self,
+        reqs: List[Req],
+        replies: Dict[str, SRDraftReply],
+        pending: Dict[str, SRPendingEntry],
+    ) -> Dict[str, SRDraftReply]:
         if getattr(self, "sr_speculation_stopped", False):
             return {}
-        retry = self._sr_apply_commit_acks(live, replies, pending)
+        retry = self._sr_apply_commit_acks(reqs, replies, pending)
         if not retry:
             return replies
         for req in retry:
@@ -587,6 +589,17 @@ class SchedulerStandaloneRemoteTargetMixin:
         replies.update(snap)
         return replies
 
+    def rpc_next_draft(self, reqs: List[Req]) -> Dict[str, SRDraftReply]:
+        live = self._sr_step_candidates(reqs)
+        if not live:
+            return {}
+        # This RPC does not update the target graph. Lengths are still written
+        # by graph.update immediately before replay.
+        replies, pending = self._sr_rpc(
+            SRAction.STEP, live, include_full_context=False
+        )
+        return self._sr_complete_step_replies(live, replies, pending)
+
     def notify_sr_draft_finished(self, req: Req, action: SRAction = SRAction.FINISH) -> None:
         if _is_health_check(req):
             return
@@ -599,6 +612,10 @@ class SchedulerStandaloneRemoteTargetMixin:
         pending.append(req)
 
     def _sr_flush_finish_notifications(self) -> None:
+        # An inflight STEP reply sits on the DEALER until recv. send_batch
+        # drains that socket, so FINISH must wait until the reply is taken.
+        if getattr(self, "_sr_hold_finish_flush", False):
+            return
         pending = getattr(self, "_sr_finish_pending", None) or []
         if not pending:
             return
@@ -796,13 +813,50 @@ class SchedulerStandaloneRemoteTargetMixin:
                 )
                 with metrics.phase("run_batch_including_verify"):
                     result = self.run_batch(batch)
-                with metrics.phase("process_result"):
-                    self.process_batch_result(batch, result)
-                still = [r for r in live if not r.finished()]
-                if still:
-                    with metrics.phase("rpc_wait"):
-                        replies = self.rpc_next_draft(still)
-                    self._sr_maybe_align_chain_replies(still, replies, prefill=False)
-                    self._sr_attach_replies(still, replies)
+                still = [req for req in live if not req.finished()]
+                candidates = self._sr_step_candidates(still)
+                inflight = (
+                    self._sr_send(
+                        SRAction.STEP, candidates, include_full_context=False
+                    )
+                    if candidates
+                    else None
+                )
+                # Hide the next draft forward behind postprocess. FINISH for
+                # requests that end in that postprocess stays queued until
+                # the STEP reply is received.
+                self._sr_hold_finish_flush = inflight is not None
+                try:
+                    with metrics.phase("process_result"):
+                        self.process_batch_result(batch, result)
+                finally:
+                    self._sr_hold_finish_flush = False
+                    try:
+                        if candidates:
+                            alive = [
+                                req for req in candidates if not req.finished()
+                            ]
+                            if inflight is not None:
+                                with metrics.phase("rpc_wait"):
+                                    replies, pending = self._sr_recv(inflight)
+                                    replies = self._sr_complete_step_replies(
+                                        alive, replies, pending
+                                    )
+                            else:
+                                replies = self._sr_complete_step_replies(
+                                    alive, {}, {}
+                                )
+                            self._sr_maybe_align_chain_replies(
+                                alive, replies, prefill=False
+                            )
+                            self._sr_attach_replies(alive, replies)
+                        elif still:
+                            alive = [req for req in still if not req.finished()]
+                            self._sr_maybe_align_chain_replies(
+                                alive, {}, prefill=False
+                            )
+                            self._sr_attach_replies(alive, {})
+                    finally:
+                        self._sr_flush_finish_notifications()
             finally:
                 batch.sr_round_metrics = None

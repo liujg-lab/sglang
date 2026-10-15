@@ -2719,10 +2719,12 @@ class TestRoundMetrics(unittest.TestCase):
             ROOT
             / "python/sglang/srt/speculative/standalone_remote/verifier/sr_target_scheduler_mixin.py"
         )
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
         run = load_functions(
             target,
             ["_sr_run_verify_round"],
-            dict(get_sr_round_metrics=get_sr_round_metrics),
+            dict(get_sr_round_metrics=get_sr_round_metrics, SRAction=SRAction),
         )["_sr_run_verify_round"]
         for has_draft in (False, True):
             with self.subTest(has_draft=has_draft):
@@ -2736,6 +2738,13 @@ class TestRoundMetrics(unittest.TestCase):
                     server_args=NS(speculative_num_draft_tokens=15),
                     _sr_select_reqs=lambda batch: [req],
                     rpc_next_draft=lambda reqs: trace.append("rpc") or {},
+                    _sr_step_candidates=lambda reqs: list(reqs),
+                    _sr_send=lambda action, reqs, include_full_context=False: (
+                        trace.append("send") or "inflight"
+                    ),
+                    _sr_recv=lambda inflight: trace.append("recv") or ({}, {}),
+                    _sr_complete_step_replies=lambda reqs, replies, pending: replies,
+                    _sr_flush_finish_notifications=lambda: None,
                     _sr_maybe_align_chain_replies=lambda *a, **k: None,
                     _sr_attach_replies=lambda *a: 0,
                     run_batch=lambda batch: trace.append(
@@ -2747,9 +2756,9 @@ class TestRoundMetrics(unittest.TestCase):
                 self.assertEqual(
                     trace,
                     (
-                        [("forward", 15), "process", "rpc"]
+                        [("forward", 15), "send", "process", "recv"]
                         if has_draft
-                        else ["rpc", ("forward", 1), "process", "rpc"]
+                        else ["rpc", ("forward", 1), "send", "process", "recv"]
                     ),
                 )
                 self.assertIsNone(batch.sr_round_metrics)

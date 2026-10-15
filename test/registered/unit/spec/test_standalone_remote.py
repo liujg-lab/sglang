@@ -1629,7 +1629,7 @@ class TestDraftWindowBudget(CustomTestCase):
 
 
 class TestTargetPrefillOverlap(CustomTestCase):
-    """PREFILL send happens before Target GPU; STEP remains send+recv together."""
+    """PREFILL send happens before Target GPU. Decode STEP send overlaps postprocess."""
 
     def _import_mixin(self):
         try:
@@ -1753,13 +1753,14 @@ class TestTargetPrefillOverlap(CustomTestCase):
             mixin.event_loop_normal_standalone_remote_target()
         self.assertEqual(order, ["send", "gpu", "recv"])
 
-    def test_step_stays_blocking_send_recv(self):
+    def test_step_send_overlaps_process(self):
         order = []
         req = self._make_req()
         mixin, _client = self._make_mixin(order, req, is_extend=False)
+        mixin.process_batch_result = lambda _batch, _result: order.append("process")
         with self.assertRaises(mixin.recv_requests.StopLoop):
             mixin.event_loop_normal_standalone_remote_target()
-        self.assertEqual(order, ["send", "recv", "gpu", "send", "recv"])
+        self.assertEqual(order, ["send", "recv", "gpu", "send", "process", "recv"])
 
     def test_reset_clears_inflight(self):
         mixin_cls = self._import_mixin()
@@ -3927,6 +3928,115 @@ class TestSRAbortAndRollback(CustomTestCase):
         self.assertEqual(sent, [(SRAction.FINISH, ["a", "b"])])
         mixin._sr_flush_finish_notifications()
         self.assertEqual(len(sent), 1)
+
+    def test_finish_flush_holds_until_step_reply_is_received(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.current_scheduler_metrics_enabled = False
+        mixin.server_args = SimpleNamespace(
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1
+        )
+        sent = []
+        attached = []
+
+        class Req:
+            def __init__(self, rid, drafts):
+                self.rid = rid
+                self.cur_drafts = drafts
+                self.sr_stop_spec = False
+                self._finished = False
+
+            def finished(self):
+                return self._finished
+
+        keep = Req("keep", [1])
+        done = Req("done", [1])
+        batch = SimpleNamespace(reqs=[keep, done])
+        mixin._sr_select_reqs = lambda _batch: list(_batch.reqs)
+
+        def send(action, reqs, include_full_context=False):
+            sent.append((action, [req.rid for req in reqs]))
+            if action == SRAction.FINISH:
+                self.assertFalse(mixin._sr_hold_finish_flush)
+            return "inflight" if action == SRAction.STEP else None
+
+        def process(_batch, _result):
+            done._finished = True
+            mixin.notify_sr_draft_finished(done)
+            mixin._sr_flush_finish_notifications()
+            self.assertEqual(sent, [(SRAction.STEP, ["keep", "done"])])
+
+        mixin._sr_send = send
+        mixin._sr_recv = lambda inflight: ({"keep": object(), "done": object()}, {})
+        mixin._sr_complete_step_replies = lambda reqs, replies, pending: {
+            req.rid: replies[req.rid] for req in reqs
+        }
+        mixin._sr_maybe_align_chain_replies = lambda *args, **kwargs: None
+        mixin._sr_attach_replies = lambda reqs, replies: attached.append(
+            [req.rid for req in reqs]
+        ) or 0
+        mixin.run_batch = lambda _batch: None
+        mixin.process_batch_result = process
+
+        mixin._sr_run_verify_round(batch)
+
+        self.assertEqual(attached, [["keep"]])
+        self.assertEqual(
+            sent,
+            [(SRAction.STEP, ["keep", "done"]), (SRAction.FINISH, ["done"])],
+        )
+        self.assertFalse(mixin._sr_hold_finish_flush)
+
+    def test_verify_round_without_inflight_flushes_finish_immediately(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.current_scheduler_metrics_enabled = False
+        mixin.server_args = SimpleNamespace(
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1
+        )
+        mixin.sr_breaker = None
+        mixin.sr_speculation_stopped = True
+        sent = []
+        attached = []
+        req = SimpleNamespace(
+            rid="a",
+            cur_drafts=[1],
+            sr_stop_spec=False,
+            finished=lambda: False,
+        )
+        batch = SimpleNamespace(reqs=[req])
+        mixin._sr_select_reqs = lambda _batch: list(_batch.reqs)
+        mixin._sr_send = lambda action, reqs, include_full_context=False: sent.append(
+            (action, [item.rid for item in reqs])
+        )
+        mixin._sr_maybe_align_chain_replies = lambda *args, **kwargs: None
+        mixin._sr_attach_replies = lambda reqs, replies: attached.append(
+            ([item.rid for item in reqs], replies)
+        ) or 0
+        mixin.run_batch = lambda _batch: None
+
+        def process(_batch, _result):
+            mixin.notify_sr_draft_finished(req)
+            mixin._sr_flush_finish_notifications()
+            self.assertEqual(sent, [(SRAction.FINISH, ["a"])])
+
+        mixin.process_batch_result = process
+        mixin._sr_run_verify_round(batch)
+        self.assertEqual(sent, [(SRAction.FINISH, ["a"])])
+        self.assertEqual(attached, [(["a"], {})])
+        self.assertFalse(getattr(mixin, "_sr_hold_finish_flush", False))
 
     def test_poisoned_finish_returns_host_row_without_device_free(self):
         try:
