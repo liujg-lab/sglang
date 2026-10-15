@@ -1243,6 +1243,15 @@ class TestSourceGuards(CustomTestCase):
         self.assertIn("_seen_tree_paged_shapes", warm_src)
         self.assertIn("tree warmup layout=", warm_src)
         self.assertNotIn("prepare_sr_tree_paged_eager", warm_src)
+        self.assertNotIn('if not getattr(self, "sr_tree_paged", False)', warm_src)
+        self.assertLess(
+            warm_src.find("warm_private_slot_move"),
+            warm_src.find("_sr_warm_layout_shapes"),
+        )
+        self.assertLess(
+            warm_src.find("warm_tree_reply_pack"),
+            warm_src.find("_sr_warm_layout_shapes"),
+        )
         layout_src = _fn_source(_DRAFTER, "_sr_warm_layout_shapes")
         self.assertIn("prepare_sr_tree_paged_eager", layout_src)
         self.assertIn("ALLOC_LEASE", layout_src)
@@ -2067,10 +2076,9 @@ class TestSRWarmup(CustomTestCase):
         Prod().evict()
         self.assertEqual(calls, [1])
 
-    def test_outer_fatal_not_swallowed(self):
+    def _compiled_warm_tree_shapes(self, ns):
         import logging
         import time
-        from types import MethodType
 
         from sglang.srt.speculative.standalone_remote.sr_align import SRWarmupFatalError
 
@@ -2086,28 +2094,29 @@ class TestSRWarmup(CustomTestCase):
                     ):
                         fn = child
         self.assertIsNotNone(fn)
-        ns = {
-            "read_sr_tree_warmup_env": lambda: True,
-            "SR_TREE_WARMUP_ENV": "SGLANG_NPU_SR_TREE_WARMUP",
-            "warm_draft_alloc_mapping": lambda _d: (_ for _ in ()).throw(
-                SRWarmupFatalError("ledger unknown")
-            ),
-            "warm_private_slot_move": mock.Mock(),
-            "torch": torch,
-            "NpuGraphReplaySubmittedError": type(
-                "NpuGraphReplaySubmittedError", (Exception,), {}
-            ),
-            "SRWarmupFatalError": SRWarmupFatalError,
-            "KVMoveSubmittedError": KVMoveSubmittedError,
-            "is_device_context_error": lambda _e: False,
-            "logger": logging.getLogger("sr-warmup-fatal-test"),
-            "time": time,
-        }
+        ns.setdefault("read_sr_tree_warmup_env", lambda: True)
+        ns.setdefault("SR_TREE_WARMUP_ENV", "SGLANG_NPU_SR_TREE_WARMUP")
+        ns.setdefault("torch", torch)
+        ns.setdefault(
+            "NpuGraphReplaySubmittedError",
+            type("NpuGraphReplaySubmittedError", (Exception,), {}),
+        )
+        ns.setdefault("SRWarmupFatalError", SRWarmupFatalError)
+        ns.setdefault("KVMoveSubmittedError", KVMoveSubmittedError)
+        ns.setdefault("is_device_context_error", lambda _e: False)
+        ns.setdefault("logger", logging.getLogger("sr-warmup-test"))
+        ns.setdefault("time", time)
         ast.fix_missing_locations(fn)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(src_path), "exec"), ns)
+        return ns["_sr_warm_tree_shapes"]
 
+    def _warmup_dummy(self, paged, layouts):
         class Dummy:
-            sr_tree_paged = True
+            sr_tree_paged = paged
+            device = "cpu"
+            topk = 1
+            speculative_num_steps = 1
+            speculative_num_draft_tokens = 2
             _seen_tree_paged_shapes = None
             draft_model_runner = SimpleNamespace(token_to_kv_pool=object())
             req_to_token_pool = SimpleNamespace(
@@ -2115,17 +2124,79 @@ class TestSRWarmup(CustomTestCase):
             )
 
             def _sr_warm_layout_shapes(self):
+                layouts.append(1)
                 return [(1, 0, 1, 2)]
 
-        dummy = Dummy()
-        dummy._sr_warm_tree_shapes = MethodType(ns["_sr_warm_tree_shapes"], dummy)
-        with self.assertRaises(SRWarmupFatalError):
-            dummy._sr_warm_tree_shapes()
+        return Dummy()
+
+    def test_outer_fatal_not_swallowed(self):
+        from sglang.srt.speculative.standalone_remote.sr_align import SRWarmupFatalError
+
+        ns = {
+            "warm_draft_alloc_mapping": lambda _d: (_ for _ in ()).throw(
+                SRWarmupFatalError("ledger unknown")
+            ),
+            "warm_private_slot_move": mock.Mock(),
+        }
+        warm = self._compiled_warm_tree_shapes(ns)
+        layouts = []
+        dummy = self._warmup_dummy(True, layouts)
+        dummy._sr_warm_tree_shapes = MethodType(warm, dummy)
+        with (
+            mock.patch(
+                "sglang.srt.speculative.standalone_remote.drafter."
+                "sr_tree_reply_pack.warm_tree_reply_pack",
+                return_value=[],
+            ) as packed,
+            mock.patch(
+                "sglang.srt.speculative.standalone_remote.sr_warmup.warmup_synchronize"
+            ),
+        ):
+            with self.assertRaises(SRWarmupFatalError):
+                dummy._sr_warm_tree_shapes()
+        packed.assert_called_once_with(dummy.device, dummy.topk, 1, 2)
+        self.assertEqual(layouts, [1])
         ns["warm_private_slot_move"].assert_called_once_with(
             dummy.draft_model_runner.token_to_kv_pool,
             index_dtype=torch.int64,
             dst_index_dtype=torch.int32,
         )
+
+    def test_kernel_warmup_runs_without_paged_layout(self):
+        for paged in (False, True):
+            with self.subTest(paged=paged):
+                layouts = []
+                alloc = mock.Mock(return_value={"allocation": ["a"], "mapping": ["m"]})
+                ns = {
+                    "warm_private_slot_move": mock.Mock(),
+                    "warm_draft_alloc_mapping": alloc,
+                }
+                warm = self._compiled_warm_tree_shapes(ns)
+                dummy = self._warmup_dummy(paged, layouts)
+                dummy._sr_warm_tree_shapes = MethodType(warm, dummy)
+                with (
+                    mock.patch(
+                        "sglang.srt.speculative.standalone_remote.drafter."
+                        "sr_tree_reply_pack.warm_tree_reply_pack",
+                        return_value=[],
+                    ) as packed,
+                    mock.patch(
+                        "sglang.srt.speculative.standalone_remote.sr_warmup."
+                        "warmup_synchronize"
+                    ) as sync,
+                ):
+                    dummy._sr_warm_tree_shapes()
+                ns["warm_private_slot_move"].assert_called_once()
+                packed.assert_called_once_with(dummy.device, dummy.topk, 1, 2)
+                sync.assert_called_once_with(dummy.device)
+                if paged:
+                    self.assertEqual(layouts, [1])
+                    alloc.assert_called_once_with(dummy)
+                    self.assertEqual(dummy._seen_tree_paged_shapes, {(1, 0, 1, 2)})
+                else:
+                    self.assertEqual(layouts, [])
+                    alloc.assert_not_called()
+                    self.assertIsNone(dummy._seen_tree_paged_shapes)
 
     def test_unreachable_jump_is_not_failure(self):
         from sglang.srt.speculative.standalone_remote.sr_warmup import (

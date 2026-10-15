@@ -432,6 +432,15 @@ class TestTreeReplyPack(unittest.TestCase):
         self.assertIn("warm_tree_reply_pack", body)
         self.assertIn("warmup_synchronize", body)
         self.assertNotIn("tree_device_pack_copies", body)
+        pack_src = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_reply_pack.py"
+        )
+        pack_text = pack_src.read_text(encoding="utf-8")
+        pack_start = pack_text.index("def warm_tree_reply_pack")
+        pack_body = pack_text[pack_start : pack_text.index("\ndef ", pack_start + 1)]
+        self.assertIn("if steps <= 1:", pack_body)
+        self.assertIn("torch.empty((1, 0), dtype=torch.int64, device=dev)", pack_body)
         tokens = torch.tensor([[10, 11]], dtype=torch.int64)
         parents = torch.tensor([[-1, 0]], dtype=torch.int64)
         indices = torch.tensor([[0, 1]], dtype=torch.int64)

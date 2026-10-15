@@ -146,7 +146,8 @@ def warm_tree_reply_pack(device, topk: int, steps: int, num_draft_tokens: int):
     """Compile both reply-pack kernels before the first request.
 
     CPU returns immediately. CUDA and NPU each launch the production packer
-    once with slots and once without. Pointer dtypes are specialized;
+    once with slots and once without. ``steps <= 1`` uses the empty parent
+    row that ``organize_draft_results`` writes. Pointer dtypes are specialized;
     sizes are not. The caller must keep the returned tensors alive until
     ``warmup_synchronize`` returns, because the launches are still queued.
     """
@@ -157,7 +158,10 @@ def warm_tree_reply_pack(device, topk: int, steps: int, num_draft_tokens: int):
     steps = max(int(steps), 1)
     width = max(int(num_draft_tokens), 1)
     tokens = torch.zeros((1, width), dtype=torch.int64, device=dev)
-    parents = torch.zeros((1, width), dtype=torch.int64, device=dev)
+    if steps <= 1:
+        parents = torch.empty((1, 0), dtype=torch.int64, device=dev)
+    else:
+        parents = torch.zeros((1, width), dtype=torch.int64, device=dev)
     scores = torch.zeros((1, width), dtype=torch.float32, device=dev)
     indices = torch.topk(scores, k=width, dim=-1).indices
     node_ids = torch.zeros((steps, topk), dtype=torch.int64, device=dev)

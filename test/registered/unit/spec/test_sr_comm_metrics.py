@@ -205,6 +205,23 @@ class TestCommTransport(unittest.TestCase):
         self.assertEqual(window["counts"]["unpack_error"], 1)
         self.assertEqual(window["values"]["non_draft_elapsed_ms"], [10])
 
+    def test_bare_pickle_without_srctrl_is_not_accepted(self):
+        bare_reply = pickle.dumps(
+            {"session_id": "session", "rpc_seq": 1, "reqs": []}
+        )
+        self.client.send_batch(self.request())
+        self.client._socket.incoming.extend([[bare_reply], self.reply_frames()])
+        self.assertEqual(self.client.recv_batch("session", 1).rpc_seq, 1)
+        self.assertEqual(self.window(self.client)["counts"]["unpack_error"], 1)
+
+        bare_request = pickle.dumps(self.request().to_dict())
+        self.server._socket.incoming.append([bare_request])
+        self.assertIsNone(self.server.recv_batch())
+        self.assertIsNone(self.server._comm_pending)
+        self.assertEqual(
+            self.window(self.server, "unknown")["counts"]["unpack_error"], 1
+        )
+
     def test_timeout_reconnect_and_close_clear_pending(self):
         self.client.send_batch(self.request())
         old_socket = self.client._socket

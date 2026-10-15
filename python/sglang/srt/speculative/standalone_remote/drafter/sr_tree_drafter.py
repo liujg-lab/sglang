@@ -611,11 +611,14 @@ class SRTreeDrafter:
         return combos
 
     def _sr_warm_tree_shapes(self) -> None:
-        """Prime layout, alloc, and mapping before the first request."""
+        """Prime KV-move and reply-pack on every accelerator.
+
+        Paged layout, allocation, and mapping stay on the paged path. Kernel
+        warmup runs first so a later layout failure cannot leave the first
+        request to compile them.
+        """
         if not read_sr_tree_warmup_env():
             logger.info("[SR] tree shape warmup skipped: %s=0", SR_TREE_WARMUP_ENV)
-            return
-        if not getattr(self, "sr_tree_paged", False):
             return
         t0 = time.perf_counter()
         combos = []
@@ -630,10 +633,6 @@ class SRTreeDrafter:
                 index_dtype=torch.int64,
                 dst_index_dtype=self.req_to_token_pool.req_to_token.dtype,
             )
-            combos = self._sr_warm_layout_shapes()
-            coverage = warm_draft_alloc_mapping(self)
-            alloc_keys = coverage.get("allocation") or []
-            mapping_keys = coverage.get("mapping") or []
             from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
                 warm_tree_reply_pack,
             )
@@ -652,6 +651,16 @@ class SRTreeDrafter:
             warmup_synchronize(self.device)
             reply_pack_s = time.perf_counter() - t_pack
             del reply_holds
+            if getattr(self, "sr_tree_paged", False):
+                combos = self._sr_warm_layout_shapes()
+                coverage = warm_draft_alloc_mapping(self)
+                alloc_keys = coverage.get("allocation") or []
+                mapping_keys = coverage.get("mapping") or []
+                seen = getattr(self, "_seen_tree_paged_shapes", None)
+                if seen is None:
+                    seen = set()
+                    self._seen_tree_paged_shapes = seen
+                seen.update(combos)
         except (NpuGraphReplaySubmittedError, KVMoveSubmittedError, SRWarmupFatalError):
             raise
         except Exception as e:
@@ -666,11 +675,6 @@ class SRTreeDrafter:
                 mapping_keys,
             )
             return
-        seen = getattr(self, "_seen_tree_paged_shapes", None)
-        if seen is None:
-            seen = set()
-            self._seen_tree_paged_shapes = seen
-        seen.update(combos)
         logger.info(
             "[SR] tree warmup layout=%s allocation=%s mapping=%s "
             "reply_pack=%.3fs elapsed=%.3fs",
@@ -2167,10 +2171,11 @@ class SRTreeDrafter:
             self.speculative_num_steps, -1
         )
         rows = int(out_cache_loc.shape[1])
-        # One int32 conversion for every layer of every step. Remap and the
-        # saved loc stay on the original int64 tensor.
+        # NPU KV writes need int32 slots. Convert once for every layer.
+        # CUDA writes accept the original int64 loc. Remap and the saved loc
+        # stay on that tensor.
         kv_slots = out_cache_loc
-        if kv_slots.dtype != torch.int32:
+        if kv_slots.device.type == "npu" and kv_slots.dtype != torch.int32:
             kv_slots = kv_slots.to(dtype=torch.int32)
         candidates = getattr(self, "_capture_candidate_workspace", None)
         if not getattr(self, "_capture_candidate_selected", False):

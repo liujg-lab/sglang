@@ -1,6 +1,7 @@
 """Unit tests for STANDALONE_REMOTE protocol, alignment, mm, and stale replies."""
 
 import inspect
+import pickle
 import threading
 import time
 import unittest
@@ -60,7 +61,9 @@ from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBre
 from sglang.srt.speculative.standalone_remote.sr_transport import (
     SRDraftServer,
     SRTargetClient,
+    _CTRL_FRAME,
     _pack_request,
+    _unpack_reply,
     _unpack_request,
 )
 
@@ -1083,6 +1086,24 @@ class TestMMPayloadMultipart(CustomTestCase):
         self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
         got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
         self.assertTrue(torch.equal(got, feature))
+
+    def test_unpack_rejects_bare_pickle_and_keeps_router_identity(self):
+        batch = SRBatchRequest(session_id="s", rpc_seq=1, action=SRAction.STEP)
+        bare = pickle.dumps(batch.to_dict())
+        with self.assertRaisesRegex(ValueError, "missing SRCTRL"):
+            _unpack_request([bare])
+        restored, mm = _unpack_request([b"identity", _CTRL_FRAME, bare])
+        self.assertEqual(restored.session_id, "s")
+        self.assertEqual(restored.rpc_seq, 1)
+        self.assertEqual(mm, {})
+
+        reply = SRBatchReply(session_id="s", rpc_seq=1)
+        bare_reply = pickle.dumps(reply.to_dict())
+        with self.assertRaisesRegex(ValueError, "missing SRCTRL"):
+            _unpack_reply([bare_reply])
+        got = _unpack_reply([_CTRL_FRAME, bare_reply])
+        self.assertEqual(got.session_id, "s")
+        self.assertEqual(got.rpc_seq, 1)
 
     def test_walk_treats_tensor_placeholder_as_leaf(self):
         try:

@@ -149,9 +149,11 @@ class TestFiaKvWriteSource(CustomTestCase):
 
     def test_draft_forward_casts_slots_once(self):
         src = _fn_source_at(_DRAFTER, "SRTreeDrafter", "_draft_forward")
+        npu_at = src.find('kv_slots.device.type == "npu"')
         cast_at = src.find("kv_slots.to(dtype=torch.int32)")
         loop_at = src.find("for i in range(self.speculative_num_steps)")
-        self.assertGreaterEqual(cast_at, 0)
+        self.assertGreaterEqual(npu_at, 0)
+        self.assertGreater(cast_at, npu_at)
         self.assertLess(cast_at, loop_at)
         self.assertIn(
             "_remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)", src

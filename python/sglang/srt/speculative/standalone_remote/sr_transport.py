@@ -80,6 +80,17 @@ def _is_magic(frame, magic: bytes) -> bool:
     return view.nbytes == len(magic) and view.tobytes() == magic
 
 
+def _ctrl_offset(frames: List[Any]) -> int:
+    """Index of SRCTRL. A ROUTER identity, when present, occupies frames[0]."""
+    if not frames:
+        raise ValueError("empty STANDALONE_REMOTE frames")
+    if _is_magic(frames[0], _CTRL_FRAME):
+        return 0
+    if len(frames) >= 2 and _is_magic(frames[1], _CTRL_FRAME):
+        return 1
+    raise ValueError("STANDALONE_REMOTE frame missing SRCTRL")
+
+
 def _load_mm_payload():
     from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
 
@@ -124,14 +135,7 @@ def _pack_request(
 
 
 def _unpack_request(frames: List[Any]) -> Tuple[SRBatchRequest, Dict[str, Any]]:
-    if not frames:
-        raise ValueError("empty STANDALONE_REMOTE frames")
-    offset = 0
-    if not _is_magic(frames[0], _CTRL_FRAME):
-        if len(frames) >= 2 and _is_magic(frames[1], _CTRL_FRAME):
-            offset = 1
-        else:
-            return SRBatchRequest.from_dict(pickle.loads(_frame_view(frames[0]))), {}
+    offset = _ctrl_offset(frames)
     batch = SRBatchRequest.from_dict(pickle.loads(_frame_view(frames[offset + 1])))
     mm_by_rid: Dict[str, Any] = {}
     rest_at = offset + 2
@@ -155,16 +159,8 @@ def _pack_reply(batch: SRBatchReply) -> List[bytes]:
 
 
 def _unpack_reply(frames: List[Any]) -> SRBatchReply:
-    if not frames:
-        raise ValueError("empty STANDALONE_REMOTE reply")
-    raw = [_as_bytes(f) for f in frames]
-    idx = 0
-    if raw[0] != _CTRL_FRAME:
-        if len(raw) >= 2 and raw[1] == _CTRL_FRAME:
-            idx = 1
-        else:
-            return SRBatchReply.from_dict(pickle.loads(raw[0]))
-    return SRBatchReply.from_dict(pickle.loads(raw[idx + 1]))
+    idx = _ctrl_offset(frames)
+    return SRBatchReply.from_dict(pickle.loads(_frame_view(frames[idx + 1])))
 
 
 class SRTargetClient(_CommEndpoint):

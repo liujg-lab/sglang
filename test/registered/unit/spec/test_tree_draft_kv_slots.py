@@ -590,6 +590,15 @@ class TestTreeDraftSlotGatherWiring(CustomTestCase):
         self.assertIn("warm_draft_alloc_mapping", warm_src)
         self.assertIn("_seen_tree_paged_shapes", warm_src)
         self.assertNotIn("prepare_sr_tree_paged_eager", warm_src)
+        self.assertNotIn('if not getattr(self, "sr_tree_paged", False)', warm_src)
+        self.assertLess(
+            warm_src.find("warm_private_slot_move"),
+            warm_src.find("_sr_warm_layout_shapes"),
+        )
+        self.assertLess(
+            warm_src.find("warm_tree_reply_pack"),
+            warm_src.find("_sr_warm_layout_shapes"),
+        )
         layout_src = _function_source(_SR_TREE, "_sr_warm_layout_shapes")
         self.assertIn("prepare_sr_tree_paged_eager", layout_src)
         self.assertIn("ALLOC_LEASE", layout_src)
