@@ -1,7 +1,6 @@
 """Real-device KV scratch checks. Run with PYTHONPATH=python.
 
 Uses ordinary unittest entrypoints; no model weights or custom runner needed.
-Full service/TP performance comparisons are described in SR_KV_COPY.md.
 """
 
 import unittest

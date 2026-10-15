@@ -8,9 +8,6 @@ Draft 负责生成候选；两端可以在同机或不同服务器运行。业�
 “有适配代码”不等于所有硬件、模型组合均已验证，也不保证投机比 Target 单独解码更快。
 大小模型是常见部署方式，协议并不要求 Target 参数量一定更大。
 
-NPU Target/Draft 分页元数据融合、工作区生命周期和设备验收说明见
-[SR_PAGED_METADATA.md](SR_PAGED_METADATA.md)。
-
 ## 目录
 
 - [概览与支持矩阵](#overview)
@@ -239,7 +236,7 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 候选 token 与 Target argmax token 相等的条件，而不只是比较 logit 数值相等，从而对齐 greedy。
 `tau>0` 允许近邻候选，不保证输出逐 token 等于普通 Target greedy。
 
-SR 的合格 NPU 分支优先使用 [RPD 主机计划](RPD_HOST_PLAN.md)，日志为
+SR 的合格 NPU 分支优先使用 RPD 主机计划，日志为
 `npu_sr_host_plan`：输入包携带边下标，统计一次等待，CPU 选路直接进入接受提交。
 其他调用方和回退批次仍通过 `verify_tree_rpd()` 按 logits 的 `device.type` 分派，
 不新增启动参数。该共享入口中 `npu` 判断在 `is_cuda` 之前，因此
@@ -325,8 +322,7 @@ submitted 处理，禁止回滚 allocator / 提前释放 lease。ATB 与 FIA 共
 未设置或 `1/true/yes/on` 请求启用；`0/false/no/off` 使用原来的 V1 接受后处理。
 只在 Target 初始化时读取一次，改值后需重启 Target，不是运行时热切换，也没有
 执行中自动回退。覆盖 NPU、普通 MHA/GQA 六维分页 KV、`topk>1`、greedy 或
-具有本轮主机上下文的 RPD、`page_size>1`。RPD 主机计划的具体门控、传输与
-验收边界见 [专项说明](RPD_HOST_PLAN.md)。采样、grammar、logprob、hidden 返回、混合状态、
+具有本轮主机上下文的 RPD、`page_size>1`。采样、grammar、logprob、hidden 返回、混合状态、
 自定义 logit processor、CUDA、单链、非分页、模拟接受长度，以及宽度或
 allocator 不匹配的批次在写工作区之前走 V1。Qwen3-VL dense
 （`Qwen3VLForConditionalGeneration`）和 MoE
@@ -1161,4 +1157,4 @@ CI 注册及 runner 约定见
 
 ### Shared KV movement
 
-Draft parent remap, prefix-tail and lease copies, Target fixed accept, and the NPU pool move API use pool-owned reusable scratch. The NPU paged path performs two gather/scatter launches; other layouts use fixed `out` staging. There is no runtime legacy switch. See [SR_KV_COPY.md](SR_KV_COPY.md) for ownership, tests and hardware validation boundaries.
+Draft parent remap, prefix-tail and lease copies, Target fixed accept, and the NPU pool move API use pool-owned reusable scratch. The NPU paged path performs two gather/scatter launches; other layouts use fixed `out` staging. There is no runtime legacy switch.
