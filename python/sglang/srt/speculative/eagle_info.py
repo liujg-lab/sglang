@@ -703,24 +703,30 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if export_sr_paths:
             for req in batch.reqs:
                 req.sr_accepted_tree_candidate_indices = None
+            # req.sr_draft_tree_version is None when the Draft cannot reuse
+            # cached tree KV. Skip the row copy and the export for those rows.
             try:
                 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
                     export_accepted_tree_candidate_indices,
+                    rows_with_draft_tree_version,
                 )
 
-                sr_rows = []
-                for i, row in enumerate(accept_index_cpu):
-                    copied = list(row)
-                    cut = sr_eos_cut[i] if sr_eos_cut is not None else None
-                    if cut is not None:
-                        for k in range(cut, len(copied)):
-                            copied[k] = -1
-                    sr_rows.append(copied)
-                accepted_tree_candidate_indices = export_accepted_tree_candidate_indices(
-                    sr_rows
-                )
-                for req, path in zip(batch.reqs, accepted_tree_candidate_indices):
-                    req.sr_accepted_tree_candidate_indices = list(path)
+                reusable = rows_with_draft_tree_version(batch.reqs)
+                if reusable:
+                    sr_rows = []
+                    for i in reusable:
+                        copied = list(accept_index_cpu[i])
+                        cut = sr_eos_cut[i] if sr_eos_cut is not None else None
+                        if cut is not None:
+                            for k in range(cut, len(copied)):
+                                copied[k] = -1
+                        sr_rows.append(copied)
+                    paths = export_accepted_tree_candidate_indices(sr_rows)
+                    accepted_tree_candidate_indices = [[] for _ in batch.reqs]
+                    for i, path in zip(reusable, paths):
+                        stored = list(path)
+                        batch.reqs[i].sr_accepted_tree_candidate_indices = stored
+                        accepted_tree_candidate_indices[i] = stored
             except Exception as exc:
                 accepted_tree_candidate_indices = []
                 for req in batch.reqs:

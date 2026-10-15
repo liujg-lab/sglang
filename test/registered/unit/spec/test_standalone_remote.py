@@ -2637,6 +2637,47 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(child.tolist(), [[1, -1, -1, -1]])
         self.assertEqual(child_sib.tolist(), [[-1, 2, -1, -1]])
 
+        batched = torch.tensor(
+            [
+                [3, -1, -1, -1],
+                [4, 5, -1, -1],
+                [2, -1, -1, -1],
+            ],
+            dtype=torch.int64,
+        )
+        batched_sib = torch.tensor(
+            [
+                [-1, 2, -1, 1],
+                [1, -1, -1, -1],
+                [-1, 3, 1, -1],
+            ],
+            dtype=torch.int64,
+        )
+        unlink_disconnected_retrieve_nodes(batched, batched_sib, ((2,), (), (0, 1)))
+        self.assertEqual(
+            batched.tolist(),
+            [[1, -1, -1, -1], [4, 5, -1, -1], [3, -1, -1, -1]],
+        )
+        self.assertEqual(
+            batched_sib.tolist(),
+            [[-1, 2, -1, 1], [1, -1, -1, -1], [-1, 3, 3, -1]],
+        )
+
+        short_next = torch.tensor(
+            [[3, -1, -1, -1], [1, 3, -1, -1]],
+            dtype=torch.int64,
+        )
+        short_sib = torch.tensor([[-1, 2, -1, 1]], dtype=torch.int64)
+        unlink_disconnected_retrieve_nodes(short_next, short_sib, ((2,), (2,), (1,)))
+        self.assertEqual(short_next.tolist(), [[1, -1, -1, -1], [1, -1, -1, -1]])
+        self.assertEqual(short_sib.tolist(), [[-1, 2, -1, 1]])
+
+        wide = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int64)
+        wide_sib = torch.tensor([[7, 8], [9, 10]], dtype=torch.int64)
+        clear_no_draft_retrieve_links(wide, wide_sib, [True, False, True, True])
+        self.assertEqual(wide.tolist(), [[-1, -1], [3, 4], [-1, -1]])
+        self.assertEqual(wide_sib.tolist(), [[-1, -1], [9, 10]])
+
         _, loose_parents, loose_indices, loose_tokens = packet.load(
             [4],
             [[8, 9]],

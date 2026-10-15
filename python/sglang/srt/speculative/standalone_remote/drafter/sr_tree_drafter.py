@@ -162,27 +162,33 @@ class SRTreeDrafter:
         self._last_out_cache_loc = None
         max_bs = max(int(getattr(self.server_args, "cuda_graph_max_bs", 0) or 8), 8)
         self._identity_rows = max(max_bs, 1) * max(self.topk, 1)
-        id_dev = self.device
-        self._slot_node_ids = torch.full(
-            (self.speculative_num_steps, self._identity_rows),
-            -1,
-            dtype=torch.int64,
-            device=id_dev,
-        )
         self._identity_table_frozen = False
         self._identity_table_key = None
         self._identity_graph = None
         self._active_identity_workspace = None
-        self._identity_eager = IdentityRemapWorkspace(
-            id_dev,
-            self.speculative_num_steps,
-            self._identity_rows,
-            graph=False,
-            domain="tree_eager",
-        )
-        self._step0_node_ids = first_forward_node_ids(
-            self.topk, max_bs, device=id_dev
-        )
+        # CUDA page size 1 cannot reuse tree KV. Leave the identity tables empty
+        # until a lease is actually supported.
+        self._slot_node_ids = None
+        self._identity_eager = None
+        self._step0_node_ids = None
+        if self._lease_supported():
+            id_dev = self.device
+            self._slot_node_ids = torch.full(
+                (self.speculative_num_steps, self._identity_rows),
+                -1,
+                dtype=torch.int64,
+                device=id_dev,
+            )
+            self._identity_eager = IdentityRemapWorkspace(
+                id_dev,
+                self.speculative_num_steps,
+                self._identity_rows,
+                graph=False,
+                domain="tree_eager",
+            )
+            self._step0_node_ids = first_forward_node_ids(
+                self.topk, max_bs, device=id_dev
+            )
         self._init_attention_backend()
         self.sr_tree_paged = False
         self._paged_dummy_page = 0

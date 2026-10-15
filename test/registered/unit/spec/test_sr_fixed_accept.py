@@ -102,6 +102,7 @@ class _Req:
         self.cancel_at = cancel_at
         self.finished_reason = None
         self.sr_accepted_tree_candidate_indices = None
+        self.sr_draft_tree_version = None
 
     def finished(self):
         return self.finished_reason is not None
@@ -473,7 +474,16 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             kv,
         )
 
-    def _run(self, rows, tokens, pre_lengths, prefixes, finish_at, cache=None):
+    def _run(
+        self,
+        rows,
+        tokens,
+        pre_lengths,
+        prefixes,
+        finish_at,
+        cache=None,
+        tree_versions=None,
+    ):
         bs = len(rows)
         path = max(len(row) for row in rows)
         width = 4
@@ -496,6 +506,9 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         alloc = NPUPagedTokenToKVPoolAllocator(4)
         alloc.kv_buffer = kv
         reqs = [_Req(finish_at=item) for item in finish_at]
+        if tree_versions is not None:
+            for req, version in zip(reqs, tree_versions):
+                req.sr_draft_tree_version = version
         batch, kv = self._batch(reqs, prefixes, cache, kv)
         logits = SimpleNamespace()
         from sglang.srt.speculative.standalone_remote import sr_kv_copy
@@ -564,6 +577,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             pre_lengths=[1, 0],
             prefixes=[0, 0],
             finish_at=[None, None],
+            tree_versions=[1, 1],
         )
         self.assertEqual(
             reqs[0].sr_accepted_tree_candidate_indices,
@@ -599,6 +613,7 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         from sglang.srt.speculative.standalone_remote import sr_round_metrics
 
         req = _Req()
+        req.sr_draft_tree_version = 1
         req.sr_accepted_tree_candidate_indices = [1, 2]
         batch = SimpleNamespace(
             reqs=[req],
@@ -625,6 +640,44 @@ class FixedAcceptFinalizeTest(CustomTestCase):
             self.assertIn("tail-extend", logs.records[0].getMessage())
         finally:
             sr_round_metrics._sr_tree_path_export_warned = False
+
+    def test_missing_tree_version_skips_path_export(self):
+        req = _Req()
+        req.sr_accepted_tree_candidate_indices = [99]
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
+        )
+        state = SRFixedAcceptState(1, 4, 4, 128, "cpu")
+        with patch(
+            "sglang.srt.speculative.standalone_remote.sr_verify_layout.export_accepted_tree_candidate_indices",
+            side_effect=AssertionError("export"),
+        ):
+            state._export_paths(batch, [[0, 2, -1, -1]])
+        self.assertEqual(state._tree_paths, [])
+        self.assertIsNone(req.sr_accepted_tree_candidate_indices)
+
+    def test_mixed_tree_version_exports_only_reusable_rows(self):
+        reusable = _Req()
+        reusable.sr_draft_tree_version = 4
+        skipped = _Req()
+        skipped.sr_accepted_tree_candidate_indices = [7]
+        batch = SimpleNamespace(
+            reqs=[reusable, skipped],
+            spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
+        )
+        state = SRFixedAcceptState(2, 4, 4, 128, "cpu")
+        truncated = [[0, 2, -1, -1], [4, 5, -1, -1]]
+        state._export_paths(batch, truncated)
+        self.assertEqual(
+            reusable.sr_accepted_tree_candidate_indices,
+            export_accepted_tree_candidate_indices([truncated[0]])[0],
+        )
+        self.assertIsNone(skipped.sr_accepted_tree_candidate_indices)
+        self.assertEqual(
+            state._tree_paths,
+            [reusable.sr_accepted_tree_candidate_indices, []],
+        )
 
     def test_note_tree_path_export_error_counts_without_metrics(self):
         from sglang.srt.speculative.standalone_remote import sr_round_metrics

@@ -79,20 +79,16 @@ class SRTreeKVLease:
             self.page_count = len(self.page_ids or ())
 
 
-def pages_per_branch(remainder: int, steps: int, page_size: int) -> int:
-    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
-        pages_per_branch as layout_pages_per_branch,
-    )
-
-    return layout_pages_per_branch(remainder, steps, page_size)
-
-
 def plan_paged_tree_layout(
     seq_lens: Sequence[int],
     page_size: int,
     topk: int,
     steps: int,
 ) -> PagedTreeLayout:
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+        pages_per_branch,
+    )
+
     ps = max(int(page_size), 1)
     remainders = [int(s) % ps for s in seq_lens]
     nnp = [pages_per_branch(r, steps, ps) for r in remainders]

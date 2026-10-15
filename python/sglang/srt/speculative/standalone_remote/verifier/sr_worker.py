@@ -326,7 +326,6 @@ class StandaloneRemoteWorker:
         bs = batch.batch_size()
         device = batch.device
         topk = self.topk
-        token_width = max(num_draft_tokens - 1, 1)
 
         cpu_lens = batch.seq_lens_cpu
         if (
@@ -338,11 +337,11 @@ class StandaloneRemoteWorker:
             cpu_lens = batch.seq_lens_cpu
         # The verify tree mask is sized by this sum. Recompute it from the
         # CPU lengths every round so a stale Python int cannot shorten it.
-        batch.seq_lens_sum = int(sum(int(x) for x in cpu_lens.tolist()[:bs]))
+        batch.seq_lens_sum = int(cpu_lens[:bs].sum())
 
         verified_id, parent_list, top_scores_index, draft_tokens = (
             self._assemble_draft_tensors(
-                batch, bs, device, topk, spec_steps, num_draft_tokens, token_width
+                batch, bs, device, topk, spec_steps, num_draft_tokens
             )
         )
 
@@ -896,7 +895,6 @@ class StandaloneRemoteWorker:
         topk: int,
         spec_steps: int,
         num_draft_tokens: int,
-        _token_width: int,
     ):
         """Borrow verify views for this round. Never synthesizes a fake bush.
 
@@ -910,9 +908,8 @@ class StandaloneRemoteWorker:
 
         Returned views are invalidated by the next upload. Stable across
         rounds are the tree built from them and the existing graph
-        mask/position buffers. ``_token_width`` is accepted for callers that
-        already derived ``max(num_draft_tokens - 1, 1)``; the packet layout
-        recomputes widths from the draft rows.
+        mask/position buffers. The packet layout recomputes widths from the
+        draft rows.
         """
         metrics = getattr(batch, "sr_round_metrics", None)
         verified_ids = []

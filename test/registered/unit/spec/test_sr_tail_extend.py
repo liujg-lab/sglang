@@ -2892,6 +2892,29 @@ class TestTreeIngestLifecycle(unittest.TestCase):
         self.assertIsNone(ar.sr_tree_leases)
         self.assertEqual(len(stores), 1)
 
+    def test_identity_workspaces_follow_lease_supported(self):
+        drafter_py = (
+            ROOT
+            / "python/sglang/srt/speculative/standalone_remote/drafter/sr_tree_drafter.py"
+        )
+        src = drafter_py.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SRTreeDrafter"
+        )
+        init = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        init_src = ast.get_source_segment(src, init)
+        lease = init_src.index("self._lease_supported()")
+        self.assertLess(lease, init_src.index("_slot_node_ids = torch.full"))
+        self.assertLess(lease, init_src.index("IdentityRemapWorkspace("))
+        self.assertLess(lease, init_src.index("_step0_node_ids = first_forward_node_ids"))
+
     def _lease(self, rid, version=1):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
             SRTreeKVLease,

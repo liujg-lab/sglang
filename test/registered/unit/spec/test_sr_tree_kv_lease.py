@@ -20,7 +20,6 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     lease_budget_ok,
     lease_page_count,
     live_accept_prefix,
-    pages_per_branch,
     plan_paged_tree_layout,
     prefix_window_tokens,
     record_device_event,
@@ -35,6 +34,9 @@ from sglang.test.sr_reference import (
     prefix_window_from_committed,
     remap_slot_node_ids,
     tree_raw_span_len,
+)
+from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
+    pages_per_branch,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_reply_pack import (
     pack_tree_reply,
@@ -1068,6 +1070,16 @@ class TestProtocolAndExport(unittest.TestCase):
             src.index("is_standalone_remote"),
             src.index("export_accepted_tree_candidate_indices"),
         )
+        self.assertLess(
+            src.index("sr_draft_tree_version"),
+            src.index("export_accepted_tree_candidate_indices"),
+        )
+        self.assertLess(
+            fixed.index("sr_draft_tree_version"),
+            fixed.index("export_accepted_tree_candidate_indices"),
+        )
+        self.assertIn("rows_with_draft_tree_version", src)
+        self.assertIn("rows_with_draft_tree_version", fixed)
         self.assertIn("sr_eos_cut", src)
         self.assertIn("sr_accepted_tree_candidate_indices = None", src)
         self.assertIn("note_sr_tree_path_export_error", src)

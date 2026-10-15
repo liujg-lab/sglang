@@ -107,6 +107,20 @@ def export_accepted_tree_candidate_indices(
     return out
 
 
+def rows_with_draft_tree_version(reqs) -> List[int]:
+    """Rows whose Draft can reuse a cached tree KV lease.
+
+    ``sr_draft_tree_version is None`` means the Draft cannot reuse the tree,
+    as with CUDA page size 1 or a request that fell back. Accepted candidate
+    indices for those rows are unused.
+    """
+    return [
+        i
+        for i, req in enumerate(reqs)
+        if getattr(req, "sr_draft_tree_version", None) is not None
+    ]
+
+
 def chain_tree_structure(
     num_draft_tokens: int, spec_steps: int, device=None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -550,6 +564,26 @@ def write_draft_regions(
         _numpy_prefix(index_view[i], index)
 
 
+def _skip_removed_link(node: int, removed: set, old_sib: Sequence[int]) -> int:
+    """Walk the pre-rewrite sibling chain past nodes in ``removed``."""
+    seen = set()
+    while node in removed:
+        if node < 0 or node in seen or node >= len(old_sib):
+            return -1
+        seen.add(node)
+        node = int(old_sib[node])
+    return node
+
+
+def _index_copy_rows(
+    dest: torch.Tensor, rows_t: torch.Tensor, values: Sequence[Sequence[int]]
+) -> None:
+    updated = torch.tensor(
+        [list(row) for row in values], dtype=dest.dtype, device=dest.device
+    )
+    dest.index_copy_(0, rows_t, updated)
+
+
 def unlink_disconnected_retrieve_nodes(
     retrive_next_token: Optional[torch.Tensor],
     retrive_next_sibling: Optional[torch.Tensor],
@@ -560,38 +594,65 @@ def unlink_disconnected_retrieve_nodes(
     ``disconnected[row]`` holds draft slots. Tree position ``slot + 1`` is the
     node the verify kernel linked after the parent column was rewritten. Splicing
     it out leaves grounded nodes reachable and the ungrounded node unreachable.
+
+    Affected rows are gathered with one ``index_select`` and one host copy,
+    rewritten together, then written back with one ``index_copy_``.
     """
     if not disconnected or retrive_next_token is None or retrive_next_token.numel() == 0:
         return
-    for row, slots in enumerate(disconnected):
-        if not slots or row >= int(retrive_next_token.shape[0]):
-            continue
-        removed = {int(slot) + 1 for slot in slots}
-        old_next = [int(node) for node in retrive_next_token[row].detach().tolist()]
-        if retrive_next_sibling is None or row >= int(retrive_next_sibling.shape[0]):
-            old_sib = [-1] * len(old_next)
-            sibling_row = None
+    limit = int(retrive_next_token.shape[0])
+    affected = [
+        row
+        for row, slots in enumerate(disconnected)
+        if slots and row < limit
+    ]
+    if not affected:
+        return
+
+    rows_t = torch.tensor(affected, dtype=torch.long, device=retrive_next_token.device)
+    next_host = retrive_next_token.index_select(0, rows_t).cpu().tolist()
+
+    sib_limit = 0
+    if retrive_next_sibling is not None and retrive_next_sibling.numel() != 0:
+        sib_limit = int(retrive_next_sibling.shape[0])
+    with_sib = [row for row in affected if row < sib_limit]
+    sib_by_row: Dict[int, List[int]] = {}
+    sib_rows_t = None
+    if with_sib:
+        if (
+            len(with_sib) == len(affected)
+            and retrive_next_sibling.device == retrive_next_token.device
+        ):
+            sib_rows_t = rows_t
         else:
-            sibling_row = retrive_next_sibling[row]
-            old_sib = [int(node) for node in sibling_row.detach().tolist()]
+            sib_rows_t = torch.tensor(
+                with_sib, dtype=torch.long, device=retrive_next_sibling.device
+            )
+        for row, old in zip(
+            with_sib, retrive_next_sibling.index_select(0, sib_rows_t).cpu().tolist()
+        ):
+            sib_by_row[row] = old
 
-        def skip(node: int) -> int:
-            seen = set()
-            while node in removed:
-                if node < 0 or node in seen or node >= len(old_sib):
-                    return -1
-                seen.add(node)
-                node = int(old_sib[node])
-            return node
-
-        def write_row(dest: torch.Tensor, values: Sequence[int]) -> None:
-            dest.copy_(
-                torch.tensor(list(values), dtype=dest.dtype, device=dest.device)
+    new_next: List[List[int]] = []
+    new_sib: List[List[int]] = []
+    for local_i, row in enumerate(affected):
+        removed = {int(slot) + 1 for slot in disconnected[row]}
+        old_next = [int(node) for node in next_host[local_i]]
+        if row in sib_by_row:
+            old_sib = [int(node) for node in sib_by_row[row]]
+        else:
+            old_sib = [-1] * len(old_next)
+        new_next.append(
+            [_skip_removed_link(node, removed, old_sib) for node in old_next]
+        )
+        if row in sib_by_row:
+            new_sib.append(
+                [_skip_removed_link(node, removed, old_sib) for node in old_sib]
             )
 
-        write_row(retrive_next_token[row], [skip(node) for node in old_next])
-        if sibling_row is not None:
-            write_row(sibling_row, [skip(node) for node in old_sib])
+    _index_copy_rows(retrive_next_token, rows_t, new_next)
+    if with_sib:
+        _index_copy_rows(retrive_next_sibling, sib_rows_t, new_sib)
 
 
 def clear_no_draft_retrieve_links(
@@ -609,13 +670,20 @@ def clear_no_draft_retrieve_links(
     rows = [i for i, flag in enumerate(no_draft) if flag]
     if not rows:
         return
+    cached_key = None
+    cached_rows_t = None
     for tensor in (retrive_next_token, retrive_next_sibling):
         if tensor is None or tensor.numel() == 0:
             continue
         limit = int(tensor.shape[0])
-        for row in rows:
-            if row < limit:
-                tensor[row].fill_(-1)
+        kept = [row for row in rows if row < limit]
+        if not kept:
+            continue
+        key = (str(tensor.device), tuple(kept))
+        if cached_rows_t is None or key != cached_key:
+            cached_rows_t = torch.tensor(kept, dtype=torch.long, device=tensor.device)
+            cached_key = key
+        tensor.index_fill_(0, cached_rows_t, -1)
 
 
 def devices_compatible(stored: torch.device, requested: torch.device) -> bool:

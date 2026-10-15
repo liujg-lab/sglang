@@ -337,16 +337,22 @@ def fill_target_tree_fia_mask_(
     custom_mask: torch.Tensor,
     prefixes: Sequence[int],
     queries: int,
+    validated: bool = False,
 ) -> None:
-    """Convert FULL_MASK (True=attend) into ``[B,1,Q,S]`` True=masked."""
+    """Convert FULL_MASK (True=attend) into ``[B,1,Q,S]`` True=masked.
+
+    ``validated`` skips the layout check after ``validate_target_tree_fia_inputs``
+    has already accepted this mask. A direct fill still rejects a bad layout.
+    """
     raw_bs = len(prefixes)
     capture_bs = int(md.blocked_mask.shape[0])
     queries = int(md.blocked_mask.shape[2])
     width = int(md.blocked_mask.shape[-1])
     q = int(queries)
-    assert_full_mask_layout(
-        custom_mask, prefixes, q, where="target tree fia mask"
-    )
+    if not validated:
+        assert_full_mask_layout(
+            custom_mask, prefixes, q, where="target tree fia mask"
+        )
     md.blocked_mask.fill_(True)
     if raw_bs == 0 or q == 0 or width == 0:
         if width > 0:
@@ -436,7 +442,9 @@ def fill_target_tree_fia_metadata_(
         queries,
         dummy_page=dummy_page,
     )
-    fill_target_tree_fia_mask_(md, custom_mask, prefixes, queries)
+    fill_target_tree_fia_mask_(
+        md, custom_mask, prefixes, queries, validated=True
+    )
     assign_captured_lens(md.kv_lens_cpu, kv_lens, "kv_lens_cpu")
     assign_captured_lens(md.q_lens_cpu, q_lens, "q_lens_cpu")
     md.active_rows.zero_()

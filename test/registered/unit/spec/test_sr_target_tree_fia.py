@@ -23,6 +23,7 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     SRTargetTreeFiaMetadata,
     TARGET_TREE_FIA_KV_ATTR,
     assign_captured_lens,
+    fill_target_tree_fia_mask_,
     fill_target_tree_fia_metadata_,
     maybe_select_target_tree_fia,
     pages_for_s_cap,
@@ -443,6 +444,48 @@ class TestTargetTreeFiaLayout(CustomTestCase):
                 2,
                 128,
             )
+
+
+class TestTargetTreeFiaMaskValidation(CustomTestCase):
+    def test_metadata_validates_the_mask_once(self):
+        from sglang.srt.speculative.tree_attn_mask import assert_full_mask_layout
+
+        prefixes = [4]
+        queries = 4
+        page = 128
+        needed = prefixes[0] + queries
+        pages = pages_for_s_cap(max(needed, 256), page)
+        md = SRTargetTreeFiaMetadata.allocate(1, queries, pages, page, "cpu")
+        table = _req_to_token([[1]], page)
+        pool = torch.arange(1, dtype=torch.int64)
+        mask = _full_mask(prefixes, queries)
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs.get("where"))
+            return assert_full_mask_layout(*args, **kwargs)
+
+        with patch(
+            "sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia.assert_full_mask_layout",
+            side_effect=counted,
+        ):
+            fill_target_tree_fia_metadata_(
+                md, table, pool, mask, prefixes, queries, 1
+            )
+        self.assertEqual(calls, ["target tree fia"])
+        self.assertEqual(int(mask.numel()), full_mask_numel(prefixes, queries))
+
+        direct = SRTargetTreeFiaMetadata.allocate(1, queries, pages, page, "cpu")
+        calls.clear()
+        with patch(
+            "sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia.assert_full_mask_layout",
+            side_effect=counted,
+        ):
+            fill_target_tree_fia_mask_(direct, mask, prefixes, queries)
+        self.assertEqual(calls, ["target tree fia mask"])
+
+        with self.assertRaises(ValueError):
+            fill_target_tree_fia_mask_(direct, mask[:1], prefixes, queries)
 
 
 class TestTargetTreeFiaRecords(CustomTestCase):

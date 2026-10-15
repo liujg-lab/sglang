@@ -1065,8 +1065,9 @@ class SRFixedAcceptState:
     def _export_paths(self, batch, truncated) -> None:
         """Record this round's paths.
 
-        A skipped export leaves request attributes unchanged and publishes
-        nothing. A failed export clears both.
+        A non-SR batch leaves request attributes unchanged and publishes
+        nothing. Rows whose ``sr_draft_tree_version is None`` are cleared
+        and not exported. A failed export clears every request.
         """
         self._tree_paths = []
         spec_algo = getattr(batch, "spec_algorithm", None)
@@ -1080,12 +1081,25 @@ class SRFixedAcceptState:
         try:
             from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
                 export_accepted_tree_candidate_indices,
+                rows_with_draft_tree_version,
             )
 
-            paths = export_accepted_tree_candidate_indices(truncated)
-            stored = [list(path) for path in paths]
-            for req, path in zip(batch.reqs, stored):
-                req.sr_accepted_tree_candidate_indices = path
+            reusable = rows_with_draft_tree_version(batch.reqs)
+            if not reusable:
+                for req in batch.reqs:
+                    req.sr_accepted_tree_candidate_indices = None
+                return
+            paths = export_accepted_tree_candidate_indices(
+                [truncated[i] for i in reusable]
+            )
+            stored = [[] for _ in batch.reqs]
+            reusable_set = set(reusable)
+            for i, path in zip(reusable, paths):
+                stored[i] = list(path)
+                batch.reqs[i].sr_accepted_tree_candidate_indices = stored[i]
+            for i, req in enumerate(batch.reqs):
+                if i not in reusable_set:
+                    req.sr_accepted_tree_candidate_indices = None
             self._tree_paths = stored
         except Exception as exc:
             self._tree_paths = []
