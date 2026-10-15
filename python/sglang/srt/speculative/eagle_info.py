@@ -91,14 +91,6 @@ def select_hidden_states_for_draft(
     return hidden_states[index]
 
 
-def _bump_seq_lens_sum(batch, accept_length_list) -> None:
-    """Add ``accept_length + 1`` per request next to an in-place CPU update."""
-    current = getattr(batch, "seq_lens_sum", None)
-    if not isinstance(current, int):
-        return
-    batch.seq_lens_sum = current + sum(int(length) + 1 for length in accept_length_list)
-
-
 def _eagle_output_from_fixed(raw, batch, topk: int):
     """Wrap a workspace-stable fixed-accept result in the V1 output types.
 
@@ -663,6 +655,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
             append_verify_row,
+            bump_seq_lens_sum,
         )
 
         # Iterate every accepted token and check if req has finished after append the token
@@ -701,43 +694,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         accepted_tree_candidate_indices = []
         if export_sr_paths:
-            for req in batch.reqs:
-                req.sr_accepted_tree_candidate_indices = None
-            # req.sr_draft_tree_version is None when the Draft cannot reuse
-            # cached tree KV. Skip the row copy and the export for those rows.
-            try:
-                from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-                    export_accepted_tree_candidate_indices,
-                    rows_with_draft_tree_version,
-                )
+            # EOS truncation stays here. publish_sr_tree_paths only writes paths.
+            rows = []
+            for i, row in enumerate(accept_index_cpu):
+                copied = list(row)
+                cut = sr_eos_cut[i]
+                if cut is not None:
+                    for k in range(cut, len(copied)):
+                        copied[k] = -1
+                rows.append(copied)
+            from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+                publish_sr_tree_paths,
+            )
 
-                reusable = rows_with_draft_tree_version(batch.reqs)
-                if reusable:
-                    sr_rows = []
-                    for i in reusable:
-                        copied = list(accept_index_cpu[i])
-                        cut = sr_eos_cut[i] if sr_eos_cut is not None else None
-                        if cut is not None:
-                            for k in range(cut, len(copied)):
-                                copied[k] = -1
-                        sr_rows.append(copied)
-                    paths = export_accepted_tree_candidate_indices(sr_rows)
-                    accepted_tree_candidate_indices = [[] for _ in batch.reqs]
-                    for i, path in zip(reusable, paths):
-                        stored = list(path)
-                        batch.reqs[i].sr_accepted_tree_candidate_indices = stored
-                        accepted_tree_candidate_indices[i] = stored
-            except Exception as exc:
-                accepted_tree_candidate_indices = []
-                for req in batch.reqs:
-                    req.sr_accepted_tree_candidate_indices = None
-                from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
-                    note_sr_tree_path_export_error,
-                )
-
-                note_sr_tree_path_export_error(
-                    getattr(batch, "sr_round_metrics", None), exc
-                )
+            accepted_tree_candidate_indices = publish_sr_tree_paths(batch, rows)
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
@@ -825,7 +795,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
-            _bump_seq_lens_sum(batch, accept_length_list)
+            bump_seq_lens_sum(
+                batch, sum(int(length) + 1 for length in accept_length_list)
+            )
 
             draft_input = EagleDraftInput(
                 hidden_states=select_hidden_states_for_draft(
@@ -864,7 +836,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
                 batch.seq_lens.add_(accept_length + 1)
                 batch.seq_lens_cpu.add_(accept_length_cpu + 1)
-                _bump_seq_lens_sum(batch, accept_length_list)
+                bump_seq_lens_sum(
+                    batch, sum(int(length) + 1 for length in accept_length_list)
+                )
 
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
@@ -888,7 +862,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.seq_lens,
                     )
                     batch.seq_lens_cpu.add_(accept_length_cpu + 1)
-                    _bump_seq_lens_sum(batch, accept_length_list)
+                    bump_seq_lens_sum(
+                        batch, sum(int(length) + 1 for length in accept_length_list)
+                    )
                     filter_finished_cache_loc_kernel[(bs,)](
                         batch.out_cache_loc,
                         tgt_cache_loc,

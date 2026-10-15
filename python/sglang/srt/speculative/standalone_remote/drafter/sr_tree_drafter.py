@@ -2197,61 +2197,61 @@ class SRTreeDrafter:
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
         scores = None
-        for i in range(self.speculative_num_steps):
-            if candidates is None:
-                input_ids, hidden_states, scores, tree_info, parent_rows = (
-                    select_top_k_tokens(i, topk_p, topk_index, hidden_states, scores, self.topk)
-                )
-                score_list.append(tree_info[0])
-                token_list.append(tree_info[1])
-                parents_list.append(tree_info[2])
-                node_ids = tree_info[2]
-            else:
-                input_ids, scores, node_ids, parent_rows = candidates.select(i, topk_p, topk_index, scores)
-            if i == self.speculative_num_steps - 1:
-                break
-            if i > 0 and self.topk > 1 and parent_rows is not None:
-                self._remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)
-            if maintain_identity:
-                if i == 0:
-                    self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
-                else:
-                    self._slot_node_ids[i, :rows].copy_(
-                        later_forward_node_ids(node_ids)[:rows]
+        # Tree steps are bs*topk, not 1-token AR. DECODE graphs must not replay
+        # here (capture would hit unset raw_num_token; runtime layout is wrong).
+        prev_graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
+        self.draft_model_runner.graph_runner = None
+        try:
+            for i in range(self.speculative_num_steps):
+                if candidates is None:
+                    input_ids, hidden_states, scores, tree_info, parent_rows = (
+                        select_top_k_tokens(i, topk_p, topk_index, hidden_states, scores, self.topk)
                     )
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = kv_slots[i]
-            advance_tree_draft_positions_for_step(
-                i,
-                forward_batch.positions,
-                getattr(forward_batch, "mrope_positions", None),
-            )
-            if self.draft_attn_backend is not None:
-                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = None
-            # Tree steps are bs*topk, not 1-token AR. DECODE graphs must not replay
-            # here (capture would hit unset raw_num_token; runtime layout is wrong).
-            prev_graph_runner = getattr(self.draft_model_runner, "graph_runner", None)
-            self.draft_model_runner.graph_runner = None
-            try:
+                    score_list.append(tree_info[0])
+                    token_list.append(tree_info[1])
+                    parents_list.append(tree_info[2])
+                    node_ids = tree_info[2]
+                else:
+                    input_ids, scores, node_ids, parent_rows = candidates.select(i, topk_p, topk_index, scores)
+                if i == self.speculative_num_steps - 1:
+                    break
+                if i > 0 and self.topk > 1 and parent_rows is not None:
+                    self._remap_tree_kv_to_parents(out_cache_loc, parent_rows, i)
+                if maintain_identity:
+                    if i == 0:
+                        self._slot_node_ids[i, :rows].copy_(self._step0_node_ids[:rows])
+                    else:
+                        self._slot_node_ids[i, :rows].copy_(
+                            later_forward_node_ids(node_ids)[:rows]
+                        )
+                forward_batch.input_ids = input_ids
+                forward_batch.out_cache_loc = kv_slots[i]
+                advance_tree_draft_positions_for_step(
+                    i,
+                    forward_batch.positions,
+                    getattr(forward_batch, "mrope_positions", None),
+                )
+                if self.draft_attn_backend is not None:
+                    forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+                spec_info.hidden_states = None
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
-            finally:
-                self.draft_model_runner.graph_runner = prev_graph_runner
-            maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
-            if candidates is None:
-                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            else:
-                topk_p, topk_index = candidates.probabilities(logits_output.next_token_logits, i)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"SR draft_forward step {i}: topk_index OOB",
-            )
-            hidden_states = None
+                maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
+                if candidates is None:
+                    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                else:
+                    topk_p, topk_index = candidates.probabilities(logits_output.next_token_logits, i)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"SR draft_forward step {i}: topk_index OOB",
+                )
+                hidden_states = None
+        finally:
+            self.draft_model_runner.graph_runner = prev_graph_runner
         self._last_out_cache_loc = out_cache_loc
         if candidates is not None:
             return candidates.finish(forward_batch.batch_size)

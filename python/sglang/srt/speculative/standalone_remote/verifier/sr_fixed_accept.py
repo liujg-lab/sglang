@@ -1078,38 +1078,19 @@ class SRFixedAcceptState:
         )
         if not export:
             return
+        previous = getattr(batch, "sr_round_metrics", None)
+        attached = previous is None and self.metrics is not None
+        if attached:
+            batch.sr_round_metrics = self.metrics
         try:
             from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
-                export_accepted_tree_candidate_indices,
-                rows_with_draft_tree_version,
+                publish_sr_tree_paths,
             )
 
-            reusable = rows_with_draft_tree_version(batch.reqs)
-            if not reusable:
-                for req in batch.reqs:
-                    req.sr_accepted_tree_candidate_indices = None
-                return
-            paths = export_accepted_tree_candidate_indices(
-                [truncated[i] for i in reusable]
-            )
-            stored = [[] for _ in batch.reqs]
-            reusable_set = set(reusable)
-            for i, path in zip(reusable, paths):
-                stored[i] = list(path)
-                batch.reqs[i].sr_accepted_tree_candidate_indices = stored[i]
-            for i, req in enumerate(batch.reqs):
-                if i not in reusable_set:
-                    req.sr_accepted_tree_candidate_indices = None
-            self._tree_paths = stored
-        except Exception as exc:
-            self._tree_paths = []
-            for req in batch.reqs:
-                req.sr_accepted_tree_candidate_indices = None
-            from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
-                note_sr_tree_path_export_error,
-            )
-
-            note_sr_tree_path_export_error(self.metrics, exc)
+            self._tree_paths = publish_sr_tree_paths(batch, truncated)
+        finally:
+            if attached:
+                batch.sr_round_metrics = previous
 
     def _commit(
         self,
@@ -1300,7 +1281,7 @@ class SRFixedAcceptState:
         if mode == "all":
             batch.seq_lens.add_(counts_dev.to(dtype=batch.seq_lens.dtype))
             batch.seq_lens_cpu.add_(counts_host.to(dtype=batch.seq_lens_cpu.dtype))
-            _bump_seq_lens_sum(batch, sum(int(count) for count in accepted))
+            bump_seq_lens_sum(batch, sum(int(count) for count in accepted))
         verified = token_dev.to(dtype=torch.int32)
         flat_index = src_index_dev.clone()
         unfinished = [i for i, flag in enumerate(finished) if not flag]
@@ -1361,7 +1342,7 @@ class SRFixedAcceptState:
         return self.out_cache_buf[:total].clone()
 
 
-def _bump_seq_lens_sum(batch, delta: int) -> None:
+def bump_seq_lens_sum(batch, delta: int) -> None:
     """Keep the Python length sum next to an in-place ``seq_lens_cpu`` update."""
     current = getattr(batch, "seq_lens_sum", None)
     if isinstance(current, int):

@@ -2087,7 +2087,6 @@ class SeqLensCacheTest(unittest.TestCase):
         names = {
             "_req_committed_len",
             "_host_len_cache",
-            "_write_host_values",
             "_copy_committed_lens",
             "_align_seq_lens_to_committed",
         }

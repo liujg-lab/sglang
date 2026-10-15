@@ -121,6 +121,42 @@ def rows_with_draft_tree_version(reqs) -> List[int]:
     ]
 
 
+def publish_sr_tree_paths(batch, rows) -> List[List[int]]:
+    """Write accepted candidate paths for rows the Draft can reuse.
+
+    Callers skip non-standalone-remote batches. A row whose
+    ``sr_draft_tree_version`` is missing is cleared and omitted. Returns an
+    empty list when nothing is reusable or export fails. On failure every
+    request path is cleared and ``batch.sr_round_metrics`` records the error.
+    """
+    reqs = batch.reqs
+    try:
+        reusable = rows_with_draft_tree_version(reqs)
+        if not reusable:
+            for req in reqs:
+                req.sr_accepted_tree_candidate_indices = None
+            return []
+        paths = export_accepted_tree_candidate_indices([rows[i] for i in reusable])
+        stored: List[List[int]] = [[] for _ in reqs]
+        reusable_set = set(reusable)
+        for i, path in zip(reusable, paths):
+            stored[i] = list(path)
+            reqs[i].sr_accepted_tree_candidate_indices = stored[i]
+        for i, req in enumerate(reqs):
+            if i not in reusable_set:
+                req.sr_accepted_tree_candidate_indices = None
+        return stored
+    except Exception as exc:
+        for req in reqs:
+            req.sr_accepted_tree_candidate_indices = None
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            note_sr_tree_path_export_error,
+        )
+
+        note_sr_tree_path_export_error(getattr(batch, "sr_round_metrics", None), exc)
+        return []
+
+
 def chain_tree_structure(
     num_draft_tokens: int, spec_steps: int, device=None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -193,63 +229,44 @@ def _as_int_list(values) -> Optional[List[int]]:
 def tree_row_valid(tokens, parents, indices, topk: int, steps: int, num_draft_tokens: int) -> bool:
     """Whether one supplied tree row matches the verify kernel's fixed stride.
 
-    Callers skip rows whose parent or index is ``None``. An empty list is
-    present topology and is checked here. A selected child whose parent
-    candidate was not selected is a normal EAGLE row: the kernel skips that
-    token, so the row stays valid. A parent token of ``-1`` at ``parent_tb > 0``
-    does not stop the mask thread and is invalid.
+    ``tokens``, ``parents``, and ``indices`` are already int sequences. An empty
+    parent list is present topology and is checked here. A selected child whose
+    parent candidate was not selected is a normal EAGLE row: the kernel skips
+    that token, so the row stays valid even when that parent id is larger than
+    the child. A parent token of ``-1`` at ``parent_tb > 0`` does not stop the
+    mask thread and is invalid.
+
+    A selected parent must have a candidate id strictly less than the child.
+    Draft trees number candidates by step, so every real edge decreases the id
+    and cannot form a cycle.
     """
-    token_row = _as_int_list(tokens)
-    parent_row = _as_int_list(parents)
-    index_row = _as_int_list(indices)
-    if token_row is None or parent_row is None or index_row is None:
-        return False
     topk = int(topk)
     steps = int(steps)
     width = int(num_draft_tokens)
     if topk < 1 or steps < 1 or width < 1:
         return False
-    if len(token_row) != width - 1 or len(index_row) != width - 1:
+    if len(tokens) != width - 1 or len(indices) != width - 1:
         return False
-    if len(parent_row) != organized_parent_len(topk, steps):
+    if len(parents) != organized_parent_len(topk, steps):
         return False
+    pos_of: Dict[int, int] = {}
+    for node_i, node in enumerate(indices):
+        if node not in pos_of:
+            pos_of[node] = node_i
     limit = draft_index_limit(topk, steps)
-    for idx in index_row:
+    for idx in indices:
         if idx < 0 or idx >= limit:
             return False
         parent_tb = idx // topk
         if parent_tb <= 0:
             continue
-        if parent_tb >= len(parent_row):
+        if parent_tb >= len(parents):
             return False
-        if parent_row[parent_tb] == -1:
-            return False
-    # Same parent walk as the mask thread. A missing parent is disconnected
-    # and stops at the root. A cycle never reaches the root.
-    pos_of: Dict[int, int] = {}
-    for node_i, node in enumerate(index_row):
-        if node not in pos_of:
-            pos_of[node] = node_i
-    parent_of = [0] * width
-    for i, idx in enumerate(index_row):
-        parent_tb = idx // topk
-        if parent_tb <= 0:
-            continue
-        parent_token = parent_row[parent_tb]
+        parent_token = parents[parent_tb]
         if parent_token == -1:
             return False
-        found = pos_of.get(parent_token)
-        if found is None:
-            continue
-        parent_of[i + 1] = found + 1
-    for start in range(width):
-        seen = set()
-        node = start
-        while node > 0:
-            if node in seen:
-                return False
-            seen.add(node)
-            node = parent_of[node]
+        if parent_token in pos_of and parent_token >= idx:
+            return False
     return True
 
 
@@ -259,35 +276,36 @@ def repair_ungrounded_parents(
     """Point missing parents at a grounded node so the mask thread can stop.
 
     A node is grounded when ``parent_tb == 0``, or its parent token is a
-    grounded selected id. Other nodes stay in the row, but their parent column
-    is rewritten to the first grounded root-child id. The mask thread finds
-    that id and stops on the next ``parent_tb == 0``. When nothing is grounded,
-    every index becomes 0 and the mask thread does not read ``parent_list``.
+    grounded selected id. ``parents`` and ``indices`` are already int sequences.
+    Selected parents have a smaller candidate id than their children, so one
+    ascending scan marks the same grounded set as a fixed-point loop. Other
+    nodes stay in the row, but their parent column is rewritten to the first
+    grounded root-child id. The mask thread finds that id and stops on the next
+    ``parent_tb == 0``. When nothing is grounded, every index becomes 0 and the
+    mask thread does not read ``parent_list``.
 
-    Returns copied ``(parents, indices, ungrounded draft slots)``. The caller's
-    sequences are not modified. The ungrounded slots must not be accepted.
+    Returns ``(parents, indices, ungrounded draft slots)``. A rewritten parent
+    row is a new list. The caller's sequences are not modified. The ungrounded
+    slots must not be accepted.
     """
-    parent_row = _as_int_list(parents) or []
-    index_row = _as_int_list(indices) or []
+    parent_row = parents
+    index_row = indices
     topk = int(topk)
     grounded = [idx // topk <= 0 for idx in index_row]
     pos_of: Dict[int, int] = {}
     for slot, node in enumerate(index_row):
         if node not in pos_of:
             pos_of[node] = slot
-    changed = True
-    while changed:
-        changed = False
-        for slot, idx in enumerate(index_row):
-            if grounded[slot]:
-                continue
-            parent_tb = idx // topk
-            if parent_tb <= 0 or parent_tb >= len(parent_row):
-                continue
-            found = pos_of.get(parent_row[parent_tb])
-            if found is not None and grounded[found]:
-                grounded[slot] = True
-                changed = True
+    for slot in sorted(range(len(index_row)), key=index_row.__getitem__):
+        if grounded[slot]:
+            continue
+        idx = index_row[slot]
+        parent_tb = idx // topk
+        if parent_tb <= 0 or parent_tb >= len(parent_row):
+            continue
+        found = pos_of.get(parent_row[parent_tb])
+        if found is not None and grounded[found]:
+            grounded[slot] = True
     ungrounded = [slot for slot, flag in enumerate(grounded) if not flag]
     if not ungrounded:
         return parent_row, index_row, []
@@ -398,13 +416,23 @@ def plan_draft_rows(
                 no_draft[i] = True
                 continue
             tokens = token_rows[i] if i < len(token_rows) else None
-            if not tree_row_valid(tokens, parent, index, topk_i, steps_i, width):
+            token_row = _as_int_list(tokens)
+            parent_row = _as_int_list(parent)
+            index_row = _as_int_list(index)
+            if (
+                token_row is None
+                or parent_row is None
+                or index_row is None
+                or not tree_row_valid(
+                    token_row, parent_row, index_row, topk_i, steps_i, width
+                )
+            ):
                 invalid += 1
                 token_rows_out[i] = cleared
                 no_draft[i] = True
                 continue
             repaired_parents, repaired_indices, slots = repair_ungrounded_parents(
-                parent, index, topk_i
+                parent_row, index_row, topk_i
             )
             parsed_parents[i] = repaired_parents
             parsed_indices[i] = repaired_indices

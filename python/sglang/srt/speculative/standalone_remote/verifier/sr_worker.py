@@ -22,6 +22,11 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
+from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+    SRPagedMetadataSubmittedError,
+    finish_paged_metadata,
+    poison_paged_metadata,
+)
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     is_health_check_req as _is_health_check,
     make_draft_tokens_and_logits,
@@ -30,23 +35,27 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     bind_graph_host_metrics,
     restore_graph_host_metrics,
 )
+from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     VerifyInputPacket,
     clear_no_draft_retrieve_links,
     unlink_disconnected_retrieve_nodes,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
+    build_fixed_accept_state,
     conservative_mode_reason,
+)
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
+    target_verify_cpu_prefix,
+)
+from sglang.srt.speculative.standalone_remote.verifier.sr_target_warmup import (
+    warm_sr_target_kernels,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def _req_committed_len(req) -> int:
-    from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import (
-        target_verify_cpu_prefix,
-    )
-
     return target_verify_cpu_prefix(req)
 
 
@@ -102,18 +111,6 @@ def _host_len_cache(batch, name: str, n: int, dtype: torch.dtype) -> torch.Tenso
     return cache
 
 
-def _write_host_values(dest: torch.Tensor, values) -> None:
-    n = len(values)
-    if n <= 0:
-        return
-    chunk = dest[:n]
-    try:
-        chunk.numpy()[:] = values
-    except Exception:
-        for i, value in enumerate(values):
-            chunk[i] = int(value)
-
-
 def _copy_committed_lens(dest: torch.Tensor, host: torch.Tensor, n: int) -> torch.Tensor:
     view = host[:n]
     if dest.shape == view.shape and dest.dtype == view.dtype:
@@ -130,16 +127,14 @@ def _copy_committed_lens(dest: torch.Tensor, host: torch.Tensor, n: int) -> torc
 def _align_seq_lens_to_committed(batch: ScheduleBatch) -> None:
     committed = [_req_committed_len(req) for req in batch.reqs]
     n = len(committed)
+    source = torch.tensor(committed, dtype=torch.int64)
     host = _host_len_cache(batch, "_sr_committed_len_host", n, batch.seq_lens.dtype)
-    _write_host_values(host, committed)
-    try:
-        filled = host[:n].numpy() if n else committed
-    except Exception:
-        filled = committed
-    batch.seq_lens = _copy_committed_lens(batch.seq_lens, host, n)
     cpu_host = _host_len_cache(batch, "_sr_committed_len_cpu", n, torch.int64)
-    if cpu_host.data_ptr() != host.data_ptr():
-        _write_host_values(cpu_host, filled)
+    if n:
+        host[:n].copy_(source)
+        if cpu_host.data_ptr() != host.data_ptr():
+            cpu_host[:n].copy_(source)
+    batch.seq_lens = _copy_committed_lens(batch.seq_lens, host, n)
     if batch.seq_lens_cpu is not None:
         batch.seq_lens_cpu = _copy_committed_lens(batch.seq_lens_cpu, cpu_host, n)
     else:
@@ -148,10 +143,10 @@ def _align_seq_lens_to_committed(batch: ScheduleBatch) -> None:
         orig_host = _host_len_cache(
             batch, "_sr_committed_len_orig", n, batch.orig_seq_lens.dtype
         )
-        if orig_host.data_ptr() != host.data_ptr():
-            _write_host_values(orig_host, filled)
+        if n and orig_host.data_ptr() != host.data_ptr():
+            orig_host[:n].copy_(source)
         batch.orig_seq_lens = _copy_committed_lens(batch.orig_seq_lens, orig_host, n)
-    batch.seq_lens_sum = int(sum(committed))
+    batch.seq_lens_sum = int(source.sum())
 
 
 class StandaloneRemoteWorker:
@@ -209,13 +204,7 @@ class StandaloneRemoteWorker:
                 or getattr(runner, "hybrid_lightning_config", None) is not None
             )
         )
-        from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
-            build_fixed_accept_state,
-        )
-        from sglang.srt.speculative.standalone_remote.verifier.sr_target_warmup import (
-            warm_sr_target_kernels,
-        )
-
+        self._sr_hidden_round = None
         self._fixed_accept_state = build_fixed_accept_state(self)
         warm_sr_target_kernels(self)
 
@@ -238,7 +227,12 @@ class StandaloneRemoteWorker:
         """Keep Target hidden states for HTTP return or hybrid models.
 
         Ordinary SR Target does not send hidden states to remote Draft.
+        A tree-decode round stores ``(batch, result)`` on ``_sr_hidden_round``
+        so construct and verify share one request scan.
         """
+        cached = getattr(self, "_sr_hidden_round", None)
+        if cached is not None and cached[0] is batch:
+            return cached[1]
         if getattr(self.server_args, "enable_return_hidden_states", False):
             return True
         if self._hybrid_needs_hidden:
@@ -278,11 +272,17 @@ class StandaloneRemoteWorker:
 
         spec_steps = self.speculative_num_steps
         metrics = getattr(batch, "sr_round_metrics", None)
-        with metrics.phase("construct_tree") if metrics else nullcontext():
-            spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
-        logits_output, verify_output, _, can_run_cuda_graph = self.verify(
-            batch, spec_info
-        )
+        self._sr_hidden_round = (batch, self._need_target_hidden(batch))
+        try:
+            with metrics.phase("construct_tree") if metrics else nullcontext():
+                spec_info = self.construct_draft_input(
+                    batch, draft_num_tokens, spec_steps
+                )
+            logits_output, verify_output, _, can_run_cuda_graph = self.verify(
+                batch, spec_info
+            )
+        finally:
+            self._sr_hidden_round = None
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.verified_id,
@@ -414,12 +414,7 @@ class StandaloneRemoteWorker:
         metrics = getattr(batch, "sr_round_metrics", None)
         prepare_start = time.perf_counter()
         prepare_hidden = self._need_target_hidden(batch)
-        runner = self.target_worker.model_runner
-        mamba_verify = (
-            runner.hybrid_gdn_config is not None
-            or runner.mamba2_config is not None
-            or runner.hybrid_lightning_config is not None
-        )
+        mamba_verify = self._hybrid_needs_hidden
         seq_lens_pre_verify = batch.seq_lens.clone() if mamba_verify else None
         seq_lens_cpu_pre = _snapshot_seq_lens_cpu(batch)
         spec_info.prepare_for_verify(batch, self.page_size)
@@ -457,17 +452,8 @@ class StandaloneRemoteWorker:
                 batch_result = self.target_worker.forward_batch_generation(
                     model_worker_batch, is_verify=True
                 )
-                from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
-                    finish_paged_metadata,
-                )
-
                 finish_paged_metadata(paged_backend)
         except BaseException as exc:
-            from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
-                SRPagedMetadataSubmittedError,
-                poison_paged_metadata,
-            )
-
             if poison_paged_metadata(paged_backend):
                 raise SRPagedMetadataSubmittedError(
                     "Target forward failed after paged metadata submission"
@@ -849,7 +835,9 @@ class StandaloneRemoteWorker:
             mask_buf = graph_mask.reshape(-1)[:needed_mask]
             wrote_graph_mask = True
         else:
-            mask_buf = self._ensure_own_mask(needed_mask, device)
+            mask_buf = self._ensure_own_buf(
+                "_verify_mask_buf", needed_mask, device, torch.bool
+            )
 
         wrote_graph_pos = False
         if graph_pos is not None:
@@ -861,23 +849,22 @@ class StandaloneRemoteWorker:
             pos_buf = graph_pos.reshape(-1)[:needed_pos]
             wrote_graph_pos = True
         else:
-            pos_buf = self._ensure_own_pos(needed_pos, device)
+            pos_buf = self._ensure_own_buf(
+                "_verify_pos_buf", needed_pos, device, torch.int64
+            )
         return mask_buf, pos_buf, wrote_graph_mask, wrote_graph_pos
 
-    def _ensure_own_mask(self, needed: int, device):
-        buf = getattr(self, "_verify_mask_buf", None)
+    def _ensure_own_buf(self, name: str, needed: int, device, dtype: torch.dtype):
+        buf = getattr(self, name, None)
         dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if buf is None or buf.device != dev or buf.numel() < needed:
-            buf = torch.empty((needed,), dtype=torch.bool, device=dev)
-            self._verify_mask_buf = buf
-        return buf.reshape(-1)[:needed]
-
-    def _ensure_own_pos(self, needed: int, device):
-        buf = getattr(self, "_verify_pos_buf", None)
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if buf is None or buf.device != dev or buf.numel() < needed:
-            buf = torch.empty((needed,), dtype=torch.int64, device=dev)
-            self._verify_pos_buf = buf
+        if (
+            buf is None
+            or buf.device != dev
+            or buf.dtype != dtype
+            or buf.numel() < needed
+        ):
+            buf = torch.empty((needed,), dtype=dtype, device=dev)
+            setattr(self, name, buf)
         return buf.reshape(-1)[:needed]
 
     def _maybe_update_graph_verify_buffers(self, spec_info: EagleVerifyInput) -> None:
@@ -931,8 +918,6 @@ class StandaloneRemoteWorker:
             getattr(self, "_fixed_accept_state", None) is not None
             and getattr(self.server_args, "speculative_verify_mode", None) == "rpd"
         ):
-            from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
-
             rpd_kwargs = dict(
                 rpd_vocab=int(batch.sampling_info.vocab_size),
                 rpd_batch_key=rpd_batch_key(list(batch.reqs)[:bs]),

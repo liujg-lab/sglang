@@ -2501,8 +2501,9 @@ class TestStandaloneRemoteTree(CustomTestCase):
         from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
             VerifyInputPacket,
             clear_no_draft_retrieve_links,
-            unlink_disconnected_retrieve_nodes,
+            repair_ungrounded_parents,
             tree_row_valid,
+            unlink_disconnected_retrieve_nodes,
         )
 
         self.assertTrue(
@@ -2517,6 +2518,18 @@ class TestStandaloneRemoteTree(CustomTestCase):
             tree_row_valid([11, 12, 13], [-1, -1, 1, 2, 3], [0, 1, 2], 2, 3, 4)
         )
         self.assertFalse(tree_row_valid([1, 2], [-1, 4, 2], [2, 4], 2, 2, 3))
+        self.assertFalse(tree_row_valid([1, 2], [-1, 4, 0], [2, 4], 2, 2, 3))
+
+        parents = [-1, 0, 0, 2, 0]
+        indices = [6, 2, 0]
+        repaired_parents, repaired_indices, slots = repair_ungrounded_parents(
+            parents, indices, 2
+        )
+        self.assertEqual(slots, [])
+        self.assertEqual(repaired_parents, parents)
+        self.assertEqual(repaired_indices, indices)
+        self.assertEqual(parents, [-1, 0, 0, 2, 0])
+        self.assertEqual(indices, [6, 2, 0])
 
         packet = VerifyInputPacket()
         metrics = SRRoundMetrics("Target")
@@ -5404,6 +5417,11 @@ class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
         from contextlib import nullcontext
         from pathlib import Path
 
+        from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
+            SRPagedMetadataSubmittedError,
+            finish_paged_metadata,
+            poison_paged_metadata,
+        )
         from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
             conservative_mode_reason,
         )
@@ -5460,6 +5478,9 @@ class TestSRDiscardUnusedVerifyLogits(CustomTestCase):
             "_sync_kv_from_cpu_lengths": lambda batch, seq_lens_cpu, lengths: None,
             "_is_health_check": lambda req: False,
             "add_output_logprobs_for_spec_v1": logprob_mod.add_output_logprobs_for_spec_v1,
+            "finish_paged_metadata": finish_paged_metadata,
+            "poison_paged_metadata": poison_paged_metadata,
+            "SRPagedMetadataSubmittedError": SRPagedMetadataSubmittedError,
         }
         module = ast.Module(
             body=[ast.parse("from __future__ import annotations").body[0], *nodes],

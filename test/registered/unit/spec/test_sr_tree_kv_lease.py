@@ -1066,24 +1066,20 @@ class TestProtocolAndExport(unittest.TestCase):
             root
             / "python/sglang/srt/speculative/standalone_remote/verifier/sr_fixed_accept.py"
         ).read_text(encoding="utf-8")
+        layout = (
+            root
+            / "python/sglang/srt/speculative/standalone_remote/sr_verify_layout.py"
+        ).read_text(encoding="utf-8")
+        publish = layout[layout.index("def publish_sr_tree_paths") :]
+        publish = publish[: publish.index("\ndef ", 1)]
+        self.assertLess(src.index("is_standalone_remote"), src.index("publish_sr_tree_paths"))
         self.assertLess(
-            src.index("is_standalone_remote"),
-            src.index("export_accepted_tree_candidate_indices"),
+            fixed.index("is_standalone_remote"), fixed.index("publish_sr_tree_paths")
         )
-        self.assertLess(
-            src.index("sr_draft_tree_version"),
-            src.index("export_accepted_tree_candidate_indices"),
-        )
-        self.assertLess(
-            fixed.index("sr_draft_tree_version"),
-            fixed.index("export_accepted_tree_candidate_indices"),
-        )
-        self.assertIn("rows_with_draft_tree_version", src)
-        self.assertIn("rows_with_draft_tree_version", fixed)
         self.assertIn("sr_eos_cut", src)
-        self.assertIn("sr_accepted_tree_candidate_indices = None", src)
-        self.assertIn("note_sr_tree_path_export_error", src)
-        self.assertIn("note_sr_tree_path_export_error", fixed)
+        self.assertIn("rows_with_draft_tree_version", publish)
+        self.assertIn("sr_accepted_tree_candidate_indices = None", publish)
+        self.assertIn("note_sr_tree_path_export_error", publish)
         self.assertIn('metrics.counts["sr_tree_path_export_errors"]', metrics)
 
 
