@@ -54,7 +54,7 @@ class SRTreeCandidateWorkspace:
                 device=device,
             )
             if steps > 1
-            else torch.empty((batch, 0), dtype=torch.float32, device=device)
+            else torch.empty((batch, 0), dtype=torch.int64, device=device)
         )
         self.probs = torch.empty((batch * topk, vocab), dtype=dtype, device=device)
         self.top_values = torch.empty(

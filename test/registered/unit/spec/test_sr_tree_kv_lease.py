@@ -301,6 +301,49 @@ class TestTreeReplyPack(unittest.TestCase):
         indices = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int64)
         self._assert_packed(tokens, parents, indices, None, None, 2, 1, 1, False)
 
+    def test_steps1_topk2_empty_float_parents_pack(self):
+        from sglang.srt.speculative.eagle_utils import organize_draft_results
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_drafter import (
+            SRTreeDrafter,
+        )
+
+        batch, topk, steps = 2, 2, 1
+        workspace = SRTreeCandidateWorkspace(
+            "cpu", batch, topk, steps, 2, 8, torch.float32
+        )
+        self.assertEqual(workspace.parent_table.dtype, torch.int64)
+        self.assertEqual(tuple(workspace.parent_table.shape), (batch, 0))
+
+        scores = [torch.tensor([[[0.2, 0.8]], [[0.9, 0.1]]], dtype=torch.float32)]
+        tokens = [torch.tensor([[10, 11], [20, 21]], dtype=torch.int64)]
+        parents = [
+            torch.arange(-1, topk, dtype=torch.int64).unsqueeze(0).repeat(batch, 1)
+        ]
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
+            scores, tokens, parents, steps + 1
+        )
+        self.assertEqual(tuple(parent_list.shape), (batch, 0))
+        self.assertEqual(parent_list.dtype, torch.float32)
+
+        drafter = SRTreeDrafter.__new__(SRTreeDrafter)
+        drafter.topk = topk
+        drafter.speculative_num_steps = steps
+        drafter._pending_lease_state = None
+        drafter._tree_slots = None
+        drafter._active_tree_slot = None
+        drafter.scheduler = None
+        tokens_cpu, parents_cpu, indices_cpu, slots_cpu = drafter._d2h_tree_outputs(
+            draft_tokens, parent_list, top_scores_index
+        )
+        self.assertEqual(tokens_cpu.tolist(), draft_tokens.tolist())
+        self.assertEqual(indices_cpu.tolist(), top_scores_index.tolist())
+        self.assertEqual(parents_cpu.numel(), 0)
+        self.assertEqual(parents_cpu.dtype, torch.int64)
+        self.assertIsNone(slots_cpu)
+
     def test_pack_matches_oracle_for_duplicates_and_isolation(self):
         batch, topk, steps = 2, 2, 2
         tokens = torch.arange(12, dtype=torch.int64).view(3, 4)[:batch, ::2]

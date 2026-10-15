@@ -934,6 +934,8 @@ class SRTreeDrafter:
             )
         tokens = _as_2d(draft_tokens.detach())
         parents = _as_2d(parent_list.detach())
+        if parents.numel() == 0 and parents.dtype != torch.int64:
+            parents = parents.to(torch.int64)
         indices = _as_2d(top_scores_index.detach())
         lease_state = getattr(self, "_pending_lease_state", None)
         compact = None
