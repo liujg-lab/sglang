@@ -42,6 +42,15 @@ from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
 
+_SR_RESYNC_REJECTS = frozenset(
+    {
+        "commit_mismatch",
+        "delta_length",
+        "stale_version",
+        "missing_cache",
+    }
+)
+
 
 def _mm_features_alive(req: Req) -> bool:
     mm = getattr(req, "multimodal_inputs", None)
@@ -538,6 +547,8 @@ class SchedulerStandaloneRemoteTargetMixin:
                 _clear_draft(req)
                 continue
             if item.status == SRReplyStatus.REJECT:
+                if item.reason in _SR_RESYNC_REJECTS:
+                    req.sr_force_snapshot = True
                 continue
             if status_advances_cursor(item.status):
                 ok, _reason = ack_matches(item, entry)

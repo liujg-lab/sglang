@@ -595,6 +595,53 @@ class FixedAcceptFinalizeTest(CustomTestCase):
         )
         self.assertEqual(token[0, 0, :4, 0, 0].tolist(), [0, 0, 1, 3])
 
+    def test_export_failure_clears_paths_and_counts_once(self):
+        from sglang.srt.speculative.standalone_remote import sr_round_metrics
+
+        req = _Req()
+        req.sr_accepted_tree_candidate_indices = [1, 2]
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: True),
+        )
+        state = SRFixedAcceptState(1, 4, 4, 128, "cpu")
+        state.metrics = SimpleNamespace(counts=Counter())
+        sr_round_metrics._sr_tree_path_export_warned = False
+        try:
+            with patch(
+                "sglang.srt.speculative.standalone_remote.sr_verify_layout.export_accepted_tree_candidate_indices",
+                side_effect=RuntimeError("export broke"),
+            ):
+                with self.assertLogs(
+                    "sglang.srt.speculative.standalone_remote.sr_round_metrics",
+                    level="WARNING",
+                ) as logs:
+                    state._export_paths(batch, [[0, 2, -1, -1]])
+                    state._export_paths(batch, [[0, 2, -1, -1]])
+            self.assertEqual(state._tree_paths, [])
+            self.assertIsNone(req.sr_accepted_tree_candidate_indices)
+            self.assertEqual(state.metrics.counts["sr_tree_path_export_errors"], 2)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn("tail-extend", logs.records[0].getMessage())
+        finally:
+            sr_round_metrics._sr_tree_path_export_warned = False
+
+    def test_note_tree_path_export_error_counts_without_metrics(self):
+        from sglang.srt.speculative.standalone_remote import sr_round_metrics
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            note_sr_tree_path_export_error,
+        )
+
+        sr_round_metrics._sr_tree_path_export_warned = False
+        try:
+            note_sr_tree_path_export_error(None, RuntimeError("no metrics"))
+            metrics = SimpleNamespace(counts=Counter())
+            note_sr_tree_path_export_error(metrics, RuntimeError("again"))
+            note_sr_tree_path_export_error(metrics, RuntimeError("third"))
+            self.assertEqual(metrics.counts["sr_tree_path_export_errors"], 2)
+        finally:
+            sr_round_metrics._sr_tree_path_export_warned = False
+
     def test_zero_page_gather_and_batch_error_appends_nothing(self):
         state = SRFixedAcceptState(1, 4, 15, 128, "cpu")
         predict, accept_index, accept_length = state.bind_verify_buffers(1)

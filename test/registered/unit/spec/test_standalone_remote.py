@@ -3235,6 +3235,30 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual(paged.kv_committed_len, 6)
         self.assertEqual(paged.kv_allocated_len, 6)
 
+        missing = SimpleNamespace(
+            rid="missing",
+            kv_committed_len=7,
+            kv_allocated_len=7,
+        )
+        with self.assertRaisesRegex(RuntimeError, "seq_lens_cpu snapshot is missing"):
+            _sync_kv_from_cpu_lengths(SimpleNamespace(reqs=[missing]), None, [1])
+        self.assertEqual(missing.kv_committed_len, 7)
+        self.assertEqual(missing.kv_allocated_len, 7)
+        short = SimpleNamespace(
+            rid="short",
+            kv_committed_len=4,
+            kv_allocated_len=4,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "seq_lens_cpu snapshot shorter than the verify batch"
+        ):
+            _sync_kv_from_cpu_lengths(
+                SimpleNamespace(reqs=[short]), torch.tensor([], dtype=torch.int64), [1]
+            )
+        self.assertEqual(short.kv_committed_len, 4)
+        verify = path.read_text(encoding="utf-8")
+        self.assertEqual(verify.count('raise RuntimeError("seq_lens_cpu snapshot is missing")'), 2)
+
     def test_build_request_sends_speculative_num_draft_tokens(self):
         mixin_cls = self._import_mixin()
         mixin = mixin_cls()
@@ -6581,6 +6605,54 @@ class TestSRV2StopAndVersion(CustomTestCase):
         self.assertFalse(req.sr_force_snapshot)
         self.assertEqual(req.cur_drafts, [])
         self.assertEqual(req.sr_ack_commit_version, 3)
+
+    def test_resync_reject_forces_snapshot_and_leaves_session_rejects(self):
+        mixin, _inflight_cls = self._target()
+        pending = SRPendingEntry(
+            step_id=1, base_committed_len=4, commit_version=4, sent_output_len=2
+        )
+
+        def apply(reason):
+            req = SimpleNamespace(
+                rid="a",
+                sr_next_commit_version=5,
+                sr_ack_commit_version=3,
+                sr_ack_output_len=1,
+                sr_force_snapshot=False,
+                sr_stop_spec=False,
+                origin_input_ids=[1],
+                cur_drafts=[4],
+            )
+            reply = SRDraftReply(
+                rid="a",
+                step_id=1,
+                base_committed_len=4,
+                status=SRReplyStatus.REJECT,
+                reason=reason,
+                draft_tokens=[],
+            )
+            mixin._sr_apply_commit_acks([req], {"a": reply}, {"a": pending})
+            return req
+
+        for reason in (
+            "commit_mismatch",
+            "delta_length",
+            "stale_version",
+            "missing_cache",
+        ):
+            req = apply(reason)
+            self.assertTrue(req.sr_force_snapshot, reason)
+            self.assertFalse(req.sr_stop_spec, reason)
+            self.assertEqual(req.sr_ack_commit_version, 3, reason)
+            self.assertEqual(req.sr_ack_output_len, 1, reason)
+            self.assertEqual(req.cur_drafts, [4], reason)
+
+        for reason in ("deferred_finish", "stale_session"):
+            req = apply(reason)
+            self.assertFalse(req.sr_force_snapshot, reason)
+            self.assertFalse(req.sr_stop_spec, reason)
+            self.assertEqual(req.sr_ack_commit_version, 3, reason)
+            self.assertEqual(req.sr_ack_output_len, 1, reason)
 
     def test_spec_shape_mismatch_rejects_step_and_keeps_finish(self):
         mixin = self._draft()

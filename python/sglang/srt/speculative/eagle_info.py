@@ -721,10 +721,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
                 for req, path in zip(batch.reqs, accepted_tree_candidate_indices):
                     req.sr_accepted_tree_candidate_indices = list(path)
-            except Exception:
+            except Exception as exc:
                 accepted_tree_candidate_indices = []
                 for req in batch.reqs:
                     req.sr_accepted_tree_candidate_indices = None
+                from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+                    note_sr_tree_path_export_error,
+                )
+
+                note_sr_tree_path_export_error(
+                    getattr(batch, "sr_round_metrics", None), exc
+                )
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them

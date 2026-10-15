@@ -28,6 +28,7 @@ GRAPH_HOST_STAGE_LOG = {
 }
 _GRAPH_HOST_WARN_MAX = 8
 _graph_host_warns = 0
+_sr_tree_path_export_warned = False
 
 
 def _ns_to_ms(duration_ns):
@@ -43,6 +44,24 @@ def _warn_graph_host(where, exc):
         logger.warning("SR graph host %s failed: %s", where, exc)
     except Exception:
         return
+
+
+def note_sr_tree_path_export_error(metrics, exc) -> None:
+    """Count every tree-path export failure. Warn once per process.
+
+    Clearing the path is safe: Draft treats a missing candidate path as a
+    lease miss and falls back to tail-extend.
+    """
+    global _sr_tree_path_export_warned
+    if metrics is not None and hasattr(metrics, "counts"):
+        metrics.counts["sr_tree_path_export_errors"] += 1
+    if _sr_tree_path_export_warned:
+        return
+    _sr_tree_path_export_warned = True
+    logger.warning(
+        "[SR] accepted tree path export failed; clearing paths so Draft uses tail-extend: %s",
+        exc,
+    )
 
 
 def begin_graph_host_sample(context):

@@ -1052,9 +1052,17 @@ class TestProtocolAndExport(unittest.TestCase):
     def test_eagle_verify_gates_sr_export(self):
         from pathlib import Path
 
-        src = (
-            Path(__file__).resolve().parents[4]
-            / "python/sglang/srt/speculative/eagle_info.py"
+        root = Path(__file__).resolve().parents[4]
+        src = (root / "python/sglang/srt/speculative/eagle_info.py").read_text(
+            encoding="utf-8"
+        )
+        metrics = (
+            root
+            / "python/sglang/srt/speculative/standalone_remote/sr_round_metrics.py"
+        ).read_text(encoding="utf-8")
+        fixed = (
+            root
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_fixed_accept.py"
         ).read_text(encoding="utf-8")
         self.assertLess(
             src.index("is_standalone_remote"),
@@ -1062,6 +1070,9 @@ class TestProtocolAndExport(unittest.TestCase):
         )
         self.assertIn("sr_eos_cut", src)
         self.assertIn("sr_accepted_tree_candidate_indices = None", src)
+        self.assertIn("note_sr_tree_path_export_error", src)
+        self.assertIn("note_sr_tree_path_export_error", fixed)
+        self.assertIn('metrics.counts["sr_tree_path_export_errors"]', metrics)
 
 
 if __name__ == "__main__":

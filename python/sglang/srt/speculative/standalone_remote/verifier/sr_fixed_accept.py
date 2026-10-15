@@ -1087,10 +1087,15 @@ class SRFixedAcceptState:
             for req, path in zip(batch.reqs, stored):
                 req.sr_accepted_tree_candidate_indices = path
             self._tree_paths = stored
-        except Exception:
+        except Exception as exc:
             self._tree_paths = []
             for req in batch.reqs:
                 req.sr_accepted_tree_candidate_indices = None
+            from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+                note_sr_tree_path_export_error,
+            )
+
+            note_sr_tree_path_export_error(self.metrics, exc)
 
     def _commit(
         self,

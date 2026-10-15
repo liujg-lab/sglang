@@ -67,19 +67,23 @@ def _sync_kv_from_cpu_lengths(
     ``accept_length`` is draft tokens only; +1 is the Target bonus. Finished
     requests use the same formula after eagle_info truncates accept_index.
     Do not read device ``seq_lens``: paged topk>1 may leave it unchanged.
+    Do not read ``kv_committed_len``: ``append_verify_row`` has already added
+    this round's accepted count.
     """
     if seq_lens_cpu_pre is None:
-        pre_list = [_req_committed_len(req) for req in batch.reqs]
-    elif isinstance(seq_lens_cpu_pre, torch.Tensor):
+        raise RuntimeError("seq_lens_cpu snapshot is missing")
+    if isinstance(seq_lens_cpu_pre, torch.Tensor):
         pre_list = seq_lens_cpu_pre.tolist()
     else:
         pre_list = list(seq_lens_cpu_pre)
     acc = list(accept_length_per_req_cpu or [])
     for i, req in enumerate(batch.reqs):
+        if i >= len(pre_list):
+            raise RuntimeError("seq_lens_cpu snapshot shorter than the verify batch")
         if _is_health_check(req):
             continue
         accepted = int(acc[i]) if i < len(acc) else 0
-        pre = int(pre_list[i]) if i < len(pre_list) else _req_committed_len(req)
+        pre = int(pre_list[i])
         committed = pre + accepted + 1
         req.kv_committed_len = committed
         req.kv_allocated_len = committed
@@ -525,6 +529,8 @@ class StandaloneRemoteWorker:
             if fixed_state is not None:
                 fixed_state.metrics = None
         if not batch.forward_mode.is_idle():
+            if seq_lens_cpu_pre is None:
+                raise RuntimeError("seq_lens_cpu snapshot is missing")
             _sync_kv_from_cpu_lengths(
                 batch, seq_lens_cpu_pre, res.accept_length_per_req_cpu
             )
