@@ -286,9 +286,38 @@ def tree_row_valid(
     return True
 
 
+def _parent_slots_from_pos(
+    parent_row, index_row, pos_of: Dict[int, int], topk: int, ungrounded
+) -> List[int]:
+    """Parent tree-slot of every node, using the ``pos_of`` repair already built.
+
+    Slot 0 is the root and stays ``-1``. A draft slot in ``ungrounded`` stays
+    ``-1``. ``parent_tb == 0`` points at the root. Any other selected parent
+    points at ``pos_of[parent] + 1``. Candidate ids already decrease along an
+    edge, so these slots cannot form a cycle.
+    """
+    width = len(index_row) + 1
+    parent_of = [-1] * width
+    loose = set(ungrounded)
+    for draft_i, idx in enumerate(index_row):
+        if draft_i in loose:
+            continue
+        parent_tb = int(idx) // topk
+        if parent_tb <= 0:
+            parent_of[draft_i + 1] = 0
+            continue
+        if parent_tb >= len(parent_row):
+            continue
+        found = pos_of.get(parent_row[parent_tb])
+        if found is None:
+            continue
+        parent_of[draft_i + 1] = found + 1
+    return parent_of
+
+
 def repair_ungrounded_parents(
     parents, indices, topk: int
-) -> Tuple[List[int], List[int], List[int]]:
+) -> Tuple[List[int], List[int], List[int], List[int]]:
     """Point missing parents at a grounded node so the mask thread can stop.
 
     A node is grounded when ``parent_tb == 0``, or its parent token is a
@@ -300,9 +329,10 @@ def repair_ungrounded_parents(
     ``parent_tb == 0``. When nothing is grounded, every index becomes 0 and the
     mask thread does not read ``parent_list``.
 
-    Returns ``(parents, indices, ungrounded draft slots)``. A rewritten parent
-    row is a new list. The caller's sequences are not modified. The ungrounded
-    slots must not be accepted.
+    Returns ``(parents, indices, ungrounded draft slots, parent slots)``. A
+    rewritten parent row is a new list. The caller's sequences are not modified.
+    The ungrounded slots must not be accepted, and their parent slot stays
+    ``-1``. ``parent slots`` has length ``len(indices) + 1``.
     """
     parent_row = parents
     index_row = indices
@@ -324,9 +354,19 @@ def repair_ungrounded_parents(
             grounded[slot] = True
     ungrounded = [slot for slot, flag in enumerate(grounded) if not flag]
     if not ungrounded:
-        return parent_row, index_row, []
+        return (
+            parent_row,
+            index_row,
+            [],
+            _parent_slots_from_pos(parent_row, index_row, pos_of, topk, []),
+        )
     if not any(grounded):
-        return parent_row, [0] * len(index_row), ungrounded
+        return (
+            parent_row,
+            [0] * len(index_row),
+            ungrounded,
+            [-1] * (len(index_row) + 1),
+        )
     anchor = next(
         index_row[slot]
         for slot, flag in enumerate(grounded)
@@ -340,7 +380,12 @@ def repair_ungrounded_parents(
             continue
         if rewritten[parent_tb] not in grounded_ids:
             rewritten[parent_tb] = anchor
-    return rewritten, index_row, ungrounded
+    return (
+        rewritten,
+        index_row,
+        ungrounded,
+        _parent_slots_from_pos(rewritten, index_row, pos_of, topk, ungrounded),
+    )
 
 
 class DraftPacketPlan:
@@ -361,6 +406,7 @@ class DraftPacketPlan:
         invalid_tree_rows: int = 0,
         no_draft: Optional[Sequence[bool]] = None,
         disconnected: Optional[Sequence[Sequence[int]]] = None,
+        parent_slots: Optional[Sequence[Sequence[int]]] = None,
     ) -> None:
         self.bs = int(bs)
         self.token_width = int(token_width)
@@ -381,6 +427,11 @@ class DraftPacketPlan:
             self.disconnected = [[] for _ in range(self.bs)]
         else:
             self.disconnected = [list(slots) for slots in disconnected]
+        width = self.token_width + 1
+        if parent_slots is None:
+            self.parent_slots = [[-1] * width for _ in range(self.bs)]
+        else:
+            self.parent_slots = [list(row) for row in parent_slots]
 
     @property
     def used(self) -> int:
@@ -410,6 +461,8 @@ def plan_draft_rows(
     parents stay ``-1`` and indices stay ``0``, with no chain template. Only a
     failed row clears tokens and increments ``invalid_tree_rows``. When
     ``vocab`` is set, a token outside ``[0, vocab)`` fails that check.
+    ``parent_slots[b]`` is the tree-slot parent of every node. Slot 0 and every
+    unlinked draft slot are ``-1``.
     """
     bs = len(token_rows)
     width = int(num_draft_tokens)
@@ -424,6 +477,7 @@ def plan_draft_rows(
     token_rows_out: List = list(token_rows)
     no_draft = [False] * bs
     disconnected: List[List[int]] = [[] for _ in range(bs)]
+    parent_slots: List[List[int]] = [[-1] * width for _ in range(bs)]
     cleared = (0,) * token_width
     invalid = 0
     if topk_i > 1:
@@ -455,12 +509,13 @@ def plan_draft_rows(
                 token_rows_out[i] = cleared
                 no_draft[i] = True
                 continue
-            repaired_parents, repaired_indices, slots = repair_ungrounded_parents(
+            repaired_parents, repaired_indices, slots, linked = repair_ungrounded_parents(
                 parent_row, index_row, topk_i
             )
             parsed_parents[i] = repaired_parents
             parsed_indices[i] = repaired_indices
             disconnected[i] = slots
+            parent_slots[i] = linked
     return DraftPacketPlan(
         bs,
         token_width,
@@ -475,6 +530,7 @@ def plan_draft_rows(
         invalid,
         no_draft,
         disconnected,
+        parent_slots,
     )
 
 
@@ -924,8 +980,7 @@ class VerifyInputPacket:
                 owner=self,
                 generation=self.generation,
                 batch_key=rpd_batch_key,
-                no_draft=plan.no_draft,
-                disconnected=plan.disconnected,
+                parent_slots=plan.parent_slots,
             )
             if context is not None:
                 used += int(context.edge_index_cpu.numel())

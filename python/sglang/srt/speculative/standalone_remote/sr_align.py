@@ -297,25 +297,6 @@ def replay_grammar_from_committed(template, committed_ids: Optional[Sequence[int
     return grammar
 
 
-def drop_duplicate_root_draft(
-    last_committed: Optional[int],
-    draft_tokens: Sequence[int],
-    include_root: bool = False,
-) -> List[int]:
-    """Drop a leading draft token that duplicates EAGLE's verify root.
-
-    STANDALONE_REMOTE windows do not prepend ``verified_id``. A repeated token
-    id (``\\n\\n``, stacked words) is a valid next token unless the caller
-    marks the window as ``include_root=True``.
-    """
-    tokens = list(draft_tokens or [])
-    if not include_root or last_committed is None or not tokens:
-        return tokens
-    if tokens[0] == last_committed:
-        return tokens[1:]
-    return tokens
-
-
 def wrap_tp_broadcast(obj: Any) -> List[Any]:
     """Box an object for ``broadcast_pyobj`` (needs ``len``). ``[None]`` is valid."""
     return [obj]

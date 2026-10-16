@@ -30,7 +30,6 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     committed_tail_not_in_kv,
     draft_needed_max_new_tokens,
     draft_token_budget,
-    drop_duplicate_root_draft,
     find_fork_point,
     ingest_active_indices,
     kv_release_len,
@@ -1865,22 +1864,6 @@ class TestOverlappedPrefillShift(CustomTestCase):
     def test_empty_drafts(self):
         self.assertEqual(shift_overlapped_prefill_drafts([10], []), [])
 
-    def test_drop_duplicate_verify_root(self):
-        self.assertEqual(
-            drop_duplicate_root_draft(10, [10, 11, 12, 13, 14]),
-            [10, 11, 12, 13, 14],
-        )
-        self.assertEqual(drop_duplicate_root_draft(10, [11, 12, 13]), [11, 12, 13])
-        self.assertEqual(drop_duplicate_root_draft(None, [10, 11]), [10, 11])
-        self.assertEqual(
-            drop_duplicate_root_draft(10, [10, 11, 12, 13, 14], include_root=True),
-            [11, 12, 13, 14],
-        )
-        self.assertEqual(
-            drop_duplicate_root_draft(10, [11, 12, 13], include_root=True),
-            [11, 12, 13],
-        )
-
 
 class TestStandaloneRemoteTree(CustomTestCase):
     def _import_worker(self):
@@ -2553,7 +2536,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
 
         parents = [-1, 0, 0, 2, 0]
         indices = [6, 2, 0]
-        repaired_parents, repaired_indices, slots = repair_ungrounded_parents(
+        repaired_parents, repaired_indices, slots, _parent_slots = repair_ungrounded_parents(
             parents, indices, 2
         )
         self.assertEqual(slots, [])
@@ -3645,13 +3628,12 @@ class TestStandaloneRemoteTree(CustomTestCase):
             called["n"] += 1
 
         mixin._sr_shift_prefill_replies = boom
-        mixin._sr_drop_root_duplicate_replies = boom
         mixin._sr_maybe_align_chain_replies([], {}, prefill=True)
         mixin._sr_maybe_align_chain_replies([], {}, prefill=False)
         self.assertEqual(called["n"], 0)
         mixin.server_args.speculative_eagle_topk = 1
         mixin._sr_maybe_align_chain_replies([], {}, prefill=True)
-        self.assertEqual(called["n"], 2)
+        self.assertEqual(called["n"], 1)
 
 
 class TestReplayGrammarFromCommitted(CustomTestCase):

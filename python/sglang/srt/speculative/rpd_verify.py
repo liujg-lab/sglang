@@ -9,7 +9,7 @@ smaller sum of gaps, then leftmost sibling order.
 Torch-only so CPU unit tests can import it without the rest of sglang.srt.
 Production verification on NPU, CUDA, and CPU uses the compact path: the vocab
 reduction and paired edge logits stay on device, and the longest path is still
-chosen on CPU. ``_verify_tree_rpd_cpu`` is an independent reference for tests.
+chosen on CPU. The independent CPU reference lives in the test helper.
 """
 
 from __future__ import annotations
@@ -21,28 +21,17 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
+    alloc_host,
+    submit_copy,
+    wait_event,
+)
+
 logger = logging.getLogger(__name__)
-_logged_rpd_path = False
-_logged_rpd_npu_path = False
-_logged_rpd_cuda_path = False
+_logged_compact_devices = set()
+_compact_cross_device_bytes = 0
+_compact_stat_waits = 0
 _COMPACT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-
-
-@dataclass
-class _CompactStats:
-    """Test-facing counters for compact transfers. Production does not read them."""
-
-    cross_device_bytes: int = 0
-    stat_waits: int = 0
-
-    def note_bytes(self, tensor: torch.Tensor) -> None:
-        self.cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
-
-    def note_wait(self) -> None:
-        self.stat_waits += 1
-
-
-_compact_stats = _CompactStats()
 
 
 def rpd_gap_max(tau: float) -> float:
@@ -53,18 +42,6 @@ def rpd_gap_max(tau: float) -> float:
     if tau_f == 0.0:
         return 0.0
     return -math.log(1.0 - tau_f)
-
-
-def edge_valid_from_logits(z_star: float, z_c: float, tau: float) -> bool:
-    """Test-only gap check. Production selection does not call this helper.
-
-    tau=0 requires exact equality of the two logits only when they correspond
-    to the same argmax token; callers that have token ids should use
-    ``c_v == c_star`` instead. This helper is the gap form for tau>0 tests.
-    """
-    if float(tau) == 0.0:
-        return float(z_c) >= float(z_star)
-    return (float(z_star) - float(z_c)) <= rpd_gap_max(tau)
 
 
 def _children_and_parents(
@@ -125,106 +102,11 @@ def _longest_path(
     return path
 
 
-def _prepare_logits(logits: torch.Tensor) -> torch.Tensor:
-    if logits.dim() == 3:
-        return logits.reshape(-1, logits.shape[-1])
-    return logits
-
-
-def _verify_tree_rpd_cpu(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    logits: torch.Tensor,
-    gap_max: float,
-    use_equality: bool,
-) -> None:
-    """Independent reference for tests. Production CPU verification uses compact."""
-    bs, n = candidates.shape
-    logits_f32 = _prepare_logits(logits).float()
-    target_predict = torch.argmax(logits_f32, dim=-1)
-    z_star = logits_f32.max(dim=-1).values
-
-    next_token = retrive_next_token.detach().to("cpu")
-    next_sibling = retrive_next_sibling.detach().to("cpu")
-    cand_cpu = candidates.detach().to("cpu")
-    retr_cpu = retrive_index.detach().to("cpu")
-    argmax_cpu = target_predict.detach().to("cpu")
-    z_star_cpu = z_star.detach().to("cpu")
-    logits_cpu = logits_f32.detach().to("cpu")
-
-    accept_index.fill_(-1)
-    vocab = logits_cpu.shape[-1]
-
-    for b in range(bs):
-        nt = next_token[b].tolist()
-        ns = next_sibling[b].tolist()
-        children, parent = _children_and_parents(nt, ns)
-        valid = [False] * n
-        gaps = [0.0] * n
-        for v in range(n):
-            p = parent[v]
-            if p < 0:
-                continue
-            parent_flat = int(retr_cpu[b, p].item())
-            child_tok = int(cand_cpu[b, v].item())
-            if parent_flat < 0 or parent_flat >= z_star_cpu.numel():
-                continue
-            if child_tok < 0 or child_tok >= vocab:
-                continue
-            star_tok = int(argmax_cpu[parent_flat].item())
-            z_s = float(z_star_cpu[parent_flat].item())
-            z_c = float(logits_cpu[parent_flat, child_tok].item())
-            gap = z_s - z_c
-            gaps[v] = gap
-            if use_equality:
-                valid[v] = child_tok == star_tok
-            else:
-                valid[v] = gap <= gap_max
-
-        path = _longest_path(children, valid, gaps)
-        k = len(path) - 1
-        accept_token_num[b] = k
-        for t, slot in enumerate(path):
-            flat = int(retr_cpu[b, slot].item())
-            accept_index[b, t] = flat
-        for t in range(1, len(path)):
-            parent_slot = path[t - 1]
-            child_slot = path[t]
-            parent_flat = int(retr_cpu[b, parent_slot].item())
-            child_tok = int(cand_cpu[b, child_slot].item())
-            predicts[parent_flat] = child_tok
-        last_flat = int(retr_cpu[b, path[-1]].item())
-        predicts[last_flat] = int(argmax_cpu[last_flat].item())
-
-
-def compact_cross_device_bytes() -> int:
-    """Bytes moved by the compact helpers between two different devices."""
-    return _compact_stats.cross_device_bytes
-
-
-def reset_compact_cross_device_bytes() -> None:
-    _compact_stats.cross_device_bytes = 0
-
-
-def compact_stat_waits() -> int:
-    """How many times argmax and edge scalars were waited on together."""
-    return _compact_stats.stat_waits
-
-
-def reset_compact_stat_waits() -> None:
-    _compact_stats.stat_waits = 0
-
-
 def _compact_host_read(tensor: torch.Tensor) -> torch.Tensor:
     """Logical D2H. A tensor that is already on CPU is not a cross-device copy."""
     if tensor.device.type == "cpu":
         return tensor
-    _compact_stats.note_bytes(tensor)
+    _note_cross_device_bytes(tensor)
     return tensor.detach().to(device="cpu")
 
 
@@ -232,17 +114,23 @@ def _compact_device_write(tensor: torch.Tensor, device: torch.device) -> torch.T
     """Logical H2D. Same-device tensors, including CPU copies, are not counted."""
     if tensor.device == device:
         return tensor
-    _compact_stats.note_bytes(tensor)
+    _note_cross_device_bytes(tensor)
     return tensor.detach().to(device=device)
 
 
-def _rpd_backend_name(device_type: str, is_cuda: bool) -> str:
-    """Pick the RPD backend. NPU wins even when ``is_cuda`` has been aliased."""
-    if device_type == "npu":
-        return "npu"
-    if bool(is_cuda) or device_type == "cuda":
-        return "cuda"
-    return "cpu"
+def _log_compact_once(device: torch.device) -> None:
+    """Log the shared compact path once per ``device.type``."""
+    kind = device.type
+    if kind in _logged_compact_devices:
+        return
+    _logged_compact_devices.add(kind)
+    if kind == "cpu":
+        logger.info(
+            "Speculative RPD verify path: cpu_compact_cpu_path device=%s",
+            device,
+        )
+        return
+    logger.info("Speculative RPD verify path: %s_compact_cpu_path", kind)
 
 
 def _rpd_compact_layout(logits: torch.Tensor) -> Tuple[int, int, Optional[int]]:
@@ -299,15 +187,18 @@ def _rpd_compact_tree(
     return _compact_host_read(packed)
 
 
-def _rpd_compact_edges(
+def _rpd_link_rows(
     tree_cpu: torch.Tensor, rows: int, vocab: int
-) -> Tuple[List[Tuple[int, int, int]], Optional[torch.Tensor]]:
-    """Build sibling-ordered edges on the host.
+) -> Tuple[
+    List[Tuple[int, int, int]], Optional[torch.Tensor], List[List[List[int]]]
+]:
+    """Walk each row once.
 
-    Returns ``(batch, child_slot, parent_slot)`` and a CPU ``int64[2, E]``
-    index of ``(parent_row, child_token)``. Positions with no parent, an
-    out-of-range parent retrieve, or an out-of-range child token produce no
-    edge. ``E == 0`` returns ``None`` instead of an index tensor.
+    Returns sibling-ordered ``(batch, child_slot, parent_slot)`` edges, a CPU
+    ``int64[2, E]`` index of ``(parent_row, child_token)``, and the children
+    lists from that same walk. Positions with no parent, an out-of-range parent
+    retrieve, or an out-of-range child token produce no edge. ``E == 0``
+    returns ``None`` instead of an index tensor.
     """
     cand = tree_cpu[0].tolist()
     retr = tree_cpu[1].tolist()
@@ -316,8 +207,10 @@ def _rpd_compact_edges(
     edges: List[Tuple[int, int, int]] = []
     parent_rows: List[int] = []
     child_tokens: List[int] = []
+    children_rows: List[List[List[int]]] = []
     for b in range(len(cand)):
-        _, parent = _children_and_parents(next_token[b], next_sibling[b])
+        children, parent = _children_and_parents(next_token[b], next_sibling[b])
+        children_rows.append(children)
         for v in range(len(cand[b])):
             p = parent[v]
             if p < 0:
@@ -332,8 +225,25 @@ def _rpd_compact_edges(
             parent_rows.append(parent_flat)
             child_tokens.append(child_tok)
     if not edges:
-        return edges, None
-    return edges, torch.tensor([parent_rows, child_tokens], dtype=torch.int64)
+        return edges, None, children_rows
+    return (
+        edges,
+        torch.tensor([parent_rows, child_tokens], dtype=torch.int64),
+        children_rows,
+    )
+
+
+def _rpd_compact_edges(
+    tree_cpu: torch.Tensor, rows: int, vocab: int
+) -> Tuple[List[Tuple[int, int, int]], Optional[torch.Tensor]]:
+    """Build sibling-ordered edges on the host.
+
+    Returns ``(batch, child_slot, parent_slot)`` and a CPU ``int64[2, E]``
+    index of ``(parent_row, child_token)``. The children lists from the same
+    walk are dropped; production selection uses ``_rpd_link_rows`` instead.
+    """
+    edges, edge_index, _children = _rpd_link_rows(tree_cpu, rows, vocab)
+    return edges, edge_index
 
 
 def _rpd_slot_argmax(
@@ -368,69 +278,33 @@ def _rpd_compact_edge_values(
     return torch.stack((edge_max, edge_candidate), dim=0)
 
 
-def _try_pinned_like(tensor: torch.Tensor) -> Optional[torch.Tensor]:
-    try:
-        return torch.empty(
-            tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
-        )
-    except (RuntimeError, NotImplementedError):
-        return None
-
-
-def _record_stream_event(device: torch.device):
-    try:
-        if device.type == "cuda":
-            event = torch.cuda.Event()
-        elif device.type == "npu":
-            event = torch.npu.Event()
-        else:
-            return None
-        event.record()
-        return event
-    except (AttributeError, RuntimeError):
-        return None
-
-
 def _note_cross_device_bytes(tensor: torch.Tensor) -> None:
-    _compact_stats.note_bytes(tensor)
+    global _compact_cross_device_bytes
+    _compact_cross_device_bytes += int(tensor.numel()) * int(tensor.element_size())
 
 
 def _compact_await_stats(
     argmax: torch.Tensor, edge_values: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Bring argmax and optional edge scalars to the host with one wait."""
-    _compact_stats.note_wait()
+    global _compact_stat_waits
+    _compact_stat_waits += 1
     pending = [argmax] if edge_values is None else [argmax, edge_values]
     if all(tensor.device.type == "cpu" for tensor in pending):
         argmax_cpu = _compact_host_read(argmax)
         edge_cpu = None if edge_values is None else _compact_host_read(edge_values)
         return argmax_cpu, edge_cpu
-    pinned = []
-    for tensor in pending:
-        dest = _try_pinned_like(tensor)
-        if dest is None:
-            pinned = []
-            break
-        pinned.append(dest)
-    if not pinned:
-        argmax_cpu = _compact_host_read(argmax)
-        edge_cpu = None if edge_values is None else _compact_host_read(edge_values)
-        return argmax_cpu, edge_cpu
-    for dest, src in zip(pinned, pending):
+    hosts = []
+    last_event = None
+    for src in pending:
+        dest, _pinned = alloc_host(tuple(src.shape), src.dtype, src.device)
         _note_cross_device_bytes(src)
-        dest.copy_(src, non_blocking=True)
-    event = _record_stream_event(pending[0].device)
-    if event is None:
-        stream_device = pending[0].device
-        if stream_device.type == "cuda":
-            torch.cuda.current_stream(stream_device).synchronize()
-        elif stream_device.type == "npu":
-            torch.npu.current_stream(stream_device).synchronize()
-    else:
-        event.synchronize()
+        last_event = submit_copy(dest, src)
+        hosts.append(dest)
+    wait_event(last_event)
     if edge_values is None:
-        return pinned[0], None
-    return pinned[0], pinned[1]
+        return hosts[0], None
+    return hosts[0], hosts[1]
 
 
 @dataclass(frozen=True)
@@ -442,12 +316,16 @@ class _RPDHostTopology:
     edges: tuple
 
 
-def _rpd_host_topology(tree_cpu, edges):
+def _rpd_host_topology(tree_cpu, edges, children=None):
     cand, retr, next_token, next_sibling = tree_cpu.tolist()
+    if children is None:
+        children = [
+            _children_and_parents(n, s)[0] for n, s in zip(next_token, next_sibling)
+        ]
     return _RPDHostTopology(
         cand,
         retr,
-        [_children_and_parents(n, s)[0] for n, s in zip(next_token, next_sibling)],
+        children,
         {(b, v): i for i, (b, v, _parent) in enumerate(edges)},
         tuple(edges),
     )
@@ -495,8 +373,6 @@ def _rpd_select_host(
                     f"RPD accepted retrieve {flat} is outside logits rows "
                     f"[0, {rows}) or predicts length {predict_len}."
                 )
-            if int(star[b][slot]) < 0:
-                raise ValueError("RPD clamp placeholder reached an accepted retrieve.")
             flats.append(flat)
         plans.append((path, flats))
 
@@ -522,14 +398,16 @@ def _rpd_compact_select(
     accept_width: int,
     rows: int,
     predict_len: int,
+    children: Optional[Sequence] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Choose every path on the host and fold predict writes before any upload.
 
     A path longer than ``accept_index`` or a retrieve outside the logit rows
     and ``predicts`` raises here, before the result packet is uploaded.
+    ``children`` comes from the same row walk that built ``edges``.
     """
     rows_list, lengths_list, folded = _rpd_select_host(
-        _rpd_host_topology(tree_cpu, edges),
+        _rpd_host_topology(tree_cpu, edges, children),
         star_cpu.tolist(),
         None if stats_cpu is None else stats_cpu.tolist(),
         gap_max,
@@ -638,7 +516,7 @@ def _verify_tree_rpd_compact(
         retrive_next_sibling,
     )
     z_star, argmax = _rpd_compact_reduce(logits)
-    edges, edge_index = _rpd_compact_edges(tree_cpu, rows, vocab)
+    edges, edge_index, children = _rpd_link_rows(tree_cpu, rows, vocab)
     slot_argmax = _rpd_slot_argmax(argmax, retrive_index, rows)
     edge_values = None
     if edge_index is not None:
@@ -654,6 +532,7 @@ def _verify_tree_rpd_compact(
         accept_width,
         rows,
         int(predicts.numel()),
+        children,
     )
     _rpd_compact_apply(payload, predicts, accept_index, accept_token_num, device)
 
@@ -681,10 +560,9 @@ def verify_tree_rpd(
         logits: ``[tot, vocab]`` target logits, rows indexed by retrive_index.
         tau: RPD threshold in ``[0, 1)``.
     """
-    global _logged_rpd_path, _logged_rpd_npu_path, _logged_rpd_cuda_path
     gap_max = rpd_gap_max(tau)
     use_equality = float(tau) == 0.0
-    kwargs = dict(
+    _verify_tree_rpd_compact(
         predicts=predicts,
         accept_index=accept_index,
         accept_token_num=accept_token_num,
@@ -696,20 +574,5 @@ def verify_tree_rpd(
         gap_max=gap_max,
         use_equality=use_equality,
     )
-    backend = _rpd_backend_name(logits.device.type, bool(logits.is_cuda))
-    _verify_tree_rpd_compact(**kwargs)
-    if backend == "npu":
-        if not _logged_rpd_npu_path:
-            _logged_rpd_npu_path = True
-            logger.info("Speculative RPD verify path: npu_compact_cpu_path")
-    elif backend == "cuda":
-        if not _logged_rpd_cuda_path:
-            _logged_rpd_cuda_path = True
-            logger.info("Speculative RPD verify path: cuda_compact_cpu_path")
-    elif not _logged_rpd_path:
-        _logged_rpd_path = True
-        logger.info(
-            "Speculative RPD verify path: cpu_compact_cpu_path device=%s",
-            logits.device,
-        )
+    _log_compact_once(logits.device)
     return predicts, accept_index, accept_token_num

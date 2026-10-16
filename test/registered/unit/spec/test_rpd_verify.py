@@ -7,13 +7,17 @@ import torch
 
 import sglang.srt.speculative.rpd_verify as rpd
 from sglang.srt.speculative.rpd_verify import (
-    _rpd_backend_name,
     _verify_tree_rpd_compact,
-    _verify_tree_rpd_cpu,
-    edge_valid_from_logits,
-    reset_compact_cross_device_bytes,
     rpd_gap_max,
     verify_tree_rpd,
+)
+from sglang.test.rpd_reference import (
+    _verify_tree_rpd_cpu,
+    compact_cross_device_bytes,
+    compact_stat_waits,
+    edge_valid_from_logits,
+    reset_compact_cross_device_bytes,
+    reset_compact_stat_waits,
 )
 
 try:
@@ -815,16 +819,14 @@ class TestRpdCompactTransfers(CustomTestCase):
         tensors = TestRpdCompactMatchesReference()._branching(vocab=64)
         reset_compact_cross_device_bytes()
         _run_reference_and_compact(*tensors, tau=0.2)
-        from sglang.srt.speculative.rpd_verify import compact_cross_device_bytes
-
         self.assertEqual(compact_cross_device_bytes(), 0)
 
     def test_edged_batch_reads_tree_then_stats_once(self):
         tensors = TestRpdCompactMatchesReference()._branching()
-        rpd.reset_compact_stat_waits()
+        reset_compact_stat_waits()
         reads, writes, ref, compact = self._run_with_stub(tensors, tau=0.2)
         _assert_same_result(self, ref, compact)
-        self.assertEqual(rpd.compact_stat_waits(), 1)
+        self.assertEqual(compact_stat_waits(), 1)
         self.assertEqual(len(reads), 3)
         self.assertEqual(len(writes), 2)
         self.assertEqual(tuple(reads[0].shape), (4, 1, 7))
@@ -872,11 +874,11 @@ class TestRpdCompactTransfers(CustomTestCase):
         sibling = torch.tensor([[-1]], dtype=torch.int64)
         logits = torch.zeros(1, 32, dtype=torch.float32)
         logits[0, 3] = 1.0
-        rpd.reset_compact_stat_waits()
+        reset_compact_stat_waits()
         reads, writes, _ref, _compact = self._run_with_stub(
             (candidates, retrive, nxt, sibling, logits), tau=0.2, spec_width=2
         )
-        self.assertEqual(rpd.compact_stat_waits(), 1)
+        self.assertEqual(compact_stat_waits(), 1)
         self.assertEqual(len(reads), 2)
         self.assertEqual(len(writes), 1)
         self.assertEqual(tuple(reads[0].shape), (4, 1, 1))
@@ -955,59 +957,35 @@ class TestRpdCompactTransfers(CustomTestCase):
         self.assertEqual(seen, [])
 
     def test_dispatch_by_device_type(self):
-        self.assertEqual(_rpd_backend_name("npu", True), "npu")
-        self.assertEqual(_rpd_backend_name("npu", False), "npu")
-        self.assertEqual(_rpd_backend_name("cuda", True), "cuda")
-        self.assertEqual(_rpd_backend_name("cuda", False), "cuda")
-        self.assertEqual(_rpd_backend_name("cpu", False), "cpu")
-
         called = []
         original_compact = rpd._verify_tree_rpd_compact
-        original_cpu = rpd._verify_tree_rpd_cpu
 
         def watch_compact(**kwargs):
             called.append("compact")
             original_compact(**kwargs)
 
-        def forbid_cpu(**kwargs):
-            raise AssertionError("cpu dispatch entered reference")
-
         rpd._verify_tree_rpd_compact = watch_compact
-        rpd._verify_tree_rpd_cpu = forbid_cpu
         try:
             case = TestRpdLongestPath()._branching_tree()
             _run_rpd(*case, tau=0.2)
         finally:
             rpd._verify_tree_rpd_compact = original_compact
-            rpd._verify_tree_rpd_cpu = original_cpu
         self.assertEqual(called, ["compact"])
 
     def test_cuda_backend_uses_compact_not_reference(self):
         called = []
-        original_name = rpd._rpd_backend_name
         original_compact = rpd._verify_tree_rpd_compact
-        original_cpu = rpd._verify_tree_rpd_cpu
-
-        def fake_name(device_type, is_cuda):
-            return "cuda"
 
         def watch_compact(**kwargs):
             called.append("compact")
             original_compact(**kwargs)
 
-        def forbid_cpu(**kwargs):
-            raise AssertionError("cuda dispatch entered cpu reference")
-
-        rpd._rpd_backend_name = fake_name
         rpd._verify_tree_rpd_compact = watch_compact
-        rpd._verify_tree_rpd_cpu = forbid_cpu
         try:
             case = TestRpdLongestPath()._branching_tree()
             got = _run_rpd(*case, tau=0.2)
         finally:
-            rpd._rpd_backend_name = original_name
             rpd._verify_tree_rpd_compact = original_compact
-            rpd._verify_tree_rpd_cpu = original_cpu
         self.assertEqual(called, ["compact"])
         ref = _run_rpd(*TestRpdLongestPath()._branching_tree(), tau=0.2)
         self.assertEqual(got[2].tolist(), ref[2].tolist())

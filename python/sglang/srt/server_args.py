@@ -782,6 +782,10 @@ class ServerArgs:
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
+        # RPD mode and tau are pure argument checks. Dummy models skip the
+        # rest of speculative setup, so this must run before that return.
+        self._validate_speculative_verify_args()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -2999,7 +3003,7 @@ class ServerArgs:
             )
         return False
 
-    def _handle_speculative_decoding(self):
+    def _validate_speculative_verify_args(self):
         verify_modes = ("auto", "greedy", "target_only", "rpd")
         if self.speculative_verify_mode not in verify_modes:
             raise ValueError(
@@ -3011,6 +3015,9 @@ class ServerArgs:
                 "--speculative-rpd-tau must be in [0, 1), "
                 f"got {self.speculative_rpd_tau}."
             )
+
+    def _handle_speculative_decoding(self):
+        self._validate_speculative_verify_args()
 
         if (
             self.speculative_draft_model_path is not None

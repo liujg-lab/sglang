@@ -553,14 +553,6 @@ class SRFixedAcceptState:
         )
         self._page_exact = None
         self._staging_noted = False
-        self.rpd_workspace = None
-        self._rpd_fallback_logged = set()
-
-    def note_rpd_fallback(self, reason: str) -> None:
-        self.note_path("rpd_host_fallback_" + reason)
-        if reason not in self._rpd_fallback_logged:
-            self._rpd_fallback_logged.add(reason)
-            logger.info("[SR] RPD host plan fallback reason=%s", reason)
 
     def note_path(self, name: str) -> None:
         metrics = self.metrics
@@ -646,8 +638,6 @@ class SRFixedAcceptState:
         if not logits.is_contiguous() or not out_cache_loc.is_contiguous():
             return "noncontiguous"
         if verify_mode == "rpd":
-            from sglang.srt.speculative.standalone_remote.sr_rpd import SRRPDWorkspace
-
             if rpd_host_input is None:
                 return "rpd_context"
             if (
@@ -655,11 +645,6 @@ class SRFixedAcceptState:
                 and rpd_host_input.batch_key != rpd_live_batch_key
             ):
                 return "rpd_batch_key"
-            if self.rpd_workspace is None:
-                self.rpd_workspace = SRRPDWorkspace()
-            reason = self.rpd_workspace.prepare(logits, rpd_host_input, self.metrics)
-            if reason:
-                return "rpd_" + reason
         return None
 
     def bind_verify_buffers(self, bs: int):
@@ -879,10 +864,6 @@ class SRFixedAcceptState:
             raise RuntimeError("RPD host plan capacity or layout mismatch")
         if batch.out_cache_loc.numel() != bs * self.W:
             raise RuntimeError("RPD host plan cache slots mismatch")
-        for row, tokens in zip(plan.rows, plan.tokens):
-            for idx, tok in zip(row, tokens):
-                if idx >= 0 and not 0 <= tok < plan.vocab:
-                    raise RuntimeError("RPD host plan token outside vocabulary")
         validate_packed_rows(plan.rows, plan.pre_lengths, [0] * bs)
         if any(not row or row[0] == -1 for row in plan.rows):
             raise RuntimeError("RPD host plan missing root")

@@ -309,6 +309,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
         prepare_local_draft_hidden: bool = True,
         sr_accept_state=None,
+        sr_rpd_workspace=None,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -409,9 +410,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sr_accept_state.note_path("fixed_accept_noncontiguous")
             else:
                 sr_accept_state.note_path("fixed_accept_" + reject_reason)
-                if verify_mode == "rpd":
-                    sr_accept_state.note_rpd_fallback(reject_reason)
-        if not fixed_bound and not rpd_host_bound:
+        host_plan_ready = (
+            sr_rpd_workspace is not None
+            and verify_mode == "rpd"
+            and int(self.topk) > 1
+        )
+        if not fixed_bound and not host_plan_ready:
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
             predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
@@ -490,39 +494,61 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             resolved_verify, verify_mode=verify_mode, tau=rpd_tau
         )
 
+        host_v1_plan = None
         if resolved_verify == "rpd":
-            if rpd_host_bound:
+            if host_plan_ready:
                 from sglang.srt.speculative.standalone_remote.sr_rpd import (
                     verify_sr_rpd_host,
                 )
 
+                rpd_context = getattr(self, "sr_rpd_input", None)
+                if rpd_context is None or not rpd_context.current():
+                    raise RuntimeError(
+                        "SR RPD tree batch has no current host topology"
+                    )
+                prepare_reason = sr_rpd_workspace.prepare(
+                    logits_output.next_token_logits,
+                    rpd_context,
+                    sr_rpd_workspace.metrics,
+                )
+                if prepare_reason:
+                    raise RuntimeError(
+                        f"SR RPD host plan prepare failed: {prepare_reason}"
+                    )
                 host_plan = verify_sr_rpd_host(
                     logits_output.next_token_logits,
                     rpd_context,
-                    sr_accept_state.rpd_workspace,
+                    sr_rpd_workspace,
                     rpd_tau,
                     self.spec_steps + 1,
                 )
-                raw = sr_accept_state.finalize_from_host(
-                    batch,
-                    logits_output,
-                    page_size,
-                    self.topk,
-                    token_to_kv_pool_allocator,
-                    host_plan,
+                if rpd_host_bound:
+                    sr_rpd_workspace.log_path_once("npu_sr_host_plan")
+                    raw = sr_accept_state.finalize_from_host(
+                        batch,
+                        logits_output,
+                        page_size,
+                        self.topk,
+                        token_to_kv_pool_allocator,
+                        host_plan,
+                    )
+                    return _eagle_output_from_fixed(raw, batch, self.topk)
+                host_v1_plan = host_plan
+                sr_rpd_workspace.log_path_once(
+                    f"{logits_output.next_token_logits.device.type}_sr_host_v1"
                 )
-                return _eagle_output_from_fixed(raw, batch, self.topk)
-            predict, accept_index, accept_length = verify_tree_rpd(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                logits=logits_output.next_token_logits,
-                tau=rpd_tau,
-            )
+            else:
+                predict, accept_index, accept_length = verify_tree_rpd(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    logits=logits_output.next_token_logits,
+                    tau=rpd_tau,
+                )
         elif resolved_verify == "greedy":
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -604,7 +630,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 deterministic=True,
             )
 
-        if SIMULATE_ACC_LEN > 0.0:
+        if SIMULATE_ACC_LEN > 0.0 and host_v1_plan is None:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
@@ -634,8 +660,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         unfinished_index = []
         unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
+        host_v1_tokens = None
+        if host_v1_plan is not None:
+            accept_index_cpu = [list(row) for row in host_v1_plan.rows]
+            host_v1_tokens = [list(row) for row in host_v1_plan.tokens]
+        else:
+            accept_index_cpu = accept_index.tolist()
+            predict_cpu = predict.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
         spec_algo = getattr(batch, "spec_algorithm", None)
@@ -654,9 +685,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            token_row = [
-                predict_cpu[idx] if idx != -1 else None for idx in accept_index_row
-            ]
+            if host_v1_tokens is not None:
+                token_row = host_v1_tokens[i]
+            else:
+                token_row = [
+                    predict_cpu[idx] if idx != -1 else None for idx in accept_index_row
+                ]
             grammar = req.grammar
             try:
                 _appended, eos_cut, sentinel_col = append_verify_row(
@@ -667,22 +701,64 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     on_token=grammar.accept_token if grammar is not None else None,
                 )
             except ValueError as e:
-                logger.info(f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n")
+                logger.info(f"{i=}, {req=}\n" f"{accept_index_row=}\n" f"{token_row=}\n")
                 raise e
             if eos_cut is not None:
                 has_finished = True
                 # set all tokens after finished token to -1
-                accept_index[i, eos_cut:] = -1
+                if host_v1_plan is not None:
+                    for col in range(eos_cut, len(accept_index_cpu[i])):
+                        accept_index_cpu[i][col] = -1
+                else:
+                    accept_index[i, eos_cut:] = -1
                 if sr_eos_cut is not None:
                     sr_eos_cut[i] = eos_cut
             if not req.finished():
                 unfinished_index.append(i)
-                if sentinel_col is not None:
-                    unfinished_accept_index.append(accept_index[i, :sentinel_col])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
+                if host_v1_plan is None:
+                    if sentinel_col is not None:
+                        unfinished_accept_index.append(accept_index[i, :sentinel_col])
+                    else:
+                        unfinished_accept_index.append(accept_index[i])
 
-        if has_finished:
+        if host_v1_plan is not None:
+            from sglang.srt.speculative.standalone_remote.sr_rpd import stage_v1_result
+
+            flat_idx = []
+            flat_tok = []
+            accept_length_list = []
+            spans = []
+            for row, toks in zip(accept_index_cpu, host_v1_tokens):
+                start = len(flat_idx)
+                kept = 0
+                for idx, tok in zip(row, toks):
+                    if int(idx) == -1:
+                        break
+                    flat_idx.append(int(idx))
+                    flat_tok.append(int(tok))
+                    kept += 1
+                spans.append((start, kept))
+                accept_length_list.append(kept - 1)
+            select = []
+            if has_finished:
+                for row_i in unfinished_index:
+                    start, kept = spans[row_i]
+                    select.extend(range(start, start + kept))
+            (
+                accept_index,
+                verified_id,
+                accept_length,
+                unfinished_select,
+            ) = stage_v1_result(
+                sr_rpd_workspace,
+                flat_idx,
+                flat_tok,
+                accept_length_list,
+                batch.device,
+                select,
+            )
+            accept_length_cpu = torch.tensor(accept_length_list, dtype=torch.int32)
+        elif has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
         accepted_tree_candidate_indices = []
@@ -704,14 +780,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
+        result_device = batch.device
+        if host_v1_plan is None:
+            accept_index = accept_index[accept_index != -1]
+            verified_id = predict[accept_index]
+            result_device = predict.device
+            accept_length_cpu = accept_length.cpu()
+            # FIXME: this `tolist()` fixes the numerical calculation consistency
+            # try to unify the tensor representation and list representation
+            accept_length_list = accept_length_cpu.tolist()
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
-        accept_length_cpu = accept_length.cpu()
-        # FIXME: this `tolist()` fixes the numerical calculation consistency
-        # try to unify the tensor representation and list representation
-        accept_length_list = accept_length_cpu.tolist()
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
@@ -833,10 +912,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     batch, sum(int(length) + 1 for length in accept_length_list)
                 )
 
-            if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = torch.cat(unfinished_accept_index)
+            if len(unfinished_index) > 0:
+                unfinished_tokens = None
+                if host_v1_plan is None:
+                    unfinished_accept_index = torch.cat(unfinished_accept_index)
+                else:
+                    unfinished_accept_index = accept_index[unfinished_select]
+                    unfinished_tokens = verified_id[unfinished_select]
                 unfinished_index_device = torch.tensor(
-                    unfinished_index, dtype=torch.int64, device=predict.device
+                    unfinished_index, dtype=torch.int64, device=result_device
                 )
                 draft_input_accept_length_cpu = [
                     accept_length_list[i] for i in unfinished_index
@@ -847,7 +931,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     batch.out_cache_loc = torch.empty(
                         len(unfinished_index) + sum(draft_input_accept_length_cpu),
                         dtype=torch.int64,
-                        device=predict.device,
+                        device=result_device,
                     )
                     accept_length_filter = create_accept_length_filter(
                         accept_length,
@@ -873,7 +957,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         unfinished_accept_index,
                         prepare_local_draft_hidden,
                     ),
-                    verified_id=predict[unfinished_accept_index],
+                    verified_id=(
+                        unfinished_tokens
+                        if host_v1_plan is not None
+                        else predict[unfinished_accept_index]
+                    ),
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],

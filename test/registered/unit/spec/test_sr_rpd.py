@@ -182,19 +182,58 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(trees["short"], trees["padded"])
 
     def test_cycle_declines_and_missing_parent_is_disconnected(self):
+        from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
+            plan_draft_rows,
+        )
+
+        tokens = [[1, 2, 3, 4, 5]]
+        selected = [[0, 1, 2, 3, 4]]
+        cycled = plan_draft_rows(
+            tokens, [[-1, 2, 1, 2, 3]], selected, 2, 3, 6, vocab=32
+        )
+        self.assertEqual(cycled.invalid_tree_rows, 1)
+        self.assertEqual(cycled.no_draft, [True])
+        self.assertEqual(cycled.parent_slots, [[-1, -1, -1, -1, -1, -1]])
         owner = SimpleNamespace(generation=1, unresolved=False)
-        args = dict(topk=2, steps=3, width=6, vocab=32, owner=owner, generation=1)
-        verified, tokens = torch.tensor([0]), torch.tensor([[1, 2, 3, 4, 5]])
-        selected = torch.tensor([[0, 1, 2, 3, 4]])
-        bad = build_sr_rpd_input(
-            verified, tokens, torch.tensor([[-1, 2, 1, 2, 3]]), selected, **args
+        verified = torch.tensor([0])
+        token_row = torch.tensor(tokens)
+        cycled_tree = build_sr_rpd_input(
+            verified,
+            token_row,
+            torch.tensor([[-1, 2, 1, 2, 3]]),
+            torch.tensor(selected),
+            topk=2,
+            steps=3,
+            width=6,
+            vocab=32,
+            owner=owner,
+            generation=1,
+            parent_slots=cycled.parent_slots,
         )
-        self.assertIsNone(bad)
-        missing = build_sr_rpd_input(
-            verified, tokens, torch.tensor([[-1, 99, 1, 2, 3]]), selected, **args
+        self.assertEqual(cycled_tree.edges, [])
+        self.assertEqual(cycled_tree.tree[2, 0].tolist(), [-1, -1, -1, -1, -1, -1])
+
+        missing = plan_draft_rows(
+            tokens, [[-1, 99, 1, 2, 3]], selected, 2, 3, 6, vocab=32
         )
-        self.assertIsNotNone(missing)
-        self.assertEqual(missing.tree[2, 0, 1].item(), -1)
+        self.assertEqual(missing.invalid_tree_rows, 0)
+        self.assertEqual(missing.no_draft, [False])
+        self.assertEqual(missing.disconnected, [[2, 3]])
+        context = build_sr_rpd_input(
+            verified,
+            token_row,
+            torch.tensor([[-1, 99, 1, 2, 3]]),
+            torch.tensor(selected),
+            topk=2,
+            steps=3,
+            width=6,
+            vocab=32,
+            owner=owner,
+            generation=1,
+            parent_slots=missing.parent_slots,
+        )
+        self.assertIsNotNone(context)
+        self.assertEqual(context.tree[2, 0, 1].item(), -1)
 
     def test_host_plan_matches_existing_compact_all_dtypes_and_thresholds(self):
         torch.manual_seed(11)
@@ -452,6 +491,7 @@ class SRRPDTest(unittest.TestCase):
                 vocab=3,
                 owner=owner,
                 generation=1,
+                parent_slots=[[-1] for _ in range(bs)],
             )
             owner.rpd_input = context
             context.edge_index = context.edge_index_cpu
@@ -596,6 +636,56 @@ class SRRPDTest(unittest.TestCase):
             "rpd_batch_key",
         )
 
+    def test_prepare_admits_cuda_without_npu_edge_kernel(self):
+        import sys
+
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        packet, _ = packet_input()
+        context = packet.rpd_input
+        logits = torch.zeros(12, 32)
+        workspace = SRRPDWorkspace()
+        npu_mod = "sglang.srt.speculative.standalone_remote.sr_rpd_kernels_npu"
+        sys.modules.pop(npu_mod, None)
+        cuda = torch.device("cuda")
+        real_empty = torch.empty
+        real_get = torch.get_device_module
+
+        def empty(*args, **kwargs):
+            device = kwargs.get("device", None)
+            if getattr(device, "type", None) == "cuda":
+                kwargs["device"] = "cpu"
+            return real_empty(*args, **kwargs)
+
+        class _Event:
+            def record(self):
+                return None
+
+        class _CudaMod:
+            @staticmethod
+            def Event():
+                return _Event()
+
+        def get_device_module(name):
+            if name == "cuda":
+                return _CudaMod
+            return real_get(name)
+
+        with patch.object(
+            torch.Tensor, "device", new_callable=PropertyMock, return_value=cuda
+        ), patch.object(module, "pin_supported", return_value=True), patch.object(
+            module, "event_supported", return_value=True
+        ), patch.object(
+            module,
+            "alloc_host",
+            side_effect=lambda shape, dtype, device: (real_empty(shape, dtype=dtype), True),
+        ), patch.object(torch, "empty", side_effect=empty), patch.object(
+            torch, "get_device_module", side_effect=get_device_module
+        ):
+            self.assertIs(module._edge_gather_impl(logits), module._gather_edge_stats)
+            self.assertIsNone(workspace.prepare(logits, context))
+        self.assertNotIn(npu_mod, sys.modules)
+
     def test_eagle_dispatch_runs_penalty_once_and_skips_greedy_buffers(self):
         import test_sr_fixed_accept as fixed
 
@@ -646,6 +736,7 @@ class SRRPDTest(unittest.TestCase):
             ["verify"],
             namespace,
         )["verify"]
+        workspace = SRRPDWorkspace()
         with patch.object(
             state, "bind_verify_buffers", side_effect=AssertionError("greedy buffers")
         ), patch.object(
@@ -659,37 +750,39 @@ class SRRPDTest(unittest.TestCase):
                 4,
                 prepare_local_draft_hidden=False,
                 sr_accept_state=state,
+                sr_rpd_workspace=workspace,
             )
         self.assertEqual(result, "committed")
         penalizer.apply.assert_called_once()
         finalize.assert_called_once()
 
-        class LegacyExit(RuntimeError):
+        class StopAfterStage(Exception):
             pass
 
-        legacy = Mock(side_effect=LegacyExit)
+        legacy = Mock(side_effect=AssertionError("shared compact path"))
         namespace["verify_tree_rpd"] = legacy
         namespace["apply_custom_logit_processor"] = Mock()
-        for case in (
-            "off",
-            "missing",
-            "stale",
-            "logprob",
-            "hidden",
-            "grammar",
-            "processor",
-            "simulate",
-            "noncontiguous",
-        ):
-            packet, _ = packet_input(reqs=reqs)
+        batch.model_config = SimpleNamespace(think_end_id=None)
+        apply_cases = ("off", "logprob", "hidden", "grammar", "processor", "simulate")
+        import sglang.srt.speculative.standalone_remote.sr_rpd as sr_rpd_mod
+
+        real_stage = sr_rpd_mod.stage_v1_result
+        for case in apply_cases + ("missing", "stale", "noncontiguous"):
+            case_reqs = [fixed._Req(), fixed._Req()]
+            for req in case_reqs:
+                req.grammar = None
+            packet, _ = packet_input(reqs=case_reqs)
             ctx = packet.rpd_input
+            batch.reqs = case_reqs
             spec.sr_rpd_input = ctx
+            spec.retrive_index = ctx.tree[1]
             spec.retrive_next_token = ctx.tree[2]
             spec.retrive_next_sibling = ctx.tree[3]
+            spec.draft_token = ctx.tree[0].flatten()
             if case == "missing":
                 spec.sr_rpd_input = None
             if case == "stale":
-                packet_input(packet=packet, reqs=reqs)
+                packet_input(packet=packet, reqs=case_reqs)
             batch.return_logprob = case == "logprob"
             batch.has_grammar = case == "grammar"
             batch.sampling_info.has_custom_logit_processor = case == "processor"
@@ -701,6 +794,16 @@ class SRRPDTest(unittest.TestCase):
             )
             legacy.reset_mock()
             penalizer.apply.reset_mock()
+            staged = []
+
+            def watch_stage(workspace, indices, tokens, lengths, device, select=()):
+                staged.append((list(indices), list(tokens), list(lengths)))
+                real_stage(workspace, indices, tokens, lengths, device, select)
+                raise StopAfterStage
+
+            def forbid_compact(*_args, **_kwargs):
+                raise AssertionError("compact transfer")
+
             with patch.object(
                 state,
                 "finalize_from_host",
@@ -709,19 +812,88 @@ class SRRPDTest(unittest.TestCase):
                 state,
                 "bind_verify_buffers",
                 side_effect=AssertionError("greedy buffers"),
-            ):
-                with self.assertRaises(LegacyExit):
-                    verify(
-                        spec,
-                        batch,
-                        SimpleNamespace(next_token_logits=logits),
-                        SimpleNamespace(is_not_in_free_group=True),
-                        4,
-                        prepare_local_draft_hidden=case == "hidden",
-                        sr_accept_state=None if case == "off" else state,
-                    )
-            legacy.assert_called_once()
+            ), patch.object(
+                rpd, "_compact_await_stats", forbid_compact
+            ), patch.object(
+                rpd, "_compact_host_read", forbid_compact
+            ), patch.object(
+                rpd, "_compact_device_write", forbid_compact
+            ), patch.object(sr_rpd_mod, "stage_v1_result", watch_stage):
+                if case in apply_cases:
+                    with self.assertRaises(StopAfterStage):
+                        verify(
+                            spec,
+                            batch,
+                            SimpleNamespace(next_token_logits=logits),
+                            SimpleNamespace(is_not_in_free_group=True),
+                            4,
+                            prepare_local_draft_hidden=case == "hidden",
+                            sr_accept_state=None if case == "off" else state,
+                            sr_rpd_workspace=workspace,
+                        )
+                else:
+                    with self.assertRaises(RuntimeError):
+                        verify(
+                            spec,
+                            batch,
+                            SimpleNamespace(next_token_logits=logits),
+                            SimpleNamespace(is_not_in_free_group=True),
+                            4,
+                            prepare_local_draft_hidden=False,
+                            sr_accept_state=state,
+                            sr_rpd_workspace=workspace,
+                        )
+            legacy.assert_not_called()
             penalizer.apply.assert_called_once()
+            if case not in apply_cases:
+                continue
+            ref_predict = torch.empty((13,), dtype=torch.int32)
+            ref_index = torch.full((2, 4), -1, dtype=torch.int32)
+            ref_length = torch.empty((2,), dtype=torch.int32)
+            rpd.verify_tree_rpd(
+                ref_predict,
+                ref_index,
+                ref_length,
+                ctx.tree[0],
+                ctx.tree[1],
+                ctx.tree[2],
+                ctx.tree[3],
+                logits,
+                0.2,
+            )
+            got_index, got_tokens, got_length = staged[0]
+            ref_flat = [idx for idx in ref_index.reshape(-1).tolist() if idx >= 0]
+            self.assertEqual(got_index, ref_flat)
+            self.assertEqual(got_length, ref_length.tolist())
+            self.assertEqual(got_tokens, [int(ref_predict[idx]) for idx in ref_flat])
+
+    def test_stage_v1_reuses_buffer_without_pinned_alloc_or_wait(self):
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        workspace = SRRPDWorkspace()
+
+        def forbid(*_args, **_kwargs):
+            raise AssertionError("stage must not allocate or wait")
+
+        with patch.object(module, "alloc_host", forbid), patch.object(
+            module, "wait_event", forbid
+        ):
+            first_idx, first_tok, first_len, first_sel = module.stage_v1_result(
+                workspace, [3, 4], [8, 9], [1], torch.device("cpu"), [0]
+            )
+            self.assertEqual(first_idx.tolist(), [3, 4])
+            self.assertEqual(first_tok.tolist(), [8, 9])
+            self.assertEqual(first_len.tolist(), [1])
+            self.assertEqual(first_sel.tolist(), [0])
+            held = workspace._v1_dev
+            second_idx, second_tok, second_len, second_sel = module.stage_v1_result(
+                workspace, [1], [7], [0, 0], torch.device("cpu")
+            )
+        self.assertIs(workspace._v1_dev, held)
+        self.assertEqual(second_idx.tolist(), [1])
+        self.assertEqual(second_tok.tolist(), [7])
+        self.assertEqual(second_len.tolist(), [0, 0])
+        self.assertEqual(second_sel.tolist(), [])
 
     def test_host_finalizer_matches_device_finalizer_and_never_reads_back(self):
         import test_sr_fixed_accept as fixed

@@ -33,11 +33,13 @@ from sglang.srt.speculative.rpd_verify import (
     _rpd_compact_tree,
     _rpd_slot_argmax,
     _verify_tree_rpd_compact,
+    rpd_gap_max,
+    verify_tree_rpd,
+)
+from sglang.test.rpd_reference import (
     _verify_tree_rpd_cpu,
     compact_cross_device_bytes,
     reset_compact_cross_device_bytes,
-    rpd_gap_max,
-    verify_tree_rpd,
 )
 
 
@@ -127,11 +129,6 @@ class TestNpuRpdCompact(unittest.TestCase):
 
     def test_compact_matches_reference_including_specials(self):
         device = self._device()
-        original = rpd._verify_tree_rpd_cpu
-
-        def forbid_reference(**kwargs):
-            raise AssertionError("NPU dispatch entered the CPU reference")
-
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             for tau, accept_len in ((0.0, 0), (0.0, 3), (0.2, 1)):
                 tensors = [
@@ -148,11 +145,7 @@ class TestNpuRpdCompact(unittest.TestCase):
                     float(tau) == 0.0,
                 )
                 got = _buffers(tensors[0], tensors[1])
-                rpd._verify_tree_rpd_cpu = forbid_reference
-                try:
-                    returned = verify_tree_rpd(*got, *tensors, tau)
-                finally:
-                    rpd._verify_tree_rpd_cpu = original
+                returned = verify_tree_rpd(*got, *tensors, tau)
                 self.assertIs(returned[0], got[0])
                 for actual, expect in zip(got, ref):
                     self.assertEqual(actual.cpu().tolist(), expect.tolist())
@@ -407,6 +400,7 @@ class TestNpuRpdCompact(unittest.TestCase):
             vocab=4,
             owner=owner,
             generation=1,
+            parent_slots=[[-1], [-1]],
         )
         owner.rpd_input = context
         context.edge_index = torch.empty((2, 0), dtype=torch.int64, device=device)

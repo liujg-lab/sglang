@@ -110,15 +110,14 @@ def build_sr_rpd_input(
     owner,
     generation,
     batch_key=(),
-    no_draft=None,
-    disconnected=None,
+    parent_slots,
 ):
-    """Build only topology, matching build_tree_efficient's reverse insertion.
+    """Build topology from parent slots already chosen by ``plan_draft_rows``.
 
-    Unsupported/malformed layouts decline the optimization before upload. Missing
-    selected parents stay disconnected, exactly as in the existing tree builder.
-    ``no_draft`` rows skip linking so their ``nxt`` stays ``-1``.
-    ``disconnected`` draft slots are ungrounded nodes and are not linked.
+    Unsupported layouts decline the optimization before upload. ``parent_slots``
+    is one row per request, length ``width``. Slot 0 and every unlinked draft
+    slot are ``-1``. Insertion still walks slots from high to low so sibling
+    order matches ``build_tree_efficient``.
     """
     bs = int(verified.numel())
     # Parent width is the verify-kernel stride ``topk * (steps - 1) + 1``
@@ -136,6 +135,8 @@ def build_sr_rpd_input(
         or parents.shape[0] != bs
         or int(parents.shape[1]) < 1
         or any(t.device.type != "cpu" for t in (verified, tokens, parents, selected))
+        or len(parent_slots) != bs
+        or any(len(row) != width for row in parent_slots)
     ):
         return None
     cand = torch.cat((verified.reshape(bs, 1), tokens), dim=1)
@@ -143,68 +144,30 @@ def build_sr_rpd_input(
     nxt = torch.full((bs, width), -1, dtype=torch.int64)
     sibling = torch.full_like(nxt, -1)
     cand_rows = cand.tolist()
-    rows = bs * width
     edges: list = []
     parent_rows: list = []
     child_tokens: list = []
     batch_children: list = []
-    skipped = list(no_draft) if no_draft is not None else []
-    loose = list(disconnected) if disconnected is not None else []
-    for b, (pp, ss) in enumerate(zip(parents.tolist(), selected.tolist())):
+    for b, slots in enumerate(parent_slots):
         children = [[] for _ in range(width)]
-        parent_of = [-1] * width
-        if b < len(skipped) and skipped[b]:
-            batch_children.append(children)
-            continue
-        loose_slots = set(loose[b]) if b < len(loose) else set()
-        pos_of = {}
-        for node_i, node in enumerate(ss):
-            if node not in pos_of:
-                pos_of[node] = node_i
         for i in range(width - 1, 0, -1):
-            if (i - 1) in loose_slots:
+            pos = int(slots[i])
+            if pos < 0:
                 continue
-            if ss[i - 1] < 0:
-                return None
-            parent_tb = ss[i - 1] // topk
-            pos = 0
-            if parent_tb > 0:
-                if parent_tb >= len(pp):
-                    return None
-                found = pos_of.get(pp[parent_tb])
-                if found is None:
-                    continue
-                pos = found + 1
-            parent_of[i] = pos
             children[pos].append(i)
             sibling[b, i] = nxt[b, pos]
             nxt[b, pos] = i
-        # Never let a malformed input turn the CPU DFS into an infinite loop.
-        for i in range(width):
-            seen = set()
-            u = i
-            while u >= 0:
-                if u in seen:
-                    return None
-                seen.add(u)
-                u = parent_of[u]
         # Reverse insertion prepends, so append order is opposite sibling order.
         for kids in children:
             kids.reverse()
         batch_children.append(children)
         row_tokens = cand_rows[b]
-        for v, p in enumerate(parent_of):
+        for v, p in enumerate(slots):
             if p < 0:
                 continue
-            parent_flat = b * width + p
-            child_tok = int(row_tokens[v])
-            if parent_flat < 0 or parent_flat >= rows:
-                continue
-            if child_tok < 0 or child_tok >= vocab:
-                continue
-            edges.append((b, v, p))
-            parent_rows.append(parent_flat)
-            child_tokens.append(child_tok)
+            edges.append((b, v, int(p)))
+            parent_rows.append(b * width + int(p))
+            child_tokens.append(int(row_tokens[v]))
     tree = torch.stack((cand, retr, nxt, sibling))
     if edges:
         index = torch.tensor([parent_rows, child_tokens], dtype=torch.int64)
@@ -239,9 +202,18 @@ class SRRPDWorkspace:
         self.event = None
         self.unresolved = False
         self.holds = None
-        self.logged = False
+        self._logged_paths = set()
         self.metrics = None
         self.edge_index = None
+        self._v1_dev = None
+        self._v1_cap = 0
+        self._v1_hold = None
+
+    def log_path_once(self, name: str) -> None:
+        if name in self._logged_paths:
+            return
+        self._logged_paths.add(name)
+        logger.info("Speculative RPD verify path: %s", name)
 
     def count(self, name, value=1):
         if self.metrics is not None:
@@ -273,9 +245,9 @@ class SRRPDWorkspace:
         ):
             return "edge_layout"
         device = logits.device
-        # CPU supports deterministic contract tests, but production admission is
-        # restricted to NPU by SRFixedAcceptState.static_disable_reason.
-        if device.type not in ("cpu", "npu"):
+        # CPU stays for contract tests. CUDA and NPU share this workspace;
+        # CUDA edge statistics use the reference gather below.
+        if device.type not in ("cpu", "npu", "cuda"):
             return "device"
         if device.type != "cpu" and (
             not pin_supported(device) or not event_supported(device)
@@ -418,7 +390,78 @@ def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
     )
     token_rows = [[folded[i] if i >= 0 else 0 for i in row] for row in rows]
     workspace.count("rpd_host_plan_hit")
-    if not workspace.logged:
-        logger.info("Speculative RPD verify path: npu_sr_host_plan")
-        workspace.logged = True
     return SRRPDHostPlan(rows, token_rows, lengths, context.vocab, context.batch_key)
+
+
+def stage_v1_result(workspace, indices, tokens, lengths, device, select=()):
+    """Upload one truncated V1 result without waiting or allocating pinned memory.
+
+    ``indices`` and ``tokens`` are the surviving accept positions and the
+    tokens written there, in row order. ``lengths`` is one draft count per
+    request, excluding the bonus. ``select`` holds offsets into those flat
+    arrays for unfinished requests. Storage grows by capacity and stays on
+    ``workspace``. The ``copy_`` is ordered on the current stream; later
+    consumers on that stream observe it without a ``wait_event``.
+    """
+    idx_t = torch.tensor(list(indices), dtype=torch.int32)
+    tok_t = torch.tensor(list(tokens), dtype=torch.int32)
+    len_t = torch.tensor(list(lengths), dtype=torch.int32)
+    sel_t = torch.tensor(list(select), dtype=torch.int32)
+    n_idx = int(idx_t.numel())
+    n_tok = int(tok_t.numel())
+    n_len = int(len_t.numel())
+    n_sel = int(sel_t.numel())
+    need = n_idx + n_tok + n_len + n_sel
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    same = workspace._v1_dev is not None and workspace._v1_dev.device == dev
+    if not same or workspace._v1_cap < max(need, 1):
+        cap = max(need, workspace._v1_cap, 1)
+        cap = 1 << (cap - 1).bit_length()
+        workspace._v1_dev = torch.empty((cap,), dtype=torch.int32, device=dev)
+        workspace._v1_cap = cap
+    host = torch.empty((need,), dtype=torch.int32)
+    if n_idx:
+        host[:n_idx] = idx_t
+    if n_tok:
+        host[n_idx : n_idx + n_tok] = tok_t
+    if n_len:
+        host[n_idx + n_tok : n_idx + n_tok + n_len] = len_t
+    if n_sel:
+        host[n_idx + n_tok + n_len :] = sel_t
+    workspace._v1_hold = host
+    if need:
+        workspace._v1_dev[:need].copy_(host, non_blocking=dev.type != "cpu")
+    buf = workspace._v1_dev
+    return (
+        buf[:n_idx],
+        buf[n_idx : n_idx + n_tok],
+        buf[n_idx + n_tok : n_idx + n_tok + n_len],
+        buf[n_idx + n_tok + n_len : need],
+    )
+
+
+def host_plan_compact_payload(plan, accept_width):
+    """Pack a host plan into the four tensors ``_rpd_compact_apply`` already writes.
+
+    Nonnegative accept indices are the folded predict positions. A repeated
+    retrieve keeps the last token and the first insertion order, matching
+    ``_rpd_select_host``.
+    """
+    width = int(accept_width)
+    if plan.rows:
+        accept = torch.tensor(plan.rows, dtype=torch.int64)
+    else:
+        accept = torch.empty((0, width), dtype=torch.int64)
+    lengths = torch.tensor(plan.pre_lengths, dtype=torch.int64)
+    folded = {}
+    for row, tokens in zip(plan.rows, plan.tokens):
+        for idx, tok in zip(row, tokens):
+            if idx >= 0:
+                folded[int(idx)] = int(tok)
+    if folded:
+        positions = torch.tensor(list(folded.keys()), dtype=torch.int64)
+        values = torch.tensor(list(folded.values()), dtype=torch.int64)
+    else:
+        positions = torch.empty((0,), dtype=torch.int64)
+        values = torch.empty((0,), dtype=torch.int64)
+    return accept, lengths, positions, values

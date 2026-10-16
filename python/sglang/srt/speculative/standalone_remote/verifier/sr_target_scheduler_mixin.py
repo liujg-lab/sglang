@@ -10,7 +10,6 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.speculative.standalone_remote.sr_align import (
     broadcast_sr_obj,
     shift_overlapped_prefill_drafts,
-    drop_duplicate_root_draft,
 )
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
@@ -682,22 +681,6 @@ class SchedulerStandaloneRemoteTargetMixin:
             reply.parent_list = None
             reply.top_scores_index = None
 
-    def _sr_drop_root_duplicate_replies(
-        self, reqs: List[Req], replies: Dict[str, SRDraftReply]
-    ) -> None:
-        for req in reqs:
-            reply = replies.get(req.rid)
-            if reply is None or not reply.draft_tokens:
-                continue
-            last = (req.output_ids or [None])[-1] if req.output_ids else None
-            original = list(reply.draft_tokens)
-            dropped = drop_duplicate_root_draft(last, original)
-            if dropped == original:
-                continue
-            reply.draft_tokens = dropped
-            reply.parent_list = None
-            reply.top_scores_index = None
-
     def _sr_attach_replies(
         self, reqs: List[Req], replies: Dict[str, SRDraftReply]
     ) -> int:
@@ -743,11 +726,9 @@ class SchedulerStandaloneRemoteTargetMixin:
     def _sr_maybe_align_chain_replies(
         self, reqs: List[Req], replies: Dict[str, SRDraftReply], *, prefill: bool
     ) -> None:
-        if not self._sr_chain_mode():
+        if not self._sr_chain_mode() or not prefill:
             return
-        if prefill:
-            self._sr_shift_prefill_replies(reqs, replies)
-        self._sr_drop_root_duplicate_replies(reqs, replies)
+        self._sr_shift_prefill_replies(reqs, replies)
 
     @DynamicGradMode()
     def event_loop_normal_standalone_remote_target(self):

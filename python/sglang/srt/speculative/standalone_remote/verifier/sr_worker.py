@@ -35,7 +35,10 @@ from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     metrics_phase,
     restore_graph_host_metrics,
 )
-from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
+from sglang.srt.speculative.standalone_remote.sr_rpd import (
+    SRRPDWorkspace,
+    rpd_batch_key,
+)
 from sglang.srt.speculative.standalone_remote.sr_verify_layout import (
     VerifyInputPacket,
     clear_no_draft_retrieve_links,
@@ -206,6 +209,11 @@ class StandaloneRemoteWorker:
         )
         self._sr_hidden_round = None
         self._fixed_accept_state = build_fixed_accept_state(self)
+        self._rpd_workspace = (
+            SRRPDWorkspace()
+            if getattr(server_args, "speculative_verify_mode", None) == "rpd"
+            else None
+        )
         warm_sr_target_kernels(self)
 
     @property
@@ -494,8 +502,11 @@ class StandaloneRemoteWorker:
 
         spec_info.hidden_states = logits_output.hidden_states
         fixed_state = self._fixed_accept_state
+        rpd_workspace = self._rpd_workspace
         if fixed_state is not None:
             fixed_state.metrics = metrics
+        if rpd_workspace is not None:
+            rpd_workspace.metrics = metrics
         try:
             res: EagleVerifyOutput = spec_info.verify(
                 batch,
@@ -505,10 +516,13 @@ class StandaloneRemoteWorker:
                 vocab_mask,
                 prepare_local_draft_hidden=prepare_hidden,
                 sr_accept_state=fixed_state,
+                sr_rpd_workspace=rpd_workspace,
             )
         finally:
             if fixed_state is not None:
                 fixed_state.metrics = None
+            if rpd_workspace is not None:
+                rpd_workspace.metrics = None
         if not batch.forward_mode.is_idle():
             if seq_lens_cpu_pre is None:
                 raise RuntimeError("seq_lens_cpu snapshot is missing")
@@ -911,8 +925,8 @@ class StandaloneRemoteWorker:
             index_rows.append(None if dtl is None else dtl.get("top_scores_index"))
         rpd_kwargs = {}
         if (
-            self._fixed_accept_state is not None
-            and getattr(self.server_args, "speculative_verify_mode", None) == "rpd"
+            getattr(self.server_args, "speculative_verify_mode", None) == "rpd"
+            and int(topk) > 1
         ):
             rpd_kwargs = dict(
                 rpd_vocab=int(batch.sampling_info.vocab_size),
