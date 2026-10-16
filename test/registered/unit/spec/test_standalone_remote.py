@@ -4151,6 +4151,182 @@ class TestSRAbortAndRollback(CustomTestCase):
         self.assertEqual(attached, [(["a"], {})])
         self.assertFalse(getattr(mixin, "_sr_hold_finish_flush", False))
 
+    def test_early_step_sends_once_and_holds_finish(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.sr_protocol import (
+                account_sr_verify_step,
+            )
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.current_scheduler_metrics_enabled = False
+        mixin.server_args = SimpleNamespace(
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1
+        )
+        mixin.sr_breaker = None
+        mixin.sr_speculation_stopped = False
+        trace = []
+        sent = []
+        attached = []
+
+        class Req:
+            def __init__(self, rid, finished=False):
+                self.rid = rid
+                self.cur_drafts = [1]
+                self.sr_stop_spec = False
+                self._finished = finished
+                self.output_ids = [7]
+                self.spec_cnt = 0
+                self.sr_step_id = 3
+                self.len_output_ids = 0
+
+            def finished(self):
+                return self._finished
+
+        keep = Req("keep")
+        done = Req("done")
+        stopped = Req("stopped", finished=True)
+        health = Req("HEALTH_CHECK_1")
+        batch = SimpleNamespace(reqs=[keep, done, stopped, health])
+
+        def send(action, reqs, include_full_context=False):
+            trace.append("send")
+            sent.append((action, [req.rid for req in reqs]))
+            if action == SRAction.FINISH:
+                self.assertFalse(mixin._sr_hold_finish_flush)
+            return "inflight" if action == SRAction.STEP else None
+
+        def run_batch(batch):
+            trace.append("forward")
+            batch.sr_accept_ready_hook(batch)
+            trace.append("commit")
+
+        def process(_batch, _result):
+            trace.append("process")
+            self.assertTrue(mixin._sr_hold_finish_flush)
+            done._finished = True
+            mixin.notify_sr_draft_finished(done)
+            mixin._sr_flush_finish_notifications()
+            self.assertEqual(sent, [(SRAction.STEP, ["keep", "done"])])
+
+        mixin._sr_send = send
+        mixin._sr_recv = lambda inflight: trace.append("recv") or (
+            {"keep": object(), "done": object()},
+            {},
+        )
+        mixin._sr_complete_step_replies = lambda reqs, replies, pending: {
+            req.rid: replies[req.rid] for req in reqs
+        }
+        mixin._sr_maybe_align_chain_replies = lambda *args, **kwargs: None
+        mixin._sr_attach_replies = lambda reqs, replies: attached.append(
+            [req.rid for req in reqs]
+        ) or 0
+        mixin.run_batch = run_batch
+        mixin.process_batch_result = process
+
+        mixin._sr_run_verify_round(batch)
+
+        self.assertEqual(
+            trace, ["forward", "send", "commit", "process", "recv", "send"]
+        )
+        self.assertEqual(
+            sent,
+            [(SRAction.STEP, ["keep", "done"]), (SRAction.FINISH, ["done"])],
+        )
+        self.assertEqual(attached, [["keep"]])
+        self.assertFalse(mixin._sr_hold_finish_flush)
+        self.assertIsNone(batch.sr_accept_ready_hook)
+        self.assertEqual(keep.spec_cnt, 1)
+        self.assertEqual(keep.sr_step_id, 4)
+        self.assertEqual(keep.len_output_ids, 1)
+        self.assertEqual(done.spec_cnt, 1)
+        self.assertEqual(done.sr_step_id, 4)
+        self.assertEqual(stopped.spec_cnt, 1)
+        self.assertEqual(stopped.sr_step_id, 4)
+        self.assertEqual(health.spec_cnt, 0)
+        self.assertEqual(health.sr_step_id, 3)
+        account_sr_verify_step(batch)
+        self.assertEqual(keep.spec_cnt, 1)
+        self.assertEqual(stopped.sr_step_id, 4)
+
+    def test_early_step_failure_drains_inflight(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+                SchedulerStandaloneRemoteTargetMixin,
+            )
+        except ImportError as e:
+            self.skipTest(str(e))
+
+        mixin = SchedulerStandaloneRemoteTargetMixin()
+        mixin.current_scheduler_metrics_enabled = False
+        mixin.server_args = SimpleNamespace(
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1
+        )
+        mixin.sr_breaker = None
+        mixin.sr_speculation_stopped = False
+        sent = []
+        drained = []
+        req = SimpleNamespace(
+            rid="keep",
+            cur_drafts=[1],
+            sr_stop_spec=False,
+            output_ids=[1],
+            spec_cnt=0,
+            sr_step_id=0,
+            len_output_ids=0,
+            finished=lambda: False,
+        )
+        batch = SimpleNamespace(reqs=[req])
+        mixin._sr_send = lambda action, reqs, include_full_context=False: sent.append(
+            action
+        ) or "inflight"
+        mixin._sr_recv = lambda inflight: drained.append(inflight) or ({}, {})
+
+        def run_batch(batch):
+            batch.sr_accept_ready_hook(batch)
+            raise RuntimeError("commit failed")
+
+        mixin.run_batch = run_batch
+        with self.assertRaisesRegex(RuntimeError, "commit failed"):
+            mixin._sr_run_verify_round(batch)
+        self.assertEqual(sent, [SRAction.STEP])
+        self.assertEqual(drained, ["inflight"])
+        self.assertFalse(mixin._sr_hold_finish_flush)
+        self.assertIsNone(batch.sr_accept_ready_hook)
+        self.assertEqual(req.spec_cnt, 1)
+
+    def test_accept_ready_hook_precedes_kv_commit(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[4]
+        fixed = (
+            root
+            / "python/sglang/srt/speculative/standalone_remote/verifier/sr_fixed_accept.py"
+        ).read_text(encoding="utf-8")
+        finalize = fixed[fixed.index("def _finalize_cpu_rows") : fixed.index("def _pack")]
+        self.assertLess(
+            finalize.index("_export_paths"), finalize.index("sr_accept_ready_hook")
+        )
+        self.assertLess(
+            finalize.index("sr_accept_ready_hook"), finalize.index("self._commit")
+        )
+        eagle = (root / "python/sglang/srt/speculative/eagle_info.py").read_text(
+            encoding="utf-8"
+        )
+        verify = eagle[eagle.index("def verify") : eagle.index("class EagleDraftInput")]
+        self.assertLess(
+            verify.index("publish_sr_tree_paths(batch, rows)"),
+            verify.index("sr_accept_ready_hook"),
+        )
+        self.assertLess(
+            verify.index("sr_accept_ready_hook"),
+            verify.index("Free the KV cache"),
+        )
+
     def test_poisoned_finish_returns_host_row_without_device_free(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (

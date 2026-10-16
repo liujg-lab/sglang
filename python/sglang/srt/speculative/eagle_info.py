@@ -778,6 +778,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             accepted_tree_candidate_indices = publish_sr_tree_paths(batch, rows)
 
+        accept_ready = getattr(batch, "sr_accept_ready_hook", None)
+        if accept_ready is not None:
+            accept_ready(batch)
+
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         result_device = batch.device

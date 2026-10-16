@@ -330,3 +330,21 @@ class SRBatchReply:
 
 def is_health_check_req(req) -> bool:
     return getattr(req, "rid", "").startswith("HEALTH_CHECK")
+
+
+def account_sr_verify_step(batch) -> None:
+    """Count one verify step. A second call in the same round does nothing.
+
+    ``len_output_ids`` is the accepted output length. Callers that send STEP
+    early must account before the send; the late path accounts only if this
+    round has not already done so.
+    """
+    if getattr(batch, "sr_step_accounted", False):
+        return
+    for req in getattr(batch, "reqs", None) or ():
+        if is_health_check_req(req):
+            continue
+        req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
+        req.len_output_ids = len(req.output_ids)
+        req.sr_step_id = int(getattr(req, "sr_step_id", 0) or 0) + 1
+    batch.sr_step_accounted = True

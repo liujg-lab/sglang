@@ -29,6 +29,7 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftRequest,
     SRPendingEntry,
     SRReplyStatus,
+    account_sr_verify_step,
     is_health_check_req as _is_health_check,
     local_spec_shape,
     make_draft_tokens_and_logits,
@@ -788,6 +789,32 @@ class SchedulerStandaloneRemoteTargetMixin:
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def _sr_accept_ready(self, batch) -> None:
+        """Send STEP once accepted tokens and tree paths are final.
+
+        KV commit and logits gathering stay after this send. Finished
+        requests are still counted so a later FINISH uses the new step id,
+        and they are left out of the STEP itself.
+        """
+        if getattr(batch, "sr_step_sent", False):
+            return
+        account_sr_verify_step(batch)
+        still = [
+            req for req in self._sr_select_reqs(batch) if not req.finished()
+        ]
+        candidates = self._sr_step_candidates(still)
+        inflight = (
+            self._sr_send(SRAction.STEP, candidates, include_full_context=False)
+            if candidates
+            else None
+        )
+        batch.sr_step_inflight = inflight
+        batch.sr_step_still = still
+        batch.sr_step_candidates = candidates
+        # process_batch_result can queue FINISH before this round receives.
+        self._sr_hold_finish_flush = inflight is not None
+        batch.sr_step_sent = True
+
     def _sr_run_verify_round(self, batch):
         metrics = get_sr_round_metrics(self, "Target")
         with metrics.round():
@@ -803,17 +830,39 @@ class SchedulerStandaloneRemoteTargetMixin:
                 batch.draft_num_tokens = (
                     self.server_args.speculative_num_draft_tokens if n_ok else 1
                 )
-                with metrics.phase("run_batch_including_verify"):
-                    result = self.run_batch(batch)
-                still = [req for req in live if not req.finished()]
-                candidates = self._sr_step_candidates(still)
-                inflight = (
-                    self._sr_send(
-                        SRAction.STEP, candidates, include_full_context=False
+                batch.sr_step_sent = False
+                batch.sr_step_accounted = False
+                batch.sr_step_inflight = None
+                batch.sr_step_still = None
+                batch.sr_step_candidates = None
+                accept_ready = getattr(self, "_sr_accept_ready", None)
+                if accept_ready is not None:
+                    batch.sr_accept_ready_hook = accept_ready
+                try:
+                    with metrics.phase("run_batch_including_verify"):
+                        result = self.run_batch(batch)
+                except BaseException:
+                    # The DEALER still holds a STEP reply if the hook sent.
+                    # Drain it on every rank before the next send_batch.
+                    self._sr_hold_finish_flush = False
+                    inflight = getattr(batch, "sr_step_inflight", None)
+                    if inflight is not None:
+                        self._sr_recv(inflight)
+                    raise
+                if getattr(batch, "sr_step_sent", False):
+                    inflight = batch.sr_step_inflight
+                    still = list(batch.sr_step_still or [])
+                    candidates = list(batch.sr_step_candidates or [])
+                else:
+                    still = [req for req in live if not req.finished()]
+                    candidates = self._sr_step_candidates(still)
+                    inflight = (
+                        self._sr_send(
+                            SRAction.STEP, candidates, include_full_context=False
+                        )
+                        if candidates
+                        else None
                     )
-                    if candidates
-                    else None
-                )
                 # Hide the next draft forward behind postprocess. FINISH for
                 # requests that end in that postprocess stays queued until
                 # the STEP reply is received.
@@ -852,3 +901,4 @@ class SchedulerStandaloneRemoteTargetMixin:
                         self._sr_flush_finish_notifications()
             finally:
                 batch.sr_round_metrics = None
+                batch.sr_accept_ready_hook = None

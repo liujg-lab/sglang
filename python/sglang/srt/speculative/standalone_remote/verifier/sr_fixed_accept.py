@@ -924,6 +924,9 @@ class SRFixedAcceptState:
                 device=False,
             )
             self._export_paths(batch, truncated)
+            accept_ready = getattr(batch, "sr_accept_ready_hook", None)
+            if accept_ready is not None:
+                accept_ready(batch)
             output = _timed(
                 self.metrics,
                 "fixed_accept_kv_commit",

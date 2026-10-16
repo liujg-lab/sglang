@@ -27,6 +27,7 @@ from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
     poison_paged_metadata,
 )
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    account_sr_verify_step,
     is_health_check_req as _is_health_check,
     make_draft_tokens_and_logits,
 )
@@ -530,12 +531,8 @@ class StandaloneRemoteWorker:
                 batch, seq_lens_cpu_pre, res.accept_length_per_req_cpu
             )
 
-        for req in batch.reqs:
-            if _is_health_check(req):
-                continue
-            req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
-            req.len_output_ids = len(req.output_ids)
-            req.sr_step_id = int(getattr(req, "sr_step_id", 0) or 0) + 1
+        if not getattr(batch, "sr_step_accounted", False):
+            account_sr_verify_step(batch)
 
         # Graph replay can attach a FULL hidden buffer this round does not
         # consume. Drop the view before the discard check; the persistent
