@@ -2704,13 +2704,26 @@ class TestSeedOnlyForward(unittest.TestCase):
         expected = pruned.clone()
         bias(expected)
         custom(expected, info)
-        vals, indices = (expected / info.temperatures).softmax(-1).topk(3)
+        vals, indices = expected.softmax(-1).topk(3)
         torch.testing.assert_close(result.logits_output.tree_seed_topk_p, vals)
         torch.testing.assert_close(result.logits_output.tree_seed_topk_index, indices)
+        nongreedy_p = result.logits_output.tree_seed_topk_p.clone()
+        nongreedy_index = result.logits_output.tree_seed_topk_index.clone()
         torch.testing.assert_close(torch.random.get_rng_state(), rng)
         runner.sample.assert_not_called()
         info.update_regex_vocab_mask.assert_called_once()
         self.assertFalse(hasattr(result, "next_token_ids"))
+
+        info.is_all_greedy = True
+        output.next_token_logits = pruned.clone()
+        greedy = forward(
+            worker, None, forward_batch=NS(sampling_info=info), seed_only=True
+        )
+        torch.testing.assert_close(greedy.logits_output.tree_seed_topk_p, nongreedy_p)
+        torch.testing.assert_close(
+            greedy.logits_output.tree_seed_topk_index, nongreedy_index
+        )
+        runner.sample.assert_not_called()
 
 
 class TestRoundMetrics(unittest.TestCase):

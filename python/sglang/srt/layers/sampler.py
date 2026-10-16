@@ -81,11 +81,7 @@ class Sampler(nn.Module):
                 capture_tree_seed_topk,
             )
 
-            seed_src = (
-                logits
-                if sampling_info.is_all_greedy
-                else logits / sampling_info.temperatures
-            )
+            seed_src = logits  # tree topology always scored at T=1, same as expand steps
             (
                 logits_output.tree_seed_topk_p,
                 logits_output.tree_seed_topk_index,
