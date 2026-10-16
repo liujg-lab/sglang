@@ -354,7 +354,10 @@ class SRRPDWorkspace:
 
 
 def _host_array(value):
-    """Host array for selection. Avoids a nested Python ``tolist`` copy.
+    """Host array for selection.
+
+    ``_rpd_select_host`` converts the array with one ``tolist``, so the edge
+    loop does not pay a scalar conversion per value.
 
     bfloat16 has no NumPy scalar type here. It is the high 16 bits of float32,
     so the cast matches the Python ``float()`` values used by selection.

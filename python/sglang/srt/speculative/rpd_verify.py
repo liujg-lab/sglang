@@ -66,15 +66,21 @@ def _longest_path(
     valid: Sequence[bool],
     gaps: Sequence[float],
 ) -> List[int]:
-    """Return slot indices of the longest valid path from root (slot 0)."""
+    """Return slot indices of the longest valid path from root (slot 0).
+
+    Child slots are greater than their parent, so a descending scan finishes
+    each subtree before its parent. Children are stored left to right; the
+    reverse scan sees the right sibling first. On an equal length, replace
+    unless that sibling has a strictly smaller gap. Equality and NaN then
+    keep the left sibling, matching Python ``<``.
+    """
     n = len(children)
     length = [1] * n
     best_child = [-1] * n
     path_gap = [0.0] * n
 
-    def dfs(u: int) -> None:
-        for v in children[u]:
-            dfs(v)
+    for u in range(n - 1, -1, -1):
+        for v in reversed(children[u]):
             if not valid[v]:
                 continue
             cand_gap = float(gaps[v]) + path_gap[v]
@@ -86,14 +92,14 @@ def _longest_path(
                 replace = True
             elif length[v] == length[b]:
                 cur_gap = float(gaps[b]) + path_gap[b]
-                if cand_gap < cur_gap:
+                # ``v`` is the later, left sibling. Keep it unless ``b`` is
+                # strictly better. ``<=`` would leave a NaN gap on the right.
+                if not (cur_gap < cand_gap):
                     replace = True
             if replace:
                 best_child[u] = v
                 length[u] = 1 + length[v]
                 path_gap[u] = cand_gap
-
-    dfs(0)
     path = [0]
     u = 0
     while best_child[u] >= 0:
@@ -335,6 +341,10 @@ def _rpd_select_host(
     topology, star, stats, gap_max, use_equality, accept_width, rows, predict_len
 ):
     """Shared Python selection; no tensors or device operations are created."""
+    if stats is not None and hasattr(stats, "tolist"):
+        stats = stats.tolist()
+    if use_equality and hasattr(star, "tolist"):
+        star = star.tolist()
     cand, retr = topology.candidates, topology.retrieve
     edges, edge_pos = topology.edges, topology.edge_pos
     batch = len(cand)
