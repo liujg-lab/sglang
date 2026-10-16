@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -54,6 +55,7 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     IMPL_TREE_PAGED_FIA,
     TARGET_TREE_FIA_KV_ATTR,
     TARGET_TREE_FIA_Q_ATTR,
+    read_sr_target_baked_kv_env,
     read_sr_target_update_overlap_env,
     validate_target_tree_fia_records,
 )
@@ -65,6 +67,7 @@ from sglang.srt.utils import (
     empty_context,
     get_compiler_backend,
     is_npu,
+    log_info_on_rank0,
 )
 
 is_npu = is_npu()
@@ -128,6 +131,11 @@ class NPUGraphRunner(CudaGraphRunner):
         self._logged_sr_target_overlap_submit = False
         target_overlap_requested = read_sr_target_update_overlap_env()
         self._npu_sr_target_update_overlap_requested = target_overlap_requested
+        # Capture runs inside super().__init__, so the flag must exist first.
+        self._npu_sr_target_baked_kv = read_sr_target_baked_kv_env()
+        model_runner._npu_sr_target_baked_kv = self._npu_sr_target_baked_kv
+        self._baked_static_keys = set()
+        self._capture_static_fia = False
         super().__init__(model_runner)
         self.model_runner = model_runner
         if not hasattr(self, "attr_name"):
@@ -143,10 +151,42 @@ class NPUGraphRunner(CudaGraphRunner):
             self._fia_payloads = {}
         if getattr(self, "_target_fia_maps", None) is None:
             self._target_fia_maps = {}
+        if getattr(self, "_baked_static_keys", None) is None:
+            self._baked_static_keys = set()
 
     def capture(self):
         self._ensure_capture_attrs()
         super().capture()
+        self._warmup_baked_static_graphs()
+
+    def _warmup_baked_static_graphs(self):
+        """Replay each baked bucket graph once on the inference stream.
+
+        The first ``replay`` instantiates the CANN executable. Doing it here
+        moves that cost to startup. Later requests in this process only enqueue.
+        """
+        keys = sorted(getattr(self, "_baked_static_keys", ()))
+        if not keys:
+            return
+        started = time.perf_counter()
+        for key in keys:
+            graph = self.graphs.get(key)
+            if graph is None:
+                raise NpuGraphPreparationError(
+                    f"baked bucket graph missing for warmup: {key}",
+                    scope="graph",
+                )
+            graph.replay()
+        torch.npu.synchronize()
+        tp_group = getattr(self.model_runner, "tp_group", None)
+        if tp_group is not None:
+            tp_group.barrier()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        log_info_on_rank0(
+            logger,
+            "[SR CudaGraph] Baked bucket graph warmup complete. "
+            f"graphs={len(keys)} elapsed_ms={elapsed_ms:.1f}",
+        )
 
     def _capture_extra_keys(self, ntpb=None):
         """S_cap buckets only for tree TARGET_VERIFY. DECODE keeps integer / r1 keys."""
@@ -303,6 +343,7 @@ class NPUGraphRunner(CudaGraphRunner):
             return False
         if (
             self._current_tree_attention_impl() == IMPL_TREE_PAGED_FIA
+            and graph_key not in getattr(self, "_baked_static_keys", ())
             and getattr(self, "_target_fia_maps", {}).get(graph_key) is None
         ):
             self._last_can_run_reject = "fia_map_missing"
@@ -348,13 +389,22 @@ class NPUGraphRunner(CudaGraphRunner):
         else:
             skip_guard_context = empty_context()
 
-        with skip_guard_context, torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=True,
-        ):
-            out = run_once_fn()
+        if bool(getattr(self, "_capture_static_fia", False)):
+            with skip_guard_context, torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=False,
+            ):
+                out = run_once_fn()
+        else:
+            with skip_guard_context, torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ):
+                out = run_once_fn()
         return out
 
     def _get_update_attr_name(self):
@@ -373,6 +423,12 @@ class NPUGraphRunner(CudaGraphRunner):
         backend = self.model_runner.attn_backend
         shared = getattr(backend, "_use_tree_shared_prefix", lambda: False)()
         target_fia = getattr(backend, "_use_target_tree_paged_fia", lambda: False)()
+        static_fia = (
+            bool(getattr(self, "_npu_sr_target_baked_kv", False))
+            and target_fia
+            and getattr(self, "_active_capture_extra", None) is not None
+        )
+        self._capture_static_fia = static_fia
         if shared or target_fia:
             backend._shared_capture_width = getattr(self, "_active_capture_extra", None)
         try:
@@ -380,6 +436,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 bs, forward, stream_idx, ntpb_override
             )
         finally:
+            self._capture_static_fia = False
             if shared or target_fia:
                 backend._shared_capture_width = None
         self._ensure_capture_attrs()
@@ -397,6 +454,9 @@ class NPUGraphRunner(CudaGraphRunner):
             if shared:
                 return graph, out
             if target_fia:
+                if static_fia:
+                    self._baked_static_keys.add(key)
+                    return graph, out
                 self._bind_target_tree_fia_payload(graph, key, bs)
                 return graph, out
         n_lens = int(bs) * int(ntpb) if extra is not None else int(bs)
@@ -549,13 +609,51 @@ class NPUGraphRunner(CudaGraphRunner):
             bool(overlap),
         )
 
+    def _replay_target_tree_fia_baked(self, graph, graph_key, kv_bucket):
+        """Replay the captured bucket graph. Lengths stay at capture time."""
+        metrics = self._target_graph_host_metrics()
+        sample = None
+        if metrics is not None:
+            try:
+                sample = begin_graph_host_sample(
+                    {
+                        "graph_phase": "target_verify",
+                        "round_id": int(metrics.rounds) + 1,
+                        "graph_key": graph_key,
+                        "implementation": self._current_tree_attention_impl(),
+                        "raw_bs": int(getattr(self, "raw_bs", 0) or 0),
+                        "capture_bs": int(self.bs),
+                        "kv_bucket": kv_bucket,
+                        "overlap": False,
+                    }
+                )
+            except Exception:
+                sample = None
+
+        def replay():
+            measure_call(sample, "replay_call", graph.replay)
+
+        def _submit():
+            if sample is not None:
+                sample.record_stage("update_call", 0.0, completed=True)
+            measure_call(sample, "submit_envelope", replay)
+
+        try:
+            measure_call(sample, "prepare_submit", _submit)
+        except BaseException:
+            mark_graph_host_failed(sample)
+            raise
+        finally:
+            record_graph_host_sample_safely(metrics, sample)
+
     def _replay_target_tree_fia(self, info, kv_lens, graph, graph_key, kv_bucket):
         """Fill this round's lengths, then update and replay the same graph.
 
         Overlap submits ``graph.update`` on the caller stream and queues
         ``graph.replay`` before that update returns. Captured events keep the
         dynamic operators behind the update. The caller joins this generation
-        before the next payload fill.
+        before the next payload fill. Statically captured bucket graphs do not
+        enter this body.
         """
         overlap = bool(getattr(self, "_npu_sr_target_update_overlap", False))
         device_id = getattr(self, "_npu_graph_device_id", None)
@@ -770,11 +868,6 @@ class NPUGraphRunner(CudaGraphRunner):
             seq_lens = None
             if not skip_fia_update:
                 if is_tree_verify and target_fia:
-                    info = getattr(self, "_target_fia_maps", {}).get(graph_key)
-                    if info is None:
-                        raise NpuGraphPreparationError(
-                            "target tree FIA payload missing", scope="graph"
-                        )
                     md = getattr(
                         getattr(backend, "forward_metadata", None),
                         "sr_target_tree_fia",
@@ -792,9 +885,19 @@ class NPUGraphRunner(CudaGraphRunner):
                             scope="graph",
                         )
                     seq_lens = kv_lens
-                    self._replay_target_tree_fia(
-                        info, kv_lens, graph, graph_key, kv_bucket
-                    )
+                    if graph_key in getattr(self, "_baked_static_keys", ()):
+                        self._replay_target_tree_fia_baked(
+                            graph, graph_key, kv_bucket
+                        )
+                    else:
+                        info = getattr(self, "_target_fia_maps", {}).get(graph_key)
+                        if info is None:
+                            raise NpuGraphPreparationError(
+                                "target tree FIA payload missing", scope="graph"
+                            )
+                        self._replay_target_tree_fia(
+                            info, kv_lens, graph, graph_key, kv_bucket
+                        )
                 elif is_tree_verify and compact_fia:
                     ntpb = actual_ntpb
                     capture_rows = int(self.bs) * int(ntpb)

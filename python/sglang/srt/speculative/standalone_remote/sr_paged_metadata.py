@@ -421,7 +421,9 @@ def _outputs(ws, expected):
                 raise ValueError("paged metadata output storage is no longer ND")
 
 
-def fill_target_paged_metadata_(md, mapping, pool, mask, plan, dummy=0):
+def fill_target_paged_metadata_(
+    md, mapping, pool, mask, plan, dummy=0, *, preserve_captured_lens=False
+):
     ws = md.workspace
     if any(
         a is not b
@@ -474,6 +476,8 @@ def fill_target_paged_metadata_(md, mapping, pool, mask, plan, dummy=0):
         assign_captured_lens,
     )
 
+    if preserve_captured_lens:
+        return
     assign_captured_lens(md.kv_lens_cpu, plan.kv_lens, "kv_lens_cpu")
     assign_captured_lens(
         md.q_lens_cpu, [plan.queries] * plan.capacity, "q_lens_cpu"

@@ -364,6 +364,8 @@ helper 返回或抛错）。`submit_envelope` 接近 `max(update, replay)` 不�
 不看单独的 replay 提交变快。出现正确性差异或没有稳定收益时，把对应开关设为
 `0` 并重启该进程。测量数字在实跑后补记。
 
+`SGLANG_NPU_SR_TARGET_BAKED_KV` 默认关闭。未设置或 `0/false/no/off` 保持现在每轮`graph.update`；`1/true/yes/on` 才对 Target `tree_paged_fia` 的带 KV 桶的验证图做静态捕获。捕获前把 `actual_seq_lengths_kv` 写成桶对齐后的 mask 宽度，query 长度写成捕获的query 数，并且 `auto_dispatch_capture=False`，长度不再是动态输入。同一 runner 里的`r1_*` 解码图和其他模式仍是 `auto_dispatch_capture=True`。`auto_dispatch_capture=True`时跳过 `graph.update` 会让 FIA 一直等更新事件，请求停在第一次核验。静态捕获后桶内只`graph.replay`，没有 `graph.update`。捕获结束后会把这些桶图各 replay 一次，把首次装图挪到启动。只在 Target 的 NPU graph runner 初始化时读取一次，改值后需重启 Target，不是运行时热切换，也不是 CLI/协议字段。草稿树、tail、普通 AR 和EAGLE compact-FIA 不读这个开关。桶仍是 `SGLANG_NPU_TREE_GRAPH_KV_BUCKETS`（默认 `256,512,1024,2048,4096`），跨桶换已经捕获的下一张静态图。页表和 tree mask 仍按真实前缀每轮填写，`s >= prefix + queries` 的列保持挡住。开启后主机计时里不应再出现非 0 的 `update_call_host_ms`，`replay_call_host_ms` 仍在。静态捕获会冻住这次前向里的全部主机输入；这条图每轮通过 `graph.update` 发布的只有FIA 的 KV/query 长度，页表和 mask 走设备张量。本机没有 NPU。实机要用同一请求对比开关 `0` 和 `1` 的 greedy 输出，并确认 `needed_len_max` 等于桶宽。出现正确性差异时把开关设为 `0` 并重启 Target。
+
 启动期 Draft `_sr_warm_tree_shapes` 先做 layout：对每个 raw_bs 枚举
 `shared ∈ [0, max(page_buckets)]` 的**原始页数**（不是桶值）与
 `rem ∈ {1, page_size - num_steps + 1, page_size - 1}`，

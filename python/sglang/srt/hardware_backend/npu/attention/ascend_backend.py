@@ -1893,6 +1893,9 @@ class AscendAttnBackend(AttentionBackend):
             prime_target_tree_fia_capture_(
                 metadata.sr_target_tree_fia,
                 dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
+                baked=bool(
+                    getattr(self.model_runner, "_npu_sr_target_baked_kv", False)
+                ),
             )
             self.graph_metadata[bs] = metadata
             self.forward_metadata = metadata
@@ -2073,6 +2076,9 @@ class AscendAttnBackend(AttentionBackend):
                 queries,
                 raw_bs,
                 dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
+                preserve_captured_lens=bool(
+                    getattr(self.model_runner, "_npu_sr_target_baked_kv", False)
+                ),
             )
             metadata.sr_target_tree_fia = md
             from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (

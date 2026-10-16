@@ -25,6 +25,7 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 
 SR_TARGET_TREE_FIA_ENV = "SGLANG_NPU_SR_TARGET_TREE_FIA"
 SR_TARGET_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP"
+SR_TARGET_BAKED_KV_ENV = "SGLANG_NPU_SR_TARGET_BAKED_KV"
 IMPL_TREE_PAGED_FIA = "tree_paged_fia"
 TARGET_TREE_FIA_PAGE_SIZE = 128
 TARGET_TREE_FIA_HEAD_DIMS = (64, 128)
@@ -49,6 +50,18 @@ def read_sr_target_update_overlap_env(env=None) -> bool:
     """
     environ = os.environ if env is None else env
     raw = environ.get(SR_TARGET_UPDATE_OVERLAP_ENV, "1")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_target_baked_kv_env(env=None) -> bool:
+    """Read once during NPU graph runner init; default off.
+
+    When set, Target ``tree_paged_fia`` captures ``actual_seq_lengths_kv`` at
+    the bucket width and replays without ``graph.update``. Unset or 0 keeps
+    the per-round length update. Not a runtime toggle.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TARGET_BAKED_KV_ENV, "0")
     return str(raw).strip().lower() in _TRUTHY
 
 
@@ -280,10 +293,21 @@ def assign_captured_lens(dest, values, what: str):
 
 
 def prime_target_tree_fia_capture_(
-    md: SRTargetTreeFiaMetadata, dummy_page: int = 0
+    md: SRTargetTreeFiaMetadata, dummy_page: int = 0, *, baked: bool = False
 ) -> None:
-    """Legal capture-time contents: dummy pages and one unmasked dummy column."""
+    """Legal capture-time contents: dummy pages and one unmasked dummy column.
+
+    ``baked`` then writes KV lengths to the mask width. ``clear`` itself still
+    resets those lengths to 1 so other callers keep the short placeholder.
+    """
     md.clear(dummy_page=dummy_page)
+    if not baked:
+        return
+    width = int(md.blocked_mask.shape[-1])
+    bs = int(md.block_tables.shape[0])
+    queries = int(md.blocked_mask.shape[2])
+    assign_captured_lens(md.kv_lens_cpu, [width] * bs, "kv_lens_cpu")
+    assign_captured_lens(md.q_lens_cpu, [queries] * bs, "q_lens_cpu")
 
 
 def fill_target_tree_fia_page_tables_(
@@ -402,8 +426,13 @@ def fill_target_tree_fia_metadata_(
     *,
     dummy_page: int = 0,
     table_width: Optional[int] = None,
+    preserve_captured_lens: bool = False,
 ) -> None:
-    """Validate, then refresh page tables, mask, lengths, and active rows."""
+    """Validate, then refresh page tables, mask, lengths, and active rows.
+
+    ``preserve_captured_lens`` keeps the capture-time KV and query lists. Graph
+    replay uses that when lengths were baked to the bucket width.
+    """
     capture_bs = int(md.block_tables.shape[0])
     pages = int(md.block_tables.shape[1])
     prefixes = validate_target_tree_fia_inputs(
@@ -428,12 +457,15 @@ def fill_target_tree_fia_metadata_(
             prefixes, capture_bs, queries, pages, md.page_size
         )
         fill_target_paged_metadata_(
-            md, req_to_token, req_pool_indices, custom_mask, plan, dummy_page
+            md,
+            req_to_token,
+            req_pool_indices,
+            custom_mask,
+            plan,
+            dummy_page,
+            preserve_captured_lens=preserve_captured_lens,
         )
         return
-    _, kv_lens, q_lens = plan_target_tree_fia_lengths(
-        prefixes, queries, raw_bs, capture_bs
-    )
     fill_target_tree_fia_page_tables_(
         md,
         req_to_token,
@@ -445,8 +477,12 @@ def fill_target_tree_fia_metadata_(
     fill_target_tree_fia_mask_(
         md, custom_mask, prefixes, queries, validated=True
     )
-    assign_captured_lens(md.kv_lens_cpu, kv_lens, "kv_lens_cpu")
-    assign_captured_lens(md.q_lens_cpu, q_lens, "q_lens_cpu")
+    if not preserve_captured_lens:
+        _, kv_lens, q_lens = plan_target_tree_fia_lengths(
+            prefixes, queries, raw_bs, capture_bs
+        )
+        assign_captured_lens(md.kv_lens_cpu, kv_lens, "kv_lens_cpu")
+        assign_captured_lens(md.q_lens_cpu, q_lens, "q_lens_cpu")
     md.active_rows.zero_()
     if raw_bs:
         md.active_rows[: int(raw_bs)] = True

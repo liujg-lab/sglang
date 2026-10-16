@@ -29,7 +29,9 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     pages_for_s_cap,
     plan_target_tree_fia_lengths,
     prime_target_tree_fia_capture_,
+    SR_TARGET_BAKED_KV_ENV,
     SR_TARGET_UPDATE_OVERLAP_ENV,
+    read_sr_target_baked_kv_env,
     read_sr_target_tree_fia_env,
     read_sr_target_update_overlap_env,
     target_tree_fia_blocked_extra_combos,
@@ -136,6 +138,13 @@ class TestTargetTreeFiaEnv(CustomTestCase):
             self.assertTrue(
                 read_sr_target_update_overlap_env({SR_TARGET_UPDATE_OVERLAP_ENV: raw})
             )
+
+    def test_baked_kv_env_default_off(self):
+        self.assertFalse(read_sr_target_baked_kv_env({}))
+        self.assertFalse(read_sr_target_baked_kv_env({SR_TARGET_BAKED_KV_ENV: "0"}))
+        self.assertFalse(read_sr_target_baked_kv_env({SR_TARGET_BAKED_KV_ENV: "false"}))
+        for raw in ("1", "true", "YES", "on"):
+            self.assertTrue(read_sr_target_baked_kv_env({SR_TARGET_BAKED_KV_ENV: raw}))
 
 
 class TestTargetTreeFiaSelection(CustomTestCase):
@@ -619,8 +628,16 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         self.assertNotIn("overlap=True", target_call)
         self.assertNotIn("overlap=True", replay)
         self.assertLess(
+            target_call.find("_baked_static_keys"),
             target_call.find("target tree FIA payload missing"),
-            target_call.find("_replay_target_tree_fia"),
+        )
+        self.assertLess(
+            target_call.find("_replay_target_tree_fia_baked"),
+            target_call.find("target tree FIA payload missing"),
+        )
+        self.assertLess(
+            target_call.find("target tree FIA payload missing"),
+            target_call.find("_replay_target_tree_fia("),
         )
         submit = _fn_source(_RUNNER, "NPUGraphRunner", "_replay_target_tree_fia")
         self.assertIn("fill_fia_cpu_update_payload", submit)
@@ -638,6 +655,30 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         self.assertNotIn("torch.npu.synchronize", submit)
         self.assertNotIn("wait_stream", submit)
         self.assertNotIn("update_stream.synchronize", submit)
+        self.assertNotIn("_replay_target_tree_fia_baked", submit)
+        self.assertNotIn("_npu_sr_target_baked_kv", submit)
+        baked = _fn_source(_RUNNER, "NPUGraphRunner", "_replay_target_tree_fia_baked")
+        self.assertNotIn("graph.update", baked)
+        self.assertNotIn("fill_fia_cpu_update_payload", baked)
+        self.assertIn("graph.replay", baked)
+        self.assertIn('record_stage("update_call", 0.0, completed=True)', baked)
+        self.assertIn("replay_call", baked)
+        capture = _fn_source(_RUNNER, "NPUGraphRunner", "_capture_graph")
+        self.assertLess(
+            capture.find("_capture_static_fia"),
+            capture.find("auto_dispatch_capture=False"),
+        )
+        self.assertIn("auto_dispatch_capture=True", capture)
+        one_body = one.split("static_fia =", 1)[1]
+        self.assertLess(one_body.find("_npu_sr_target_baked_kv"), one_body.find("target_fia"))
+        self.assertLess(
+            one_body.find("_active_capture_extra"),
+            one_body.find("_bind_target_tree_fia_payload"),
+        )
+        self.assertLess(
+            one_body.find("_baked_static_keys.add"),
+            one_body.find("_bind_target_tree_fia_payload"),
+        )
         bind = _fn_source(_RUNNER, "NPUGraphRunner", "_bind_target_tree_fia_payload")
         self.assertNotIn("read_sr_target_shared_kv_env", bind)
         self.assertNotIn("expand_fia_cpu_update_inputs", bind)
@@ -659,6 +700,18 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         self.assertIn("_replay_target_tree_fia", replay)
         can = _fn_source(_RUNNER, "NPUGraphRunner", "can_run")
         self.assertIn("_target_fia_maps", can)
+        self.assertLess(can.find("_baked_static_keys"), can.find("fia_map_missing"))
+        capture_entry = _fn_source(_RUNNER, "NPUGraphRunner", "capture")
+        self.assertLess(
+            capture_entry.find("super().capture()"),
+            capture_entry.find("_warmup_baked_static_graphs"),
+        )
+        warm = _fn_source(_RUNNER, "NPUGraphRunner", "_warmup_baked_static_graphs")
+        self.assertIn("_baked_static_keys", warm)
+        self.assertIn("graph.replay", warm)
+        self.assertLess(warm.find("graph.replay"), warm.find("torch.npu.synchronize"))
+        self.assertLess(warm.find("torch.npu.synchronize"), warm.find("barrier"))
+        self.assertNotIn("graph.update", warm)
 
     def test_replay_error_does_not_rerun_forward(self):
         spec = _REPO / "python/sglang/srt/speculative/spec_utils.py"
@@ -920,6 +973,53 @@ class TestPrimeCapture(CustomTestCase):
         self.assertFalse(bool(md.blocked_mask[:, :, :, 0].any()))
         self.assertTrue(bool(md.blocked_mask[:, :, :, 1:].all()))
         self.assertEqual(md.kv_lens_cpu, [1, 1])
+
+    def test_baked_capture_uses_mask_width(self):
+        md = SRTargetTreeFiaMetadata.allocate(1, 20, 8, 128, "cpu")
+        prime_target_tree_fia_capture_(md, dummy_page=0, baked=True)
+        width = int(md.blocked_mask.shape[-1])
+        self.assertEqual(width, 1024)
+        self.assertEqual(md.kv_lens_cpu, [width])
+        self.assertEqual(md.q_lens_cpu, [20])
+        self.assertTrue((md.block_tables == 0).all())
+        self.assertFalse(bool(md.blocked_mask[:, :, :, 0].any()))
+
+    def test_baked_replay_fill_keeps_bucket_lengths(self):
+        prefixes = [760]
+        queries = 20
+        page = 128
+        pages = pages_for_s_cap(1024, page)
+        md = SRTargetTreeFiaMetadata.allocate(1, queries, pages, page, "cpu")
+        prime_target_tree_fia_capture_(md, dummy_page=0, baked=True)
+        width = int(md.blocked_mask.shape[-1])
+        page_ids = [[3, 9, 1, 4, 5, 6, 7, 8]]
+        table = _req_to_token(page_ids, page)
+        pool = torch.zeros(1, dtype=torch.int64)
+        mask = _full_mask(prefixes, queries)
+        fill_target_tree_fia_metadata_(
+            md,
+            table,
+            pool,
+            mask,
+            prefixes,
+            queries,
+            1,
+            preserve_captured_lens=True,
+        )
+        self.assertEqual(md.kv_lens_cpu, [width])
+        self.assertEqual(md.q_lens_cpu, [queries])
+        real = prefixes[0] + queries
+        self.assertTrue(bool(md.blocked_mask[0, 0, :, real:].all()))
+        self.assertTrue(prefix_columns_visible(md.blocked_mask, prefixes))
+        self.assertFalse(
+            bool(md.blocked_mask[0, 0, queries - 1, real - 1].item())
+        )
+
+        fill_target_tree_fia_metadata_(
+            md, table, pool, mask, prefixes, queries, 1
+        )
+        self.assertEqual(md.kv_lens_cpu, [real])
+        self.assertEqual(md.q_lens_cpu, [queries])
 
 
 if __name__ == "__main__":
