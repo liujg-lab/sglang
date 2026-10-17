@@ -1014,12 +1014,21 @@ class SRRPDTest(unittest.TestCase):
         import sglang.srt.speculative.standalone_remote.sr_rpd as module
 
         workspace = SRRPDWorkspace()
+        allocs = {"host": 0}
+        real_alloc = module.alloc_host
 
-        def forbid(*_args, **_kwargs):
-            raise AssertionError("stage must not allocate or wait")
+        def counting_alloc(*args, **kwargs):
+            allocs["host"] += 1
+            return real_alloc(*args, **kwargs)
 
-        with patch.object(module, "alloc_host", forbid), patch.object(
-            module, "wait_event", forbid
+        def forbid_wait(*_args, **_kwargs):
+            raise AssertionError("stage must not wait")
+
+        def forbid_empty(*_args, **_kwargs):
+            raise AssertionError("stage must not allocate")
+
+        with patch.object(module, "alloc_host", counting_alloc), patch.object(
+            module, "wait_event", forbid_wait
         ):
             first_idx, first_tok, first_len, first_sel = module.stage_v1_result(
                 workspace, [3, 4], [8, 9], [1], torch.device("cpu"), [0]
@@ -1028,11 +1037,73 @@ class SRRPDTest(unittest.TestCase):
             self.assertEqual(first_tok.tolist(), [8, 9])
             self.assertEqual(first_len.tolist(), [1])
             self.assertEqual(first_sel.tolist(), [0])
-            held = workspace._v1_dev
-            second_idx, second_tok, second_len, second_sel = module.stage_v1_result(
-                workspace, [1], [7], [0, 0], torch.device("cpu")
+            self.assertEqual(allocs["host"], 1)
+            held_dev = workspace._v1_dev
+            held_host = workspace._v1_host
+            with patch.object(module.torch, "empty", forbid_empty):
+                second_idx, second_tok, second_len, second_sel = module.stage_v1_result(
+                    workspace, [1], [7], [0, 0], torch.device("cpu")
+                )
+        self.assertEqual(allocs["host"], 1)
+        self.assertIs(workspace._v1_dev, held_dev)
+        self.assertIs(workspace._v1_host, held_host)
+        self.assertEqual(second_idx.tolist(), [1])
+        self.assertEqual(second_tok.tolist(), [7])
+        self.assertEqual(second_len.tolist(), [0, 0])
+        self.assertEqual(second_sel.tolist(), [])
+
+    def test_device_cache_key_equates_unnumbered_and_indexed_device(self):
+        from sglang.srt.speculative.standalone_remote import sr_transfer_staging
+
+        class _Mod:
+            def current_device(self):
+                return 0
+
+        # ``npu`` is not a builtin device type here. ``cuda`` has the same
+        # unnumbered-versus-indexed mismatch that breaks buffer reuse.
+        unnumbered = torch.device("cuda")
+        indexed = torch.device("cuda", 0)
+        self.assertNotEqual(unnumbered, indexed)
+        with patch.object(
+            sr_transfer_staging.torch, "get_device_module", return_value=_Mod()
+        ):
+            self.assertEqual(
+                sr_transfer_staging.device_cache_key(unnumbered),
+                sr_transfer_staging.device_cache_key(indexed),
             )
-        self.assertIs(workspace._v1_dev, held)
+
+    def test_stage_v1_reuses_unnumbered_device_with_same_cache_key(self):
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        workspace = SRRPDWorkspace()
+
+        def accel_key(device):
+            dev = device if isinstance(device, torch.device) else torch.device(device)
+            if dev.type in ("cpu", "cuda"):
+                return ("cuda", 0)
+            raise AssertionError(f"unexpected device {device}")
+
+        def forbid_empty(*_args, **_kwargs):
+            raise AssertionError("stage must reuse the device buffer")
+
+        # The buffer stays on CPU, so ``tensor.device == torch.device("cuda")``
+        # is false. Both that buffer and the unnumbered ``"cuda"`` request share
+        # one cache key, which is what production resolves for ``"cuda"``.
+        with patch.object(module, "device_cache_key", side_effect=accel_key):
+            module.stage_v1_result(
+                workspace, [3, 4], [8, 9], [1], torch.device("cpu"), [0]
+            )
+            self.assertEqual(workspace._v1_dev.device.type, "cpu")
+            self.assertNotEqual(workspace._v1_dev.device, torch.device("cuda"))
+            self.assertEqual(workspace._v1_key, ("cuda", 0))
+            held_dev = workspace._v1_dev
+            held_host = workspace._v1_host
+            with patch.object(module.torch, "empty", forbid_empty):
+                second_idx, second_tok, second_len, second_sel = module.stage_v1_result(
+                    workspace, [1], [7], [0, 0], "cuda"
+                )
+        self.assertIs(workspace._v1_dev, held_dev)
+        self.assertIs(workspace._v1_host, held_host)
         self.assertEqual(second_idx.tolist(), [1])
         self.assertEqual(second_tok.tolist(), [7])
         self.assertEqual(second_len.tolist(), [0, 0])

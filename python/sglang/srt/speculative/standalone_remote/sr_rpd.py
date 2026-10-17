@@ -22,6 +22,7 @@ from sglang.srt.speculative.rpd_verify import (
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
     alloc_host,
+    device_cache_key,
     event_supported,
     pin_supported,
     wait_event,
@@ -206,8 +207,10 @@ class SRRPDWorkspace:
         self.metrics = None
         self.edge_index = None
         self._v1_dev = None
+        self._v1_host = None
         self._v1_cap = 0
-        self._v1_hold = None
+        self._v1_key = None
+        self._v1_pinned = False
 
     def log_path_once(self, name: str) -> None:
         if name in self._logged_paths:
@@ -397,43 +400,59 @@ def verify_sr_rpd_host(logits, context, workspace, tau, path_cap):
 
 
 def stage_v1_result(workspace, indices, tokens, lengths, device, select=()):
-    """Upload one truncated V1 result without waiting or allocating pinned memory.
+    """Upload one truncated V1 result on the current stream, without waiting.
 
     ``indices`` and ``tokens`` are the surviving accept positions and the
     tokens written there, in row order. ``lengths`` is one draft count per
     request, excluding the bonus. ``select`` holds offsets into those flat
-    arrays for unfinished requests. Storage grows by capacity and stays on
-    ``workspace``. The ``copy_`` is ordered on the current stream; later
-    consumers on that stream observe it without a ``wait_event``.
+    arrays for unfinished requests.
+
+    Device and host storage grow by capacity and stay on ``workspace``.
+    ``alloc_host`` runs only when the capacity grows or the device changes.
+    This function does not call ``wait_event``. The H2D ``copy_`` is ordered
+    on the current stream, so later consumers on that stream observe it
+    without another wait.
+
+    The host prefix may be overwritten on the next call. The next
+    ``statistics()`` records ``wait_event`` on the same stream after the
+    previous H2D, so that copy has finished before the overwrite.
+
+    The four returned views alias the reused device buffer and are valid only
+    for this round. Standalone-remote code does not read
+    ``spec_info.verified_id`` or ``spec_info.accept_length`` across rounds.
+    Same-round consumers are ``eagle_info.verify`` before it returns, and
+    ``sr_worker`` handing ``verified_id`` back as ``next_token_ids`` (the
+    output processor calls ``tolist()``). The next ``verify()`` replaces
+    ``batch.spec_info`` before the next ``stage_v1_result``.
     """
-    idx_t = torch.tensor(list(indices), dtype=torch.int32)
-    tok_t = torch.tensor(list(tokens), dtype=torch.int32)
-    len_t = torch.tensor(list(lengths), dtype=torch.int32)
-    sel_t = torch.tensor(list(select), dtype=torch.int32)
-    n_idx = int(idx_t.numel())
-    n_tok = int(tok_t.numel())
-    n_len = int(len_t.numel())
-    n_sel = int(sel_t.numel())
+    indices = list(indices)
+    tokens = list(tokens)
+    lengths = list(lengths)
+    select = list(select)
+    n_idx = len(indices)
+    n_tok = len(tokens)
+    n_len = len(lengths)
+    n_sel = len(select)
     need = n_idx + n_tok + n_len + n_sel
     dev = device if isinstance(device, torch.device) else torch.device(device)
-    same = workspace._v1_dev is not None and workspace._v1_dev.device == dev
-    if not same or workspace._v1_cap < max(need, 1):
+    key = device_cache_key(dev)
+    if workspace._v1_key != key or workspace._v1_cap < max(need, 1):
         cap = max(need, workspace._v1_cap, 1)
         cap = 1 << (cap - 1).bit_length()
         workspace._v1_dev = torch.empty((cap,), dtype=torch.int32, device=dev)
+        workspace._v1_host, workspace._v1_pinned = alloc_host(
+            (cap,), torch.int32, dev
+        )
         workspace._v1_cap = cap
-    host = torch.empty((need,), dtype=torch.int32)
-    if n_idx:
-        host[:n_idx] = idx_t
-    if n_tok:
-        host[n_idx : n_idx + n_tok] = tok_t
-    if n_len:
-        host[n_idx + n_tok : n_idx + n_tok + n_len] = len_t
-    if n_sel:
-        host[n_idx + n_tok + n_len :] = sel_t
-    workspace._v1_hold = host
+        workspace._v1_key = key
+    host = workspace._v1_host[:need]
     if need:
-        workspace._v1_dev[:need].copy_(host, non_blocking=dev.type != "cpu")
+        host.copy_(
+            torch.tensor(indices + tokens + lengths + select, dtype=torch.int32)
+        )
+        workspace._v1_dev[:need].copy_(
+            host, non_blocking=workspace._v1_pinned and dev.type != "cpu"
+        )
     buf = workspace._v1_dev
     return (
         buf[:n_idx],
