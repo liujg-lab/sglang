@@ -2216,6 +2216,10 @@ class TestSRTreeCandidates(unittest.TestCase):
                 sys.modules[name] = old
 
     def episode(self, workspace, batch, logits, seeds, indices):
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            topk_probs_from_logits,
+        )
+
         select = TestRemoteSpecDevice()._select_top_k_tokens()
         # Match the real NPU fast_topk==1 branch too.
         select.__globals__["fast_topk"] = lambda x, k, dim=-1: (
@@ -2236,13 +2240,7 @@ class TestSRTreeCandidates(unittest.TestCase):
             token_list.append(info[1].clone())
             parent_list.append(info[2].clone())
             if step < workspace.steps - 1:
-                probs = torch.softmax(logits[step], dim=-1)
-                ref = (
-                    torch.max(probs, dim=-1, keepdim=True)
-                    if workspace.topk == 1
-                    else torch.topk(probs, workspace.topk, dim=-1)
-                )
-                rp, ri = ref.values, ref.indices
+                rp, ri = topk_probs_from_logits(logits[step], workspace.topk)
                 wp, wi = workspace.probabilities(logits[step], step)
                 torch.testing.assert_close(wp, rp, rtol=0, atol=0, equal_nan=True)
                 torch.testing.assert_close(wi, ri, rtol=0, atol=0)
@@ -2333,6 +2331,29 @@ class TestSRTreeCandidates(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capacity/storage"):
             workspace.check(2)
 
+    def test_candidate_probabilities_match_softmax_topk(self):
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
+            SRTreeCandidateWorkspace,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            topk_probs_from_logits,
+        )
+
+        workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 128, torch.float32)
+        logits = torch.randn(6, 128, generator=torch.Generator().manual_seed(11))
+        probs = torch.softmax(logits, dim=-1)
+        expect_vals, expect_idx = torch.topk(probs, 3, dim=-1)
+        got_vals, got_idx = workspace.probabilities(logits, 0)
+        torch.testing.assert_close(got_vals, expect_vals)
+        self.assertTrue(torch.equal(got_idx, expect_idx))
+        workspace.probability_out = False
+        fallback_vals, fallback_idx = workspace.probabilities(logits, 1)
+        direct_vals, direct_idx = topk_probs_from_logits(logits, 3)
+        self.assertTrue(torch.equal(fallback_vals, direct_vals))
+        self.assertTrue(torch.equal(fallback_idx, direct_idx))
+        self.assertTrue(torch.equal(got_vals, fallback_vals))
+        self.assertTrue(torch.equal(got_idx, fallback_idx))
+
     def test_candidate_cpu_preflight_and_fallback_probability_operator(self):
         from sglang.srt.speculative.standalone_remote.drafter.sr_tree_candidates import (
             SRTreeCandidateWorkspace,
@@ -2390,12 +2411,12 @@ class TestSRTreeCandidates(unittest.TestCase):
 
         workspace = SRTreeCandidateWorkspace("cpu", 2, 3, 3, 7, 37, torch.float32)
         workspace.validated = False
-        real_softmax, real_mul = torch.softmax, torch.mul
+        real_logsumexp, real_mul = torch.logsumexp, torch.mul
 
-        def softmax(inp, dim=None, dtype=None, out=None):
+        def logsumexp(inp, dim=None, keepdim=False, *, out=None):
             if out is not None:
-                raise RuntimeError("softmax out rejected")
-            return real_softmax(inp, dim=dim, dtype=dtype)
+                raise RuntimeError("logsumexp out rejected")
+            return real_logsumexp(inp, dim=dim, keepdim=keepdim)
 
         def mul(inp, other, *, out=None):
             if out is not None:
@@ -2405,7 +2426,7 @@ class TestSRTreeCandidates(unittest.TestCase):
         saved = self._preflight_references()
         try:
             with (
-                unittest.mock.patch.object(torch, "softmax", softmax),
+                unittest.mock.patch.object(torch, "logsumexp", logsumexp),
                 unittest.mock.patch.object(torch, "mul", mul),
                 unittest.mock.patch.object(
                     workspace, "_submitted", side_effect=AssertionError("submitted")

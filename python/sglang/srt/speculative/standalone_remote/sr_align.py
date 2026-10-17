@@ -164,11 +164,27 @@ def kv_release_len(committed_len: int, allocated_len: int) -> int:
     return max(int(committed_len or 0), int(allocated_len or 0))
 
 
+def topk_probs_from_logits(logits: torch.Tensor, k: int, *, upcast: bool = False):
+    """Top-k probabilities without a ``[rows, vocab]`` softmax tensor.
+
+    Softmax is strictly increasing in the logit, so the top-k indices match
+    softmax-then-topk. ``exp(vals - logsumexp(logits))`` is the softmax of
+    those entries. ``upcast`` scores in fp32, which is the tree-seed path.
+    """
+    work = logits.float() if upcast else logits
+    width = int(work.shape[-1])
+    k = min(max(int(k), 1), width)
+    if k == 1:
+        vals, idx = torch.max(work, dim=-1, keepdim=True)
+    else:
+        vals, idx = torch.topk(work, k, dim=-1)
+    lse = torch.logsumexp(work, dim=-1, keepdim=True)
+    return torch.exp(vals - lse), idx
+
+
 def capture_tree_seed_topk(logits: torch.Tensor, topk: int):
-    """Softmax + top-k; caller must not keep the full vocab tensor."""
-    probs = torch.softmax(logits.float(), dim=-1)
-    k = min(max(int(topk), 1), int(probs.shape[-1]))
-    return torch.topk(probs, k, dim=-1)
+    """Tree-seed top-k. Scored in fp32; caller must not keep a vocab tensor."""
+    return topk_probs_from_logits(logits, topk, upcast=True)
 
 
 def tree_seed_matches_prefix(seed, origin_ids: Sequence[int], output_ids: Sequence[int]) -> bool:

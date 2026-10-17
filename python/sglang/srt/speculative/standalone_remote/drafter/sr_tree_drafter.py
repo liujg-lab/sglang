@@ -31,7 +31,6 @@ from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     build_paged_draft_cache_locs,
     device_backend_key,
-    fast_topk,
     get_last_loc_large_page_size_large_top_k,
     maybe_detect_nan,
     maybe_detect_oob,
@@ -76,6 +75,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     is_device_context_error,
     seq_lens_cpu_for_host,
     seq_lens_sum_from_batch,
+    topk_probs_from_logits,
 )
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import (
     KVMoveSubmittedError,
@@ -2241,8 +2241,9 @@ class SRTreeDrafter:
                 ).logits_output
                 maybe_detect_nan(logits_output.next_token_logits, f"SR draft_forward step {i}")
                 if candidates is None:
-                    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                    topk_p, topk_index = topk_probs_from_logits(
+                        logits_output.next_token_logits, self.topk
+                    )
                 else:
                     topk_p, topk_index = candidates.probabilities(logits_output.next_token_logits, i)
                 maybe_detect_oob(

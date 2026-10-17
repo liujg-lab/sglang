@@ -26,6 +26,7 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     apply_tree_seed_topk,
     broadcast_sr_obj,
     capture_tree_seed_topk,
+    topk_probs_from_logits,
     classify_prefix_alignment,
     committed_tail_not_in_kv,
     draft_needed_max_new_tokens,
@@ -738,16 +739,28 @@ class TestForkPointAlign(CustomTestCase):
     def test_capture_tree_seed_topk_matches_softmax_topk(self):
         if torch is None:
             self.skipTest("torch is required")
-        logits = torch.tensor(
-            [[1.0, 2.0, 0.5, -1.0], [0.1, 0.2, 3.0, 0.0]],
-            dtype=torch.float32,
-        )
-        vals, idx = capture_tree_seed_topk(logits, 2)
-        expect_vals, expect_idx = torch.topk(
-            torch.softmax(logits.float(), dim=-1), 2, dim=-1
-        )
-        self.assertTrue(torch.allclose(vals, expect_vals))
-        self.assertTrue(torch.equal(idx, expect_idx))
+        cases = [
+            torch.tensor(
+                [[1.0, 2.0, 0.5, -1.0], [0.1, 0.2, 3.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            torch.randn(4, 4096, generator=torch.Generator().manual_seed(7)),
+        ]
+        for logits in cases:
+            for k in (1, 2, 8):
+                if k > logits.shape[-1]:
+                    continue
+                vals, idx = capture_tree_seed_topk(logits, k)
+                probs = torch.softmax(logits.float(), dim=-1)
+                if k == 1:
+                    expect_vals, expect_idx = torch.max(probs, dim=-1, keepdim=True)
+                else:
+                    expect_vals, expect_idx = torch.topk(probs, k, dim=-1)
+                self.assertTrue(torch.allclose(vals, expect_vals))
+                self.assertTrue(torch.equal(idx, expect_idx))
+                direct, direct_idx = topk_probs_from_logits(logits, k, upcast=True)
+                self.assertTrue(torch.equal(vals, direct))
+                self.assertTrue(torch.equal(idx, direct_idx))
 
     def test_plan_tree_seed_recovery(self):
         self.assertEqual(

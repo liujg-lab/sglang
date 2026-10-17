@@ -1,4 +1,4 @@
-"""SR candidate storage. Existing softmax/topk arithmetic and ordering are kept."""
+"""SR candidate storage. Top-k probabilities stay on the logit ranking."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.speculative.standalone_remote.sr_align import topk_probs_from_logits
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
 )
@@ -41,42 +42,52 @@ class SRTreeCandidateWorkspace:
         self.probability_out = True
         self.selection_out = True
         self.validated = self.device.type == "cpu"
-        self.stream = self._stream()
         total = topk + (steps - 1) * topk * topk
         if width - 1 > total:
             raise ValueError("draft window exceeds candidate count")
-        self.score_table = torch.empty((batch, total), dtype=dtype, device=device)
-        self.token_table = torch.empty((batch, total), dtype=torch.int64, device=device)
+        self.score_table = torch.empty((batch, total), dtype=dtype, device=self.device)
+        # Callers pass "npu"; allocated tensors carry "npu:0".
+        if self.device.index is None and self.device.type != "cpu":
+            self.device = self.score_table.device
+        self.stream = self._stream()
+        self.token_table = torch.empty(
+            (batch, total), dtype=torch.int64, device=self.device
+        )
         self.parent_table = (
             torch.empty(
                 (batch, topk + 1 + max(steps - 2, 0) * topk),
                 dtype=torch.int64,
-                device=device,
+                device=self.device,
             )
             if steps > 1
-            else torch.empty((batch, 0), dtype=torch.int64, device=device)
+            else torch.empty((batch, 0), dtype=torch.int64, device=self.device)
         )
-        self.probs = torch.empty((batch * topk, vocab), dtype=dtype, device=device)
+        self.lse = torch.empty((batch * topk, 1), dtype=dtype, device=self.device)
         self.top_values = torch.empty(
-            (max(steps - 1, 1), batch * topk, topk), dtype=dtype, device=device
+            (max(steps - 1, 1), batch * topk, topk), dtype=dtype, device=self.device
         )
         self.top_indices = torch.empty_like(self.top_values, dtype=torch.int64)
-        self.scores = torch.empty((steps, batch, topk), dtype=dtype, device=device)
+        self.scores = torch.empty(
+            (steps, batch, topk), dtype=dtype, device=self.device
+        )
         self.select_indices = torch.empty(
-            (steps, batch, topk), dtype=torch.int64, device=device
+            (steps, batch, topk), dtype=torch.int64, device=self.device
         )
         self.input_ids = torch.empty_like(self.select_indices)
         self.parent_rows = torch.empty_like(self.select_indices)
         self.parent_nodes = torch.empty_like(self.select_indices)
         self.base_rows = (
-            torch.arange(batch, dtype=torch.int64, device=device).reshape(-1, 1) * topk
+            torch.arange(batch, dtype=torch.int64, device=self.device).reshape(-1, 1)
+            * topk
         )
         self.initial_parents = (
-            torch.arange(-1, topk, dtype=torch.int64, device=device)
+            torch.arange(-1, topk, dtype=torch.int64, device=self.device)
             .reshape(1, -1)
             .repeat(batch, 1)
         )
-        self.final_values = torch.empty((batch, width - 1), dtype=dtype, device=device)
+        self.final_values = torch.empty(
+            (batch, width - 1), dtype=dtype, device=self.device
+        )
         self.final_indices_unsorted = torch.empty_like(
             self.final_values, dtype=torch.int64
         )
@@ -152,18 +163,16 @@ class SRTreeCandidateWorkspace:
         rows = logits.shape[0]
         values, indices = self.top_values[step, :rows], self.top_indices[step, :rows]
         if self.probability_out:
-            torch.softmax(logits, dim=-1, out=self.probs[:rows])
-            _topk_out(self.probs[:rows], self.topk, values, indices)
+            # Logit top-k, then the softmax of those entries. ``lse`` is
+            # ``[rows, 1]``; the vocab axis is never materialized.
+            _topk_out(logits, self.topk, values, indices)
+            torch.logsumexp(logits, dim=-1, keepdim=True, out=self.lse[:rows])
+            values.sub_(self.lse[:rows]).exp_()
         else:
             # Selected data still lives in step-specific workspace storage.
-            probs = torch.softmax(logits, dim=-1)
-            result = (
-                torch.max(probs, dim=-1, keepdim=True)
-                if self.topk == 1
-                else torch.topk(probs, self.topk, dim=-1)
-            )
-            values.copy_(result.values)
-            indices.copy_(result.indices)
+            probs, idx = topk_probs_from_logits(logits, self.topk)
+            values.copy_(probs)
+            indices.copy_(idx)
         return values, indices
 
     def select(self, step, p, indices, previous):
@@ -318,14 +327,8 @@ class SRTreeCandidateWorkspace:
             .repeat(self.batch * self.topk, 1)
         )
         self.holds = (row, logits)
-        p = torch.softmax(logits, dim=-1)
-        self.holds = (row, logits, p)
-        expected = (
-            torch.max(p, dim=-1, keepdim=True)
-            if self.topk == 1
-            else torch.topk(p, self.topk, dim=-1)
-        )
-        self.holds = (logits, p, expected)
+        expected_values, expected_indices = topk_probs_from_logits(logits, self.topk)
+        self.holds = (row, logits, expected_values, expected_indices)
         self.probability_out = True
         try:
             values, indices = self._probabilities(logits, 0)
@@ -334,10 +337,8 @@ class SRTreeCandidateWorkspace:
             probability_match = False
         else:
             self._sync()
-            probability_match = (
-                torch.equal(self.probs, p)
-                and torch.equal(values, expected.values)
-                and torch.equal(indices, expected.indices)
+            probability_match = torch.equal(values, expected_values) and torch.equal(
+                indices, expected_indices
             )
         self.probability_out = bool(probability_match)
         # Validate strided score regions and all selection/order out variants.
@@ -345,7 +346,7 @@ class SRTreeCandidateWorkspace:
         from sglang.srt.speculative.eagle_utils import organize_draft_results
         from sglang.srt.speculative.spec_utils import select_top_k_tokens
 
-        seed_p, seed_i = expected.values[: self.batch], expected.indices[: self.batch]
+        seed_p, seed_i = expected_values[: self.batch], expected_indices[: self.batch]
 
         def validate_selection():
             rp, ri = seed_p, seed_i
@@ -368,7 +369,7 @@ class SRTreeCandidateWorkspace:
                     )
                     next_probs = None
                     if step < self.steps - 1:
-                        rp, ri = expected.values, expected.indices
+                        rp, ri = expected_values, expected_indices
                         wp, wi = self._probabilities(logits, step)
                         next_probs = (wp, wi, rp, ri)
                     compared.append(

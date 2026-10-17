@@ -334,8 +334,11 @@ class TestCUDAKVMove(unittest.TestCase):
 @unittest.skipUnless(torch_npu is not None, "requires torch_npu and NPU")
 class TestNPUCandidates(unittest.TestCase):
     def episode(self, workspace, seed_p, seed_i, logits):
-        from sglang.srt.speculative.spec_utils import select_top_k_tokens
         from sglang.srt.speculative.eagle_utils import organize_draft_results
+        from sglang.srt.speculative.spec_utils import select_top_k_tokens
+        from sglang.srt.speculative.standalone_remote.sr_align import (
+            topk_probs_from_logits,
+        )
 
         rp, ri, wp, wi = seed_p, seed_i, seed_p, seed_i
         rs = ws = None
@@ -354,13 +357,7 @@ class TestNPUCandidates(unittest.TestCase):
             tokens.append(info[1])
             parents.append(info[2])
             if step < workspace.steps - 1:
-                p = torch.softmax(logits[step], dim=-1)
-                top = (
-                    torch.max(p, -1, keepdim=True)
-                    if workspace.topk == 1
-                    else torch.topk(p, workspace.topk, -1)
-                )
-                rp, ri = top.values, top.indices
+                rp, ri = topk_probs_from_logits(logits[step], workspace.topk)
                 wp, wi = workspace.probabilities(logits[step], step)
         ref = organize_draft_results(scores, tokens, parents, workspace.width)
         got = workspace.finish(seed_p.shape[0])
@@ -383,7 +380,7 @@ class TestNPUCandidates(unittest.TestCase):
                 )
                 top = torch.topk(seed, 3, -1)
                 logits = torch.randn(4, batch * 3, 151936, dtype=dtype, device="npu")
-                self.episode(workspace, top.values, top.indices, logits)
+                self.episode(workspace, top.values, top.indices.to(torch.int64), logits)
                 self.assertEqual(workspace._storage_key(), key)
             torch.npu.synchronize()
 
