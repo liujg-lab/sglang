@@ -444,6 +444,8 @@ class SRRPDTest(unittest.TestCase):
                     ws.rows_cap = 1
                 elif case == "buffer":
                     context.edge_index = context.edge_index.clone()
+                elif case == "kernel":
+                    ws._edge_probe.clear()
                 with (
                     patch.object(torch, "max") as maximum,
                     patch.object(

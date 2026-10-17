@@ -789,6 +789,16 @@ class SchedulerStandaloneRemoteTargetMixin:
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def _sr_send_step(self, reqs):
+        still = [req for req in reqs if not req.finished()]
+        candidates = self._sr_step_candidates(still)
+        inflight = (
+            self._sr_send(SRAction.STEP, candidates, include_full_context=False)
+            if candidates
+            else None
+        )
+        return still, candidates, inflight
+
     def _sr_accept_ready(self, batch) -> None:
         """Send STEP once accepted tokens and tree paths are final.
 
@@ -799,15 +809,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         if getattr(batch, "sr_step_sent", False):
             return
         account_sr_verify_step(batch)
-        still = [
-            req for req in self._sr_select_reqs(batch) if not req.finished()
-        ]
-        candidates = self._sr_step_candidates(still)
-        inflight = (
-            self._sr_send(SRAction.STEP, candidates, include_full_context=False)
-            if candidates
-            else None
-        )
+        still, candidates, inflight = self._sr_send_step(self._sr_select_reqs(batch))
         batch.sr_step_inflight = inflight
         batch.sr_step_still = still
         batch.sr_step_candidates = candidates
@@ -854,15 +856,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                     still = list(batch.sr_step_still or [])
                     candidates = list(batch.sr_step_candidates or [])
                 else:
-                    still = [req for req in live if not req.finished()]
-                    candidates = self._sr_step_candidates(still)
-                    inflight = (
-                        self._sr_send(
-                            SRAction.STEP, candidates, include_full_context=False
-                        )
-                        if candidates
-                        else None
-                    )
+                    still, candidates, inflight = self._sr_send_step(live)
                 # Hide the next draft forward behind postprocess. FINISH for
                 # requests that end in that postprocess stays queued until
                 # the STEP reply is received.

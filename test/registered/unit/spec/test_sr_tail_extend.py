@@ -2734,11 +2734,12 @@ class TestRoundMetrics(unittest.TestCase):
         )
         from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
-        run = load_functions(
+        loaded = load_functions(
             target,
-            ["_sr_run_verify_round"],
+            ["_sr_run_verify_round", "_sr_send_step"],
             dict(get_sr_round_metrics=get_sr_round_metrics, SRAction=SRAction),
-        )["_sr_run_verify_round"]
+        )
+        run = loaded["_sr_run_verify_round"]
         for has_draft in (False, True):
             with self.subTest(has_draft=has_draft):
                 trace = []
@@ -2765,6 +2766,7 @@ class TestRoundMetrics(unittest.TestCase):
                     ),
                     process_batch_result=lambda *a: trace.append("process"),
                 )
+                owner._sr_send_step = MethodType(loaded["_sr_send_step"], owner)
                 run(owner, batch)
                 self.assertEqual(
                     trace,

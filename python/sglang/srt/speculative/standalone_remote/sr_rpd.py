@@ -211,8 +211,8 @@ class SRRPDWorkspace:
         self._v1_cap = 0
         self._v1_key = None
         self._v1_pinned = False
-        # ``None`` means the probe succeeded. An ImportError or AttributeError
-        # is stored and reused. Other exceptions are not cached.
+        # A hit is the resolved gather callable. ImportError and AttributeError
+        # are stored and re-raised. Other exceptions are not cached.
         self._edge_probe = {}
 
     def log_path_once(self, name: str) -> None:
@@ -224,6 +224,20 @@ class SRRPDWorkspace:
     def count(self, name, value=1):
         if self.metrics is not None:
             self.metrics.counts[name] += value
+
+    def _edge_gather(self, logits):
+        """Return the gather callable for this device type and dtype."""
+        probe_key = (logits.device.type, logits.dtype)
+        if probe_key not in self._edge_probe:
+            try:
+                self._edge_probe[probe_key] = _edge_gather_impl(logits)
+            except (ImportError, AttributeError) as exc:
+                self._edge_probe[probe_key] = exc
+                raise
+        cached = self._edge_probe[probe_key]
+        if isinstance(cached, (ImportError, AttributeError)):
+            raise cached
+        return cached
 
     def prepare(self, logits, context, metrics=None):
         """Metadata/capability admission only; no statistic or request writes."""
@@ -262,15 +276,9 @@ class SRRPDWorkspace:
         key = (device, logits.dtype)
         edges = len(context.edges)
         if edges:
-            probe_key = (device.type, logits.dtype)
-            if probe_key not in self._edge_probe:
-                try:
-                    _edge_gather_impl(logits)
-                except (ImportError, AttributeError) as exc:
-                    self._edge_probe[probe_key] = exc
-                    return "edge_kernel"
-                self._edge_probe[probe_key] = None
-            elif self._edge_probe[probe_key] is not None:
+            try:
+                self._edge_gather(logits)
+            except (ImportError, AttributeError):
                 return "edge_kernel"
         if key != self.key or rows > self.rows_cap or edges > self.edges_cap:
             rc = max(rows, self.rows_cap, 1)
@@ -308,7 +316,7 @@ class SRRPDWorkspace:
         index = context.edge_index
         if index is not self.edge_index:
             raise RuntimeError("RPD statistics edge index changed")
-        gather = _edge_gather_impl(logits) if edges else None
+        gather = self._edge_gather(logits) if edges else None
         if rows == 0:
             return self.star_host[:0].reshape(bs, width), None
         async_copy = logits.device.type != "cpu"

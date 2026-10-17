@@ -413,8 +413,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 rpd_live_batch_key=rpd_live_batch_key,
             )
             if reject_reason is None and verify_mode == "rpd":
-                rpd_host_bound = True
-                rpd_host_bound = rpd_host_bound and host_plan_ready
+                rpd_host_bound = host_plan_ready
                 if not rpd_host_bound:
                     sr_accept_state.note_path("fixed_accept_rpd_prepare")
             elif reject_reason is None:
@@ -521,7 +520,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.spec_steps + 1,
                 )
                 if rpd_host_bound:
-                    sr_rpd_workspace.log_path_once("npu_sr_host_plan")
+                    sr_rpd_workspace.log_path_once(
+                        f"{logits_output.next_token_logits.device.type}_sr_host_plan"
+                    )
                     raw = sr_accept_state.finalize_from_host(
                         batch,
                         logits_output,
@@ -658,10 +659,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         unfinished_index = []
         unfinished_accept_index = []
-        host_v1_tokens = None
         if host_v1_plan is not None:
-            accept_index_cpu = [list(row) for row in host_v1_plan.rows]
-            host_v1_tokens = [list(row) for row in host_v1_plan.tokens]
+            accept_index_cpu = host_v1_plan.rows
+            flat_idx = []
+            flat_tok = []
+            accept_length_list = []
+            select = []
         else:
             accept_index_cpu = accept_index.tolist()
             predict_cpu = predict.tolist()
@@ -683,8 +686,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            if host_v1_tokens is not None:
-                token_row = host_v1_tokens[i]
+            if host_v1_plan is not None:
+                token_row = host_v1_plan.tokens[i]
             else:
                 token_row = [
                     predict_cpu[idx] if idx != -1 else None for idx in accept_index_row
@@ -704,44 +707,28 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             if eos_cut is not None:
                 has_finished = True
                 # set all tokens after finished token to -1
-                if host_v1_plan is not None:
-                    for col in range(eos_cut, len(accept_index_cpu[i])):
-                        accept_index_cpu[i][col] = -1
-                else:
+                if host_v1_plan is None:
                     accept_index[i, eos_cut:] = -1
                 if sr_eos_cut is not None:
                     sr_eos_cut[i] = eos_cut
+            if host_v1_plan is not None:
+                start = len(flat_idx)
+                for j in range(_appended):
+                    flat_idx.append(int(accept_index_row[j]))
+                    flat_tok.append(int(token_row[j]))
+                accept_length_list.append(_appended - 1)
             if not req.finished():
                 unfinished_index.append(i)
-                if host_v1_plan is None:
-                    if sentinel_col is not None:
-                        unfinished_accept_index.append(accept_index[i, :sentinel_col])
-                    else:
-                        unfinished_accept_index.append(accept_index[i])
+                if host_v1_plan is not None:
+                    select.extend(range(start, start + _appended))
+                elif sentinel_col is not None:
+                    unfinished_accept_index.append(accept_index[i, :sentinel_col])
+                else:
+                    unfinished_accept_index.append(accept_index[i])
 
         if host_v1_plan is not None:
             from sglang.srt.speculative.standalone_remote.sr_rpd import stage_v1_result
 
-            flat_idx = []
-            flat_tok = []
-            accept_length_list = []
-            spans = []
-            for row, toks in zip(accept_index_cpu, host_v1_tokens):
-                start = len(flat_idx)
-                kept = 0
-                for idx, tok in zip(row, toks):
-                    if int(idx) == -1:
-                        break
-                    flat_idx.append(int(idx))
-                    flat_tok.append(int(tok))
-                    kept += 1
-                spans.append((start, kept))
-                accept_length_list.append(kept - 1)
-            select = []
-            if has_finished:
-                for row_i in unfinished_index:
-                    start, kept = spans[row_i]
-                    select.extend(range(start, start + kept))
             (
                 accept_index,
                 verified_id,
@@ -753,7 +740,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 flat_tok,
                 accept_length_list,
                 batch.device,
-                select,
+                select if has_finished else (),
             )
             accept_length_cpu = torch.tensor(accept_length_list, dtype=torch.int32)
         elif has_finished:

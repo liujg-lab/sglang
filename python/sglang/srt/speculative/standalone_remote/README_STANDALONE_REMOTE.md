@@ -237,7 +237,7 @@ RPD 不是每一层只锁定 top-1；不同合格孩子参与后续路径比较�
 `tau>0` 允许近邻候选，不保证输出逐 token 等于普通 Target greedy。
 
 SR 的树 RPD（`topk > 1`）都先用验证包里的主机拓扑选路。fixed-accept 接纳的批次日志为
-`npu_sr_host_plan`：统计一次等待，CPU 选路直接进入接受提交。
+`{device}_sr_host_plan`：统计一次等待，CPU 选路直接进入接受提交。
 logprob、grammar、hidden、非 Qwen3-VL 多模态和 CUDA Target 用同一份主机计划写入 V1 缓冲，
 日志为 `{device}_sr_host_v1`，然后继续原 V1 后处理。
 EAGLE、SPECTRE，以及没有主机拓扑的 SR `topk <= 1`，仍通过 `verify_tree_rpd()` 按
@@ -1026,7 +1026,7 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `key=1_s512` | Draft 图键，batch 1、长度容量 bucket 512；不是实际 prefix 恰好 512 |
 | `key=r15_1_s512` | Target 图键，每请求 15 个验证位置、batch 1、容量 bucket 512 |
 | `needed_len_max=None` | 部分路径不构造旧 FIA 的主机长度统计；不能单凭 None 判断长度错误 |
-| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径。SR 树批次先算主机计划：fixed-accept 接纳时为 `npu_sr_host_plan`，否则为 `{device}_sr_host_v1` 并写入 V1。EAGLE、SPECTRE 和 SR `topk <= 1` 的共享入口为 `cuda_compact_cpu_path`、`npu_compact_cpu_path` 或 `cpu_reference`。主机计划和 compact 都把词表统计留在设备上、最长路径留在 CPU，不是全设备核验 |
+| `Speculative verify method` / `Speculative RPD verify path` | 实际验证规则及 RPD 执行路径。SR 树批次先算主机计划：fixed-accept 接纳时为 `{device}_sr_host_plan`，否则为 `{device}_sr_host_v1` 并写入 V1。EAGLE、SPECTRE 和 SR `topk <= 1` 的共享入口为 `cuda_compact_cpu_path`、`npu_compact_cpu_path` 或 `cpu_reference`。主机计划和 compact 都把词表统计留在设备上、最长路径留在 CPU，不是全设备核验 |
 | `Prefill batch` | `#new-seq/#new-token/#cached-token` 为本批新请求、输入及缓存复用量；`npu graph: False` 对普通 tail/prefill 不等于树图失效 |
 | `Decode batch #running-req/#queue-req` | 当前运行/排队请求数 |
 | `#token/token usage` | KV 池占用相关统计，不是本轮生成的 token 数 |
