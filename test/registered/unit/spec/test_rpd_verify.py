@@ -132,6 +132,14 @@ class TestRpdLongestPath(CustomTestCase):
         self.assertEqual(int(predicts[1]), 3)
         self.assertEqual(int(predicts[2]), 7)
 
+    def test_equal_length_nan_middle_sibling_keeps_strict_left_to_right(self):
+        # Three equal-length leaves. A reverse fold drops the right sibling
+        # when the middle gap is NaN; left-to-right ``<`` keeps slot 3.
+        children = [[1, 2, 3], [], [], []]
+        valid = [True, True, True, True]
+        gaps = [0.0, 1.0, float("nan"), 0.5]
+        self.assertEqual(rpd._longest_path(children, valid, gaps), [0, 3])
+
 
 class TestRpdGreedyChain(CustomTestCase):
     def test_tau_zero_chain_matches_left_cstar_walk(self):

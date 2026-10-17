@@ -69,10 +69,10 @@ def _longest_path(
     """Return slot indices of the longest valid path from root (slot 0).
 
     Child slots are greater than their parent, so a descending scan finishes
-    each subtree before its parent. Children are stored left to right; the
-    reverse scan sees the right sibling first. On an equal length, replace
-    unless that sibling has a strictly smaller gap. Equality and NaN then
-    keep the left sibling, matching Python ``<``.
+    each subtree before its parent. Children are stored left to right and
+    folded in that order. On an equal length, replace only when the candidate
+    gap is strictly smaller. Python ``<`` leaves equality and NaN with the
+    left sibling.
     """
     n = len(children)
     length = [1] * n
@@ -80,26 +80,20 @@ def _longest_path(
     path_gap = [0.0] * n
 
     for u in range(n - 1, -1, -1):
-        for v in reversed(children[u]):
+        for v in children[u]:
             if not valid[v]:
                 continue
             cand_gap = float(gaps[v]) + path_gap[v]
             b = best_child[u]
-            replace = False
-            if b < 0:
-                replace = True
-            elif length[v] > length[b]:
-                replace = True
-            elif length[v] == length[b]:
-                cur_gap = float(gaps[b]) + path_gap[b]
-                # ``v`` is the later, left sibling. Keep it unless ``b`` is
-                # strictly better. ``<=`` would leave a NaN gap on the right.
-                if not (cur_gap < cand_gap):
-                    replace = True
-            if replace:
-                best_child[u] = v
-                length[u] = 1 + length[v]
-                path_gap[u] = cand_gap
+            if b < 0 or length[v] > length[b] or (
+                length[v] == length[b]
+                and cand_gap < float(gaps[b]) + path_gap[b]
+            ):
+                best_child[u], length[u], path_gap[u] = (
+                    v,
+                    1 + length[v],
+                    cand_gap,
+                )
     path = [0]
     u = 0
     while best_child[u] >= 0:
