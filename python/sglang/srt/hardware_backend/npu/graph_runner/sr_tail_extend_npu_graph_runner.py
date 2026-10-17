@@ -193,10 +193,11 @@ class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
         sample = None
         if metrics is not None:
             try:
+                round_id = int(getattr(metrics, "total_rounds", metrics.rounds)) + 1
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "tail_extend",
-                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
+                        "round_id": round_id,
                         "graph_key": bucket,
                         "implementation": "fia" if use_fia else "atb",
                         "raw_bs": None,

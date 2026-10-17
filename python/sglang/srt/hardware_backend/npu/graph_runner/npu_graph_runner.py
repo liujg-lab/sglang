@@ -615,10 +615,11 @@ class NPUGraphRunner(CudaGraphRunner):
         sample = None
         if metrics is not None:
             try:
+                round_id = int(getattr(metrics, "total_rounds", metrics.rounds)) + 1
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "target_verify",
-                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
+                        "round_id": round_id,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(getattr(self, "raw_bs", 0) or 0),
@@ -661,10 +662,11 @@ class NPUGraphRunner(CudaGraphRunner):
         sample = None
         if metrics is not None:
             try:
+                round_id = int(getattr(metrics, "total_rounds", metrics.rounds)) + 1
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "target_verify",
-                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
+                        "round_id": round_id,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(getattr(self, "raw_bs", 0) or 0),

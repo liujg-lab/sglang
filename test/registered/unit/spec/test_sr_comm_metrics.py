@@ -1302,5 +1302,26 @@ class TestGraphHostMetrics(unittest.TestCase):
         self.assertLess(body.find("finally:"), body.find("restore_graph_host_metrics"))
 
 
+class TestVerifyRowsWithoutDraft(unittest.TestCase):
+    def _count(self):
+        try:
+            from sglang.srt.speculative.standalone_remote.verifier.sr_worker import (
+                count_verify_rows_without_draft,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        return count_verify_rows_without_draft
+
+    def test_idle_lengths_ignore_stale_no_draft_rows(self):
+        count = self._count()
+        # Idle DP batches keep the previous packet and have lengths=[].
+        self.assertEqual(count((True, True), len([])), 0)
+
+    def test_matching_batch_keeps_current_no_draft_rows(self):
+        count = self._count()
+        lengths = [0, 1]
+        self.assertEqual(count((True, False), len(lengths)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,6 +63,11 @@ def _req_committed_len(req) -> int:
     return target_verify_cpu_prefix(req)
 
 
+def count_verify_rows_without_draft(no_draft_rows, n_rows: int) -> int:
+    rows = no_draft_rows or ()
+    return sum(1 for flag in rows[:n_rows] if flag)
+
+
 def _snapshot_seq_lens_cpu(batch: ScheduleBatch) -> Optional[torch.Tensor]:
     cpu = getattr(batch, "seq_lens_cpu", None)
     if cpu is None:
@@ -582,12 +587,13 @@ class StandaloneRemoteWorker:
             lengths = res.accept_length_per_req_cpu
             metrics.counts["verify_batches"] += 1
             metrics.counts["verify_requests"] += len(lengths)
-            no_draft_rows = (
-                getattr(getattr(self, "_verify_packet", None), "no_draft_rows", None)
-                or ()
-            )
-            metrics.counts["verify_rows_without_draft"] += sum(
-                1 for flag in no_draft_rows if flag
+            metrics.counts["verify_rows_without_draft"] += (
+                count_verify_rows_without_draft(
+                    getattr(
+                        getattr(self, "_verify_packet", None), "no_draft_rows", None
+                    ),
+                    len(lengths),
+                )
             )
             metrics.counts["accepted_draft_tokens"] += sum(lengths)
             metrics.counts["accepted_tokens_including_bonus"] += sum(lengths) + len(lengths)

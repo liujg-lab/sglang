@@ -856,10 +856,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                         num_steps = int(peek["n_steps"])
                     except (TypeError, ValueError):
                         num_steps = peek.get("n_steps")
+                round_id = int(getattr(metrics, "total_rounds", metrics.rounds)) + 1
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "draft_tree",
-                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
+                        "round_id": round_id,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(self.raw_bs),
