@@ -149,6 +149,7 @@ def build_sr_rpd_input(
     parent_rows: list = []
     child_tokens: list = []
     batch_children: list = []
+    edge_of = [[-1] * width for _ in range(bs)]
     for b, slots in enumerate(parent_slots):
         children = [[] for _ in range(width)]
         for i in range(width - 1, 0, -1):
@@ -166,6 +167,7 @@ def build_sr_rpd_input(
         for v, p in enumerate(slots):
             if p < 0:
                 continue
+            edge_of[b][v] = len(edges)
             edges.append((b, v, int(p)))
             parent_rows.append(b * width + int(p))
             child_tokens.append(int(row_tokens[v]))
@@ -179,7 +181,7 @@ def build_sr_rpd_input(
         cand_rows,
         retrieve,
         batch_children,
-        {(b, v): i for i, (b, v, _parent) in enumerate(edges)},
+        edge_of,
         tuple(edges),
     )
     return SRRPDHostInput(
@@ -464,9 +466,7 @@ def stage_v1_result(workspace, indices, tokens, lengths, device, select=()):
         workspace._v1_key = key
     host = workspace._v1_host[:need]
     if need:
-        host.copy_(
-            torch.tensor(indices + tokens + lengths + select, dtype=torch.int32)
-        )
+        host.numpy()[:need] = indices + tokens + lengths + select
         workspace._v1_dev[:need].copy_(
             host, non_blocking=workspace._v1_pinned and dev.type != "cpu"
         )

@@ -312,7 +312,7 @@ class _RPDHostTopology:
     candidates: list
     retrieve: list
     children: list
-    edge_pos: dict
+    edge_of: list
     edges: tuple
 
 
@@ -322,11 +322,16 @@ def _rpd_host_topology(tree_cpu, edges, children=None):
         children = [
             _children_and_parents(n, s)[0] for n, s in zip(next_token, next_sibling)
         ]
+    batch = len(cand)
+    width = len(cand[0]) if batch else 0
+    edge_of = [[-1] * width for _ in range(batch)]
+    for i, (b, v, _parent) in enumerate(edges):
+        edge_of[b][v] = i
     return _RPDHostTopology(
         cand,
         retr,
         children,
-        {(b, v): i for i, (b, v, _parent) in enumerate(edges)},
+        edge_of,
         tuple(edges),
     )
 
@@ -340,17 +345,18 @@ def _rpd_select_host(
     if use_equality and hasattr(star, "tolist"):
         star = star.tolist()
     cand, retr = topology.candidates, topology.retrieve
-    edges, edge_pos = topology.edges, topology.edge_pos
+    edges, edge_of = topology.edges, topology.edge_of
     batch = len(cand)
     width = len(cand[0]) if batch else 0
     plans = []
     for b in range(batch):
         children = topology.children[b]
+        row = edge_of[b]
         valid = [False] * width
         gaps = [0.0] * width
         for v in range(width):
-            edge_i = edge_pos.get((b, v))
-            if edge_i is None:
+            edge_i = row[v]
+            if edge_i < 0:
                 continue
             if stats is None:
                 raise RuntimeError("RPD compact is missing edge statistics.")

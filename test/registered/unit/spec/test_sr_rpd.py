@@ -67,7 +67,7 @@ class SRRPDTest(unittest.TestCase):
         packet_input(1, packet)
         self.assertEqual(context.topology.candidates, before.candidates)
         self.assertEqual(context.topology.children, before.children)
-        self.assertEqual(context.topology.edge_pos, before.edge_pos)
+        self.assertEqual(context.topology.edge_of, before.edge_of)
 
     def test_python_selection_fold_and_nan_match_independent_reference(self):
         # Duplicate retrieve writes across requests are folded globally, in
@@ -125,7 +125,7 @@ class SRRPDTest(unittest.TestCase):
         self.assertEqual(context.topology.retrieve, ref_topo.retrieve)
         self.assertEqual(context.topology.children, ref_topo.children)
         self.assertEqual(context.topology.edges, ref_topo.edges)
-        self.assertEqual(context.topology.edge_pos, ref_topo.edge_pos)
+        self.assertEqual(context.topology.edge_of, ref_topo.edge_of)
         if ref_index is None:
             self.assertEqual(tuple(context.edge_index_cpu.shape), (2, 0))
         else:
@@ -1067,9 +1067,12 @@ class SRRPDTest(unittest.TestCase):
         def forbid_empty(*_args, **_kwargs):
             raise AssertionError("stage must not allocate")
 
+        def forbid_tensor(*_args, **_kwargs):
+            raise AssertionError("stage must not build a temporary tensor")
+
         with patch.object(module, "alloc_host", counting_alloc), patch.object(
             module, "wait_event", forbid_wait
-        ):
+        ), patch.object(module.torch, "tensor", forbid_tensor):
             first_idx, first_tok, first_len, first_sel = module.stage_v1_result(
                 workspace, [3, 4], [8, 9], [1], torch.device("cpu"), [0]
             )
