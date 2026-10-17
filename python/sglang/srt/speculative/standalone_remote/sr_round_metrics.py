@@ -257,11 +257,18 @@ class SRCommMetrics:
                 )
 
 
+WINDOW_LIMIT = 32
+DEVICE_SAMPLE_ROUND = 15  # 0-based index of the 16th metered round
+IDLE_FLUSH_S = 2.0
+
+
 class SRRoundMetrics:
-    def __init__(self, role, device_module=None):
+    def __init__(self, role, device_module=None, tp_rank=0):
         self.role = role
         self.device_module = device_module
+        self.tp_rank = int(tp_rank or 0)
         self.rounds = 0
+        self.skipped_batches = 0
         self.host = Counter()
         self.host_max = Counter()
         self._round_host = Counter()
@@ -272,6 +279,10 @@ class SRRoundMetrics:
         self.pending = deque()
         self.active = False
         self._graph_host_samples = []
+        self._window_start = None
+        self._window_end = None
+        self._last_activity = None
+        self._pending_graph_rounds = None
 
     def _timing_failure(self, where, exc):
         if is_device_context_error(exc):
@@ -315,54 +326,29 @@ class SRRoundMetrics:
         self._round_host.clear()
         self.active = True
         start = time.perf_counter()
+        if self._window_start is None:
+            self._window_start = start
         try:
             yield self
         except BaseException:
             self.counts["failed_rounds"] += 1
             raise
         finally:
-            self.add_host("total", time.perf_counter() - start)
+            end = time.perf_counter()
+            self.add_host("total", end - start)
             self.active = False
             self._round_host.clear()
             self.rounds += 1
-            if self.rounds % 32 == 0:
+            self._window_end = end
+            self._last_activity = end
+            if self.rounds + self.skipped_batches >= WINDOW_LIMIT:
                 # A diagnostics error must not replace a business exception.
                 import sys
 
                 if sys.exc_info()[0] is None:
                     self.poll()
                 try:
-                    logger.info(
-                        "[SR %s round] rounds=32 host_mean_ms=%s host_max_ms=%s "
-                        "device_sample_mean_ms=%s device_samples=%s "
-                        "device_pending=%s counters=%s tail_attention=%s accept_len_mean=%s",
-                        self.role,
-                        {k: round(v * 1000 / 32, 3) for k, v in self.host.items()},
-                        {k: round(v * 1000, 3) for k, v in self.host_max.items()},
-                        {
-                            k: round(v / self.device_samples[k], 3)
-                            for k, v in self.device_ms.items()
-                        },
-                        dict(self.device_samples),
-                        len(self.pending),
-                        dict(self.counts),
-                        dict(self.paths),
-                        (
-                            round(
-                                self.counts["accepted_tokens_including_bonus"]
-                                / self.counts["verify_requests"],
-                                3,
-                            )
-                            if self.counts["verify_requests"]
-                            else None
-                        ),
-                    )
-                    self.host.clear()
-                    self.host_max.clear()
-                    self.counts.clear()
-                    self.paths.clear()
-                    self.device_ms.clear()
-                    self.device_samples.clear()
+                    self._emit_window("full")
                 finally:
                     self._flush_graph_host_safely()
 
@@ -376,8 +362,9 @@ class SRRoundMetrics:
         factory = getattr(self.device_module, "Event", None)
         if (
             device
+            and self.tp_rank == 0
             and factory is not None
-            and self.rounds % 32 == 0
+            and self.rounds == DEVICE_SAMPLE_ROUND
             and len(self.pending) < 16
         ):
             try:
@@ -409,6 +396,113 @@ class SRRoundMetrics:
                 else:
                     self.pending.append((name, start, end))
 
+    def note_skip(self, reason, n_reqs):
+        """Count one unmetered AR batch. Does not open a host-timed round."""
+        if reason not in ("breaker", "high_bs"):
+            reason = "high_bs"
+        self.counts[f"skip_rpc_{reason}_batches"] += 1
+        self.counts[f"skip_rpc_{reason}_requests"] += int(n_reqs)
+        self.skipped_batches += 1
+        self._last_activity = time.perf_counter()
+        if not self.active and self.rounds + self.skipped_batches >= WINDOW_LIMIT:
+            self.flush("full")
+
+    def idle_flush(self, now=None):
+        if self.active or (self.rounds == 0 and self.skipped_batches == 0):
+            return
+        now = time.perf_counter() if now is None else now
+        if self._last_activity is None or now - self._last_activity < IDLE_FLUSH_S:
+            return
+        self.flush("idle")
+
+    def flush(self, reason):
+        if self.active or (self.rounds == 0 and self.skipped_batches == 0):
+            return
+        try:
+            self._emit_window(reason)
+        finally:
+            self._flush_graph_host_safely()
+
+    def _fallback_requests(self):
+        return (
+            self.counts["normal_decode_fallback_requests"]
+            + self.counts["skip_rpc_breaker_requests"]
+            + self.counts["skip_rpc_high_bs_requests"]
+        )
+
+    def _emit_window(self, reason):
+        n = self.rounds
+        skipped = self.skipped_batches
+        wall_ms = None
+        if self._window_start is not None and self._window_end is not None:
+            wall_ms = round((self._window_end - self._window_start) * 1000, 3)
+        busy_ms = round(self.host["total"] * 1000, 3) if n else None
+        host_mean = (
+            {k: round(v * 1000 / n, 3) for k, v in self.host.items()} if n else {}
+        )
+        verify_requests = self.counts["verify_requests"]
+        fallback_requests = self._fallback_requests()
+        step_denom = verify_requests + fallback_requests
+        accept_len = (
+            round(self.counts["accepted_tokens_including_bonus"] / verify_requests, 3)
+            if verify_requests
+            else None
+        )
+        produced = self.counts["accepted_tokens_including_bonus"] + fallback_requests
+        tokens_per_step = round(produced / step_denom, 3) if step_denom else None
+        fallback_ratio = (
+            round(fallback_requests / step_denom, 3) if step_denom else None
+        )
+        header = (
+            f"[SR %s round] rounds={n} reason={reason} "
+            f"window_wall_ms={wall_ms} busy_ms={busy_ms} tp_rank={self.tp_rank} "
+            f"skipped_batches={skipped} "
+        )
+        message = (
+            header + "host_mean_ms=%s host_max_ms=%s "
+            "device_sample_mean_ms=%s device_samples=%s "
+            "device_pending=%s counters=%s tail_attention=%s"
+        )
+        args = [
+            self.role,
+            host_mean,
+            {k: round(v * 1000, 3) for k, v in self.host_max.items()},
+            {
+                k: round(v / self.device_samples[k], 3)
+                for k, v in self.device_ms.items()
+            },
+            dict(self.device_samples),
+            len(self.pending),
+            dict(self.counts),
+            dict(self.paths),
+        ]
+        if self.role == "Target":
+            message += (
+                " accept_len_mean=%s tokens_per_req_step=%s "
+                "fallback_ratio=%s verify_rows_without_draft=%s"
+            )
+            args.extend(
+                [
+                    accept_len,
+                    tokens_per_step,
+                    fallback_ratio,
+                    self.counts["verify_rows_without_draft"],
+                ]
+            )
+        self._pending_graph_rounds = n
+        self.rounds = 0
+        self.skipped_batches = 0
+        self.host.clear()
+        self.host_max.clear()
+        self.counts.clear()
+        self.paths.clear()
+        self.device_ms.clear()
+        self.device_samples.clear()
+        self._window_start = None
+        self._window_end = None
+        if self.tp_rank == 0:
+            logger.info(message, *args)
+
     def record_graph_host_sample(self, sample):
         if sample is None or sample._recorded:
             return
@@ -418,14 +512,18 @@ class SRRoundMetrics:
     def _flush_graph_host_safely(self):
         samples = self._graph_host_samples
         self._graph_host_samples = []
+        window_rounds = self._pending_graph_rounds
+        self._pending_graph_rounds = None
+        if window_rounds is None:
+            window_rounds = self.rounds
         if not samples:
             return
         try:
-            self._emit_graph_host_window(samples)
+            self._emit_graph_host_window(samples, window_rounds)
         except Exception as exc:
             _warn_graph_host("flush", exc)
 
-    def _emit_graph_host_window(self, samples):
+    def _emit_graph_host_window(self, samples, window_rounds):
         grouped = {}
         for sample in samples:
             key = sample.group_key()
@@ -492,12 +590,34 @@ class SRRoundMetrics:
                     },
                 }
             )
-        logger.info("[SR %s graph host] window_rounds=32 groups=%s", self.role, groups)
+        if self.tp_rank == 0:
+            logger.info(
+                "[SR %s graph host] window_rounds=%s groups=%s",
+                self.role,
+                window_rounds,
+                groups,
+            )
 
 
 def get_sr_round_metrics(owner, role):
     metrics = getattr(owner, "_sr_round_metrics", None)
     if metrics is None:
-        metrics = SRRoundMetrics(role, getattr(owner, "device_module", None))
+        metrics = SRRoundMetrics(
+            role,
+            getattr(owner, "device_module", None),
+            tp_rank=getattr(owner, "tp_rank", 0),
+        )
         owner._sr_round_metrics = metrics
     return metrics
+
+
+def flush_sr_round_metrics(owner, reason):
+    metrics = getattr(owner, "_sr_round_metrics", None)
+    if metrics is not None:
+        metrics.flush(reason)
+
+
+def idle_sr_round_metrics(owner):
+    metrics = getattr(owner, "_sr_round_metrics", None)
+    if metrics is not None:
+        metrics.idle_flush()

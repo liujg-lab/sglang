@@ -1913,6 +1913,143 @@ class TestStandaloneRemoteTree(CustomTestCase):
         eager_src = inspect.getsource(worker_cls._forward_target_eager)
         self.assertIn("graph_runner = None", eager_src)
 
+    def _exec_function(self, relative, name):
+        import ast
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[4] / relative
+        fn = next(
+            node
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        fn.returns = None
+        for arg in fn.args.args + fn.args.kwonlyargs + fn.args.posonlyargs:
+            arg.annotation = None
+        env = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                str(path),
+                "exec",
+            ),
+            env,
+        )
+        return env[name]
+
+    def test_normal_decode_counts_only_appended_tokens(self):
+        if torch is None:
+            self.skipTest("torch is not installed")
+        from sglang.srt.speculative.standalone_remote.sr_protocol import (
+            is_health_check_req,
+        )
+
+        forward = self._exec_function(
+            "python/sglang/srt/speculative/standalone_remote/verifier/sr_worker.py",
+            "_forward_normal_decode",
+        )
+
+        class _Result:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        def make_req(rid):
+            return SimpleNamespace(
+                rid=rid,
+                output_ids=[1],
+                origin_input_ids=[1],
+                kv_committed_len=1,
+                kv_allocated_len=1,
+                grammar=None,
+                spec_cnt=0,
+                spec_fallback_ct=0,
+                sr_step_id=0,
+                check_finished=lambda: None,
+            )
+
+        ok = make_req("r1")
+        health = make_req("HEALTH_CHECK_1")
+        missing = make_req("r2")
+        batch = MagicMock()
+        batch.batch_size.return_value = 3
+        batch.reqs = [ok, health, missing]
+        batch.seq_lens = torch.tensor([2, 2, 2])
+        batch.seq_lens_cpu = torch.tensor([2, 2, 2])
+        batch.sampling_info.penalizer_orchestrator.is_required = False
+        batch.global_num_tokens = None
+        batch.global_num_tokens_for_logprob = None
+        batch.orig_seq_lens = None
+        batch.seq_lens_sum = 6
+        batch.return_logprob = False
+        batch.sr_round_metrics = None
+        batch.get_model_worker_batch.return_value = object()
+        worker = SimpleNamespace(
+            _forward_target_eager=lambda _model_batch: SimpleNamespace(
+                next_token_ids=torch.tensor([9, 8]),
+                logits_output=None,
+            )
+        )
+        env_forward = forward.__globals__
+        env_forward.update(
+            torch=torch,
+            ForwardMode=SimpleNamespace(DECODE="decode"),
+            _align_seq_lens_to_committed=lambda _batch: None,
+            alloc_for_decode=lambda _batch, token_per_req=1: None,
+            _is_health_check=is_health_check_req,
+            logger=MagicMock(),
+            make_draft_tokens_and_logits=lambda tokens: {"draft_tokens": tokens},
+            GenerationBatchResult=_Result,
+        )
+        env_forward["_forward_normal_decode"](worker, batch)
+        self.assertEqual(ok.output_ids, [1, 9])
+        self.assertEqual(ok.spec_fallback_ct, 1)
+        self.assertEqual(health.spec_fallback_ct, 0)
+        self.assertEqual(health.output_ids, [1])
+        self.assertEqual(missing.spec_fallback_ct, 0)
+
+    def test_fallback_meta_is_emitted_only_for_standalone_remote(self):
+        calculate = self._exec_function(
+            "python/sglang/srt/managers/tokenizer_manager.py",
+            "_calculate_spec_decoding_metrics",
+        )
+        manager = SimpleNamespace(
+            server_args=SimpleNamespace(
+                speculative_algorithm="STANDALONE_REMOTE",
+                speculative_num_draft_tokens=8,
+            )
+        )
+        recv = SimpleNamespace(
+            spec_verify_ct=[0],
+            spec_accepted_tokens=[0],
+            spec_acceptance_histogram=[[]],
+            spec_fallback_ct=[3],
+            completion_tokens=[4],
+        )
+        meta = {}
+        calculate(manager, meta, recv, 0)
+        self.assertEqual(meta["spec_verify_ct"], 0)
+        self.assertEqual(meta["spec_accept_token_num"], 0)
+        self.assertEqual(meta["spec_draft_token_num"], 0)
+        self.assertEqual(meta["spec_fallback_ct"], 3)
+        self.assertNotIn("spec_accept_length", meta)
+
+        eagle = {}
+        manager.server_args.speculative_algorithm = "EAGLE"
+        calculate(manager, eagle, recv, 0)
+        self.assertNotIn("spec_fallback_ct", eagle)
+        self.assertNotIn("spec_verify_ct", eagle)
+
+        recv.spec_verify_ct = [2]
+        recv.spec_accepted_tokens = [4]
+        recv.completion_tokens = [7]
+        recv.spec_fallback_ct = [1]
+        manager.server_args.speculative_algorithm = "STANDALONE_REMOTE"
+        kept = {}
+        calculate(manager, kept, recv, 0)
+        self.assertEqual(kept["spec_accept_length"], 3.5)
+        self.assertEqual(kept["spec_accept_rate"], 4 / 14)
+        self.assertEqual(kept["spec_fallback_ct"], 1)
+
     def test_draft_tokens_stay_lists(self):
         import ast
         from pathlib import Path

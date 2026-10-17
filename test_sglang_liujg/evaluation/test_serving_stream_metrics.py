@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import eval_spectre_rsteller_serving as serving
-from eval_spectre_rsteller import extract_perf
+from eval_spectre_rsteller import extract_perf, spec_condition_columns
 
 STOP = {"type": "stop"}
 
@@ -356,6 +356,81 @@ class ApplyAndSummaryTest(unittest.TestCase):
         self.assertIsNone(stats["mean_tpot_ms"])
         self.assertIsNone(stats["mean_post_first_ms"])
 
+    def test_weighted_accept_length_removes_prefill_and_fallback(self) -> None:
+        stats = serving.summarize_serving(
+            [
+                {
+                    "completion_tokens": 5,
+                    "spec_verify_ct": 2,
+                    "spec_fallback_ct": 1,
+                    "spec_accept_token_num": 3,
+                    "spec_draft_token_num": 14,
+                    "spec_accept_length": 2.5,
+                    "spec_accept_rate": 3 / 14,
+                },
+                {
+                    "completion_tokens": 4,
+                    "spec_verify_ct": 0,
+                    "spec_fallback_ct": 3,
+                    "spec_accept_token_num": 0,
+                    "spec_draft_token_num": 0,
+                },
+            ],
+            wall_s=1.0,
+        )
+        # (5-1-1) + (4-1-3) = 3, over 2 verify steps.
+        self.assertAlmostEqual(stats["accept_length_weighted"], 1.5)
+        self.assertAlmostEqual(stats["tokens_per_target_step"], 7 / 6)
+        self.assertAlmostEqual(stats["accepted_draft_per_verify"], 1.5)
+        self.assertAlmostEqual(stats["accept_rate_weighted"], 3 / 14)
+        self.assertEqual(stats["total_fallback_steps"], 4)
+        self.assertAlmostEqual(stats["fallback_ratio"], 4 / 6)
+        self.assertEqual(stats["spec_samples"], 2)
+        self.assertEqual(stats["fallback_known"], "yes")
+        # The legacy column is still the equal-weight mean of the biased ratio.
+        self.assertAlmostEqual(stats["avg_alen"], 2.5)
+
+    def test_missing_fallback_field_is_an_upper_bound(self) -> None:
+        rec = extract_perf(
+            {},
+            {
+                "text": "a",
+                "meta_info": {
+                    "completion_tokens": 3,
+                    "spec_verify_ct": 1,
+                    "spec_accept_token_num": 1,
+                    "spec_draft_token_num": 7,
+                    "spec_accept_length": 3.0,
+                },
+            },
+            ttft_s=None,
+            client_e2e_s=1.0,
+        )
+        self.assertIsNone(rec["spec_fallback_ct"])
+        stats = serving.summarize_serving([rec], wall_s=1.0)
+        self.assertAlmostEqual(stats["accept_length_weighted"], 2.0)
+        self.assertEqual(stats["fallback_known"], "no")
+        self.assertEqual(stats["total_fallback_steps"], 0)
+
+    def test_verify_zero_request_stays_in_the_totals(self) -> None:
+        stats = serving.summarize_serving(
+            [
+                {
+                    "completion_tokens": 2,
+                    "spec_verify_ct": 0,
+                    "spec_fallback_ct": 1,
+                    "spec_accept_token_num": 0,
+                    "spec_draft_token_num": 0,
+                }
+            ],
+            wall_s=1.0,
+        )
+        self.assertEqual(stats["spec_samples"], 1)
+        self.assertIsNone(stats["accept_length_weighted"])
+        self.assertAlmostEqual(stats["tokens_per_target_step"], 1.0)
+        self.assertEqual(stats["fallback_known"], "yes")
+        self.assertEqual(serving.metric_csv_values(stats)["Spec Samples"], "1")
+
     def test_csv_header_mismatch_refuses_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "stats.csv"
@@ -435,10 +510,41 @@ class AlignedClientsTest(unittest.TestCase):
         self.assertAlmostEqual(mixed["mean_post_first_ms"], 250.0)
         fields = closed.closed_csv_fields()
         self.assertEqual(fields[:3], ["Test Time", "batch_size", "mode"])
+        self.assertIn("Algorithm", fields)
+        self.assertIn("Accept Length (weighted)", fields)
         self.assertIn("Decode tok/s", fields)
         self.assertIn("Mean Post-first Delivery (ms)", fields)
         self.assertNotIn("Avg Prefill (ms)", fields)
         self.assertNotIn("End-to-end tok/s", fields)
+
+
+class SpecConditionColumnsTest(unittest.TestCase):
+    def test_unavailable_snapshot_is_unknown(self) -> None:
+        columns = spec_condition_columns(
+            {"status": "unavailable", "error": "connection refused"}
+        )
+        self.assertEqual(columns, {"Algorithm": "unknown", "Spec Config": ""})
+
+    def test_available_without_speculation_is_ar(self) -> None:
+        columns = spec_condition_columns(
+            {"status": "available", "settings": {"speculative_algorithm": None}}
+        )
+        self.assertEqual(columns, {"Algorithm": "AR", "Spec Config": ""})
+
+    def test_standalone_remote_records_spec_shape(self) -> None:
+        columns = spec_condition_columns(
+            {
+                "status": "available",
+                "settings": {
+                    "speculative_algorithm": "STANDALONE_REMOTE",
+                    "speculative_num_steps": 4,
+                    "speculative_eagle_topk": 2,
+                    "speculative_num_draft_tokens": 8,
+                },
+            }
+        )
+        self.assertEqual(columns["Algorithm"], "STANDALONE_REMOTE")
+        self.assertEqual(columns["Spec Config"], "steps=4/topk=2/ndt=8")
 
 
 if __name__ == "__main__":

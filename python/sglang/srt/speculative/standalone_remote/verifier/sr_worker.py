@@ -582,6 +582,13 @@ class StandaloneRemoteWorker:
             lengths = res.accept_length_per_req_cpu
             metrics.counts["verify_batches"] += 1
             metrics.counts["verify_requests"] += len(lengths)
+            no_draft_rows = (
+                getattr(getattr(self, "_verify_packet", None), "no_draft_rows", None)
+                or ()
+            )
+            metrics.counts["verify_rows_without_draft"] += sum(
+                1 for flag in no_draft_rows if flag
+            )
             metrics.counts["accepted_draft_tokens"] += sum(lengths)
             metrics.counts["accepted_tokens_including_bonus"] += sum(lengths) + len(lengths)
             metrics.counts["first_level_hits"] += sum(n > 0 for n in lengths)
@@ -774,6 +781,7 @@ class StandaloneRemoteWorker:
             token = next_token_ids_list[i] if i < len(next_token_ids_list) else None
             if token is not None:
                 req.output_ids.append(token)
+                req.spec_fallback_ct = int(getattr(req, "spec_fallback_ct", 0) or 0) + 1
                 if req.grammar is not None and not req.finished():
                     try:
                         req.grammar.accept_token(token)

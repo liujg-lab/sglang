@@ -82,10 +82,23 @@ CSV 汇总列（只统计无 error 的成功条；百分位为排序后线性插
                                   decode_s / (N-K) 的算术平均 ×1000
                                   首事件之后的平均 token 交付间隔
 
-    Avg Accept Length             spec_accept_length 均值（toks / verify）
-    Avg Accept Rate               spec_accept_rate 均值
+    Avg Accept Length             spec_accept_length 的逐条等权均值（toks / verify）
+                                  分子含 prefill 首 token，且不含 AR 回退步，有偏
+    Avg Accept Rate               spec_accept_rate 的逐条等权均值，同样有偏
+                                  分母是 verify × (num_draft_tokens-1)。树模式
+                                  topk=2, ndt=8, steps=4 时上限约为 4/7
     Avg Draft Tokens per Verify   draft_tokens_per_verify 均值
-    Total Verify                  spec_verify_ct 之和
+    Total Verify                  spec_verify_ct 之和，含 0
+    Accept Length (weighted)      Σ(c-1-f) / Σv。每次验证产出的 token，含 bonus
+                                  无回退字段时 f=0，结果是上界，Fallback Known=no
+                                  Σv=0 时留空
+    Tokens per Target Step        Σ(c-1) / Σ(v+f)。每个 Target decode 步的 token 数
+    Accepted Draft per Verify     Σa / Σv。不含 bonus，树模式可读到接近 steps
+    Accept Rate (weighted)        Σa / Σspec_draft_token_num。树模式上限与旧列相同
+    Total Fallback Steps          Σf。字段缺失的请求按 0 计入，看 Fallback Known
+    Fallback Ratio                Σf / Σ(v+f)
+    Spec Samples                  带 spec_verify_ct（含 0）的成功请求数
+    Fallback Known                yes=每条投机样本都有 spec_fallback_ct；否则 no
     Avg BLEU / ROUGE-1/2/L        本脚本先留空，精度脚本补上
 
     列集合变化后，已有旧表头的 CSV 会拒绝追加，需换一个 --output-csv。
@@ -117,11 +130,15 @@ from eval_spectre_rsteller import (
     _fmt,
     append_jsonl,
     call_metrics_script,
+    create_run_paths,
     extract_perf,
     flush_cache,
     load_dataset,
     mean,
     prepare_request,
+    server_snapshot,
+    spec_condition_columns,
+    warn_eval_conditions,
 )
 
 CSV_FIELDS = [
@@ -129,6 +146,8 @@ CSV_FIELDS = [
     "request_rate",
     "max_concurrency",
     "traffic",
+    "Algorithm",
+    "Spec Config",
     "Total Items",
     "Total Generated Tokens",
     "Output tok/s (wall)",
@@ -155,6 +174,14 @@ CSV_FIELDS = [
     "Avg Accept Rate",
     "Avg Draft Tokens per Verify",
     "Total Verify",
+    "Accept Length (weighted)",
+    "Tokens per Target Step",
+    "Accepted Draft per Verify",
+    "Accept Rate (weighted)",
+    "Total Fallback Steps",
+    "Fallback Ratio",
+    "Spec Samples",
+    "Fallback Known",
     "Avg BLEU",
     "Avg ROUGE-1",
     "Avg ROUGE-2",
@@ -617,6 +644,84 @@ def _spec_values(ok: list[dict[str, Any]], key: str) -> list[float]:
     return values
 
 
+def _weighted_spec(ok: list[dict[str, Any]]) -> dict[str, Any]:
+    """Token-weighted speculative totals.
+
+    ``c`` is completion tokens, ``v`` is verify steps, ``a`` is accepted draft
+    tokens, and ``f`` is AR fallback steps. A missing fallback field is treated
+    as 0 and marks the accept length as an upper bound. Ratios with a zero
+    denominator stay empty. Tree-mode accept rate still uses
+    ``verify * (num_draft_tokens - 1)`` as its denominator, so its ceiling is
+    about ``steps / (num_draft_tokens - 1)``.
+    """
+    sum_verify_tokens = 0.0
+    sum_decode_tokens = 0.0
+    sum_v = 0.0
+    sum_f = 0.0
+    sum_steps = 0.0
+    sum_a = 0.0
+    sum_a_v = 0.0
+    sum_draft = 0.0
+    sum_rate_a = 0.0
+    spec_samples = 0
+    missing_fallback = False
+    saw_completion = False
+    saw_accepted = False
+    saw_draft = False
+
+    for rec in ok:
+        verify = _as_float(rec.get("spec_verify_ct"))
+        if verify is None:
+            continue
+        spec_samples += 1
+        raw_fallback = rec.get("spec_fallback_ct")
+        fallback = _as_float(raw_fallback)
+        if fallback is None:
+            missing_fallback = True
+            fallback = 0.0
+        completion = _as_float(rec.get("completion_tokens"))
+        if completion is not None:
+            saw_completion = True
+            sum_verify_tokens += completion - 1 - fallback
+            sum_decode_tokens += completion - 1
+            sum_v += verify
+            sum_f += fallback
+            sum_steps += verify + fallback
+        accepted = _as_float(rec.get("spec_accept_token_num"))
+        if accepted is not None:
+            saw_accepted = True
+            sum_a += accepted
+            sum_a_v += verify
+        draft = _as_float(rec.get("spec_draft_token_num"))
+        if accepted is not None and draft is not None:
+            saw_draft = True
+            sum_rate_a += accepted
+            sum_draft += draft
+
+    if spec_samples == 0:
+        fallback_known = None
+    elif missing_fallback:
+        fallback_known = "no"
+    else:
+        fallback_known = "yes"
+
+    def _ratio(numerator: float, denominator: float, ready: bool) -> float | None:
+        if not ready or denominator <= 0:
+            return None
+        return numerator / denominator
+
+    return {
+        "accept_length_weighted": _ratio(sum_verify_tokens, sum_v, saw_completion),
+        "tokens_per_target_step": _ratio(sum_decode_tokens, sum_steps, saw_completion),
+        "accepted_draft_per_verify": _ratio(sum_a, sum_a_v, saw_accepted),
+        "accept_rate_weighted": _ratio(sum_rate_a, sum_draft, saw_draft),
+        "total_fallback_steps": sum_f if spec_samples and saw_completion else None,
+        "fallback_ratio": _ratio(sum_f, sum_steps, saw_completion),
+        "spec_samples": spec_samples,
+        "fallback_known": fallback_known,
+    }
+
+
 def summarize_serving(records: list[dict[str, Any]], wall_s: float) -> dict[str, Any]:
     ok = [r for r in records if not r.get("error")]
     toks = [
@@ -685,6 +790,7 @@ def summarize_serving(records: list[dict[str, Any]], wall_s: float) -> dict[str,
     rates = _spec_values(ok, "spec_accept_rate")
     drafts = _spec_values(ok, "draft_tokens_per_verify")
     verifies = _spec_values(ok, "spec_verify_ct")
+    weighted = _weighted_spec(ok)
     total_toks = sum(toks)
     n_ok = len(ok)
     total_decode_tokens = sum(tokens for tokens, _ in measurable)
@@ -722,6 +828,7 @@ def summarize_serving(records: list[dict[str, Any]], wall_s: float) -> dict[str,
         "avg_accept": mean(rates),
         "avg_draft_per_verify": mean(drafts),
         "total_verify": sum(verifies) if verifies else 0.0,
+        **weighted,
     }
 
 
@@ -758,6 +865,18 @@ def metric_csv_values(stats: dict[str, Any]) -> dict[str, str]:
         "Avg Accept Rate": _csv_num(stats["avg_accept"], 4),
         "Avg Draft Tokens per Verify": _csv_num(stats["avg_draft_per_verify"], 4),
         "Total Verify": f"{stats['total_verify']:.0f}",
+        "Accept Length (weighted)": _csv_num(stats["accept_length_weighted"], 4),
+        "Tokens per Target Step": _csv_num(stats["tokens_per_target_step"], 4),
+        "Accepted Draft per Verify": _csv_num(stats["accepted_draft_per_verify"], 4),
+        "Accept Rate (weighted)": _csv_num(stats["accept_rate_weighted"], 4),
+        "Total Fallback Steps": (
+            f"{stats['total_fallback_steps']:.0f}"
+            if stats["total_fallback_steps"] is not None
+            else ""
+        ),
+        "Fallback Ratio": _csv_num(stats["fallback_ratio"], 4),
+        "Spec Samples": str(stats["spec_samples"]),
+        "Fallback Known": stats["fallback_known"] or "",
         "Avg BLEU": "",
         "Avg ROUGE-1": "",
         "Avg ROUGE-2": "",
@@ -783,7 +902,11 @@ def format_serving_summary(stats: dict[str, Any], wall_s: float) -> str:
         f"tpot_ms={_fmt(stats['mean_tpot_ms'], 2)}  "
         f"post_first_ms={_fmt(stats['mean_post_first_ms'], 2)}  "
         f"accept={_fmt(stats['avg_accept'])}  "
-        f"alen={_fmt(stats['avg_alen'])}"
+        f"alen={_fmt(stats['avg_alen'])}  "
+        f"alen_w={_fmt(stats['accept_length_weighted'])}  "
+        f"tok/step={_fmt(stats['tokens_per_target_step'])}  "
+        f"fallback={_fmt(stats['fallback_ratio'])}  "
+        f"fallback_known={stats['fallback_known'] or ''}"
     )
 
 
@@ -826,10 +949,13 @@ async def run_benchmark(args: argparse.Namespace) -> int:
         f"target={generate_url}  traffic=open  request_rate={rate_s}  "
         f"max_concurrency={conc}  max_new_tokens={args.max_new_tokens}"
     )
-
-    args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    args.output_jsonl.write_text("", encoding="utf-8")
+    snapshot = server_snapshot(base_url, args.timeout)
+    warn_eval_conditions(snapshot, args.max_concurrency, bool(args.flush_cache))
+    conditions = spec_condition_columns(snapshot)
+    run_id, args.output_jsonl, args.output_csv, manifest_path = create_run_paths(
+        args.output_jsonl, args.output_csv
+    )
+    print(f"run_id={run_id}  manifest={manifest_path}")
 
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     async with aiohttp.ClientSession(
@@ -885,9 +1011,24 @@ async def run_benchmark(args: argparse.Namespace) -> int:
         "request_rate": rate_s,
         "max_concurrency": args.max_concurrency if args.max_concurrency else "",
         "traffic": "open",
+        **conditions,
     }
     row.update(metric_csv_values(stats))
     write_csv_row(args.output_csv, row)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "server": snapshot,
+                "results_jsonl": str(args.output_jsonl),
+                "summary_csv": str(args.output_csv),
+                "summary": stats,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(format_serving_summary(stats, wall))
     print(f"wrote {args.output_jsonl}")
     print(f"wrote {args.output_csv}")

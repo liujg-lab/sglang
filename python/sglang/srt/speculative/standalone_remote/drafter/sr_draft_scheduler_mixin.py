@@ -102,7 +102,9 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     local_spec_shape,
 )
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    flush_sr_round_metrics,
     get_sr_round_metrics,
+    idle_sr_round_metrics,
 )
 from sglang.srt.speculative.standalone_remote.sr_transfer_staging import (
     SRTransferUnresolved,
@@ -266,6 +268,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         """Drop previous-session Draft RPC state. Target flush_cache never
         reaches this process; a new session_id is the only signal.
 
+        Flush the current round window first so the previous session does not
+        leak into the next one.
+
         HTTP generate reqs on this Draft process must survive. Full radix /
         KV / embedding_cache reset only runs when no HTTP req is alive
         (needed for VL leftover 128 vs 64 embeddings).
@@ -273,6 +278,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         ``_sr_deferred_finish`` is intentionally left alone. A session change
         must not drop a FINISH that is still waiting on its consumer event.
         """
+        flush_sr_round_metrics(self, "session_reset")
         from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
             has_unresolved_resources,
         )
@@ -2968,3 +2974,4 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_cleanup_stale_drafts()
             self._sr_poll_deferred_finishes()
             self._sr_run_http_batch()
+            idle_sr_round_metrics(self)

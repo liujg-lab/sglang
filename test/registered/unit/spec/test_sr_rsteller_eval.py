@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,6 +16,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
+EVAL_DIR = ROOT / "test_sglang_liujg/evaluation"
+import sys
+
+sys.path.insert(0, str(EVAL_DIR))
 spec = importlib.util.spec_from_file_location(
     "sr_rsteller_eval",
     ROOT / "test_sglang_liujg/evaluation/eval_spectre_rsteller.py",
@@ -34,6 +39,29 @@ def result(ids, count=None, text="caption", finished=True):
     }
 
 
+def _observation(payload):
+    """Client-clock stand-in for a mocked post_generate_stream."""
+    meta = payload["meta_info"]
+    return SimpleNamespace(
+        text=payload["text"],
+        output_ids=list(payload["output_ids"]),
+        meta_info=meta,
+        token_events=[],
+        itl=[],
+        ttft_s=0.01,
+        first_text_s=0.01,
+        first_chunk_tokens=1,
+        decode_s=None,
+        decode_tokens=None,
+        decode_tok_s=None,
+        client_e2e_s=0.02,
+        server_e2e_s=None,
+        token_metrics_available=True,
+        completion_tokens=meta["completion_tokens"],
+        error=None,
+    )
+
+
 class TestRSTellerEvidence(unittest.TestCase):
     def stream(self, responses):
         payload = "".join("data: " + json.dumps(r) + "\n\n" for r in responses)
@@ -43,9 +71,18 @@ class TestRSTellerEvidence(unittest.TestCase):
             "urlopen",
             return_value=io.BytesIO(payload.encode()),
         ):
-            return evaluation.post_generate_stream("http://localhost/generate", {}, 1)[
-                0
-            ]
+            return evaluation.post_generate_stream("http://localhost/generate", {}, 1)
+
+    def _perf(self, obs, **kwargs):
+        return evaluation.extract_perf(
+            {},
+            {
+                "text": obs.text,
+                "output_ids": obs.output_ids,
+                "meta_info": obs.meta_info,
+            },
+            **kwargs,
+        )
 
     def test_cumulative_and_incremental_streams_preserve_repeated_ids(self):
         cumulative = self.stream(
@@ -62,15 +99,16 @@ class TestRSTellerEvidence(unittest.TestCase):
                 result([], count=2, text=""),
             ]
         )
-        self.assertEqual(cumulative, incremental)
-        rec = evaluation.extract_perf({}, incremental, ttft_s=0.1, client_e2e_s=1)
+        self.assertEqual(cumulative.output_ids, incremental.output_ids)
+        self.assertEqual(cumulative.text, incremental.text)
+        rec = self._perf(incremental, ttft_s=0.1, client_e2e_s=1)
         self.assertEqual(rec["output_ids"], [7, 7])
         self.assertTrue(rec["token_ids_complete"])
         self.assertEqual(rec["finish_reason"], {"type": "stop"})
 
     def test_missing_and_gapped_tokens_are_not_claimed_complete(self):
         streamed = self.stream([result([4], count=3)])
-        rec = evaluation.extract_perf({}, streamed, ttft_s=None, client_e2e_s=1)
+        rec = self._perf(streamed, ttft_s=None, client_e2e_s=1)
         self.assertFalse(rec["token_ids_complete"])
         self.assertIsNone(rec["decode_s"])
         self.assertIsNone(rec["decode_tok_s"])
@@ -162,7 +200,7 @@ class TestRSTellerEvidence(unittest.TestCase):
                 patch.object(
                     evaluation,
                     "post_generate_stream",
-                    return_value=(result([7, 8]), 0.01),
+                    return_value=_observation(result([7, 8])),
                 ),
                 patch.object(evaluation, "call_metrics_script") as score,
                 redirect_stdout(io.StringIO()),
@@ -194,15 +232,28 @@ class TestRSTellerEvidence(unittest.TestCase):
                 with call.args[1].open(newline="") as stream:
                     rows = list(csv.DictReader(stream))
                 self.assertEqual(len(rows), 1)
-                self.assertIn("End-to-end tok/s", rows[0])
-                self.assertNotIn("Decode tok/s", rows[0])
+                self.assertIn("Decode tok/s", rows[0])
+                self.assertNotIn("End-to-end tok/s", rows[0])
+                self.assertIn("Algorithm", rows[0])
 
-    def test_summary_uses_full_chunk_wall_time(self):
-        summary = evaluation.summarize([{"completion_tokens": 100}], 2)
-        self.assertEqual(summary["e2e_tok_s"], 50)
-        self.assertNotIn("decode_tok_s", summary)
+    def test_summary_uses_client_decode_and_wall_output(self):
+        import eval_spectre_rsteller_serving as serving
 
-    def test_concurrent_requests_keep_dataset_order_and_nonstream_ids(self):
+        summary = serving.summarize_serving(
+            [
+                {
+                    "completion_tokens": 100,
+                    "decode_tokens": 99,
+                    "decode_s": 2.0,
+                    "client_e2e_s": 2.0,
+                }
+            ],
+            2,
+        )
+        self.assertEqual(summary["output_tok_s"], 50)
+        self.assertEqual(summary["decode_tok_s"], 49.5)
+
+    def test_concurrent_requests_keep_dataset_order_and_stream(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "a.jpg").write_bytes(b"image")
@@ -212,10 +263,10 @@ class TestRSTellerEvidence(unittest.TestCase):
                 token = next(
                     i for i in range(3) if f">{i}<|im_end|>" in payload["text"]
                 )
-                self.assertNotIn("stream", payload)
-                return result([token, 9])
+                self.assertTrue(payload["stream"])
+                return _observation(result([token, 9]))
 
-            with patch.object(evaluation, "post_json", side_effect=post):
+            with patch.object(evaluation, "post_generate_stream", side_effect=post):
                 _, rows = evaluation.run_chunk_concurrent(
                     "http://localhost/generate", items, root, {"temperature": 0}, 1
                 )

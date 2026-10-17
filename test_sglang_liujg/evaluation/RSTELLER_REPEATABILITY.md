@@ -3,9 +3,9 @@
 `eval_spectre_rsteller.py` 保留原串行/闭式并发请求方式。每轮生成独立的
 `<stem>.<UTC时间-唯一编号>.jsonl`、CSV 和 `.run.json`，包括显式指定输出路径时。
 CLI 输出路径是文件名模板；终端打印实际路径。旧结果不清空，精度脚本只更新本轮文件。
-CSV 的汇总吞吐列改名为 `End-to-end tok/s`，终端使用 `e2e_tok/s`。
-这是生成 token 数除以 chunk 墙钟时间，包含 prefill、HTTP 和客户端准备开销，
-不包含启动、预热、缓存清理及精度计算。没有 TTFT 的并发请求不再伪造 decode 耗时。
+CSV 的输出阶段速度是 `Decode tok/s`，等于 `Σ(N-K) / Σ(decode_s)`，时间取客户端 `perf_counter`。
+`Output tok/s (wall)` 是生成 token 数除以墙钟，包含 prefill、HTTP 和客户端准备开销，
+不包含启动、预热、缓存清理及精度计算。没有 TTFT 的请求不再伪造 decode 耗时。
 
 运行示例（服务、图片和数据集已就绪）：
 
@@ -44,10 +44,18 @@ python test_sglang_liujg/evaluation/eval_spectre_rsteller.py --port 30000 --batc
 
 ## SR 统计口径
 
-`host_mean_ms` 是阶段窗口累计时间除以 32；缺席轮次计零。
-`host_max_ms` 是该阶段单轮累计时间的最大值。正常和失败轮次均计入，
+`host_mean_ms` 是阶段窗口累计时间除以本窗口的计量轮数 `rounds`，不把 skip-RPC 批次算进除数。
+缺席阶段不出现在均值里。`host_max_ms` 是该阶段单轮累计时间的最大值。正常和失败轮次均计入，
 同轮多次 KV 搬运先求和。各阶段可能嵌套，不应相加推导总时间。
-设备事件采样口径不变，eager 样本不代表 graph 内全部搬运。
+设备事件在 rank 0 的第 16 个计量轮采样一次，eager 样本不代表 graph 内全部搬运。
+
+客户端 `Avg Accept Length` 是逐条 `completion_tokens / spec_verify_ct` 的等权均值，分子含 prefill 首 token，有偏。
+`Accept Length (weighted) = Σ(completion_tokens - 1 - spec_fallback_ct) / Σspec_verify_ct`，
+是每次验证产出的 token 数，含 bonus。服务端没有 `spec_fallback_ct` 时回退步按 0 计，该列是上界，`Fallback Known=no`。
+`Tokens per Target Step = Σ(completion_tokens - 1) / Σ(spec_verify_ct + spec_fallback_ct)`，可与 AR 的 1.0 对比。
+`Accept Rate (weighted)` 的分母仍是 `verify × (num_draft_tokens - 1)`。树模式 `steps=4, ndt=8` 时上限约为 4/7。
+`Accepted Draft per Verify = Σspec_accept_token_num / Σspec_verify_ct` 不含 bonus，可读到接近 `steps`。
+`Fallback Ratio = Σspec_fallback_ct / Σ(spec_verify_ct + spec_fallback_ct)`。`verify_ct == 0` 的全程回退请求仍进入这些和。
 
 本地验证入口：
 

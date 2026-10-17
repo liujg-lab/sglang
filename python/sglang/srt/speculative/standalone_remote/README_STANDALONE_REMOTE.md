@@ -837,22 +837,35 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 ### 整轮日志的公共字段
 
 `[SR Draft round]` 当前针对树模式 STEP；`[SR Target round]` 针对进入 SR 验证轮的处理。
-某些直接跳过 RPC 的普通解码不会进入该整轮统计，不能把 round 计数当成服务全部请求数。
-与通信日志不同，TP 各 rank 可能都有 round 日志；比较同一 rank，不能把 TP0 与 TP1 重复求和。
+跳过 RPC 的普通解码不打开计量轮，但会计入 `skipped_batches` 和对应 counter。
+各 rank 都累计计数；只有 TP rank 0 打日志，日志里的 `tp_rank=0`。不要把未打印的 rank 再加一遍。
+
+窗口在计量轮与 skip 批次之和达到 32 时输出，`reason=full`。不满窗时也会输出：
+Target `flush_cache` 和 Draft 换 session 为 `session_reset`；距上一轮结束超过 2 秒的空闲为 `idle`。
+空闲等待本身不算进 `window_wall_ms`。
 
 | 字段 | 含义 |
 | --- | --- |
-| `rounds=32` | 汇总 32 个被计量的调度轮次，不是 32 个 token |
-| `host_mean_ms` | 各阶段主机墙钟耗时累计除以 32；包括同步等待，不是纯 CPU 计算时间 |
-| `host_max_ms` | 窗口内各阶段的单轮累计耗时最大值（毫秒，不除 32）；同轮多次调用先求和，与 `host_mean_ms` 使用相同口径；不能与均值相减 |
-| `device_sample_mean_ms` | 已完成设备事件样本的平均毫秒数，不是全部 32 轮的设备平均 |
-| `device_samples` | 每项有效设备样本数；例如 1 就只有一次采样 |
+| `rounds=<n>` | 本窗口被计量的调度轮次，不是 token 数，也不是 skip 批次数 |
+| `reason` | `full`、`idle` 或 `session_reset` |
+| `window_wall_ms` | 本窗第一轮开始到最后一轮结束的墙钟毫秒；没有计量轮时为空 |
+| `busy_ms` | 计量轮 `total` 之和的毫秒数；没有计量轮时为空 |
+| `tp_rank` | 打出这条日志的 rank，当前恒为 0 |
+| `skipped_batches` | 本窗口跳过 Draft RPC 的 batch 数，不含轮内普通解码回退 |
+| `host_mean_ms` | 各阶段主机墙钟累计除以 `rounds`；skip 批次不进入除数。包括同步等待，不是纯 CPU 计算 |
+| `host_max_ms` | 窗口内各阶段的单轮累计耗时最大值（毫秒，不除 `rounds`）；同轮多次调用先求和 |
+| `device_sample_mean_ms` | 已完成设备事件样本的平均毫秒数，不是全部计量轮的设备平均 |
+| `device_samples` | 每项有效设备样本数；短窗口可能为 0 |
 | `device_pending` | 尚未完成或未读取的计时事件数量；0 不代表整台设备没有待执行任务 |
-| `counters` | 本窗口请求实例、token、命中、失败等计数 |
+| `counters` | 本窗口请求实例、token、命中、失败和 skip 计数 |
 | `tail_attention` | tail 实际 attention 路径的调用计数，不是树 attention 的选择 |
-| `accept_len_mean` | 接受 token（含 bonus）/参与验证请求实例数；Draft 没有验证计数时为 None |
+| `accept_len_mean` | 仅 Target：接受 token（含 bonus）/ `verify_requests`。Draft 不输出此字段 |
+| `tokens_per_req_step` | 仅 Target：(含 bonus 的接受数 + 回退请求数) / (验证请求数 + 回退请求数) |
+| `fallback_ratio` | 仅 Target：回退请求数 / (验证请求数 + 回退请求数) |
+| `verify_rows_without_draft` | 仅 Target：验证 batch 里没有草稿、但仍走验证的行数 |
 
-设备事件每 32 轮采样一次，完成后延后读取，可能落入后续窗口。计时器不主动执行设备同步。
+回退请求数含轮内 `normal_decode_fallback_requests`，以及 `skip_rpc_breaker_requests` 和 `skip_rpc_high_bs_requests`。每条按 1 个 token 计。
+设备事件只在 rank 0、且本窗口第 16 个计量轮采样一次；不满 16 轮的窗口没有新样本。完成后延后读取，可能落入后续窗口。计时器不主动执行设备同步。
 主机均值与单个设备样本不能精确相减；两端窗口、通信窗口和 round 窗口也不保证逐轮对齐。
 
 ### Draft round 阶段与计数
@@ -904,7 +917,7 @@ round 从调度处理开始，到发送调用完成结束。两者显示相同�
 
 ### Draft graph host 阶段
 
-`[SR Draft graph host]` 是 NPU SR Draft `_replay()` 的主机调用区间观测，按 32 轮窗口追加在原 `[SR Draft round]` 日志和计数器清理之后。不改 `host_mean_ms`、设备事件队列或推理路径。
+`[SR Draft graph host]` 是 NPU SR Draft `_replay()` 的主机调用区间观测，追加在同一 round 窗口结算之后。`window_rounds` 是该窗口的计量轮数，不满 32 的刷新也会把已积累样本发出。不改 `host_mean_ms`、设备事件队列或推理路径。只有 rank 0 输出。
 
 这些是主机调用墙钟，可能含 API 内部等待；`replay_call` 不是设备图执行时间。`submit_envelope` 已包含 update/replay，串行和重叠模式都不可再与两者相加。重叠时 `update_call` 只覆盖 `graph.update`；分页路径的 `set_device`、线程创建和 join 计入 `submit_envelope`。分组键含 `overlap`，serial 与 overlap 样本不得混组。
 
@@ -914,7 +927,7 @@ round 从调度处理开始，到发送调用完成结束。两者显示相同�
 
 | 字段 | 含义 |
 | --- | --- |
-| `[SR Draft graph host]` | 每 32 个被计量调度轮次追加一行；无调用样本时不输出 |
+| `[SR Draft graph host]` | 每个 round 窗口结算后追加一行，`window_rounds` 为实际计量轮数；无调用样本时不输出 |
 | `ok` / `failed` | 被观测调用正常结束 / 失败或中断的次数 |
 | `lengths_host_ms` | `seq_lens_cpu` 切片到 `step_lens_list` 构造/校验结束 |
 | `payload_fill_host_ms` | 仅 `fill_*_payload` 调用到返回；payload 缺失检查不计时 |
@@ -1002,11 +1015,14 @@ fixed accept 还会分开记录 `fixed_accept_d2h_submit`、`fixed_accept_d2h_wa
 | `verify_logits_gather_batches` | 核验成功后仍按接受行 gather logits 的 batch 数 |
 | `verify_logits_skipped_output_bytes` | 上述丢弃路径避免物化的接受行 logits 字节数，按 `accepted_count * vocab * element_size` 估算，不是实测带宽 |
 | `normal_decode_fallback_batches/normal_decode_fallback_requests` | 在受计量路径内进入普通单 token fallback 的 batch / 请求实例数 |
+| `skip_rpc_breaker_batches/requests` | 熔断 OPEN 时跳过 Draft RPC 的 batch / 请求数。不打开计量轮 |
+| `skip_rpc_high_bs_batches/requests` | batch 超过 `standalone_remote_max_batch_size` 时跳过 Draft RPC 的 batch / 请求数 |
+| `verify_rows_without_draft` | 验证 batch 中没有草稿、但仍走验证并计入 `verify_requests` 的行数 |
 | `failed_rounds` | 整轮抛出异常的次数 |
 
-`accept_len_mean = accepted_tokens_including_bonus / verify_requests`，无验证样本时为 None。
-这个统计不能用来覆盖未进入 round 的直接普通解码路径；也不能与包含其他窗口、停止裁剪或
-不同请求集合的通用日志逐项强行相等。
+`accept_len_mean = accepted_tokens_including_bonus / verify_requests`，无验证样本时为 None。只出现在 Target 日志。
+`tokens_per_req_step` 把轮内回退和 skip-RPC 都按每请求 1 token 计入，用来和客户端 `Tokens per Target Step` 对照。
+`accept_len_mean` 仍只覆盖验证行。它不能与包含停止裁剪或其他请求集合的通用日志逐项强行相等。
 
 ### 图、启动与通用批次日志
 

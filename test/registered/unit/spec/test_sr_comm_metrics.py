@@ -367,7 +367,10 @@ class TestCommTransport(unittest.TestCase):
             for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "_sr_wipe_all"
         )
-        namespace = {"logger": logging.getLogger(__name__)}
+        namespace = {
+            "logger": logging.getLogger(__name__),
+            "flush_sr_round_metrics": round_metrics.flush_sr_round_metrics,
+        }
         exec(
             compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
             namespace,
@@ -531,6 +534,7 @@ class TestSRRoundMetrics(unittest.TestCase):
                 else:
                     start.elapsed_time.side_effect = error
                 metrics = SRRoundMetrics("Draft", SimpleNamespace(Event=factory))
+                metrics.rounds = round_metrics.DEVICE_SAMPLE_ROUND
                 body = Mock()
                 stream = object()
                 with metrics.round():
@@ -554,6 +558,7 @@ class TestSRRoundMetrics(unittest.TestCase):
         metrics = SRRoundMetrics(
             "Target", SimpleNamespace(Event=Mock(side_effect=[start, end]))
         )
+        metrics.rounds = round_metrics.DEVICE_SAMPLE_ROUND
         with self.assertRaises(ValueError) as raised:
             with metrics.round():
                 with metrics.phase("kv_move_eager", device=True):
@@ -589,6 +594,7 @@ class TestSRRoundMetrics(unittest.TestCase):
         metrics = SRRoundMetrics(
             "Draft", SimpleNamespace(Event=Mock(side_effect=error))
         )
+        metrics.rounds = round_metrics.DEVICE_SAMPLE_ROUND
         with self.assertRaises(RuntimeError) as raised:
             with metrics.round():
                 with metrics.phase("copy", device=True):
@@ -604,6 +610,7 @@ class TestSRRoundMetrics(unittest.TestCase):
         metrics = SRRoundMetrics(
             "Draft", SimpleNamespace(Event=Mock(side_effect=[start, end]))
         )
+        metrics.rounds = round_metrics.DEVICE_SAMPLE_ROUND
         with metrics.round():
             with metrics.phase("kv_move_eager", device=True, stream=stream):
                 pass
@@ -732,6 +739,78 @@ class TestSRRoundMetrics(unittest.TestCase):
         self.assertFalse(metrics.host)
         self.assertFalse(metrics.host_max)
 
+    def test_partial_window_mean_uses_actual_rounds_and_rank_gate(self):
+        metrics = SRRoundMetrics("Draft")
+        with metrics.round():
+            metrics.add_host("tree_forward", 0.002)
+        with metrics.round():
+            metrics.add_host("tree_forward", 0.004)
+        logged = {}
+
+        def capture(fmt, *args, **kwargs):
+            logged["fmt"] = fmt
+            logged["mean"] = args[1]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            metrics.flush("session_reset")
+        self.assertIn("rounds=2", logged["fmt"])
+        self.assertIn("reason=session_reset", logged["fmt"])
+        self.assertNotIn("accept_len_mean", logged["fmt"])
+        self.assertEqual(logged["mean"]["tree_forward"], 3.0)
+        self.assertFalse(metrics.host)
+
+        quiet = SRRoundMetrics("Draft", tp_rank=1)
+        with patch.object(round_metrics.logger, "info") as log:
+            with quiet.round():
+                quiet.add_host("tree_forward", 0.001)
+            quiet.flush("idle")
+        log.assert_not_called()
+        self.assertFalse(quiet.host)
+
+    def test_idle_flush_waits_and_skip_batches_close_the_window(self):
+        metrics = SRRoundMetrics("Target")
+        with metrics.round():
+            pass
+        metrics.idle_flush(metrics._last_activity + 1.0)
+        self.assertEqual(metrics.rounds, 1)
+        metrics.idle_flush(metrics._last_activity + round_metrics.IDLE_FLUSH_S)
+        self.assertEqual(metrics.rounds, 0)
+
+        skipped = SRRoundMetrics("Target")
+        for _ in range(31):
+            skipped.note_skip("high_bs", 2)
+        self.assertEqual(skipped.skipped_batches, 31)
+        logged = {}
+
+        def capture(fmt, *args, **kwargs):
+            logged["fmt"] = fmt
+            logged["counters"] = args[6]
+            logged["tail"] = args[8:]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            skipped.note_skip("breaker", 1)
+        self.assertIn("rounds=0", logged["fmt"])
+        self.assertIn("reason=full", logged["fmt"])
+        self.assertIn("skipped_batches=32", logged["fmt"])
+        self.assertEqual(logged["counters"]["skip_rpc_high_bs_requests"], 62)
+        self.assertEqual(logged["counters"]["skip_rpc_breaker_requests"], 1)
+        self.assertEqual(logged["tail"][1], 1.0)
+        self.assertEqual(logged["tail"][2], 1.0)
+        self.assertIsNone(logged["tail"][0])
+
+    def test_device_sample_is_the_sixteenth_metered_round(self):
+        factory = Mock()
+        metrics = SRRoundMetrics("Draft", SimpleNamespace(Event=factory))
+        with metrics.round():
+            with metrics.phase("tree_forward", device=True):
+                pass
+        factory.assert_not_called()
+        metrics.rounds = round_metrics.DEVICE_SAMPLE_ROUND
+        with metrics.round():
+            with metrics.phase("tree_forward", device=True):
+                pass
+        self.assertEqual(factory.call_count, 2)
+
 
 def _graph_ctx(**overrides):
     ctx = {
@@ -799,6 +878,27 @@ class TestGraphHostMetrics(unittest.TestCase):
         self.assertEqual(group["ok_stats"]["lengths_host_ms"]["n"], 8)
         self.assertEqual(group["ok_stats"]["replay_call_host_ms"]["n"], 32)
         self.assertNotIn("lengths_host_ms", group["failed_stats"])
+        self.assertEqual(host_line[1], 32)
+
+    def test_partial_round_window_flushes_graph_host_with_actual_n(self):
+        metrics = SRRoundMetrics("Draft")
+        sample = begin_graph_host_sample(_graph_ctx())
+        self._advance_call(sample, "replay_call", 1)
+        record_graph_host_sample_safely(metrics, sample)
+        for _ in range(3):
+            with metrics.round():
+                pass
+        captured = {}
+
+        def capture(fmt, *args, **kwargs):
+            if "graph host" in fmt:
+                captured["rounds"] = args[1]
+                captured["groups"] = args[-1]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            metrics.flush("session_reset")
+        self.assertEqual(captured["rounds"], 3)
+        self.assertEqual(captured["groups"][0]["ok"], 1)
 
     def test_group_key_isolates_shape_and_bucket_not_round_id(self):
         metrics = SRRoundMetrics("Draft")

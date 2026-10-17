@@ -62,8 +62,12 @@ from eval_spectre_rsteller import (
     DEFAULT_RESULT_DIR,
     append_jsonl,
     call_metrics_script,
+    create_run_paths,
     extract_perf,
     flush_cache,
+    server_snapshot,
+    spec_condition_columns,
+    warn_eval_conditions,
 )
 from eval_spectre_rsteller_serving import (
     AIOHTTP_READ_BUFSIZE,
@@ -218,10 +222,13 @@ async def run_benchmark(args: argparse.Namespace) -> int:
         f"target={generate_url}  traffic=open  request_rate={rate_s}  "
         f"max_concurrency={conc}  max_new_tokens={args.max_new_tokens}"
     )
-
-    args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    args.output_jsonl.write_text("", encoding="utf-8")
+    snapshot = server_snapshot(base_url, args.timeout)
+    warn_eval_conditions(snapshot, args.max_concurrency, bool(args.flush_cache))
+    conditions = spec_condition_columns(snapshot)
+    run_id, args.output_jsonl, args.output_csv, manifest_path = create_run_paths(
+        args.output_jsonl, args.output_csv
+    )
+    print(f"run_id={run_id}  manifest={manifest_path}")
 
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     async with aiohttp.ClientSession(
@@ -270,9 +277,24 @@ async def run_benchmark(args: argparse.Namespace) -> int:
         "request_rate": rate_s,
         "max_concurrency": args.max_concurrency if args.max_concurrency else "",
         "traffic": "open",
+        **conditions,
     }
     row.update(metric_csv_values(stats))
     write_csv_row(args.output_csv, row)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "server": snapshot,
+                "results_jsonl": str(args.output_jsonl),
+                "summary_csv": str(args.output_csv),
+                "summary": stats,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(format_serving_summary(stats, wall))
     print(f"wrote {args.output_jsonl}")
     print(f"wrote {args.output_csv}")

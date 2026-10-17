@@ -50,10 +50,11 @@ jsonl 每条字段（在原始 sample 上追加）
     request_started_at / request_finished_at  客户端 UTC 请求时间
     run_id / cache_policy / cache_flush / warmup_enabled / batch_size
     spec_accept_rate          投机接受率（不含 Target bonus）
-    spec_accept_length        平均接受长度 = toks / verify
-    spec_verify_ct            Target verify 次数
+    spec_accept_length        平均接受长度 = toks / verify；含 prefill 首 token，有偏
+    spec_verify_ct            Target verify 次数；全程回退时为 0
     spec_draft_token_num      草稿 token 总数（verify × (num_draft_tokens-1)）
     draft_tokens_per_verify   每步草稿长度 = spec_draft_token_num / verify
+    spec_fallback_ct          SR 的 AR 回退步数；服务端未给出时为空，不当成 0
     batch_wall_s / chunk_index / global_index
     error                     缺图、HTTP 失败或流在 finish_reason 之前断开；精度脚本会跳过
 
@@ -67,7 +68,8 @@ CSV 汇总列含义
     Mean/P99 TTFT、Mean/P99 Decode Time、Decode tok/s、Decode Samples、
     Mean TPOT、Mean Post-first Delivery、客户端 E2E 百分位、Mean Server E2E。
     旧表头的 CSV 会拒绝追加。
-    Avg Accept Length / Rate、Avg Draft Tokens per Verify、Total Verify
+    Avg Accept Length / Rate      逐条比值的等权均值，含 prefill 首 token，有偏
+    Accept Length (weighted) 等   见 serving 脚本；树模式 Accept Rate 上限约为 steps/(ndt-1)
     Avg BLEU / ROUGE-1/2/L        本脚本先留空，精度脚本补上
 
 运行（仓库根目录，Target + Draft 已启动）
@@ -124,6 +126,8 @@ CLOSED_CSV_PREFIX = [
     "Test Time",
     "batch_size",
     "mode",
+    "Algorithm",
+    "Spec Config",
     "Total Items",
     "Total Generated Tokens",
 ]
@@ -330,6 +334,8 @@ def extract_perf(
     rec["spec_draft_token_num"] = draft_num
     rec["draft_tokens_per_verify"] = draft_per_verify
     rec["spec_accept_token_num"] = _num(meta, "spec_accept_token_num")
+    # Missing means the server did not report fallback steps. Do not store 0.
+    rec["spec_fallback_ct"] = _num(meta, "spec_fallback_ct")
     return rec
 
 
@@ -529,6 +535,9 @@ def server_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
         "speculative_num_steps",
         "speculative_eagle_topk",
         "speculative_num_draft_tokens",
+        "standalone_remote_max_batch_size",
+        "stream_interval",
+        "disable_overlap_schedule",
         "incremental_streaming_output",
     )
     try:
@@ -541,6 +550,61 @@ def server_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"status": "unavailable", "error": str(exc)}
+
+
+def spec_condition_columns(snapshot: dict[str, Any]) -> dict[str, str]:
+    """Algorithm is AR when a readable snapshot has speculative decoding off.
+
+    A failed ``/server_info`` is unknown. Recording it as AR would hide an
+    SR run whose configuration could not be read.
+    """
+    if snapshot.get("status") != "available":
+        return {"Algorithm": "unknown", "Spec Config": ""}
+    settings = snapshot.get("settings") or {}
+    algorithm = settings.get("speculative_algorithm") or "AR"
+    if algorithm == "AR":
+        config = ""
+    else:
+        config = (
+            f"steps={settings.get('speculative_num_steps')}"
+            f"/topk={settings.get('speculative_eagle_topk')}"
+            f"/ndt={settings.get('speculative_num_draft_tokens')}"
+        )
+    return {"Algorithm": str(algorithm), "Spec Config": config}
+
+
+def warn_eval_conditions(
+    snapshot: dict[str, Any], max_concurrency: int | None, flush_cache: bool
+) -> None:
+    """Warn only. Callers keep their existing defaults."""
+    if not flush_cache:
+        print(
+            "WARNING: --flush-cache is off. Item 0 can hit the radix cache "
+            "and understate TTFT."
+        )
+    if snapshot.get("status") != "available":
+        print(
+            "WARNING: server snapshot unavailable; cannot check whether an "
+            "SR batch will silently fall back to AR."
+        )
+        return
+    settings = snapshot.get("settings") or {}
+    if settings.get("speculative_algorithm") != "STANDALONE_REMOTE":
+        return
+    limit = settings.get("standalone_remote_max_batch_size")
+    if not isinstance(limit, int):
+        print(
+            "WARNING: standalone_remote_max_batch_size is missing from the "
+            "server snapshot; cannot check SR fallback risk."
+        )
+        return
+    if max_concurrency is None or max_concurrency > limit:
+        shown = "unlimited" if max_concurrency is None else str(max_concurrency)
+        print(
+            "WARNING: SR max_concurrency="
+            f"{shown} is above standalone_remote_max_batch_size={limit}. "
+            "Larger batches skip the draft RPC and the measured rows are AR."
+        )
 
 
 def compare_records(
@@ -730,6 +794,7 @@ def main() -> int:
 
     save_manifest()
     print(f"run_id={run_id}  manifest={manifest_path}")
+    warn_eval_conditions(manifest["server"], args.batch_size, bool(args.flush_cache))
 
     if not args.no_warmup and dataset:
         print("=== warmup (first item, discarded) ===")
@@ -810,6 +875,7 @@ def main() -> int:
         "Test Time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "batch_size": args.batch_size,
         "mode": mode,
+        **spec_condition_columns(manifest["server"]),
     }
     row.update(metric_csv_values(stats))
     write_csv_row(args.output_csv, row)

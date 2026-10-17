@@ -844,6 +844,9 @@ class Req(ReqDllmMixin):
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
+        # AR decode steps that appended a token without a verification pass.
+        # STANDALONE_REMOTE uses this to keep fallback tokens out of accept length.
+        self.spec_fallback_ct = 0
 
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.

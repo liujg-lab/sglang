@@ -989,6 +989,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
+        spec_fallback_ct = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
@@ -1104,6 +1105,9 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    spec_fallback_ct.append(
+                        int(getattr(req, "spec_fallback_ct", 0) or 0)
+                    )
 
                 if return_logprob:
                     if (
@@ -1209,6 +1213,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_fallback_ct=spec_fallback_ct,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

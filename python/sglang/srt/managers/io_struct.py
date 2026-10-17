@@ -101,6 +101,10 @@ class SpeculativeDecodingMetricsMixin:
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
+    # AR fallback steps that appended a token. Keyword-only so subclasses can
+    # keep required fields after this mixin. Absent on non-SR outputs.
+    spec_fallback_ct: Optional[List[int]] = field(default=None, kw_only=True)
+
 
 # Parameters for a session
 @dataclass

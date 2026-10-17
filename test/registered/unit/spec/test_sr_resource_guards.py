@@ -208,7 +208,10 @@ class QuarantineTest(unittest.TestCase):
             for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
             if isinstance(n, ast.FunctionDef) and n.name == "_sr_wipe_all"
         )
-        env = dict(logger=logging.getLogger(__name__))
+        env = dict(
+            logger=logging.getLogger(__name__),
+            flush_sr_round_metrics=lambda owner, reason: None,
+        )
         exec(
             compile(
                 ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
@@ -258,6 +261,7 @@ class QuarantineTest(unittest.TestCase):
             torch=torch,
             __name__=__name__,
             __package__="sglang.srt.speculative.standalone_remote.drafter",
+            flush_sr_round_metrics=lambda owner, reason: None,
         )
         exec(
             compile(

@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.standalone_remote.sr_round_metrics import get_sr_round_metrics
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    flush_sr_round_metrics,
+    get_sr_round_metrics,
+    idle_sr_round_metrics,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.speculative.standalone_remote.sr_align import (
     broadcast_sr_obj,
@@ -169,6 +173,7 @@ class SchedulerStandaloneRemoteTargetMixin:
             )
 
     def reset_standalone_remote_target_state(self) -> None:
+        flush_sr_round_metrics(self, "session_reset")
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
         self._sr_finish_pending = []
@@ -712,14 +717,18 @@ class SchedulerStandaloneRemoteTargetMixin:
         current_bsz = max(batch.batch_size(), self.running_batch.batch_size())
         return current_bsz > self.server_args.standalone_remote_max_batch_size
 
-    def _sr_skip_draft_rpc(self, batch: ScheduleBatch) -> bool:
+    def _sr_skip_draft_rpc(self, batch: ScheduleBatch):
         # High batch size used to return before the breaker saw the skipped
         # step, so OPEN never reached HALF_OPEN while the batch stayed large.
+        # The returned reason is captured before note_skipped_step, which can
+        # move OPEN to HALF_OPEN on the last cooldown step.
         breaker = self.sr_breaker
         if breaker is not None and not breaker.should_send():
             breaker.note_skipped_step()
-            return True
-        return self._sr_is_high_overhead(batch)
+            return "breaker"
+        if self._sr_is_high_overhead(batch):
+            return "high_bs"
+        return None
 
     def _sr_chain_mode(self) -> bool:
         return int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1) <= 1
@@ -776,7 +785,10 @@ class SchedulerStandaloneRemoteTargetMixin:
                                 still, replies, prefill=True
                             )
                             self._sr_attach_replies(still, replies)
-                elif self._sr_skip_draft_rpc(batch):
+                elif skip_reason := self._sr_skip_draft_rpc(batch):
+                    get_sr_round_metrics(self, "Target").note_skip(
+                        skip_reason, batch.batch_size()
+                    )
                     batch.draft_num_tokens = 1
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
@@ -784,6 +796,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                     self._sr_run_verify_round(batch)
             else:
                 self.self_check_during_idle()
+                idle_sr_round_metrics(self)
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():

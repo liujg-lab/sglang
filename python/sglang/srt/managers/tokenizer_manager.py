@@ -1946,27 +1946,34 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
-            hasattr(recv_obj, "spec_verify_ct")
-            and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_tokens")
-            and len(recv_obj.spec_accepted_tokens) > i
-        ):
+        verify_list = getattr(recv_obj, "spec_verify_ct", None)
+        accepted_list = getattr(recv_obj, "spec_accepted_tokens", None)
+        has_verify = (
+            isinstance(verify_list, list)
+            and len(verify_list) > i
+            and isinstance(accepted_list, list)
+            and len(accepted_list) > i
+        )
+        is_sr = (
+            getattr(self.server_args, "speculative_algorithm", None)
+            == "STANDALONE_REMOTE"
+        )
+        if has_verify and verify_list[i] > 0:
             # The draft tokens per speculative step (excluding the target-sampled token).
             num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
-            accepted_tokens = recv_obj.spec_accepted_tokens[i]
+            total_draft_tokens = verify_list[i] * num_guess_tokens
+            accepted_tokens = accepted_list[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
             if total_draft_tokens > 0:
                 # Calculate acceptance rate: accepted / (steps * lookahead)
                 meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
                 meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                    recv_obj.completion_tokens[i] / verify_list[i]
                 )
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                meta_info["spec_verify_ct"] = verify_list[i]
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
@@ -1977,6 +1984,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
                     i
                 ]
+        elif (
+            is_sr
+            and isinstance(verify_list, list)
+            and len(verify_list) > i
+            and verify_list[i] == 0
+        ):
+            # A request that never verified still belongs in the client totals.
+            # Leave accept length and rate unset; those ratios divide by verify_ct.
+            meta_info["spec_verify_ct"] = 0
+            meta_info["spec_accept_token_num"] = 0
+            meta_info["spec_draft_token_num"] = 0
+
+        if is_sr:
+            fallback_list = getattr(recv_obj, "spec_fallback_ct", None)
+            if (
+                isinstance(fallback_list, list)
+                and len(fallback_list) > i
+                and fallback_list[i] is not None
+            ):
+                meta_info["spec_fallback_ct"] = int(fallback_list[i])
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
