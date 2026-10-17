@@ -477,6 +477,44 @@ class SRRPDTest(unittest.TestCase):
         allocate.assert_not_called()
         self.assertIsNone(ws.key)
 
+    def test_prepare_caches_edge_kernel_probe_by_device_and_dtype(self):
+        import sglang.srt.speculative.standalone_remote.sr_rpd as module
+
+        packet, _ = packet_input()
+        context = packet.rpd_input
+        self.assertGreater(len(context.edges), 0)
+        ws = SRRPDWorkspace()
+        real = module._edge_gather_impl
+        calls = []
+
+        def spy(logits):
+            calls.append((logits.device.type, logits.dtype))
+            return real(logits)
+
+        with patch.object(module, "_edge_gather_impl", side_effect=spy):
+            logits = torch.zeros(12, 32)
+            self.assertIsNone(ws.prepare(logits, context))
+            self.assertIsNone(ws.prepare(logits, context))
+            self.assertEqual(calls, [("cpu", torch.float32)])
+            logits_f16 = torch.zeros(12, 32, dtype=torch.float16)
+            self.assertIsNone(ws.prepare(logits_f16, context))
+            self.assertEqual(calls, [("cpu", torch.float32), ("cpu", torch.float16)])
+
+        failed = SRRPDWorkspace()
+        with (
+            patch.object(
+                module,
+                "_edge_gather_impl",
+                side_effect=ImportError("missing Triton"),
+            ) as probe,
+            patch("torch.empty") as allocate,
+        ):
+            self.assertEqual(failed.prepare(logits, context), "edge_kernel")
+            self.assertEqual(failed.prepare(logits, context), "edge_kernel")
+        self.assertEqual(probe.call_count, 1)
+        allocate.assert_not_called()
+        self.assertIsNone(failed.key)
+
     def test_empty_batch_and_root_only(self):
         for bs in (0, 2):
             owner = SimpleNamespace(generation=1, unresolved=False)

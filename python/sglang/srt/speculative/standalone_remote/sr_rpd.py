@@ -211,6 +211,9 @@ class SRRPDWorkspace:
         self._v1_cap = 0
         self._v1_key = None
         self._v1_pinned = False
+        # ``None`` means the probe succeeded. An ImportError or AttributeError
+        # is stored and reused. Other exceptions are not cached.
+        self._edge_probe = {}
 
     def log_path_once(self, name: str) -> None:
         if name in self._logged_paths:
@@ -259,9 +262,15 @@ class SRRPDWorkspace:
         key = (device, logits.dtype)
         edges = len(context.edges)
         if edges:
-            try:
-                _edge_gather_impl(logits)
-            except (ImportError, AttributeError):
+            probe_key = (device.type, logits.dtype)
+            if probe_key not in self._edge_probe:
+                try:
+                    _edge_gather_impl(logits)
+                except (ImportError, AttributeError) as exc:
+                    self._edge_probe[probe_key] = exc
+                    return "edge_kernel"
+                self._edge_probe[probe_key] = None
+            elif self._edge_probe[probe_key] is not None:
                 return "edge_kernel"
         if key != self.key or rows > self.rows_cap or edges > self.edges_cap:
             rc = max(rows, self.rows_cap, 1)
