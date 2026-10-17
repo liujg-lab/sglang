@@ -702,6 +702,8 @@ def unlink_disconnected_retrieve_nodes(
     ``disconnected[row]`` holds draft slots. Tree position ``slot + 1`` is the
     node the verify kernel linked after the parent column was rewritten. Splicing
     it out leaves grounded nodes reachable and the ungrounded node unreachable.
+    The removed node's own next and sibling are then cleared to ``-1``. The skip
+    still reads the pre-clear sibling chain, so a live successor is not lost.
 
     Affected rows are gathered with one ``index_select`` and one host copy,
     rewritten together, then written back with one ``index_copy_``.
@@ -750,13 +752,22 @@ def unlink_disconnected_retrieve_nodes(
             old_sib = [int(node) for node in sib_by_row[row]]
         else:
             old_sib = [-1] * len(old_next)
-        new_next.append(
-            [_skip_removed_link(node, removed, old_sib) for node in old_next]
-        )
+        rewritten_next = [
+            _skip_removed_link(node, removed, old_sib) for node in old_next
+        ]
+        rewritten_sib = None
         if row in sib_by_row:
-            new_sib.append(
-                [_skip_removed_link(node, removed, old_sib) for node in old_sib]
-            )
+            rewritten_sib = [
+                _skip_removed_link(node, removed, old_sib) for node in old_sib
+            ]
+        for pos in removed:
+            if 0 <= pos < len(rewritten_next):
+                rewritten_next[pos] = -1
+            if rewritten_sib is not None and 0 <= pos < len(rewritten_sib):
+                rewritten_sib[pos] = -1
+        new_next.append(rewritten_next)
+        if rewritten_sib is not None:
+            new_sib.append(rewritten_sib)
 
     _index_copy_rows(retrive_next_token, rows_t, new_next)
     if with_sib:
