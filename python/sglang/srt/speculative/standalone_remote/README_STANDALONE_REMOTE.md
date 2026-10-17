@@ -842,7 +842,7 @@ PREFILL 和 STEP 必须分开看；日志中的 `transport=ipc` 不能用于推�
 
 窗口在计量轮与 skip 批次之和达到 32 时输出，`reason=full`。不满窗时也会输出：
 Target `flush_cache` 和 Draft 换 session 为 `session_reset`；距上一轮结束超过 2 秒的空闲为 `idle`。
-空闲等待本身不算进 `window_wall_ms`。
+窗口从首个计量轮开始，到最后一个计量轮结束；中间不足 2 秒的空隙和 skip 批次都计入；触发 idle 刷新的尾部空闲不计入 `window_wall_ms`。
 
 | 字段 | 含义 |
 | --- | --- |

@@ -859,7 +859,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "draft_tree",
-                        "round_id": int(metrics.rounds) + 1,
+                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(self.raw_bs),

@@ -390,6 +390,43 @@ class ApplyAndSummaryTest(unittest.TestCase):
         # The legacy column is still the equal-weight mean of the biased ratio.
         self.assertAlmostEqual(stats["avg_alen"], 2.5)
 
+    def test_retraction_prefill_is_removed_from_weighted_lengths(self) -> None:
+        rec = extract_perf(
+            {},
+            {
+                "text": "a",
+                "meta_info": {
+                    "completion_tokens": 5,
+                    "spec_verify_ct": 2,
+                    "spec_fallback_ct": 1,
+                    "total_retractions": 1,
+                },
+            },
+            ttft_s=None,
+            client_e2e_s=1.0,
+        )
+        self.assertEqual(rec["total_retractions"], 1.0)
+        missing = extract_perf(
+            {},
+            {
+                "text": "b",
+                "meta_info": {
+                    "completion_tokens": 4,
+                    "spec_verify_ct": 0,
+                    "spec_fallback_ct": 3,
+                },
+            },
+            ttft_s=None,
+            client_e2e_s=1.0,
+        )
+        self.assertIsNone(missing["total_retractions"])
+        stats = serving.summarize_serving([rec, missing], wall_s=1.0)
+        # (5-1-1-1) + (4-1-0-3) = 2, over 2 verify steps.
+        self.assertAlmostEqual(stats["accept_length_weighted"], 1.0)
+        # (5-1-1) + (4-1) = 6, over 2 verify + 4 fallback steps.
+        self.assertAlmostEqual(stats["tokens_per_target_step"], 1.0)
+        self.assertEqual(stats["fallback_known"], "yes")
+
     def test_missing_fallback_field_is_an_upper_bound(self) -> None:
         rec = extract_perf(
             {},

@@ -2951,6 +2951,11 @@ class StandaloneRemoteDraftSchedulerMixin:
                 else:
                     metrics = get_sr_round_metrics(self, "Draft")
                     measure = self._sr_tree_mode() and batch.action == SRAction.STEP
+                    # Close the previous session before this round is metered.
+                    # _sr_wipe_all still flushes, covering unmetered actions.
+                    last_session = self.sr_state.session_id
+                    if last_session is not None and batch.session_id > last_session:
+                        flush_sr_round_metrics(self, "session_reset")
                     with metrics.round() if measure else nullcontext():
                         if not supported_protocol(batch.protocol_version):
                             reply = self._sr_protocol_mismatch_reply(batch)

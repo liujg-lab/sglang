@@ -196,7 +196,7 @@ class SRTailExtendNpuGraphRunner(SRTailExtendGraphRunner):
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "tail_extend",
-                        "round_id": int(metrics.rounds) + 1,
+                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
                         "graph_key": bucket,
                         "implementation": "fia" if use_fia else "atb",
                         "raw_bs": None,

@@ -268,6 +268,7 @@ class SRRoundMetrics:
         self.device_module = device_module
         self.tp_rank = int(tp_rank or 0)
         self.rounds = 0
+        self.total_rounds = 0
         self.skipped_batches = 0
         self.host = Counter()
         self.host_max = Counter()
@@ -339,6 +340,7 @@ class SRRoundMetrics:
             self.active = False
             self._round_host.clear()
             self.rounds += 1
+            self.total_rounds += 1
             self._window_end = end
             self._last_activity = end
             if self.rounds + self.skipped_batches >= WINDOW_LIMIT:
@@ -418,6 +420,12 @@ class SRRoundMetrics:
     def flush(self, reason):
         if self.active or (self.rounds == 0 and self.skipped_batches == 0):
             return
+        # Same guard as the full-window path: do not poll while a business
+        # exception is already propagating.
+        import sys
+
+        if sys.exc_info()[0] is None:
+            self.poll()
         try:
             self._emit_window(reason)
         finally:

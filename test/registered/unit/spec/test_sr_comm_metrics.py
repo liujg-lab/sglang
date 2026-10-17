@@ -811,6 +811,66 @@ class TestSRRoundMetrics(unittest.TestCase):
                 pass
         self.assertEqual(factory.call_count, 2)
 
+    def test_partial_flush_polls_completed_device_events(self):
+        start, end = Mock(), Mock()
+        end.query.return_value = True
+        start.elapsed_time.return_value = 4.5
+        metrics = SRRoundMetrics("Draft")
+        with metrics.round():
+            pass
+        metrics.pending.append(("tree_forward", start, end))
+        logged = {}
+
+        def capture(fmt, *args, **kwargs):
+            logged["fmt"] = fmt
+            logged["device_mean"] = args[3]
+            logged["device_samples"] = args[4]
+            logged["device_pending"] = args[5]
+
+        with patch.object(round_metrics.logger, "info", side_effect=capture):
+            metrics.flush("idle")
+        self.assertIn("reason=idle", logged["fmt"])
+        self.assertEqual(logged["device_mean"]["tree_forward"], 4.5)
+        self.assertEqual(logged["device_samples"]["tree_forward"], 1)
+        self.assertEqual(logged["device_pending"], 0)
+        self.assertFalse(metrics.pending)
+
+    def test_total_rounds_increases_across_windows(self):
+        metrics = SRRoundMetrics("Target")
+        with metrics.round():
+            pass
+        self.assertEqual(metrics.rounds, 1)
+        self.assertEqual(metrics.total_rounds, 1)
+        metrics.flush("session_reset")
+        self.assertEqual(metrics.rounds, 0)
+        self.assertEqual(metrics.total_rounds, 1)
+        with metrics.round():
+            pass
+        with metrics.round():
+            pass
+        self.assertEqual(metrics.rounds, 2)
+        self.assertEqual(metrics.total_rounds, 3)
+
+    def test_draft_session_flush_precedes_metered_round(self):
+        src_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/standalone_remote/drafter"
+            / "sr_draft_scheduler_mixin.py"
+        )
+        src = src_path.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        loop = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "event_loop_normal_standalone_remote_draft"
+        )
+        body = ast.get_source_segment(src, loop)
+        flush_at = body.find('flush_sr_round_metrics(self, "session_reset")')
+        round_at = body.find("with metrics.round()")
+        self.assertNotEqual(flush_at, -1)
+        self.assertLess(flush_at, round_at)
+
 
 def _graph_ctx(**overrides):
     ctx = {

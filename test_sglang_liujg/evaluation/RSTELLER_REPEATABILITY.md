@@ -50,9 +50,9 @@ python test_sglang_liujg/evaluation/eval_spectre_rsteller.py --port 30000 --batc
 设备事件在 rank 0 的第 16 个计量轮采样一次，eager 样本不代表 graph 内全部搬运。
 
 客户端 `Avg Accept Length` 是逐条 `completion_tokens / spec_verify_ct` 的等权均值，分子含 prefill 首 token，有偏。
-`Accept Length (weighted) = Σ(completion_tokens - 1 - spec_fallback_ct) / Σspec_verify_ct`，
-是每次验证产出的 token 数，含 bonus。服务端没有 `spec_fallback_ct` 时回退步按 0 计，该列是上界，`Fallback Known=no`。
-`Tokens per Target Step = Σ(completion_tokens - 1) / Σ(spec_verify_ct + spec_fallback_ct)`，可与 AR 的 1.0 对比。
+`Accept Length (weighted) = Σ(completion_tokens - 1 - total_retractions - spec_fallback_ct) / Σspec_verify_ct`，
+是每次验证产出的 token 数，含 bonus。`total_retractions` 缺失按 0，不另加未知标记。服务端没有 `spec_fallback_ct` 时回退步按 0 计，该列是上界，`Fallback Known=no`。
+`Tokens per Target Step = Σ(completion_tokens - 1 - total_retractions) / Σ(spec_verify_ct + spec_fallback_ct)`，可与 AR 的 1.0 对比。
 `Accept Rate (weighted)` 的分母仍是 `verify × (num_draft_tokens - 1)`。树模式 `steps=4, ndt=8` 时上限约为 4/7。
 `Accepted Draft per Verify = Σspec_accept_token_num / Σspec_verify_ct` 不含 bonus，可读到接近 `steps`。
 `Fallback Ratio = Σspec_fallback_ct / Σ(spec_verify_ct + spec_fallback_ct)`。`verify_ct == 0` 的全程回退请求仍进入这些和。

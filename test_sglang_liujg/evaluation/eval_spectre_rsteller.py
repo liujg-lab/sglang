@@ -55,6 +55,7 @@ jsonl 每条字段（在原始 sample 上追加）
     spec_draft_token_num      草稿 token 总数（verify × (num_draft_tokens-1)）
     draft_tokens_per_verify   每步草稿长度 = spec_draft_token_num / verify
     spec_fallback_ct          SR 的 AR 回退步数；服务端未给出时为空，不当成 0
+    total_retractions         请求被 retract 的次数；服务端未给出时为空，加权时按 0
     batch_wall_s / chunk_index / global_index
     error                     缺图、HTTP 失败或流在 finish_reason 之前断开；精度脚本会跳过
 
@@ -336,6 +337,8 @@ def extract_perf(
     rec["spec_accept_token_num"] = _num(meta, "spec_accept_token_num")
     # Missing means the server did not report fallback steps. Do not store 0.
     rec["spec_fallback_ct"] = _num(meta, "spec_fallback_ct")
+    # Missing stays None. Weighted totals treat that as zero retractions.
+    rec["total_retractions"] = _num(meta, "total_retractions")
     return rec
 
 

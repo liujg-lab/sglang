@@ -89,10 +89,11 @@ CSV 汇总列（只统计无 error 的成功条；百分位为排序后线性插
                                   topk=2, ndt=8, steps=4 时上限约为 4/7
     Avg Draft Tokens per Verify   draft_tokens_per_verify 均值
     Total Verify                  spec_verify_ct 之和，含 0
-    Accept Length (weighted)      Σ(c-1-f) / Σv。每次验证产出的 token，含 bonus
+    Accept Length (weighted)      Σ(c-1-r-f) / Σv。每次验证产出的 token，含 bonus
+                                  r 是 total_retractions，缺失按 0，不另加未知标记
                                   无回退字段时 f=0，结果是上界，Fallback Known=no
                                   Σv=0 时留空
-    Tokens per Target Step        Σ(c-1) / Σ(v+f)。每个 Target decode 步的 token 数
+    Tokens per Target Step        Σ(c-1-r) / Σ(v+f)。每个 Target decode 步的 token 数
     Accepted Draft per Verify     Σa / Σv。不含 bonus，树模式可读到接近 steps
     Accept Rate (weighted)        Σa / Σspec_draft_token_num。树模式上限与旧列相同
     Total Fallback Steps          Σf。字段缺失的请求按 0 计入，看 Fallback Known
@@ -648,9 +649,12 @@ def _weighted_spec(ok: list[dict[str, Any]]) -> dict[str, Any]:
     """Token-weighted speculative totals.
 
     ``c`` is completion tokens, ``v`` is verify steps, ``a`` is accepted draft
-    tokens, and ``f`` is AR fallback steps. A missing fallback field is treated
-    as 0 and marks the accept length as an upper bound. Ratios with a zero
-    denominator stay empty. Tree-mode accept rate still uses
+    tokens, ``f`` is AR fallback steps, and ``r`` is retractions. Each
+    retraction re-prefills one token that is neither verified nor a fallback
+    step, so the numerators are ``c-1-r-f`` and ``c-1-r``. A missing retraction
+    field counts as 0 and does not mark the result unknown. A missing fallback
+    field is treated as 0 and marks the accept length as an upper bound.
+    Ratios with a zero denominator stay empty. Tree-mode accept rate still uses
     ``verify * (num_draft_tokens - 1)`` as its denominator, so its ceiling is
     about ``steps / (num_draft_tokens - 1)``.
     """
@@ -682,8 +686,10 @@ def _weighted_spec(ok: list[dict[str, Any]]) -> dict[str, Any]:
         completion = _as_float(rec.get("completion_tokens"))
         if completion is not None:
             saw_completion = True
-            sum_verify_tokens += completion - 1 - fallback
-            sum_decode_tokens += completion - 1
+            retract = _as_float(rec.get("total_retractions")) or 0.0
+            prefill_tokens = 1.0 + retract
+            sum_verify_tokens += completion - prefill_tokens - fallback
+            sum_decode_tokens += completion - prefill_tokens
             sum_v += verify
             sum_f += fallback
             sum_steps += verify + fallback

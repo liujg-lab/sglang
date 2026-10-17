@@ -618,7 +618,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "target_verify",
-                        "round_id": int(metrics.rounds) + 1,
+                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(getattr(self, "raw_bs", 0) or 0),
@@ -664,7 +664,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 sample = begin_graph_host_sample(
                     {
                         "graph_phase": "target_verify",
-                        "round_id": int(metrics.rounds) + 1,
+                        "round_id": int(getattr(metrics, "total_rounds", metrics.rounds)) + 1,
                         "graph_key": graph_key,
                         "implementation": self._current_tree_attention_impl(),
                         "raw_bs": int(getattr(self, "raw_bs", 0) or 0),
