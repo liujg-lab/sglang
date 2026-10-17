@@ -831,6 +831,18 @@ class SRRPDTest(unittest.TestCase):
                             sr_accept_state=None if case == "off" else state,
                             sr_rpd_workspace=workspace,
                         )
+                elif case == "noncontiguous":
+                    with self.assertRaisesRegex(AssertionError, "shared compact path"):
+                        verify(
+                            spec,
+                            batch,
+                            SimpleNamespace(next_token_logits=logits),
+                            SimpleNamespace(is_not_in_free_group=True),
+                            4,
+                            prepare_local_draft_hidden=False,
+                            sr_accept_state=state,
+                            sr_rpd_workspace=workspace,
+                        )
                 else:
                     with self.assertRaises(RuntimeError):
                         verify(
@@ -843,8 +855,16 @@ class SRRPDTest(unittest.TestCase):
                             sr_accept_state=state,
                             sr_rpd_workspace=workspace,
                         )
-            legacy.assert_not_called()
-            penalizer.apply.assert_called_once()
+            if case == "noncontiguous":
+                legacy.assert_called_once()
+                penalizer.apply.assert_called_once()
+                self.assertIn("host_plan_fallback_logits_layout", workspace._logged_paths)
+            elif case in ("missing", "stale"):
+                legacy.assert_not_called()
+                penalizer.apply.assert_not_called()
+            else:
+                legacy.assert_not_called()
+                penalizer.apply.assert_called_once()
             if case not in apply_cases:
                 continue
             ref_predict = torch.empty((13,), dtype=torch.int32)
@@ -866,6 +886,129 @@ class SRRPDTest(unittest.TestCase):
             self.assertEqual(got_index, ref_flat)
             self.assertEqual(got_length, ref_length.tolist())
             self.assertEqual(got_tokens, [int(ref_predict[idx]) for idx in ref_flat])
+
+    def test_host_plan_prepare_failure_falls_back_to_verify_tree_rpd(self):
+        import test_sr_fixed_accept as fixed
+
+        reqs = [fixed._Req(), fixed._Req()]
+        for req in reqs:
+            req.grammar = None
+        packet, _ = packet_input(reqs=reqs)
+        context = packet.rpd_input
+        state = SRFixedAcceptState(2, 4, 6, 4, "cpu")
+        state.metrics = SimpleNamespace(paths=Counter())
+
+        class Sampling:
+            is_all_greedy = True
+            has_custom_logit_processor = False
+            logit_bias = None
+            penalizer_orchestrator = SimpleNamespace(is_required=False)
+
+            def __len__(self):
+                return 2
+
+        class _Bucket:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        batch = SimpleNamespace(
+            reqs=reqs,
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            sampling_info=Sampling(),
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+            out_cache_loc=torch.arange(12),
+            req_pool_indices=torch.tensor([0, 1]),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((2, 16), dtype=torch.int32)
+            ),
+            spec_info=SimpleNamespace(hidden_states=None),
+            model_config=SimpleNamespace(
+                think_end_id=None, hidden_size=4, dtype=torch.float32
+            ),
+            device=torch.device("cpu"),
+            return_logprob=False,
+            has_grammar=False,
+        )
+        spec = SimpleNamespace(
+            retrive_index=context.tree[1],
+            retrive_next_token=context.tree[2],
+            retrive_next_sibling=context.tree[3],
+            draft_token=context.tree[0].flatten(),
+            draft_token_num=6,
+            spec_steps=3,
+            topk=2,
+            sr_rpd_input=context,
+        )
+        namespace = dict(
+            torch=torch,
+            SIMULATE_ACC_LEN=0,
+            get_global_server_args=lambda: SimpleNamespace(
+                speculative_verify_mode="rpd", speculative_rpd_tau=0.2
+            ),
+            tree_verify_backend=lambda: "cpu",
+            is_remote_spec_algorithm=lambda _: True,
+            _log_verify_method_once=lambda *a, **kw: None,
+            _eagle_output_from_fixed=lambda raw, *args: raw,
+            verify_tree_rpd=rpd.verify_tree_rpd,
+            select_hidden_states_for_draft=lambda *a, **kw: None,
+            assign_req_to_token_pool_func=lambda *a, **kw: None,
+            EagleDraftInput=_Bucket,
+            EagleVerifyOutput=_Bucket,
+        )
+        verify = fixed._load_functions(
+            fixed._REPO / "python/sglang/srt/speculative/eagle_info.py",
+            ["verify"],
+            namespace,
+        )["verify"]
+        workspace = SRRPDWorkspace()
+        logits = torch.randn(12, 32)
+        ref_logits = logits.clone()
+        with patch.object(
+            workspace, "prepare", return_value="edge_kernel"
+        ) as prepare, patch.object(
+            state,
+            "finalize_from_host",
+            side_effect=AssertionError("host plan must not commit"),
+        ) as finalize, patch.object(
+            state,
+            "bind_verify_buffers",
+            side_effect=AssertionError("greedy buffers"),
+        ):
+            result = verify(
+                spec,
+                batch,
+                SimpleNamespace(next_token_logits=logits),
+                SimpleNamespace(is_not_in_free_group=True, free=lambda slots: None),
+                1,
+                prepare_local_draft_hidden=False,
+                sr_accept_state=state,
+                sr_rpd_workspace=workspace,
+            )
+        prepare.assert_called_once()
+        finalize.assert_not_called()
+        self.assertIn("host_plan_fallback_edge_kernel", workspace._logged_paths)
+        self.assertEqual(state.metrics.paths["fixed_accept_rpd_prepare"], 1)
+        ref_predict = torch.empty((13,), dtype=torch.int32)
+        ref_index = torch.full((2, 4), -1, dtype=torch.int32)
+        ref_length = torch.empty((2,), dtype=torch.int32)
+        rpd.verify_tree_rpd(
+            ref_predict,
+            ref_index,
+            ref_length,
+            context.tree[0],
+            context.tree[1],
+            context.tree[2],
+            context.tree[3],
+            ref_logits,
+            0.2,
+        )
+        ref_flat = [idx for idx in ref_index.reshape(-1).tolist() if idx >= 0]
+        self.assertEqual(result.accepted_indices.tolist(), ref_flat)
+        self.assertEqual(result.accept_length_per_req_cpu, ref_length.tolist())
+        self.assertEqual(
+            result.verified_id.tolist(), [int(ref_predict[idx]) for idx in ref_flat]
+        )
 
     def test_stage_v1_reuses_buffer_without_pinned_alloc_or_wait(self):
         import sglang.srt.speculative.standalone_remote.sr_rpd as module

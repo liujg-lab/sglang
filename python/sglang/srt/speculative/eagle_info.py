@@ -359,6 +359,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         rpd_live_batch_key = None
         fixed_detach = None
         fixed_decision = None
+        host_plan_ready = False
+        rpd_context = getattr(self, "sr_rpd_input", None)
+        if (
+            sr_rpd_workspace is not None
+            and verify_mode == "rpd"
+            and int(self.topk) > 1
+        ):
+            reason = sr_rpd_workspace.prepare(
+                logits_output.next_token_logits, rpd_context, sr_rpd_workspace.metrics
+            )
+            if reason == "context":
+                raise RuntimeError("SR RPD tree batch has no current host topology")
+            host_plan_ready = reason is None
+            if not host_plan_ready:
+                sr_rpd_workspace.log_path_once("host_plan_fallback_" + reason)
         if sr_accept_state is not None:
             from sglang.srt.speculative.standalone_remote.verifier.sr_fixed_accept import (
                 accept_control_decision,
@@ -368,7 +383,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             fixed_detach = detach_verify_output
             fixed_decision = accept_control_decision
-            rpd_context = getattr(self, "sr_rpd_input", None)
             if verify_mode == "rpd":
                 from sglang.srt.speculative.standalone_remote.sr_rpd import (
                     rpd_batch_key,
@@ -400,6 +414,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             if reject_reason is None and verify_mode == "rpd":
                 rpd_host_bound = True
+                rpd_host_bound = rpd_host_bound and host_plan_ready
+                if not rpd_host_bound:
+                    sr_accept_state.note_path("fixed_accept_rpd_prepare")
             elif reject_reason is None:
                 try:
                     predict, accept_index, accept_length = (
@@ -410,11 +427,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sr_accept_state.note_path("fixed_accept_noncontiguous")
             else:
                 sr_accept_state.note_path("fixed_accept_" + reject_reason)
-        host_plan_ready = (
-            sr_rpd_workspace is not None
-            and verify_mode == "rpd"
-            and int(self.topk) > 1
-        )
         if not fixed_bound and not host_plan_ready:
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
@@ -501,20 +513,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     verify_sr_rpd_host,
                 )
 
-                rpd_context = getattr(self, "sr_rpd_input", None)
-                if rpd_context is None or not rpd_context.current():
-                    raise RuntimeError(
-                        "SR RPD tree batch has no current host topology"
-                    )
-                prepare_reason = sr_rpd_workspace.prepare(
-                    logits_output.next_token_logits,
-                    rpd_context,
-                    sr_rpd_workspace.metrics,
-                )
-                if prepare_reason:
-                    raise RuntimeError(
-                        f"SR RPD host plan prepare failed: {prepare_reason}"
-                    )
                 host_plan = verify_sr_rpd_host(
                     logits_output.next_token_logits,
                     rpd_context,
