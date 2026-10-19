@@ -2,22 +2,28 @@
 """RSTeller（及同结构 jsonl）生成结果精度统计：BLEU / ROUGE-1/2/L。
 
 功能
-    读生成脚本写出的 jsonl，对同时满足下列条件的条目打分：
-      - 无 error 字段（或为空）
-      - 有非空 model_output
-      - 有非空 ground_truth
+    读生成脚本写出的 jsonl，对无 error（或 error 为空）且 ground_truth
+    分词后非空的条目打分。重跑时先清掉旧 metrics。
+    没有 error 但 model_output 分词后为空的条目记 0，并计入平均分母。
+    ground_truth 分词后为空的条目跳过、不计入分母，并单独计数（no_ref）。
+    带 error 的条目跳过，不计入分母。
     把 per-item 字典 metrics={bleu, rouge1, rouge2, rougeL} 写回 jsonl。
     若指定 --csv，把平均值写入该 CSV 的指定数据行（默认最后一行）的
     Avg BLEU / Avg ROUGE-1 / Avg ROUGE-2 / Avg ROUGE-L 列（缺列会补上）。
     不直接读原始 RSTeller JSON；输入必须是 eval_spectre_rsteller.py 的产出。
+    本分词与分母规则改动后的数值与历史 CSV 不能直接比较。
 
 指标含义
-    bleu     nltk sentence_bleu，参考/假设按空白分词，smoothing=method1
-    rouge1/2/L  rouge-score F-measure，use_stemmer=True
-    CSV 四列为上述字段在有效条目上的算术平均。带 error 的条目不计入分母。
+    bleu 与 rouge1/2/L 共用同一套分词：转小写；中日韩字符按单字切；
+    其余按词字符切；标点丢掉；ASCII 词长度大于 3 时做 Porter 词干化
+    （与原先 use_stemmer=True 对 ASCII 词的处理一致）。
+    bleu        nltk sentence_bleu，smoothing=method1
+    rouge1/2/L  rouge-score F-measure，使用上述 tokenizer
+    CSV 四列为上述字段在有效条目上的算术平均。分母含空输出，
+    不含 error 与无参考的条目。
 
 依赖
-    pip install nltk rouge-score
+    pip install nltk "rouge-score>=0.1.2"
 
 运行
     python test_sglang_liujg/evaluation/eval_rsteller_metrics.py \\
@@ -36,25 +42,44 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
 ACCURACY_FIELDS = ("Avg BLEU", "Avg ROUGE-1", "Avg ROUGE-2", "Avg ROUGE-L")
 
+# CJK (incl. kana / hangul) as single characters; other word chars as tokens.
+# Punctuation and underscores are dropped.
+_TOKEN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]|[^\W_]+")
+_stemmer: Any = None
+
+
+def tokenize(text: str) -> list[str]:
+    tokens = _TOKEN_RE.findall(text.lower())
+    return [_stemmer.stem(t) if t.isascii() and len(t) > 3 else t for t in tokens]
+
+
+class _Tokenizer:
+    def tokenize(self, text: str) -> list[str]:
+        return tokenize(text)
+
 
 def _import_scorers():
+    global _stemmer
     try:
+        from nltk.stem.porter import PorterStemmer
         from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
         from rouge_score import rouge_scorer
     except ImportError:
         print(
-            "缺少评估库，请安装: pip install nltk rouge-score",
+            '缺少评估库，请安装: pip install nltk "rouge-score>=0.1.2"',
             file=sys.stderr,
         )
         raise
+    _stemmer = PorterStemmer()
     return sentence_bleu, SmoothingFunction().method1, rouge_scorer.RougeScorer(
-        ["rouge1", "rouge2", "rougeL"], use_stemmer=True
+        ["rouge1", "rouge2", "rougeL"], tokenizer=_Tokenizer()
     )
 
 
@@ -65,11 +90,11 @@ def compute_metrics(
     smooth_fn: Any,
     scorer: Any,
 ) -> dict[str, float]:
-    bleu = sentence_bleu(
-        [reference.split()],
-        hypothesis.split(),
-        smoothing_function=smooth_fn,
-    )
+    hyp_tokens = tokenize(hypothesis)
+    ref_tokens = tokenize(reference)
+    if not hyp_tokens:
+        return {"bleu": 0.0, "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
+    bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smooth_fn)
     scores = scorer.score(reference, hypothesis)
     return {
         "bleu": float(bleu),
@@ -100,16 +125,20 @@ def score_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     sentence_bleu, smooth_fn, scorer = _import_scorers()
     totals = {"bleu": 0.0, "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
     n_valid = 0
+    n_no_ref = 0
+    n_empty_output = 0
     for rec in records:
+        rec.pop("metrics", None)
         if rec.get("error"):
             continue
-        hypothesis = rec.get("model_output")
-        reference = rec.get("ground_truth")
-        if not hypothesis or not reference:
+        reference = str(rec.get("ground_truth") or "")
+        if not tokenize(reference):
+            n_no_ref += 1
             continue
-        metrics = compute_metrics(
-            str(hypothesis), str(reference), sentence_bleu, smooth_fn, scorer
-        )
+        hypothesis = str(rec.get("model_output") or "")
+        metrics = compute_metrics(hypothesis, reference, sentence_bleu, smooth_fn, scorer)
+        if not tokenize(hypothesis):
+            n_empty_output += 1
         rec["metrics"] = metrics
         for key in totals:
             totals[key] += metrics[key]
@@ -117,6 +146,8 @@ def score_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
 
     avgs = {key: (totals[key] / n_valid if n_valid else 0.0) for key in totals}
     avgs["valid_metric_count"] = float(n_valid)
+    avgs["n_no_ref"] = float(n_no_ref)
+    avgs["n_empty_output"] = float(n_empty_output)
     return records, avgs
 
 
@@ -177,8 +208,12 @@ def main() -> int:
     write_jsonl(args.jsonl, records)
 
     n_valid = int(avgs["valid_metric_count"])
+    n_no_ref = int(avgs["n_no_ref"])
+    n_empty_output = int(avgs["n_empty_output"])
     print(
         f"scored {n_valid}/{len(records)} items  "
+        f"no_ref={n_no_ref}  "
+        f"empty_output={n_empty_output}  "
         f"BLEU={avgs['bleu']:.4f}  "
         f"ROUGE-1={avgs['rouge1']:.4f}  "
         f"ROUGE-2={avgs['rouge2']:.4f}  "

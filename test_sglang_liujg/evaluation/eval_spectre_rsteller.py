@@ -697,7 +697,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=30000)
     p.add_argument("--batch-size", type=int, default=1, help="Closed-loop concurrency")
     p.add_argument("--max-items", type=int, default=100)
-    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--data-file", type=Path, default=DEFAULT_DATA)
