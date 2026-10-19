@@ -324,7 +324,7 @@ def parse_args() -> argparse.Namespace:
         help="Cap on in-flight requests (asyncio.Semaphore). Default: unlimited.",
     )
     p.add_argument("--max-items", type=int, default=100)
-    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--data-file", type=Path, default=DEFAULT_DATA)

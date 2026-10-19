@@ -117,10 +117,10 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 DEFAULT_DATA = Path(
     "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/"
-    "USFM_UAV_training_data/json/test/test_RSTeller.json"
+    "test_RSTeller/json/test/test_RSTeller_ar_qwen3-vl-32B.json"
 )
 DEFAULT_IMG_DIR = Path(
-    "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/USFM_UAV_training_data"
+    "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/test_RSTeller"
 )
 DEFAULT_RESULT_DIR = HERE.parent / "result"
 CLOSED_CSV_PREFIX = [

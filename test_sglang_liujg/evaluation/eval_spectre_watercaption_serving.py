@@ -47,7 +47,7 @@ from eval_spectre_rsteller_serving import run_benchmark
 
 DEFAULT_DATA = Path(
     "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/"
-    "test_WaterCaption/json/test/test_WaterCaption.json"
+    "test_WaterCaption/json/test/test_WaterCaption_ar_qwen3-vl-32B.json"
 )
 DEFAULT_IMG_DIR = Path(
     "/home_18T/liujg/Hugging_Face/model_and_data_of_project_1/test_WaterCaption"
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         help="Cap on in-flight requests (asyncio.Semaphore). Default: unlimited.",
     )
     p.add_argument("--max-items", type=int, default=100)
-    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--data-file", type=Path, default=DEFAULT_DATA)
