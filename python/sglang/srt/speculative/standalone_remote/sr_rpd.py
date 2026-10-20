@@ -466,7 +466,7 @@ def stage_v1_result(workspace, indices, tokens, lengths, device, select=()):
         workspace._v1_key = key
     host = workspace._v1_host[:need]
     if need:
-        host.numpy()[:need] = indices + tokens + lengths + select
+        host.numpy()[:] = indices + tokens + lengths + select
         workspace._v1_dev[:need].copy_(
             host, non_blocking=workspace._v1_pinned and dev.type != "cpu"
         )

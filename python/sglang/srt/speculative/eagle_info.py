@@ -694,7 +694,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ]
             grammar = req.grammar
             try:
-                _appended, eos_cut, sentinel_col = append_verify_row(
+                appended, eos_cut, sentinel_col = append_verify_row(
                     req,
                     accept_index_row,
                     token_row,
@@ -713,14 +713,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sr_eos_cut[i] = eos_cut
             if host_v1_plan is not None:
                 start = len(flat_idx)
-                for j in range(_appended):
+                for j in range(appended):
                     flat_idx.append(int(accept_index_row[j]))
                     flat_tok.append(int(token_row[j]))
-                accept_length_list.append(_appended - 1)
+                accept_length_list.append(appended - 1)
             if not req.finished():
                 unfinished_index.append(i)
                 if host_v1_plan is not None:
-                    select.extend(range(start, start + _appended))
+                    select.extend(range(start, start + appended))
                 elif sentinel_col is not None:
                     unfinished_accept_index.append(accept_index[i, :sentinel_col])
                 else:
