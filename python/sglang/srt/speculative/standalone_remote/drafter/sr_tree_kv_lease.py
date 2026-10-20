@@ -17,6 +17,13 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     classify_prefix_alignment,
     find_fork_point,
 )
+from sglang.srt.speculative.standalone_remote.sr_prompt_coords import (
+    SRPromptCoordError,
+    align_target_ids,
+    logical_ids,
+    logical_prefix_floor,
+    logical_prompt_len,
+)
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 
 logger = logging.getLogger(__name__)
@@ -73,10 +80,15 @@ class SRTreeKVLease:
     pending_free_event: Any = None
     released: bool = False
     copy_unresolved: bool = False
+    # Physical KV length at publish. None means "same as base_committed_len",
+    # which is the uncompacted case. Target still matches base_committed_len.
+    kv_committed_len: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not self.page_count:
             self.page_count = len(self.page_ids or ())
+        if self.kv_committed_len is None:
+            self.kv_committed_len = int(self.base_committed_len)
 
 
 def plan_paged_tree_layout(
@@ -131,18 +143,28 @@ def snapshot_sr_align(req, dreq, prefix_len: int) -> SRAlignResult:
     output = req.output_ids or []
     kv_len = int(getattr(req, "kv_committed_len", 0) or 0)
     window = prefix_window_tokens(origin, output, base=kv_len)
-    padded = list(getattr(req, "sr_padded_ids", None) or origin)
-    local = list(origin) + list(output)
-    target = list(padded) + list(dreq.committed_ids or [])
-    _, fork = find_fork_point(local, target)
-    kind = "equal" if local == target else classify_prefix_alignment(
-        local, target, prefix_len
-    )
+    physical = list(origin) + list(output)
+    try:
+        local = logical_ids(req)
+    except SRPromptCoordError:
+        fork = 0
+        kind = "reprefill"
+    else:
+        target = align_target_ids(req, dreq)
+        _, fork = find_fork_point(local, target)
+        if local == target:
+            kind = "equal"
+        elif fork < logical_prompt_len(req):
+            kind = "reprefill"
+        else:
+            kind = classify_prefix_alignment(
+                local, target, logical_prefix_floor(req, prefix_len)
+            )
     return SRAlignResult(
         kind=kind,
         old_kv_committed_len=kv_len,
         old_prefix_revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
-        old_local_len=len(local),
+        old_local_len=len(physical),
         old_prefix_window=window,
         fork=int(fork),
     )
@@ -491,7 +513,10 @@ def validate_lease_commit(
         return MISS_VERSION
     if int(lease.base_committed_len) != int(commit_tree_base_committed_len):
         return MISS_BASE
-    if int(align.old_kv_committed_len) != int(lease.base_committed_len):
+    kv_base = lease.kv_committed_len
+    if kv_base is None:
+        kv_base = lease.base_committed_len
+    if int(align.old_kv_committed_len) != int(kv_base):
         return MISS_BASE
     if int(align.old_prefix_revision) != int(lease.revision):
         return MISS_REVISION

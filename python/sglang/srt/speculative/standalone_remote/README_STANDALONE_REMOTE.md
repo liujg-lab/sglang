@@ -491,6 +491,7 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | request `padded_input_ids` | 完整上下文发送时携带的 prompt；VL 时已 pad |
 | request `sampling_params` | 完整上下文发送时携带采样、停止条件及结构化输出配置 |
 | request `has_mm` | 本次是否附带多模态 payload，不等于该请求永远没有视觉状态 |
+| request `draft_vision_keep_ratio` | 可选。Target 按请求覆盖 Draft 视觉保留比例；缺省时 Draft 用自己的启动参数。只影响 Draft prompt |
 
 ### 回复与多模态字段
 
@@ -502,6 +503,8 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | reply item `status` | `ok` 正常、`empty` 空窗、`idempotent` 复用已生成窗口、`reject` 拒绝；Target 接入草稿要求 ok/idempotent 且 token 非空 |
 | reply item `draft_tokens` | 草稿 token ID；空窗允许 Target 降级 |
 | reply item `parent_list/top_scores_index` | 树拓扑与候选选择索引，Target 据此重建树；不是分数或完整 logits |
+| reply item `draft_prompt_len` | 可选，只出现在实际压缩过的 PREFILL 回复里，是 Draft 本地 prompt 长度 |
+| reply item `prompt_compaction` | 可选。为 `True` 时表示这次 PREFILL 缩短了 Draft 视觉 prompt。Target 只记入 `draft_prompt_tokens`、`target_prompt_tokens`、`prompt_compaction_reqs`，验证逻辑不变 |
 | mm `rid/mm_items` | 请求身份、图像/视频等 item 列表。已 pad 的 prompt 只在控制请求的 `padded_input_ids` 里，不在 MM meta 中重复 |
 | mm item | modality、format、hash、pad_value、offsets、feature、precomputed_embeddings、model_specific_data |
 | mm 特殊 token | image/video/audio/slice 等标记 ID；音频字段存在不证明完整音频路径可用 |
@@ -523,6 +526,10 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | `--standalone-remote-draft-ttl-s` | `60.0` | Draft 空闲 RPC 状态清理，单位秒；`<=0` 关闭，当前 RPC 涉及的请求不清理 |
 | `--standalone-remote-breaker-failures` | `3` | Target 连续失败阈值；超时及发送/接收失败可触发；REJECT 是活跃回复 |
 | `--standalone-remote-breaker-cooldown` | `32` | 熔断 OPEN 后跳过的 decode 步数，之后进入 HALF_OPEN 探测；不是秒 |
+| `--standalone-remote-draft-vision-compress` | `none` | 仅 Draft。`visionzip` 在建请求时剪掉部分图像 token；`none` 保持全长。Target 设成非默认值会拒绝启动 |
+| `--standalone-remote-draft-vision-keep-ratio` | `0.25` | 仅 Draft。每张图保留的 LLM 视觉 token 比例，范围 `(0, 1]`。请求字段 `draft_vision_keep_ratio` 可覆盖 |
+| `--standalone-remote-draft-vision-dominant-ratio` | `0.85` | 仅 Draft。保留名额里按注意力分数直接选取的比例，其余是上下文锚点，范围 `(0, 1]` |
+| `--standalone-remote-draft-vision-score-layer` | `-2` | 仅 Draft。打分用的 ViT block，负数从末尾数，`-2` 是倒数第二层 |
 
 ### 邻近投机与设备参数
 

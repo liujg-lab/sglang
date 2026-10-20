@@ -541,6 +541,11 @@ class ServerArgs:
     standalone_remote_draft_ttl_s: float = 60.0
     standalone_remote_breaker_failures: int = 3
     standalone_remote_breaker_cooldown: int = 32
+    # Draft-only vision token pruning. Target must leave these at the defaults.
+    standalone_remote_draft_vision_compress: Literal["none", "visionzip"] = "none"
+    standalone_remote_draft_vision_keep_ratio: float = 0.25
+    standalone_remote_draft_vision_dominant_ratio: float = 0.85
+    standalone_remote_draft_vision_score_layer: int = -2
 
     # Expert parallelism
     ep_size: int = 1
@@ -3270,6 +3275,7 @@ class ServerArgs:
                 "The overlap scheduler and mixed chunked prefill are disabled "
                 "because of using STANDALONE_REMOTE speculative decoding."
             )
+            self._validate_standalone_remote_draft_vision()
             self._validate_standalone_remote_vl_config()
             self._log_remote_spec_backend_checks("STANDALONE_REMOTE")
 
@@ -3311,6 +3317,29 @@ class ServerArgs:
                     f"{algo} speculative_verify_mode=target_only is not available "
                     f"on backend={backend}."
                 )
+
+    def _validate_standalone_remote_draft_vision(self) -> None:
+        """VisionZip flags are Draft-only. Target verification stays full-length."""
+        from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+            validate_draft_vision_config,
+        )
+
+        compress = self.standalone_remote_draft_vision_compress
+        keep = float(self.standalone_remote_draft_vision_keep_ratio)
+        dominant = float(self.standalone_remote_draft_vision_dominant_ratio)
+        layer = int(self.standalone_remote_draft_vision_score_layer)
+        validate_draft_vision_config(
+            self.standalone_remote_role, compress, keep, dominant, layer
+        )
+        if self.standalone_remote_role == "draft" and compress == "visionzip":
+            logger.info(
+                "STANDALONE_REMOTE draft VisionZip: keep_ratio=%s "
+                "dominant_ratio=%s score_layer=%s. This shortens only the Draft "
+                "prompt. Target still verifies the full vision sequence.",
+                keep,
+                dominant,
+                layer,
+            )
 
     def _validate_standalone_remote_vl_config(self) -> None:
         """Draft 自跑 ViT 时 embedding 条数必须等于占位符个数。
@@ -5437,6 +5466,44 @@ class ServerArgs:
             help=(
                 "Decode steps to skip while the Target RPC breaker is OPEN "
                 "before one STEP probe."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-draft-vision-compress",
+            type=str,
+            choices=["none", "visionzip"],
+            default=ServerArgs.standalone_remote_draft_vision_compress,
+            help=(
+                "Draft-only vision token pruning. none keeps every image token. "
+                "visionzip scores the Draft ViT and keeps a fraction of the LLM "
+                "vision tokens. Target verification is unchanged."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-draft-vision-keep-ratio",
+            type=float,
+            default=ServerArgs.standalone_remote_draft_vision_keep_ratio,
+            help=(
+                "Fraction of each image's LLM vision tokens the Draft keeps. "
+                "Range (0, 1]. A per-request draft_vision_keep_ratio overrides this."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-draft-vision-dominant-ratio",
+            type=float,
+            default=ServerArgs.standalone_remote_draft_vision_dominant_ratio,
+            help=(
+                "Fraction of the kept budget taken from the highest vision scores. "
+                "The rest are context anchors that absorb nearby tokens. Range (0, 1]."
+            ),
+        )
+        parser.add_argument(
+            "--standalone-remote-draft-vision-score-layer",
+            type=int,
+            default=ServerArgs.standalone_remote_draft_vision_score_layer,
+            help=(
+                "ViT block used to score patches. Negative indexes count from the "
+                "end, so -2 is the second-to-last block."
             ),
         )
 

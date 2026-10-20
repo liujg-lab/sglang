@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.speculative.standalone_remote.sr_prompt_coords import logical_len
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SR_PROTOCOL_VERSION,
     SRAction,
@@ -347,8 +348,7 @@ def delta_fast_allowed(
         revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
     ):
         return False
-    local_len = len(origin or []) + len(output or [])
-    return local_len == int(state.prompt_len) + int(base_output_len)
+    return logical_len(req) == int(state.prompt_len) + int(base_output_len)
 
 
 def route_snapshot_recovery(
@@ -442,14 +442,23 @@ def grammar_committed_ids(
     padded_ids: Optional[Sequence[int]],
     *,
     tree_mode: bool,
+    local_prompt_len: Optional[int] = None,
 ) -> List[int]:
-    """Committed output for grammar. Excludes prompt and unaccepted drafts."""
+    """Committed output for grammar. Excludes prompt and unaccepted drafts.
+
+    ``local_prompt_len`` is the physical prompt length. When it is omitted the
+    cut is the logical padded prompt, which matches the uncompacted sequence.
+    """
     if commit_output is not None:
         return list(commit_output)
     if tree_mode:
-        prompt = list(padded_ids if padded_ids is not None else origin_ids or [])
         folded = list(origin_ids or []) + list(output_ids or [])
-        return folded[len(prompt) :]
+        if local_prompt_len is None:
+            prompt = list(padded_ids if padded_ids is not None else origin_ids or [])
+            cut = len(prompt)
+        else:
+            cut = int(local_prompt_len)
+        return folded[cut:]
     return list(output_ids or [])
 
 

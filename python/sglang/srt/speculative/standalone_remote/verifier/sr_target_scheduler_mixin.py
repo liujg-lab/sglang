@@ -327,6 +327,9 @@ class SchedulerStandaloneRemoteTargetMixin:
                     commit_mode="snapshot",
                     commit_version=version,
                     requires_mm=requires_mm,
+                    draft_vision_keep_ratio=getattr(
+                        req, "draft_vision_keep_ratio", None
+                    ),
                 ),
                 mm_payload,
             )
@@ -687,6 +690,18 @@ class SchedulerStandaloneRemoteTargetMixin:
             reply.parent_list = None
             reply.top_scores_index = None
 
+    def _sr_note_draft_prompt_lens(self, reqs: List[Req], replies) -> None:
+        """Record Draft prompt compaction. Verification still uses Target tokens."""
+        metrics = get_sr_round_metrics(self, "Target")
+        for req in reqs:
+            reply = replies.get(req.rid)
+            if reply is None or reply.draft_prompt_len is None:
+                continue
+            metrics.counts["draft_prompt_tokens"] += int(reply.draft_prompt_len)
+            metrics.counts["target_prompt_tokens"] += len(req.origin_input_ids or [])
+            if reply.prompt_compaction:
+                metrics.counts["prompt_compaction_reqs"] += 1
+
     def _sr_attach_replies(
         self, reqs: List[Req], replies: Dict[str, SRDraftReply]
     ) -> int:
@@ -781,6 +796,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                             replies, pending = self._sr_recv(inflight)
                             still = [r for r in live if not r.finished()]
                             self._sr_apply_commit_acks(still, replies, pending)
+                            self._sr_note_draft_prompt_lens(still, replies)
                             self._sr_maybe_align_chain_replies(
                                 still, replies, prefill=True
                             )

@@ -66,6 +66,17 @@ from sglang.srt.speculative.standalone_remote.sr_align import (
     sr_decode_seq_len,
     tree_seed_matches_prefix,
 )
+from sglang.srt.speculative.standalone_remote.sr_prompt_coords import (
+    SRPromptCoordError,
+    align_target_ids,
+    local_prompt_len,
+    logical_ids,
+    physical_ids_for_target,
+    prompt_delta,
+    prompt_replaced,
+    restore_compacted_mrope,
+    to_local,
+)
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
     CommitOutcome,
@@ -1059,6 +1070,11 @@ class StandaloneRemoteDraftSchedulerMixin:
             mm_inputs = mm.to_multimodal_inputs()
             req.extend_image_inputs(mm_inputs)
             self._maybe_compute_mrope_positions(req)
+            from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+                maybe_compact_draft_prompt,
+            )
+
+            maybe_compact_draft_prompt(self, req, dreq)
 
         self._sr_attach_grammar(req)
 
@@ -1139,6 +1155,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                     req.origin_input_ids,
                     getattr(req, "sr_padded_ids", None),
                     tree_mode=self._sr_tree_mode(),
+                    local_prompt_len=local_prompt_len(req),
                 )
                 req.grammar = replay_grammar_from_committed(
                     template, committed_ids
@@ -1182,16 +1199,28 @@ class StandaloneRemoteDraftSchedulerMixin:
         state.local_prefix_stamp = None
 
     def _sr_align(
-        self, req: Req, dreq: SRDraftRequest, state: SRDraftState
+        self,
+        req: Req,
+        dreq: SRDraftRequest,
+        state: SRDraftState,
+        mm=None,
     ) -> None:
         prefix_len = self.sr_kv.get_prefix_len(req)
         result = snapshot_sr_align(req, dreq, prefix_len)
         req.sr_align_result = result
         req.sr_prefix_proven = False
         req.sr_pending_dreq = dreq
-        padded = list(getattr(req, "sr_padded_ids", None) or req.origin_input_ids)
-        local = list(req.origin_input_ids) + list(req.output_ids or [])
-        target = list(padded) + list(dreq.committed_ids or [])
+        if prompt_replaced(req, dreq):
+            invalidate_tree_seed(req)
+            self._sr_clear_prefix_stamp(state)
+            self._sr_rebuild_replaced_prompt(req, dreq, state, mm)
+            return
+        physical = list(req.origin_input_ids) + list(req.output_ids or [])
+        try:
+            local = logical_ids(req)
+        except SRPromptCoordError:
+            local = physical
+        target = align_target_ids(req, dreq)
         if result.kind == "equal":
             req.sr_prefix_proven = True
             req.draft_generation_start_len = len(req.output_ids or [])
@@ -1203,9 +1232,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         kind = result.kind
         allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
         if allocated <= 0:
-            allocated = max(0, len(local) - 1)
+            allocated = max(0, len(physical) - 1)
         committed = int(result.old_kv_committed_len)
         fork = result.fork
+        try:
+            kv_fork = to_local(req, fork)
+        except SRPromptCoordError:
+            kv_fork = None
 
         if kind == "replace_tail":
             clear_fill_credential(req)
@@ -1215,13 +1248,15 @@ class StandaloneRemoteDraftSchedulerMixin:
             clear_tree_seed_pack(req)
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
-            if last_token_in_kv(fork, committed):
+            if kv_fork is not None and last_token_in_kv(kv_fork, committed):
                 self._sr_rollback_else_reprefill(
                     req,
-                    fork,
+                    kv_fork,
                     allocated,
-                    lambda: self._sr_reprefill(req, target, dreq, state),
+                    lambda: self._sr_reprefill_logical(req, target, dreq, state, mm),
                 )
+            elif kv_fork is None:
+                self._sr_reprefill_logical(req, target, dreq, state, mm)
             return
         if kind in ("append_one", "append_n"):
             req.output_ids.extend(target[len(local) :])
@@ -1229,12 +1264,12 @@ class StandaloneRemoteDraftSchedulerMixin:
             req.draft_generation_start_len = len(req.output_ids)
             req.draft_tokens_target = dreq.num_draft_tokens
             return
-        if kind == "local_rollback" and fork == len(target):
+        if kind == "local_rollback" and fork == len(target) and kv_fork is not None:
             if self._sr_rollback_else_reprefill(
                 req,
-                fork,
+                kv_fork,
                 allocated,
-                lambda: self._sr_reprefill(req, target, dreq, state),
+                lambda: self._sr_reprefill_logical(req, target, dreq, state, mm),
             ):
                 clear_fill_credential(req)
                 extra = len(local) - fork
@@ -1248,7 +1283,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 req.draft_tokens_target = dreq.num_draft_tokens
             return
         self._sr_clear_prefix_stamp(state)
-        self._sr_reprefill(req, target, dreq, state)
+        self._sr_reprefill_logical(req, target, dreq, state, mm)
 
     def _sr_rollback_else_reprefill(self, req, fork, allocated, on_refused) -> bool:
         """True when the local rollback completed.
@@ -1367,7 +1402,12 @@ class StandaloneRemoteDraftSchedulerMixin:
     def _sr_on_scheduler_retract(self, req: Req) -> None:
         fill_ids = list(req.origin_input_ids or []) + list(req.output_ids or [])
         if not fill_ids:
-            fill_ids = list(getattr(req, "sr_padded_ids", None) or [])
+            local_prompt = getattr(req, "sr_local_prompt_ids", None)
+            fill_ids = list(
+                local_prompt
+                if local_prompt is not None
+                else (getattr(req, "sr_padded_ids", None) or [])
+            )
         self._sr_reset_linear_kv_state(req, fill_ids)
         self._sr_pause_req(req)
 
@@ -1400,16 +1440,26 @@ class StandaloneRemoteDraftSchedulerMixin:
             # origin_input_ids was rewritten, so M-RoPE must be recomputed. If
             # that fails or the vision tensors are already gone, prefilling
             # would index past the embedding table and take down the scheduler.
-            reset_mm_mrope(req.multimodal_inputs)
-            maybe = getattr(self, "_maybe_compute_mrope_positions", None)
-            if callable(maybe):
-                try:
-                    maybe(req)
-                except Exception as e:
+            # A compacted prompt keeps the full-sequence table and gathers it;
+            # the stock index would assign positions as if the short ids were
+            # a full vision grid.
+            if prompt_delta(req) > 0:
+                if not restore_compacted_mrope(req):
                     self._sr_mark_degraded(
-                        req.rid, f"compute_mrope_positions failed: {e}"
+                        req.rid, "compacted mrope restore failed"
                     )
                     return
+            else:
+                reset_mm_mrope(req.multimodal_inputs)
+                maybe = getattr(self, "_maybe_compute_mrope_positions", None)
+                if callable(maybe):
+                    try:
+                        maybe(req)
+                    except Exception as e:
+                        self._sr_mark_degraded(
+                            req.rid, f"compute_mrope_positions failed: {e}"
+                        )
+                        return
             embed_err = self._sr_mm_embed_error(req)
             if embed_err:
                 self._sr_mark_degraded(req.rid, embed_err)
@@ -2167,6 +2217,64 @@ class StandaloneRemoteDraftSchedulerMixin:
             windows[idx] = got[j]
         return windows
 
+    def _sr_reprefill_logical(
+        self,
+        req: Req,
+        logical_fill_ids: List[int],
+        dreq: SRDraftRequest,
+        state: SRDraftState,
+        mm=None,
+    ) -> None:
+        """Reprefill a Target-coordinate sequence on the physical prompt.
+
+        A replaced prompt cannot be mapped through the old keep-index. Rebuild
+        from the snapshot payload when pixels are present; otherwise degrade.
+        """
+        if prompt_replaced(req, dreq):
+            self._sr_rebuild_replaced_prompt(req, dreq, state, mm)
+            return
+        try:
+            fill = physical_ids_for_target(req, logical_fill_ids)
+        except SRPromptCoordError as exc:
+            self._sr_mark_degraded(req.rid, f"prompt coord: {exc}")
+            return
+        self._sr_reprefill(req, fill, dreq, state)
+
+    def _sr_rebuild_replaced_prompt(
+        self,
+        req: Req,
+        dreq: SRDraftRequest,
+        state: SRDraftState,
+        mm,
+    ) -> None:
+        """Drop the compacted request and create one for the new prompt."""
+        items = list(getattr(mm, "mm_items", None) or []) if mm is not None else []
+        if getattr(dreq, "requires_mm", False) and not mm_items_complete(items):
+            self._sr_mark_degraded(req.rid, "prompt changed without pixels")
+            return
+        session = ""
+        if state is not None and getattr(state, "session_id", None):
+            session = state.session_id
+        elif getattr(self.sr_state, "session_id", None):
+            session = self.sr_state.session_id
+        rebuilt = self._sr_create_req(dreq, mm, session)
+        if rebuilt is None:
+            self._sr_mark_degraded(req.rid, "prompt rebuild failed")
+            return
+        rebuilt.sr_pending_dreq = dreq
+        rebuilt.sr_prefix_proven = False
+
+    def _sr_adopt_rebuilt(self, dreq: SRDraftRequest, req: Optional[Req], state):
+        """Follow ``_sr_create_req`` when a prompt change replaced the live req."""
+        live = self.sr_state.get(dreq.rid)
+        if (
+            live is not None
+            and live.req_object is not None
+            and live.req_object is not req
+        ):
+            return live.req_object, live
+        return req, state
+
     def _sr_reprefill(
         self,
         req: Req,
@@ -2272,6 +2380,19 @@ class StandaloneRemoteDraftSchedulerMixin:
             draft_tokens=[],
             status=status,
         )
+
+    def _sr_annotate_prompt_compaction(
+        self, req: Req, reply: SRDraftReply
+    ) -> SRDraftReply:
+        """Tell Target the physical prompt length. Absent when nothing was dropped."""
+        if prompt_delta(req) <= 0:
+            return reply
+        local = getattr(req, "sr_local_prompt_ids", None)
+        if local is None:
+            return reply
+        reply.draft_prompt_len = len(local)
+        reply.prompt_compaction = True
+        return reply
 
     def _sr_stamp_window(
         self,
@@ -2675,9 +2796,11 @@ class StandaloneRemoteDraftSchedulerMixin:
             state = self.sr_state.get(dreq.rid)
         elif route == RecoveryRoute.REPREFILL:
             fill = list(prompt) + list(output_ids)
-            self._sr_reprefill(req, fill, local, state)
+            self._sr_reprefill_logical(req, fill, local, state, mm)
+            req, state = self._sr_adopt_rebuilt(local, req, state)
         else:
-            self._sr_align(req, local, state)
+            self._sr_align(req, local, state, mm)
+            req, state = self._sr_adopt_rebuilt(local, req, state)
         self._sr_stage_slow_commit(
             dreq, req, state, verdict, output_ids, fingerprint
         )
@@ -2875,6 +2998,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                 pending_wire = getattr(req, "sr_pending_wire_request", None)
                 wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
                 reply = self._sr_stamp_window(wire, window, batch.session_id)
+                if batch.action == SRAction.PREFILL:
+                    reply = self._sr_annotate_prompt_compaction(req, reply)
                 replies[i] = self._sr_finalize_v2_commit(wire, req, reply)
             if metrics.active:
                 metrics.add_host("reply_prepare", time.perf_counter() - reply_start)

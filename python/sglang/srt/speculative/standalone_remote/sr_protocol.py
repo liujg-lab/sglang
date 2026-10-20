@@ -162,6 +162,8 @@ class SRDraftRequest:
     base_output_len: Optional[int] = None
     delta_ids: Optional[List[int]] = None
     requires_mm: bool = False
+    # Optional per-request Draft vision keep ratio. None uses the Draft flag.
+    draft_vision_keep_ratio: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -210,6 +212,9 @@ class SRDraftReply:
     reason: Optional[str] = None
     # Draft local (topk, num_steps, num_draft_tokens), set on spec_shape_mismatch.
     spec_shape: Optional[Tuple[int, ...]] = None
+    # Set only on a PREFILL reply when Draft shortened its own vision prompt.
+    draft_prompt_len: Optional[int] = None
+    prompt_compaction: Optional[bool] = None
 
     def matches(self, pending: SRPendingEntry) -> Tuple[bool, Optional[str]]:
         if self.step_id != pending.step_id:

@@ -66,6 +66,9 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_eager_page_buckets,
     tree_paged_shape_key,
 )
+from sglang.srt.speculative.standalone_remote.sr_prompt_coords import (
+    lease_base_pair,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_warmup import (
     draft_warmup_raw_batch_sizes,
     warm_draft_alloc_mapping,
@@ -826,15 +829,17 @@ class SRTreeDrafter:
                     origin = req.origin_input_ids or []
                     output = req.output_ids or []
                     base = len(origin) + len(output)
+                logical_base, kv_base = lease_base_pair(req, base)
                 lease = SRTreeKVLease(
                     rid=req.rid,
                     version=store.next_version(),
                     revision=int(getattr(req, "sr_prefix_revision", 0) or 0),
-                    base_committed_len=base,
+                    base_committed_len=logical_base,
+                    kv_committed_len=kv_base,
                     prefix_tokens=prefix_window_tokens(
                         req.origin_input_ids or (),
                         req.output_ids or (),
-                        base,
+                        kv_base,
                     ),
                     page_ids=[],
                     page_slots=lease_state["page_slots"][j],
