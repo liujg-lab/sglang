@@ -491,7 +491,6 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | request `padded_input_ids` | 完整上下文发送时携带的 prompt；VL 时已 pad |
 | request `sampling_params` | 完整上下文发送时携带采样、停止条件及结构化输出配置 |
 | request `has_mm` | 本次是否附带多模态 payload，不等于该请求永远没有视觉状态 |
-| request `draft_vision_keep_ratio` | 可选。Target 按请求覆盖 Draft 视觉保留比例；缺省时 Draft 用自己的启动参数。只影响 Draft prompt |
 
 ### 回复与多模态字段
 
@@ -527,9 +526,18 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | `--standalone-remote-breaker-failures` | `3` | Target 连续失败阈值；超时及发送/接收失败可触发；REJECT 是活跃回复 |
 | `--standalone-remote-breaker-cooldown` | `32` | 熔断 OPEN 后跳过的 decode 步数，之后进入 HALF_OPEN 探测；不是秒 |
 | `--standalone-remote-draft-vision-compress` | `none` | 仅 Draft。`visionzip` 在建请求时剪掉部分图像 token；`none` 保持全长。Target 设成非默认值会拒绝启动 |
-| `--standalone-remote-draft-vision-keep-ratio` | `0.25` | 仅 Draft。每张图保留的 LLM 视觉 token 比例，范围 `(0, 1]`。请求字段 `draft_vision_keep_ratio` 可覆盖 |
-| `--standalone-remote-draft-vision-dominant-ratio` | `0.85` | 仅 Draft。保留名额里按注意力分数直接选取的比例，其余是上下文锚点，范围 `(0, 1]` |
+| `--standalone-remote-draft-vision-keep-ratio` | `0.25` | 仅 Draft。每张图保留的 LLM 视觉 token 比例，范围 `(0, 1]`。只由 Draft 启动参数决定 |
+| `--standalone-remote-draft-vision-dominant-ratio` | `0.85` | 仅 Draft。保留名额里按注意力分数直接选取的比例，其余是上下文锚点，范围 `(0, 1]`。设为 `1` 时没有锚点，未选中的 token 被丢弃，而不是并入 dominant |
 | `--standalone-remote-draft-vision-score-layer` | `-2` | 仅 Draft。打分用的 ViT block，负数从末尾数，`-2` 是倒数第二层 |
+
+### 与 VisionZip 论文的差别
+
+Draft 上的压缩按下面的方式适配 Qwen-VL，不是论文原文的逐步复现：
+
+- Qwen3-VL 没有 CLS token。被关注度是采样 query 对每个 key 的注意力平均，再按 merge 窗口求和，当作 dominant token 的分数。
+- 合并是 `mean(target + donors)`，也就是目标行和分到它的 donor 一起求均值。论文是 `target + mean(donors)`。均值的数值范围更稳，这里保留均值。
+- donor 找最近锚点时，余弦相似度用打分层 key 在 merge 窗口上的均值。Qwen 的 `spatial_merge_unit` 是 4，对应 2x2。分数仍来自同一层的 q/k。被写回的仍是完整 embedding 行，包括 deepstack 列。
+- `dominant_ratio=1` 时保留名额全部给 dominant，没有上下文锚点。其余 token 直接丢弃，不会合并进去。
 
 ### 邻近投机与设备参数
 

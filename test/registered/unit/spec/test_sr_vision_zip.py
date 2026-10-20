@@ -12,6 +12,12 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     validate_lease_commit,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+    QUERY_CHUNK,
+    _attention_received,
+    _item_token_counts,
+    _merge_context,
+    _sample_queries,
+    _slice_encoded_items,
     append_visionzip_extra_key,
     rebuild_prompt,
     validate_draft_vision_config,
@@ -331,7 +337,39 @@ class TestVisionZipRows(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
         self.assertTrue(torch.equal(first[0], embeddings[1]))
         self.assertEqual(first.shape[-1], embeddings.shape[-1])
-        self.assertGreater(float(first[1, -1]), 0.0)
+        # Dominant row is index 1. The one context target is index 2, and both
+        # remaining rows (0 and 3) match it, so the kept row is their mean.
+        expected = (embeddings[0] + embeddings[2] + embeddings[3]) / 3
+        self.assertTrue(torch.allclose(first[1], expected))
+
+    def test_metric_moves_donor_without_changing_the_mean(self):
+        embeddings = torch.tensor(
+            [
+                [1.0, 0.0, 9.0],
+                [0.0, 1.0, 3.0],
+                [1.0, 0.0, 5.0],
+            ]
+        )
+        metric = torch.tensor(
+            [
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+            ]
+        )
+        remaining = [0, 1, 2]
+        targets = [0, 1]
+        by_embed = _merge_context(embeddings, remaining, targets, hidden_size=2)
+        by_metric = _merge_context(
+            embeddings, remaining, targets, hidden_size=2, metric=metric
+        )
+        self.assertFalse(torch.allclose(by_embed, by_metric))
+        self.assertTrue(torch.allclose(by_embed[0], (embeddings[0] + embeddings[2]) / 2))
+        self.assertTrue(torch.allclose(by_embed[1], embeddings[1]))
+        self.assertTrue(torch.allclose(by_metric[0], embeddings[0]))
+        self.assertTrue(
+            torch.allclose(by_metric[1], (embeddings[1] + embeddings[2]) / 2)
+        )
 
     def test_full_keep_is_uncompacted(self):
         embeddings = torch.arange(8, dtype=torch.float32).view(4, 2)
@@ -357,8 +395,11 @@ class TestVisionZipRows(unittest.TestCase):
         self.assertTrue(salted.startswith("sr-visionzip:"))
         again = visionzip_radix_salt([0, 2, 5], 0.25, 0.85, -2)
         self.assertEqual(salted, again)
+        self.assertNotIn("0,2,5", salted)
+        self.assertEqual(len(salted.split(":")[-1]), 32)
         other = visionzip_radix_salt([0, 1, 5], 0.25, 0.85, -2)
         self.assertNotEqual(salted, other)
+        self.assertNotIn("0,1,5", other)
         kept = SimpleNamespace(extra_key="cache-salt")
         combined = append_visionzip_extra_key(kept, [0, 2, 5], 0.25, 0.85, -2)
         self.assertTrue(combined.startswith("cache-salt|"))
@@ -369,12 +410,11 @@ class TestVisionProtocol(unittest.TestCase):
     def test_optional_fields_roundtrip_and_absence(self):
         bare = SRDraftRequest(rid="a")
         self.assertNotIn("draft_vision_keep_ratio", bare.to_dict())
-        self.assertIsNone(SRDraftRequest.from_dict({"rid": "a"}).draft_vision_keep_ratio)
-        sent = SRDraftRequest(rid="a", draft_vision_keep_ratio=0.5)
-        loaded = SRDraftRequest.from_dict(sent.to_dict())
-        self.assertEqual(loaded.draft_vision_keep_ratio, 0.5)
-        loaded = SRDraftRequest.from_dict({"rid": "a", "future_field": 1})
+        loaded = SRDraftRequest.from_dict(
+            {"rid": "a", "draft_vision_keep_ratio": 0.5, "future_field": 1}
+        )
         self.assertEqual(loaded.rid, "a")
+        self.assertFalse(hasattr(loaded, "draft_vision_keep_ratio"))
 
         reply = SRDraftReply(rid="a")
         self.assertNotIn("draft_prompt_len", reply.to_dict())
@@ -394,6 +434,59 @@ class TestVisionProtocol(unittest.TestCase):
             validate_draft_vision_config("draft", "visionzip", 1.5, 0.85, -2)
         validate_draft_vision_config("target", "none", 0.25, 0.85, -2)
         validate_draft_vision_config("draft", "visionzip", 0.25, 0.85, -2)
+
+
+class TestVisionZipScoreAndSlice(unittest.TestCase):
+    def test_einsum_matches_per_head_matmul(self):
+        torch.manual_seed(0)
+        tokens, heads, dim = 96, 3, 5
+        q = torch.randn(tokens, heads, dim)
+        k = torch.randn(tokens, heads, dim)
+        got = _attention_received(q, k)
+
+        queries = _sample_queries(tokens, q.device)
+        qs = q.index_select(0, queries).float()
+        kk = k.float()
+        self.assertGreater(int(qs.shape[0]), QUERY_CHUNK)
+        scale = dim ** -0.5
+        acc = torch.zeros(tokens, dtype=torch.float32)
+        q_count = int(qs.shape[0])
+        for head in range(heads):
+            key = kk[:, head, :]
+            for q0 in range(0, q_count, QUERY_CHUNK):
+                qq = qs[q0 : q0 + QUERY_CHUNK, head, :]
+                logits = torch.matmul(qq, key.transpose(0, 1)) * scale
+                acc += torch.softmax(logits, dim=-1).sum(dim=0)
+        acc /= float(q_count * heads)
+        self.assertTrue(torch.allclose(got, acc))
+
+    def test_slice_encoded_items_covers_two_requests(self):
+        first = SimpleNamespace(
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            offsets=[(0, 0)],
+        )
+        second = SimpleNamespace(
+            image_grid_thw=torch.tensor([[1, 4, 4]]),
+            offsets=[(10, 13)],
+        )
+        merge_unit = 4
+        counts = [
+            sum(_item_token_counts(item, merge_unit)) for item in (first, second)
+        ]
+        self.assertEqual(counts, [1, 4])
+        total = sum(counts)
+        rows = torch.arange(total * 2, dtype=torch.float32).view(total, 2)
+        scores = torch.arange(total, dtype=torch.float32)
+        keys = torch.arange(total * 3, dtype=torch.float32).view(total, 3)
+        sliced = _slice_encoded_items(rows, scores, keys, [first, second], merge_unit)
+        cursor = 0
+        for item, count in ((first, counts[0]), (second, counts[1])):
+            emb, score, key = sliced[id(item)]
+            self.assertTrue(torch.equal(emb, rows[cursor : cursor + count]))
+            self.assertTrue(torch.equal(score, scores[cursor : cursor + count]))
+            self.assertTrue(torch.equal(key, keys[cursor : cursor + count]))
+            cursor += count
+        self.assertEqual(cursor, total)
 
 
 if __name__ == "__main__":

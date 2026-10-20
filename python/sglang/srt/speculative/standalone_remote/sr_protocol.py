@@ -162,8 +162,6 @@ class SRDraftRequest:
     base_output_len: Optional[int] = None
     delta_ids: Optional[List[int]] = None
     requires_mm: bool = False
-    # Optional per-request Draft vision keep ratio. None uses the Draft flag.
-    draft_vision_keep_ratio: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}

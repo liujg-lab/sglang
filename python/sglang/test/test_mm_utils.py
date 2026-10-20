@@ -46,5 +46,27 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
         proxy_feature.reconstruct_on_target_device.assert_called_once_with(0)
 
 
+def _image_item(*, precomputed=None, feature=None):
+    return MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=feature,
+        precomputed_embeddings=precomputed,
+    )
+
+
+class TestMixedPrecomputedEmbed(unittest.TestCase):
+    def test_has_mixed_precomputed(self):
+        precomputed = MultimodalInputs(
+            mm_items=[_image_item(precomputed=torch.ones(2, 4))]
+        )
+        raw = MultimodalInputs(mm_items=[_image_item(feature=torch.ones(2, 4))])
+        empty = MultimodalInputs(mm_items=[])
+        self.assertTrue(mm_utils._has_mixed_precomputed([precomputed, raw]))
+        self.assertFalse(mm_utils._has_mixed_precomputed([precomputed, precomputed]))
+        self.assertFalse(mm_utils._has_mixed_precomputed([raw, raw]))
+        self.assertFalse(mm_utils._has_mixed_precomputed([precomputed, empty, None]))
+        self.assertFalse(mm_utils._has_mixed_precomputed([raw]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

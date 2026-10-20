@@ -327,9 +327,6 @@ class SchedulerStandaloneRemoteTargetMixin:
                     commit_mode="snapshot",
                     commit_version=version,
                     requires_mm=requires_mm,
-                    draft_vision_keep_ratio=getattr(
-                        req, "draft_vision_keep_ratio", None
-                    ),
                 ),
                 mm_payload,
             )

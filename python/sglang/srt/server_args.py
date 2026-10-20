@@ -5485,7 +5485,7 @@ class ServerArgs:
             default=ServerArgs.standalone_remote_draft_vision_keep_ratio,
             help=(
                 "Fraction of each image's LLM vision tokens the Draft keeps. "
-                "Range (0, 1]. A per-request draft_vision_keep_ratio overrides this."
+                "Range (0, 1]."
             ),
         )
         parser.add_argument(

@@ -525,6 +525,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self.cur_batch = batch
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self._sr_park_finished_prefill_embeddings(batch)
                 self.last_batch = batch
                 return
         self.cur_batch = None
@@ -1007,6 +1008,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         mm: Optional[SRMMPayload],
         session_id: str,
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> Optional[Req]:
         rid = dreq.rid
         if self.sr_state.exists(rid):
@@ -1066,17 +1068,22 @@ class StandaloneRemoteDraftSchedulerMixin:
         req.suppress_local_finish = True
         self._sr_ensure_window_budget(req, dreq.num_draft_tokens)
 
+        defer_vision = vision_jobs is not None and mm is not None
         if mm is not None:
             mm_inputs = mm.to_multimodal_inputs()
             req.extend_image_inputs(mm_inputs)
             self._maybe_compute_mrope_positions(req)
-            from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
-                maybe_compact_draft_prompt,
-            )
+            if defer_vision:
+                vision_jobs.append((req, dreq))
+            else:
+                from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+                    maybe_compact_draft_prompt,
+                )
 
-            maybe_compact_draft_prompt(self, req, dreq)
+                maybe_compact_draft_prompt(self, req, dreq)
 
-        self._sr_attach_grammar(req)
+        if not defer_vision:
+            self._sr_attach_grammar(req)
 
         self.sr_state.set(
             rid,
@@ -1089,6 +1096,32 @@ class StandaloneRemoteDraftSchedulerMixin:
             ),
         )
         return req
+
+    def _sr_flush_vision_jobs(
+        self, jobs: List[Tuple[Req, SRDraftRequest]]
+    ) -> None:
+        """Compact deferred PREFILL prompts after one shared ViT encode."""
+        if not jobs:
+            return
+        from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+            maybe_compact_draft_prompt,
+            preencode_visionzip_misses,
+        )
+
+        try:
+            preencoded = preencode_visionzip_misses(self, jobs)
+        except Exception as exc:
+            logger.warning(
+                "[SR] batched vision encode failed, encoding each request: %s",
+                exc,
+            )
+            preencoded = None
+        for req, dreq in jobs:
+            live = self.sr_state.get(dreq.rid)
+            if live is None or live.req_object is not req:
+                continue
+            maybe_compact_draft_prompt(self, req, dreq, preencoded=preencoded)
+            self._sr_attach_grammar(req)
 
     def _sr_attach_grammar(self, req: Req) -> None:
         """Compile Target's schema on Draft. Failure leaves grammar unset."""
@@ -1204,6 +1237,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
         mm=None,
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> None:
         prefix_len = self.sr_kv.get_prefix_len(req)
         result = snapshot_sr_align(req, dreq, prefix_len)
@@ -1213,7 +1247,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         if prompt_replaced(req, dreq):
             invalidate_tree_seed(req)
             self._sr_clear_prefix_stamp(state)
-            self._sr_rebuild_replaced_prompt(req, dreq, state, mm)
+            self._sr_rebuild_replaced_prompt(req, dreq, state, mm, vision_jobs)
             return
         physical = list(req.origin_input_ids) + list(req.output_ids or [])
         try:
@@ -1253,10 +1287,12 @@ class StandaloneRemoteDraftSchedulerMixin:
                     req,
                     kv_fork,
                     allocated,
-                    lambda: self._sr_reprefill_logical(req, target, dreq, state, mm),
+                    lambda: self._sr_reprefill_logical(
+                        req, target, dreq, state, mm, vision_jobs
+                    ),
                 )
             elif kv_fork is None:
-                self._sr_reprefill_logical(req, target, dreq, state, mm)
+                self._sr_reprefill_logical(req, target, dreq, state, mm, vision_jobs)
             return
         if kind in ("append_one", "append_n"):
             req.output_ids.extend(target[len(local) :])
@@ -1269,7 +1305,9 @@ class StandaloneRemoteDraftSchedulerMixin:
                 req,
                 kv_fork,
                 allocated,
-                lambda: self._sr_reprefill_logical(req, target, dreq, state, mm),
+                lambda: self._sr_reprefill_logical(
+                    req, target, dreq, state, mm, vision_jobs
+                ),
             ):
                 clear_fill_credential(req)
                 extra = len(local) - fork
@@ -1283,7 +1321,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 req.draft_tokens_target = dreq.num_draft_tokens
             return
         self._sr_clear_prefix_stamp(state)
-        self._sr_reprefill_logical(req, target, dreq, state, mm)
+        self._sr_reprefill_logical(req, target, dreq, state, mm, vision_jobs)
 
     def _sr_rollback_else_reprefill(self, req, fork, allocated, on_refused) -> bool:
         """True when the local rollback completed.
@@ -1471,6 +1509,13 @@ class StandaloneRemoteDraftSchedulerMixin:
         Rebuilds all length-derived state (M-RoPE included) so EXTEND cannot
         read past a stale prompt-width tensor.
         """
+        from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+            stage_precomputed_embeddings,
+        )
+
+        stage_precomputed_embeddings(
+            getattr(req, "multimodal_inputs", None), self.device
+        )
         self._sr_reset_linear_kv_state(req, fill_ids)
         if self._sr_is_degraded(req.rid):
             return False
@@ -1498,6 +1543,19 @@ class StandaloneRemoteDraftSchedulerMixin:
         target = len(getattr(req, "origin_input_ids", None) or [])
         committed = int(getattr(req, "kv_committed_len", 0) or 0)
         return committed < target
+
+    def _sr_park_finished_prefill_embeddings(self, batch) -> None:
+        """Drop VisionZip rows off the device once this prefill no longer needs them."""
+        if batch is None or not getattr(batch, "reqs", None):
+            return
+        from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+            park_precomputed_embeddings,
+        )
+
+        for req in batch.reqs:
+            if self._sr_prefix_pending(req):
+                continue
+            park_precomputed_embeddings(getattr(req, "multimodal_inputs", None))
 
     def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
         """Prefill until committed KV covers origin_input_ids; drop sampled extras."""
@@ -1542,6 +1600,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             result = self.run_batch(batch)
             self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
             self.process_batch_result(batch, result)
+            self._sr_park_finished_prefill_embeddings(batch)
             self.last_batch = batch
             is_extend = (
                 batch.forward_mode is not None and batch.forward_mode.is_extend()
@@ -2224,6 +2283,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
         mm=None,
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> None:
         """Reprefill a Target-coordinate sequence on the physical prompt.
 
@@ -2231,7 +2291,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         from the snapshot payload when pixels are present; otherwise degrade.
         """
         if prompt_replaced(req, dreq):
-            self._sr_rebuild_replaced_prompt(req, dreq, state, mm)
+            self._sr_rebuild_replaced_prompt(req, dreq, state, mm, vision_jobs)
             return
         try:
             fill = physical_ids_for_target(req, logical_fill_ids)
@@ -2246,6 +2306,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         dreq: SRDraftRequest,
         state: SRDraftState,
         mm,
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> None:
         """Drop the compacted request and create one for the new prompt."""
         items = list(getattr(mm, "mm_items", None) or []) if mm is not None else []
@@ -2257,7 +2318,7 @@ class StandaloneRemoteDraftSchedulerMixin:
             session = state.session_id
         elif getattr(self.sr_state, "session_id", None):
             session = self.sr_state.session_id
-        rebuilt = self._sr_create_req(dreq, mm, session)
+        rebuilt = self._sr_create_req(dreq, mm, session, vision_jobs)
         if rebuilt is None:
             self._sr_mark_degraded(req.rid, "prompt rebuild failed")
             return
@@ -2355,6 +2416,7 @@ class StandaloneRemoteDraftSchedulerMixin:
                 if capture_tree_seed:
                     self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
                 self.process_batch_result(batch, result)
+                self._sr_park_finished_prefill_embeddings(batch)
                 self.last_batch = batch
             else:
                 break
@@ -2641,6 +2703,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         action: SRAction,
         session_id: str,
         mm: Optional[SRMMPayload],
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
         """Returns (early_reply, live_req)."""
         gate = self._sr_deferred_step_gate(dreq.rid, action, session_id)
@@ -2790,16 +2853,16 @@ class StandaloneRemoteDraftSchedulerMixin:
         fingerprint = commit_fingerprint(dreq)
 
         if req is None:
-            req = self._sr_create_req(dreq, mm, session_id)
+            req = self._sr_create_req(dreq, mm, session_id, vision_jobs)
             if req is None:
                 return self._sr_v2_reply(dreq, SRReplyStatus.EMPTY), None
             state = self.sr_state.get(dreq.rid)
         elif route == RecoveryRoute.REPREFILL:
             fill = list(prompt) + list(output_ids)
-            self._sr_reprefill_logical(req, fill, local, state, mm)
+            self._sr_reprefill_logical(req, fill, local, state, mm, vision_jobs)
             req, state = self._sr_adopt_rebuilt(local, req, state)
         else:
-            self._sr_align(req, local, state, mm)
+            self._sr_align(req, local, state, mm, vision_jobs)
             req, state = self._sr_adopt_rebuilt(local, req, state)
         self._sr_stage_slow_commit(
             dreq, req, state, verdict, output_ids, fingerprint
@@ -2979,9 +3042,16 @@ class StandaloneRemoteDraftSchedulerMixin:
         n = len(batch.reqs)
         replies: List[Optional[SRDraftReply]] = [None] * n
         gpu_pairs: List[Tuple[int, SRDraftRequest, Req]] = []
+        vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = (
+            [] if batch.action == SRAction.PREFILL else None
+        )
         for i, dreq in enumerate(batch.reqs):
             reply, req = self._sr_prepare_v2(
-                dreq, batch.action, batch.session_id, mm_by_rid.get(dreq.rid)
+                dreq,
+                batch.action,
+                batch.session_id,
+                mm_by_rid.get(dreq.rid),
+                vision_jobs,
             )
             if reply is not None:
                 replies[i] = reply
@@ -2989,6 +3059,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                 gpu_pairs.append((i, dreq, req))
         if metrics.active:
             metrics.add_host("align_prepare", time.perf_counter() - prepare_start)
+        if vision_jobs:
+            self._sr_flush_vision_jobs(vision_jobs)
         if gpu_pairs:
             windows = self._sr_produce_windows(
                 batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]

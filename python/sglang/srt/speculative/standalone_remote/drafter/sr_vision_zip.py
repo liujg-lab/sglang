@@ -7,10 +7,11 @@ Any failure leaves the request on the uncompacted path (delta 0).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from collections import OrderedDict
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -21,7 +22,7 @@ from sglang.srt.speculative.standalone_remote.sr_prompt_coords import (
 
 logger = logging.getLogger(__name__)
 
-ALGO_VERSION = 1
+ALGO_VERSION = 2
 MAX_QUERIES = 1024
 QUERY_CHUNK = 64
 CACHE_MAX = 8
@@ -74,12 +75,14 @@ def visionzip_radix_salt(
     """Namespace a compacted prompt so radix cannot reuse another vision KV.
 
     Image spans are a run of the same pad id. Two keep-sets of different
-    lengths share a token-id prefix. The salt is the selection itself.
+    lengths share a token-id prefix. The salt is a digest of the selection,
+    plus the algorithm version, ratios, and score layer.
     """
     kept = ",".join(str(int(i)) for i in keep_index)
+    digest = hashlib.blake2b(kept.encode(), digest_size=16).hexdigest()
     return (
         f"sr-visionzip:v{ALGO_VERSION}:{float(keep_ratio):.8f}:"
-        f"{float(dominant_ratio):.8f}:{int(score_layer)}:{kept}"
+        f"{float(dominant_ratio):.8f}:{int(score_layer)}:{digest}"
     )
 
 
@@ -97,6 +100,37 @@ def append_visionzip_extra_key(
     return req.extra_key
 
 
+def park_precomputed_embeddings(mm) -> None:
+    """Move VisionZip rows to CPU after prefill so they do not sit on device."""
+    if mm is None:
+        return
+    from sglang.srt.utils.common import is_pin_memory_available
+
+    pin = is_pin_memory_available()
+    for item in getattr(mm, "mm_items", None) or []:
+        emb = getattr(item, "precomputed_embeddings", None)
+        if not torch.is_tensor(emb) or emb.device.type == "cpu":
+            continue
+        cpu = emb.detach().to("cpu")
+        if pin and not cpu.is_pinned():
+            cpu = cpu.pin_memory()
+        item.precomputed_embeddings = cpu
+
+
+def stage_precomputed_embeddings(mm, device) -> None:
+    """Bring parked rows back to the forward device before a re-prefill."""
+    if mm is None:
+        return
+    target = torch.device(device)
+    for item in getattr(mm, "mm_items", None) or []:
+        emb = getattr(item, "precomputed_embeddings", None)
+        if not torch.is_tensor(emb) or emb.device.type != "cpu":
+            continue
+        if emb.device == target:
+            continue
+        item.precomputed_embeddings = emb.to(target, non_blocking=emb.is_pinned())
+
+
 def _warn_once(reason: str) -> None:
     if reason in _warned:
         return
@@ -110,15 +144,19 @@ def visionzip_compact_rows(
     keep_ratio: float,
     dominant_ratio: float,
     hidden_size: int,
+    metric: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, List[int]]:
     """Keep ``ceil(keep_ratio * N)`` rows. Indices are strictly increasing.
 
     Dominant rows are the highest scores. The remaining budget is a fixed-stride
     sample of context anchors; every other row is averaged into the nearest
-    anchor by cosine similarity of the main hidden slice. The whole row,
+    anchor. Cosine similarity uses ``metric`` when it is given (pooled vision
+    keys), otherwise the main hidden slice of ``embeddings``. The whole row,
     including deepstack columns, is averaged together.
 
-    ``K >= N`` returns the original rows and ``range(N)``.
+    ``dominant_ratio == 1`` leaves no anchor budget, so unselected rows are
+    dropped instead of merged. ``K >= N`` returns the original rows and
+    ``range(N)``.
     """
     if embeddings.ndim != 2:
         raise ValueError(f"embeddings must be rank 2, got {tuple(embeddings.shape)}")
@@ -132,6 +170,12 @@ def visionzip_compact_rows(
         raise ValueError(f"keep_ratio {keep_ratio} out of (0, 1]")
     if not (0.0 < float(dominant_ratio) <= 1.0):
         raise ValueError(f"dominant_ratio {dominant_ratio} out of (0, 1]")
+    if metric is not None and (
+        metric.ndim != 2 or int(metric.shape[0]) != n
+    ):
+        raise ValueError(
+            f"metric rows {tuple(metric.shape)} do not match embeddings {n}"
+        )
 
     k = min(n, int(math.ceil(float(keep_ratio) * n)))
     if k >= n:
@@ -144,11 +188,18 @@ def visionzip_compact_rows(
     remaining = [i for i in range(n) if i not in dominant_set]
     targets = _stride_pick(remaining, k - len(dominant))
     target_set = set(targets)
-    pooled = embeddings.clone()
-    if targets:
-        _merge_context(pooled, embeddings, remaining, targets, hidden_size)
     keep = sorted(dominant_set | target_set)
-    rows = pooled[keep]
+    keep_idx = torch.as_tensor(keep, device=embeddings.device, dtype=torch.long)
+    rows = embeddings.index_select(0, keep_idx).contiguous()
+    if targets:
+        averaged = _merge_context(
+            embeddings, remaining, targets, hidden_size, metric=metric
+        )
+        pos = {idx: i for i, idx in enumerate(keep)}
+        dest = torch.as_tensor(
+            [pos[int(t)] for t in targets], device=rows.device, dtype=torch.long
+        )
+        rows[dest] = averaged
     return rows, keep
 
 
@@ -172,26 +223,34 @@ def _stride_pick(remaining: Sequence[int], k: int) -> List[int]:
 
 
 def _merge_context(
-    pooled: torch.Tensor,
     embeddings: torch.Tensor,
     remaining: Sequence[int],
     targets: Sequence[int],
     hidden_size: int,
-) -> None:
+    metric: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mean each target with the donors whose cosine match is that target.
+
+    Returns one row per target, in ``targets`` order. The mean is the target
+    row plus the donors assigned to it, in float, then cast back. ``metric``
+    chooses the nearest target; the averaged values always come from
+    ``embeddings``.
+    """
     target_set = set(int(i) for i in targets)
     donors = [i for i in remaining if i not in target_set]
     width = int(embeddings.shape[-1])
     main = hidden_size if 0 < int(hidden_size) < width else width
-    base = embeddings[:, :main].float()
-    base = torch.nn.functional.normalize(base, dim=-1, eps=1e-6)
-    groups = {int(t): [int(t)] for t in targets}
+    base_src = embeddings[:, :main] if metric is None else metric
+    base = torch.nn.functional.normalize(base_src.float(), dim=-1, eps=1e-6)
+    t_idx = torch.as_tensor(list(targets), device=embeddings.device, dtype=torch.long)
+    pooled_t = embeddings[t_idx].float()
+    counts = torch.ones(len(targets), device=embeddings.device)
     if donors:
-        sim = base[donors] @ base[list(targets)].transpose(0, 1)
-        nearest = sim.argmax(dim=1).tolist()
-        for donor, slot in zip(donors, nearest):
-            groups[int(targets[int(slot)])].append(int(donor))
-    for target, members in groups.items():
-        pooled[target] = embeddings[members].float().mean(dim=0).to(dtype=embeddings.dtype)
+        d_idx = torch.as_tensor(donors, device=embeddings.device, dtype=torch.long)
+        nearest = (base[d_idx] @ base[t_idx].T).argmax(dim=1)
+        pooled_t.index_add_(0, nearest, embeddings[d_idx].float())
+        counts.index_add_(0, nearest, torch.ones_like(nearest, dtype=counts.dtype))
+    return (pooled_t / counts[:, None]).to(dtype=embeddings.dtype)
 
 
 def rebuild_prompt(
@@ -241,6 +300,7 @@ def rebuild_prompt(
 class _ScoreCapture:
     def __init__(self) -> None:
         self.llm_scores: Optional[torch.Tensor] = None
+        self.llm_keys: Optional[torch.Tensor] = None
 
 
 def _layer_index(n_blocks: int, score_layer: int) -> int:
@@ -276,7 +336,11 @@ def _sample_queries(length: int, device) -> torch.Tensor:
 
 
 def _attention_received(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Mean attention received by each key. q/k are [tokens, heads, dim]."""
+    """Mean attention received by each key. q/k are [tokens, heads, dim].
+
+    Query blocks use einsum ``[q, H, d] x [N, H, d] -> [H, q, N]``. Softmax
+    stays over keys, matching a per-head matmul.
+    """
     tokens, heads, dim = q.shape
     scale = dim ** -0.5
     queries = _sample_queries(tokens, q.device)
@@ -286,15 +350,27 @@ def _attention_received(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     qs = q.index_select(0, queries).float()
     kk = k.float()
     q_count = int(qs.shape[0])
-    for head in range(heads):
-        key = kk[:, head, :]
-        for q0 in range(0, q_count, QUERY_CHUNK):
-            qq = qs[q0 : q0 + QUERY_CHUNK, head, :]
-            logits = torch.matmul(qq, key.transpose(0, 1)) * scale
-            attn = torch.softmax(logits, dim=-1)
-            acc += attn.sum(dim=0)
+    for q0 in range(0, q_count, QUERY_CHUNK):
+        qq = qs[q0 : q0 + QUERY_CHUNK]
+        logits = torch.einsum("qhd,nhd->hqn", qq, kk) * scale
+        attn = torch.softmax(logits, dim=-1)
+        acc += attn.sum(dim=(0, 1))
     acc /= float(q_count * heads)
     return acc
+
+
+def _pool_merge_keys(k: torch.Tensor, merge_unit: int) -> torch.Tensor:
+    """Mean keys inside each merge window, then flatten heads.
+
+    ``k`` is ``[patches, heads, dim]``. Qwen's merge unit is 4, a 2x2 window.
+    The result is one vector per LLM vision token, ``[tokens, heads * dim]``.
+    """
+    patches, heads, dim = k.shape
+    unit = int(merge_unit)
+    if patches % unit != 0:
+        raise ValueError("patch count is not divisible by the merge unit")
+    grouped = k.reshape(-1, unit, heads, dim).mean(dim=1)
+    return grouped.reshape(grouped.shape[0], heads * dim)
 
 
 def _llm_scores_from_qk(
@@ -302,8 +378,9 @@ def _llm_scores_from_qk(
     k: torch.Tensor,
     grids: Sequence[Tuple[int, int, int]],
     merge_unit: int,
-) -> torch.Tensor:
-    parts: List[torch.Tensor] = []
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    score_parts: List[torch.Tensor] = []
+    key_parts: List[torch.Tensor] = []
     cursor = 0
     for t, h, w in grids:
         patches = int(t) * int(h) * int(w)
@@ -311,14 +388,20 @@ def _llm_scores_from_qk(
             raise ValueError("grid does not match ViT sequence")
         if patches % int(merge_unit) != 0:
             raise ValueError("patch count is not divisible by the merge unit")
-        received = _attention_received(q[cursor : cursor + patches], k[cursor : cursor + patches])
-        parts.append(received.view(-1, int(merge_unit)).sum(dim=-1))
+        q_slice = q[cursor : cursor + patches]
+        k_slice = k[cursor : cursor + patches]
+        received = _attention_received(q_slice, k_slice)
+        score_parts.append(received.view(-1, int(merge_unit)).sum(dim=-1))
+        key_parts.append(_pool_merge_keys(k_slice, merge_unit))
         cursor += patches
     if cursor != q.shape[0]:
         raise ValueError("ViT sequence has tokens outside image grids")
-    if not parts:
-        return torch.zeros(0, dtype=torch.float32)
-    return torch.cat(parts, dim=0)
+    if not score_parts:
+        return (
+            torch.zeros(0, dtype=torch.float32, device=q.device),
+            torch.zeros(0, 0, device=q.device),
+        )
+    return torch.cat(score_parts, dim=0), torch.cat(key_parts, dim=0)
 
 
 def _project_qk(block, x, cos, sin):
@@ -360,7 +443,9 @@ def _install_score_hook(block, capture: _ScoreCapture, grids, merge_unit: int):
         sin = kwargs.get("rotary_pos_emb_sin")
         with torch.no_grad():
             q, k = _project_qk(module, x, cos, sin)
-            capture.llm_scores = _llm_scores_from_qk(q, k, grids, merge_unit)
+            scores, keys = _llm_scores_from_qk(q, k, grids, merge_unit)
+            capture.llm_scores = scores
+            capture.llm_keys = keys
 
     return block.register_forward_pre_hook(hook, with_kwargs=True)
 
@@ -419,18 +504,21 @@ def _compact_item_rows(
     keep_ratio: float,
     dominant_ratio: float,
     hidden_size: int,
+    metric: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, List[List[int]]]:
     pieces = _split_rows(rows, counts)
     score_parts = _split_rows(scores.reshape(-1, 1), counts)
+    metric_parts = None if metric is None else _split_rows(metric, counts)
     kept_rows = []
     keeps: List[List[int]] = []
-    for piece, score in zip(pieces, score_parts):
+    for i, (piece, score) in enumerate(zip(pieces, score_parts)):
         compact, index = visionzip_compact_rows(
             piece,
             score.reshape(-1),
             keep_ratio,
             dominant_ratio,
             hidden_size,
+            metric=None if metric_parts is None else metric_parts[i],
         )
         kept_rows.append(compact)
         keeps.append(index)
@@ -450,14 +538,19 @@ def _encode_images(model, items, score_layer: int, merge_unit: int):
             embeddings = model.get_image_feature(items)
     finally:
         handle.remove()
-    if capture.llm_scores is None:
+    if capture.llm_scores is None or capture.llm_keys is None:
         raise RuntimeError("score hook did not run")
     if int(embeddings.shape[0]) != int(capture.llm_scores.shape[0]):
         raise RuntimeError(
             f"score rows {tuple(capture.llm_scores.shape)} != "
             f"embeddings {tuple(embeddings.shape)}"
         )
-    return embeddings, capture.llm_scores
+    if int(embeddings.shape[0]) != int(capture.llm_keys.shape[0]):
+        raise RuntimeError(
+            f"key rows {tuple(capture.llm_keys.shape)} != "
+            f"embeddings {tuple(embeddings.shape)}"
+        )
+    return embeddings, capture.llm_scores, capture.llm_keys
 
 
 def _skip_reason(scheduler, mm) -> Optional[str]:
@@ -493,26 +586,118 @@ def _skip_reason(scheduler, mm) -> Optional[str]:
     return None
 
 
-def maybe_compact_draft_prompt(scheduler, req, dreq) -> bool:
-    """Shrink this Draft prompt. False leaves the request unchanged."""
+def _draft_vision_ratios(scheduler) -> Tuple[float, float, int]:
+    args = getattr(scheduler, "server_args", None)
+    keep_ratio = float(
+        getattr(args, "standalone_remote_draft_vision_keep_ratio", 0.25)
+    )
+    dominant_ratio = float(
+        getattr(args, "standalone_remote_draft_vision_dominant_ratio", 0.85)
+    )
+    score_layer = int(getattr(args, "standalone_remote_draft_vision_score_layer", -2))
+    return keep_ratio, dominant_ratio, score_layer
+
+
+def _slice_encoded_items(
+    embeddings: torch.Tensor,
+    scores: torch.Tensor,
+    keys: torch.Tensor,
+    items,
+    merge_unit: int,
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Split a batched ViT result back into one slice per image item."""
+    encoded = {}
+    offset = 0
+    for item in items:
+        n = sum(_item_token_counts(item, merge_unit))
+        encoded[id(item)] = (
+            embeddings[offset : offset + n],
+            scores[offset : offset + n],
+            keys[offset : offset + n],
+        )
+        offset += n
+    if (
+        offset != int(embeddings.shape[0])
+        or offset != int(scores.shape[0])
+        or offset != int(keys.shape[0])
+    ):
+        raise RuntimeError("encoded rows do not match image items")
+    return encoded
+
+
+def _compact_block_reason(scheduler, req) -> Optional[str]:
+    mm = getattr(req, "multimodal_inputs", None)
+    if mm is None:
+        return "request has no multimodal inputs"
+    reason = _skip_reason(scheduler, mm)
+    if reason is not None:
+        return reason
+    full = getattr(mm, "mrope_positions", None)
+    if full is None or not torch.is_tensor(full) or full.ndim != 2:
+        return "mrope positions are missing"
+    if int(full.shape[1]) != len(getattr(req, "origin_input_ids", None) or []):
+        return "mrope width does not match the logical prompt"
+    return None
+
+
+def preencode_visionzip_misses(scheduler, jobs):
+    """Encode one PREFILL batch's cache misses with a single get_image_feature.
+
+    ``jobs`` is ``[(req, dreq), ...]``. Cache hits and requests that will not
+    compact are left out. A raised error tells the caller to encode each
+    request on its own.
+    """
+    ready = [
+        req
+        for req, _dreq in jobs
+        if _compact_block_reason(scheduler, req) is None
+    ]
+    if not ready:
+        return {}
+    keep_ratio, dominant_ratio, score_layer = _draft_vision_ratios(scheduler)
+    model = scheduler.tp_worker.model_runner.model
+    merge_unit = int(getattr(model.visual, "spatial_merge_unit", 4) or 4)
+    misses = []
+    seen = set()
+    for req in ready:
+        for item in req.multimodal_inputs.mm_items:
+            if not item.is_image():
+                continue
+            _item_token_counts(item, merge_unit)
+            key = _cache_key(item, keep_ratio, dominant_ratio, score_layer)
+            if key is not None and _cache_get(key) is not None:
+                continue
+            item_id = id(item)
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            misses.append(item)
+    if not misses:
+        return {}
+    embeddings, scores, keys = _encode_images(model, misses, score_layer, merge_unit)
+    return _slice_encoded_items(embeddings, scores, keys, misses, merge_unit)
+
+
+def maybe_compact_draft_prompt(scheduler, req, dreq, preencoded=None) -> bool:
+    """Shrink this Draft prompt. False leaves the request unchanged.
+
+    ``preencoded`` maps ``id(item)`` to rows from one shared ViT call. ``None``
+    encodes this request's own cache misses.
+    """
     mm = getattr(req, "multimodal_inputs", None)
     if mm is None:
         return False
-    reason = _skip_reason(scheduler, mm)
+    reason = _compact_block_reason(scheduler, req)
     if reason is not None:
         if reason != "compress is not visionzip":
             _warn_once(reason)
         return False
-    full = getattr(mm, "mrope_positions", None)
-    if full is None or not torch.is_tensor(full) or full.ndim != 2:
-        _warn_once("mrope positions are missing")
-        return False
-    if int(full.shape[1]) != len(getattr(req, "origin_input_ids", None) or []):
-        _warn_once("mrope width does not match the logical prompt")
-        return False
+    full = mm.mrope_positions
     snapshot = _snapshot_request(req, mm)
     try:
-        return _apply_visionzip(scheduler, req, dreq, mm, full)
+        return _apply_visionzip(
+            scheduler, req, dreq, mm, full, preencoded=preencoded
+        )
     except Exception as exc:
         _restore_request(req, mm, snapshot)
         _warn_once(f"{type(exc).__name__}: {exc}")
@@ -578,16 +763,10 @@ def _restore_request(req, mm, snapshot) -> None:
         item.offsets = offsets
 
 
-def _apply_visionzip(scheduler, req, dreq, mm, full_mrope: torch.Tensor) -> bool:
-    args = scheduler.server_args
-    keep_ratio = getattr(dreq, "draft_vision_keep_ratio", None)
-    if keep_ratio is None:
-        keep_ratio = getattr(args, "standalone_remote_draft_vision_keep_ratio", 0.25)
-    dominant_ratio = float(
-        getattr(args, "standalone_remote_draft_vision_dominant_ratio", 0.85)
-    )
-    score_layer = int(getattr(args, "standalone_remote_draft_vision_score_layer", -2))
-    keep_ratio = float(keep_ratio)
+def _apply_visionzip(
+    scheduler, req, dreq, mm, full_mrope: torch.Tensor, preencoded=None
+) -> bool:
+    keep_ratio, dominant_ratio, score_layer = _draft_vision_ratios(scheduler)
     model = scheduler.tp_worker.model_runner.model
     hidden = int(getattr(model.config, "hidden_size", 0) or 0)
     merge_unit = int(getattr(model.visual, "spatial_merge_unit", 4) or 4)
@@ -605,18 +784,19 @@ def _apply_visionzip(scheduler, req, dreq, mm, full_mrope: torch.Tensor) -> bool
 
     encoded = {}
     if misses:
-        embeddings, scores = _encode_images(model, misses, score_layer, merge_unit)
-        offset = 0
-        for item in misses:
-            counts = _item_token_counts(item, merge_unit)
-            n = sum(counts)
-            encoded[id(item)] = (
-                embeddings[offset : offset + n],
-                scores[offset : offset + n],
+        if preencoded is None:
+            embeddings, scores, keys = _encode_images(
+                model, misses, score_layer, merge_unit
             )
-            offset += n
-        if offset != int(embeddings.shape[0]):
-            raise RuntimeError("encoded rows do not match image items")
+            encoded = _slice_encoded_items(
+                embeddings, scores, keys, misses, merge_unit
+            )
+        else:
+            for item in misses:
+                piece = preencoded.get(id(item))
+                if piece is None:
+                    raise RuntimeError("batched vision encode is missing an image")
+                encoded[id(item)] = piece
 
     visual_param = next(model.visual.parameters())
     plans = []
@@ -626,9 +806,15 @@ def _apply_visionzip(scheduler, req, dreq, mm, full_mrope: torch.Tensor) -> bool
             rows, keeps = cached
             rows = rows.to(device=visual_param.device, dtype=visual_param.dtype)
         else:
-            rows, score = encoded[id(item)]
+            rows, score, metric = encoded[id(item)]
             rows, keeps = _compact_item_rows(
-                rows, counts, score, keep_ratio, dominant_ratio, hidden
+                rows,
+                counts,
+                score,
+                keep_ratio,
+                dominant_ratio,
+                hidden,
+                metric=metric,
             )
             if key is not None:
                 _cache_put(

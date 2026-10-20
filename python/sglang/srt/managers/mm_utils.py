@@ -987,6 +987,28 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _has_mixed_precomputed(mm_inputs_list) -> bool:
+    """True when some requests are fully precomputed and others are not.
+
+    Matches the request grouping in ``_embed_mm_inputs_with_split``: a request
+    counts as precomputed only when it has items and every item already has
+    ``precomputed_embeddings``. Empty requests are ignored.
+    """
+    flags = []
+    for mm in mm_inputs_list:
+        if mm is None:
+            continue
+        items = [it for it in (mm.mm_items or []) if it is not None]
+        if items:
+            flags.append(
+                all(
+                    getattr(it, "precomputed_embeddings", None) is not None
+                    for it in items
+                )
+            )
+    return any(flags) and not all(flags)
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1037,8 +1059,16 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
             server_args = get_global_server_args()
-            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+            use_split = bool(
+                server_args and server_args.enable_adaptive_dispatch_to_encoder
+            )
+            # Compressed (precomputed, feature=None) and raw multimodal requests
+            # cannot share embed_mm_inputs: _get_precomputed_embedding raises, or
+            # the ViT path is invoked on feature=None items. The split path
+            # embeds each group separately and writes rows back by token start.
+            if not use_split and _has_mixed_precomputed(mm_inputs_list):
+                use_split = True
+            if use_split:
                 input_embeds, other_info = _embed_mm_inputs_with_split(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
