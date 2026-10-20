@@ -83,7 +83,7 @@ CSV 汇总列含义
     --host / --port           Target HTTP，默认 127.0.0.1:30000
     --batch-size              闭式并发度，默认 1
     --max-items               最多评几条，默认 100
-    --max-new-tokens          默认 256
+    --max-new-tokens          默认 1024
     --temperature             默认 0.0
     --timeout                 单条 HTTP 超时秒，默认 600
     --data-file / --img-dir   数据集 JSON 与图片根目录
