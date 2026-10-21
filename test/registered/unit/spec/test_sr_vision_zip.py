@@ -28,6 +28,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
     _llm_scores_from_qk,
     _merge_context,
     _pool_merge_keys,
+    _project_qk,
     _sample_queries,
     _slice_encoded_items,
     append_visionzip_extra_key,
@@ -521,6 +522,59 @@ class TestVisionZipScoreAndSlice(unittest.TestCase):
         self.assertTrue(torch.equal(keys_b, _pool_merge_keys(content_b, merge_unit)))
         self.assertFalse(torch.allclose(keys_a, _pool_merge_keys(k_rope, merge_unit)))
 
+    def test_cpu_inplace_rope_keeps_pre_rope_key(self):
+        head = 2
+        head_size = 4
+        q_size = head * head_size
+        kv_size = q_size
+        seqlen, bsz, hidden = 2, 1, 4
+        width = q_size + 2 * kv_size
+
+        def qkv_proj(hidden_states):
+            rows = hidden_states.shape[0] * hidden_states.shape[1]
+            flat = torch.arange(rows * width, dtype=torch.float32)
+            return (
+                flat.view(hidden_states.shape[0], hidden_states.shape[1], width),
+                None,
+            )
+
+        block = SimpleNamespace(
+            attn=SimpleNamespace(
+                use_qkv_parallel=True,
+                q_size=q_size,
+                kv_size=kv_size,
+                num_attention_heads_per_partition=head,
+                head_size=head_size,
+                qk_normalization_by_head_size=False,
+                qkv_proj=qkv_proj,
+            ),
+            norm1=lambda x: x,
+        )
+        cos = torch.ones(seqlen * bsz, head_size)
+        sin = torch.zeros(seqlen * bsz, head_size)
+
+        def _inplace(q, k, _cos, _sin):
+            k.add_(1)
+            return q, k
+
+        with patch(
+            "sglang.srt.layers.rotary_embedding.apply_rotary_pos_emb",
+            _inplace,
+        ):
+            _q, k_rope, k_content = _project_qk(
+                block, torch.zeros(seqlen, bsz, hidden), cos, sin
+            )
+
+        projected = torch.arange(seqlen * bsz * width, dtype=torch.float32).view(
+            bsz, seqlen, width
+        )
+        expected = projected[..., q_size : q_size + kv_size].reshape(
+            seqlen * bsz, head, head_size
+        )
+        self.assertTrue(torch.equal(k_content, expected))
+        self.assertTrue(torch.equal(k_rope, expected + 1))
+        self.assertNotEqual(k_content.data_ptr(), k_rope.data_ptr())
+
 
 def _batch_image(item_hash):
     return SimpleNamespace(
@@ -623,19 +677,30 @@ class TestVisionZipBatchCache(unittest.TestCase):
                     (torch.zeros(1, 4), [[0]]),
                 )
             self.assertIsNone(_cache_get(hit_key))
+            self.assertEqual(len(preencoded["hits"][id(hit)]), 2)
             self.assertTrue(torch.equal(preencoded["hits"][id(hit)][0], hit_rows))
 
             encoded_ids.clear()
-            changed = _apply_visionzip(
-                scheduler,
-                None,
-                None,
-                SimpleNamespace(mm_items=[hit]),
-                None,
-                preencoded=preencoded,
-            )
+            to_calls = []
+            real_to = torch.Tensor.to
+
+            def _spy_to(tensor, *args, **kwargs):
+                if tensor is hit_rows:
+                    to_calls.append(tensor)
+                return real_to(tensor, *args, **kwargs)
+
+            with patch.object(torch.Tensor, "to", _spy_to):
+                changed = _apply_visionzip(
+                    scheduler,
+                    None,
+                    None,
+                    SimpleNamespace(mm_items=[hit]),
+                    None,
+                    preencoded=preencoded,
+                )
         self.assertFalse(changed)
         self.assertEqual(encoded_ids, [])
+        self.assertEqual(to_calls, [hit_rows])
 
     def test_apply_encodes_missing_piece_without_raising(self):
         item = _batch_image(3)
@@ -768,11 +833,15 @@ class TestVisionZipBatchCache(unittest.TestCase):
         ):
             preencoded = preencode_visionzip_misses(scheduler, jobs)
         self.assertEqual(preencoded["encoded"], {})
-        rows, keeps = preencoded["hits"][id(item)]
+        entry = preencoded["hits"][id(item)]
+        rows, keeps = entry[0], entry[1]
+        self.assertEqual(len(entry), 3)
+        self.assertTrue(torch.equal(entry[2], rows))
         self.assertLess(int(rows.shape[0]), source_tokens)
         self.assertEqual(sum(len(part) for part in keeps), int(rows.shape[0]))
         cached = _cache_get(_cache_key(item, 0.5, 0.85, -2))
         self.assertIsNotNone(cached)
+        self.assertEqual(len(cached), 2)
         cached_rows, cached_keeps = cached
         self.assertTrue(torch.equal(cached_rows, rows))
         self.assertEqual(
@@ -781,6 +850,53 @@ class TestVisionZipBatchCache(unittest.TestCase):
         )
         self.assertEqual(len(refs), 1)
         self.assertIsNone(refs[0]())
+
+    def test_same_batch_miss_skips_host_to_device(self):
+        item = _batch_image(31)
+
+        def _encode(model, items, score_layer, merge_unit):
+            return _fake_vision_encode(model, items, score_layer, merge_unit)
+
+        scheduler = _batch_scheduler()
+        jobs = [
+            (
+                SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[item])),
+                None,
+            )
+        ]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._compact_block_reason",
+            return_value=None,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            preencoded = preencode_visionzip_misses(scheduler, jobs)
+        entry = preencoded["hits"][id(item)]
+        self.assertEqual(len(entry), 3)
+        self.assertTrue(torch.equal(entry[0], entry[2]))
+        cached = _cache_get(_cache_key(item, 1.0, 0.85, -2))
+        self.assertEqual(len(cached), 2)
+
+        to_calls = []
+        real_to = torch.Tensor.to
+
+        def _spy_to(tensor, *args, **kwargs):
+            if tensor is entry[0] or tensor is entry[2]:
+                to_calls.append(tensor)
+            return real_to(tensor, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "to", _spy_to):
+            changed = _apply_visionzip(
+                scheduler,
+                None,
+                None,
+                SimpleNamespace(mm_items=[item]),
+                None,
+                preencoded=preencoded,
+            )
+        self.assertFalse(changed)
+        self.assertEqual(to_calls, [])
 
     def test_park_reuses_sr_parked_rows(self):
         parked = torch.arange(4, dtype=torch.float32).view(1, 4)

@@ -444,7 +444,10 @@ def _project_qk(block, x, cos, sin):
         q, k = attn._apply_qk_norm_head_size(q, k)
     k_content = k
     if cos is not None and sin is not None:
-        k_content = k.clone()
+        # CUDA native RoPE and NPU npu_rotary_mul return new tensors. The CPU
+        # AMX kernel writes back into k, so only that path needs a copy.
+        if k.device.type == "cpu":
+            k_content = k.clone()
         q = q.view(-1, head, attn.head_size)
         k = k.view(-1, head, attn.head_size)
         if cos.size(-1) * 2 == attn.head_size:
@@ -765,7 +768,10 @@ def preencode_visionzip_misses(scheduler, jobs):
     ``max_prefill_tokens * merge_unit`` patches. Compaction depends only on the
     image and the ratio parameters, so each chunk is compacted and copied to
     CPU before the next chunk runs. The uncompressed chunk tensors are then
-    dropped. The return value is ``{"hits": {id(item): (rows, keeps)}, "encoded": {}}``.
+    dropped. Fresh misses keep the compacted device rows in ``hits`` so the
+    same batch does not copy them back. The return value is
+    ``{"hits": {id(item): entry}, "encoded": {}}``. A fresh miss entry is
+    ``(cpu_rows, keeps, gpu_rows)``. An LRU snapshot stays ``(cpu_rows, keeps)``.
     ``encoded`` stays empty on success; the per-request fallback fills it.
     A raised error tells the caller to encode each request on its own.
     """
@@ -830,7 +836,8 @@ def preencode_visionzip_misses(scheduler, jobs):
                         (cpu_rows, [list(part) for part in keeps]),
                         ready=ready,
                     )
-                hits[id(item)] = (cpu_rows, [list(part) for part in keeps])
+                rows = rows.detach()
+                hits[id(item)] = (cpu_rows, [list(part) for part in keeps], rows)
             del embeddings, scores, keys, sliced, rows, score, metric
         for bucket in groups.values():
             for item in bucket[1:]:
@@ -980,11 +987,16 @@ def _apply_visionzip(
     changed = False
     for item, counts, key, cached in prepared:
         if cached is not None:
-            cpu_rows, keeps = cached
-            rows = cpu_rows.to(
-                device=visual_param.device,
-                dtype=visual_param.dtype,
-                non_blocking=cpu_rows.is_pinned(),
+            cpu_rows, keeps = cached[0], cached[1]
+            gpu = cached[2] if len(cached) > 2 else None
+            rows = (
+                gpu
+                if gpu is not None
+                else cpu_rows.to(
+                    device=visual_param.device,
+                    dtype=visual_param.dtype,
+                    non_blocking=cpu_rows.is_pinned(),
+                )
             )
             ready = None
         else:
