@@ -1,6 +1,7 @@
 """CPU tests for Draft prompt coordinates and VisionZip selection."""
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -612,8 +613,9 @@ class TestVisionZipBatchCache(unittest.TestCase):
             self.assertTrue(torch.equal(snap_rows, hit_rows))
             self.assertEqual(snap_keeps, [[0]])
             self.assertIsNot(snap_keeps[0], hit_keeps[0])
-            self.assertIn(id(miss), preencoded["encoded"])
-            self.assertNotIn(id(hit), preencoded["encoded"])
+            self.assertEqual(preencoded["encoded"], {})
+            self.assertIn(id(miss), preencoded["hits"])
+            self.assertIsNotNone(_cache_get(_cache_key(miss, 1.0, 0.85, -2)))
 
             for i in range(CACHE_MAX):
                 _cache_put(
@@ -684,11 +686,10 @@ class TestVisionZipBatchCache(unittest.TestCase):
         ):
             preencoded = preencode_visionzip_misses(_batch_scheduler(), jobs)
         self.assertEqual(encoded_items, [[first]])
-        left = preencoded["encoded"][id(first)]
-        right = preencoded["encoded"][id(second)]
+        self.assertEqual(preencoded["encoded"], {})
+        left = preencoded["hits"][id(first)]
+        right = preencoded["hits"][id(second)]
         self.assertIs(left, right)
-        for part_left, part_right in zip(left, right):
-            self.assertIs(part_left, part_right)
 
     def test_preencode_chunks_by_patch_budget(self):
         first = _batch_image(11)
@@ -725,11 +726,61 @@ class TestVisionZipBatchCache(unittest.TestCase):
         self.assertEqual([items for items, _patches in calls], [[first], [second]])
         for _items, patches in calls:
             self.assertLessEqual(patches, budget)
-        self.assertIn(id(first), preencoded["encoded"])
-        self.assertIn(id(second), preencoded["encoded"])
+        self.assertEqual(preencoded["encoded"], {})
+        self.assertIn(id(first), preencoded["hits"])
+        self.assertIn(id(second), preencoded["hits"])
         self.assertIsNot(
-            preencoded["encoded"][id(first)], preencoded["encoded"][id(second)]
+            preencoded["hits"][id(first)], preencoded["hits"][id(second)]
         )
+
+    def test_preencode_compacts_each_chunk(self):
+        item = SimpleNamespace(
+            hash=21,
+            image_grid_thw=torch.tensor([[1, 4, 4]]),
+            offsets=[(0, 3)],
+            is_image=lambda: True,
+        )
+        source_tokens = sum(_item_token_counts(item, 4))
+        self.assertEqual(source_tokens, 4)
+        refs = []
+
+        def _encode(model, items, score_layer, merge_unit):
+            embeddings, scores, keys = _fake_vision_encode(
+                model, items, score_layer, merge_unit
+            )
+            refs.append(weakref.ref(embeddings))
+            return embeddings, scores, keys
+
+        scheduler = _batch_scheduler()
+        scheduler.server_args.standalone_remote_draft_vision_keep_ratio = 0.5
+        jobs = [
+            (
+                SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[item])),
+                None,
+            )
+        ]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._compact_block_reason",
+            return_value=None,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            preencoded = preencode_visionzip_misses(scheduler, jobs)
+        self.assertEqual(preencoded["encoded"], {})
+        rows, keeps = preencoded["hits"][id(item)]
+        self.assertLess(int(rows.shape[0]), source_tokens)
+        self.assertEqual(sum(len(part) for part in keeps), int(rows.shape[0]))
+        cached = _cache_get(_cache_key(item, 0.5, 0.85, -2))
+        self.assertIsNotNone(cached)
+        cached_rows, cached_keeps = cached
+        self.assertTrue(torch.equal(cached_rows, rows))
+        self.assertEqual(
+            [list(part) for part in cached_keeps],
+            [list(part) for part in keeps],
+        )
+        self.assertEqual(len(refs), 1)
+        self.assertIsNone(refs[0]())
 
     def test_park_reuses_sr_parked_rows(self):
         parked = torch.arange(4, dtype=torch.float32).view(1, 4)

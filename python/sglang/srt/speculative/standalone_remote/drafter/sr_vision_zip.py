@@ -722,8 +722,10 @@ def _encode_items_chunked(
 ):
     """Encode ``items`` in patch-bounded chunks and clone each slice.
 
-    A dim-0 slice shares storage with the chunk tensor. Cloning lets that
-    tensor be freed before the next chunk runs.
+    Used by the per-request fallback in ``_apply_visionzip`` after a batched
+    preencode fails. A dim-0 slice shares storage with the chunk tensor.
+    Cloning lets that tensor be freed before the next chunk runs. The caller
+    compacts the clones after every chunk of this request has been encoded.
     """
     encoded = {}
     for chunk in _chunk_by_patches(items, merge_unit, patch_budget):
@@ -754,14 +756,17 @@ def _compact_block_reason(scheduler, req) -> Optional[str]:
 
 
 def preencode_visionzip_misses(scheduler, jobs):
-    """Encode one PREFILL batch's cache misses in patch-bounded ViT chunks.
+    """Encode and compact one PREFILL batch's cache misses, one ViT chunk at a time.
 
     ``jobs`` is ``[(req, dreq), ...]``. Requests that will not compact are left
     out. Cache hits are snapshotted into ``hits`` before any later ``_cache_put``
     in this batch can evict them. Misses that share a cache key and token shape
     are encoded once; items with no hash stay unique. Each ViT call stays within
-    ``max_prefill_tokens * merge_unit`` patches. The return value is
-    ``{"hits": {id(item): (rows, keeps)}, "encoded": {id(item): (embeddings, scores, keys)}}``.
+    ``max_prefill_tokens * merge_unit`` patches. Compaction depends only on the
+    image and the ratio parameters, so each chunk is compacted and copied to
+    CPU before the next chunk runs. The uncompressed chunk tensors are then
+    dropped. The return value is ``{"hits": {id(item): (rows, keeps)}, "encoded": {}}``.
+    ``encoded`` stays empty on success; the per-request fallback fills it.
     A raised error tells the caller to encode each request on its own.
     """
     empty = {"hits": {}, "encoded": {}}
@@ -794,30 +799,54 @@ def preencode_visionzip_misses(scheduler, jobs):
                 groups[dedup] = [item]
             else:
                 bucket.append(item)
-    encoded = {}
     if groups:
+        hidden = int(getattr(model.config, "hidden_size", 0) or 0)
+        budget = _vision_patch_budget(scheduler, merge_unit)
         reps = [bucket[0] for bucket in groups.values()]
-        encoded = _encode_items_chunked(
-            model,
-            reps,
-            score_layer,
-            merge_unit,
-            _vision_patch_budget(scheduler, merge_unit),
-        )
+        for chunk in _chunk_by_patches(reps, merge_unit, budget):
+            embeddings, scores, keys = _encode_images(
+                model, chunk, score_layer, merge_unit
+            )
+            sliced = _slice_encoded_items(
+                embeddings, scores, keys, chunk, merge_unit
+            )
+            for item in chunk:
+                rows, score, metric = sliced[id(item)]
+                counts = _item_token_counts(item, merge_unit)
+                rows, keeps = _compact_item_rows(
+                    rows,
+                    counts,
+                    score,
+                    keep_ratio,
+                    dominant_ratio,
+                    hidden,
+                    metric=metric,
+                )
+                cpu_rows, ready = _host_rows(rows)
+                key = _cache_key(item, keep_ratio, dominant_ratio, score_layer)
+                if key is not None:
+                    _cache_put(
+                        key,
+                        (cpu_rows, [list(part) for part in keeps]),
+                        ready=ready,
+                    )
+                hits[id(item)] = (cpu_rows, [list(part) for part in keeps])
+            del embeddings, scores, keys, sliced, rows, score, metric
         for bucket in groups.values():
-            piece = encoded[id(bucket[0])]
             for item in bucket[1:]:
-                encoded[id(item)] = piece
-    return {"hits": hits, "encoded": encoded}
+                hits[id(item)] = hits[id(bucket[0])]
+    return {"hits": hits, "encoded": {}}
 
 
 def maybe_compact_draft_prompt(scheduler, req, dreq, preencoded=None) -> bool:
     """Shrink this Draft prompt. False leaves the request unchanged.
 
     ``preencoded`` is ``{"hits", "encoded"}`` from the shared ViT encode.
-    ``hits`` maps ``id(item)`` to a cached compaction, and ``encoded`` maps
-    ``id(item)`` to rows for cache misses. ``None`` encodes this request's
-    own cache misses.
+    ``hits`` maps ``id(item)`` to a compaction. A successful preencode puts
+    both cache hits and freshly compacted misses there and leaves ``encoded``
+    empty. ``encoded`` maps ``id(item)`` to uncompressed rows and is filled
+    only by the per-request fallback. ``None`` encodes this request's own
+    cache misses.
     """
     mm = getattr(req, "multimodal_inputs", None)
     if mm is None:
