@@ -22,13 +22,14 @@ from sglang.srt.speculative.standalone_remote.sr_prompt_coords import (
 
 logger = logging.getLogger(__name__)
 
-ALGO_VERSION = 2
+ALGO_VERSION = 3
 MAX_QUERIES = 1024
 QUERY_CHUNK = 64
 CACHE_MAX = 8
 
 _warned: set = set()
 _cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_cache_ready: Dict[tuple, torch.cuda.Event] = {}
 
 
 def validate_draft_vision_config(
@@ -101,13 +102,24 @@ def append_visionzip_extra_key(
 
 
 def park_precomputed_embeddings(mm) -> None:
-    """Move VisionZip rows to CPU after prefill so they do not sit on device."""
+    """Move VisionZip rows to CPU after prefill so they do not sit on device.
+
+    Compacted rows already have one host copy on ``sr_parked_rows``. Parking
+    swaps to that tensor. Other embeddings still copy here.
+    """
     if mm is None:
         return
     from sglang.srt.utils.common import is_pin_memory_available
 
     pin = is_pin_memory_available()
     for item in getattr(mm, "mm_items", None) or []:
+        parked = getattr(item, "sr_parked_rows", None)
+        if torch.is_tensor(parked):
+            ready = getattr(item, "sr_parked_ready", None)
+            if ready is not None:
+                ready.synchronize()
+            item.precomputed_embeddings = parked
+            continue
         emb = getattr(item, "precomputed_embeddings", None)
         if not torch.is_tensor(emb) or emb.device.type == "cpu":
             continue
@@ -376,9 +388,16 @@ def _pool_merge_keys(k: torch.Tensor, merge_unit: int) -> torch.Tensor:
 def _llm_scores_from_qk(
     q: torch.Tensor,
     k: torch.Tensor,
+    k_content: torch.Tensor,
     grids: Sequence[Tuple[int, int, int]],
     merge_unit: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Score with RoPE q/k. Pool ``k_content`` for merge similarity.
+
+    ``k`` is post-RoPE. ``k_content`` is the same projection before RoPE.
+    """
+    if int(k_content.shape[0]) != int(q.shape[0]) or int(k.shape[0]) != int(q.shape[0]):
+        raise ValueError("q and k lengths disagree")
     score_parts: List[torch.Tensor] = []
     key_parts: List[torch.Tensor] = []
     cursor = 0
@@ -390,9 +409,10 @@ def _llm_scores_from_qk(
             raise ValueError("patch count is not divisible by the merge unit")
         q_slice = q[cursor : cursor + patches]
         k_slice = k[cursor : cursor + patches]
+        content_slice = k_content[cursor : cursor + patches]
         received = _attention_received(q_slice, k_slice)
         score_parts.append(received.view(-1, int(merge_unit)).sum(dim=-1))
-        key_parts.append(_pool_merge_keys(k_slice, merge_unit))
+        key_parts.append(_pool_merge_keys(content_slice, merge_unit))
         cursor += patches
     if cursor != q.shape[0]:
         raise ValueError("ViT sequence has tokens outside image grids")
@@ -422,7 +442,9 @@ def _project_qk(block, x, cos, sin):
     k = k.reshape(bsz * seqlen, head, -1).contiguous()
     if getattr(attn, "qk_normalization_by_head_size", False):
         q, k = attn._apply_qk_norm_head_size(q, k)
+    k_content = k
     if cos is not None and sin is not None:
+        k_content = k.clone()
         q = q.view(-1, head, attn.head_size)
         k = k.view(-1, head, attn.head_size)
         if cos.size(-1) * 2 == attn.head_size:
@@ -431,7 +453,7 @@ def _project_qk(block, x, cos, sin):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         q = q.view(-1, head, attn.head_size)
         k = k.view(-1, head, attn.head_size)
-    return q, k
+    return q, k, k_content
 
 
 def _install_score_hook(block, capture: _ScoreCapture, grids, merge_unit: int):
@@ -442,8 +464,10 @@ def _install_score_hook(block, capture: _ScoreCapture, grids, merge_unit: int):
         cos = kwargs.get("rotary_pos_emb_cos")
         sin = kwargs.get("rotary_pos_emb_sin")
         with torch.no_grad():
-            q, k = _project_qk(module, x, cos, sin)
-            scores, keys = _llm_scores_from_qk(q, k, grids, merge_unit)
+            q, k_rope, k_content = _project_qk(module, x, cos, sin)
+            scores, keys = _llm_scores_from_qk(
+                q, k_rope, k_content, grids, merge_unit
+            )
             capture.llm_scores = scores
             capture.llm_keys = keys
 
@@ -455,14 +479,44 @@ def _cache_get(key):
     if value is None:
         return None
     _cache.move_to_end(key)
+    ready = _cache_ready.get(key)
+    if ready is not None:
+        ready.synchronize()
     return value
 
 
-def _cache_put(key, value) -> None:
+def _cache_put(key, value, ready=None) -> None:
     _cache[key] = value
     _cache.move_to_end(key)
+    if ready is None:
+        _cache_ready.pop(key, None)
+    else:
+        _cache_ready[key] = ready
     while len(_cache) > CACHE_MAX:
-        _cache.popitem(last=False)
+        old, _ = _cache.popitem(last=False)
+        _cache_ready.pop(old, None)
+
+
+def _host_rows(rows: torch.Tensor):
+    """Return one CPU copy of compacted rows and an optional ready event.
+
+    A CPU source is detached and shared. A device source is copied once into
+    pinned memory when CUDA can pin; the event completes that copy.
+    """
+    if rows.device.type == "cpu":
+        return rows.detach(), None
+    from sglang.srt.utils.common import is_pin_memory_available
+
+    pin = bool(rows.is_cuda and is_pin_memory_available())
+    cpu_rows = torch.empty(
+        rows.shape, dtype=rows.dtype, device="cpu", pin_memory=pin
+    )
+    cpu_rows.copy_(rows.detach(), non_blocking=pin)
+    ready = None
+    if pin:
+        ready = torch.cuda.Event()
+        ready.record()
+    return cpu_rows, ready
 
 
 def _span_lengths(offsets) -> List[int]:
@@ -625,6 +679,65 @@ def _slice_encoded_items(
     return encoded
 
 
+def _vision_patch_budget(scheduler, merge_unit: int) -> int:
+    """Cap one ViT call at ``max_prefill_tokens * merge_unit`` patches."""
+    limit = getattr(scheduler, "max_prefill_tokens", None)
+    if limit is None:
+        args = getattr(scheduler, "server_args", None)
+        limit = getattr(args, "max_prefill_tokens", None)
+    if limit is None or int(limit) <= 0:
+        limit = 16384
+    return max(1, int(limit)) * int(merge_unit)
+
+
+def _item_patch_count(item, merge_unit: int) -> int:
+    return sum(_item_token_counts(item, merge_unit)) * int(merge_unit)
+
+
+def _chunk_by_patches(items, merge_unit: int, patch_budget: int):
+    """Group items so each chunk stays within ``patch_budget`` patches.
+
+    An item larger than the budget is its own chunk. One image is never split
+    across two ``get_image_feature`` calls.
+    """
+    chunks = []
+    current = []
+    current_patches = 0
+    budget = max(1, int(patch_budget))
+    for item in items:
+        patches = _item_patch_count(item, merge_unit)
+        if current and current_patches + patches > budget:
+            chunks.append(current)
+            current = []
+            current_patches = 0
+        current.append(item)
+        current_patches += patches
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _encode_items_chunked(
+    model, items, score_layer: int, merge_unit: int, patch_budget: int
+):
+    """Encode ``items`` in patch-bounded chunks and clone each slice.
+
+    A dim-0 slice shares storage with the chunk tensor. Cloning lets that
+    tensor be freed before the next chunk runs.
+    """
+    encoded = {}
+    for chunk in _chunk_by_patches(items, merge_unit, patch_budget):
+        embeddings, scores, keys = _encode_images(
+            model, chunk, score_layer, merge_unit
+        )
+        sliced = _slice_encoded_items(
+            embeddings, scores, keys, chunk, merge_unit
+        )
+        for item_id, piece in sliced.items():
+            encoded[item_id] = tuple(part.clone() for part in piece)
+    return encoded
+
+
 def _compact_block_reason(scheduler, req) -> Optional[str]:
     mm = getattr(req, "multimodal_inputs", None)
     if mm is None:
@@ -641,48 +754,70 @@ def _compact_block_reason(scheduler, req) -> Optional[str]:
 
 
 def preencode_visionzip_misses(scheduler, jobs):
-    """Encode one PREFILL batch's cache misses with a single get_image_feature.
+    """Encode one PREFILL batch's cache misses in patch-bounded ViT chunks.
 
-    ``jobs`` is ``[(req, dreq), ...]``. Cache hits and requests that will not
-    compact are left out. A raised error tells the caller to encode each
-    request on its own.
+    ``jobs`` is ``[(req, dreq), ...]``. Requests that will not compact are left
+    out. Cache hits are snapshotted into ``hits`` before any later ``_cache_put``
+    in this batch can evict them. Misses that share a cache key and token shape
+    are encoded once; items with no hash stay unique. Each ViT call stays within
+    ``max_prefill_tokens * merge_unit`` patches. The return value is
+    ``{"hits": {id(item): (rows, keeps)}, "encoded": {id(item): (embeddings, scores, keys)}}``.
+    A raised error tells the caller to encode each request on its own.
     """
+    empty = {"hits": {}, "encoded": {}}
     ready = [
         req
         for req, _dreq in jobs
         if _compact_block_reason(scheduler, req) is None
     ]
     if not ready:
-        return {}
+        return empty
     keep_ratio, dominant_ratio, score_layer = _draft_vision_ratios(scheduler)
     model = scheduler.tp_worker.model_runner.model
     merge_unit = int(getattr(model.visual, "spatial_merge_unit", 4) or 4)
-    misses = []
-    seen = set()
+    hits = {}
+    groups = {}
     for req in ready:
         for item in req.multimodal_inputs.mm_items:
             if not item.is_image():
                 continue
-            _item_token_counts(item, merge_unit)
+            counts = tuple(_item_token_counts(item, merge_unit))
             key = _cache_key(item, keep_ratio, dominant_ratio, score_layer)
-            if key is not None and _cache_get(key) is not None:
+            cached = None if key is None else _cache_get(key)
+            if cached is not None:
+                rows, keeps = cached
+                hits[id(item)] = (rows, [list(part) for part in keeps])
                 continue
-            item_id = id(item)
-            if item_id in seen:
-                continue
-            seen.add(item_id)
-            misses.append(item)
-    if not misses:
-        return {}
-    embeddings, scores, keys = _encode_images(model, misses, score_layer, merge_unit)
-    return _slice_encoded_items(embeddings, scores, keys, misses, merge_unit)
+            dedup = ("id", id(item)) if key is None else (key, counts)
+            bucket = groups.get(dedup)
+            if bucket is None:
+                groups[dedup] = [item]
+            else:
+                bucket.append(item)
+    encoded = {}
+    if groups:
+        reps = [bucket[0] for bucket in groups.values()]
+        encoded = _encode_items_chunked(
+            model,
+            reps,
+            score_layer,
+            merge_unit,
+            _vision_patch_budget(scheduler, merge_unit),
+        )
+        for bucket in groups.values():
+            piece = encoded[id(bucket[0])]
+            for item in bucket[1:]:
+                encoded[id(item)] = piece
+    return {"hits": hits, "encoded": encoded}
 
 
 def maybe_compact_draft_prompt(scheduler, req, dreq, preencoded=None) -> bool:
     """Shrink this Draft prompt. False leaves the request unchanged.
 
-    ``preencoded`` maps ``id(item)`` to rows from one shared ViT call. ``None``
-    encodes this request's own cache misses.
+    ``preencoded`` is ``{"hits", "encoded"}`` from the shared ViT encode.
+    ``hits`` maps ``id(item)`` to a cached compaction, and ``encoded`` maps
+    ``id(item)`` to rows for cache misses. ``None`` encodes this request's
+    own cache misses.
     """
     mm = getattr(req, "multimodal_inputs", None)
     if mm is None:
@@ -715,6 +850,8 @@ def _snapshot_request(req, mm):
                 getattr(item, "format", None),
                 getattr(item, "feature", None),
                 None if offsets is None else list(offsets),
+                getattr(item, "sr_parked_rows", None),
+                getattr(item, "sr_parked_ready", None),
             )
         )
     return {
@@ -756,11 +893,21 @@ def _restore_request(req, mm, snapshot) -> None:
     mm.mrope_position_delta_repeated_cache = snapshot[
         "mrope_position_delta_repeated_cache"
     ]
-    for item, embeddings, fmt, feature, offsets in snapshot["items"]:
+    for (
+        item,
+        embeddings,
+        fmt,
+        feature,
+        offsets,
+        parked_rows,
+        parked_ready,
+    ) in snapshot["items"]:
         item.precomputed_embeddings = embeddings
         item.format = fmt
         item.feature = feature
         item.offsets = offsets
+        item.sr_parked_rows = parked_rows
+        item.sr_parked_ready = parked_ready
 
 
 def _apply_visionzip(
@@ -771,40 +918,46 @@ def _apply_visionzip(
     hidden = int(getattr(model.config, "hidden_size", 0) or 0)
     merge_unit = int(getattr(model.visual, "spatial_merge_unit", 4) or 4)
     images = [item for item in mm.mm_items if item.is_image()]
+    pre_hits = {} if preencoded is None else preencoded.get("hits", {})
+    pre_enc = {} if preencoded is None else preencoded.get("encoded", {})
 
     prepared = []
     misses = []
     for item in images:
         counts = _item_token_counts(item, merge_unit)
         key = _cache_key(item, keep_ratio, dominant_ratio, score_layer)
-        cached = None if key is None else _cache_get(key)
-        if cached is None:
+        cached = pre_hits.get(id(item))
+        if cached is None and key is not None:
+            cached = _cache_get(key)
+        if cached is None and id(item) not in pre_enc:
             misses.append(item)
         prepared.append((item, counts, key, cached))
 
-    encoded = {}
+    encoded = dict(pre_enc)
     if misses:
-        if preencoded is None:
-            embeddings, scores, keys = _encode_images(
-                model, misses, score_layer, merge_unit
+        encoded.update(
+            _encode_items_chunked(
+                model,
+                misses,
+                score_layer,
+                merge_unit,
+                _vision_patch_budget(scheduler, merge_unit),
             )
-            encoded = _slice_encoded_items(
-                embeddings, scores, keys, misses, merge_unit
-            )
-        else:
-            for item in misses:
-                piece = preencoded.get(id(item))
-                if piece is None:
-                    raise RuntimeError("batched vision encode is missing an image")
-                encoded[id(item)] = piece
+        )
 
     visual_param = next(model.visual.parameters())
     plans = []
+    parked_host = {}
     changed = False
     for item, counts, key, cached in prepared:
         if cached is not None:
-            rows, keeps = cached
-            rows = rows.to(device=visual_param.device, dtype=visual_param.dtype)
+            cpu_rows, keeps = cached
+            rows = cpu_rows.to(
+                device=visual_param.device,
+                dtype=visual_param.dtype,
+                non_blocking=cpu_rows.is_pinned(),
+            )
+            ready = None
         else:
             rows, score, metric = encoded[id(item)]
             rows, keeps = _compact_item_rows(
@@ -816,12 +969,16 @@ def _apply_visionzip(
                 hidden,
                 metric=metric,
             )
+            cpu_rows, ready = _host_rows(rows)
             if key is not None:
                 _cache_put(
-                    key, (rows.detach().cpu(), [list(part) for part in keeps])
+                    key,
+                    (cpu_rows, [list(part) for part in keeps]),
+                    ready=ready,
                 )
         if sum(len(part) for part in keeps) != sum(counts):
             changed = True
+        parked_host[id(item)] = (cpu_rows, ready)
         plans.append((item, counts, rows, keeps))
 
     if not changed:
@@ -867,7 +1024,10 @@ def _apply_visionzip(
     offset_cursor = 0
     for item, _counts, rows, keeps in plans:
         n_spans = len(keeps)
+        cpu_rows, ready = parked_host[id(item)]
         item.precomputed_embeddings = rows.detach()
+        item.sr_parked_rows = cpu_rows
+        item.sr_parked_ready = ready
         item.format = MultimodalInputFormat.PRECOMPUTED_EMBEDDING
         item.feature = None
         item.offsets = new_offsets[offset_cursor : offset_cursor + n_spans]

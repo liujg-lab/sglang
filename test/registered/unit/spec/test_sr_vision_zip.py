@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -12,13 +13,25 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
     validate_lease_commit,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip import (
+    ALGO_VERSION,
+    CACHE_MAX,
     QUERY_CHUNK,
+    _apply_visionzip,
     _attention_received,
+    _cache,
+    _cache_get,
+    _cache_key,
+    _cache_put,
+    _cache_ready,
     _item_token_counts,
+    _llm_scores_from_qk,
     _merge_context,
+    _pool_merge_keys,
     _sample_queries,
     _slice_encoded_items,
     append_visionzip_extra_key,
+    park_precomputed_embeddings,
+    preencode_visionzip_misses,
     rebuild_prompt,
     validate_draft_vision_config,
     visionzip_compact_rows,
@@ -487,6 +500,250 @@ class TestVisionZipScoreAndSlice(unittest.TestCase):
             self.assertTrue(torch.equal(key, keys[cursor : cursor + count]))
             cursor += count
         self.assertEqual(cursor, total)
+
+    def test_merge_keys_ignore_rope(self):
+        patches, heads, dim = 8, 2, 4
+        merge_unit = 4
+        grids = [(1, 2, 4)]
+        q = torch.randn(patches, heads, dim)
+        k_rope = torch.randn(patches, heads, dim)
+        content_a = torch.randn(patches, heads, dim)
+        content_b = content_a + 1
+        scores_a, keys_a = _llm_scores_from_qk(
+            q, k_rope, content_a, grids, merge_unit
+        )
+        scores_b, keys_b = _llm_scores_from_qk(
+            q, k_rope, content_b, grids, merge_unit
+        )
+        self.assertTrue(torch.equal(scores_a, scores_b))
+        self.assertTrue(torch.equal(keys_a, _pool_merge_keys(content_a, merge_unit)))
+        self.assertTrue(torch.equal(keys_b, _pool_merge_keys(content_b, merge_unit)))
+        self.assertFalse(torch.allclose(keys_a, _pool_merge_keys(k_rope, merge_unit)))
+
+
+def _batch_image(item_hash):
+    return SimpleNamespace(
+        hash=item_hash,
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        offsets=[(0, 0)],
+        is_image=lambda: True,
+    )
+
+
+class _BatchVisual:
+    spatial_merge_unit = 4
+
+    def parameters(self):
+        yield torch.zeros(1, dtype=torch.float32)
+
+
+def _batch_scheduler():
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=4),
+        visual=_BatchVisual(),
+    )
+    return SimpleNamespace(
+        server_args=SimpleNamespace(
+            standalone_remote_draft_vision_keep_ratio=1.0,
+            standalone_remote_draft_vision_dominant_ratio=0.85,
+            standalone_remote_draft_vision_score_layer=-2,
+        ),
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=model)),
+    )
+
+
+def _fake_vision_encode(model, items, score_layer, merge_unit):
+    total = sum(sum(_item_token_counts(item, merge_unit)) for item in items)
+    return (
+        torch.arange(total * 4, dtype=torch.float32).view(total, 4),
+        torch.arange(total, dtype=torch.float32),
+        torch.ones(total, 2, dtype=torch.float32),
+    )
+
+
+class TestVisionZipBatchCache(unittest.TestCase):
+    def setUp(self):
+        self._saved_cache = list(_cache.items())
+        self._saved_ready = dict(_cache_ready)
+        _cache.clear()
+        _cache_ready.clear()
+
+    def tearDown(self):
+        _cache.clear()
+        _cache.update(self._saved_cache)
+        _cache_ready.clear()
+        _cache_ready.update(self._saved_ready)
+
+    def test_preencode_snapshot_survives_lru_eviction(self):
+        hit = _batch_image(1)
+        miss = _batch_image(2)
+        hit_rows = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        hit_keeps = [[0]]
+        hit_key = _cache_key(hit, 1.0, 0.85, -2)
+        for i in range(CACHE_MAX - 1):
+            _cache_put(
+                (10_000 + i, 1.0, 0.85, -2, ALGO_VERSION),
+                (torch.zeros(1, 4), [[0]]),
+            )
+        _cache_put(hit_key, (hit_rows, hit_keeps))
+        self.assertEqual(len(_cache), CACHE_MAX)
+
+        encoded_ids = []
+
+        def _encode(model, items, score_layer, merge_unit):
+            encoded_ids.append([id(item) for item in items])
+            return _fake_vision_encode(model, items, score_layer, merge_unit)
+
+        scheduler = _batch_scheduler()
+        jobs = [
+            (SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[hit])), None),
+            (SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[miss])), None),
+        ]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._compact_block_reason",
+            return_value=None,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            preencoded = preencode_visionzip_misses(scheduler, jobs)
+            self.assertEqual(encoded_ids, [[id(miss)]])
+            snap_rows, snap_keeps = preencoded["hits"][id(hit)]
+            self.assertTrue(torch.equal(snap_rows, hit_rows))
+            self.assertEqual(snap_keeps, [[0]])
+            self.assertIsNot(snap_keeps[0], hit_keeps[0])
+            self.assertIn(id(miss), preencoded["encoded"])
+            self.assertNotIn(id(hit), preencoded["encoded"])
+
+            for i in range(CACHE_MAX):
+                _cache_put(
+                    (20_000 + i, 1.0, 0.85, -2, ALGO_VERSION),
+                    (torch.zeros(1, 4), [[0]]),
+                )
+            self.assertIsNone(_cache_get(hit_key))
+            self.assertTrue(torch.equal(preencoded["hits"][id(hit)][0], hit_rows))
+
+            encoded_ids.clear()
+            changed = _apply_visionzip(
+                scheduler,
+                None,
+                None,
+                SimpleNamespace(mm_items=[hit]),
+                None,
+                preencoded=preencoded,
+            )
+        self.assertFalse(changed)
+        self.assertEqual(encoded_ids, [])
+
+    def test_apply_encodes_missing_piece_without_raising(self):
+        item = _batch_image(3)
+        encoded_ids = []
+
+        def _encode(model, items, score_layer, merge_unit):
+            encoded_ids.append([id(item) for item in items])
+            return _fake_vision_encode(model, items, score_layer, merge_unit)
+
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            changed = _apply_visionzip(
+                _batch_scheduler(),
+                None,
+                None,
+                SimpleNamespace(mm_items=[item]),
+                None,
+                preencoded={"hits": {}, "encoded": {}},
+            )
+        self.assertFalse(changed)
+        self.assertEqual(encoded_ids, [[id(item)]])
+        self.assertIsNotNone(_cache_get(_cache_key(item, 1.0, 0.85, -2)))
+
+    def test_preencode_dedups_same_cache_key(self):
+        first = _batch_image(7)
+        second = _batch_image(7)
+        encoded_items = []
+
+        def _encode(model, items, score_layer, merge_unit):
+            encoded_items.append(list(items))
+            return _fake_vision_encode(model, items, score_layer, merge_unit)
+
+        jobs = [
+            (SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[first])), None),
+            (
+                SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[second])),
+                None,
+            ),
+        ]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._compact_block_reason",
+            return_value=None,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            preencoded = preencode_visionzip_misses(_batch_scheduler(), jobs)
+        self.assertEqual(encoded_items, [[first]])
+        left = preencoded["encoded"][id(first)]
+        right = preencoded["encoded"][id(second)]
+        self.assertIs(left, right)
+        for part_left, part_right in zip(left, right):
+            self.assertIs(part_left, part_right)
+
+    def test_preencode_chunks_by_patch_budget(self):
+        first = _batch_image(11)
+        second = _batch_image(12)
+        calls = []
+
+        def _encode(model, items, score_layer, merge_unit):
+            patches = sum(
+                sum(_item_token_counts(item, merge_unit)) * merge_unit
+                for item in items
+            )
+            calls.append((list(items), patches))
+            return _fake_vision_encode(model, items, score_layer, merge_unit)
+
+        scheduler = _batch_scheduler()
+        scheduler.max_prefill_tokens = 1
+        jobs = [
+            (
+                SimpleNamespace(
+                    multimodal_inputs=SimpleNamespace(mm_items=[first, second])
+                ),
+                None,
+            )
+        ]
+        with patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._compact_block_reason",
+            return_value=None,
+        ), patch(
+            "sglang.srt.speculative.standalone_remote.drafter.sr_vision_zip._encode_images",
+            side_effect=_encode,
+        ):
+            preencoded = preencode_visionzip_misses(scheduler, jobs)
+        budget = scheduler.max_prefill_tokens * 4
+        self.assertEqual([items for items, _patches in calls], [[first], [second]])
+        for _items, patches in calls:
+            self.assertLessEqual(patches, budget)
+        self.assertIn(id(first), preencoded["encoded"])
+        self.assertIn(id(second), preencoded["encoded"])
+        self.assertIsNot(
+            preencoded["encoded"][id(first)], preencoded["encoded"][id(second)]
+        )
+
+    def test_park_reuses_sr_parked_rows(self):
+        parked = torch.arange(4, dtype=torch.float32).view(1, 4)
+        current = torch.zeros(1, 4)
+        swapped = SimpleNamespace(
+            precomputed_embeddings=current, sr_parked_rows=parked
+        )
+        kept_rows = torch.ones(1, 4)
+        kept = SimpleNamespace(precomputed_embeddings=kept_rows)
+        park_precomputed_embeddings(
+            SimpleNamespace(mm_items=[swapped, kept])
+        )
+        self.assertIs(swapped.precomputed_embeddings, parked)
+        self.assertIs(kept.precomputed_embeddings, kept_rows)
 
 
 if __name__ == "__main__":

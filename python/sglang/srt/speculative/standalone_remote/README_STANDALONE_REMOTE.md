@@ -536,7 +536,7 @@ Draft 上的压缩按下面的方式适配 Qwen-VL，不是论文原文的逐步
 
 - Qwen3-VL 没有 CLS token。被关注度是采样 query 对每个 key 的注意力平均，再按 merge 窗口求和，当作 dominant token 的分数。
 - 合并是 `mean(target + donors)`，也就是目标行和分到它的 donor 一起求均值。论文是 `target + mean(donors)`。均值的数值范围更稳，这里保留均值。
-- donor 找最近锚点时，余弦相似度用打分层 key 在 merge 窗口上的均值。Qwen 的 `spatial_merge_unit` 是 4，对应 2x2。分数仍来自同一层的 q/k。被写回的仍是完整 embedding 行，包括 deepstack 列。
+- donor 找最近锚点时，余弦相似度用打分层 RoPE 前的 key 在 merge 窗口上的均值。Qwen 的 `spatial_merge_unit` 是 4，对应 2x2。分数仍来自同一层 RoPE 之后的 q/k。被写回的仍是完整 embedding 行，包括 deepstack 列。
 - `dominant_ratio=1` 时保留名额全部给 dominant，没有上下文锚点。其余 token 直接丢弃，不会合并进去。
 
 ### 邻近投机与设备参数
