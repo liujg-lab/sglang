@@ -67,9 +67,11 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     target_tree_fia_blocked_extra_combos,
 )
 from sglang.srt.speculative.tree_attn_fallback import (
+    COMPACT_FIA_WORKSPACE_BYTES,
     TREE_GRAPH_KV_BUCKETS_ENV,
     TREE_GRAPH_MAX_KV_ENV,
     build_tree_verify_kv_slots,
+    compact_fia_workspace_fits,
     fill_tree_verify_kv_slots_,
     flatten_paged_kv,
     gather_kv_into,
@@ -404,6 +406,7 @@ class AscendAttnBackend(AttentionBackend):
         self.tree_draft_replay_count = 0
         self.tree_capacity_fallback_count = 0
         self.tree_layout_fallback_count = 0
+        self._compact_fia_workspace_unfit = False
         self._logged_tree_fallback = set()
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
@@ -965,6 +968,25 @@ class AscendAttnBackend(AttentionBackend):
             use_mla=self.use_mla, has_rope_split=q_rope is not None
         )
 
+    def _compact_fia_memory_allows(self) -> bool:
+        """Skip compact FIA once free memory cannot hold its workspace.
+
+        The first shortfall is remembered for the process. Later layers stay
+        on chunked attention and do not query the device again.
+        """
+        if self._compact_fia_workspace_unfit:
+            return False
+        free, _ = torch.npu.mem_get_info()
+        if compact_fia_workspace_fits(int(free)):
+            return True
+        self._compact_fia_workspace_unfit = True
+        logger.info(
+            "tree compact FIA skipped: free %.2f MiB is below the %d MiB workspace",
+            int(free) / (1024 * 1024),
+            COMPACT_FIA_WORKSPACE_BYTES // (1024 * 1024),
+        )
+        return False
+
     def tree_slot_graph_can_run(self, forward_batch: ForwardBatch) -> bool:
         """True when this tree batch's needed KV fits a captured bucket.
 
@@ -1426,7 +1448,7 @@ class AscendAttnBackend(AttentionBackend):
             or self.speculative_num_draft_tokens
             or 1
         )
-        if self._use_tree_compact_fia(q_rope):
+        if self._use_tree_compact_fia(q_rope) and self._compact_fia_memory_allows():
             return self._run_tree_compact_fia(
                 q,
                 k_cache,
@@ -1439,11 +1461,12 @@ class AscendAttnBackend(AttentionBackend):
                 qk_head_dim=qk_head_dim,
                 v_head_dim=v_head_dim,
             )
-        self.tree_layout_fallback_count += 1
-        self._log_tree_fallback_once(
-            "layout",
-            f"verify use_mla={self.use_mla} has_rope={q_rope is not None}",
-        )
+        if not self._use_tree_compact_fia(q_rope):
+            self.tree_layout_fallback_count += 1
+            self._log_tree_fallback_once(
+                "layout",
+                f"verify use_mla={self.use_mla} has_rope={q_rope is not None}",
+            )
         return tree_verify_attention(
             q,
             k_cache,
@@ -1505,7 +1528,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             slots = swa
         log_tree_draft_slot_gather_once(self.draft_topk, self.page_size)
-        if self._use_tree_compact_fia(q_rope):
+        if self._use_tree_compact_fia(q_rope) and self._compact_fia_memory_allows():
             return self._run_tree_compact_fia(
                 q,
                 k_cache,
@@ -1518,11 +1541,12 @@ class AscendAttnBackend(AttentionBackend):
                 qk_head_dim=qk_head_dim,
                 v_head_dim=v_head_dim,
             )
-        self.tree_layout_fallback_count += 1
-        self._log_tree_fallback_once(
-            "layout",
-            f"draft use_mla={self.use_mla} has_rope={q_rope is not None}",
-        )
+        if not self._use_tree_compact_fia(q_rope):
+            self.tree_layout_fallback_count += 1
+            self._log_tree_fallback_once(
+                "layout",
+                f"draft use_mla={self.use_mla} has_rope={q_rope is not None}",
+            )
         return tree_draft_attention(
             q,
             k_cache,

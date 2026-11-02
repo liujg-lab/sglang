@@ -547,6 +547,14 @@ class ServerArgs:
     standalone_remote_draft_vision_dominant_ratio: float = 0.85
     standalone_remote_draft_vision_score_layer: int = -2
 
+    # OPT_TREE_REMOTE speculative decoding. Width is the verify-set size N.
+    opt_tree_role: Optional[Literal["target", "draft"]] = None
+    opt_tree_width: Optional[int] = None
+    opt_tree_tau: float = 0.5
+    opt_tree_max_depth: Optional[int] = None
+    opt_tree_addr: str = "127.0.0.1"
+    opt_tree_port: str = "30029"
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -1358,7 +1366,8 @@ class ServerArgs:
                     # Co-located eagle/MTP draft weights + CUDA graphs.
                     # NEXTN is rewritten to EAGLE later in _handle_speculative_decoding.
                     reserved_mem += 4 * 1024
-                # SPECTRE / STANDALONE_REMOTE: remote draft, no co-located draft weights.
+                # SPECTRE / STANDALONE_REMOTE / OPT_TREE_REMOTE: remote draft,
+                # no co-located draft weights.
                 # NGRAM: no draft model. CUDA graphs already covered by cuda_graph_max_bs.
 
             self.mem_fraction_static = (
@@ -3279,6 +3288,16 @@ class ServerArgs:
             self._validate_standalone_remote_vl_config()
             self._log_remote_spec_backend_checks("STANDALONE_REMOTE")
 
+        if self.speculative_algorithm == "OPT_TREE_REMOTE":
+            self._handle_opt_tree_remote()
+
+    def _handle_opt_tree_remote(self) -> None:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_args import (
+            apply_opt_tree_settings,
+        )
+
+        apply_opt_tree_settings(self, on_npu=self.device == "npu" or is_npu())
+
     def _log_remote_spec_backend_checks(self, algo: str) -> None:
         """Log backend/role/verify/page/graph capability for SPECTRE and SR."""
         from sglang.srt.speculative.spec_utils import (
@@ -5145,6 +5164,7 @@ class ServerArgs:
                 "NGRAM",
                 "SPECTRE",
                 "STANDALONE_REMOTE",
+                "OPT_TREE_REMOTE",
             ],
             help="Speculative algorithm.",
         )
@@ -5505,6 +5525,59 @@ class ServerArgs:
                 "ViT block used to score patches. Negative indexes count from the "
                 "end, so -2 is the second-to-last block."
             ),
+        )
+
+        # OPT_TREE_REMOTE speculative decoding
+        parser.add_argument(
+            "--opt-tree-role",
+            type=str,
+            choices=["target", "draft"],
+            default=ServerArgs.opt_tree_role,
+            help=(
+                "Role of this process for OPT_TREE_REMOTE: 'target' verifies, "
+                "'draft' grows the OPT tree."
+            ),
+        )
+        parser.add_argument(
+            "--opt-tree-width",
+            type=int,
+            default=ServerArgs.opt_tree_width,
+            help=(
+                "OPT-Tree width N. Each layer keeps N nodes, and the verify set "
+                "is those N nodes. Omitted --speculative-num-draft-tokens is "
+                "set to N; an explicit value must equal N."
+            ),
+        )
+        parser.add_argument(
+            "--opt-tree-tau",
+            type=float,
+            default=ServerArgs.opt_tree_tau,
+            help=(
+                "OPT-Tree stops when the acceptance-mass gain is not greater "
+                "than this threshold."
+            ),
+        )
+        parser.add_argument(
+            "--opt-tree-max-depth",
+            type=int,
+            default=ServerArgs.opt_tree_max_depth,
+            help=(
+                "OPT-Tree depth cap, including the seed layer. The longest "
+                "verified chain is max_depth - 1. Omitted --speculative-num-steps "
+                "is set to this depth; an explicit value must equal it."
+            ),
+        )
+        parser.add_argument(
+            "--opt-tree-addr",
+            type=str,
+            default=ServerArgs.opt_tree_addr,
+            help="Draft RPC bind address, or the address the Target connects to.",
+        )
+        parser.add_argument(
+            "--opt-tree-port",
+            type=str,
+            default=ServerArgs.opt_tree_port,
+            help="TCP port for the OPT_TREE_REMOTE sync RPC.",
         )
 
         # Expert parallelism

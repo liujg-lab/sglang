@@ -302,6 +302,16 @@ def tree_compact_fia_layout_supported(*, use_mla: bool, has_rope_split: bool) ->
     return (not bool(use_mla)) and (not bool(has_rope_split))
 
 
+# ``get_max_workspace`` for this BSND tree path requested 252 MiB on NPU.
+# Chunked attention is used when the device cannot hold that allocation.
+COMPACT_FIA_WORKSPACE_BYTES = 252 * 1024 * 1024
+
+
+def compact_fia_workspace_fits(free_bytes: int) -> bool:
+    """True when free device memory can hold the compact FIA workspace."""
+    return int(free_bytes) >= COMPACT_FIA_WORKSPACE_BYTES
+
+
 def tree_fia_actual_seq_lengths_kv(kv_lens: SeqLens, capture_rows: Optional[int] = None):
     """CPU length vector for FIA. Zero-length rows become 1 (zero K/V + clear out)."""
     if isinstance(kv_lens, torch.Tensor):

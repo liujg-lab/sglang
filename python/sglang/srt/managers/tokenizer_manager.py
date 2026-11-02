@@ -1954,13 +1954,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             and isinstance(accepted_list, list)
             and len(accepted_list) > i
         )
-        is_sr = (
+        algo = SpeculativeAlgorithm.from_string(
             getattr(self.server_args, "speculative_algorithm", None)
-            == "STANDALONE_REMOTE"
         )
         if has_verify and verify_list[i] > 0:
-            # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+            num_guess_tokens = algo.guess_tokens_per_step(self.server_args)
             total_draft_tokens = verify_list[i] * num_guess_tokens
             accepted_tokens = accepted_list[i]
 
@@ -1985,7 +1983,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     i
                 ]
         elif (
-            is_sr
+            algo.reports_remote_spec_metrics()
             and isinstance(verify_list, list)
             and len(verify_list) > i
             and verify_list[i] == 0
@@ -1996,7 +1994,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             meta_info["spec_accept_token_num"] = 0
             meta_info["spec_draft_token_num"] = 0
 
-        if is_sr:
+        if algo.reports_remote_spec_metrics():
             fallback_list = getattr(recv_obj, "spec_fallback_ct", None)
             if (
                 isinstance(fallback_list, list)

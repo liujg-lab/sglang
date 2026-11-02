@@ -130,6 +130,27 @@ class SchedulerStandaloneRemoteTargetMixin:
         elif self.spec_algorithm.is_standalone_remote():
             self.notify_sr_draft_finished(req, SRAction.FINISH)
 
+    def maybe_abort_remote_target(self) -> None:
+        """Tell Draft to drop KV before the session id rotates.
+
+        A later PREFILL on the new session also wipes, but only if one arrives.
+        """
+        if not self.spec_algorithm.is_standalone_remote():
+            return
+        notify_active = getattr(self, "notify_sr_draft_aborted_active", None)
+        if callable(notify_active):
+            notify_active()
+        self.reset_standalone_remote_target_state()
+
+    def maybe_notify_remote_draft_aborted(self, reqs) -> None:
+        """Tell Draft about requests aborted one at a time.
+
+        ``abort_all`` rotates the session through ``maybe_abort_remote_target``.
+        """
+        if not self.spec_algorithm.is_standalone_remote() or not reqs:
+            return
+        self.notify_sr_draft_aborted(reqs)
+
     def _new_sr_session_id(self) -> str:
         return f"{time.time_ns():020d}_{uuid.uuid4().hex[:8]}"
 
@@ -843,7 +864,13 @@ class SchedulerStandaloneRemoteTargetMixin:
         self._sr_hold_finish_flush = inflight is not None
         batch.sr_step_sent = True
 
-    def _sr_run_verify_round(self, batch):
+    def _sr_run_verify_round(self, batch, draft_num_tokens: Optional[int] = None):
+        """Run one verify round.
+
+        ``draft_num_tokens`` overrides the forward length for this batch only.
+        The default remains ``speculative_num_draft_tokens``. The wire shape
+        is not changed.
+        """
         metrics = get_sr_round_metrics(self, "Target")
         with metrics.round():
             batch.sr_round_metrics = metrics
@@ -855,9 +882,14 @@ class SchedulerStandaloneRemoteTargetMixin:
                         replies = self.rpc_next_draft(live)
                     self._sr_maybe_align_chain_replies(live, replies, prefill=False)
                     n_ok = self._sr_attach_replies(live, replies)
-                batch.draft_num_tokens = (
-                    self.server_args.speculative_num_draft_tokens if n_ok else 1
-                )
+                if n_ok == 0:
+                    batch.draft_num_tokens = 1
+                elif draft_num_tokens is None:
+                    batch.draft_num_tokens = (
+                        self.server_args.speculative_num_draft_tokens
+                    )
+                else:
+                    batch.draft_num_tokens = int(draft_num_tokens)
                 batch.sr_step_sent = False
                 batch.sr_step_accounted = False
                 batch.sr_step_inflight = None

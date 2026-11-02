@@ -16,8 +16,10 @@ from sglang.srt.speculative.tree_attn_fallback import (
     ATTN_CHUNK_ALIGN,
     MAX_ATTN_CHUNK_WIDTH,
     MAX_ATTN_CHUNKS,
+    COMPACT_FIA_WORKSPACE_BYTES,
     build_tree_verify_kv_slots,
     build_tree_verify_kv_slots_ref,
+    compact_fia_workspace_fits,
     fill_tree_verify_kv_slots_,
     chunked_attend,
     flatten_paged_kv,
@@ -1218,6 +1220,14 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
         self.assertTrue(tree_compact_fia_layout_supported(use_mla=False, has_rope_split=False))
         self.assertFalse(tree_compact_fia_layout_supported(use_mla=True, has_rope_split=False))
 
+    def test_compact_fia_workspace_fits_free_memory(self):
+        mib = 1024 * 1024
+        self.assertEqual(COMPACT_FIA_WORKSPACE_BYTES, 252 * mib)
+        self.assertFalse(compact_fia_workspace_fits(12 * mib))
+        self.assertFalse(compact_fia_workspace_fits(COMPACT_FIA_WORKSPACE_BYTES - 1))
+        self.assertTrue(compact_fia_workspace_fits(COMPACT_FIA_WORKSPACE_BYTES))
+        self.assertTrue(compact_fia_workspace_fits(COMPACT_FIA_WORKSPACE_BYTES + mib))
+
     def test_fia_update_list_matches_full_records(self):
         spec_utils = _REPO_ROOT / "python/sglang/srt/speculative/spec_utils.py"
         src = _function_source(spec_utils, "expand_fia_cpu_update_inputs")
@@ -1325,10 +1335,17 @@ class TestTreeCompactFillAndBuckets(CustomTestCase):
         self.assertIn("[1] * rows", compact_src)
         self.assertNotIn(".cpu()", compact_src)
         verify_src = _function_source(_ASCEND_BACKEND, "_run_tree_verify_slot_gather")
+        self.assertIn("_compact_fia_memory_allows", verify_src)
         self.assertIn("_run_tree_compact_fia", verify_src)
         self.assertIn("tree_verify_attention", verify_src)
         draft_src = _function_source(_ASCEND_BACKEND, "_run_tree_draft_slot_gather")
+        self.assertIn("_compact_fia_memory_allows", draft_src)
         self.assertIn("_run_tree_compact_fia", draft_src)
+        self.assertIn("tree_draft_attention", draft_src)
+        allow_src = _function_source(_ASCEND_BACKEND, "_compact_fia_memory_allows")
+        self.assertIn("_compact_fia_workspace_unfit", allow_src)
+        self.assertIn("compact_fia_workspace_fits", allow_src)
+        self.assertIn("mem_get_info", allow_src)
 
 
 if __name__ == "__main__":

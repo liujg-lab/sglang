@@ -1,0 +1,426 @@
+"""OPT_TREE_REMOTE scheduling.
+
+The send/recv loop follows the standalone-remote RPC session: Target asks,
+Draft answers, and a missed reply falls back inside that session. Tree growth
+does not use the EAGLE top-k drafter. Each kept layer is one masked forward.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from contextlib import nullcontext
+from typing import Dict, List, Optional, Tuple
+
+from sglang.srt.environ import envs
+from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
+from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+    OptLayerForward,
+    grow_with_forwards,
+    produce_opt_windows,
+)
+from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
+from sglang.srt.speculative.standalone_remote.sr_commit import (
+    SR_PROTOCOL_VERSION,
+    supported_protocol,
+)
+from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
+from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    SRAction,
+    SRBatchReply,
+    SRBatchRequest,
+    SRDraftRequest,
+    SRReplyStatus,
+)
+from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+    get_sr_round_metrics,
+    idle_sr_round_metrics,
+)
+from sglang.srt.speculative.standalone_remote.sr_transport import (
+    SRDraftServer,
+    SRTargetClient,
+)
+from sglang.srt.utils import DynamicGradMode
+
+logger = logging.getLogger(__name__)
+
+
+def make_opt_tree_transport(server_args):
+    """Bind or connect the OPT RPC socket. Addresses come from ``--opt-tree-*``."""
+    role = server_args.opt_tree_role
+    addr = server_args.opt_tree_addr or "127.0.0.1"
+    port = str(server_args.opt_tree_port or "30029")
+    if role == "draft":
+        return SRDraftServer(addr, port)
+    timeout_ms = int(
+        getattr(server_args, "standalone_remote_rpc_timeout_ms", 5000) or 5000
+    )
+    return SRTargetClient(addr, port, timeout_ms=timeout_ms)
+
+
+class OptTreeSchedulerMixin:
+    @property
+    def is_remote_spec_draft(self) -> bool:
+        if (
+            self.spec_algorithm.is_opt_tree_remote()
+            and self.server_args.opt_tree_role == "draft"
+        ):
+            return True
+        return super().is_remote_spec_draft
+
+    def maybe_notify_remote_draft_finished(self, req) -> None:
+        if (
+            self.spec_algorithm.is_opt_tree_remote()
+            and self.server_args.opt_tree_role == "target"
+        ):
+            self.notify_sr_draft_finished(req, SRAction.FINISH)
+            return
+        return super().maybe_notify_remote_draft_finished(req)
+
+    def maybe_abort_remote_target(self) -> None:
+        """Tell the draft to drop KV before the target session rotates."""
+        if not (
+            self.spec_algorithm.is_opt_tree_remote()
+            and self.server_args.opt_tree_role == "target"
+        ):
+            parent = getattr(super(), "maybe_abort_remote_target", None)
+            if callable(parent):
+                parent()
+            return
+        notify_active = getattr(self, "notify_sr_draft_aborted_active", None)
+        if callable(notify_active):
+            notify_active()
+        reset = getattr(self, "reset_standalone_remote_target_state", None)
+        if callable(reset):
+            reset()
+
+    def maybe_notify_remote_draft_aborted(self, reqs) -> None:
+        """Same single-request draft abort as standalone-remote, for OPT target."""
+        if not (
+            self.spec_algorithm.is_opt_tree_remote()
+            and self.server_args.opt_tree_role == "target"
+        ):
+            return super().maybe_notify_remote_draft_aborted(reqs)
+        if not reqs:
+            return
+        notify = getattr(self, "notify_sr_draft_aborted", None)
+        if callable(notify):
+            notify(reqs)
+
+    def init_opt_tree_communication(self) -> None:
+        if not self.spec_algorithm.is_opt_tree_remote():
+            return
+        role = self.server_args.opt_tree_role
+        if role not in ("target", "draft"):
+            raise ValueError(f"Invalid OPT_TREE_REMOTE role: {role}")
+        self.sr_client = None
+        self.sr_breaker = None
+        self.sr_speculation_stopped = False
+        if role == "draft":
+            self.paused_reqs: List = []
+            self.paused_reqs_lock = threading.RLock()
+            self.draft_paused_reqs: List = []
+
+    def _init_opt_tree_target(self) -> None:
+        self._sync_sr_session_id()
+        self.sr_rpc_seq = 0
+        self.sr_client = None
+        self._sr_hold_finish_flush = False
+        self.sr_breaker = SRRpcBreaker(
+            failure_threshold=int(
+                getattr(self.server_args, "standalone_remote_breaker_failures", 3)
+                or 3
+            ),
+            cooldown_steps=int(
+                getattr(self.server_args, "standalone_remote_breaker_cooldown", 32)
+                or 32
+            ),
+        )
+        if self.tp_size == 1 or self.tp_rank == 0:
+            client = make_opt_tree_transport(self.server_args)
+            assert isinstance(client, SRTargetClient)
+            client.drop_callback = self._sr_note_stale
+            self.sr_client = client
+        if self.tp_rank == 0:
+            logger.info(
+                "[OPT] Target session_id=%s addr=%s port=%s",
+                self.sr_session_id,
+                self.server_args.opt_tree_addr,
+                self.server_args.opt_tree_port,
+            )
+
+    def _init_opt_tree_draft(self) -> None:
+        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
+            SRDraftStateManager,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import (
+            SRKVRollbacker,
+        )
+
+        ttl = float(
+            getattr(self.server_args, "standalone_remote_draft_ttl_s", 60.0) or 0.0
+        )
+        self.sr_state = SRDraftStateManager(timeout_threshold=ttl)
+        self.sr_kv = SRKVRollbacker(
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
+            page_size=self.server_args.page_size or 1,
+            tp_rank=self.tp_rank,
+        )
+        self.sr_server = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            server = make_opt_tree_transport(self.server_args)
+            assert isinstance(server, SRDraftServer)
+            self.sr_server = server
+        self.draft_paused_reqs = []
+        self.sr_tree_drafter = None
+        self._sr_device_poisoned = False
+        if self.tp_rank == 0:
+            logger.info(
+                "[OPT] Draft scheduler ready width=%s max_depth=%s tau=%s addr=%s port=%s",
+                self.server_args.opt_tree_width,
+                self.server_args.opt_tree_max_depth,
+                self.server_args.opt_tree_tau,
+                self.server_args.opt_tree_addr,
+                self.server_args.opt_tree_port,
+            )
+
+    def _opt_run_verify_round(self, batch) -> None:
+        """Same verify round as standalone-remote, with N + 1 forward tokens.
+
+        ``--speculative-num-draft-tokens`` stays equal to the OPT width. The
+        extra token is the committed tail at verify slot 0, and that length
+        is only this batch's forward size.
+        """
+        self._sr_run_verify_round(
+            batch, draft_num_tokens=int(self.server_args.opt_tree_width) + 1
+        )
+
+    def _opt_rollback(self, req, keep_len: int) -> None:
+        kv = getattr(self, "sr_kv", None)
+        if kv is None:
+            return
+        allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+        if allocated <= int(keep_len):
+            return
+        if not kv.rollback(req, int(keep_len), allocated):
+            raise RuntimeError(
+                f"OPT draft {req.rid} could not roll KV back to {keep_len} "
+                f"from {allocated}"
+            )
+
+    def _opt_expand_one(self, req) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
+        self._sr_resume_req(req)
+        self._sr_isolate_need({req.rid})
+        committed = len(req.origin_input_ids or []) + len(req.output_ids or [])
+        try:
+            cached = int(getattr(req, "kv_committed_len", 0) or 0)
+            if cached != committed:
+                raise RuntimeError(
+                    f"OPT draft {req.rid} committed KV {cached} != {committed} tokens"
+                )
+            allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+            if allocated > committed:
+                self._opt_rollback(req, committed)
+            config = OptTreeConfig(
+                width=int(self.server_args.opt_tree_width),
+                tau=float(self.server_args.opt_tree_tau),
+                max_depth=int(self.server_args.opt_tree_max_depth),
+            )
+            runner = OptLayerForward(self, req, committed)
+            tail_logits = runner.logits_at_tail()
+            tokens, parents, cols = grow_with_forwards(
+                config,
+                tail_logits,
+                runner.forward_layer,
+            )
+            return tokens, parents, cols
+        except Exception as exc:
+            logger.warning("[OPT] tree expand failed for %s: %s", req.rid, exc)
+            return [], None, None
+        finally:
+            self._opt_rollback(req, committed)
+            if not self._sr_is_finished(req):
+                self._sr_pause_req(req)
+            self.last_batch = None
+            self.cur_batch = None
+
+    def _opt_handle_batch_impl(self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
+        metrics = get_sr_round_metrics(self, "Draft")
+        prepare_start = time.perf_counter()
+        last_session = self.sr_state.session_id
+        if last_session is not None and batch.session_id > last_session:
+            self._sr_wipe_all()
+        self.sr_state.session_id = batch.session_id
+        self._sr_cleanup_stale_drafts(keep_rids={d.rid for d in batch.reqs})
+        if (
+            batch.action not in (SRAction.FINISH, SRAction.ABORT)
+            and self._sr_draft_busy()
+        ):
+            logger.info(
+                "[OPT] Draft busy, REJECT rpc_seq=%s n=%s",
+                batch.rpc_seq,
+                len(batch.reqs),
+            )
+            return SRBatchReply(
+                session_id=batch.session_id,
+                rpc_seq=batch.rpc_seq,
+                protocol_version=SR_PROTOCOL_VERSION,
+                reqs=[
+                    self._sr_empty_reply(d, status=SRReplyStatus.REJECT)
+                    for d in batch.reqs
+                ],
+            )
+        n = len(batch.reqs)
+        replies: List[Optional[object]] = [None] * n
+        gpu_pairs = []
+        vision_jobs = [] if batch.action == SRAction.PREFILL else None
+        for i, dreq in enumerate(batch.reqs):
+            reply, req = self._sr_prepare_v2(
+                dreq,
+                batch.action,
+                batch.session_id,
+                mm_by_rid.get(dreq.rid),
+                vision_jobs,
+            )
+            if reply is not None:
+                replies[i] = reply
+            else:
+                gpu_pairs.append((i, dreq, req))
+        if metrics.active:
+            metrics.add_host("align_prepare", time.perf_counter() - prepare_start)
+        if vision_jobs:
+            self._sr_flush_vision_jobs(vision_jobs)
+        if gpu_pairs:
+            windows = produce_opt_windows(
+                self, batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
+            )
+            for (i, dreq, req), window in zip(gpu_pairs, windows):
+                pending_wire = getattr(req, "sr_pending_wire_request", None)
+                wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
+                reply = self._sr_stamp_window(wire, window, batch.session_id)
+                if batch.action == SRAction.PREFILL:
+                    reply = self._sr_annotate_prompt_compaction(req, reply)
+                replies[i] = self._sr_finalize_v2_commit(wire, req, reply)
+        self._sr_note_handled(batch)
+        return SRBatchReply(
+            session_id=batch.session_id,
+            rpc_seq=batch.rpc_seq,
+            protocol_version=SR_PROTOCOL_VERSION,
+            reqs=[
+                r if r is not None else self._sr_empty_reply(d)
+                for r, d in zip(replies, batch.reqs)
+            ],
+        )
+
+    @DynamicGradMode()
+    def event_loop_normal_opt_tree_target(self):
+        self._init_opt_tree_target()
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                is_extend = (
+                    batch.forward_mode is not None and batch.forward_mode.is_extend()
+                ) or getattr(batch, "is_extend_in_batch", False)
+
+                if is_extend:
+                    live = [
+                        r for r in self._sr_select_reqs(batch) if not r.finished()
+                    ]
+                    inflight = (
+                        self._sr_send(
+                            SRAction.PREFILL, live, include_full_context=True
+                        )
+                        if live
+                        else None
+                    )
+                    batch.draft_num_tokens = self.server_args.speculative_num_draft_tokens
+                    try:
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
+                    finally:
+                        if inflight is not None:
+                            replies, pending = self._sr_recv(inflight)
+                            still = [r for r in live if not r.finished()]
+                            self._sr_apply_commit_acks(still, replies, pending)
+                            self._sr_note_draft_prompt_lens(still, replies)
+                            self._sr_maybe_align_chain_replies(
+                                still, replies, prefill=True
+                            )
+                            self._sr_attach_replies(still, replies)
+                elif skip_reason := self._sr_skip_draft_rpc(batch):
+                    get_sr_round_metrics(self, "Target").note_skip(
+                        skip_reason, batch.batch_size()
+                    )
+                    batch.draft_num_tokens = 1
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+                else:
+                    self._opt_run_verify_round(batch)
+            else:
+                self.self_check_during_idle()
+                idle_sr_round_metrics(self)
+
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
+    @DynamicGradMode()
+    def event_loop_normal_opt_tree_draft(self) -> None:
+        self._init_opt_tree_draft()
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            packet = self._sr_recv_packet()
+            if packet is not None:
+                batch, mm = packet
+                if self._sr_batch_is_stale(batch):
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "[OPT] Draft drop stale session=%s rpc_seq=%s",
+                            batch.session_id,
+                            batch.rpc_seq,
+                        )
+                else:
+                    metrics = get_sr_round_metrics(self, "Draft")
+                    measure = batch.action == SRAction.STEP
+                    last_session = self.sr_state.session_id
+                    if last_session is not None and batch.session_id > last_session:
+                        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+                            flush_sr_round_metrics,
+                        )
+
+                        flush_sr_round_metrics(self, "session_reset")
+                    with metrics.round() if measure else nullcontext():
+                        if not supported_protocol(batch.protocol_version):
+                            reply = self._sr_protocol_mismatch_reply(batch)
+                            self._sr_note_handled(batch)
+                        elif self._sr_spec_shape_rejected(batch):
+                            reply = self._sr_spec_shape_mismatch_reply(batch)
+                            self._sr_note_handled(batch)
+                        else:
+                            reply = self._opt_handle_batch_impl(batch, mm)
+                        if (
+                            (self.tp_size == 1 or self.tp_rank == 0)
+                            and self.sr_server is not None
+                            and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                        ):
+                            with metrics.phase("reply_send"):
+                                self.sr_server.send_batch(reply)
+                self.last_batch = None
+                self._sr_resume_http_reqs()
+                self._sr_poll_deferred_finishes()
+                continue
+            self._sr_cleanup_stale_drafts()
+            self._sr_poll_deferred_finishes()
+            self._sr_run_http_batch()
+            idle_sr_round_metrics(self)

@@ -215,6 +215,9 @@ from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import
 from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
     SchedulerSpectreTargetMixin,
 )
+from sglang.srt.speculative.opt_tree_remote.opt_tree_scheduler import (
+    OptTreeSchedulerMixin,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
     StandaloneRemoteDraftSchedulerMixin as SchedulerStandaloneRemoteDraftMixin,
 )
@@ -303,6 +306,7 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerSpectreDraftMixin,
     SchedulerSpectreTargetMixin,
+    OptTreeSchedulerMixin,
     SchedulerStandaloneRemoteDraftMixin,
     SchedulerStandaloneRemoteTargetMixin,
 ):
@@ -448,6 +452,7 @@ class Scheduler(
 
         self.init_spectre_communication()
         self.init_standalone_remote_communication()
+        self.init_opt_tree_communication()
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -528,9 +533,8 @@ class Scheduler(
         那样 VL 请求会拿到纯文本位置编码：不报错，只表现为接受率莫名很低。
         与其静默跑错，不如启动就失败。
         """
-        if self.server_args.spectre_role != "draft" and not (
-            self.spec_algorithm.is_standalone_remote()
-            and self.server_args.standalone_remote_role == "draft"
+        if not self.spec_algorithm.needs_draft_multimodal_processor(
+            self.server_args
         ):
             return
         if not self.model_config.is_multimodal:
@@ -735,21 +739,9 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        # SPECTRE draft is a standalone AR server. SpectreWorker is the Target
-        # verifier only; wrapping draft with it leaves batch.draft_num_tokens
-        # unset (None) and crashes decode with `None - 1`.
-        if (
-            self.spec_algorithm.is_spectre()
-            and self.server_args.spectre_role == "draft"
-        ):
-            self.draft_worker = None
-            self.external_corpus_manager = None
-            return
-
-        if (
-            self.spec_algorithm.is_standalone_remote()
-            and self.server_args.standalone_remote_role == "draft"
-        ):
+        # Remote drafts are standalone AR servers. A target verifier worker
+        # leaves batch.draft_num_tokens unset and crashes decode with `None - 1`.
+        if self.spec_algorithm.skips_colocated_draft_worker(self.server_args):
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -2485,7 +2477,7 @@ class Scheduler(
     def get_num_allocatable_reqs(self, running_bs):
         paused_count = 0
         if self.is_remote_spec_draft:
-            if self.spec_algorithm.is_standalone_remote():
+            if self.spec_algorithm.uses_draft_paused_reqs(self.server_args):
                 paused_count = len(getattr(self, "draft_paused_reqs", None) or [])
             else:
                 lock = getattr(self, "paused_reqs_lock", None)
@@ -3426,16 +3418,10 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
         draft_http_abort = bool(getattr(self, "is_remote_spec_draft", False))
-        sr_target_abort = (
-            self.spec_algorithm.is_standalone_remote() and not draft_http_abort
-        )
-        if recv_req.abort_all and sr_target_abort:
-            # Tell Draft to drop KV before the session id rotates. A later
-            # PREFILL on the new session also wipes, but only if one arrives.
-            notify_active = getattr(self, "notify_sr_draft_aborted_active", None)
-            if callable(notify_active):
-                notify_active()
-            self.reset_standalone_remote_target_state()
+        if recv_req.abort_all and not draft_http_abort:
+            abort_remote = getattr(self, "maybe_abort_remote_target", None)
+            if callable(abort_remote):
+                abort_remote()
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3475,10 +3461,10 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-        if sr_target_abort and not recv_req.abort_all and aborted_waiting:
-            notify_one = getattr(self, "notify_sr_draft_aborted", None)
-            if callable(notify_one):
-                notify_one(aborted_waiting)
+        if not recv_req.abort_all and not draft_http_abort and aborted_waiting:
+            notify_aborted = getattr(self, "maybe_notify_remote_draft_aborted", None)
+            if callable(notify_aborted):
+                notify_aborted(aborted_waiting)
 
         if draft_http_abort:
             paused = getattr(self, "draft_paused_reqs", None) or []
@@ -3571,13 +3557,13 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                if sr_target_abort and not recv_req.abort_all:
+                if not recv_req.abort_all and not draft_http_abort:
                     aborted_running.append(req)
                 req.to_finish = FINISH_ABORT()
         if aborted_running:
-            notify_running = getattr(self, "notify_sr_draft_aborted", None)
-            if callable(notify_running):
-                notify_running(aborted_running)
+            notify_aborted = getattr(self, "maybe_notify_remote_draft_aborted", None)
+            if callable(notify_aborted):
+                notify_aborted(aborted_running)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -3829,6 +3815,16 @@ def dispatch_event_loop(scheduler: Scheduler):
             and server_args.standalone_remote_role == "target"
         ):
             scheduler.event_loop_normal_standalone_remote_target()
+        elif (
+            scheduler.spec_algorithm.is_opt_tree_remote()
+            and server_args.opt_tree_role == "draft"
+        ):
+            scheduler.event_loop_normal_opt_tree_draft()
+        elif (
+            scheduler.spec_algorithm.is_opt_tree_remote()
+            and server_args.opt_tree_role == "target"
+        ):
+            scheduler.event_loop_normal_opt_tree_target()
         elif server_args.spectre_role == "draft":
             scheduler.event_loop_normal_spectre_draft()
         elif (

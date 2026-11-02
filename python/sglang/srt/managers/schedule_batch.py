@@ -2131,15 +2131,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # SPECTRE draft uses ordinary TpModelWorker AR decode, so it must
             # still collapse input_ids to the last token (otherwise q_len stays
             # at the prefill length and flashinfer decode rejects it).
-            spectre_draft = (
-                self.spec_algorithm.is_spectre()
-                and get_global_server_args().spectre_role == "draft"
-            )
-            standalone_remote_draft = (
-                self.spec_algorithm.is_standalone_remote()
-                and get_global_server_args().standalone_remote_role == "draft"
-            )
-            if not spectre_draft and not standalone_remote_draft:
+            if not self.spec_algorithm.uses_ordinary_decode_prepare(
+                get_global_server_args()
+            ):
                 return
 
         if self.sampling_info.penalizer_orchestrator.is_required:

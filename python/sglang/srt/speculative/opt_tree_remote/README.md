@@ -1,0 +1,107 @@
+# OPT-Tree Remote
+
+原版 OPT-Tree 的 CPU 实现，行为对照 `opt_classic_qwen3/tree.py` 里的 `Tree`。一轮里的宽度 N 和阈值 τ 固定。
+
+`OPT_TREE_REMOTE` 已经注册为 `--speculative-algorithm` 的一个选项。Target 和 Draft 是两个进程：Target 用 `build_tree_from_parents` 做验证，Draft 的每一层调用 `update`，不走 EAGLE 的 top-k 树。这个包不包含 AdaCost、代价模型或在线宽度控制器。
+
+## 算法
+
+1. 用根分布的 top-N 作为第 1 层。
+2. 每一层把父节点的路径概率乘以该父节点 top-N 个孩子的概率，再取全局 top-N。概率是温度 1 的 fp32 全词表 softmax，不做 top-N 内的再归一化。
+3. E 是除最新一层以外的节点里，top-N 路径概率之和。
+4. 当 `E - E_prev > tau` 且 `depth < max_depth` 时继续展开。否则丢掉最新一层，验证集仍然是 N 个节点。
+5. 同分时按路径概率降序、深度升序、列号升序。浅层父节点排在前面，因此选出的 N 个节点已经包含各自的祖先。
+
+`max_depth` 把种子层和每一次展开都算进去。停止时丢掉的是最新一层，所以一条草稿链最长是 `max_depth - 1`。
+
+## 注意力和父指针
+
+默认草稿 mask 只让每个节点看到自己和祖先。`ancestor_mask(state, leak=True)` 才会复现参考实现里 `kv_cache_mask` 从不清零的结果。后续草稿前向应使用 `ancestor_mask`。
+
+验证集里的 `parents[i] == -1` 表示已经提交的 tail token。其余父下标必须小于 `i`。`build_tree_from_parents` 把这个列表变成 FULL_MASK、positions，以及 `retrive_index` / `retrive_next_token` / `retrive_next_sibling`。根 token 占验证序列的第 0 位，不在 `draft_tokens` 里。
+
+`positions` 是 1-based 层深。调用方再加前缀偏移。未停止时，这一层的每个节点位置相同；停止后，每个验证节点使用自己的深度。
+
+## CPU 用法
+
+`update` 接收的是概率，不是 logits。第一调用形状可以是 `[vocab]` 或 `[1, 1, vocab]`，之后是 `[N, vocab]` 或 `[1, N, vocab]`。
+
+```python
+import torch
+
+from sglang.srt.speculative.opt_tree_remote import (
+    OptTreeConfig,
+    OptTreeState,
+    build_tree_from_parents,
+    topk_probs_from_logits,
+    update,
+)
+
+config = OptTreeConfig(width=4, tau=0.5, max_depth=10)
+state = OptTreeState.create(config)
+
+# 根分布。logits 形状 [vocab]。
+root_probs, _ = topk_probs_from_logits(root_logits, k=root_logits.shape[-1])
+step = update(state, root_probs)
+
+while not step.is_final:
+    # step.tokens: [N]
+    # step.positions: [N]，值为当前层的 1-based 深度
+    # step.ancestor_mask: [N, depth * N]，1 表示可见
+    next_logits = draft_forward(step.tokens, step.positions, step.ancestor_mask)
+    flat = next_logits.reshape(config.width, -1)
+    probs = torch.softmax(flat.float(), dim=-1)
+    step = update(state, probs)
+
+verify = step.verify
+seq_lens = torch.tensor([prefix_len], dtype=torch.long)
+layout = build_tree_from_parents(verify.parents, seq_lens)
+```
+
+`topk_probs_from_logits` 用 `exp(logit - logsumexp)` 计算全词表概率，再取 top-k。它和先 softmax 再 top-k 的下标一致。
+
+## 检查
+
+```bash
+PYTHONPATH=python python3.10 test/registered/unit/spec/test_opt_tree_remote.py -q
+```
+
+## 启动命令
+
+先启动 Target，等服务就绪后再启动 Draft。HTTP 请求只发到 Target 端口。两端的 N、τ 和 `max_depth` 必须相同。`--opt-tree-width` 是验证宽度 N，`--opt-tree-max-depth` 含种子层。未写 `--speculative-num-draft-tokens` 时它等于 N，未写 `--speculative-num-steps` 时它等于 `max_depth`。若仍手写这两个参数，必须与对应的 OPT 参数相同。验证前向还会带上已提交的 tail，所以实际前向长度是 N + 1。不要开启 RPD。CUDA 的 `--page-size` 是 1，NPU 是 128。
+
+Target：
+
+```bash
+python -m sglang.launch_server \
+  --model-path <target-model> \
+  --speculative-algorithm OPT_TREE_REMOTE \
+  --opt-tree-role target \
+  --opt-tree-width 4 \
+  --opt-tree-tau 0.5 \
+  --opt-tree-max-depth 10 \
+  --opt-tree-addr <draft-host> \
+  --opt-tree-port <rpc-port> \
+  --attention-backend triton \
+  --page-size 1 \
+  --port <target-http-port>
+```
+
+Draft：
+
+```bash
+python -m sglang.launch_server \
+  --model-path <draft-model> \
+  --speculative-algorithm OPT_TREE_REMOTE \
+  --opt-tree-role draft \
+  --opt-tree-width 4 \
+  --opt-tree-tau 0.5 \
+  --opt-tree-max-depth 10 \
+  --opt-tree-addr <draft-host> \
+  --opt-tree-port <rpc-port> \
+  --attention-backend triton \
+  --page-size 1 \
+  --port <draft-http-port>
+```
+
+CUDA 使用 `--page-size 1` 和 `triton`。NPU 把 `--page-size` 改为 128，并改用该后端对应的 attention backend。

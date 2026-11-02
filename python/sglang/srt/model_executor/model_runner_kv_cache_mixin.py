@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.model_executor.kv_token_budget import resolve_kv_token_budget
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -69,6 +70,20 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _device_total_capacity_gb(device: str, gpu_id: int) -> Optional[float]:
+    try:
+        if device == "npu":
+            from sglang.srt.utils.common import get_npu_memory_capacity
+
+            return get_npu_memory_capacity() / 1024
+        if device == "cuda":
+            return torch.cuda.mem_get_info(gpu_id)[1] / (1 << 30)
+    except Exception:
+        logger.debug("Unable to read device memory capacity", exc_info=True)
+        return None
+    return None
 
 
 class ModelRunnerKVCacheMixin:
@@ -168,13 +183,32 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
+        base_rest = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
+        rest_memory = base_rest
         if self.mambaish_config is not None:
-            rest_memory = self.handle_max_mamba_cache(rest_memory)
+            rest_memory = self.handle_max_mamba_cache(base_rest)
 
-        return int(rest_memory * (1 << 30)) // cell_size
+        budget = resolve_kv_token_budget(
+            pre_gb=float(pre_model_load_memory),
+            post_gb=float(post_model_load_memory),
+            mem_fraction_static=float(self.mem_fraction_static),
+            cell_size=cell_size,
+            page_size=self.server_args.page_size or 1,
+            chunked_prefill_size=self.server_args.chunked_prefill_size,
+            cuda_graph_bs=self.server_args.cuda_graph_bs,
+            total_capacity_gb=_device_total_capacity_gb(self.device, self.gpu_id),
+            extra_reserve_gb=float(base_rest - rest_memory),
+        )
+        if budget.used_fallback:
+            logger.warning("%s", budget.warning)
+            self.server_args.chunked_prefill_size = budget.chunked_prefill_size
+            self.server_args.cuda_graph_bs = budget.cuda_graph_bs
+            self.server_args.cuda_graph_max_bs = budget.cuda_graph_max_bs
+            if budget.disable_cuda_graph:
+                self.server_args.disable_cuda_graph = True
+        return budget.profiled_tokens
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
