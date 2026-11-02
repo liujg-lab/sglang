@@ -177,6 +177,11 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
                 SimpleNamespace(num_tokens_per_req=2)
             )
         )
+        self.assertFalse(
+            decode_cuda_graph_accepts_spec_info(
+                SimpleNamespace(forbids_decode_graph=True, num_tokens_per_req=1)
+            )
+        )
 
     def test_capture_keeps_last_when_draft_spec_info_is_none(self):
         null, last, full = 0, 1, 2

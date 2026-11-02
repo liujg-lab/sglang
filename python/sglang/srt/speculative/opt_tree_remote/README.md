@@ -8,11 +8,11 @@
 
 1. 用根分布的 top-N 作为第 1 层。
 2. 每一层把父节点的路径概率乘以该父节点 top-N 个孩子的概率，再取全局 top-N。概率是温度 1 的 fp32 全词表 softmax，不做 top-N 内的再归一化。
-3. E 是除最新一层以外的节点里，top-N 路径概率之和。
-4. 当 `E - E_prev > tau` 且 `depth < max_depth` 时继续展开。否则丢掉最新一层，验证集仍然是 N 个节点。
+3. E 是已经加入的每一层节点里，top-N 路径概率之和。
+4. 加完第 k 层后立刻判断。当 `E - E_prev > tau` 且 `depth < max_depth - 1` 时，前向第 k 层并展开下一层。否则停止。验证集就是这 k 层里的 N 个节点，不再为了丢掉下一层而多做一次草稿前向。
 5. 同分时按路径概率降序、深度升序、列号升序。浅层父节点排在前面，因此选出的 N 个节点已经包含各自的祖先。
 
-`max_depth` 把种子层和每一次展开都算进去。停止时丢掉的是最新一层，所以一条草稿链最长是 `max_depth - 1`。
+`max_depth` 与参考实现的 `Tree.max_depth` 相同，容量里仍留着那个参考实现会填上再丢掉的槽。这里在造出该层之前就停止，所以一条草稿链最长仍是 `max_depth - 1`。
 
 ## 注意力和父指针
 
@@ -68,7 +68,7 @@ PYTHONPATH=python python3.10 test/registered/unit/spec/test_opt_tree_remote.py -
 
 ## 启动命令
 
-先启动 Target，等服务就绪后再启动 Draft。HTTP 请求只发到 Target 端口。两端的 N、τ 和 `max_depth` 必须相同。`--opt-tree-width` 是验证宽度 N，`--opt-tree-max-depth` 含种子层。未写 `--speculative-num-draft-tokens` 时它等于 N，未写 `--speculative-num-steps` 时它等于 `max_depth`。若仍手写这两个参数，必须与对应的 OPT 参数相同。验证前向还会带上已提交的 tail，所以实际前向长度是 N + 1。不要开启 RPD。CUDA 的 `--page-size` 是 1，NPU 是 128。
+先启动 Target，等服务就绪后再启动 Draft。HTTP 请求只发到 Target 端口。两端的 N、τ 和 `max_depth` 必须相同。`--opt-tree-width` 是树宽 N，`--opt-tree-max-depth` 含种子层。未写 `--speculative-num-draft-tokens` 时，Target 填 N + 1（验证 token 数，含已提交尾 token），Draft 填 N（每层前向宽度）。手写该参数必须等于本角色的期望值。未写 `--speculative-num-steps` 时它等于 `max_depth`，手写时也必须等于 `max_depth`。线上 `spec_shape` 是 `(N, max_depth, N)`，与角色无关。不要开启 RPD。CUDA 的 `--page-size` 是 1，NPU 是 128。
 
 Target：
 

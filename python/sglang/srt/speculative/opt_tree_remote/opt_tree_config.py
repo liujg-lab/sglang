@@ -14,9 +14,9 @@ class OptTreeConfig:
     """Original OPT-Tree: keep N nodes per layer, stop on a probability gap.
 
     ``width`` is N. ``tau`` is the threshold on the increase of E. ``max_depth``
-    counts seed plus every expansion, matching ``Tree.max_depth``. The newest
-    layer is dropped on stop, so a chain of draft nodes is at most
-    ``max_depth - 1`` long.
+    matches ``Tree.max_depth``, including the extra slot that implementation
+    fills and then drops. This tree stops before that slot is built, so a
+    chain of draft nodes is still at most ``max_depth - 1`` long.
     """
 
     width: int
@@ -28,8 +28,8 @@ class OptTreeConfig:
             raise ValueError(f"opt-tree width must be >= 1, got {self.width}")
         if int(self.max_depth) < 2:
             raise ValueError(
-                f"opt-tree max_depth must be >= 2 so the newest layer can be "
-                f"dropped, got {self.max_depth}"
+                f"opt-tree max_depth must be >= 2 to match Tree.max_depth, "
+                f"got {self.max_depth}"
             )
         if not math.isfinite(float(self.tau)):
             raise ValueError(f"opt-tree tau must be finite, got {self.tau}")
@@ -39,5 +39,5 @@ class OptTreeConfig:
 
 
 def longest_draft_chain(config: OptTreeConfig) -> int:
-    """Most draft tokens on one root-to-leaf path after the newest layer is dropped."""
+    """Most draft tokens on one root-to-leaf path. The cap is ``max_depth - 1``."""
     return int(config.max_depth) - 1

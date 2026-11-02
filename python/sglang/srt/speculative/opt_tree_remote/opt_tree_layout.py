@@ -100,8 +100,8 @@ def build_tree_from_parents(
 
     ``num_verify_tokens`` is ``num_draft + 1``. Slot 0 of each row is the root.
     A draft node at hop ``h`` from the root (``h == 0`` when its parent is -1)
-    is placed at ``seq_len + h + 1``. The longest OPT chain therefore occupies
-    ``max_depth - 1`` draft positions when the newest layer was dropped.
+    is placed at ``seq_len + h + 1``. The longest OPT chain occupies
+    ``max_depth - 1`` draft positions.
     """
     parents = _as_long_2d(parent_index)
     batch, num_draft = int(parents.shape[0]), int(parents.shape[1])

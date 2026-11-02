@@ -220,6 +220,12 @@ class FixedAcceptEnvTest(CustomTestCase):
         too_long.speculative_num_steps = 4
         self.assertEqual(static_disable_reason(too_long), "capacity")
 
+        opt = _worker()
+        opt.speculative_algorithm = "OPT_TREE_REMOTE"
+        opt.speculative_num_draft_tokens = 61
+        opt.speculative_num_steps = 8
+        self.assertEqual(static_disable_reason(opt), "opt_tree")
+
     def test_warmup_scratch_resets_private_buffers(self):
         state = SRFixedAcceptState(2, 3, 4, 4, "cpu")
         from sglang.srt.speculative.standalone_remote import sr_kv_copy

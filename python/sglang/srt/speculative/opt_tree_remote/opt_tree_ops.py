@@ -1,13 +1,16 @@
 """CPU OPT-Tree expand / stop / ancestor mask.
 
-The control flow matches ``opt_classic_qwen3/tree.py`` ``Tree.update``:
+Layer selection matches ``opt_classic_qwen3/tree.py`` ``Tree.update``. The stop
+check does not. The reference adds layer k + 1 before judging E on layers
+1..k, then drops that extra layer. This implementation judges as soon as layer
+k exists, so the draft forward that only built the dropped layer is skipped.
+The verify set is the same N nodes.
 
 - each layer keeps N nodes (parent path probability times that parent's top-N
   child probabilities, then a global top-N);
-- E is the sum of the top-N path probabilities on every layer except the one
-  just added;
-- grow while ``E - E_prev > tau`` and ``depth < max_depth``;
-- on stop, drop the newest layer and verify N nodes.
+- E is the sum of the top-N path probabilities on every layer added so far;
+- grow while ``E - E_prev > tau`` and ``depth < max_depth - 1``;
+- on stop, verify those layers. Do not add a layer that would be discarded.
 
 Draft attention defaults to the ancestor chain. ``leak=True`` reproduces the
 reference ``kv_cache_mask`` that is never cleared.
@@ -25,7 +28,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 
 @dataclass
 class OptVerifySet:
-    """N verify nodes, newest layer already removed.
+    """N verify nodes chosen from every layer added so far.
 
     ``parents[i] == -1`` means the committed tail (the root). Any other parent
     is an index into this list and is strictly smaller than ``i``.
@@ -178,23 +181,25 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
 
 
 def acceptance_mass(state: OptTreeState) -> torch.Tensor:
-    """E on ``weight[:depth-1]``, excluding the layer just added."""
-    if state.depth < 2:
-        raise RuntimeError("acceptance mass needs a layer that can be dropped")
-    flat = state.weight[: state.depth - 1].reshape(-1)
+    """E on ``weight[:depth]``, every layer added so far."""
+    if state.depth < 1:
+        raise RuntimeError("acceptance mass needs a seeded tree")
+    flat = state.weight[: state.depth].reshape(-1)
     return torch.topk(flat, k=state.config.width, dim=-1).values.sum()
 
 
 def depth_rule(state: OptTreeState) -> bool:
-    """True when the tree should keep the newest layer and expand again.
+    """True when the latest layer should be forwarded and expanded again.
 
     The comparison stays in fp32. This does not write ``prev_e``.
+    ``depth < max_depth - 1`` is the reference ``depth < max_depth`` check
+    after the extra layer, without building that layer.
     """
     if state.prev_e is None:
         raise RuntimeError("prev_e is missing")
     e = acceptance_mass(state)
     grow = (e - state.prev_e) > state.config.tau
-    return bool(grow.item()) and state.depth < state.config.max_depth
+    return bool(grow.item()) and state.depth < state.config.max_depth - 1
 
 
 def _layer_positions(state: OptTreeState) -> torch.Tensor:
@@ -269,17 +274,17 @@ def _ranked_verify_indices(
 
 
 def finish(state: OptTreeState) -> OptVerifySet:
-    """Drop the newest layer and keep the top-N nodes under the total order.
+    """Keep the top-N nodes of every layer added so far.
 
     Shallower nodes win ties, so the selected prefix already contains every
     ancestor. Closure is checked and does not add or remove nodes.
     """
     if state.finished:
         raise RuntimeError("tree is already finished")
-    if state.depth < 2:
-        raise RuntimeError("finish needs an expanded layer to drop")
+    if state.depth < 1:
+        raise RuntimeError("finish needs a seeded tree")
     n = state.config.width
-    layer_count = state.depth - 1
+    layer_count = state.depth
     flat = state.weight[:layer_count].reshape(-1)
     selected = _ranked_verify_indices(flat, layer_count, n)
     closed = _close_under_ancestors(
@@ -330,30 +335,25 @@ def finish(state: OptTreeState) -> OptVerifySet:
 
 
 def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
-    """One original OPT step. Seed, or expand then either grow or finish."""
+    """Seed or expand, then judge E on every layer present.
+
+    A non-final step asks for a draft forward of the layer just added. A final
+    step verifies that layer and does not forward it.
+    """
     if state.finished:
         raise RuntimeError("update called after finish")
     if state.depth == 0:
         seed(state, probs)
-        mask = ancestor_mask(state, leak=False)
-        return OptTreeStep(
-            is_final=False,
-            tokens=state.tokens[0].clone(),
-            positions=_layer_positions(state),
-            leak_mask=mask.clone(),
-            ancestor_mask=mask.clone(),
-        )
-    expand_layer(state, probs)
+    else:
+        expand_layer(state, probs)
     leak = ancestor_mask(state, leak=True)
     correct = ancestor_mask(state, leak=False)
-    tokens = state.tokens[state.depth - 1].clone()
-    positions = _layer_positions(state)
     if depth_rule(state):
         state.prev_e = acceptance_mass(state)
         return OptTreeStep(
             is_final=False,
-            tokens=tokens,
-            positions=positions,
+            tokens=state.tokens[state.depth - 1].clone(),
+            positions=_layer_positions(state),
             leak_mask=leak.clone(),
             ancestor_mask=correct.clone(),
         )

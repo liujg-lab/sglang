@@ -34,6 +34,12 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
         width = int(self.server_args.opt_tree_width)
         max_depth = int(self.server_args.opt_tree_max_depth)
         num_verify = width + 1
+        draft_tokens = int(self.server_args.speculative_num_draft_tokens)
+        if num_verify != draft_tokens:
+            raise RuntimeError(
+                f"OPT verify length {num_verify} != speculative_num_draft_tokens "
+                f"{draft_tokens}"
+            )
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 max(width, 1),

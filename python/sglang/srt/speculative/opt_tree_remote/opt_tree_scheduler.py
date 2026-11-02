@@ -20,6 +20,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     grow_with_forwards,
     produce_opt_windows,
 )
+from sglang.srt.speculative.standalone_remote.sr_align import plan_committed_ingest
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
@@ -188,15 +189,13 @@ class OptTreeSchedulerMixin:
             )
 
     def _opt_run_verify_round(self, batch) -> None:
-        """Same verify round as standalone-remote, with N + 1 forward tokens.
+        """Same verify round as standalone-remote.
 
-        ``--speculative-num-draft-tokens`` stays equal to the OPT width. The
-        extra token is the committed tail at verify slot 0, and that length
-        is only this batch's forward size.
+        Target ``--speculative-num-draft-tokens`` is already N + 1, the
+        committed tail plus the N draft nodes, so the default forward length
+        is the verify length.
         """
-        self._sr_run_verify_round(
-            batch, draft_num_tokens=int(self.server_args.opt_tree_width) + 1
-        )
+        self._sr_run_verify_round(batch)
 
     def _opt_rollback(self, req, keep_len: int) -> None:
         kv = getattr(self, "sr_kv", None)
@@ -216,21 +215,34 @@ class OptTreeSchedulerMixin:
         self._sr_isolate_need({req.rid})
         committed = len(req.origin_input_ids or []) + len(req.output_ids or [])
         try:
-            cached = int(getattr(req, "kv_committed_len", 0) or 0)
-            if cached != committed:
-                raise RuntimeError(
-                    f"OPT draft {req.rid} committed KV {cached} != {committed} tokens"
-                )
             allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
             if allocated > committed:
                 self._opt_rollback(req, committed)
+            cached = int(getattr(req, "kv_committed_len", 0) or 0)
+            mode, _tail = plan_committed_ingest(
+                len(req.origin_input_ids or []),
+                req.output_ids,
+                cached,
+                max_decode_steps=self._sr_max_ingest_decode_steps(),
+            )
             config = OptTreeConfig(
                 width=int(self.server_args.opt_tree_width),
                 tau=float(self.server_args.opt_tree_tau),
                 max_depth=int(self.server_args.opt_tree_max_depth),
             )
             runner = OptLayerForward(self, req, committed)
-            tail_logits = runner.logits_at_tail()
+            if mode == "reprefill":
+                self._sr_reprefill_committed([req])
+                tail_logits = runner.logits_at_tail()
+            elif mode == "decode":
+                tail_logits = runner.extend_uncommitted()
+            else:
+                tail_logits = runner.logits_at_tail()
+            written = int(getattr(req, "kv_committed_len", 0) or 0)
+            if written != committed:
+                raise RuntimeError(
+                    f"OPT draft {req.rid} committed KV {written} != {committed} tokens"
+                )
             tokens, parents, cols = grow_with_forwards(
                 config,
                 tail_logits,

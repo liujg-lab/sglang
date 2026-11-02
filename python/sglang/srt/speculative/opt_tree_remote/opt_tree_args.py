@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 def apply_opt_tree_settings(server_args, *, on_npu: bool) -> None:
     """Check OPT flags and turn off overlap, mixed chunk, and co-located draft.
 
-    ``--opt-tree-width`` is N. When ``--speculative-num-draft-tokens`` is
-    omitted it is set to N; an explicit value must already equal N. The verify
-    forward adds the committed tail, so it runs N + 1 tokens.
+    ``--opt-tree-width`` is N. ``--speculative-num-draft-tokens`` follows the
+    EAGLE split: Target stores the verify length N + 1 (committed tail plus N
+    nodes), Draft stores the per-layer width N. An omitted value is filled
+    with that role's length; an explicit value must already equal it.
     ``--opt-tree-max-depth`` includes the seed layer. When
     ``--speculative-num-steps`` is omitted it is set to that depth; an explicit
     value must already equal it.
@@ -43,12 +44,20 @@ def apply_opt_tree_settings(server_args, *, on_npu: bool) -> None:
         raise ValueError("OPT_TREE_REMOTE requires --opt-tree-max-depth.")
     width = int(server_args.opt_tree_width)
     depth = int(server_args.opt_tree_max_depth)
+    role = server_args.opt_tree_role
+    expected_draft_tokens = width + 1 if role == "target" else width
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = width
-    elif int(server_args.speculative_num_draft_tokens) != width:
+        server_args.speculative_num_draft_tokens = expected_draft_tokens
+    elif int(server_args.speculative_num_draft_tokens) != expected_draft_tokens:
+        if role == "target":
+            raise ValueError(
+                "OPT_TREE_REMOTE target requires --speculative-num-draft-tokens "
+                "to equal --opt-tree-width + 1 "
+                f"({expected_draft_tokens})."
+            )
         raise ValueError(
-            "OPT_TREE_REMOTE requires --speculative-num-draft-tokens to equal "
-            f"--opt-tree-width ({width})."
+            "OPT_TREE_REMOTE draft requires --speculative-num-draft-tokens "
+            f"to equal --opt-tree-width ({expected_draft_tokens})."
         )
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = depth
@@ -74,8 +83,8 @@ def apply_opt_tree_settings(server_args, *, on_npu: bool) -> None:
         )
     if server_args.speculative_eagle_topk not in (None, int(server_args.opt_tree_width)):
         logger.warning(
-            "speculative_eagle_topk is set to opt_tree_width (%s) so both "
-            "OPT processes share one RPC spec shape.",
+            "speculative_eagle_topk is set to opt_tree_width (%s) so NPU "
+            "tree verify keeps topk greater than 1.",
             server_args.opt_tree_width,
         )
     server_args.speculative_eagle_topk = int(server_args.opt_tree_width)

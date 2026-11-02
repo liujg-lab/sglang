@@ -24,12 +24,28 @@ def parse_protocol_version(value: Any) -> Optional[int]:
     return None
 
 
+def _is_opt_tree_remote(server_args) -> bool:
+    algo = getattr(server_args, "speculative_algorithm", None)
+    if algo == "OPT_TREE_REMOTE":
+        return True
+    is_opt = getattr(algo, "is_opt_tree_remote", None)
+    return bool(is_opt()) if callable(is_opt) else False
+
+
 def local_spec_shape(server_args) -> Tuple[int, int, int]:
     """``(topk, num_steps, num_draft_tokens)`` from one process's server args.
 
     Matches the widths the draft tree, verify kernel, and packet stride use.
     A missing draft width becomes ``steps + 1``.
+
+    OPT Target stores verify length N + 1 and Draft stores layer width N.
+    The wire shape stays ``(opt_tree_width, opt_tree_max_depth, opt_tree_width)``
+    so the two roles do not reject each other.
     """
+    if server_args is not None and _is_opt_tree_remote(server_args):
+        width = int(getattr(server_args, "opt_tree_width", 0) or 0)
+        depth = int(getattr(server_args, "opt_tree_max_depth", 0) or 0)
+        return (width, depth, width)
     topk = max(1, int(getattr(server_args, "speculative_eagle_topk", 1) or 1))
     steps = max(1, int(getattr(server_args, "speculative_num_steps", 1) or 1))
     width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)

@@ -190,19 +190,6 @@ def _reference_triples(ref):
     return sorted(triples)
 
 
-def _run_pair(config, prob_steps):
-    ref = _ReferenceTree(config.width, "cpu", config.tau, config.max_depth)
-    state = OptTreeState.create(config)
-    steps = []
-    for probs in prob_steps:
-        ref_out = ref.update(probs)
-        our = update(state, probs)
-        steps.append((ref, ref_out, state, our))
-        if ref_out["is_final"] or our.is_final:
-            break
-    return steps
-
-
 class OptTreeRemoteTest(CustomTestCase):
     def test_config_rejects_bad_values(self):
         with self.assertRaises(ValueError):
@@ -234,44 +221,47 @@ class OptTreeRemoteTest(CustomTestCase):
             ref = _ReferenceTree(config.width, "cpu", config.tau, config.max_depth)
             our = OptTreeState.create(config)
             vocab = 16
+            our_out = None
+            ref_out = None
             for step in range(config.max_depth + 1):
                 if ref.depth == 0:
                     logits = torch.randn(1, 1, vocab, generator=gen)
                 else:
                     logits = torch.randn(1, config.width, vocab, generator=gen)
                 probs = torch.softmax(logits, dim=-1)
+                if our_out is None or not our_out.is_final:
+                    our_out = update(our, probs)
                 ref_out = ref.update(probs)
-                our_out = update(our, probs)
-                self.assertEqual(our_out.is_final, ref_out["is_final"], msg=f"seed {seed} step {step}")
-                if not ref_out["is_final"]:
+                if not our_out.is_final:
+                    self.assertFalse(
+                        ref_out["is_final"], msg=f"seed {seed} step {step}"
+                    )
                     self.assertTrue(torch.equal(our_out.tokens, ref_out["input_ids"]))
                     self.assertTrue(torch.equal(our_out.positions, ref_out["position_ids"]))
                     self.assertTrue(torch.equal(our_out.leak_mask, ref_out["attention_mask"]))
                     self.assertTrue(
                         torch.equal(our_out.ancestor_mask, ancestor_mask(our, leak=False))
                     )
-                    self.assertGreater(our.depth, 0)
                     self.assertTrue(torch.equal(our.tokens[our.depth - 1], our_out.tokens))
-                else:
-                    self.assertEqual(
-                        _node_pairs(our_out.verify.tokens, our_out.verify.positions),
-                        _node_pairs(ref_out["input_ids"], ref_out["position_ids"]),
-                    )
-                    self.assertEqual(_verify_triples(our_out.verify), _reference_triples(ref))
-                    self.assertTrue(torch.equal(our_out.positions, our_out.verify.positions))
-                    self.assertTrue(torch.equal(our_out.leak_mask, ref.draft_mask()))
-                    self.assertTrue((our_out.verify.depths < our.depth - 1).all())
-                    dropped = our.depth - 1
-                    self.assertNotIn(dropped, our_out.verify.depths.tolist())
-                    for parent in our_out.verify.parents.tolist():
-                        self.assertTrue(parent == -1 or parent >= 0)
-                    for i, parent in enumerate(our_out.verify.parents.tolist()):
-                        self.assertTrue(parent == -1 or parent < i)
+                if ref_out["is_final"]:
                     break
             else:
                 self.fail(f"seed {seed} did not stop")
+            self.assertIsNotNone(our_out)
+            self.assertTrue(our_out.is_final)
+            self.assertTrue(ref_out["is_final"])
+            self.assertEqual(our.depth, ref.depth - 1)
+            self.assertEqual(
+                _node_pairs(our_out.verify.tokens, our_out.verify.positions),
+                _node_pairs(ref_out["input_ids"], ref_out["position_ids"]),
+            )
+            self.assertEqual(_verify_triples(our_out.verify), _reference_triples(ref))
+            self.assertTrue(torch.equal(our_out.positions, our_out.verify.positions))
+            self.assertTrue((our_out.verify.depths < our.depth).all())
+            for i, parent in enumerate(our_out.verify.parents.tolist()):
+                self.assertTrue(parent == -1 or parent < i)
 
-    def test_continue_keeps_latest_layer_and_stop_drops_it(self):
+    def test_continue_until_cap_keeps_filled_layers(self):
         config = OptTreeConfig(width=2, tau=-1.0, max_depth=4)
         gen = torch.Generator().manual_seed(7)
         vocab = 8
@@ -298,14 +288,14 @@ class OptTreeRemoteTest(CustomTestCase):
             probs = torch.softmax(torch.randn(1, config.width, vocab, generator=gen), dim=-1)
             step = update(state, probs)
         self.assertTrue(step.is_final)
-        self.assertEqual(state.depth, config.max_depth)
+        self.assertEqual(state.depth, config.max_depth - 1)
         self.assertTrue(torch.equal(state.tokens[1], kept_tokens))
         self.assertTrue(torch.equal(state.weight[1], kept_weight))
         self.assertTrue((step.verify.depths <= config.max_depth - 2).all())
         self.assertNotIn(config.max_depth - 1, step.verify.depths.tolist())
 
-    def test_default_mask_is_ancestors_and_leak_matches_reference(self):
-        config = OptTreeConfig(width=2, tau=0.05, max_depth=6)
+    def test_nonfinal_leak_mask_matches_reference(self):
+        config = OptTreeConfig(width=2, tau=-1.0, max_depth=6)
         seed_probs = torch.tensor([[[0.50, 0.40, 0.05, 0.05]]], dtype=torch.float32)
         expand1 = torch.tensor(
             [[[0.05, 0.05, 0.60, 0.30], [0.40, 0.05, 0.50, 0.05]]],
@@ -315,34 +305,31 @@ class OptTreeRemoteTest(CustomTestCase):
             [[[0.50, 0.49, 0.005, 0.005], [0.10, 0.10, 0.10, 0.70]]],
             dtype=torch.float32,
         )
-        steps = _run_pair(config, [seed_probs, expand1, expand2])
-        self.assertEqual(len(steps), 3)
-        _, ref_seed, _, our_seed = steps[0]
-        self.assertFalse(our_seed.is_final)
-        self.assertTrue(torch.equal(our_seed.leak_mask, our_seed.ancestor_mask))
-        self.assertTrue(torch.equal(our_seed.leak_mask, ref_seed["attention_mask"]))
-
-        _, ref_mid, _, our_mid = steps[1]
-        self.assertFalse(our_mid.is_final)
-        self.assertTrue(torch.equal(our_mid.leak_mask, our_mid.ancestor_mask))
-        self.assertTrue(torch.equal(our_mid.leak_mask, ref_mid["attention_mask"]))
-
-        ref, ref_stop, state, our_stop = steps[2]
-        self.assertTrue(our_stop.is_final)
-        self.assertTrue(ref_stop["is_final"])
-        self.assertTrue(torch.equal(our_stop.leak_mask, ref.draft_mask()))
-        self.assertFalse(torch.equal(our_stop.leak_mask, our_stop.ancestor_mask))
-        stale = (our_stop.leak_mask == 1) & (our_stop.ancestor_mask == 0)
-        self.assertGreater(int(stale.sum()), 0)
-        self.assertEqual(int((our_stop.ancestor_mask == 1).sum()), 2 * 3)
+        ref = _ReferenceTree(config.width, "cpu", config.tau, config.max_depth)
+        state = OptTreeState.create(config)
+        saw_stale = False
+        for probs in (seed_probs, expand1, expand2):
+            ref_out = ref.update(probs)
+            our = update(state, probs)
+            self.assertFalse(our.is_final)
+            self.assertFalse(ref_out["is_final"])
+            self.assertTrue(torch.equal(our.leak_mask, ref_out["attention_mask"]))
+            self.assertTrue(
+                torch.equal(our.ancestor_mask, ancestor_mask(state, leak=False))
+            )
+            if not torch.equal(our.leak_mask, our.ancestor_mask):
+                saw_stale = True
+                stale = (our.leak_mask == 1) & (our.ancestor_mask == 0)
+                self.assertGreater(int(stale.sum()), 0)
+                self.assertEqual(int((our.ancestor_mask == 1).sum()), 2 * 3)
+        self.assertTrue(saw_stale)
 
     def test_tied_scores_keep_parent_and_do_not_insert_weaker_node(self):
         config = OptTreeConfig(width=3, tau=0.0, max_depth=4)
         state = OptTreeState.create(config)
-        state.depth = 3
+        state.depth = 2
         state.weight[0] = torch.tensor([0.5, 0.5, 0.2])
         state.weight[1] = torch.tensor([0.5, 0.1, 0.05])
-        state.weight[2] = torch.tensor([0.9, 0.9, 0.9])
         state.tokens[0] = torch.tensor([10, 11, 12])
         state.tokens[1] = torch.tensor([20, 21, 22])
         # (1, 0) ties its parent (0, 1). The 0.2 node must not replace the child.
@@ -463,7 +450,7 @@ class OptTreeRemoteTest(CustomTestCase):
             self.assertEqual(row[seq_len:].tolist(), expect)
             self.assertTrue(all(row[:seq_len].tolist()))
 
-    def test_grow_calls_update_and_drops_newest_layer(self):
+    def test_grow_stops_before_the_extra_layer(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
 
         config = OptTreeConfig(width=2, tau=0.5, max_depth=2)
@@ -480,8 +467,7 @@ class OptTreeRemoteTest(CustomTestCase):
             return torch.full((config.width, 8), 1.0 / 8)
 
         tokens, parents, cols = grow_opt_tree(config, next_probs)
-        self.assertEqual(seen[0], None)
-        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen, [None])
         self.assertEqual(tokens, [1, 2])
         self.assertEqual(parents, [-1, -1])
         self.assertEqual(len(cols), config.width)
@@ -554,7 +540,7 @@ class OptTreeRemoteTest(CustomTestCase):
 
         args = SimpleNamespace(
             speculative_verify_mode="auto",
-            speculative_num_draft_tokens=4,
+            speculative_num_draft_tokens=5,
             speculative_num_steps=10,
             speculative_eagle_topk=None,
             opt_tree_role="target",
@@ -581,14 +567,33 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertFalse(ok.enable_mixed_chunk)
         self.assertEqual(ok.max_running_requests, 48)
         self.assertEqual(ok.speculative_eagle_topk, 4)
+        self.assertEqual(ok.speculative_num_draft_tokens, ok.opt_tree_width + 1)
 
         rpd = self._opt_server_args(speculative_verify_mode="rpd")
         with self.assertRaises(ValueError):
             apply_opt_tree_settings(rpd, on_npu=False)
 
-        width = self._opt_server_args(opt_tree_width=3)
+        target_short = self._opt_server_args(speculative_num_draft_tokens=4)
         with self.assertRaises(ValueError):
-            apply_opt_tree_settings(width, on_npu=False)
+            apply_opt_tree_settings(target_short, on_npu=False)
+
+        target_width = self._opt_server_args(
+            opt_tree_width=3, speculative_num_draft_tokens=4
+        )
+        apply_opt_tree_settings(target_width, on_npu=False)
+        self.assertEqual(target_width.speculative_num_draft_tokens, 4)
+
+        draft_long = self._opt_server_args(
+            opt_tree_role="draft", speculative_num_draft_tokens=5
+        )
+        with self.assertRaises(ValueError):
+            apply_opt_tree_settings(draft_long, on_npu=False)
+
+        draft_ok = self._opt_server_args(
+            opt_tree_role="draft", speculative_num_draft_tokens=4
+        )
+        apply_opt_tree_settings(draft_ok, on_npu=False)
+        self.assertEqual(draft_ok.speculative_num_draft_tokens, draft_ok.opt_tree_width)
 
         depth = self._opt_server_args(opt_tree_max_depth=9)
         with self.assertRaises(ValueError):
@@ -609,24 +614,50 @@ class OptTreeRemoteTest(CustomTestCase):
             speculative_num_steps=None,
         )
         apply_opt_tree_settings(filled, on_npu=False)
-        self.assertEqual(filled.speculative_num_draft_tokens, filled.opt_tree_width)
+        self.assertEqual(
+            filled.speculative_num_draft_tokens, filled.opt_tree_width + 1
+        )
         self.assertEqual(filled.speculative_num_steps, filled.opt_tree_max_depth)
 
-    def test_local_spec_shape_ignores_opt_width(self):
+        filled_draft = self._opt_server_args(
+            opt_tree_role="draft",
+            speculative_num_draft_tokens=None,
+            speculative_num_steps=None,
+        )
+        apply_opt_tree_settings(filled_draft, on_npu=False)
+        self.assertEqual(
+            filled_draft.speculative_num_draft_tokens, filled_draft.opt_tree_width
+        )
+        self.assertEqual(
+            filled_draft.speculative_num_steps, filled_draft.opt_tree_max_depth
+        )
+
+    def test_local_spec_shape_opt_uses_tree_width(self):
         from types import SimpleNamespace
 
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.standalone_remote.sr_protocol import (
             local_spec_shape,
         )
 
         args = SimpleNamespace(
             speculative_algorithm="OPT_TREE_REMOTE",
-            speculative_eagle_topk=4,
-            speculative_num_steps=10,
+            speculative_eagle_topk=8,
+            speculative_num_steps=7,
             speculative_num_draft_tokens=5,
             opt_tree_width=4,
+            opt_tree_max_depth=10,
         )
-        self.assertEqual(local_spec_shape(args), (4, 10, 5))
+        self.assertEqual(local_spec_shape(args), (4, 10, 4))
+        enum_args = SimpleNamespace(
+            speculative_algorithm=SpeculativeAlgorithm.OPT_TREE_REMOTE,
+            speculative_eagle_topk=8,
+            speculative_num_steps=7,
+            speculative_num_draft_tokens=5,
+            opt_tree_width=4,
+            opt_tree_max_depth=10,
+        )
+        self.assertEqual(local_spec_shape(enum_args), (4, 10, 4))
         self.assertEqual(
             local_spec_shape(
                 SimpleNamespace(
@@ -635,10 +666,26 @@ class OptTreeRemoteTest(CustomTestCase):
                     speculative_num_steps=10,
                     speculative_num_draft_tokens=5,
                     opt_tree_width=4,
+                    opt_tree_max_depth=10,
                 )
             ),
             (4, 10, 5),
         )
+
+    def test_guess_tokens_per_step_uses_opt_width(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        args = SimpleNamespace(
+            speculative_num_draft_tokens=5,
+            opt_tree_width=4,
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.OPT_TREE_REMOTE.guess_tokens_per_step(args), 4
+        )
+        eagle = SimpleNamespace(speculative_num_draft_tokens=5, opt_tree_width=4)
+        self.assertEqual(SpeculativeAlgorithm.EAGLE.guess_tokens_per_step(eagle), 4)
 
     def test_layer_positions_and_mask(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -681,8 +728,8 @@ class OptTreeRemoteTest(CustomTestCase):
             return torch.randn(config.width, 16)
 
         grow_with_forwards(config, torch.randn(16), forward_layer)
-        self.assertEqual(len(calls), config.max_depth - 1)
-        self.assertEqual([depth for depth, _, _ in calls], [1, 2, 3])
+        self.assertEqual(len(calls), config.max_depth - 2)
+        self.assertEqual([depth for depth, _, _ in calls], [1, 2])
         self.assertTrue((calls[-1][2] == 0).any())
 
         stopped = []
@@ -696,8 +743,7 @@ class OptTreeRemoteTest(CustomTestCase):
             torch.rand(16),
             forward_once,
         )
-        self.assertEqual(len(stopped), 1)
-        self.assertEqual(tuple(stopped[0].shape), (2, 2))
+        self.assertEqual(len(stopped), 0)
 
     def test_prefill_materializes_missing_pool(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -717,7 +763,7 @@ class OptTreeRemoteTest(CustomTestCase):
             produce_opt_windows(bare, SRAction.PREFILL, [(None, _OptReq())])
         self.assertEqual(bare.calls, ["materialize"])
 
-    def test_step_materializes_before_ingest(self):
+    def test_step_materializes_before_expand(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             produce_opt_windows,
         )
@@ -726,19 +772,54 @@ class OptTreeRemoteTest(CustomTestCase):
         missing = _OptReq()
         host = _OptWindowHost(assign_pool=True)
         windows = produce_opt_windows(host, SRAction.STEP, [(None, missing)])
-        self.assertEqual(host.calls, ["materialize", "ingest", "grammar", "expand"])
+        self.assertEqual(host.calls, ["materialize", "grammar", "expand"])
         self.assertEqual(windows, [([7], [-1], [0])])
 
         ready = _OptReq()
         ready.req_pool_idx = 2
         again = _OptWindowHost(assign_pool=True)
         produce_opt_windows(again, SRAction.STEP, [(None, ready)])
-        self.assertEqual(again.calls, ["ingest", "grammar", "expand"])
+        self.assertEqual(again.calls, ["grammar", "expand"])
 
         blocked = _OptWindowHost(assign_pool=False)
         with self.assertRaises(RuntimeError):
             produce_opt_windows(blocked, SRAction.STEP, [(None, _OptReq())])
         self.assertEqual(blocked.calls, ["materialize"])
+
+    def test_layer_spec_forbids_decode_graph_and_keeps_raw_logits(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerSpec,
+            _keep_raw_logits,
+        )
+
+        self.assertTrue(OptLayerSpec.forbids_decode_graph)
+        info = SimpleNamespace(
+            is_all_greedy=False,
+            need_top_p_sampling=True,
+            need_top_k_sampling=True,
+            need_min_p_sampling=True,
+            temperatures=torch.tensor([0.7]),
+            acc_additive_penalties=torch.ones(1),
+            acc_scaling_penalties=torch.ones(1),
+            penalizer_orchestrator=object(),
+            logit_bias=torch.ones(1),
+            vocab_mask=torch.ones(1),
+        )
+        batch = SimpleNamespace(
+            sampling_info=info,
+            has_grammar=True,
+            return_logprob=True,
+            return_hidden_states=True,
+        )
+        _keep_raw_logits(batch)
+        self.assertIsNone(info.acc_additive_penalties)
+        self.assertIsNone(info.acc_scaling_penalties)
+        self.assertIsNone(info.penalizer_orchestrator)
+        self.assertIsNone(info.logit_bias)
+        self.assertIsNone(info.vocab_mask)
+        self.assertFalse(batch.has_grammar)
 
 
 class _OptReq:
@@ -760,12 +841,6 @@ class _OptWindowHost:
             return
         for req in reqs:
             req.req_pool_idx = 3
-
-    def _sr_ingest_committed_batch(self, reqs):
-        self.calls.append("ingest")
-        for req in reqs:
-            if req.req_pool_idx is None:
-                raise AssertionError("ingest ran before the prefix had a pool slot")
 
     def _sr_replay_grammars(self, reqs):
         self.calls.append("grammar")

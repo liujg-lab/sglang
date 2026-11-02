@@ -125,11 +125,13 @@ class SpeculativeAlgorithm(Enum):
         """Draft tokens counted in the acceptance-rate denominator.
 
         EAGLE-style algorithms store the target-sampled token inside
-        ``speculative_num_draft_tokens``. OPT's value is the width N.
+        ``speculative_num_draft_tokens``, so the guess count is ``n - 1``.
+        OPT's denominator is the tree width N. Target's
+        ``speculative_num_draft_tokens`` is the verify length N + 1.
         """
-        n = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
         if self.is_opt_tree_remote():
-            return n
+            return int(getattr(server_args, "opt_tree_width", 0) or 0)
+        n = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
         return n - 1
 
     def reports_remote_spec_metrics(self) -> bool:
@@ -363,9 +365,15 @@ def cuda_graph_hidden_mode_needs_recapture(requested, captured) -> bool:
 
 
 def decode_cuda_graph_accepts_spec_info(spec_info) -> bool:
-    """Ordinary DECODE graphs are 1-token AR. Tree ``EagleDraftInput`` must not replay them."""
+    """Ordinary DECODE graphs are 1-token AR.
+
+    Tree ``EagleDraftInput`` and OPT layer verify must not replay them.
+    OPT's ``seq_lens`` is the prefix; DECODE includes the token being written.
+    """
     if spec_info is None:
         return True
+    if getattr(spec_info, "forbids_decode_graph", False):
+        return False
     is_draft = getattr(spec_info, "is_draft_input", None)
     if callable(is_draft) and is_draft():
         return False

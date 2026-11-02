@@ -8,7 +8,7 @@ appended past the committed prefix and dropped by the caller.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -53,7 +53,7 @@ def layer_attention_mask(prefix_len: int, ancestor: torch.Tensor) -> torch.Tenso
 
 
 def materialize_missing_prefix(scheduler, reqs) -> None:
-    """Build draft KV before ingest.
+    """Build draft KV before the seed forward.
 
     ``_sr_kv_len`` treats a request with no pool slot as already cached, so
     OPT checks ``req_pool_idx`` itself and does not change that helper.
@@ -68,7 +68,12 @@ def materialize_missing_prefix(scheduler, reqs) -> None:
 
 
 def produce_opt_windows(scheduler, action, pairs) -> list:
-    """PREFILL only materializes KV. STEP materializes, ingests, then grows."""
+    """PREFILL only materializes KV. STEP materializes, then grows a tree.
+
+    A short committed tail is written by the seed extend. Grammar replay
+    still runs first: that forward clears the grammar, and the replay keeps
+    constraints aligned with the committed tokens.
+    """
     from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
     if not pairs:
@@ -80,7 +85,6 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
     if action != SRAction.STEP:
         return [([], None, None)] * len(pairs)
     materialize_missing_prefix(scheduler, reqs)
-    scheduler._sr_ingest_committed_batch(reqs)
     scheduler._sr_replay_grammars(reqs)
     return [scheduler._opt_expand_one(req) for req in reqs]
 
@@ -95,10 +99,11 @@ def grow_with_forwards(
     tail_logits: torch.Tensor,
     forward_layer: Callable,
 ) -> Tuple[List[int], List[int], List[int]]:
-    """Seed from the committed tail, then one ``forward_layer`` per kept layer.
+    """Seed from the committed tail, then forward every layer except the last.
 
-    ``forward_layer(step)`` receives the non-final step and returns logits for
-    its N tokens. The stopping ``update`` is top-N only and is not forwarded.
+    ``forward_layer(step)`` receives a non-final step and returns logits for
+    its N tokens. The stopping ``update`` verifies that layer and is not
+    forwarded.
     """
 
     def next_probs(step, state):
@@ -111,7 +116,13 @@ def grow_with_forwards(
 
 @dataclass
 class OptLayerSpec:
-    """Fields TARGET_VERIFY attention already reads. Not an EAGLE verify input."""
+    """Fields TARGET_VERIFY attention already reads. Not an EAGLE verify input.
+
+    ``seq_lens`` is the prefix. A DECODE graph counts the token being written,
+    so this spec must not replay one even when the layer width is 1.
+    """
+
+    forbids_decode_graph = True
 
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -152,13 +163,53 @@ class OptLayerForward:
         _keep_raw_logits(batch)
         return _row_logits(self._run(batch), 1, tail=True)
 
+    def extend_uncommitted(self) -> torch.Tensor:
+        """Write ``[kv_committed_len, committed)`` in one EXTEND.
+
+        The last row is the next-token distribution after the committed tail.
+        ``prefix_lens`` is the real KV length. This is not the zero-prefix
+        tail-extend graph.
+        """
+        start = int(getattr(self.req, "kv_committed_len", 0) or 0)
+        end = self.prefix_len
+        if self.req.req_pool_idx is None:
+            raise RuntimeError(f"OPT draft {self.req.rid} has no KV pool slot")
+        if start < 0 or start >= end:
+            raise RuntimeError(
+                f"OPT draft {self.req.rid} extend span [{start}, {end}) is empty"
+            )
+        n = end - start
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+            read_token_span,
+        )
+
+        tokens = read_token_span(
+            self.req.origin_input_ids, self.req.output_ids, start, n
+        )
+        if len(tokens) != n:
+            raise RuntimeError(
+                f"OPT draft {self.req.rid} is missing tokens at [{start}, {end})"
+            )
+        out_cache_loc = self._alloc_layer_slots(n, start=start)
+        self.req.kv_allocated_len = end
+        try:
+            batch = self._extend_batch(tokens, start, out_cache_loc)
+            logits = _row_logits(self._run(batch), n, tail=True)
+        except Exception:
+            self.scheduler._opt_rollback(self.req, start)
+            raise
+        self.req.kv_committed_len = end
+        self.req.kv_allocated_len = end
+        self.cached_len = end
+        return logits
+
     def forward_layer(self, step) -> torch.Tensor:
         """Forward the N tokens ``update`` just kept. KV stays uncommitted."""
         tokens = step.tokens
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(list(tokens), dtype=torch.long)
         n = int(tokens.shape[0])
-        width = int(self.scheduler.server_args.speculative_num_draft_tokens)
+        width = int(self.scheduler.server_args.opt_tree_width)
         if n != width:
             raise RuntimeError(
                 f"OPT layer has {n} tokens but attention was built for {width}"
@@ -184,7 +235,7 @@ class OptLayerForward:
         self.cached_len += n
         return logits
 
-    def _alloc_layer_slots(self, n: int) -> torch.Tensor:
+    def _alloc_layer_slots(self, n: int, start: Optional[int] = None) -> torch.Tensor:
         from sglang.srt.mem_cache.common import (
             alloc_paged_token_slots_extend,
             alloc_token_slots,
@@ -196,14 +247,15 @@ class OptLayerForward:
         tree_cache = scheduler.tree_cache
         page = int(getattr(tree_cache, "page_size", 1) or 1)
         device = scheduler.req_to_token_pool.device
-        seq = torch.tensor([self.cached_len], dtype=torch.int64, device=device)
+        base = self.cached_len if start is None else int(start)
+        seq = torch.tensor([base], dtype=torch.int64, device=device)
         pool_index = torch.tensor(
             [int(self.req.req_pool_idx)], dtype=torch.int64, device=device
         )
         if page == 1:
             out_cache_loc = alloc_token_slots(tree_cache, n)
         else:
-            seq_cpu = torch.tensor([self.cached_len], dtype=torch.int64)
+            seq_cpu = torch.tensor([base], dtype=torch.int64)
             end = seq + n
             end_cpu = seq_cpu + n
             last = get_last_loc(
@@ -268,6 +320,29 @@ class OptLayerForward:
         _keep_raw_logits(batch)
         return batch
 
+    def _extend_batch(self, tokens, prefix: int, out_cache_loc):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        n = len(tokens)
+        end = int(prefix) + n
+        batch = self.scheduler._sr_make_decode_batch([self.req])
+        device = batch.seq_lens.device
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.global_forward_mode = ForwardMode.EXTEND
+        batch.input_ids = torch.tensor(tokens, dtype=torch.int64, device=device)
+        batch.output_ids = None
+        batch.seq_lens = torch.tensor([end], dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor([end], dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor([end], dtype=torch.int32, device=device)
+        batch.seq_lens_sum = end
+        batch.out_cache_loc = out_cache_loc
+        batch.extend_lens = [n]
+        batch.prefix_lens = [int(prefix)]
+        batch.extend_num_tokens = n
+        batch.extend_logprob_start_lens = [0]
+        _keep_raw_logits(batch)
+        return batch
+
     def _run(self, batch) -> torch.Tensor:
         self.scheduler.cur_batch = batch
         result = self.scheduler.run_batch(batch)
@@ -282,7 +357,9 @@ def _keep_raw_logits(batch) -> None:
 
     The sampler turns non-greedy logits into probabilities in place. OPT's
     path score is the full-vocabulary temperature-1 softmax, so this batch
-    only argmaxes and discards that token.
+    only argmaxes and discards that token. Penalty and logit bias are also
+    cleared: ``apply_logits_bias`` would add them onto these logits. This
+    sampling info belongs to the batch, not the request.
     """
     info = batch.sampling_info
     info.is_all_greedy = True
@@ -290,6 +367,11 @@ def _keep_raw_logits(batch) -> None:
     info.need_top_k_sampling = False
     info.need_min_p_sampling = False
     info.temperatures = torch.ones_like(info.temperatures)
+    info.acc_additive_penalties = None
+    info.acc_scaling_penalties = None
+    info.penalizer_orchestrator = None
+    info.logit_bias = None
+    info.vocab_mask = None
     batch.has_grammar = False
     batch.return_logprob = False
     batch.return_hidden_states = False
