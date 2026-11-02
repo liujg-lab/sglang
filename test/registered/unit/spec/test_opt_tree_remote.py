@@ -730,6 +730,70 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertIsNone(opt.dual_ntpb_cuda_graph_options(draft))
         self.assertEqual(opt.target_verify_cuda_graph_num_tokens_per_bs(draft), 1)
 
+    def test_extend_past_prompt_mrope_keeps_token_width(self):
+        import ast
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+            tail_mrope_positions,
+        )
+
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/model_executor/forward_batch_info.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        fn = next(
+            child
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ForwardBatch"
+            for child in node.body
+            if isinstance(child, ast.FunctionDef)
+            and child.name == "_compute_mrope_positions"
+        )
+        for arg in (*fn.args.args, *fn.args.kwonlyargs):
+            arg.annotation = None
+        fn.returns = None
+        namespace = {
+            "torch": torch,
+            "get_global_server_args": lambda: SimpleNamespace(
+                rl_on_policy_target=None
+            ),
+        }
+        exec(compile(ast.Module([fn], type_ignores=[]), str(source), "exec"), namespace)
+
+        class _ExtendMode:
+            def is_decode(self):
+                return False
+
+            def is_extend(self, include_draft_extend_v2=False):
+                return True
+
+        prompt_width = 10
+        extend_len = 4
+        mm = SimpleNamespace(
+            mrope_positions=torch.arange(prompt_width).unsqueeze(0).repeat(3, 1),
+            mrope_position_delta=torch.tensor([2]),
+        )
+        fb = SimpleNamespace(
+            seq_lens_cpu=torch.tensor([prompt_width + extend_len]),
+            forward_mode=_ExtendMode(),
+            is_sr_tail_extend=False,
+            input_ids=torch.arange(extend_len, dtype=torch.int64),
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[mm],
+            extend_seq_lens=[extend_len],
+            extend_prefix_lens=[prompt_width],
+        )
+        namespace["_compute_mrope_positions"](
+            fb, SimpleNamespace(device="cpu"), batch
+        )
+        expected = tail_mrope_positions(mm, prompt_width, extend_len)
+        self.assertEqual(tuple(fb.mrope_positions.shape), (3, extend_len))
+        self.assertTrue(torch.equal(fb.mrope_positions.cpu(), expected))
+
     def test_layer_positions_and_mask(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             layer_attention_mask,

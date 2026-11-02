@@ -805,11 +805,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         * 3
                     )
                 else:
-                    if self.is_sr_tail_extend:
-                        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
-                            tail_mrope_positions,
-                        )
+                    from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+                        tail_mrope_positions,
+                    )
 
+                    if self.is_sr_tail_extend:
                         mrope_positions_list[batch_idx] = tail_mrope_positions(
                             mm_input, extend_prefix_len, extend_seq_len
                         )
@@ -818,9 +818,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+                    # Stored positions cover the prompt. A generated tail past
+                    # that width used to collapse to one column and fail the
+                    # RoPE length check. Continue those columns as text.
                     if mrope_positions.shape[1] != extend_seq_len:
-                        mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens_cpu[batch_idx]
+                        mrope_positions = tail_mrope_positions(
+                            mm_input, extend_prefix_len, extend_seq_len
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 

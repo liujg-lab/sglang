@@ -5671,9 +5671,14 @@ class TestComputeMropeWidthFallback(CustomTestCase):
         except ImportError as e:
             self.skipTest(str(e))
 
+        from sglang.srt.speculative.standalone_remote.drafter.sr_tail_extend import (
+            tail_mrope_positions,
+        )
+
         fb = ForwardBatch.__new__(ForwardBatch)
         fb.seq_lens_cpu = torch.tensor([10])
         fb.forward_mode = ForwardMode.EXTEND
+        fb.is_sr_tail_extend = False
         fb.input_ids = torch.arange(8, dtype=torch.int64)
         mm = SimpleNamespace(
             mrope_positions=torch.arange(5).unsqueeze(0).repeat(3, 1),
@@ -5685,15 +5690,18 @@ class TestComputeMropeWidthFallback(CustomTestCase):
             extend_seq_lens=[8],
             extend_prefix_lens=[0],
         )
-        fallback = torch.arange(8).unsqueeze(0).repeat(3, 1)
-        fb._expand_mrope_from_input = MagicMock(return_value=fallback)
+        fb._expand_mrope_from_input = MagicMock(
+            side_effect=AssertionError("extend must not use the 1-column fallback")
+        )
         with patch(
             "sglang.srt.model_executor.forward_batch_info.get_global_server_args",
             return_value=SimpleNamespace(rl_on_policy_target=None),
         ):
             fb._compute_mrope_positions(SimpleNamespace(device="cpu"), batch)
-        fb._expand_mrope_from_input.assert_called_once()
+        fb._expand_mrope_from_input.assert_not_called()
+        expected = tail_mrope_positions(mm, 0, 8)
         self.assertEqual(tuple(fb.mrope_positions.shape), (3, 8))
+        self.assertTrue(torch.equal(fb.mrope_positions.cpu(), expected))
 
     def test_extend_keeps_cached_mrope_when_width_matches(self):
         if torch is None:
@@ -5709,6 +5717,7 @@ class TestComputeMropeWidthFallback(CustomTestCase):
         fb = ForwardBatch.__new__(ForwardBatch)
         fb.seq_lens_cpu = torch.tensor([8])
         fb.forward_mode = ForwardMode.EXTEND
+        fb.is_sr_tail_extend = False
         fb.input_ids = torch.arange(5, dtype=torch.int64)
         cached = torch.arange(8).unsqueeze(0).repeat(3, 1)
         mm = SimpleNamespace(mrope_positions=cached)
