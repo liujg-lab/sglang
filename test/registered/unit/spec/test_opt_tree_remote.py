@@ -18,6 +18,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_layout import (
 )
 from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
     OptTreeState,
+    _pack_scores_and_ids,
     _ranked_verify_indices,
     ancestor_mask,
     depth_rule,
@@ -27,7 +28,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
     topk_probs_from_logits,
     update,
 )
-from sglang.srt.speculative.tree_attn_mask import iter_full_mask_rows
+from sglang.srt.speculative.tree_attn_mask import full_mask_numel, iter_full_mask_rows
 from sglang.test.ci.ci_register import register_cpu_ci
 
 try:
@@ -156,6 +157,24 @@ class _ReferenceTree:
         return self.last_draft_mask
 
 
+def _reference_ancestor_mask(state):
+    """Parent walk that ``ancestor_mask(leak=False)`` used to run on device."""
+    n = state.config.width
+    d = state.depth
+    parents = state.parents[:d].tolist()
+    mask = torch.zeros(n, d * n, dtype=torch.int8)
+    for i in range(n):
+        row = d - 1
+        col = i
+        while True:
+            mask[i, row * n + col] = 1
+            if row == 0:
+                break
+            col = int(parents[row][col])
+            row -= 1
+    return mask
+
+
 def _node_pairs(tokens, positions):
     return sorted(
         (int(tok), int(pos))
@@ -214,6 +233,29 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertTrue(torch.equal(got_i, ref_i))
         self.assertTrue(torch.allclose(got_p, ref_p, atol=1e-5, rtol=0))
 
+    def test_score_id_pack_keeps_int64_ids(self):
+        scores = torch.tensor([0.5, 0.25, 0.125], dtype=torch.float32)
+        ids = torch.tensor([3, 2**24 + 3, 7], dtype=torch.long)
+        got_scores, got_ids = _pack_scores_and_ids(scores, ids)
+        self.assertEqual(got_scores.device.type, "cpu")
+        self.assertEqual(got_ids.dtype, torch.int64)
+        self.assertTrue(torch.equal(got_scores, scores))
+        self.assertTrue(torch.equal(got_ids, ids))
+        wide_scores = torch.arange(9, dtype=torch.float32).reshape(3, 3) / 9
+        wide_ids = torch.arange(9, dtype=torch.long).reshape(3, 3) + 2**24
+        got_scores, got_ids = _pack_scores_and_ids(wide_scores, wide_ids)
+        self.assertTrue(torch.equal(got_scores, wide_scores))
+        self.assertTrue(torch.equal(got_ids, wide_ids))
+
+    def test_state_stays_on_cpu(self):
+        config = OptTreeConfig(width=3, tau=-1.0, max_depth=4)
+        state = OptTreeState.create(config)
+        seed(state, torch.tensor([0.5, 0.4, 0.1, 0.0]))
+        expand_layer(state, torch.tensor([[0.6, 0.3, 0.1, 0.0]] * 3))
+        for tensor in (state.weight, state.tokens, state.parents, state.anc_mask):
+            self.assertEqual(tensor.device.type, "cpu")
+        self.assertEqual(tuple(state.anc_mask.shape), (3, 6))
+
     def test_random_rounds_match_reference_tree(self):
         config = OptTreeConfig(width=4, tau=0.05, max_depth=6)
         for seed in range(5):
@@ -238,10 +280,16 @@ class OptTreeRemoteTest(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(our_out.tokens, ref_out["input_ids"]))
                     self.assertTrue(torch.equal(our_out.positions, ref_out["position_ids"]))
-                    self.assertTrue(torch.equal(our_out.leak_mask, ref_out["attention_mask"]))
+                    self.assertIs(our_out.ancestor_mask, our.anc_mask)
                     self.assertTrue(
-                        torch.equal(our_out.ancestor_mask, ancestor_mask(our, leak=False))
+                        torch.equal(our.anc_mask, _reference_ancestor_mask(our))
                     )
+                    self.assertTrue(
+                        torch.equal(
+                            ancestor_mask(our, leak=True), ref_out["attention_mask"]
+                        )
+                    )
+                    self.assertIsNone(our_out.leak_mask)
                     self.assertTrue(torch.equal(our.tokens[our.depth - 1], our_out.tokens))
                 if ref_out["is_final"]:
                     break
@@ -250,6 +298,8 @@ class OptTreeRemoteTest(CustomTestCase):
             self.assertIsNotNone(our_out)
             self.assertTrue(our_out.is_final)
             self.assertTrue(ref_out["is_final"])
+            self.assertIsNone(our_out.ancestor_mask)
+            self.assertIsNone(our_out.leak_mask)
             self.assertEqual(our.depth, ref.depth - 1)
             self.assertEqual(
                 _node_pairs(our_out.verify.tokens, our_out.verify.positions),
@@ -288,6 +338,8 @@ class OptTreeRemoteTest(CustomTestCase):
             probs = torch.softmax(torch.randn(1, config.width, vocab, generator=gen), dim=-1)
             step = update(state, probs)
         self.assertTrue(step.is_final)
+        self.assertIsNone(step.ancestor_mask)
+        self.assertIsNone(step.leak_mask)
         self.assertEqual(state.depth, config.max_depth - 1)
         self.assertTrue(torch.equal(state.tokens[1], kept_tokens))
         self.assertTrue(torch.equal(state.weight[1], kept_weight))
@@ -313,13 +365,14 @@ class OptTreeRemoteTest(CustomTestCase):
             our = update(state, probs)
             self.assertFalse(our.is_final)
             self.assertFalse(ref_out["is_final"])
-            self.assertTrue(torch.equal(our.leak_mask, ref_out["attention_mask"]))
-            self.assertTrue(
-                torch.equal(our.ancestor_mask, ancestor_mask(state, leak=False))
-            )
-            if not torch.equal(our.leak_mask, our.ancestor_mask):
+            leak = ancestor_mask(state, leak=True)
+            self.assertTrue(torch.equal(leak, ref_out["attention_mask"]))
+            self.assertIs(our.ancestor_mask, state.anc_mask)
+            self.assertIs(ancestor_mask(state, leak=False), state.anc_mask)
+            self.assertTrue(torch.equal(state.anc_mask, _reference_ancestor_mask(state)))
+            if not torch.equal(leak, our.ancestor_mask):
                 saw_stale = True
-                stale = (our.leak_mask == 1) & (our.ancestor_mask == 0)
+                stale = (leak == 1) & (our.ancestor_mask == 0)
                 self.assertGreater(int(stale.sum()), 0)
                 self.assertEqual(int((our.ancestor_mask == 1).sum()), 2 * 3)
         self.assertTrue(saw_stale)
@@ -415,6 +468,8 @@ class OptTreeRemoteTest(CustomTestCase):
                 torch.randn(1, config.width, vocab, generator=gen), dim=-1
             )
             step = update(state, probs)
+        self.assertIsNone(step.ancestor_mask)
+        self.assertIsNone(step.leak_mask)
         verify = step.verify
         for i, parent in enumerate(verify.parents.tolist()):
             self.assertTrue(parent == -1 or parent < i)
@@ -851,6 +906,109 @@ class OptTreeRemoteTest(CustomTestCase):
             forward_once,
         )
         self.assertEqual(len(stopped), 0)
+
+    def test_extend_logits_are_one_row_per_request(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _extend_request_rows,
+        )
+
+        logits = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4)
+        rows = _extend_request_rows(logits, 3)
+        self.assertEqual(len(rows), 3)
+        for i, row in enumerate(rows):
+            self.assertTrue(torch.equal(row, logits[i]))
+        # Lengths [2, 5, 1] used to address a per-token logit tensor at [1, 6, 7].
+        self.assertGreater(7, int(logits.shape[0]) - 1)
+        with self.assertRaises(IndexError):
+            _ = logits[7]
+        with self.assertRaises(RuntimeError):
+            _extend_request_rows(logits[:2], 3)
+
+    def test_pack_verify_attention_splits_by_request(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            pack_verify_attention,
+        )
+
+        width = 2
+        eye = torch.eye(width, dtype=torch.int8)
+        mask, positions = pack_verify_attention([3, 5], [eye, eye], depth=1, width=width)
+        self.assertEqual(int(mask.numel()), full_mask_numel([3, 5], width))
+        self.assertTrue(torch.equal(positions, torch.tensor([3, 3, 5, 5])))
+        rows = {
+            (b, t): row.tolist()
+            for b, t, row in iter_full_mask_rows(mask, [3, 5], width)
+        }
+        self.assertEqual(rows[(0, 0)], [True, True, True, True, False])
+        self.assertEqual(rows[(0, 1)], [True, True, True, False, True])
+        self.assertEqual(rows[(1, 0)], [True] * 5 + [True, False])
+        self.assertEqual(rows[(1, 1)], [True] * 5 + [False, True])
+
+        deeper = torch.tensor(
+            [[1, 0, 1, 0], [0, 1, 0, 1]],
+            dtype=torch.int8,
+        )
+        mask, positions = pack_verify_attention([4], [deeper], depth=2, width=width)
+        cached = 4 + width
+        self.assertEqual(int(mask.numel()), full_mask_numel([cached], width))
+        self.assertTrue(torch.equal(positions, torch.tensor([5, 5])))
+        deeper_rows = [
+            row.tolist() for _, _, row in iter_full_mask_rows(mask, [cached], width)
+        ]
+        self.assertEqual(deeper_rows[0], [True] * 4 + [True, False, True, False])
+        self.assertEqual(deeper_rows[1], [True] * 4 + [False, True, False, True])
+
+    def test_grow_active_layers_matches_serial_and_drops_stopped(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            grow_active_layers,
+            grow_with_forwards,
+        )
+
+        def serial(config, tail, layers):
+            queue = list(layers)
+
+            def forward_layer(step):
+                return queue.pop(0)
+
+            return grow_with_forwards(config, tail, forward_layer)
+
+        def batched(config, tails, layers):
+            queues = [list(rows) for rows in layers]
+            seen = []
+
+            def forward_active(steps, indices):
+                seen.append(list(indices))
+                return torch.stack([queues[i].pop(0) for i in indices])
+
+            got = grow_active_layers(config, tails, forward_active)
+            return got, seen
+
+        config = OptTreeConfig(width=2, tau=-1.0, max_depth=4)
+        gen = torch.Generator().manual_seed(3)
+        tails = [torch.randn(8, generator=gen) for _ in range(2)]
+        layers = [
+            [torch.randn(2, 8, generator=gen) for _ in range(2)] for _ in range(2)
+        ]
+        got, seen = batched(config, tails, layers)
+        self.assertEqual(seen, [[0, 1], [0, 1]])
+        for i in range(2):
+            self.assertEqual(got[i], serial(config, tails[i], layers[i]))
+
+        flat = torch.log(torch.full((2, 4), 0.25))
+        peaked = torch.log(
+            torch.tensor([[0.9, 0.05, 0.03, 0.02], [0.9, 0.05, 0.03, 0.02]])
+        )
+        stop = OptTreeConfig(width=2, tau=0.3, max_depth=6)
+        stop_tails = [
+            torch.log(torch.full((4,), 0.25)),
+            torch.log(torch.tensor([0.8, 0.1, 0.05, 0.05])),
+        ]
+        stop_layers = [[flat], [peaked, flat]]
+        got, seen = batched(stop, stop_tails, stop_layers)
+        self.assertEqual(seen[0], [0, 1])
+        self.assertNotIn(0, seen[-1])
+        self.assertEqual(seen[-1], [1])
+        for i in range(2):
+            self.assertEqual(got[i], serial(stop, stop_tails[i], stop_layers[i]))
 
     def test_prefill_materializes_missing_pool(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (

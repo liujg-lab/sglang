@@ -14,6 +14,9 @@ The verify set is the same N nodes.
 
 Draft attention defaults to the ancestor chain. ``leak=True`` reproduces the
 reference ``kv_cache_mask`` that is never cleared.
+
+Tree tensors stay on CPU. ``seed`` and ``expand_layer`` run top-k on the
+probability device and copy that layer's scores and ids back once.
 """
 
 from __future__ import annotations
@@ -48,15 +51,16 @@ class OptTreeStep:
     """One ``Tree.update`` result.
 
     ``positions`` is the 1-based layer depth used before the caller adds the
-    prefix offset. A non-final step fills every entry with that layer's depth.
-    A final step uses each verified node's own depth.
+    prefix offset. A non-final step fills every entry with that layer's depth
+    and sets ``ancestor_mask``. A final step uses each verified node's own
+    depth and leaves both masks unset.
     """
 
     is_final: bool
     tokens: torch.Tensor
     positions: torch.Tensor
-    leak_mask: torch.Tensor
-    ancestor_mask: torch.Tensor
+    leak_mask: Optional[torch.Tensor] = None
+    ancestor_mask: Optional[torch.Tensor] = None
     verify: Optional[OptVerifySet] = None
 
 
@@ -68,24 +72,20 @@ class OptTreeState:
     parents: torch.Tensor
     depth: int = 0
     prev_e: Optional[torch.Tensor] = None
-    kv_mask: Optional[torch.Tensor] = None
-    kv_cache_mask: Optional[torch.Tensor] = None
-    leak_mask: Optional[torch.Tensor] = None
+    anc_mask: Optional[torch.Tensor] = None
     finished: bool = False
 
     @classmethod
-    def create(cls, config: OptTreeConfig, device=None) -> "OptTreeState":
-        device = torch.device("cpu") if device is None else device
+    def create(cls, config: OptTreeConfig) -> "OptTreeState":
+        """Allocate the tree on CPU. Top-k scores and ids are copied in later."""
         n = config.width
         d = config.max_depth
         return cls(
             config=config,
-            weight=torch.zeros(d, n, dtype=torch.float32, device=device),
-            tokens=torch.zeros(d, n, dtype=torch.long, device=device),
-            parents=torch.zeros(d, n, dtype=torch.long, device=device),
-            prev_e=torch.zeros((), dtype=torch.float32, device=device),
-            kv_mask=torch.zeros(n, 0, dtype=torch.int8, device=device),
-            kv_cache_mask=torch.zeros(n, n, dtype=torch.int8, device=device),
+            weight=torch.zeros(d, n, dtype=torch.float32),
+            tokens=torch.zeros(d, n, dtype=torch.long),
+            parents=torch.zeros(d, n, dtype=torch.long),
+            prev_e=torch.zeros((), dtype=torch.float32),
         )
 
 
@@ -133,6 +133,48 @@ def _probs_matrix(probs: torch.Tensor, *, seed: bool, width: int) -> torch.Tenso
     raise ValueError(f"probabilities must be 1D, 2D, or 3D, got {tuple(probs.shape)}")
 
 
+def _pack_scores_and_ids(
+    scores: torch.Tensor, ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy fp32 scores and int64 ids through one uint8 buffer onto CPU.
+
+    The id region is 8-byte aligned and is not cast through float, so token
+    ids above 2^24 stay exact. ``.cpu()`` is the single transfer.
+    """
+    if scores.device != ids.device:
+        raise RuntimeError(
+            f"scores device {scores.device} != ids device {ids.device}"
+        )
+    scores_f = scores.detach().to(dtype=torch.float32).contiguous()
+    ids_i = ids.detach().to(dtype=torch.int64).contiguous()
+    score_flat = scores_f.reshape(-1)
+    id_flat = ids_i.reshape(-1)
+    score_bytes = int(score_flat.numel()) * 4
+    pad = (8 - (score_bytes % 8)) % 8
+    id_bytes = int(id_flat.numel()) * 8
+    raw = torch.empty(
+        score_bytes + pad + id_bytes, dtype=torch.uint8, device=scores_f.device
+    )
+    raw[:score_bytes].view(torch.float32).copy_(score_flat)
+    raw[score_bytes + pad :].view(torch.int64).copy_(id_flat)
+    host = raw.cpu()
+    out_scores = host[:score_bytes].view(torch.float32).reshape(scores_f.shape).clone()
+    out_ids = host[score_bytes + pad :].view(torch.int64).reshape(ids_i.shape).clone()
+    return out_scores, out_ids
+
+
+def _host_scores_and_ids(
+    scores: torch.Tensor, ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One D2H of a top-k result. CPU inputs are returned without a copy."""
+    if scores.device.type == "cpu" and ids.device.type == "cpu":
+        return (
+            scores.detach().float().contiguous(),
+            ids.detach().to(dtype=torch.long).contiguous(),
+        )
+    return _pack_scores_and_ids(scores, ids)
+
+
 def seed(state: OptTreeState, probs: torch.Tensor) -> None:
     """Top-N of the root distribution. Depth becomes 1. Not a stopping point."""
     if state.depth != 0 or state.finished:
@@ -141,18 +183,18 @@ def seed(state: OptTreeState, probs: torch.Tensor) -> None:
     row = _probs_matrix(probs, seed=True, width=n)
     if int(row.shape[-1]) < n:
         raise ValueError(f"vocab {int(row.shape[-1])} < width {n}")
-    scores, ids = torch.topk(row, k=n, dim=-1)
+    scores, ids = _host_scores_and_ids(*torch.topk(row, k=n, dim=-1))
     state.weight[0].copy_(scores)
     state.tokens[0].copy_(ids)
     # Reference stores arange here. Logical parent of every layer-0 node is the root.
-    state.parents[0].copy_(torch.arange(n, device=scores.device))
+    state.parents[0].copy_(torch.arange(n))
     state.depth = 1
-    state.leak_mask = torch.eye(n, dtype=torch.int8, device=scores.device)
+    state.anc_mask = torch.eye(n, dtype=torch.int8)
 
 
 def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
-    """Append one layer of N nodes and update the leaky draft mask."""
-    if state.finished or state.depth < 1:
+    """Append one layer of N nodes and extend the ancestor mask."""
+    if state.finished or state.depth < 1 or state.anc_mask is None:
         raise RuntimeError("expand_layer requires a seeded, unfinished tree")
     if state.depth >= state.config.max_depth:
         raise RuntimeError(
@@ -161,7 +203,7 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
         )
     n = state.config.width
     matrix = _probs_matrix(probs, seed=False, width=n)
-    child_scores, child_ids = torch.topk(matrix, k=n, dim=-1)
+    child_scores, child_ids = _host_scores_and_ids(*torch.topk(matrix, k=n, dim=-1))
     path_scores = child_scores * state.weight[state.depth - 1].unsqueeze(1)
     flat_scores = path_scores.reshape(-1)
     flat_ids = child_ids.reshape(-1)
@@ -170,13 +212,9 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
     state.parents[state.depth].copy_(parent_cols)
     state.weight[state.depth].copy_(top_scores)
     state.tokens[state.depth].copy_(flat_ids[top_index])
-
-    rows = torch.arange(n, device=parent_cols.device)
-    state.kv_cache_mask[rows, parent_cols] = 1
-    state.kv_mask = torch.cat([state.kv_mask[parent_cols], state.kv_cache_mask], dim=1)
-    state.kv_cache_mask[rows, parent_cols] = 1
-    eye = torch.eye(n, dtype=torch.int8, device=parent_cols.device)
-    state.leak_mask = torch.cat([state.kv_mask, eye], dim=1)
+    # Row i is the parent's ancestor row, including the parent, plus this node.
+    eye = torch.eye(n, dtype=torch.int8)
+    state.anc_mask = torch.cat([state.anc_mask[parent_cols], eye], dim=1)
     state.depth += 1
 
 
@@ -212,30 +250,38 @@ def _layer_positions(state: OptTreeState) -> torch.Tensor:
     )
 
 
+def _leak_mask(state: OptTreeState) -> torch.Tensor:
+    """Reference mask whose ``kv_cache_mask`` is never cleared.
+
+    Replayed from ``parents[1:depth]`` only when requested. The second write
+    of each parent column matches the reference and does not change bits.
+    """
+    n = state.config.width
+    if state.depth == 1:
+        return torch.eye(n, dtype=torch.int8)
+    kv_cache_mask = torch.zeros(n, n, dtype=torch.int8)
+    kv_mask = torch.zeros(n, 0, dtype=torch.int8)
+    rows = torch.arange(n)
+    for layer in range(1, state.depth):
+        parent_cols = state.parents[layer]
+        kv_cache_mask[rows, parent_cols] = 1
+        kv_mask = torch.cat([kv_mask[parent_cols], kv_cache_mask], dim=1)
+        kv_cache_mask[rows, parent_cols] = 1
+    return torch.cat([kv_mask, torch.eye(n, dtype=torch.int8)], dim=1)
+
+
 def ancestor_mask(state: OptTreeState, leak: bool = False) -> torch.Tensor:
     """Draft mask for the latest filled layer.
 
-    Default: each node sees itself and its ancestors only. ``leak=True``
-    returns the reference mask whose ``kv_cache_mask`` is never cleared.
-    Shape is ``[N, depth * N]``.
+    Default: the stored ancestor mask, where each node sees itself and its
+    ancestors only. ``leak=True`` rebuilds the reference mask whose
+    ``kv_cache_mask`` is never cleared. Shape is ``[N, depth * N]``.
     """
-    if state.depth < 1 or state.leak_mask is None:
+    if state.depth < 1 or state.anc_mask is None:
         raise RuntimeError("ancestor_mask requires a seeded tree")
     if leak:
-        return state.leak_mask.clone()
-    n = state.config.width
-    d = state.depth
-    mask = torch.zeros(n, d * n, dtype=torch.int8, device=state.weight.device)
-    for i in range(n):
-        row = d - 1
-        col = i
-        while True:
-            mask[i, row * n + col] = 1
-            if row == 0:
-                break
-            col = int(state.parents[row, col].item())
-            row -= 1
-    return mask
+        return _leak_mask(state)
+    return state.anc_mask
 
 
 def _close_under_ancestors(
@@ -300,35 +346,37 @@ def finish(state: OptTreeState) -> OptVerifySet:
     kept = sorted(selected_set)
     nodes = [(idx // n, idx % n) for idx in kept]
     index_of = {node: i for i, node in enumerate(nodes)}
+    token_rows, parent_rows = torch.stack(
+        [state.tokens[:layer_count], state.parents[:layer_count]], dim=0
+    ).tolist()
     tokens = []
     depths = []
     cols = []
     parents_out = []
     for row, col in nodes:
-        tokens.append(int(state.tokens[row, col].item()))
+        tokens.append(int(token_rows[row][col]))
         depths.append(row)
         cols.append(col)
         if row == 0:
             parents_out.append(-1)
         else:
-            parent_col = int(state.parents[row, col].item())
+            parent_col = int(parent_rows[row][col])
             parent_key = (row - 1, parent_col)
             if parent_key not in index_of:
                 raise RuntimeError(
                     f"missing ancestor {parent_key} for node {(row, col)}"
                 )
             parents_out.append(index_of[parent_key])
-    device = state.weight.device
-    parent_tensor = torch.tensor(parents_out, dtype=torch.long, device=device)
+    parent_tensor = torch.tensor(parents_out, dtype=torch.long)
     for i, parent in enumerate(parents_out):
         if parent != -1 and parent >= i:
             raise RuntimeError(f"parent index {parent} at {i} is not before the node")
-    depth_tensor = torch.tensor(depths, dtype=torch.long, device=device)
+    depth_tensor = torch.tensor(depths, dtype=torch.long)
     state.finished = True
     return OptVerifySet(
-        tokens=torch.tensor(tokens, dtype=torch.long, device=device),
+        tokens=torch.tensor(tokens, dtype=torch.long),
         depths=depth_tensor,
-        cols=torch.tensor(cols, dtype=torch.long, device=device),
+        cols=torch.tensor(cols, dtype=torch.long),
         parents=parent_tensor,
         positions=depth_tensor + 1,
     )
@@ -338,7 +386,7 @@ def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
     """Seed or expand, then judge E on every layer present.
 
     A non-final step asks for a draft forward of the layer just added. A final
-    step verifies that layer and does not forward it.
+    step verifies that layer and does not forward it, and does not build a mask.
     """
     if state.finished:
         raise RuntimeError("update called after finish")
@@ -346,23 +394,18 @@ def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
         seed(state, probs)
     else:
         expand_layer(state, probs)
-    leak = ancestor_mask(state, leak=True)
-    correct = ancestor_mask(state, leak=False)
     if depth_rule(state):
         state.prev_e = acceptance_mass(state)
         return OptTreeStep(
             is_final=False,
             tokens=state.tokens[state.depth - 1].clone(),
             positions=_layer_positions(state),
-            leak_mask=leak.clone(),
-            ancestor_mask=correct.clone(),
+            ancestor_mask=state.anc_mask,
         )
     verify = finish(state)
     return OptTreeStep(
         is_final=True,
         tokens=verify.tokens,
         positions=verify.positions.clone(),
-        leak_mask=leak.clone(),
-        ancestor_mask=correct.clone(),
         verify=verify,
     )

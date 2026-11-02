@@ -25,7 +25,7 @@ def grow_opt_tree(config: OptTreeConfig, next_probs) -> Tuple[List[int], List[in
     root = next_probs(None, None)
     if not torch.is_tensor(root):
         raise TypeError("OPT-Tree root distribution must be a tensor")
-    state = OptTreeState.create(config, device=root.device)
+    state = OptTreeState.create(config)
     step: Optional[OptTreeStep] = update(state, root)
     guard = 0
     while step is not None and not step.is_final:

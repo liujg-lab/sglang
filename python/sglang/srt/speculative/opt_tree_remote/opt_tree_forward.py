@@ -3,17 +3,25 @@
 The committed tail is scored once. Each non-final ``update`` then runs N
 tokens at one shared position under ``ancestor_mask``. Speculative KV is
 appended past the committed prefix and dropped by the caller.
+
+Several requests that are still growing share one forward at the same depth.
+A single request, and any batch that fails, still grow through
+``_opt_expand_one``.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
+from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import OptTreeState, update
+
+logger = logging.getLogger(__name__)
 
 
 def layer_positions(prefix_len: int, depth: int, width: int) -> torch.Tensor:
@@ -52,6 +60,33 @@ def layer_attention_mask(prefix_len: int, ancestor: torch.Tensor) -> torch.Tenso
     return torch.cat([prefix, tree], dim=1).reshape(-1)
 
 
+def pack_verify_attention(
+    prefix_lens: Sequence[int],
+    ancestors: Sequence[torch.Tensor],
+    depth: int,
+    width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate per-request TARGET_VERIFY masks and positions.
+
+    Mask segment ``b`` is ``[N, prefix_lens[b] + depth * N]`` flattened, which
+    is ``[N, cached_len_b + N]`` once ``cached_len`` counts layers already
+    forwarded. Positions for one request are identical.
+    """
+    if len(prefix_lens) != len(ancestors):
+        raise ValueError(
+            f"OPT verify pack has {len(prefix_lens)} prefixes and "
+            f"{len(ancestors)} masks"
+        )
+    masks = [
+        layer_attention_mask(prefix, ancestor)
+        for prefix, ancestor in zip(prefix_lens, ancestors)
+    ]
+    positions = [layer_positions(prefix, depth, width) for prefix in prefix_lens]
+    if not masks:
+        return torch.empty(0, dtype=torch.bool), torch.empty(0, dtype=torch.long)
+    return torch.cat(masks, dim=0), torch.cat(positions, dim=0)
+
+
 def materialize_missing_prefix(scheduler, reqs) -> None:
     """Build draft KV before the seed forward.
 
@@ -86,7 +121,13 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
         return [([], None, None)] * len(pairs)
     materialize_missing_prefix(scheduler, reqs)
     scheduler._sr_replay_grammars(reqs)
-    return [scheduler._opt_expand_one(req) for req in reqs]
+    if len(reqs) <= 1:
+        return [scheduler._opt_expand_one(req) for req in reqs]
+    try:
+        return grow_batch(scheduler, reqs)
+    except Exception as exc:
+        logger.warning("[OPT] batch tree expand failed, falling back: %s", exc)
+        return [scheduler._opt_expand_one(req) for req in reqs]
 
 
 def softmax_probs(logits: torch.Tensor) -> torch.Tensor:
@@ -112,6 +153,94 @@ def grow_with_forwards(
         return softmax_probs(forward_layer(step))
 
     return grow_opt_tree(config, next_probs)
+
+
+def _verify_window(step) -> Tuple[List[int], List[int], List[int]]:
+    verify = step.verify
+    if verify is None:
+        raise RuntimeError("OPT tree finished without a verify set")
+    return (
+        [int(x) for x in verify.tokens.tolist()],
+        [int(x) for x in verify.parents.tolist()],
+        [int(x) for x in verify.cols.tolist()],
+    )
+
+
+def _shared_depth(steps) -> int:
+    depths = [int(step.positions.reshape(-1)[0].item()) for step in steps]
+    if any(depth != depths[0] for depth in depths):
+        raise RuntimeError(f"OPT batch layers are at different depths: {depths}")
+    return depths[0]
+
+
+def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
+    """Split one layer's logits into ``bs`` tensors of shape ``[N, vocab]``."""
+    if isinstance(logits, (list, tuple)):
+        rows = list(logits)
+        if len(rows) != bs:
+            raise RuntimeError(
+                f"OPT layer returned {len(rows)} rows for {bs} requests"
+            )
+        return rows
+    t = logits.detach()
+    if t.dim() == 3 and int(t.shape[0]) == bs and int(t.shape[1]) == width:
+        return [t[i] for i in range(bs)]
+    if t.dim() == 3 and int(t.shape[0]) == 1:
+        t = t[0]
+    if t.dim() == 1:
+        t = t.unsqueeze(0)
+    need = bs * width
+    if t.dim() != 2 or int(t.shape[0]) != need:
+        raise RuntimeError(
+            f"OPT layer logits shape {tuple(logits.shape)} != [{bs}, {width}, vocab]"
+        )
+    return [t[i * width : (i + 1) * width] for i in range(bs)]
+
+
+def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Callable):
+    """Grow one tree per tail. Requests still at one depth share a forward.
+
+    ``forward_active(steps, indices)`` sees only non-final steps. ``indices``
+    are positions into ``tail_logits``. The return value is a list of
+    ``[N, vocab]`` logits, or a tensor of shape ``[bs, N, vocab]`` or
+    ``[bs * N, vocab]``. A request that stops is absent from the next call.
+    """
+    tails = list(tail_logits)
+    states = [OptTreeState.create(config) for _ in tails]
+    steps = [None] * len(tails)
+    results = [None] * len(tails)
+    active: List[int] = []
+    for i, logits in enumerate(tails):
+        step = update(states[i], softmax_probs(logits))
+        steps[i] = step
+        if step.is_final:
+            results[i] = _verify_window(step)
+        else:
+            active.append(i)
+    guard = 0
+    while active:
+        guard += 1
+        if guard > config.max_depth:
+            raise RuntimeError(
+                f"OPT-Tree did not finish within max_depth {config.max_depth}"
+            )
+        chosen = [steps[i] for i in active]
+        _shared_depth(chosen)
+        rows = _as_layer_rows(
+            forward_active(chosen, list(active)), len(active), config.width
+        )
+        nxt: List[int] = []
+        for i, row in zip(active, rows):
+            step = update(states[i], softmax_probs(row))
+            steps[i] = step
+            if step.is_final:
+                results[i] = _verify_window(step)
+            else:
+                nxt.append(i)
+        active = nxt
+    if any(item is None for item in results):
+        raise RuntimeError("OPT batch finished with a missing verify set")
+    return results
 
 
 @dataclass
@@ -344,12 +473,7 @@ class OptLayerForward:
         return batch
 
     def _run(self, batch) -> torch.Tensor:
-        self.scheduler.cur_batch = batch
-        result = self.scheduler.run_batch(batch)
-        logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
-        if logits is None:
-            raise RuntimeError(f"OPT draft {self.req.rid} forward returned no logits")
-        return logits
+        return _run_batch(self.scheduler, batch)
 
 
 def _keep_raw_logits(batch) -> None:
@@ -390,3 +514,330 @@ def _row_logits(logits: torch.Tensor, n: int, *, tail: bool) -> torch.Tensor:
     if t.dim() != 2 or int(t.shape[0]) != n:
         raise RuntimeError(f"OPT layer logits shape {tuple(t.shape)} != [{n}, vocab]")
     return t
+
+
+def _run_batch(scheduler, batch) -> torch.Tensor:
+    scheduler.cur_batch = batch
+    result = scheduler.run_batch(batch)
+    logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
+    if logits is None:
+        raise RuntimeError("OPT draft forward returned no logits")
+    return logits
+
+
+def _flatten_logits(logits: torch.Tensor) -> torch.Tensor:
+    t = logits.detach()
+    if t.dim() == 3 and int(t.shape[0]) == 1:
+        t = t[0]
+    if t.dim() == 1:
+        return t.unsqueeze(0)
+    if t.dim() != 2:
+        raise RuntimeError(f"OPT logits rank {t.dim()} is not 1 or 2")
+    return t
+
+
+def _extend_request_rows(logits: torch.Tensor, num_reqs: int) -> List[torch.Tensor]:
+    """One tail row per request.
+
+    EXTEND without ``return_logprob`` already keeps only the last hidden
+    state of each request, so ``next_token_logits`` is ``[num_reqs, vocab]``.
+    """
+    flat = _flatten_logits(logits)
+    if int(flat.shape[0]) != int(num_reqs):
+        raise RuntimeError(
+            f"OPT extend logits rows {int(flat.shape[0])} != {int(num_reqs)} requests"
+        )
+    return [flat[i] for i in range(int(num_reqs))]
+
+
+def _extend_batch_many(scheduler, runners, token_spans, prefix_lens, out_cache_loc):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    reqs = [runner.req for runner in runners]
+    batch = scheduler._sr_make_decode_batch(reqs)
+    device = batch.seq_lens.device
+    extend_lens = [len(span) for span in token_spans]
+    ends = [int(prefix) + n for prefix, n in zip(prefix_lens, extend_lens)]
+    flat = [int(tok) for span in token_spans for tok in span]
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.global_forward_mode = ForwardMode.EXTEND
+    batch.input_ids = torch.tensor(flat, dtype=torch.int64, device=device)
+    batch.output_ids = None
+    batch.seq_lens = torch.tensor(ends, dtype=torch.int64, device=device)
+    batch.seq_lens_cpu = torch.tensor(ends, dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor(ends, dtype=torch.int32, device=device)
+    batch.seq_lens_sum = sum(ends)
+    batch.out_cache_loc = out_cache_loc
+    batch.extend_lens = extend_lens
+    batch.prefix_lens = [int(prefix) for prefix in prefix_lens]
+    batch.extend_num_tokens = sum(extend_lens)
+    batch.extend_logprob_start_lens = [0] * len(runners)
+    _keep_raw_logits(batch)
+    return batch
+
+
+def _verify_batch_many(
+    scheduler, runners, tokens, positions, custom_mask, out_cache_loc, cached
+):
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    reqs = [runner.req for runner in runners]
+    batch = scheduler._sr_make_decode_batch(reqs)
+    device = batch.seq_lens.device
+    width = int(tokens[0].shape[0]) if tokens else 0
+    cached = [int(n) for n in cached]
+    batch.forward_mode = ForwardMode.TARGET_VERIFY
+    batch.global_forward_mode = ForwardMode.TARGET_VERIFY
+    batch.input_ids = torch.cat([row.reshape(-1) for row in tokens]).to(
+        dtype=torch.int64, device=device
+    )
+    batch.output_ids = None
+    batch.seq_lens = torch.tensor(cached, dtype=torch.int64, device=device)
+    batch.seq_lens_cpu = torch.tensor(cached, dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor(cached, dtype=torch.int32, device=device)
+    batch.seq_lens_sum = sum(cached)
+    batch.out_cache_loc = out_cache_loc
+    batch.extend_lens = [width] * len(runners)
+    batch.prefix_lens = list(cached)
+    batch.extend_num_tokens = width * len(runners)
+    batch.extend_logprob_start_lens = list(cached)
+    batch.spec_info = OptLayerSpec(
+        custom_mask=custom_mask.reshape(-1),
+        positions=positions.reshape(-1).to(dtype=torch.int64, device=device),
+        draft_token_num=width,
+        num_tokens_per_req=width,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+    )
+    _keep_raw_logits(batch)
+    return batch
+
+
+def _logits_at_tail_batch(scheduler, runners) -> List[torch.Tensor]:
+    """One DECODE row per request, reusing the committed tail slot."""
+    if not runners:
+        return []
+    pool = scheduler.req_to_token_pool.req_to_token
+    slots = []
+    for runner in runners:
+        if runner.prefix_len < 1:
+            raise RuntimeError(f"OPT draft {runner.req.rid} has an empty prefix")
+        if runner.req.req_pool_idx is None:
+            raise RuntimeError(f"OPT draft {runner.req.rid} has no KV pool slot")
+        slot = pool[runner.req.req_pool_idx, runner.prefix_len - 1]
+        if int(slot.item()) < 0:
+            raise RuntimeError(f"OPT draft {runner.req.rid} tail KV slot is empty")
+        slots.append(slot.reshape(-1))
+    batch = scheduler._sr_make_decode_batch([runner.req for runner in runners])
+    batch.input_ids = batch.output_ids
+    batch.out_cache_loc = torch.cat(slots)
+    batch.output_ids = None
+    _keep_raw_logits(batch)
+    logits = _flatten_logits(_run_batch(scheduler, batch))
+    if int(logits.shape[0]) != len(runners):
+        raise RuntimeError(
+            f"OPT tail logits rows {int(logits.shape[0])} != {len(runners)} requests"
+        )
+    return [logits[i] for i in range(len(runners))]
+
+
+def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
+    """Write every short tail in one EXTEND and keep each request's last row."""
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+        read_token_span,
+    )
+
+    prepared = []
+    try:
+        spans = []
+        starts = []
+        locs = []
+        for runner in runners:
+            start = int(getattr(runner.req, "kv_committed_len", 0) or 0)
+            end = runner.prefix_len
+            if runner.req.req_pool_idx is None:
+                raise RuntimeError(f"OPT draft {runner.req.rid} has no KV pool slot")
+            if start < 0 or start >= end:
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} extend span [{start}, {end}) is empty"
+                )
+            n = end - start
+            tokens = read_token_span(
+                runner.req.origin_input_ids, runner.req.output_ids, start, n
+            )
+            if len(tokens) != n:
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} is missing tokens at [{start}, {end})"
+                )
+            loc = runner._alloc_layer_slots(n, start=start)
+            runner.req.kv_allocated_len = end
+            prepared.append((runner, start))
+            spans.append(tokens)
+            starts.append(start)
+            locs.append(loc.reshape(-1))
+        batch = _extend_batch_many(
+            scheduler,
+            runners,
+            spans,
+            starts,
+            torch.cat(locs),
+        )
+        rows = _extend_request_rows(_run_batch(scheduler, batch), len(runners))
+    except Exception:
+        for runner, start in prepared:
+            scheduler._opt_rollback(runner.req, start)
+        raise
+    for runner in runners:
+        runner.req.kv_committed_len = runner.prefix_len
+        runner.req.kv_allocated_len = runner.prefix_len
+        runner.cached_len = runner.prefix_len
+    return rows
+
+
+def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
+    """One TARGET_VERIFY for requests that still share a depth."""
+    if not runners:
+        raise RuntimeError("OPT verify batch is empty")
+    width = int(scheduler.server_args.opt_tree_width)
+    device = scheduler.req_to_token_pool.device
+    depth = _shared_depth(steps)
+    token_rows = []
+    ancestors = []
+    for runner, step in zip(runners, steps):
+        tokens = step.tokens
+        if not torch.is_tensor(tokens):
+            tokens = torch.tensor(list(tokens), dtype=torch.long)
+        n = int(tokens.shape[0])
+        if n != width:
+            raise RuntimeError(
+                f"OPT layer has {n} tokens but attention was built for {width}"
+            )
+        ancestor = step.ancestor_mask
+        anc_shape = None if ancestor is None else tuple(ancestor.shape)
+        if anc_shape != (n, depth * n):
+            raise RuntimeError(
+                f"OPT ancestor mask {anc_shape} != [{n}, {depth * n}]"
+            )
+        if runner.cached_len + n != runner.prefix_len + depth * n:
+            raise RuntimeError(
+                f"OPT cache length {runner.cached_len} is not layer {depth} "
+                f"after prefix {runner.prefix_len}"
+            )
+        token_rows.append(tokens.to(dtype=torch.long, device=device))
+        ancestors.append(ancestor)
+    prefix_lens = [runner.prefix_len for runner in runners]
+    flat_mask, flat_positions = pack_verify_attention(
+        prefix_lens, ancestors, depth, width
+    )
+    locs = []
+    cached = []
+    for runner in runners:
+        loc = runner._alloc_layer_slots(width)
+        runner.req.kv_allocated_len = runner.cached_len + width
+        locs.append(loc.reshape(-1))
+        cached.append(runner.cached_len)
+    batch = _verify_batch_many(
+        scheduler,
+        runners,
+        token_rows,
+        flat_positions.to(device),
+        flat_mask.to(device),
+        torch.cat(locs),
+        cached,
+    )
+    logits = _run_batch(scheduler, batch)
+    for runner in runners:
+        runner.cached_len += width
+    return logits
+
+
+def _batch_tail_logits(scheduler, runners) -> List[torch.Tensor]:
+    from sglang.srt.speculative.standalone_remote.sr_align import plan_committed_ingest
+
+    reprefill = []
+    decode = []
+    noop = []
+    for runner in runners:
+        cached = int(getattr(runner.req, "kv_committed_len", 0) or 0)
+        mode, _tail = plan_committed_ingest(
+            len(runner.req.origin_input_ids or []),
+            runner.req.output_ids,
+            cached,
+            max_decode_steps=scheduler._sr_max_ingest_decode_steps(),
+        )
+        if mode == "reprefill":
+            reprefill.append(runner)
+        elif mode == "decode":
+            decode.append(runner)
+        elif mode == "noop":
+            noop.append(runner)
+        else:
+            raise RuntimeError(
+                f"OPT draft {runner.req.rid} ingest mode {mode} is unknown"
+            )
+    if reprefill:
+        scheduler._sr_reprefill_committed([runner.req for runner in reprefill])
+    logits = {}
+    if decode:
+        for runner, row in zip(decode, _extend_uncommitted_batch(scheduler, decode)):
+            logits[id(runner)] = row
+    tail_decode = noop + reprefill
+    if tail_decode:
+        for runner, row in zip(tail_decode, _logits_at_tail_batch(scheduler, tail_decode)):
+            logits[id(runner)] = row
+    return [logits[id(runner)] for runner in runners]
+
+
+def _committed_len(req) -> int:
+    return len(req.origin_input_ids or []) + len(req.output_ids or [])
+
+
+def grow_batch(scheduler, reqs):
+    """Grow every request together. Tree KV is dropped before returning.
+
+    Short uncommitted tails share one EXTEND. Requests that still have the
+    same depth share one TARGET_VERIFY. ``finally`` rolls each request back
+    to the committed length, matching ``_opt_expand_one``.
+    """
+    if not reqs:
+        return []
+    committed = [_committed_len(req) for req in reqs]
+    try:
+        for req in reqs:
+            scheduler._sr_resume_req(req)
+        scheduler._sr_isolate_need({req.rid for req in reqs})
+        for req, keep in zip(reqs, committed):
+            allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+            if allocated > keep:
+                scheduler._opt_rollback(req, keep)
+        config = OptTreeConfig(
+            width=int(scheduler.server_args.opt_tree_width),
+            tau=float(scheduler.server_args.opt_tree_tau),
+            max_depth=int(scheduler.server_args.opt_tree_max_depth),
+        )
+        runners = [
+            OptLayerForward(scheduler, req, keep) for req, keep in zip(reqs, committed)
+        ]
+        tail_logits = _batch_tail_logits(scheduler, runners)
+        for runner, keep in zip(runners, committed):
+            written = int(getattr(runner.req, "kv_committed_len", 0) or 0)
+            if written != keep:
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} committed KV {written} != {keep} tokens"
+                )
+
+        def forward_active(steps, indices):
+            return _forward_verify_batch(
+                scheduler, [runners[i] for i in indices], steps
+            )
+
+        return grow_active_layers(config, tail_logits, forward_active)
+    finally:
+        for req, keep in zip(reqs, committed):
+            scheduler._opt_rollback(req, keep)
+            if not scheduler._sr_is_finished(req):
+                scheduler._sr_pause_req(req)
+        scheduler.last_batch = None
+        scheduler.cur_batch = None
