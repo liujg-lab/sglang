@@ -147,8 +147,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> bool:
         """Whether CudaGraphRunner should capture TARGET_VERIFY (not DECODE).
 
-        STANDALONE_REMOTE Draft must stay on DECODE so chain ``run_batch`` can
-        replay ordinary decode graphs. Only the Target role captures verify.
+        STANDALONE_REMOTE and OPT_TREE_REMOTE Draft stay on DECODE so chain
+        ``run_batch`` can replay ordinary decode graphs. Only the Target role
+        captures verify.
         """
         if is_draft_worker:
             return False
@@ -161,15 +162,21 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "standalone_remote_role", None) == "target"
         ):
             return True
+        if (
+            self.is_opt_tree_remote()
+            and getattr(server_args, "opt_tree_role", None) == "target"
+        ):
+            return True
         return False
 
     def uses_dual_ntpb_cuda_graph(
         self, server_args: "ServerArgs", is_draft_worker: bool = False
     ) -> bool:
-        """Capture both TARGET_VERIFY and ntpb=1 DECODE graphs (SPECTRE / SR Target).
+        """Capture both TARGET_VERIFY and ntpb=1 DECODE graphs.
 
-        DECODE graphs cover 1-token AR. STANDALONE_REMOTE Draft stays on a
-        single ordinary DECODE capture.
+        Covers SPECTRE, STANDALONE_REMOTE Target, and OPT_TREE_REMOTE Target.
+        OPT Target options are ``{1, N + 1}``. DECODE graphs cover 1-token AR.
+        STANDALONE_REMOTE and OPT Draft stay on a single ordinary DECODE capture.
         """
         if is_draft_worker:
             return False
@@ -178,6 +185,11 @@ class SpeculativeAlgorithm(Enum):
         if (
             self.is_standalone_remote()
             and getattr(server_args, "standalone_remote_role", None) == "target"
+        ):
+            return True
+        if (
+            self.is_opt_tree_remote()
+            and getattr(server_args, "opt_tree_role", None) == "target"
         ):
             return True
         return False

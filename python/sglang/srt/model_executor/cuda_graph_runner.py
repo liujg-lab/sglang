@@ -511,8 +511,17 @@ def _is_spectre(runner) -> bool:
 
 
 def _uses_dual_ntpb(runner) -> bool:
-    """SPECTRE Target and STANDALONE_REMOTE Target capture verify + ntpb=1 DECODE."""
+    """SPECTRE, SR Target, and OPT Target capture verify + ntpb=1 DECODE."""
     return getattr(runner, "dual_ntpb", False)
+
+
+def _dual_ntpb_log_tag(runner) -> str:
+    if _is_spectre(runner):
+        return "[Spectre CudaGraph]"
+    algo = runner.model_runner.spec_algorithm
+    if algo.is_opt_tree_remote():
+        return "[OPT CudaGraph]"
+    return "[SR CudaGraph]"
 
 
 class CudaGraphRunner:
@@ -612,7 +621,7 @@ class CudaGraphRunner:
         self._captured_attn_tensors = {}
 
         if self.dual_ntpb:
-            tag = "[Spectre CudaGraph]" if self.is_spectre else "[SR CudaGraph]"
+            tag = _dual_ntpb_log_tag(self)
             log_info_on_rank0(
                 logger,
                 f"{tag} dual_ntpb=True, "
@@ -774,6 +783,7 @@ class CudaGraphRunner:
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
+                    or self.model_runner.spec_algorithm.is_opt_tree_remote()
                     or _is_spectre(self)
                 )
                 else max(forward_batch.global_num_tokens_cpu)
@@ -920,11 +930,7 @@ class CudaGraphRunner:
                 ) or [self.num_tokens_per_bs]
                 for ntpb in ntpb_list:
                     if is_dual:
-                        tag = (
-                            "[Spectre CudaGraph]"
-                            if _is_spectre(self)
-                            else "[SR CudaGraph]"
-                        )
+                        tag = _dual_ntpb_log_tag(self)
                         log_info_on_rank0(
                             logger,
                             f"{tag} Capturing: bs={bs}, "
@@ -988,7 +994,7 @@ class CudaGraphRunner:
                 if isinstance(k, str) and k.startswith("r")
             ]
             captured_tensors = getattr(self, "_captured_attn_tensors", {})
-            tag = "[Spectre CudaGraph]" if _is_spectre(self) else "[SR CudaGraph]"
+            tag = _dual_ntpb_log_tag(self)
             log_info_on_rank0(
                 logger,
                 f"{tag} Capture complete. "
@@ -1309,6 +1315,7 @@ class CudaGraphRunner:
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
+                    or self.model_runner.spec_algorithm.is_opt_tree_remote()
                     or _is_spectre(self)
                 )
                 else max_num_tokens
@@ -1475,6 +1482,39 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif (
+            self.model_runner.spec_algorithm.is_opt_tree_remote()
+            and getattr(self.model_runner.server_args, "opt_tree_role", None)
+            == "target"
+        ):
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            draft_token_num = (
+                ntpb_override
+                if ntpb_override is not None
+                else self.num_tokens_per_bs
+            )
+            if _uses_dual_ntpb(self) and draft_token_num == 1:
+                return None
+            width = int(self.model_runner.server_args.opt_tree_width)
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=self.buffers.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                retrive_cum_len=None,
+                spec_steps=int(self.model_runner.server_args.opt_tree_max_depth),
+                topk=width,
+                draft_token_num=width + 1,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
 
         elif self.is_spectre:
             from sglang.srt.speculative.eagle_info import EagleVerifyInput

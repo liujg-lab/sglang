@@ -257,6 +257,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
+                    or self.model_runner.spec_algorithm.is_opt_tree_remote()
                     or _is_spectre(self)
                 )
                 else max_num_tokens

@@ -687,6 +687,49 @@ class OptTreeRemoteTest(CustomTestCase):
         eagle = SimpleNamespace(speculative_num_draft_tokens=5, opt_tree_width=4)
         self.assertEqual(SpeculativeAlgorithm.EAGLE.guess_tokens_per_step(eagle), 4)
 
+    def test_opt_target_captures_verify_cuda_graph(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        opt = SpeculativeAlgorithm.OPT_TREE_REMOTE
+        width = 4
+        target = SimpleNamespace(
+            opt_tree_role="target",
+            speculative_num_draft_tokens=width + 1,
+            spectre_role=None,
+            standalone_remote_role=None,
+        )
+        self.assertTrue(opt.captures_target_verify_cuda_graph(target))
+        self.assertTrue(opt.uses_dual_ntpb_cuda_graph(target))
+        self.assertEqual(opt.dual_ntpb_cuda_graph_options(target), [width + 1, 1])
+        self.assertEqual(
+            opt.target_verify_cuda_graph_num_tokens_per_bs(target), width + 1
+        )
+        self.assertFalse(
+            opt.captures_target_verify_cuda_graph(target, is_draft_worker=True)
+        )
+        self.assertFalse(
+            opt.uses_dual_ntpb_cuda_graph(target, is_draft_worker=True)
+        )
+        self.assertEqual(
+            opt.target_verify_cuda_graph_num_tokens_per_bs(
+                target, is_draft_worker=True
+            ),
+            1,
+        )
+
+        draft = SimpleNamespace(
+            opt_tree_role="draft",
+            speculative_num_draft_tokens=width,
+            spectre_role=None,
+            standalone_remote_role=None,
+        )
+        self.assertFalse(opt.captures_target_verify_cuda_graph(draft))
+        self.assertFalse(opt.uses_dual_ntpb_cuda_graph(draft))
+        self.assertIsNone(opt.dual_ntpb_cuda_graph_options(draft))
+        self.assertEqual(opt.target_verify_cuda_graph_num_tokens_per_bs(draft), 1)
+
     def test_layer_positions_and_mask(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             layer_attention_mask,
