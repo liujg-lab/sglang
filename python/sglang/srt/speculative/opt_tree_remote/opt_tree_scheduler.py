@@ -17,10 +17,12 @@ from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     OptLayerForward,
+    clear_prefill_tail_logits,
     grow_with_forwards,
+    ingest_tail_logits,
     produce_opt_windows,
+    release_uncommitted,
 )
-from sglang.srt.speculative.standalone_remote.sr_align import plan_committed_ingest
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.standalone_remote.sr_commit import (
     SR_PROTOCOL_VERSION,
@@ -210,34 +212,23 @@ class OptTreeSchedulerMixin:
                 f"from {allocated}"
             )
 
+    def _opt_release_uncommitted(self, req) -> int:
+        """Free slots past ``kv_committed_len`` before extend reuses that span."""
+        return release_uncommitted(req, self._opt_rollback)
+
     def _opt_expand_one(self, req) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
         self._sr_resume_req(req)
         self._sr_isolate_need({req.rid})
         committed = len(req.origin_input_ids or []) + len(req.output_ids or [])
         try:
-            allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
-            if allocated > committed:
-                self._opt_rollback(req, committed)
-            cached = int(getattr(req, "kv_committed_len", 0) or 0)
-            mode, _tail = plan_committed_ingest(
-                len(req.origin_input_ids or []),
-                req.output_ids,
-                cached,
-                max_decode_steps=self._sr_max_ingest_decode_steps(),
-            )
+            self._opt_release_uncommitted(req)
             config = OptTreeConfig(
                 width=int(self.server_args.opt_tree_width),
                 tau=float(self.server_args.opt_tree_tau),
                 max_depth=int(self.server_args.opt_tree_max_depth),
             )
             runner = OptLayerForward(self, req, committed)
-            if mode == "reprefill":
-                self._sr_reprefill_committed([req])
-                tail_logits = runner.logits_at_tail()
-            elif mode == "decode":
-                tail_logits = runner.extend_uncommitted()
-            else:
-                tail_logits = runner.logits_at_tail()
+            tail_logits = ingest_tail_logits(self, [runner])[0]
             written = int(getattr(req, "kv_committed_len", 0) or 0)
             if written != committed:
                 raise RuntimeError(
@@ -253,6 +244,7 @@ class OptTreeSchedulerMixin:
             logger.warning("[OPT] tree expand failed for %s: %s", req.rid, exc)
             return [], None, None
         finally:
+            clear_prefill_tail_logits(req)
             self._opt_rollback(req, committed)
             if not self._sr_is_finished(req):
                 self._sr_pause_req(req)

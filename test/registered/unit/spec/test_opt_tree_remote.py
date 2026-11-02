@@ -1086,6 +1086,88 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertIsNone(info.vocab_mask)
         self.assertFalse(batch.has_grammar)
 
+    def test_release_uncommitted_rolls_back_to_kv_committed_len(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            release_uncommitted,
+        )
+
+        host = _ReleaseHost()
+        # Logical length is 5, but slots only through kv_committed_len are kept.
+        gap = SimpleNamespace(
+            rid="gap",
+            kv_committed_len=2,
+            kv_allocated_len=4,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4, 5],
+        )
+        cached = release_uncommitted(gap, host._opt_rollback)
+        self.assertEqual(cached, 2)
+        self.assertEqual(host.rolls, [2])
+
+        past = SimpleNamespace(
+            rid="past",
+            kv_committed_len=5,
+            kv_allocated_len=8,
+            origin_input_ids=[1, 2, 3, 4, 5],
+            output_ids=[],
+        )
+        host.rolls.clear()
+        cached = release_uncommitted(past, host._opt_rollback)
+        self.assertEqual(cached, 5)
+        self.assertEqual(host.rolls, [5])
+
+        equal = SimpleNamespace(
+            rid="equal",
+            kv_committed_len=5,
+            kv_allocated_len=5,
+            origin_input_ids=[1, 2, 3, 4, 5],
+            output_ids=[],
+        )
+        host.rolls.clear()
+        cached = release_uncommitted(equal, host._opt_rollback)
+        self.assertEqual(cached, 5)
+        self.assertEqual(host.rolls, [])
+
+    def test_plan_opt_tail_extends_instead_of_reprefill_threshold(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            extend_chunk_bounds,
+            plan_opt_tail,
+        )
+
+        def req(origin, output, kv, pool=1):
+            return SimpleNamespace(
+                rid="opt-tail",
+                req_pool_idx=pool,
+                origin_input_ids=list(range(origin)),
+                output_ids=list(range(output)),
+                kv_committed_len=kv,
+            )
+
+        # 20 missing outputs used to exceed the per-token decode threshold.
+        self.assertEqual(plan_opt_tail(req(10, 20, 10), 2048), "extend")
+        self.assertEqual(plan_opt_tail(req(10, 0, 10), 2048), "noop")
+        self.assertEqual(plan_opt_tail(req(0, 3000, 0), 2048), "extend_chunked")
+        self.assertEqual(
+            extend_chunk_bounds(0, 3000, 2048),
+            [(0, 2048), (2048, 3000)],
+        )
+        self.assertEqual(plan_opt_tail(req(5, 1, 2), 2048), "reprefill")
+        self.assertEqual(plan_opt_tail(req(4, 0, 4, pool=None), 2048), "reprefill")
+        self.assertEqual(plan_opt_tail(req(0, 5000, 0), None), "extend")
+        self.assertEqual(plan_opt_tail(req(0, 5000, 0), 0), "extend")
+
+
+class _ReleaseHost:
+    def __init__(self):
+        self.rolls = []
+
+    def _opt_rollback(self, req, keep_len):
+        self.rolls.append(int(keep_len))
+
 
 class _OptReq:
     def __init__(self):
@@ -1100,7 +1182,7 @@ class _OptWindowHost:
         self.assign_pool = assign_pool
         self.calls = []
 
-    def _sr_materialize_prefix_batch(self, reqs):
+    def _sr_materialize_prefix_batch(self, reqs, on_extend_logits=None):
         self.calls.append("materialize")
         if not self.assign_pool:
             return

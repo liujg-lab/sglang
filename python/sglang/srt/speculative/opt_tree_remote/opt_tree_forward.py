@@ -87,16 +87,144 @@ def pack_verify_attention(
     return torch.cat(masks, dim=0), torch.cat(positions, dim=0)
 
 
-def materialize_missing_prefix(scheduler, reqs) -> None:
+def release_uncommitted(req, rollback) -> int:
+    """Free slots past ``kv_committed_len`` before extend reuses that span.
+
+    ``kv_allocated_len`` can sit at or below the logical committed length.
+    Rolling back only past that length leaves ``[kv_committed_len,
+    kv_allocated_len)`` allocated. The next extend writes new slots over the
+    same columns and drops the old indices.
+    """
+    cached = int(getattr(req, "kv_committed_len", 0) or 0)
+    if int(getattr(req, "kv_allocated_len", 0) or 0) > cached:
+        rollback(req, cached)
+    return cached
+
+
+def opt_extend_chunk_limit(chunked_prefill_size) -> Optional[int]:
+    """Largest single OPT extend. ``None`` or a non-positive size means no cap."""
+    if chunked_prefill_size is None:
+        return None
+    limit = int(chunked_prefill_size)
+    if limit <= 0:
+        return None
+    return limit
+
+
+def plan_opt_tail(req, chunked_prefill_size) -> str:
+    """How OPT writes the committed tail.
+
+    ``reprefill`` when the KV prefix is missing or does not cover the prompt.
+    ``noop`` when that prefix already covers every committed token.
+    ``extend`` when the missing output fits in one chunk. ``extend_chunked``
+    when it does not. This does not use the per-token decode threshold.
+    """
+    origin = getattr(req, "origin_input_ids", None) or []
+    output = getattr(req, "output_ids", None) or []
+    kv_len = int(getattr(req, "kv_committed_len", 0) or 0)
+    if getattr(req, "req_pool_idx", None) is None or kv_len < len(origin):
+        return "reprefill"
+    missing = len(origin) + len(output) - kv_len
+    if missing <= 0:
+        return "noop"
+    limit = opt_extend_chunk_limit(chunked_prefill_size)
+    if limit is None or missing <= limit:
+        return "extend"
+    return "extend_chunked"
+
+
+def extend_chunk_bounds(start: int, end: int, chunk: int) -> List[Tuple[int, int]]:
+    """Half-open spans of at most ``chunk`` tokens covering ``[start, end)``."""
+    start = int(start)
+    end = int(end)
+    chunk = int(chunk)
+    if chunk <= 0:
+        raise ValueError(f"OPT extend chunk must be positive, got {chunk}")
+    if start >= end:
+        return []
+    bounds = []
+    cursor = start
+    while cursor < end:
+        nxt = min(end, cursor + chunk)
+        bounds.append((cursor, nxt))
+        cursor = nxt
+    return bounds
+
+
+def stash_finished_prefill_logits(scheduler, batch, logits) -> None:
+    """Keep the last row for requests whose prompt KV just finished."""
+    reqs = list(getattr(batch, "reqs", None) or [])
+    if not reqs:
+        return
+    try:
+        rows = _extend_request_rows(logits, len(reqs))
+    except RuntimeError as exc:
+        logger.warning("[OPT] skip prefill tail logits: %s", exc)
+        return
+    for req, row in zip(reqs, rows):
+        if scheduler._sr_prefix_pending(req):
+            continue
+        req.opt_prefill_tail_logits = row
+
+
+def take_cached_tail_logits(req, logical_len: int):
+    """Return a stashed prefill row when KV already covers ``logical_len``."""
+    row = getattr(req, "opt_prefill_tail_logits", None)
+    if row is None:
+        return None
+    req.opt_prefill_tail_logits = None
+    cached = int(getattr(req, "kv_committed_len", 0) or 0)
+    if cached != int(logical_len):
+        return None
+    return row
+
+
+def clear_prefill_tail_logits(req) -> None:
+    if getattr(req, "opt_prefill_tail_logits", None) is not None:
+        req.opt_prefill_tail_logits = None
+
+
+def reprefill_tail_logits(scheduler, reqs) -> List[torch.Tensor]:
+    """Rebuild an invalid prefix and keep the finishing chunk's last row."""
+
+    def _keep(batch, logits) -> None:
+        stash_finished_prefill_logits(scheduler, batch, logits)
+
+    scheduler._sr_reprefill_committed(reqs, on_extend_logits=_keep)
+    rows = []
+    missing = []
+    for req in reqs:
+        row = take_cached_tail_logits(req, _committed_len(req))
+        if row is None:
+            missing.append(getattr(req, "rid", None))
+            continue
+        rows.append(row)
+    if missing:
+        raise RuntimeError(
+            f"OPT draft reprefill returned no tail logits for {missing}"
+        )
+    return rows
+
+
+def materialize_missing_prefix(scheduler, reqs, capture_tail_logits: bool = False) -> None:
     """Build draft KV before the seed forward.
 
     ``_sr_kv_len`` treats a request with no pool slot as already cached, so
     OPT checks ``req_pool_idx`` itself and does not change that helper.
+    STEP keeps the last row of the chunk that finishes the prompt so expand
+    does not decode that tail again. PREFILL does not need those logits.
     """
     missing = [req for req in reqs if req.req_pool_idx is None]
     if not missing:
         return
-    scheduler._sr_materialize_prefix_batch(missing)
+
+    def _keep(batch, logits) -> None:
+        stash_finished_prefill_logits(scheduler, batch, logits)
+
+    if capture_tail_logits:
+        scheduler._sr_materialize_prefix_batch(missing, on_extend_logits=_keep)
+    else:
+        scheduler._sr_materialize_prefix_batch(missing)
     for req in missing:
         if req.req_pool_idx is None:
             raise RuntimeError(f"OPT draft {req.rid} prefix KV was not materialized")
@@ -119,7 +247,7 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
         return [([], None, None)] * len(pairs)
     if action != SRAction.STEP:
         return [([], None, None)] * len(pairs)
-    materialize_missing_prefix(scheduler, reqs)
+    materialize_missing_prefix(scheduler, reqs, capture_tail_logits=True)
     scheduler._sr_replay_grammars(reqs)
     if len(reqs) <= 1:
         return [scheduler._opt_expand_one(req) for req in reqs]
@@ -300,7 +428,25 @@ class OptLayerForward:
         tail-extend graph.
         """
         start = int(getattr(self.req, "kv_committed_len", 0) or 0)
-        end = self.prefix_len
+        return self._extend_range(start, self.prefix_len)
+
+    def extend_uncommitted_chunked(self, chunk: int) -> torch.Tensor:
+        """Write the same span in chunks. Only the last chunk's row is kept."""
+        start = int(getattr(self.req, "kv_committed_len", 0) or 0)
+        logits = None
+        for begin, end in extend_chunk_bounds(start, self.prefix_len, chunk):
+            logits = self._extend_range(begin, end)
+        if logits is None:
+            raise RuntimeError(
+                f"OPT draft {self.req.rid} chunked extend "
+                f"[{start}, {self.prefix_len}) is empty"
+            )
+        return logits
+
+    def _extend_range(self, start: int, end: int) -> torch.Tensor:
+        """Write ``[start, end)`` and publish that end as committed KV."""
+        start = int(start)
+        end = int(end)
         if self.req.req_pool_idx is None:
             raise RuntimeError(f"OPT draft {self.req.rid} has no KV pool slot")
         if start < 0 or start >= end:
@@ -643,20 +789,28 @@ def _logits_at_tail_batch(scheduler, runners) -> List[torch.Tensor]:
     return [logits[i] for i in range(len(runners))]
 
 
-def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
-    """Write every short tail in one EXTEND and keep each request's last row."""
+def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
+    """EXTEND each runner from its committed KV to ``ends[i]``.
+
+    A failed runner rolls back only to the start of this span. Earlier chunks
+    stay committed.
+    """
     from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
         read_token_span,
     )
 
+    if len(runners) != len(ends):
+        raise RuntimeError(
+            f"OPT extend has {len(runners)} runners and {len(ends)} ends"
+        )
     prepared = []
     try:
         spans = []
         starts = []
         locs = []
-        for runner in runners:
+        for runner, end in zip(runners, ends):
             start = int(getattr(runner.req, "kv_committed_len", 0) or 0)
-            end = runner.prefix_len
+            end = int(end)
             if runner.req.req_pool_idx is None:
                 raise RuntimeError(f"OPT draft {runner.req.rid} has no KV pool slot")
             if start < 0 or start >= end:
@@ -673,7 +827,7 @@ def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
                 )
             loc = runner._alloc_layer_slots(n, start=start)
             runner.req.kv_allocated_len = end
-            prepared.append((runner, start))
+            prepared.append((runner, start, end))
             spans.append(tokens)
             starts.append(start)
             locs.append(loc.reshape(-1))
@@ -686,14 +840,56 @@ def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
         )
         rows = _extend_request_rows(_run_batch(scheduler, batch), len(runners))
     except Exception:
-        for runner, start in prepared:
+        for runner, start, _end in prepared:
             scheduler._opt_rollback(runner.req, start)
         raise
-    for runner in runners:
-        runner.req.kv_committed_len = runner.prefix_len
-        runner.req.kv_allocated_len = runner.prefix_len
-        runner.cached_len = runner.prefix_len
+    for runner, _start, end in prepared:
+        runner.req.kv_committed_len = end
+        runner.req.kv_allocated_len = end
+        runner.cached_len = end
     return rows
+
+
+def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
+    """Write every short tail in one EXTEND and keep each request's last row."""
+    return _extend_span_batch(
+        scheduler, runners, [runner.prefix_len for runner in runners]
+    )
+
+
+def _extend_uncommitted_chunked_batch(
+    scheduler, runners, chunk: int
+) -> List[torch.Tensor]:
+    """Extend each long tail by ``chunk`` tokens. Keep the row that finishes it."""
+    pending = list(runners)
+    saved = {}
+    while pending:
+        before = [
+            int(getattr(runner.req, "kv_committed_len", 0) or 0) for runner in pending
+        ]
+        ends = []
+        for runner, start in zip(pending, before):
+            bounds = extend_chunk_bounds(start, runner.prefix_len, chunk)
+            if not bounds:
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} chunked extend "
+                    f"[{start}, {runner.prefix_len}) is empty"
+                )
+            ends.append(bounds[0][1])
+        rows = _extend_span_batch(scheduler, pending, ends)
+        nxt = []
+        for runner, row, end in zip(pending, rows, ends):
+            if int(end) >= int(runner.prefix_len):
+                saved[id(runner)] = row
+            else:
+                nxt.append(runner)
+        after = [
+            int(getattr(runner.req, "kv_committed_len", 0) or 0) for runner in pending
+        ]
+        if after == before:
+            raise RuntimeError("OPT chunked extend made no progress")
+        pending = nxt
+    return [saved[id(runner)] for runner in runners]
 
 
 def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
@@ -753,24 +949,26 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
     return logits
 
 
-def _batch_tail_logits(scheduler, runners) -> List[torch.Tensor]:
-    from sglang.srt.speculative.standalone_remote.sr_align import plan_committed_ingest
-
-    reprefill = []
-    decode = []
+def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
+    """Logits after each committed tail, without SR's per-token decode threshold."""
+    limit = getattr(scheduler, "chunked_prefill_size", None)
+    logits = {}
+    extend = []
+    chunked = []
     noop = []
+    reprefill = []
     for runner in runners:
-        cached = int(getattr(runner.req, "kv_committed_len", 0) or 0)
-        mode, _tail = plan_committed_ingest(
-            len(runner.req.origin_input_ids or []),
-            runner.req.output_ids,
-            cached,
-            max_decode_steps=scheduler._sr_max_ingest_decode_steps(),
-        )
+        cached_row = take_cached_tail_logits(runner.req, runner.prefix_len)
+        if cached_row is not None:
+            logits[id(runner)] = cached_row
+            continue
+        mode = plan_opt_tail(runner.req, limit)
         if mode == "reprefill":
             reprefill.append(runner)
-        elif mode == "decode":
-            decode.append(runner)
+        elif mode == "extend":
+            extend.append(runner)
+        elif mode == "extend_chunked":
+            chunked.append(runner)
         elif mode == "noop":
             noop.append(runner)
         else:
@@ -778,14 +976,18 @@ def _batch_tail_logits(scheduler, runners) -> List[torch.Tensor]:
                 f"OPT draft {runner.req.rid} ingest mode {mode} is unknown"
             )
     if reprefill:
-        scheduler._sr_reprefill_committed([runner.req for runner in reprefill])
-    logits = {}
-    if decode:
-        for runner, row in zip(decode, _extend_uncommitted_batch(scheduler, decode)):
+        rows = reprefill_tail_logits(scheduler, [runner.req for runner in reprefill])
+        for runner, row in zip(reprefill, rows):
             logits[id(runner)] = row
-    tail_decode = noop + reprefill
-    if tail_decode:
-        for runner, row in zip(tail_decode, _logits_at_tail_batch(scheduler, tail_decode)):
+    if extend:
+        for runner, row in zip(extend, _extend_uncommitted_batch(scheduler, extend)):
+            logits[id(runner)] = row
+    if chunked:
+        rows = _extend_uncommitted_chunked_batch(scheduler, chunked, int(limit))
+        for runner, row in zip(chunked, rows):
+            logits[id(runner)] = row
+    if noop:
+        for runner, row in zip(noop, _logits_at_tail_batch(scheduler, noop)):
             logits[id(runner)] = row
     return [logits[id(runner)] for runner in runners]
 
@@ -797,9 +999,11 @@ def _committed_len(req) -> int:
 def grow_batch(scheduler, reqs):
     """Grow every request together. Tree KV is dropped before returning.
 
-    Short uncommitted tails share one EXTEND. Requests that still have the
-    same depth share one TARGET_VERIFY. ``finally`` rolls each request back
-    to the committed length, matching ``_opt_expand_one``.
+    A missing output that fits in one chunk shares one EXTEND. A longer output
+    is extended in ``chunked_prefill_size`` pieces, and only the last piece's
+    row is kept. Requests that still have the same depth share one
+    TARGET_VERIFY. ``finally`` rolls each request back to the committed
+    length, matching ``_opt_expand_one``.
     """
     if not reqs:
         return []
@@ -808,10 +1012,8 @@ def grow_batch(scheduler, reqs):
         for req in reqs:
             scheduler._sr_resume_req(req)
         scheduler._sr_isolate_need({req.rid for req in reqs})
-        for req, keep in zip(reqs, committed):
-            allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
-            if allocated > keep:
-                scheduler._opt_rollback(req, keep)
+        for req in reqs:
+            scheduler._opt_release_uncommitted(req)
         config = OptTreeConfig(
             width=int(scheduler.server_args.opt_tree_width),
             tau=float(scheduler.server_args.opt_tree_tau),
@@ -820,7 +1022,7 @@ def grow_batch(scheduler, reqs):
         runners = [
             OptLayerForward(scheduler, req, keep) for req, keep in zip(reqs, committed)
         ]
-        tail_logits = _batch_tail_logits(scheduler, runners)
+        tail_logits = ingest_tail_logits(scheduler, runners)
         for runner, keep in zip(runners, committed):
             written = int(getattr(runner.req, "kv_committed_len", 0) or 0)
             if written != keep:
@@ -836,6 +1038,7 @@ def grow_batch(scheduler, reqs):
         return grow_active_layers(config, tail_logits, forward_active)
     finally:
         for req, keep in zip(reqs, committed):
+            clear_prefill_tail_logits(req)
             scheduler._opt_rollback(req, keep)
             if not scheduler._sr_is_finished(req):
                 scheduler._sr_pause_req(req)

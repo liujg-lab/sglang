@@ -2,7 +2,7 @@ import logging
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1557,8 +1557,17 @@ class StandaloneRemoteDraftSchedulerMixin:
                 continue
             park_precomputed_embeddings(getattr(req, "multimodal_inputs", None))
 
-    def _sr_materialize_prefix_batch(self, reqs: List[Req]) -> None:
-        """Prefill until committed KV covers origin_input_ids; drop sampled extras."""
+    def _sr_materialize_prefix_batch(
+        self,
+        reqs: List[Req],
+        on_extend_logits: Optional[Callable] = None,
+    ) -> None:
+        """Prefill until committed KV covers origin_input_ids; drop sampled extras.
+
+        ``on_extend_logits(batch, logits)`` sees a clone of
+        ``next_token_logits`` taken before the batch result is processed.
+        Callers keep rows only for requests whose prefix is no longer pending.
+        """
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
             return
@@ -1598,8 +1607,17 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_enable_tree_seed_hidden(batch)
             self.cur_batch = batch
             result = self.run_batch(batch)
+            cloned = None
+            if on_extend_logits is not None:
+                logits = getattr(
+                    getattr(result, "logits_output", None), "next_token_logits", None
+                )
+                if logits is not None:
+                    cloned = logits.detach().clone()
             self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
             self.process_batch_result(batch, result)
+            if cloned is not None:
+                on_extend_logits(batch, cloned)
             self._sr_park_finished_prefill_embeddings(batch)
             self.last_batch = batch
             is_extend = (
@@ -1631,7 +1649,11 @@ class StandaloneRemoteDraftSchedulerMixin:
             n = int(getattr(server_args, "speculative_num_steps", 0) or 0) + 1
         return max(DEFAULT_MAX_INGEST_DECODE_STEPS, 2 * n)
 
-    def _sr_reprefill_committed(self, reqs: List[Req]) -> None:
+    def _sr_reprefill_committed(
+        self,
+        reqs: List[Req],
+        on_extend_logits: Optional[Callable] = None,
+    ) -> None:
         """Fold a long committed tail into one extend instead of N decodes."""
         rebuilt: List[Req] = []
         for req in reqs:
@@ -1650,7 +1672,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             self._sr_ensure_window_budget(req, req.draft_tokens_target)
             rebuilt.append(req)
         if rebuilt:
-            self._sr_materialize_prefix_batch(rebuilt)
+            self._sr_materialize_prefix_batch(
+                rebuilt, on_extend_logits=on_extend_logits
+            )
 
     def _sr_make_tail_extend_batch(self, plans) -> ScheduleBatch:
         return make_tail_extend_batch(self, plans)
