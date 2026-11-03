@@ -2,7 +2,8 @@
 
 The committed tail is scored once. Each non-final ``update`` then runs N
 tokens at one shared position under ``ancestor_mask``. Speculative KV is
-appended past the committed prefix and dropped by the caller.
+appended past the committed prefix. On CUDA page size 1 a successful expand
+keeps those slots in ``req.opt_tree_lease``. Every other path drops them.
 
 Several requests that are still growing share one forward at the same depth.
 A single request, and any batch that fails for a reason other than a device
@@ -126,13 +127,15 @@ def opt_extend_chunk_limit(chunked_prefill_size) -> Optional[int]:
     return limit
 
 
-def plan_opt_tail(req, chunked_prefill_size) -> str:
+def plan_opt_tail(req, chunked_prefill_size, page_size: int = 1) -> str:
     """How OPT writes the committed tail.
 
     ``reprefill`` when the KV prefix is missing or does not cover the prompt.
     ``noop`` when that prefix already covers every committed token.
-    ``extend`` when the missing output fits in one chunk. ``extend_chunked``
-    when it does not. This does not use the per-token decode threshold.
+    ``decode`` when page size is 1 and one or two tokens are missing, so the
+    step can replay the captured ntpb=1 DECODE graph. ``extend`` when the
+    missing output fits in one chunk. ``extend_chunked`` when it does not.
+    Page size other than 1 keeps the extend path for a short tail.
     """
     origin = getattr(req, "origin_input_ids", None) or []
     output = getattr(req, "output_ids", None) or []
@@ -142,6 +145,8 @@ def plan_opt_tail(req, chunked_prefill_size) -> str:
     missing = len(origin) + len(output) - kv_len
     if missing <= 0:
         return "noop"
+    if int(page_size) == 1 and missing <= 2:
+        return "decode"
     limit = opt_extend_chunk_limit(chunked_prefill_size)
     if limit is None or missing <= limit:
         return "extend"
@@ -524,6 +529,7 @@ class OptLayerForward:
         self.req = req
         self.prefix_len = int(prefix_len)
         self.cached_len = int(prefix_len)
+        self.layer_slots: List[torch.Tensor] = []
 
     def logits_at_tail(self) -> torch.Tensor:
         """Recompute the committed tail in its existing KV slot."""
@@ -681,6 +687,11 @@ class OptLayerForward:
             out_cache_loc,
             1,
         )
+        if start is None:
+            # Ingest passes start= and must not become part of the tree lease.
+            self.layer_slots.append(
+                out_cache_loc.detach().to(device="cpu").reshape(-1).clone()
+            )
         return out_cache_loc
 
     def _verify_batch(self, tokens, positions, mask, out_cache_loc):
@@ -1161,20 +1172,136 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
     return logits
 
 
+def _opt_page_size(scheduler) -> int:
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return 1
+    return int(getattr(tree, "page_size", 1) or 1)
+
+
+def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
+    """Write one missing token per request with a DECODE batch.
+
+    ``spec_info`` stays unset so ntpb=1 can replay the captured DECODE graph.
+    ``seq_lens`` counts the token being written. ``sr_decode_seq_len`` does
+    not: that length is the already committed tail.
+    """
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.standalone_remote.drafter.sr_tree_kv_lease import (
+        read_token_span,
+    )
+
+    if not runners:
+        return []
+    prepared = []
+    try:
+        tokens = []
+        starts = []
+        locs = []
+        for runner in runners:
+            start = int(getattr(runner.req, "kv_committed_len", 0) or 0)
+            end = start + 1
+            if runner.req.req_pool_idx is None:
+                raise RuntimeError(f"OPT draft {runner.req.rid} has no KV pool slot")
+            if start < 0 or end > int(runner.prefix_len):
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} decode append [{start}, {end}) "
+                    f"is outside prefix {runner.prefix_len}"
+                )
+            span = read_token_span(
+                runner.req.origin_input_ids, runner.req.output_ids, start, 1
+            )
+            if len(span) != 1:
+                raise RuntimeError(
+                    f"OPT draft {runner.req.rid} is missing a token at {start}"
+                )
+            loc = runner._alloc_layer_slots(1, start=start)
+            runner.req.kv_allocated_len = end
+            prepared.append((runner, start, end))
+            tokens.append(int(span[0]))
+            starts.append(start)
+            locs.append(loc.reshape(-1))
+        batch = scheduler._sr_make_decode_batch([runner.req for runner in runners])
+        device = batch.seq_lens.device
+        seq = [start + 1 for start in starts]
+        token_ids = torch.tensor(tokens, dtype=torch.int64, device=device)
+        batch.forward_mode = ForwardMode.DECODE
+        batch.global_forward_mode = ForwardMode.DECODE
+        batch.spec_info = None
+        batch.input_ids = token_ids
+        batch.output_ids = token_ids
+        batch.seq_lens = torch.tensor(seq, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq)
+        batch.out_cache_loc = torch.cat(locs)
+        _keep_raw_logits(batch)
+        logits = _flatten_logits(_run_batch(scheduler, batch))
+        if int(logits.shape[0]) != len(runners):
+            raise RuntimeError(
+                f"OPT decode append rows {int(logits.shape[0])} != {len(runners)}"
+            )
+        rows = [logits[i].clone() for i in range(len(runners))]
+    except Exception:
+        for runner, start, _end in prepared:
+            scheduler._opt_rollback(runner.req, start)
+        raise
+    for runner, _start, end in prepared:
+        runner.req.kv_committed_len = end
+        runner.req.kv_allocated_len = end
+        runner.cached_len = end
+    return rows
+
+
+def _decode_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
+    """Append a gap of one or two tokens, one DECODE step at a time."""
+    pending = list(runners)
+    saved = {}
+    for _step in range(2):
+        if not pending:
+            break
+        before = [
+            int(getattr(runner.req, "kv_committed_len", 0) or 0) for runner in pending
+        ]
+        rows = _decode_append_batch(scheduler, pending)
+        nxt = []
+        for runner, row in zip(pending, rows):
+            if int(getattr(runner.req, "kv_committed_len", 0) or 0) >= int(
+                runner.prefix_len
+            ):
+                saved[id(runner)] = row
+            else:
+                nxt.append(runner)
+        after = [
+            int(getattr(runner.req, "kv_committed_len", 0) or 0) for runner in pending
+        ]
+        if after == before:
+            raise RuntimeError("OPT decode append made no progress")
+        pending = nxt
+    if pending:
+        raise RuntimeError(
+            "OPT decode append left "
+            + ", ".join(runner.req.rid for runner in pending)
+        )
+    return [saved[id(runner)] for runner in runners]
+
+
 def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
     """Logits after each committed tail, without SR's per-token decode threshold."""
     limit = getattr(scheduler, "chunked_prefill_size", None)
+    page = _opt_page_size(scheduler)
     logits = {}
     extend = []
     chunked = []
     noop = []
+    decode = []
     reprefill = []
     for runner in runners:
         cached_row = take_cached_tail_logits(runner.req, runner.prefix_len)
         if cached_row is not None:
             logits[id(runner)] = cached_row
             continue
-        mode = plan_opt_tail(runner.req, limit)
+        mode = plan_opt_tail(runner.req, limit, page)
         if mode == "reprefill":
             reprefill.append(runner)
         elif mode == "extend":
@@ -1183,6 +1310,8 @@ def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
             chunked.append(runner)
         elif mode == "noop":
             noop.append(runner)
+        elif mode == "decode":
+            decode.append(runner)
         else:
             raise RuntimeError(
                 f"OPT draft {runner.req.rid} ingest mode {mode} is unknown"
@@ -1201,6 +1330,9 @@ def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
     if noop:
         for runner, row in zip(noop, _logits_at_tail_batch(scheduler, noop)):
             logits[id(runner)] = row
+    if decode:
+        for runner, row in zip(decode, _decode_uncommitted_batch(scheduler, decode)):
+            logits[id(runner)] = row
     return [logits[id(runner)] for runner in runners]
 
 
@@ -1208,22 +1340,68 @@ def _committed_len(req) -> int:
     return len(req.origin_input_ids or []) + len(req.output_ids or [])
 
 
+def _publish_or_rollback(scheduler, req, runner, keep, window, expanded: bool) -> None:
+    """Keep a page-1 tree lease, or roll slots back to ``keep``.
+
+    The caller turns a rollback error into the expand failure when no earlier
+    exception is already propagating.
+    """
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+        publish_opt_tree_lease,
+    )
+
+    published = False
+    finished = False
+    checker = getattr(scheduler, "_sr_is_finished", None)
+    if callable(checker):
+        try:
+            finished = bool(checker(req))
+        except Exception:
+            finished = True
+    if (
+        expanded
+        and not finished
+        and not getattr(scheduler, "_sr_device_poisoned", False)
+    ):
+        try:
+            published = publish_opt_tree_lease(scheduler, req, runner, keep, window)
+        except Exception as exc:
+            logger.warning(
+                "[OPT] lease publish failed for %s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+    if published:
+        return
+    scheduler._opt_rollback(req, keep)
+
+
 def grow_batch(scheduler, reqs):
-    """Grow every request together. Tree KV is dropped before returning.
+    """Grow every request together.
 
     A missing output that fits in one chunk shares one EXTEND. A longer output
     is extended in ``chunked_prefill_size`` pieces, and only the last piece's
-    row is kept. Requests that still have the same depth share one
-    TARGET_VERIFY. ``finally`` rolls each request back to the committed
-    length, matching ``_opt_expand_one``.
+    row is kept. One or two missing tokens on page size 1 are DECODE steps.
+    Requests that still have the same depth share one TARGET_VERIFY. On page
+    size 1, ``finally`` keeps forwarded slots in ``req.opt_tree_lease``.
+    Every other finish rolls those slots back to the committed length.
     """
     if not reqs:
         return []
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+        consume_opt_tree_lease,
+    )
+
     committed = [_committed_len(req) for req in reqs]
+    runners: List[OptLayerForward] = []
+    windows = None
+    expanded = False
     try:
         for req in reqs:
             scheduler._sr_resume_req(req)
         scheduler._sr_isolate_need({req.rid for req in reqs})
+        for req in reqs:
+            consume_opt_tree_lease(scheduler, req)
         for req in reqs:
             scheduler._opt_release_uncommitted(req)
         config = OptTreeConfig(
@@ -1270,14 +1448,19 @@ def grow_batch(scheduler, reqs):
         metrics.add_host("opt_grow", time.perf_counter() - t1)
         metrics.counts["opt_layer_forwards"] += layers
         metrics.counts["opt_rounds"] += 1
+        expanded = True
         return windows
     finally:
         pending = sys.exc_info()[1]
         rollback_error = None
-        for req, keep in zip(reqs, committed):
+        for index, (req, keep) in enumerate(zip(reqs, committed)):
             clear_prefill_tail_logits(req)
+            runner = runners[index] if index < len(runners) else None
+            window = None
+            if expanded and windows is not None and index < len(windows):
+                window = windows[index]
             try:
-                scheduler._opt_rollback(req, keep)
+                _publish_or_rollback(scheduler, req, runner, keep, window, expanded)
             except Exception as rollback_exc:
                 logger.warning(
                     "[OPT] rollback after batch expand failed for %s: %s",

@@ -5,6 +5,7 @@ here so the test does not import that repository.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -1305,6 +1306,10 @@ class OptTreeRemoteTest(CustomTestCase):
         # 20 missing outputs used to exceed the per-token decode threshold.
         self.assertEqual(plan_opt_tail(req(10, 20, 10), 2048), "extend")
         self.assertEqual(plan_opt_tail(req(10, 0, 10), 2048), "noop")
+        self.assertEqual(plan_opt_tail(req(10, 1, 10), 2048), "decode")
+        self.assertEqual(plan_opt_tail(req(10, 2, 10), 2048), "decode")
+        self.assertEqual(plan_opt_tail(req(10, 1, 10), 2048, page_size=128), "extend")
+        self.assertEqual(plan_opt_tail(req(10, 2, 10), 2048, page_size=128), "extend")
         self.assertEqual(plan_opt_tail(req(0, 3000, 0), 2048), "extend_chunked")
         self.assertEqual(
             extend_chunk_bounds(0, 3000, 2048),
@@ -1653,6 +1658,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(
             get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 1
         )
+        self.assertIsNone(getattr(req, "opt_tree_lease", None))
 
     def test_expand_device_error_reraises_through_rollback(self):
         from types import SimpleNamespace
@@ -1696,6 +1702,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(
             get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 0
         )
+        self.assertIsNone(getattr(req, "opt_tree_lease", None))
 
     def test_grow_batch_records_draft_stage_times(self):
         from unittest.mock import patch
@@ -1851,6 +1858,470 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertTrue(captured(False, True))
         self.assertFalse(captured(False, False))
 
+    def test_layer_alloc_records_slots_and_extend_does_not(self):
+        import sys
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+        )
+
+        runner = OptLayerForward.__new__(OptLayerForward)
+        runner.layer_slots = []
+        runner.cached_len = 4
+        runner.req = SimpleNamespace(req_pool_idx=0)
+        runner.scheduler = SimpleNamespace(
+            tree_cache=SimpleNamespace(page_size=1),
+            req_to_token_pool=SimpleNamespace(
+                device="cpu",
+                req_to_token=torch.full((1, 8), -1, dtype=torch.int32),
+            ),
+        )
+        loc = torch.tensor([5, 6, 7])
+        common = SimpleNamespace(
+            alloc_token_slots=lambda _tree, n: loc[: int(n)].clone(),
+            alloc_paged_token_slots_extend=lambda *_args, **_kwargs: loc,
+            get_last_loc=lambda *_args, **_kwargs: None,
+        )
+        spec_utils = SimpleNamespace(
+            assign_req_to_token_pool_func=lambda *_args, **_kwargs: None
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.mem_cache.common": common,
+                "sglang.srt.speculative.spec_utils": spec_utils,
+            },
+        ):
+            recorded = runner._alloc_layer_slots(3)
+            skipped = runner._alloc_layer_slots(1, start=4)
+        self.assertEqual(recorded.tolist(), [5, 6, 7])
+        self.assertEqual(len(runner.layer_slots), 1)
+        self.assertEqual(runner.layer_slots[0].tolist(), [5, 6, 7])
+        self.assertEqual(skipped.tolist(), [5])
+
+    def test_decode_append_replays_one_token_without_spec_info(self):
+        import sys
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _decode_append_batch,
+            _decode_uncommitted_batch,
+        )
+
+        class _DecodeMode:
+            name = "DECODE"
+
+        forward_info = SimpleNamespace(ForwardMode=SimpleNamespace(DECODE=_DecodeMode()))
+
+        class _Info:
+            is_all_greedy = False
+            temperatures = torch.ones(1, 1)
+            logit_bias = None
+            has_custom_logit_processor = False
+            penalizer_orchestrator = None
+            need_top_p_sampling = True
+            need_top_k_sampling = True
+            need_min_p_sampling = True
+            acc_additive_penalties = None
+            acc_scaling_penalties = None
+            vocab_mask = None
+
+        class _Runner:
+            def __init__(self, prefix, origin, output, kv):
+                self.prefix_len = prefix
+                self.cached_len = kv
+                self.layer_slots = []
+                self.alloc_starts = []
+                self.req = SimpleNamespace(
+                    rid="decode",
+                    req_pool_idx=0,
+                    kv_committed_len=kv,
+                    kv_allocated_len=kv,
+                    origin_input_ids=list(origin),
+                    output_ids=list(output),
+                )
+
+            def _alloc_layer_slots(self, n, start=None):
+                self.alloc_starts.append(start)
+                return torch.tensor([40 + int(start)])
+
+        def run(runners):
+            batch = SimpleNamespace(
+                seq_lens=torch.tensor([runners[0].req.kv_committed_len]),
+                sampling_info=_Info(),
+                has_grammar=False,
+                return_logprob=True,
+                return_hidden_states=True,
+                spec_info="verify",
+                forward_mode=None,
+                global_forward_mode=None,
+            )
+            seen = []
+
+            def make_batch(_reqs):
+                return batch
+
+            def run_batch(built):
+                seen.append(
+                    {
+                        "input_ids": [int(item) for item in built.input_ids],
+                        "seq_lens": [int(item) for item in built.seq_lens],
+                        "spec_info": built.spec_info,
+                        "forward_mode": built.forward_mode,
+                    }
+                )
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros(len(runners), 4)
+                    )
+                )
+
+            host = SimpleNamespace(
+                _sr_make_decode_batch=make_batch,
+                run_batch=run_batch,
+                cur_batch=None,
+                _opt_rollback=lambda *_args, **_kwargs: None,
+            )
+            return host, batch, seen
+
+        one = _Runner(4, [1, 2, 3], [9], 3)
+        host, batch, seen = run([one])
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.model_executor.forward_batch_info": forward_info},
+        ):
+            rows = _decode_append_batch(host, [one])
+        self.assertEqual(tuple(rows[0].shape), (4,))
+        self.assertIsNone(batch.spec_info)
+        self.assertEqual(batch.forward_mode.name, "DECODE")
+        self.assertEqual(batch.global_forward_mode.name, "DECODE")
+        self.assertEqual(int(batch.seq_lens[0]), 4)
+        self.assertEqual(int(batch.input_ids[0]), 9)
+        self.assertEqual(int(batch.out_cache_loc[0]), 43)
+        self.assertEqual(one.req.kv_committed_len, 4)
+        self.assertEqual(one.req.kv_allocated_len, 4)
+        self.assertEqual(one.cached_len, 4)
+        self.assertEqual(one.layer_slots, [])
+        self.assertEqual(one.alloc_starts, [3])
+        self.assertEqual(len(seen), 1)
+
+        two = _Runner(5, [1, 2, 3], [8, 9], 3)
+        host, batch, seen = run([two])
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.model_executor.forward_batch_info": forward_info},
+        ):
+            rows = _decode_uncommitted_batch(host, [two])
+        self.assertEqual(tuple(rows[0].shape), (4,))
+        self.assertEqual(two.alloc_starts, [3, 4])
+        self.assertEqual(seen[0]["input_ids"], [8])
+        self.assertEqual(seen[1]["input_ids"], [9])
+        self.assertEqual(seen[0]["seq_lens"], [4])
+        self.assertEqual(seen[1]["seq_lens"], [5])
+        self.assertIsNone(seen[0]["spec_info"])
+        self.assertIsNone(seen[1]["spec_info"])
+        self.assertEqual(seen[0]["forward_mode"].name, "DECODE")
+        self.assertEqual(seen[1]["forward_mode"].name, "DECODE")
+        self.assertEqual(two.req.kv_committed_len, 5)
+        self.assertEqual(two.layer_slots, [])
+
+    def test_publish_keeps_page1_slots_and_skips_other_pages(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            publish_opt_tree_lease,
+        )
+
+        host, pool, _freed = _lease_host()
+        req = _lease_req(keep=3, allocated=5)
+        runner = SimpleNamespace(layer_slots=[torch.tensor([10, 11])])
+        published = publish_opt_tree_lease(
+            host, req, runner, 3, ([8, 9], [-1, 0], [1, 0])
+        )
+        self.assertTrue(published)
+        self.assertEqual(req.kv_allocated_len, 3)
+        self.assertEqual(req.kv_committed_len, 3)
+        self.assertEqual(pool[0, 3:5].tolist(), [-1, -1])
+        self.assertEqual(req.opt_tree_lease.layer_slots, ((10, 11),))
+        self.assertEqual(req.opt_tree_lease.depths, (0, 1))
+
+        npu, npu_pool, npu_freed = _lease_host(page=128)
+        npu_req = _lease_req(keep=3, allocated=5)
+        self.assertFalse(
+            publish_opt_tree_lease(
+                npu, npu_req, runner, 3, ([8], [-1], [0])
+            )
+        )
+        self.assertIsNone(getattr(npu_req, "opt_tree_lease", None))
+        self.assertEqual(npu_req.kv_allocated_len, 5)
+        self.assertEqual(npu_pool[0, 3:5].tolist(), [7, 7])
+        self.assertEqual(npu_freed, [])
+
+        poisoned, _poison_pool, _poison_freed = _lease_host()
+        poisoned._sr_device_poisoned = True
+        poison_req = _lease_req(keep=3, allocated=5)
+        self.assertFalse(
+            publish_opt_tree_lease(
+                poisoned, poison_req, runner, 3, ([8], [-1], [0])
+            )
+        )
+        self.assertIsNone(getattr(poison_req, "opt_tree_lease", None))
+
+    def test_apply_rewrites_accepted_slots_and_frees_the_rest(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+            release_opt_tree_lease,
+        )
+
+        host, pool, freed = _lease_host(width=8)
+        req = _lease_req(keep=3, allocated=3)
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [20, 21, 99]
+        req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        req.opt_tree_lease = OptTreeKVLease(
+            keep=3,
+            layer_slots=((100, 101, 102), (200, 201, 202)),
+            tokens=(20, 21, 30),
+            parents=(-1, 0, -1),
+            cols=(1, 0, 2),
+            depths=(0, 1, 0),
+        )
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(pool[0, 3].item(), 101)
+        self.assertEqual(pool[0, 4].item(), 200)
+        self.assertEqual(req.kv_committed_len, 5)
+        self.assertEqual(req.kv_allocated_len, 5)
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(freed, [100, 102, 201, 202])
+
+        host, pool, freed = _lease_host()
+        req = _lease_req(keep=3, allocated=3)
+        req.output_ids = [7]
+        req.sr_align_result = SimpleNamespace(kind="append_one", old_local_len=3)
+        req.opt_tree_lease = _sample_lease(3)
+        pool[0, 3] = 4
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(pool[0, 3].item(), 4)
+        self.assertEqual(req.kv_committed_len, 3)
+        self.assertEqual(req.kv_allocated_len, 3)
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(freed, [100, 101])
+        release_opt_tree_lease(host, req)
+        self.assertEqual(freed, [100, 101])
+
+    def test_apply_stops_before_unforwarded_node(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+        )
+
+        host, pool, freed = _lease_host()
+        req = _lease_req(keep=2, allocated=2)
+        req.origin_input_ids = [1, 2]
+        req.output_ids = [20, 21]
+        req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=2)
+        req.opt_tree_lease = OptTreeKVLease(
+            keep=2,
+            layer_slots=((100, 101),),
+            tokens=(20, 21),
+            parents=(-1, 0),
+            cols=(0, 1),
+            depths=(0, 1),
+        )
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(pool[0, 2].item(), 100)
+        self.assertEqual(req.kv_committed_len, 3)
+        self.assertEqual(req.kv_allocated_len, 3)
+        self.assertCountEqual(freed, [101])
+
+    def test_apply_drops_lease_when_depth_does_not_match_step(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+        )
+
+        host, pool, freed = _lease_host()
+        req = _lease_req(keep=3, allocated=3)
+        req.output_ids = [20]
+        req.sr_align_result = SimpleNamespace(kind="append_one", old_local_len=3)
+        req.opt_tree_lease = OptTreeKVLease(
+            keep=3,
+            layer_slots=((100, 101),),
+            tokens=(20,),
+            parents=(-1,),
+            cols=(0,),
+            depths=(1,),
+        )
+        pool[0, 3] = 4
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(pool[0, 3].item(), 4)
+        self.assertEqual(req.kv_committed_len, 3)
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(freed, [100, 101])
+
+        host, _pool, freed = _lease_host()
+        req = _lease_req(keep=3, allocated=3)
+        req.output_ids = [20]
+        req.sr_align_result = SimpleNamespace(kind="equal", old_local_len=3)
+        req.opt_tree_lease = _sample_lease(3)
+        consume_opt_tree_lease(host, req)
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(freed, [100, 101])
+
+    def test_grow_batch_publishes_on_success_and_rolls_back_on_failure(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            grow_batch,
+        )
+
+        host, pool, _freed = _lease_host()
+        rolls = []
+        host.device = "cpu"
+        host.chunked_prefill_size = None
+        host.server_args = SimpleNamespace(
+            opt_tree_width=2, opt_tree_tau=0.1, opt_tree_max_depth=4
+        )
+        host._sr_resume_req = lambda _req: None
+        host._sr_isolate_need = lambda _rids: None
+        host._opt_release_uncommitted = lambda _req: None
+        host._opt_rollback = lambda _req, keep: rolls.append(int(keep))
+        host._sr_is_finished = lambda _req: False
+        host._sr_pause_req = lambda _req: None
+        host.last_batch = "stale"
+        host.cur_batch = "stale"
+        req = _lease_req(keep=3, allocated=5)
+
+        def ingest(_scheduler, runners):
+            runners[0].layer_slots.append(torch.tensor([10, 11]))
+            return [torch.zeros(4)]
+
+        def grow(_config, _tails, _forward_active, _scheduler):
+            return [([8], [-1], [1])]
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.ingest_tail_logits",
+            ingest,
+        ), patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.grow_active_layers",
+            grow,
+        ):
+            windows = grow_batch(host, [req])
+        self.assertEqual(windows, [([8], [-1], [1])])
+        self.assertEqual(rolls, [])
+        self.assertEqual(req.kv_allocated_len, 3)
+        self.assertEqual(pool[0, 3:5].tolist(), [-1, -1])
+        self.assertEqual(req.opt_tree_lease.layer_slots, ((10, 11),))
+
+        rolls.clear()
+        failed = _lease_req(keep=3, allocated=5)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("layer failed")
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.ingest_tail_logits",
+            ingest,
+        ), patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.grow_active_layers",
+            boom,
+        ):
+            with self.assertRaises(RuntimeError):
+                grow_batch(host, [failed])
+        self.assertEqual(rolls, [3])
+        self.assertIsNone(getattr(failed, "opt_tree_lease", None))
+        self.assertEqual(failed.kv_allocated_len, 5)
+
+    def test_cleanup_paths_release_or_retain_the_lease(self):
+        opt_cls = _load_opt_lease_overrides()
+        host = opt_cls()
+        host.events = []
+        host._sr_device_poisoned = False
+        host.spec_algorithm = SimpleNamespace(is_opt_tree_remote=lambda: True)
+        host.server_args = SimpleNamespace(opt_tree_role="draft")
+        _freed = []
+        host.token_to_kv_pool_allocator = _RecordingAllocator(_freed)
+        host.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.full((1, 4), -1, dtype=torch.int32)
+        )
+        host.tree_cache = SimpleNamespace(page_size=1)
+        req = _lease_req(keep=2, allocated=2)
+        req.opt_tree_lease = _sample_lease(2)
+        state = SimpleNamespace(req_object=req)
+
+        host._sr_finish_rid("rid", state=state)
+        self.assertEqual(host.events, ["finish"])
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(_freed, [100, 101])
+
+        _freed.clear()
+        host.events.clear()
+        req.opt_tree_lease = _sample_lease(2)
+        host._sr_rollback_else_reprefill(req, 1, 2, lambda: None)
+        self.assertEqual(host.events, ["rollback"])
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(_freed, [100, 101])
+
+        _freed.clear()
+        host.events.clear()
+        req.opt_tree_lease = _sample_lease(2)
+        host._sr_reset_linear_kv_state(req, [1, 2])
+        self.assertEqual(host.events, ["reset"])
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(_freed, [100, 101])
+
+        host._sr_device_poisoned = True
+        req.opt_tree_lease = _sample_lease(2)
+        before = list(_freed)
+        host._sr_finish_rid("rid", state=state)
+        self.assertIsNotNone(req.opt_tree_lease)
+        self.assertEqual(_freed, before)
+
+        host._sr_abandon_poisoned_kv(req)
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertEqual(_freed, before)
+        owners = [record.owner for record in host._sr_kv_quarantine.records]
+        self.assertTrue(any(isinstance(owner, tuple) and owner[0] is req for owner in owners))
+
+    def test_lease_cleanup_stays_off_other_algorithms(self):
+        opt_cls = _load_opt_lease_overrides()
+
+        def assert_untouched(host):
+            freed = []
+            host.events = []
+            host._sr_device_poisoned = False
+            host.token_to_kv_pool_allocator = _RecordingAllocator(freed)
+            host.req_to_token_pool = SimpleNamespace(
+                req_to_token=torch.full((1, 4), -1, dtype=torch.int32)
+            )
+            host.tree_cache = SimpleNamespace(page_size=1)
+            req = _lease_req(keep=2, allocated=2)
+            lease = _sample_lease(2)
+            req.opt_tree_lease = lease
+            state = SimpleNamespace(req_object=req)
+            host._sr_finish_rid("rid", state=state)
+            host._sr_rollback_else_reprefill(req, 1, 2, lambda: None)
+            host._sr_reset_linear_kv_state(req, [1, 2])
+            host._sr_abandon_poisoned_kv(req)
+            self.assertIs(req.opt_tree_lease, lease)
+            self.assertFalse(lease.released)
+            self.assertEqual(freed, [])
+            self.assertIsNone(getattr(host, "_sr_kv_quarantine", None))
+            self.assertEqual(host.events, ["finish", "rollback", "reset", "abandon"])
+
+        other = opt_cls()
+        other.spec_algorithm = SimpleNamespace(is_opt_tree_remote=lambda: False)
+        other.server_args = SimpleNamespace(opt_tree_role="draft")
+        assert_untouched(other)
+
+        target = opt_cls()
+        target.spec_algorithm = SimpleNamespace(is_opt_tree_remote=lambda: True)
+        target.server_args = SimpleNamespace(opt_tree_role="target")
+        assert_untouched(target)
+
+        missing = opt_cls()
+        assert_untouched(missing)
+
 
 def _load_opt_materialize_override():
     """Load OPT's materialize override with a recording ``super()``."""
@@ -1915,6 +2386,84 @@ def _opt_stage_req(rid):
         output_ids=[3],
         kv_committed_len=3,
     )
+
+
+def _lease_host(page=1, width=8):
+    pool = torch.full((1, width), 7, dtype=torch.int32)
+    freed = []
+    return (
+        SimpleNamespace(
+            tree_cache=SimpleNamespace(page_size=page),
+            req_to_token_pool=SimpleNamespace(req_to_token=pool, device=pool.device),
+            token_to_kv_pool_allocator=_RecordingAllocator(freed),
+            _sr_device_poisoned=False,
+        ),
+        pool,
+        freed,
+    )
+
+
+def _lease_req(keep, allocated):
+    return SimpleNamespace(
+        rid="lease",
+        req_pool_idx=0,
+        origin_input_ids=[1, 2, 3][:keep],
+        output_ids=[],
+        kv_committed_len=keep,
+        kv_allocated_len=allocated,
+        opt_tree_lease=None,
+    )
+
+
+def _sample_lease(keep):
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import OptTreeKVLease
+
+    return OptTreeKVLease(
+        keep=keep,
+        layer_slots=((100, 101),),
+        tokens=(20,),
+        parents=(-1,),
+        cols=(0,),
+        depths=(0,),
+    )
+
+
+class _RecordingAllocator:
+    def __init__(self, freed):
+        self.freed = freed
+
+    def free(self, index):
+        self.freed.extend(int(slot) for slot in index.detach().cpu().tolist())
+
+
+def _load_opt_lease_overrides():
+    """Load the lease cleanup overrides with a recording ``super()``."""
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("    def _opt_draft_lease_active(")
+    end = src.index("    def _opt_expand_one(")
+    code = (
+        "class _Super:\n"
+        "    def _sr_finish_rid(self, *args, **kwargs):\n"
+        "        self.events.append('finish')\n"
+        "    def _sr_rollback_else_reprefill(self, *args, **kwargs):\n"
+        "        self.events.append('rollback')\n"
+        "        return True\n"
+        "    def _sr_reset_linear_kv_state(self, *args, **kwargs):\n"
+        "        self.events.append('reset')\n"
+        "    def _sr_abandon_poisoned_kv(self, *args, **kwargs):\n"
+        "        self.events.append('abandon')\n"
+        "class _Opt(_Super):\n"
+        + src[start:end]
+    )
+    ns = {}
+    exec(compile(code, str(path), "exec"), ns)
+    return ns["_Opt"]
 
 
 def _load_opt_expand_one():

@@ -236,11 +236,105 @@ class OptTreeSchedulerMixin:
         """Free slots past ``kv_committed_len`` before extend reuses that span."""
         return release_uncommitted(req, self._opt_rollback)
 
+    def _opt_draft_lease_active(self) -> bool:
+        """True only on an OPT Draft. Missing fields stay inactive."""
+        try:
+            algo = getattr(self, "spec_algorithm", None)
+            is_opt = getattr(algo, "is_opt_tree_remote", None)
+            if not callable(is_opt) or not is_opt():
+                return False
+            args = getattr(self, "server_args", None)
+            return getattr(args, "opt_tree_role", None) == "draft"
+        except Exception:
+            return False
+
+    def _sr_finish_rid(self, rid, release_mm: bool = True, state=None, entry=None):
+        """FINISH and ABORT free a page-1 tree lease before the prefix KV.
+
+        TTL cleanup and ``_sr_wipe_all`` both enter here. A poisoned device
+        leaves the lease for ``_sr_abandon_poisoned_kv``. Other algorithms
+        keep the standalone-remote path unchanged.
+        """
+        if not self._opt_draft_lease_active():
+            return super()._sr_finish_rid(
+                rid, release_mm=release_mm, state=state, entry=entry
+            )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            opt_finish_req,
+            opt_kv_release_allowed,
+            release_opt_tree_lease,
+        )
+
+        if opt_kv_release_allowed(self):
+            req = opt_finish_req(self, rid, state)
+            if req is not None:
+                release_opt_tree_lease(self, req)
+        return super()._sr_finish_rid(
+            rid, release_mm=release_mm, state=state, entry=entry
+        )
+
+    def _sr_rollback_else_reprefill(self, req, fork, allocated, on_refused) -> bool:
+        """A prefix rollback makes the previous OPT tree stale."""
+        if not self._opt_draft_lease_active():
+            return super()._sr_rollback_else_reprefill(
+                req, fork, allocated, on_refused
+            )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            opt_kv_release_allowed,
+            release_opt_tree_lease,
+        )
+
+        if opt_kv_release_allowed(self):
+            release_opt_tree_lease(self, req)
+        return super()._sr_rollback_else_reprefill(req, fork, allocated, on_refused)
+
+    def _sr_reset_linear_kv_state(self, req, fill_ids) -> None:
+        """Reprefill and retract drop OPT tree slots the length no longer covers."""
+        if not self._opt_draft_lease_active():
+            return super()._sr_reset_linear_kv_state(req, fill_ids)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            opt_kv_release_allowed,
+            release_opt_tree_lease,
+        )
+
+        if opt_kv_release_allowed(self):
+            release_opt_tree_lease(self, req)
+        return super()._sr_reset_linear_kv_state(req, fill_ids)
+
+    def _sr_abandon_poisoned_kv(self, req) -> None:
+        """Keep an OPT Draft lease. Do not return its slots to the allocator."""
+        if not self._opt_draft_lease_active():
+            return super()._sr_abandon_poisoned_kv(req)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            detach_opt_tree_lease,
+        )
+        from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+            quarantine,
+        )
+
+        lease = detach_opt_tree_lease(req)
+        try:
+            return super()._sr_abandon_poisoned_kv(req)
+        finally:
+            if lease is not None:
+                quarantine(self).retain((req, lease))
+
     def _opt_expand_one(self, req) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _publish_or_rollback,
+        )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            consume_opt_tree_lease,
+        )
+
         self._sr_resume_req(req)
         self._sr_isolate_need({req.rid})
         committed = len(req.origin_input_ids or []) + len(req.output_ids or [])
+        runner = None
+        expanded = False
+        window = None
         try:
+            consume_opt_tree_lease(self, req)
             self._opt_release_uncommitted(req)
             config = OptTreeConfig(
                 width=int(self.server_args.opt_tree_width),
@@ -279,6 +373,8 @@ class OptTreeSchedulerMixin:
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             metrics.counts["opt_layer_forwards"] += layers
             metrics.counts["opt_rounds"] += 1
+            window = (tokens, parents, cols)
+            expanded = True
             return tokens, parents, cols
         except Exception as exc:
             _reraise_device_context(self, exc)
@@ -292,7 +388,7 @@ class OptTreeSchedulerMixin:
             clear_prefill_tail_logits(req)
             rollback_error = None
             try:
-                self._opt_rollback(req, committed)
+                _publish_or_rollback(self, req, runner, committed, window, expanded)
             except Exception as rollback_exc:
                 logger.warning(
                     "[OPT] rollback after expand failed for %s: %s",
