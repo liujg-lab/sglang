@@ -450,17 +450,132 @@ def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
     return [t[i * width : (i + 1) * width] for i in range(bs)]
 
 
-def _commit_prob_rows(states, indices, logits_rows, *, seed: bool, topk_out=None):
+class _LayerTiming:
+    """One metered verify forward. Absent when round metrics are off."""
+
+    __slots__ = ("metrics", "t0", "ev0", "ev1", "opened")
+
+    def __init__(self, metrics, t0, ev0, ev1):
+        self.metrics = metrics
+        self.t0 = t0
+        self.ev0 = ev0
+        self.ev1 = ev1
+        self.opened = False
+
+
+def _draft_metrics(scheduler):
+    """Active Draft round metrics, or None on the unmetered path."""
+    if scheduler is None:
+        return None
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    metrics = get_sr_round_metrics(scheduler, "Draft")
+    if not getattr(metrics, "active", False):
+        return None
+    return metrics
+
+
+def _begin_layer_timing(scheduler):
+    """Start the host clock. Event creation failure drops this sample only."""
+    metrics = _draft_metrics(scheduler)
+    if metrics is None:
+        return None
+    try:
+        factory = torch.get_device_module(scheduler.device).Event
+        ev0 = factory(enable_timing=True)
+        ev1 = factory(enable_timing=True)
+    except Exception:
+        return None
+    return _LayerTiming(metrics, time.perf_counter(), ev0, ev1)
+
+
+def _mark_layer_launch(timing) -> None:
+    """Host time stops before the verify replay is queued."""
+    if timing is None:
+        return
+    timing.metrics.counts["opt_layer_host_us"] += int(
+        (time.perf_counter() - timing.t0) * 1e6
+    )
+    try:
+        timing.ev0.record()
+    except Exception:
+        return
+    timing.opened = True
+
+
+def _finish_layer_timing(scheduler, timing) -> None:
+    """Queue the GPU interval. A failed replay never reaches this."""
+    if timing is None or not timing.opened:
+        return
+    try:
+        timing.ev1.record()
+    except Exception:
+        return
+    events = getattr(scheduler, "_opt_layer_events", None)
+    if events is None:
+        events = []
+        scheduler._opt_layer_events = events
+    events.append((timing.ev0, timing.ev1))
+
+
+def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
+    """Read queued verify events once, after the grow clock has stopped.
+
+    An empty queue does not synchronize. A poisoned device drops the events.
+    ``elapsed_time`` is milliseconds. Other timing errors increment
+    ``device_timing_dropped_opt_layer`` and do not replace a business result
+    unless the accelerator context is already dead.
+    """
+    events = getattr(scheduler, "_opt_layer_events", None)
+    if not events:
+        return
+    scheduler._opt_layer_events = []
+    if metrics is None or getattr(scheduler, "_sr_device_poisoned", False):
+        return
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    try:
+        torch.get_device_module(scheduler.device).synchronize()
+    except Exception as exc:
+        if is_device_context_error(exc):
+            raise
+        metrics.counts["device_timing_dropped_opt_layer"] += 1
+        return
+    for ev0, ev1 in events:
+        try:
+            metrics.counts["opt_layer_gpu_us"] += int(ev0.elapsed_time(ev1) * 1000)
+        except Exception as exc:
+            if is_device_context_error(exc):
+                raise
+            metrics.counts["device_timing_dropped_opt_layer"] += 1
+
+
+def _commit_prob_rows(
+    states, indices, logits_rows, *, seed: bool, topk_out=None, metrics=None
+):
     """Softmax each row, copy one stacked top-k, then update those trees.
 
     The copy keeps ``N + 1`` ids. The tree still uses the first ``N``. The
     extra id is the bonus once every verify child of that node is excluded.
     ``topk_out[index]`` receives the full id tensor: ``[N + 1]`` for the root
     and ``[N, N + 1]`` for a layer.
+
+    ``metrics``, when active, times ``host_topk_rows``. That wall clock
+    includes the top-k and the ``.cpu()`` wait for earlier GPU work.
     """
     width = int(states[indices[0]].config.width)
     probs = [softmax_probs(row) for row in logits_rows]
+    timed = metrics is not None and getattr(metrics, "active", False)
+    t0 = time.perf_counter() if timed else None
     scores, ids = host_topk_rows(probs, width + 1, seed=seed)
+    if t0 is not None:
+        metrics.counts["opt_layer_d2h_wait_us"] += int(
+            (time.perf_counter() - t0) * 1e6
+        )
     written = []
     for row, index in enumerate(indices):
         state = states[index]
@@ -523,9 +638,15 @@ def grow_active_layers(
     steps = [None] * len(tails)
     results = [None] * len(tails)
     active: List[int] = []
+    metrics = _draft_metrics(scheduler)
     if tails:
         seeded = _commit_prob_rows(
-            states, list(range(len(tails))), tails, seed=True, topk_out=topk_out
+            states,
+            list(range(len(tails))),
+            tails,
+            seed=True,
+            topk_out=topk_out,
+            metrics=metrics,
         )
         for i, step in enumerate(seeded):
             steps[i] = step
@@ -554,7 +675,9 @@ def grow_active_layers(
         nxt: List[int] = []
         for i, step in zip(
             active,
-            _commit_prob_rows(states, active, rows, seed=False, topk_out=topk_out),
+            _commit_prob_rows(
+                states, active, rows, seed=False, topk_out=topk_out, metrics=metrics
+            ),
         ):
             steps[i] = step
             if step.is_final:
@@ -758,12 +881,16 @@ class OptLayerForward:
                 f"after prefix {self.prefix_len}"
             )
         device = self.scheduler.req_to_token_pool.device
+        timing = _begin_layer_timing(self.scheduler)
         positions = layer_positions(self.prefix_len, depth, n).to(device)
         mask = layer_attention_mask(self.prefix_len, ancestor, device)
         out_cache_loc = self._alloc_layer_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
-        logits = _row_logits(self._run(batch), n, tail=False)
+        _mark_layer_launch(timing)
+        logits = self._run(batch)
+        _finish_layer_timing(self.scheduler, timing)
+        logits = _row_logits(logits, n, tail=False)
         self.cached_len += n
         return logits
 
@@ -1283,6 +1410,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
     """One TARGET_VERIFY for requests that still share a depth."""
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
+    timing = _begin_layer_timing(scheduler)
     width = int(scheduler.server_args.opt_tree_width)
     device = scheduler.req_to_token_pool.device
     depth = _shared_depth(steps)
@@ -1330,7 +1458,9 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         torch.cat(locs),
         cached,
     )
+    _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
+    _finish_layer_timing(scheduler, timing)
     for runner in runners:
         runner.cached_len += width
     return logits
@@ -2177,6 +2307,7 @@ def grow_batch(scheduler, reqs):
         expanded = True
         return windows
     finally:
+        drain_opt_layer_gpu_us(scheduler, metrics)
         finish_start = time.perf_counter()
         try:
             pending = sys.exc_info()[1]

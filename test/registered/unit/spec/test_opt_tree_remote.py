@@ -2092,6 +2092,227 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(metrics.counts["opt_layer_forwards"], 2)
         self.assertEqual(metrics.counts["opt_rounds"], 1)
 
+    def test_layer_timing_stays_off_without_an_active_round(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _commit_prob_rows,
+            _forward_verify_batch,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        touched = []
+        host = _layer_timing_host()
+        metrics = get_sr_round_metrics(host, "Draft")
+        state = OptTreeState.create(OptTreeConfig(width=2, tau=0.1, max_depth=4))
+        with patch.object(
+            forward.torch,
+            "get_device_module",
+            lambda _device: touched.append(1),
+        ), patch.object(
+            forward, "_verify_batch_many", lambda *_args, **_kwargs: "batch"
+        ), patch.object(
+            forward, "_run_batch", lambda _scheduler, _batch: torch.zeros(2, 3)
+        ):
+            logits = _forward_verify_batch(
+                host, [_LayerSlots()], [_layer_timing_step()]
+            )
+            _commit_prob_rows(
+                [state],
+                [0],
+                [torch.tensor([0.1, 0.2, 0.3, 0.4])],
+                seed=True,
+                metrics=metrics,
+            )
+        self.assertEqual(touched, [])
+        self.assertEqual(tuple(logits.shape), (2, 3))
+        self.assertEqual(metrics.counts["opt_layer_host_us"], 0)
+        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 0)
+        self.assertEqual(metrics.counts["opt_layer_d2h_wait_us"], 0)
+        self.assertIsNone(getattr(host, "_opt_layer_events", None))
+
+    def test_layer_timing_splits_host_gpu_and_d2h(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+            _commit_prob_rows,
+            _forward_verify_batch,
+            drain_opt_layer_gpu_us,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        samples = [
+            10.0,
+            10.0 + 250e-6,
+            20.0,
+            20.0 + 250e-6,
+            30.0,
+            30.0 + 400e-6,
+        ]
+        clock = _SampleClock(samples)
+        syncs = []
+        created = []
+        device = _TimingDevice(syncs, created)
+        host = _layer_timing_host()
+        metrics = get_sr_round_metrics(host, "Draft")
+        runner = _LayerSlots()
+        layer = OptLayerForward.__new__(OptLayerForward)
+        layer.scheduler = host
+        layer.req = SimpleNamespace(kv_allocated_len=0)
+        layer.prefix_len = 4
+        layer.cached_len = 4
+        layer._alloc_layer_slots = lambda n, start=None: torch.arange(n)
+        layer._verify_batch = lambda *_args, **_kwargs: "batch"
+        layer._run = lambda _batch: torch.zeros(2, 4)
+
+        def batch_many(*_args, **_kwargs):
+            return "batch"
+
+        def run_batch(_scheduler, _batch):
+            return torch.zeros(2, 3)
+
+        metrics.active = True
+        try:
+            with patch.object(forward.time, "perf_counter", clock), patch.object(
+                forward.torch, "get_device_module", lambda _device: device
+            ), patch.object(forward, "_verify_batch_many", batch_many), patch.object(
+                forward, "_run_batch", run_batch
+            ):
+                _forward_verify_batch(host, [runner], [_layer_timing_step()])
+                layer.forward_layer(_layer_timing_step())
+                state = OptTreeState.create(OptTreeConfig(width=2, tau=0.1, max_depth=4))
+                _commit_prob_rows(
+                    [state],
+                    [0],
+                    [torch.tensor([0.1, 0.2, 0.3, 0.4])],
+                    seed=True,
+                    metrics=metrics,
+                )
+                self.assertEqual(len(host._opt_layer_events), 2)
+                self.assertEqual(syncs, [])
+                drain_opt_layer_gpu_us(host, metrics)
+        finally:
+            metrics.active = False
+        self.assertEqual(clock.calls, len(samples))
+        self.assertEqual(
+            metrics.counts["opt_layer_host_us"],
+            int((samples[1] - samples[0]) * 1e6)
+            + int((samples[3] - samples[2]) * 1e6),
+        )
+        self.assertEqual(
+            metrics.counts["opt_layer_d2h_wait_us"],
+            int((samples[5] - samples[4]) * 1e6),
+        )
+        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 3000)
+        self.assertEqual(syncs, [1])
+        self.assertEqual(host._opt_layer_events, [])
+        self.assertEqual(runner.cached_len, 6)
+        self.assertEqual(layer.cached_len, 6)
+        self.assertTrue(all(event.recorded == 1 for event in created))
+
+    def test_layer_timing_replay_error_keeps_the_event_pair_off_the_queue(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _forward_verify_batch,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        samples = [10.0, 10.0 + 250e-6]
+        clock = _SampleClock(samples)
+        device = _TimingDevice([], [])
+        host = _layer_timing_host()
+        metrics = get_sr_round_metrics(host, "Draft")
+        runner = _LayerSlots()
+
+        def run_batch(_scheduler, _batch):
+            raise RuntimeError("replay failed")
+
+        metrics.active = True
+        try:
+            with patch.object(forward.time, "perf_counter", clock), patch.object(
+                forward.torch, "get_device_module", lambda _device: device
+            ), patch.object(
+                forward, "_verify_batch_many", lambda *_a, **_k: "batch"
+            ), patch.object(forward, "_run_batch", run_batch):
+                with self.assertRaisesRegex(RuntimeError, "replay failed"):
+                    _forward_verify_batch(host, [runner], [_layer_timing_step()])
+        finally:
+            metrics.active = False
+        self.assertEqual(clock.calls, len(samples))
+        self.assertEqual(
+            metrics.counts["opt_layer_host_us"],
+            int((samples[1] - samples[0]) * 1e6),
+        )
+        self.assertIsNone(getattr(host, "_opt_layer_events", None))
+        self.assertEqual(runner.cached_len, 4)
+
+    def test_layer_timing_drain_skips_sync_when_idle_or_poisoned(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            drain_opt_layer_gpu_us,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        syncs = []
+        host = _layer_timing_host()
+        metrics = get_sr_round_metrics(host, "Draft")
+
+        class _Device:
+            def synchronize(self):
+                syncs.append(1)
+
+        with patch.object(forward.torch, "get_device_module", lambda _device: _Device()):
+            drain_opt_layer_gpu_us(host, metrics)
+            host._opt_layer_events = []
+            drain_opt_layer_gpu_us(host, metrics)
+            host._sr_device_poisoned = True
+            host._opt_layer_events = [(object(), object())]
+            drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(syncs, [])
+        self.assertEqual(host._opt_layer_events, [])
+        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 0)
+
+        host._sr_device_poisoned = False
+        host._opt_layer_events = [(object(), object())]
+
+        class _Dead:
+            def synchronize(self):
+                raise RuntimeError("cudaErrorIllegalAddress")
+
+        with patch.object(forward.torch, "get_device_module", lambda _device: _Dead()):
+            with self.assertRaisesRegex(RuntimeError, "cudaErrorIllegalAddress"):
+                drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(metrics.counts["device_timing_dropped_opt_layer"], 0)
+        self.assertEqual(host._opt_layer_events, [])
+
+        host._opt_layer_events = [(object(), object())]
+
+        class _ClockSkew:
+            def synchronize(self):
+                raise RuntimeError("clock skew")
+
+        with patch.object(
+            forward.torch, "get_device_module", lambda _device: _ClockSkew()
+        ):
+            drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(metrics.counts["device_timing_dropped_opt_layer"], 1)
+        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 0)
+
     def test_ingest_phases_sum_to_opt_ingest_and_other_is_nonnegative(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             OPT_INGEST_PHASES,
@@ -3232,6 +3453,70 @@ class _SyncProbe:
 
     def synchronize(self):
         self.calls.append(1)
+
+
+class _SampleClock:
+    def __init__(self, samples):
+        self.samples = list(samples)
+        self.calls = 0
+
+    def __call__(self):
+        value = self.samples[self.calls]
+        self.calls += 1
+        return value
+
+
+class _TimingEvent:
+    def __init__(self, enable_timing=False):
+        self.recorded = 0
+        self.enable_timing = enable_timing
+
+    def record(self):
+        self.recorded += 1
+
+    def elapsed_time(self, _end):
+        return 1.5
+
+
+class _TimingDevice:
+    def __init__(self, syncs, events):
+        self.syncs = syncs
+        self.events = events
+
+    def Event(self, enable_timing=False):
+        event = _TimingEvent(enable_timing=enable_timing)
+        self.events.append(event)
+        return event
+
+    def synchronize(self):
+        self.syncs.append(1)
+
+
+class _LayerSlots:
+    def __init__(self):
+        self.prefix_len = 4
+        self.cached_len = 4
+        self.req = SimpleNamespace(kv_allocated_len=0)
+
+    def _alloc_layer_slots(self, n, start=None):
+        return torch.arange(n)
+
+
+def _layer_timing_host():
+    return SimpleNamespace(
+        device="cpu",
+        server_args=SimpleNamespace(opt_tree_width=2),
+        req_to_token_pool=SimpleNamespace(device=torch.device("cpu")),
+        _sr_device_poisoned=False,
+    )
+
+
+def _layer_timing_step(width=2, depth=1):
+    return SimpleNamespace(
+        tokens=torch.arange(width),
+        positions=torch.full((width,), depth),
+        ancestor_mask=torch.ones((width, depth * width), dtype=torch.int8),
+    )
 
 
 def _opt_stage_host():

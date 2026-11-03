@@ -334,6 +334,7 @@ class OptTreeSchedulerMixin:
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             OptPhaseClock,
             commit_deferred_expands,
+            drain_opt_layer_gpu_us,
             finish_opt_expand_req,
             flush_opt_ingest_phases,
         )
@@ -413,6 +414,7 @@ class OptTreeSchedulerMixin:
         finally:
             import sys
 
+            drain_opt_layer_gpu_us(self, metrics)
             finish_start = time.perf_counter()
             try:
                 pending = sys.exc_info()[1]
