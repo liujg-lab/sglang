@@ -22,7 +22,7 @@ probability device and copy that layer's scores and ids back once.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -175,15 +175,13 @@ def _host_scores_and_ids(
     return _pack_scores_and_ids(scores, ids)
 
 
-def seed(state: OptTreeState, probs: torch.Tensor) -> None:
-    """Top-N of the root distribution. Depth becomes 1. Not a stopping point."""
+def seed_from_topk(
+    state: OptTreeState, scores: torch.Tensor, ids: torch.Tensor
+) -> None:
+    """Write one host top-N root. Depth becomes 1. Not a stopping point."""
     if state.depth != 0 or state.finished:
         raise RuntimeError("seed is only valid on an empty tree")
     n = state.config.width
-    row = _probs_matrix(probs, seed=True, width=n)
-    if int(row.shape[-1]) < n:
-        raise ValueError(f"vocab {int(row.shape[-1])} < width {n}")
-    scores, ids = _host_scores_and_ids(*torch.topk(row, k=n, dim=-1))
     state.weight[0].copy_(scores)
     state.tokens[0].copy_(ids)
     # Reference stores arange here. Logical parent of every layer-0 node is the root.
@@ -192,8 +190,20 @@ def seed(state: OptTreeState, probs: torch.Tensor) -> None:
     state.anc_mask = torch.eye(n, dtype=torch.int8)
 
 
-def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
-    """Append one layer of N nodes and extend the ancestor mask."""
+def seed(state: OptTreeState, probs: torch.Tensor) -> None:
+    """Top-N of the root distribution. Depth becomes 1. Not a stopping point."""
+    n = state.config.width
+    row = _probs_matrix(probs, seed=True, width=n)
+    if int(row.shape[-1]) < n:
+        raise ValueError(f"vocab {int(row.shape[-1])} < width {n}")
+    scores, ids = _host_scores_and_ids(*torch.topk(row, k=n, dim=-1))
+    seed_from_topk(state, scores, ids)
+
+
+def expand_from_topk(
+    state: OptTreeState, scores: torch.Tensor, ids: torch.Tensor
+) -> None:
+    """Append one layer from host ``[N, N]`` child scores and token ids."""
     if state.finished or state.depth < 1 or state.anc_mask is None:
         raise RuntimeError("expand_layer requires a seeded, unfinished tree")
     if state.depth >= state.config.max_depth:
@@ -202,11 +212,9 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
             f"{state.config.max_depth}"
         )
     n = state.config.width
-    matrix = _probs_matrix(probs, seed=False, width=n)
-    child_scores, child_ids = _host_scores_and_ids(*torch.topk(matrix, k=n, dim=-1))
-    path_scores = child_scores * state.weight[state.depth - 1].unsqueeze(1)
+    path_scores = scores * state.weight[state.depth - 1].unsqueeze(1)
     flat_scores = path_scores.reshape(-1)
-    flat_ids = child_ids.reshape(-1)
+    flat_ids = ids.reshape(-1)
     top_scores, top_index = torch.topk(flat_scores, k=n, dim=-1)
     parent_cols = top_index // n
     state.parents[state.depth].copy_(parent_cols)
@@ -216,6 +224,34 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
     eye = torch.eye(n, dtype=torch.int8)
     state.anc_mask = torch.cat([state.anc_mask[parent_cols], eye], dim=1)
     state.depth += 1
+
+
+def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
+    """Append one layer of N nodes and extend the ancestor mask."""
+    n = state.config.width
+    matrix = _probs_matrix(probs, seed=False, width=n)
+    child_scores, child_ids = _host_scores_and_ids(*torch.topk(matrix, k=n, dim=-1))
+    expand_from_topk(state, child_scores, child_ids)
+
+
+def host_topk_rows(
+    rows: Sequence[torch.Tensor], k: int, *, seed: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k already-softmaxed rows on their device, then one host copy.
+
+    Seed rows become ``[B, N]``. Expand rows become ``[B, N, N]``. CPU inputs
+    stay on the no-copy path inside ``_host_scores_and_ids``.
+    """
+    if not rows:
+        raise ValueError("host_topk_rows needs at least one row")
+    width = int(k)
+    matrices = [_probs_matrix(row, seed=seed, width=width) for row in rows]
+    vocab = int(matrices[0].shape[-1])
+    if vocab < width:
+        raise ValueError(f"vocab {vocab} < width {width}")
+    stacked = torch.stack(matrices, dim=0)
+    scores, ids = torch.topk(stacked, k=width, dim=-1)
+    return _host_scores_and_ids(scores, ids)
 
 
 def acceptance_mass(state: OptTreeState) -> torch.Tensor:
@@ -382,18 +418,12 @@ def finish(state: OptTreeState) -> OptVerifySet:
     )
 
 
-def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
-    """Seed or expand, then judge E on every layer present.
+def step_after_layer(state: OptTreeState) -> OptTreeStep:
+    """Judge E after a layer has been written and return the next step.
 
     A non-final step asks for a draft forward of the layer just added. A final
     step verifies that layer and does not forward it, and does not build a mask.
     """
-    if state.finished:
-        raise RuntimeError("update called after finish")
-    if state.depth == 0:
-        seed(state, probs)
-    else:
-        expand_layer(state, probs)
     if depth_rule(state):
         state.prev_e = acceptance_mass(state)
         return OptTreeStep(
@@ -409,3 +439,14 @@ def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
         positions=verify.positions.clone(),
         verify=verify,
     )
+
+
+def update(state: OptTreeState, probs: torch.Tensor) -> OptTreeStep:
+    """Seed or expand, then judge E on every layer present."""
+    if state.finished:
+        raise RuntimeError("update called after finish")
+    if state.depth == 0:
+        seed(state, probs)
+    else:
+        expand_layer(state, probs)
+    return step_after_layer(state)

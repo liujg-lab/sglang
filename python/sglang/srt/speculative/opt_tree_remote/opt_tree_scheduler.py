@@ -242,6 +242,7 @@ class OptTreeSchedulerMixin:
             return tokens, parents, cols
         except Exception as exc:
             logger.warning("[OPT] tree expand failed for %s: %s", req.rid, exc)
+            get_sr_round_metrics(self, "Draft").counts["opt_expand_failures"] += 1
             return [], None, None
         finally:
             clear_prefill_tail_logits(req)

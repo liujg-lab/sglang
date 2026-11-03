@@ -1561,12 +1561,14 @@ class StandaloneRemoteDraftSchedulerMixin:
         self,
         reqs: List[Req],
         on_extend_logits: Optional[Callable] = None,
+        logits_survive: Optional[Callable] = None,
     ) -> None:
         """Prefill until committed KV covers origin_input_ids; drop sampled extras.
 
-        ``on_extend_logits(batch, logits)`` sees a clone of
-        ``next_token_logits`` taken before the batch result is processed.
-        Callers keep rows only for requests whose prefix is no longer pending.
+        ``on_extend_logits(batch, logits)`` receives a clone of
+        ``next_token_logits``. ``logits_survive(batch)`` may refuse that clone
+        before ``run_batch``. Without a predicate, a callback is always given
+        the clone.
         """
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
@@ -1606,9 +1608,12 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_replay_grammars(list(batch.reqs), strict=True)
             self._sr_enable_tree_seed_hidden(batch)
             self.cur_batch = batch
+            capture = on_extend_logits is not None and (
+                logits_survive is None or logits_survive(batch)
+            )
             result = self.run_batch(batch)
             cloned = None
-            if on_extend_logits is not None:
+            if capture:
                 logits = getattr(
                     getattr(result, "logits_output", None), "next_token_logits", None
                 )
@@ -1653,6 +1658,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         self,
         reqs: List[Req],
         on_extend_logits: Optional[Callable] = None,
+        logits_survive: Optional[Callable] = None,
     ) -> None:
         """Fold a long committed tail into one extend instead of N decodes."""
         rebuilt: List[Req] = []
@@ -1673,7 +1679,9 @@ class StandaloneRemoteDraftSchedulerMixin:
             rebuilt.append(req)
         if rebuilt:
             self._sr_materialize_prefix_batch(
-                rebuilt, on_extend_logits=on_extend_logits
+                rebuilt,
+                on_extend_logits=on_extend_logits,
+                logits_survive=logits_survive,
             )
 
     def _sr_make_tail_extend_batch(self, plans) -> ScheduleBatch:

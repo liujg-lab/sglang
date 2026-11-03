@@ -891,7 +891,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertTrue(torch.equal(second, torch.full((4,), 11)))
 
         ancestor = torch.tensor([[1, 0], [0, 1]], dtype=torch.int8)
-        mask = layer_attention_mask(3, ancestor)
+        mask = layer_attention_mask(3, ancestor, "cpu")
         self.assertEqual(mask.numel(), 2 * (3 + 2))
         rows = mask.view(2, 5)
         self.assertTrue(torch.equal(rows[:, :3], torch.ones(2, 3, dtype=torch.bool)))
@@ -961,7 +961,9 @@ class OptTreeRemoteTest(CustomTestCase):
 
         width = 2
         eye = torch.eye(width, dtype=torch.int8)
-        mask, positions = pack_verify_attention([3, 5], [eye, eye], depth=1, width=width)
+        mask, positions = pack_verify_attention(
+            [3, 5], [eye, eye], depth=1, width=width, device="cpu"
+        )
         self.assertEqual(int(mask.numel()), full_mask_numel([3, 5], width))
         self.assertTrue(torch.equal(positions, torch.tensor([3, 3, 5, 5])))
         rows = {
@@ -977,7 +979,9 @@ class OptTreeRemoteTest(CustomTestCase):
             [[1, 0, 1, 0], [0, 1, 0, 1]],
             dtype=torch.int8,
         )
-        mask, positions = pack_verify_attention([4], [deeper], depth=2, width=width)
+        mask, positions = pack_verify_attention(
+            [4], [deeper], depth=2, width=width, device="cpu"
+        )
         cached = 4 + width
         self.assertEqual(int(mask.numel()), full_mask_numel([cached], width))
         self.assertTrue(torch.equal(positions, torch.tensor([5, 5])))
@@ -1190,6 +1194,299 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(plan_opt_tail(req(0, 5000, 0), None), "extend")
         self.assertEqual(plan_opt_tail(req(0, 5000, 0), 0), "extend")
 
+    def test_prefill_callback_skips_logits_rewritten_by_sampling(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            raw_logits_survive_sampling,
+        )
+
+        raw = torch.tensor([[1.0, 3.0, 0.5, -1.0]])
+
+        def sampling_info(*, greedy, temperature, penalty):
+            return SimpleNamespace(
+                is_all_greedy=greedy,
+                temperatures=torch.tensor([[temperature]]),
+                logit_bias=None,
+                has_custom_logit_processor=False,
+                penalizer_orchestrator=SimpleNamespace(is_required=penalty),
+            )
+
+        def capture(info):
+            mixin = _materialize_host()
+            mixin.draft_paused_reqs = []
+            mixin.waiting_queue = []
+            mixin.running_batch = SimpleNamespace(is_empty=lambda: True, reqs=[])
+            mixin.server_args = SimpleNamespace(speculative_eagle_topk=1)
+            mixin.chunked_req = None
+            origin = [1, 2, 3]
+            req = SimpleNamespace(
+                rid="opt-raw",
+                is_sr_draft=True,
+                origin_input_ids=list(origin),
+                output_ids=[],
+                fill_ids=list(origin),
+                req_pool_idx=None,
+                kv_committed_len=0,
+                draft_is_paused=False,
+                draft_generation_start_len=0,
+                finished=lambda: False,
+                multimodal_inputs=None,
+            )
+            seen = []
+
+            class _Extend:
+                def is_extend(self):
+                    return True
+
+            def next_batch():
+                req.req_pool_idx = 1
+                req.kv_committed_len = len(origin)
+                mixin.chunked_req = None
+                return SimpleNamespace(
+                    reqs=[req],
+                    forward_mode=_Extend(),
+                    is_extend_in_batch=False,
+                    sampling_info=info,
+                    has_grammar=False,
+                )
+
+            def run_batch(batch):
+                sampling = batch.sampling_info
+                logits = raw.clone()
+                orch = getattr(sampling, "penalizer_orchestrator", None)
+                if orch is not None and orch.is_required:
+                    logits.add_(1.0)
+                if not sampling.is_all_greedy:
+                    logits.div_(sampling.temperatures)
+                    logits[:] = torch.softmax(logits, dim=-1)
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(next_token_logits=logits)
+                )
+
+            def on_extend_logits(_batch, logits):
+                seen.append(logits.detach().clone())
+
+            mixin.get_next_batch_to_run = next_batch
+            mixin.run_batch = run_batch
+            mixin.process_batch_result = lambda *_args, **_kwargs: None
+            mixin._sr_materialize_prefix_batch(
+                [req],
+                on_extend_logits=on_extend_logits,
+                logits_survive=raw_logits_survive_sampling,
+            )
+            return seen
+
+        self.assertEqual(
+            capture(sampling_info(greedy=False, temperature=0.7, penalty=False)),
+            [],
+        )
+        self.assertEqual(
+            capture(sampling_info(greedy=True, temperature=1.0, penalty=True)),
+            [],
+        )
+        greedy = capture(sampling_info(greedy=True, temperature=1.0, penalty=False))
+        self.assertEqual(len(greedy), 1)
+        self.assertTrue(torch.equal(greedy[0], raw))
+
+    def test_reprefill_reads_raw_tail_when_prefill_cache_is_skipped(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+
+        req = SimpleNamespace(
+            rid="opt-reprefill",
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            kv_committed_len=3,
+            req_pool_idx=1,
+            opt_prefill_tail_logits=None,
+        )
+        seen = []
+
+        def committed(_reqs, on_extend_logits=None, logits_survive=None):
+            self.assertIsNotNone(on_extend_logits)
+            self.assertIs(logits_survive, forward.raw_logits_survive_sampling)
+
+        def tail(_scheduler, runners):
+            seen.append([runner.prefix_len for runner in runners])
+            return [torch.tensor([4.0, 5.0])]
+
+        scheduler = SimpleNamespace(_sr_reprefill_committed=committed)
+        original = forward._logits_at_tail_batch
+        forward._logits_at_tail_batch = tail
+        try:
+            rows = forward.reprefill_tail_logits(scheduler, [req])
+        finally:
+            forward._logits_at_tail_batch = original
+        self.assertEqual(seen, [[3]])
+        self.assertTrue(torch.equal(rows[0], torch.tensor([4.0, 5.0])))
+
+    def test_verify_groups_follow_page_aligned_budget(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _page_aligned_layer_tokens,
+            _take_verify_group,
+        )
+
+        self.assertEqual(_page_aligned_layer_tokens(100, 60, 128), 128)
+        self.assertEqual(_page_aligned_layer_tokens(100, 60, 1), 60)
+        runners = [
+            SimpleNamespace(cached_len=100),
+            SimpleNamespace(cached_len=100),
+        ]
+        pending = list(runners)
+        groups = []
+        while pending:
+            group = _take_verify_group(pending, 200, 128, 60)
+            self.assertGreater(len(group), 0)
+            groups.append(group)
+            pending = pending[len(group) :]
+        self.assertEqual([len(group) for group in groups], [1, 1])
+
+    def test_batch_fallback_expands_only_missing_windows(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host = _OptWindowHost(assign_pool=True)
+        first = _OptReq()
+        second = _OptReq()
+        second.rid = "opt-missing"
+
+        def grow(_scheduler, _reqs):
+            return [([1], [-1], [0]), None]
+
+        with patch.object(forward, "grow_batch", grow):
+            windows = forward.produce_opt_windows(
+                host, SRAction.STEP, [(None, first), (None, second)]
+            )
+        self.assertEqual(windows[0], ([1], [-1], [0]))
+        self.assertEqual(windows[1], ([7], [-1], [0]))
+        self.assertEqual(host.calls.count("expand"), 1)
+        self.assertEqual(host._sr_round_metrics.counts["opt_batch_fallbacks"], 1)
+
+        alone = _OptWindowHost(assign_pool=True)
+        get_sr_round_metrics(alone, "Draft")
+        forward.produce_opt_windows(alone, SRAction.STEP, [(None, _OptReq())])
+        self.assertEqual(alone._sr_round_metrics.counts["opt_batch_fallbacks"], 0)
+
+    def test_expand_failure_counts_empty_draft(self):
+        import logging
+        import textwrap
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            clear_prefill_tail_logits,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+        )
+        src = path.read_text()
+        start = src.index("    def _opt_expand_one(")
+        end = src.index("\n    def _opt_handle_batch_impl(")
+        ns = {
+            "get_sr_round_metrics": get_sr_round_metrics,
+            "logger": logging.getLogger("opt-expand-test"),
+            "clear_prefill_tail_logits": clear_prefill_tail_logits,
+        }
+        code = "from __future__ import annotations\n" + textwrap.dedent(src[start:end])
+        exec(compile(code, str(path), "exec"), ns)
+
+        def release(_req):
+            raise RuntimeError("kv")
+
+        host = SimpleNamespace(
+            _sr_resume_req=lambda _req: None,
+            _sr_isolate_need=lambda _rids: None,
+            _opt_release_uncommitted=release,
+            _opt_rollback=lambda _req, _keep: None,
+            _sr_is_finished=lambda _req: False,
+            _sr_pause_req=lambda _req: None,
+            last_batch=None,
+            cur_batch=None,
+        )
+        req = SimpleNamespace(rid="opt-fail", origin_input_ids=[1], output_ids=[])
+        window = ns["_opt_expand_one"](host, req)
+        self.assertEqual(window, ([], None, None))
+        self.assertEqual(
+            get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 1
+        )
+
+
+def _materialize_host():
+    """Host whose ``_sr_materialize_prefix_batch`` is the real method.
+
+    The mixin module imports sampler and quantization kernels. The CPU suite
+    does not provide those, so this loads the method from source and stubs
+    the scheduler helpers it calls.
+    """
+    try:
+        from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
+            StandaloneRemoteDraftSchedulerMixin,
+        )
+    except Exception:
+        return _materialize_host_from_source()
+    return StandaloneRemoteDraftSchedulerMixin()
+
+
+def _materialize_host_from_source():
+    import textwrap
+    from pathlib import Path
+    from types import SimpleNamespace
+    from typing import Callable, Optional
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/standalone_remote/drafter/"
+        "sr_draft_scheduler_mixin.py"
+    )
+    src = path.read_text()
+    start = src.index("    def _sr_materialize_prefix_batch(")
+    end = src.index("\n    def _sr_kv_len(")
+    ns = {
+        "List": list,
+        "Optional": Optional,
+        "Callable": Callable,
+        "Req": object,
+    }
+    exec(compile(textwrap.dedent(src[start:end]), str(path), "exec"), ns)
+    host = SimpleNamespace()
+    host._sr_materialize_prefix_batch = ns["_sr_materialize_prefix_batch"].__get__(
+        host, SimpleNamespace
+    )
+
+    def prefix_pending(req):
+        if req.req_pool_idx is None:
+            return True
+        if getattr(host, "chunked_req", None) is req:
+            return True
+        target = len(getattr(req, "origin_input_ids", None) or [])
+        committed = int(getattr(req, "kv_committed_len", 0) or 0)
+        return committed < target
+
+    host._sr_prefix_pending = prefix_pending
+    host._sr_resume_req = lambda req: setattr(req, "draft_is_paused", False)
+    host._sr_isolate_need = lambda *_args, **_kwargs: None
+    host._sr_tree_mode = lambda: False
+    host._sr_enable_tree_seed_hidden = lambda _batch: None
+    host._sr_cache_tree_seeds = lambda *_args, **_kwargs: None
+    host._sr_park_finished_prefill_embeddings = lambda *_args, **_kwargs: None
+    host._sr_is_finished = lambda _req: False
+    host._sr_pause_req = lambda req: setattr(req, "draft_is_paused", True)
+    return host
+
 
 class _ReleaseHost:
     def __init__(self):
@@ -1212,7 +1509,9 @@ class _OptWindowHost:
         self.assign_pool = assign_pool
         self.calls = []
 
-    def _sr_materialize_prefix_batch(self, reqs, on_extend_logits=None):
+    def _sr_materialize_prefix_batch(
+        self, reqs, on_extend_logits=None, logits_survive=None
+    ):
         self.calls.append("materialize")
         if not self.assign_pool:
             return

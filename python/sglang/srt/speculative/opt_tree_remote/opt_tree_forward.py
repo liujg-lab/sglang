@@ -19,7 +19,13 @@ import torch
 
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
-from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import OptTreeState, update
+from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
+    OptTreeState,
+    expand_from_topk,
+    host_topk_rows,
+    seed_from_topk,
+    step_after_layer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,25 +45,24 @@ def layer_positions(prefix_len: int, depth: int, width: int) -> torch.Tensor:
     )
 
 
-def layer_attention_mask(prefix_len: int, ancestor: torch.Tensor) -> torch.Tensor:
+def layer_attention_mask(
+    prefix_len: int, ancestor: torch.Tensor, device
+) -> torch.Tensor:
     """Flattened TARGET_VERIFY mask: committed prefix, then the ancestor mask.
 
     ``ancestor`` is ``[N, depth * N]`` with 1 for a visible tree column.
-    Every query sees the whole committed prefix. Tree columns stay
-    ancestor-only (``leak=False``).
+    Every query sees the whole committed prefix. The prefix of ones is
+    allocated on ``device``. Only the tree columns are copied.
     """
     if ancestor.dim() != 2:
         raise ValueError(
             f"ancestor mask must be [N, cols], got {tuple(ancestor.shape)}"
         )
-    n = int(ancestor.shape[0])
-    prefix = torch.ones(
-        (n, int(prefix_len)),
-        dtype=torch.bool,
-        device=ancestor.device,
-    )
-    tree = ancestor.to(dtype=torch.bool)
-    return torch.cat([prefix, tree], dim=1).reshape(-1)
+    n, cols = ancestor.shape
+    prefix_len = int(prefix_len)
+    out = torch.ones((n, prefix_len + cols), dtype=torch.bool, device=device)
+    out[:, prefix_len:].copy_(ancestor.to(dtype=torch.bool), non_blocking=True)
+    return out.reshape(-1)
 
 
 def pack_verify_attention(
@@ -65,8 +70,9 @@ def pack_verify_attention(
     ancestors: Sequence[torch.Tensor],
     depth: int,
     width: int,
+    device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Concatenate per-request TARGET_VERIFY masks and positions.
+    """Concatenate per-request TARGET_VERIFY masks and positions on ``device``.
 
     Mask segment ``b`` is ``[N, prefix_lens[b] + depth * N]`` flattened, which
     is ``[N, cached_len_b + N]`` once ``cached_len`` counts layers already
@@ -78,12 +84,18 @@ def pack_verify_attention(
             f"{len(ancestors)} masks"
         )
     masks = [
-        layer_attention_mask(prefix, ancestor)
+        layer_attention_mask(prefix, ancestor, device)
         for prefix, ancestor in zip(prefix_lens, ancestors)
     ]
-    positions = [layer_positions(prefix, depth, width) for prefix in prefix_lens]
+    positions = [
+        layer_positions(prefix, depth, width).to(device=device)
+        for prefix in prefix_lens
+    ]
     if not masks:
-        return torch.empty(0, dtype=torch.bool), torch.empty(0, dtype=torch.long)
+        return (
+            torch.empty(0, dtype=torch.bool, device=device),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
     return torch.cat(masks, dim=0), torch.cat(positions, dim=0)
 
 
@@ -185,23 +197,47 @@ def clear_prefill_tail_logits(req) -> None:
 
 
 def reprefill_tail_logits(scheduler, reqs) -> List[torch.Tensor]:
-    """Rebuild an invalid prefix and keep the finishing chunk's last row."""
+    """Rebuild an invalid prefix and keep the finishing chunk's last row.
+
+    The prefill callback is skipped when sampling would rewrite logits.
+    Those requests fall back to ``_logits_at_tail_batch``, which scores the
+    committed tail with raw logits.
+    """
 
     def _keep(batch, logits) -> None:
         stash_finished_prefill_logits(scheduler, batch, logits)
 
-    scheduler._sr_reprefill_committed(reqs, on_extend_logits=_keep)
-    rows = []
+    scheduler._sr_reprefill_committed(
+        reqs,
+        on_extend_logits=_keep,
+        logits_survive=raw_logits_survive_sampling,
+    )
+    rows: List[Optional[torch.Tensor]] = [None] * len(reqs)
     missing = []
-    for req in reqs:
+    for i, req in enumerate(reqs):
         row = take_cached_tail_logits(req, _committed_len(req))
         if row is None:
-            missing.append(getattr(req, "rid", None))
+            missing.append(i)
             continue
-        rows.append(row)
+        rows[i] = row
     if missing:
+
+        class _Tail:
+            def __init__(self, req, prefix_len):
+                self.req = req
+                self.prefix_len = prefix_len
+
+        runners = [_Tail(reqs[i], _committed_len(reqs[i])) for i in missing]
+        for i, row in zip(missing, _logits_at_tail_batch(scheduler, runners)):
+            rows[i] = row
+    if any(row is None for row in rows):
+        missing_rids = [
+            getattr(reqs[i], "rid", None)
+            for i, row in enumerate(rows)
+            if row is None
+        ]
         raise RuntimeError(
-            f"OPT draft reprefill returned no tail logits for {missing}"
+            f"OPT draft reprefill returned no tail logits for {missing_rids}"
         )
     return rows
 
@@ -222,7 +258,11 @@ def materialize_missing_prefix(scheduler, reqs, capture_tail_logits: bool = Fals
         stash_finished_prefill_logits(scheduler, batch, logits)
 
     if capture_tail_logits:
-        scheduler._sr_materialize_prefix_batch(missing, on_extend_logits=_keep)
+        scheduler._sr_materialize_prefix_batch(
+            missing,
+            on_extend_logits=_keep,
+            logits_survive=raw_logits_survive_sampling,
+        )
     else:
         scheduler._sr_materialize_prefix_batch(missing)
     for req in missing:
@@ -251,11 +291,23 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
     scheduler._sr_replay_grammars(reqs)
     if len(reqs) <= 1:
         return [scheduler._opt_expand_one(req) for req in reqs]
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    windows = [None] * len(reqs)
+    batch_failed = False
     try:
-        return grow_batch(scheduler, reqs)
+        windows = list(grow_batch(scheduler, reqs))
     except Exception as exc:
         logger.warning("[OPT] batch tree expand failed, falling back: %s", exc)
-        return [scheduler._opt_expand_one(req) for req in reqs]
+        batch_failed = True
+    if batch_failed or any(window is None for window in windows):
+        get_sr_round_metrics(scheduler, "Draft").counts["opt_batch_fallbacks"] += 1
+    for i, window in enumerate(windows):
+        if window is None:
+            windows[i] = scheduler._opt_expand_one(reqs[i])
+    return windows
 
 
 def softmax_probs(logits: torch.Tensor) -> torch.Tensor:
@@ -325,6 +377,23 @@ def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
     return [t[i * width : (i + 1) * width] for i in range(bs)]
 
 
+def _commit_prob_rows(states, indices, logits_rows, *, seed: bool):
+    """Softmax each row, copy one stacked top-k, then update those trees."""
+    probs = [softmax_probs(row) for row in logits_rows]
+    scores, ids = host_topk_rows(probs, int(states[indices[0]].config.width), seed=seed)
+    written = []
+    for row, index in enumerate(indices):
+        state = states[index]
+        if state.finished:
+            raise RuntimeError("update called after finish")
+        if seed:
+            seed_from_topk(state, scores[row], ids[row])
+        else:
+            expand_from_topk(state, scores[row], ids[row])
+        written.append(step_after_layer(state))
+    return written
+
+
 def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Callable):
     """Grow one tree per tail. Requests still at one depth share a forward.
 
@@ -332,19 +401,24 @@ def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Calla
     are positions into ``tail_logits``. The return value is a list of
     ``[N, vocab]`` logits, or a tensor of shape ``[bs, N, vocab]`` or
     ``[bs * N, vocab]``. A request that stops is absent from the next call.
+    Each request is softmaxed on its own. One layer's top-k is copied back
+    once, then each tree is updated on CPU.
     """
     tails = list(tail_logits)
     states = [OptTreeState.create(config) for _ in tails]
     steps = [None] * len(tails)
     results = [None] * len(tails)
     active: List[int] = []
-    for i, logits in enumerate(tails):
-        step = update(states[i], softmax_probs(logits))
-        steps[i] = step
-        if step.is_final:
-            results[i] = _verify_window(step)
-        else:
-            active.append(i)
+    if tails:
+        seeded = _commit_prob_rows(
+            states, list(range(len(tails))), tails, seed=True
+        )
+        for i, step in enumerate(seeded):
+            steps[i] = step
+            if step.is_final:
+                results[i] = _verify_window(step)
+            else:
+                active.append(i)
     guard = 0
     while active:
         guard += 1
@@ -354,12 +428,18 @@ def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Calla
             )
         chosen = [steps[i] for i in active]
         _shared_depth(chosen)
-        rows = _as_layer_rows(
-            forward_active(chosen, list(active)), len(active), config.width
-        )
+        try:
+            logits = forward_active(chosen, list(active))
+        except Exception as exc:
+            logger.warning(
+                "[OPT] layer forward failed, keeping finished trees: %s", exc
+            )
+            return results
+        rows = _as_layer_rows(logits, len(active), config.width)
         nxt: List[int] = []
-        for i, row in zip(active, rows):
-            step = update(states[i], softmax_probs(row))
+        for i, step in zip(
+            active, _commit_prob_rows(states, active, rows, seed=False)
+        ):
             steps[i] = step
             if step.is_final:
                 results[i] = _verify_window(step)
@@ -502,7 +582,7 @@ class OptLayerForward:
             )
         device = self.scheduler.req_to_token_pool.device
         positions = layer_positions(self.prefix_len, depth, n).to(device)
-        mask = layer_attention_mask(self.prefix_len, ancestor).to(device)
+        mask = layer_attention_mask(self.prefix_len, ancestor, device)
         out_cache_loc = self._alloc_layer_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
@@ -620,6 +700,19 @@ class OptLayerForward:
 
     def _run(self, batch) -> torch.Tensor:
         return _run_batch(self.scheduler, batch)
+
+
+def raw_logits_survive_sampling(batch) -> bool:
+    """True when the sampler leaves next_token_logits untouched."""
+    info = batch.sampling_info
+    orch = getattr(info, "penalizer_orchestrator", None)
+    return (
+        bool(info.is_all_greedy)
+        and not getattr(batch, "has_grammar", False)
+        and getattr(info, "logit_bias", None) is None
+        and not getattr(info, "has_custom_logit_processor", False)
+        and not (orch is not None and orch.is_required)
+    )
 
 
 def _keep_raw_logits(batch) -> None:
@@ -892,6 +985,66 @@ def _extend_uncommitted_chunked_batch(
     return [saved[id(runner)] for runner in runners]
 
 
+def _page_aligned_layer_tokens(cached_len: int, n: int, page: int) -> int:
+    """Tokens a new layer takes from ``available_size``.
+
+    ``page <= 1`` charges ``n`` tokens. A larger page charges every newly
+    opened page, matching the allocator's page delta.
+    """
+    n = int(n)
+    page = int(page or 1)
+    if page <= 1:
+        return n
+    cached = int(cached_len)
+    end_pages = (cached + n + page - 1) // page
+    start_pages = (cached + page - 1) // page
+    return (end_pages - start_pages) * page
+
+
+def _take_verify_group(runners, available: int, page: int, width: int):
+    """Front of ``runners`` whose page-aligned layer fits in ``available``.
+
+    A request that does not fit by itself is still returned alone so the
+    allocator can evict. Later requests wait for the next read of
+    ``available_size``.
+    """
+    group = []
+    used = 0
+    budget = int(available)
+    for runner in runners:
+        need = _page_aligned_layer_tokens(runner.cached_len, width, page)
+        if group and used + need > budget:
+            break
+        group.append(runner)
+        used += need
+    return group
+
+
+def _forward_verify_fitting(scheduler, runners, steps):
+    """Run one layer in sub-batches that fit the free KV pages."""
+    if not runners:
+        raise RuntimeError("OPT verify batch is empty")
+    allocator = scheduler.token_to_kv_pool_allocator
+    page = int(getattr(scheduler.tree_cache, "page_size", 1) or 1)
+    width = int(scheduler.server_args.opt_tree_width)
+    pending = list(zip(runners, steps))
+    rows = []
+    while pending:
+        group_pairs = _take_verify_group(
+            [runner for runner, _step in pending],
+            int(allocator.available_size()),
+            page,
+            width,
+        )
+        group_runners = group_pairs
+        count = len(group_runners)
+        group_steps = [step for _runner, step in pending[:count]]
+        logits = _forward_verify_batch(scheduler, group_runners, group_steps)
+        rows.extend(_as_layer_rows(logits, count, width))
+        pending = pending[count:]
+    return rows
+
+
 def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
     """One TARGET_VERIFY for requests that still share a depth."""
     if not runners:
@@ -925,7 +1078,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         ancestors.append(ancestor)
     prefix_lens = [runner.prefix_len for runner in runners]
     flat_mask, flat_positions = pack_verify_attention(
-        prefix_lens, ancestors, depth, width
+        prefix_lens, ancestors, depth, width, device
     )
     locs = []
     cached = []
@@ -938,8 +1091,8 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         scheduler,
         runners,
         token_rows,
-        flat_positions.to(device),
-        flat_mask.to(device),
+        flat_positions,
+        flat_mask,
         torch.cat(locs),
         cached,
     )
@@ -1031,7 +1184,7 @@ def grow_batch(scheduler, reqs):
                 )
 
         def forward_active(steps, indices):
-            return _forward_verify_batch(
+            return _forward_verify_fitting(
                 scheduler, [runners[i] for i in indices], steps
             )
 
