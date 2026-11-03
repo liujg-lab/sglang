@@ -1562,13 +1562,15 @@ class StandaloneRemoteDraftSchedulerMixin:
         reqs: List[Req],
         on_extend_logits: Optional[Callable] = None,
         logits_survive: Optional[Callable] = None,
+        capture_tree_seed: bool = True,
     ) -> None:
         """Prefill until committed KV covers origin_input_ids; drop sampled extras.
 
         ``on_extend_logits(batch, logits)`` receives a clone of
         ``next_token_logits``. ``logits_survive(batch)`` may refuse that clone
         before ``run_batch``. Without a predicate, a callback is always given
-        the clone.
+        the clone. ``capture_tree_seed`` records SR's pre-sample top-k. Callers
+        that do not read ``sr_tree_seed`` pass False.
         """
         need = [r for r in reqs if r.req_pool_idx is None]
         if not need:
@@ -1606,7 +1608,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                 batch.filter_batch(keep_indices=keep)
             if self._sr_tree_mode():
                 self._sr_replay_grammars(list(batch.reqs), strict=True)
-            self._sr_enable_tree_seed_hidden(batch)
+            if capture_tree_seed:
+                self._sr_enable_tree_seed_hidden(batch)
             self.cur_batch = batch
             capture = on_extend_logits is not None and (
                 logits_survive is None or logits_survive(batch)
@@ -1619,7 +1622,8 @@ class StandaloneRemoteDraftSchedulerMixin:
                 )
                 if logits is not None:
                     cloned = logits.detach().clone()
-            self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
+            if capture_tree_seed:
+                self._sr_cache_tree_seeds(list(batch.reqs), result, batch)
             self.process_batch_result(batch, result)
             if cloned is not None:
                 on_extend_logits(batch, cloned)

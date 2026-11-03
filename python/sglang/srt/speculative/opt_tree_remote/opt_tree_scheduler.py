@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     OptLayerForward,
+    _reraise_device_context,
     clear_prefill_tail_logits,
     grow_with_forwards,
     ingest_tail_logits,
@@ -71,6 +72,23 @@ class OptTreeSchedulerMixin:
         ):
             return True
         return super().is_remote_spec_draft
+
+    def _sr_materialize_prefix_batch(
+        self,
+        reqs,
+        on_extend_logits=None,
+        logits_survive=None,
+        capture_tree_seed: bool = True,
+    ):
+        """OPT grows from tail logits and does not read ``sr_tree_seed``."""
+        if self.spec_algorithm.is_opt_tree_remote():
+            capture_tree_seed = False
+        return super()._sr_materialize_prefix_batch(
+            reqs,
+            on_extend_logits=on_extend_logits,
+            logits_survive=logits_survive,
+            capture_tree_seed=capture_tree_seed,
+        )
 
     def maybe_notify_remote_draft_finished(self, req) -> None:
         if (
@@ -241,16 +259,31 @@ class OptTreeSchedulerMixin:
             )
             return tokens, parents, cols
         except Exception as exc:
+            _reraise_device_context(self, exc)
             logger.warning("[OPT] tree expand failed for %s: %s", req.rid, exc)
             get_sr_round_metrics(self, "Draft").counts["opt_expand_failures"] += 1
             return [], None, None
         finally:
+            import sys
+
+            pending = sys.exc_info()[1]
             clear_prefill_tail_logits(req)
-            self._opt_rollback(req, committed)
+            rollback_error = None
+            try:
+                self._opt_rollback(req, committed)
+            except Exception as rollback_exc:
+                logger.warning(
+                    "[OPT] rollback after expand failed for %s: %s",
+                    req.rid,
+                    rollback_exc,
+                )
+                rollback_error = rollback_exc
             if not self._sr_is_finished(req):
                 self._sr_pause_req(req)
             self.last_batch = None
             self.cur_batch = None
+            if rollback_error is not None and pending is None:
+                raise rollback_error
 
     def _opt_handle_batch_impl(self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
         metrics = get_sr_round_metrics(self, "Draft")

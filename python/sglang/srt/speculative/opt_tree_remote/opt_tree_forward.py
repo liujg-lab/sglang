@@ -5,13 +5,15 @@ tokens at one shared position under ``ancestor_mask``. Speculative KV is
 appended past the committed prefix and dropped by the caller.
 
 Several requests that are still growing share one forward at the same depth.
-A single request, and any batch that fails, still grow through
-``_opt_expand_one``.
+A single request, and any batch that fails for a reason other than a device
+context error, still grow through ``_opt_expand_one``. A device context error
+poisons the draft and propagates.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -300,6 +302,7 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
     try:
         windows = list(grow_batch(scheduler, reqs))
     except Exception as exc:
+        _reraise_device_context(scheduler, exc)
         logger.warning("[OPT] batch tree expand failed, falling back: %s", exc)
         batch_failed = True
     if batch_failed or any(window is None for window in windows):
@@ -394,7 +397,31 @@ def _commit_prob_rows(states, indices, logits_rows, *, seed: bool):
     return written
 
 
-def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Callable):
+def _reraise_device_context(scheduler, exc) -> None:
+    """Poison and re-raise when the accelerator context is already dead.
+
+    ``scheduler`` may be missing in a CPU unit test. The error still
+    propagates so a later caller cannot turn it into an empty draft.
+    """
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    if not is_device_context_error(exc):
+        return
+    if scheduler is not None:
+        scheduler._sr_device_poisoned = True
+        scheduler._sr_clear_stamps_after_poison()
+        logger.error("[OPT] device context error: %s", exc)
+    raise
+
+
+def grow_active_layers(
+    config: OptTreeConfig,
+    tail_logits,
+    forward_active: Callable,
+    scheduler=None,
+):
     """Grow one tree per tail. Requests still at one depth share a forward.
 
     ``forward_active(steps, indices)`` sees only non-final steps. ``indices``
@@ -431,6 +458,7 @@ def grow_active_layers(config: OptTreeConfig, tail_logits, forward_active: Calla
         try:
             logits = forward_active(chosen, list(active))
         except Exception as exc:
+            _reraise_device_context(scheduler, exc)
             logger.warning(
                 "[OPT] layer forward failed, keeping finished trees: %s", exc
             )
@@ -1020,11 +1048,28 @@ def _take_verify_group(runners, available: int, page: int, width: int):
     return group
 
 
+def _verify_layer_budget(scheduler) -> int:
+    """Free KV tokens plus radix tokens ``alloc_token_slots`` can evict.
+
+    ``ChunkCache.evictable_size`` is 0. SWA and Mamba caches raise
+    ``NotImplementedError`` from ``evictable_size``; those keep the free-slot
+    budget.
+    """
+    budget = int(scheduler.token_to_kv_pool_allocator.available_size())
+    evictable = getattr(scheduler.tree_cache, "evictable_size", None)
+    if not callable(evictable):
+        return budget
+    try:
+        extra = evictable()
+    except NotImplementedError:
+        return budget
+    return budget + int(extra)
+
+
 def _forward_verify_fitting(scheduler, runners, steps):
-    """Run one layer in sub-batches that fit the free KV pages."""
+    """Run one layer in sub-batches that fit free plus evictable KV tokens."""
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
-    allocator = scheduler.token_to_kv_pool_allocator
     page = int(getattr(scheduler.tree_cache, "page_size", 1) or 1)
     width = int(scheduler.server_args.opt_tree_width)
     pending = list(zip(runners, steps))
@@ -1032,7 +1077,7 @@ def _forward_verify_fitting(scheduler, runners, steps):
     while pending:
         group_pairs = _take_verify_group(
             [runner for runner, _step in pending],
-            int(allocator.available_size()),
+            _verify_layer_budget(scheduler),
             page,
             width,
         )
@@ -1188,12 +1233,26 @@ def grow_batch(scheduler, reqs):
                 scheduler, [runners[i] for i in indices], steps
             )
 
-        return grow_active_layers(config, tail_logits, forward_active)
+        return grow_active_layers(
+            config, tail_logits, forward_active, scheduler
+        )
     finally:
+        pending = sys.exc_info()[1]
+        rollback_error = None
         for req, keep in zip(reqs, committed):
             clear_prefill_tail_logits(req)
-            scheduler._opt_rollback(req, keep)
+            try:
+                scheduler._opt_rollback(req, keep)
+            except Exception as rollback_exc:
+                logger.warning(
+                    "[OPT] rollback after batch expand failed for %s: %s",
+                    getattr(req, "rid", None),
+                    rollback_exc,
+                )
+                rollback_error = rollback_exc
             if not scheduler._sr_is_finished(req):
                 scheduler._sr_pause_req(req)
         scheduler.last_batch = None
         scheduler.cur_batch = None
+        if rollback_error is not None and pending is None:
+            raise rollback_error

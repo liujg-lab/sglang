@@ -1345,6 +1345,51 @@ class OptTreeRemoteTest(CustomTestCase):
             pending = pending[len(group) :]
         self.assertEqual([len(group) for group in groups], [1, 1])
 
+    def test_verify_budget_includes_evictable_cache(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+
+        def scheduler(available, evictable):
+            return SimpleNamespace(
+                token_to_kv_pool_allocator=SimpleNamespace(
+                    available_size=lambda: available
+                ),
+                tree_cache=SimpleNamespace(page_size=1, evictable_size=evictable),
+                server_args=SimpleNamespace(opt_tree_width=60),
+            )
+
+        radix = scheduler(70, lambda: 100)
+        chunk = scheduler(70, lambda: 0)
+
+        def raise_evictable():
+            raise NotImplementedError
+
+        hybrid = scheduler(70, raise_evictable)
+        self.assertEqual(forward._verify_layer_budget(radix), 170)
+        self.assertEqual(forward._verify_layer_budget(chunk), 70)
+        self.assertEqual(forward._verify_layer_budget(hybrid), 70)
+
+        runners = [SimpleNamespace(cached_len=0) for _ in range(3)]
+        steps = [object(), object(), object()]
+        seen = []
+
+        def fake_batch(_scheduler, group_runners, _steps):
+            seen.append(len(group_runners))
+            return [object() for _ in group_runners]
+
+        original = forward._forward_verify_batch
+        try:
+            forward._forward_verify_batch = fake_batch
+            rows = forward._forward_verify_fitting(radix, runners, steps)
+            self.assertEqual(seen, [2, 1])
+            self.assertEqual(len(rows), 3)
+            seen.clear()
+            forward._forward_verify_fitting(chunk, runners, steps)
+            self.assertEqual(seen, [1, 1, 1])
+        finally:
+            forward._forward_verify_batch = original
+
     def test_batch_fallback_expands_only_missing_windows(self):
         from unittest.mock import patch
 
@@ -1376,33 +1421,97 @@ class OptTreeRemoteTest(CustomTestCase):
         forward.produce_opt_windows(alone, SRAction.STEP, [(None, _OptReq())])
         self.assertEqual(alone._sr_round_metrics.counts["opt_batch_fallbacks"], 0)
 
-    def test_expand_failure_counts_empty_draft(self):
-        import logging
-        import textwrap
-        from pathlib import Path
+    def test_device_context_error_skips_batch_fallback(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
+        cleared = []
+        host = _OptWindowHost(assign_pool=True)
+        host._sr_device_poisoned = False
+        host._sr_clear_stamps_after_poison = lambda: cleared.append(1)
+
+        def grow(_scheduler, _reqs):
+            raise RuntimeError("cudaErrorIllegalAddress")
+
+        with patch.object(forward, "grow_batch", grow):
+            with self.assertRaises(RuntimeError) as ctx:
+                forward.produce_opt_windows(
+                    host,
+                    SRAction.STEP,
+                    [(None, _OptReq()), (None, _OptReq())],
+                )
+        self.assertIn("cudaErrorIllegalAddress", str(ctx.exception))
+        self.assertNotIn("expand", host.calls)
+        self.assertTrue(host._sr_device_poisoned)
+        self.assertEqual(cleared, [1])
+
+        plain = _OptWindowHost(assign_pool=True)
+        plain._sr_device_poisoned = False
+
+        def ordinary(_scheduler, _reqs):
+            raise RuntimeError("shape mismatch")
+
+        with patch.object(forward, "grow_batch", ordinary):
+            windows = forward.produce_opt_windows(
+                plain,
+                SRAction.STEP,
+                [(None, _OptReq()), (None, _OptReq())],
+            )
+        self.assertEqual(windows, [([7], [-1], [0]), ([7], [-1], [0])])
+        self.assertEqual(plain.calls.count("expand"), 2)
+        self.assertFalse(plain._sr_device_poisoned)
+
+    def test_layer_forward_device_error_poisons(self):
         from types import SimpleNamespace
 
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
-            clear_prefill_tail_logits,
+            grow_active_layers,
         )
+
+        config = OptTreeConfig(width=2, tau=-1.0, max_depth=4)
+        tails = [torch.zeros(4)]
+        cleared = []
+        scheduler = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_clear_stamps_after_poison=lambda: cleared.append(1),
+        )
+
+        def device_forward(_steps, _indices):
+            raise RuntimeError("cudaErrorIllegalAddress")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            grow_active_layers(config, tails, device_forward, scheduler)
+        self.assertIn("cudaErrorIllegalAddress", str(ctx.exception))
+        self.assertTrue(scheduler._sr_device_poisoned)
+        self.assertEqual(cleared, [1])
+
+        with self.assertRaises(RuntimeError):
+            grow_active_layers(config, tails, device_forward, None)
+
+        plain = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_clear_stamps_after_poison=lambda: cleared.append(1),
+        )
+
+        def ordinary_forward(_steps, _indices):
+            raise RuntimeError("shape mismatch")
+
+        results = grow_active_layers(config, tails, ordinary_forward, plain)
+        self.assertEqual(results, [None])
+        self.assertFalse(plain._sr_device_poisoned)
+        self.assertEqual(cleared, [1])
+
+    def test_expand_failure_counts_empty_draft(self):
+        from types import SimpleNamespace
+
         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
             get_sr_round_metrics,
         )
 
-        path = (
-            Path(__file__).resolve().parents[4]
-            / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
-        )
-        src = path.read_text()
-        start = src.index("    def _opt_expand_one(")
-        end = src.index("\n    def _opt_handle_batch_impl(")
-        ns = {
-            "get_sr_round_metrics": get_sr_round_metrics,
-            "logger": logging.getLogger("opt-expand-test"),
-            "clear_prefill_tail_logits": clear_prefill_tail_logits,
-        }
-        code = "from __future__ import annotations\n" + textwrap.dedent(src[start:end])
-        exec(compile(code, str(path), "exec"), ns)
+        expand = _load_opt_expand_one()
 
         def release(_req):
             raise RuntimeError("kv")
@@ -1418,11 +1527,180 @@ class OptTreeRemoteTest(CustomTestCase):
             cur_batch=None,
         )
         req = SimpleNamespace(rid="opt-fail", origin_input_ids=[1], output_ids=[])
-        window = ns["_opt_expand_one"](host, req)
+        window = expand(host, req)
         self.assertEqual(window, ([], None, None))
         self.assertEqual(
             get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 1
         )
+
+    def test_expand_device_error_reraises_through_rollback(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        expand = _load_opt_expand_one()
+        cleared = []
+        paused = []
+
+        def release(_req):
+            raise RuntimeError("cudaErrorIllegalAddress")
+
+        def rollback(_req, _keep):
+            raise RuntimeError("acl stream synchronize failed")
+
+        host = SimpleNamespace(
+            _sr_resume_req=lambda _req: None,
+            _sr_isolate_need=lambda _rids: None,
+            _opt_release_uncommitted=release,
+            _opt_rollback=rollback,
+            _sr_is_finished=lambda _req: False,
+            _sr_pause_req=lambda _req: paused.append(1),
+            _sr_device_poisoned=False,
+            _sr_clear_stamps_after_poison=lambda: cleared.append(1),
+            last_batch="stale",
+            cur_batch="stale",
+        )
+        req = SimpleNamespace(rid="opt-device", origin_input_ids=[1], output_ids=[])
+        with self.assertRaises(RuntimeError) as ctx:
+            expand(host, req)
+        self.assertIn("cudaErrorIllegalAddress", str(ctx.exception))
+        self.assertNotIn("acl stream synchronize failed", str(ctx.exception))
+        self.assertTrue(host._sr_device_poisoned)
+        self.assertEqual(cleared, [1])
+        self.assertEqual(paused, [1])
+        self.assertIsNone(host.last_batch)
+        self.assertIsNone(host.cur_batch)
+        self.assertEqual(
+            get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 0
+        )
+
+    def test_materialize_tree_seed_switch(self):
+        from types import SimpleNamespace
+
+        def run(capture_tree_seed=None):
+            host = _materialize_host_from_source()
+            calls = []
+            host._sr_enable_tree_seed_hidden = lambda _batch: calls.append("enable")
+            host._sr_cache_tree_seeds = lambda *_args, **_kwargs: calls.append("cache")
+            origin = [1, 2, 3]
+            req = SimpleNamespace(
+                rid="opt-seed",
+                origin_input_ids=list(origin),
+                output_ids=[],
+                req_pool_idx=None,
+                kv_committed_len=0,
+                draft_is_paused=False,
+                draft_generation_start_len=0,
+                finished=lambda: False,
+            )
+
+            class _Extend:
+                def is_extend(self):
+                    return True
+
+            def next_batch():
+                req.req_pool_idx = 1
+                req.kv_committed_len = len(origin)
+                host.chunked_req = None
+                return SimpleNamespace(
+                    reqs=[req],
+                    forward_mode=_Extend(),
+                    is_extend_in_batch=False,
+                )
+
+            host.get_next_batch_to_run = next_batch
+            host.run_batch = lambda _batch: SimpleNamespace(logits_output=None)
+            host.process_batch_result = lambda *_args, **_kwargs: None
+            kwargs = {}
+            if capture_tree_seed is not None:
+                kwargs["capture_tree_seed"] = capture_tree_seed
+            host._sr_materialize_prefix_batch([req], **kwargs)
+            return calls
+
+        self.assertEqual(run(), ["enable", "cache"])
+        self.assertEqual(run(False), [])
+
+    def test_opt_materialize_forces_tree_seed_off(self):
+        from types import SimpleNamespace
+
+        opt_cls = _load_opt_materialize_override()
+
+        def captured(is_opt, requested):
+            host = opt_cls()
+            host.spec_algorithm = SimpleNamespace(
+                is_opt_tree_remote=lambda: is_opt
+            )
+            host._sr_materialize_prefix_batch([], capture_tree_seed=requested)
+            return host.captured
+
+        self.assertFalse(captured(True, True))
+        self.assertTrue(captured(False, True))
+        self.assertFalse(captured(False, False))
+
+
+def _load_opt_materialize_override():
+    """Load OPT's materialize override with a recording ``super()``."""
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("    def _sr_materialize_prefix_batch(")
+    end = src.index("\n    def maybe_notify_remote_draft_finished(")
+    code = (
+        "class _Super:\n"
+        "    def _sr_materialize_prefix_batch(\n"
+        "        self, reqs, on_extend_logits=None, logits_survive=None,\n"
+        "        capture_tree_seed=True,\n"
+        "    ):\n"
+        "        self.captured = capture_tree_seed\n"
+        "\n"
+        "class _Opt(_Super):\n"
+        + src[start:end]
+    )
+    ns = {}
+    exec(compile(code, str(path), "exec"), ns)
+    return ns["_Opt"]
+
+
+def _load_opt_expand_one():
+    """Load ``_opt_expand_one`` from source.
+
+    Importing the scheduler module pulls sampler and quantization kernels
+    that the CPU suite does not provide.
+    """
+    import logging
+    import textwrap
+    from pathlib import Path
+
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+        _reraise_device_context,
+        clear_prefill_tail_logits,
+    )
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("    def _opt_expand_one(")
+    end = src.index("\n    def _opt_handle_batch_impl(")
+    ns = {
+        "get_sr_round_metrics": get_sr_round_metrics,
+        "logger": logging.getLogger("opt-expand-test"),
+        "clear_prefill_tail_logits": clear_prefill_tail_logits,
+        "_reraise_device_context": _reraise_device_context,
+    }
+    code = "from __future__ import annotations\n" + textwrap.dedent(src[start:end])
+    exec(compile(code, str(path), "exec"), ns)
+    return ns["_opt_expand_one"]
 
 
 def _materialize_host():
