@@ -1683,7 +1683,7 @@ class OptTreeRemoteTest(CustomTestCase):
 
         def fake_batch(_scheduler, group_runners, _steps):
             seen.append(len(group_runners))
-            return [object() for _ in group_runners]
+            return [torch.zeros(1) for _ in group_runners]
 
         original = forward._forward_verify_batch
         try:
@@ -1696,6 +1696,120 @@ class OptTreeRemoteTest(CustomTestCase):
             self.assertEqual(seen, [1, 1, 1])
         finally:
             forward._forward_verify_batch = original
+
+    def test_split_verify_replays_match_one_batch(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            grow_active_layers,
+        )
+
+        width = 2
+        vocab = 4
+        config = OptTreeConfig(width=width, tau=-1.0, max_depth=4)
+
+        def peaked(token):
+            row = torch.full((width, vocab), -8.0)
+            row[:, int(token)] = 8.0
+            return row
+
+        tails = [
+            torch.tensor([8.0, -8.0, -8.0, -8.0]),
+            torch.tensor([-8.0, 8.0, -8.0, -8.0]),
+        ]
+        layers = [
+            [peaked(0), peaked(2)],
+            [peaked(1), peaked(3)],
+        ]
+
+        def run(budget):
+            queues = [[row.clone() for row in rows] for rows in layers]
+            runners = [SimpleNamespace(cached_len=0, idx=i) for i in range(2)]
+            scheduler = SimpleNamespace(
+                token_to_kv_pool_allocator=SimpleNamespace(
+                    available_size=lambda: budget
+                ),
+                tree_cache=SimpleNamespace(page_size=1, evictable_size=lambda: 0),
+                server_args=SimpleNamespace(opt_tree_width=width),
+            )
+            calls = []
+            buf = torch.empty(2, width, vocab)
+
+            def fake_batch(_scheduler, group_runners, _steps):
+                count = len(group_runners)
+                calls.append(count)
+                for row, runner in enumerate(group_runners):
+                    buf[row].copy_(queues[runner.idx].pop(0))
+                return buf[:count]
+
+            def forward_active(steps, indices):
+                chosen = [runners[i] for i in indices]
+                return forward._forward_verify_fitting(scheduler, chosen, steps)
+
+            original = forward._forward_verify_batch
+            try:
+                forward._forward_verify_batch = fake_batch
+                got = grow_active_layers(config, tails, forward_active)
+            finally:
+                forward._forward_verify_batch = original
+            return got, calls
+
+        split, split_calls = run(width)
+        whole, whole_calls = run(width * 2)
+        self.assertEqual(split_calls, [1, 1, 1, 1])
+        self.assertEqual(whole_calls, [2, 2])
+        self.assertEqual(split, whole)
+
+    def test_tail_logits_survive_a_later_replay(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _logits_at_tail_batch,
+        )
+
+        class _Info:
+            is_all_greedy = False
+            temperatures = torch.ones(2, 1)
+            logit_bias = None
+            has_custom_logit_processor = False
+            penalizer_orchestrator = None
+            need_top_p_sampling = True
+            need_top_k_sampling = True
+            need_min_p_sampling = True
+            acc_additive_penalties = None
+            acc_scaling_penalties = None
+            vocab_mask = None
+
+        buffer = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        batch = SimpleNamespace(
+            output_ids=torch.tensor([7, 8]),
+            sampling_info=_Info(),
+            has_grammar=False,
+            return_logprob=True,
+            return_hidden_states=True,
+        )
+        scheduler = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[4, 5]])
+            ),
+            _sr_make_decode_batch=lambda _reqs: batch,
+            run_batch=lambda _batch: SimpleNamespace(
+                logits_output=SimpleNamespace(next_token_logits=buffer)
+            ),
+            cur_batch=None,
+        )
+        runners = [
+            SimpleNamespace(
+                prefix_len=2,
+                req=SimpleNamespace(rid=f"opt-tail-{i}", req_pool_idx=0),
+            )
+            for i in range(2)
+        ]
+        rows = _logits_at_tail_batch(scheduler, runners)
+        buffer.zero_()
+        self.assertEqual(rows[0].tolist(), [1.0, 0.0, 0.0])
+        self.assertEqual(rows[1].tolist(), [0.0, 1.0, 0.0])
 
     def test_batch_fallback_expands_only_missing_windows(self):
         from unittest.mock import patch

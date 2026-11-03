@@ -1045,7 +1045,11 @@ def _verify_batch_many(
 
 
 def _logits_at_tail_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
-    """One DECODE row per request, reusing the committed tail slot."""
+    """One DECODE row per request, reusing the committed tail slot.
+
+    Each row is copied. A later DECODE replay in the same ingest writes the
+    same graph output buffer and would otherwise replace these views.
+    """
     phases = _phase_clock(phases)
     if not runners:
         phases.lap("opt_ingest_batch")
@@ -1073,7 +1077,7 @@ def _logits_at_tail_batch(scheduler, runners, phases=None) -> List[torch.Tensor]
         raise RuntimeError(
             f"OPT tail logits rows {int(logits.shape[0])} != {len(runners)} requests"
         )
-    return [logits[i] for i in range(len(runners))]
+    return [logits[i].clone() for i in range(len(runners))]
 
 
 def _extend_span_batch(scheduler, runners, ends, phases=None) -> List[torch.Tensor]:
@@ -1243,7 +1247,10 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
     """Run one layer in sub-batches that fit free plus evictable KV tokens.
 
     ``consume(group_runners, rows)`` runs before the next replay, while a
-    graph output view still holds this sub-batch.
+    graph output view still holds this sub-batch. A group that is not last
+    is copied: the next replay overwrites that output buffer before
+    ``_commit_prob_rows`` reads the returned rows. The last group stays a
+    view because the caller reads it before the next layer.
     """
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
@@ -1265,6 +1272,8 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
         group_rows = _as_layer_rows(logits, count, width)
         if consume is not None:
             consume(group_runners, group_rows)
+        if count < len(pending):
+            group_rows = [row.clone() for row in group_rows]
         rows.extend(group_rows)
         pending = pending[count:]
     return rows
