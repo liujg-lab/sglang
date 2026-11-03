@@ -1576,6 +1576,97 @@ class OptTreeRemoteTest(CustomTestCase):
             get_sr_round_metrics(host, "Draft").counts["opt_expand_failures"], 0
         )
 
+    def test_grow_batch_records_draft_stage_times(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        syncs = []
+        host = _opt_stage_host()
+        req = _opt_stage_req("opt-batch")
+
+        def ingest(_scheduler, _runners):
+            return [torch.zeros(4)]
+
+        def grow(_config, _tails, forward_active, _scheduler):
+            forward_active(["layer-0"], [0])
+            forward_active(["layer-1"], [0])
+            return [([1], [-1], [0])]
+
+        def fitting(_scheduler, _runners, _steps):
+            return [torch.zeros(1)]
+
+        metrics = get_sr_round_metrics(host, "Draft")
+        with patch.object(forward, "ingest_tail_logits", ingest), patch.object(
+            forward, "grow_active_layers", grow
+        ), patch.object(forward, "_forward_verify_fitting", fitting), patch.object(
+            forward.torch, "get_device_module", lambda _device: _SyncProbe(syncs)
+        ):
+            with metrics.round():
+                windows = forward.grow_batch(host, [req])
+        self.assertEqual(windows, [([1], [-1], [0])])
+        self.assertEqual(syncs, [1])
+        self.assertIn("opt_ingest", metrics.host)
+        self.assertIn("opt_grow", metrics.host)
+        self.assertGreaterEqual(metrics.host["opt_ingest"], 0)
+        self.assertGreaterEqual(metrics.host["opt_grow"], 0)
+        self.assertEqual(metrics.counts["opt_layer_forwards"], 2)
+        self.assertEqual(metrics.counts["opt_rounds"], 1)
+
+    def test_expand_records_draft_stage_times(self):
+        import time
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        syncs = []
+        expand = _load_opt_expand_one()
+        globals_ = expand.__globals__
+        globals_["time"] = time
+        globals_["torch"] = SimpleNamespace(
+            get_device_module=lambda _device: _SyncProbe(syncs)
+        )
+        globals_["OptTreeConfig"] = OptTreeConfig
+
+        class _Runner:
+            def __init__(self, _scheduler, _req, _prefix_len):
+                self.steps = []
+
+            def forward_layer(self, step):
+                self.steps.append(step)
+                return torch.zeros(1)
+
+        globals_["OptLayerForward"] = _Runner
+
+        def ingest(_scheduler, _runners):
+            return [torch.zeros(4)]
+
+        def grow(_config, _tail, forward_layer):
+            forward_layer("layer-0")
+            forward_layer("layer-1")
+            return [1], [-1], [0]
+
+        globals_["ingest_tail_logits"] = ingest
+        globals_["grow_with_forwards"] = grow
+        host = _opt_stage_host()
+        req = _opt_stage_req("opt-expand")
+        metrics = get_sr_round_metrics(host, "Draft")
+        with metrics.round():
+            window = expand(host, req)
+        self.assertEqual(window, ([1], [-1], [0]))
+        self.assertEqual(syncs, [1])
+        self.assertIn("opt_ingest", metrics.host)
+        self.assertIn("opt_grow", metrics.host)
+        self.assertGreaterEqual(metrics.host["opt_ingest"], 0)
+        self.assertGreaterEqual(metrics.host["opt_grow"], 0)
+        self.assertEqual(metrics.counts["opt_layer_forwards"], 2)
+        self.assertEqual(metrics.counts["opt_rounds"], 1)
+
     def test_materialize_tree_seed_switch(self):
         from types import SimpleNamespace
 
@@ -1665,6 +1756,44 @@ def _load_opt_materialize_override():
     ns = {}
     exec(compile(code, str(path), "exec"), ns)
     return ns["_Opt"]
+
+
+class _SyncProbe:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def synchronize(self):
+        self.calls.append(1)
+
+
+def _opt_stage_host():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        device="cpu",
+        server_args=SimpleNamespace(
+            opt_tree_width=4, opt_tree_tau=0.1, opt_tree_max_depth=8
+        ),
+        _sr_resume_req=lambda _req: None,
+        _sr_isolate_need=lambda _rids: None,
+        _opt_release_uncommitted=lambda _req: None,
+        _opt_rollback=lambda _req, _keep: None,
+        _sr_is_finished=lambda _req: False,
+        _sr_pause_req=lambda _req: None,
+        last_batch=None,
+        cur_batch=None,
+    )
+
+
+def _opt_stage_req(rid):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        rid=rid,
+        origin_input_ids=[1, 2],
+        output_ids=[3],
+        kv_committed_len=3,
+    )
 
 
 def _load_opt_expand_one():

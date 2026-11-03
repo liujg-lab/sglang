@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -1220,22 +1221,43 @@ def grow_batch(scheduler, reqs):
         runners = [
             OptLayerForward(scheduler, req, keep) for req, keep in zip(reqs, committed)
         ]
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        metrics = get_sr_round_metrics(scheduler, "Draft")
+
+        def _sync():
+            if metrics.active:
+                torch.get_device_module(scheduler.device).synchronize()
+
+        t0 = time.perf_counter()
         tail_logits = ingest_tail_logits(scheduler, runners)
+        _sync()
+        metrics.add_host("opt_ingest", time.perf_counter() - t0)
         for runner, keep in zip(runners, committed):
             written = int(getattr(runner.req, "kv_committed_len", 0) or 0)
             if written != keep:
                 raise RuntimeError(
                     f"OPT draft {runner.req.rid} committed KV {written} != {keep} tokens"
                 )
+        layers = 0
 
         def forward_active(steps, indices):
+            nonlocal layers
+            layers += 1
             return _forward_verify_fitting(
                 scheduler, [runners[i] for i in indices], steps
             )
 
-        return grow_active_layers(
+        t1 = time.perf_counter()
+        windows = grow_active_layers(
             config, tail_logits, forward_active, scheduler
         )
+        metrics.add_host("opt_grow", time.perf_counter() - t1)
+        metrics.counts["opt_layer_forwards"] += layers
+        metrics.counts["opt_rounds"] += 1
+        return windows
     finally:
         pending = sys.exc_info()[1]
         rollback_error = None

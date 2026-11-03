@@ -13,6 +13,8 @@ import time
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -246,17 +248,37 @@ class OptTreeSchedulerMixin:
                 max_depth=int(self.server_args.opt_tree_max_depth),
             )
             runner = OptLayerForward(self, req, committed)
+            metrics = get_sr_round_metrics(self, "Draft")
+
+            def _sync():
+                if metrics.active:
+                    torch.get_device_module(self.device).synchronize()
+
+            t0 = time.perf_counter()
             tail_logits = ingest_tail_logits(self, [runner])[0]
+            _sync()
+            metrics.add_host("opt_ingest", time.perf_counter() - t0)
             written = int(getattr(req, "kv_committed_len", 0) or 0)
             if written != committed:
                 raise RuntimeError(
                     f"OPT draft {req.rid} committed KV {written} != {committed} tokens"
                 )
+            layers = 0
+
+            def timed_forward(step):
+                nonlocal layers
+                layers += 1
+                return runner.forward_layer(step)
+
+            t1 = time.perf_counter()
             tokens, parents, cols = grow_with_forwards(
                 config,
                 tail_logits,
-                runner.forward_layer,
+                timed_forward,
             )
+            metrics.add_host("opt_grow", time.perf_counter() - t1)
+            metrics.counts["opt_layer_forwards"] += layers
+            metrics.counts["opt_rounds"] += 1
             return tokens, parents, cols
         except Exception as exc:
             _reraise_device_context(self, exc)
