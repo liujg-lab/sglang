@@ -450,19 +450,28 @@ def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
     return [t[i * width : (i + 1) * width] for i in range(bs)]
 
 
-def _commit_prob_rows(states, indices, logits_rows, *, seed: bool):
-    """Softmax each row, copy one stacked top-k, then update those trees."""
+def _commit_prob_rows(states, indices, logits_rows, *, seed: bool, topk_out=None):
+    """Softmax each row, copy one stacked top-k, then update those trees.
+
+    The copy keeps ``N + 1`` ids. The tree still uses the first ``N``. The
+    extra id is the bonus once every verify child of that node is excluded.
+    ``topk_out[index]`` receives the full id tensor: ``[N + 1]`` for the root
+    and ``[N, N + 1]`` for a layer.
+    """
+    width = int(states[indices[0]].config.width)
     probs = [softmax_probs(row) for row in logits_rows]
-    scores, ids = host_topk_rows(probs, int(states[indices[0]].config.width), seed=seed)
+    scores, ids = host_topk_rows(probs, width + 1, seed=seed)
     written = []
     for row, index in enumerate(indices):
         state = states[index]
         if state.finished:
             raise RuntimeError("update called after finish")
         if seed:
-            seed_from_topk(state, scores[row], ids[row])
+            seed_from_topk(state, scores[row][:width], ids[row][:width])
         else:
-            expand_from_topk(state, scores[row], ids[row])
+            expand_from_topk(state, scores[row][:, :width], ids[row][:, :width])
+        if topk_out is not None:
+            topk_out[index].append(ids[row])
         written.append(step_after_layer(state))
     return written
 
@@ -492,6 +501,7 @@ def grow_active_layers(
     forward_active: Callable,
     scheduler=None,
     states_out=None,
+    topk_out=None,
 ):
     """Grow one tree per tail. Requests still at one depth share a forward.
 
@@ -504,6 +514,7 @@ def grow_active_layers(
 
     ``states_out``, when given, receives each tree in tail order before any
     forward. The last layer is present and is not forwarded.
+    ``topk_out[i]`` collects that tail's host id tensors, root first.
     """
     tails = list(tail_logits)
     states = [OptTreeState.create(config) for _ in tails]
@@ -514,7 +525,7 @@ def grow_active_layers(
     active: List[int] = []
     if tails:
         seeded = _commit_prob_rows(
-            states, list(range(len(tails))), tails, seed=True
+            states, list(range(len(tails))), tails, seed=True, topk_out=topk_out
         )
         for i, step in enumerate(seeded):
             steps[i] = step
@@ -542,7 +553,8 @@ def grow_active_layers(
         rows = _as_layer_rows(logits, len(active), config.width)
         nxt: List[int] = []
         for i, step in zip(
-            active, _commit_prob_rows(states, active, rows, seed=False)
+            active,
+            _commit_prob_rows(states, active, rows, seed=False, topk_out=topk_out),
         ):
             steps[i] = step
             if step.is_final:
@@ -570,9 +582,10 @@ class OptLayerSpec:
     draft_token_num: int
     num_tokens_per_req: int
     capture_hidden_mode: object = None
-    # Bonus queries must hide sibling tree KV. Layer forwards leave this
-    # false so they keep the captured verify graph.
-    apply_prefix_custom_mask: bool = False
+    # Earlier layers sit in the KV prefix, so every TARGET_VERIFY reads that
+    # part of the mask. ``is_bonus`` only selects the N+1 graph key.
+    apply_prefix_custom_mask: bool = True
+    is_bonus: bool = False
 
     def is_draft_input(self) -> bool:
         return False
@@ -582,13 +595,13 @@ class OptLayerSpec:
 
 
 # Graph-key suffix for the bonus verify graph. Layer forwards stay on the
-# unsuffixed ``r{N}_{bs}`` graph, whose kernel skips the prefix mask.
+# unsuffixed ``r{N}_{bs}`` graph. Both graphs apply the prefix mask.
 OPT_BONUS_GRAPH_EXTRA = 0
 
 
 def opt_bonus_graph_extra(spec_info):
     """Extra graph key for a bonus forward, or None for a layer forward."""
-    if getattr(spec_info, "apply_prefix_custom_mask", False):
+    if getattr(spec_info, "is_bonus", False):
         return OPT_BONUS_GRAPH_EXTRA
     return None
 
@@ -611,7 +624,8 @@ def opt_draft_capture_extra_keys(server_args, ntpb) -> list:
     """Layer graphs stay unsuffixed. Only the N+1 bonus graph uses extra 0.
 
     ``ntpb == 1`` is the DECODE graph and is not duplicated. The width-N
-    verify graph is the layer forward and skips the prefix mask.
+    verify graph is the layer forward. Both graphs apply the prefix mask;
+    the suffix only separates the bonus width.
     """
     if getattr(server_args, "opt_tree_role", None) != "draft":
         return [None]
@@ -626,7 +640,7 @@ def opt_layer_verify_graph_matches(spec_info, actual_ntpb: int) -> bool:
 
     The captured ntpb must equal this spec's query width. The ntpb=1 dual
     graph is DECODE, so width 1 stays eager. A bonus spec uses width N+1 and
-    the runner selects that prefix-mask graph via ``opt_bonus_graph_extra``.
+    the runner selects that graph via ``opt_bonus_graph_extra``.
     """
     if not isinstance(spec_info, OptLayerSpec):
         return False
@@ -644,8 +658,7 @@ class OptLayerForward:
         self.prefix_len = int(prefix_len)
         self.cached_len = int(prefix_len)
         self.layer_slots: List[torch.Tensor] = []
-        self.tail_logits: Optional[torch.Tensor] = None
-        self.layer_logits: List[torch.Tensor] = []
+        self.bonus_ids: List[torch.Tensor] = []
 
     def logits_at_tail(self) -> torch.Tensor:
         """Recompute the committed tail in its existing KV slot."""
@@ -752,7 +765,6 @@ class OptLayerForward:
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
         logits = _row_logits(self._run(batch), n, tail=False)
         self.cached_len += n
-        self.layer_logits.append(logits.detach())
         return logits
 
     def _alloc_layer_slots(self, n: int, start: Optional[int] = None) -> torch.Tensor:
@@ -806,9 +818,8 @@ class OptLayerForward:
         )
         if start is None:
             # Ingest passes start= and must not become part of the tree lease.
-            self.layer_slots.append(
-                out_cache_loc.detach().to(device="cpu").reshape(-1).clone()
-            )
+            # Stay on the allocator device; publish copies every layer once.
+            self.layer_slots.append(out_cache_loc.detach().reshape(-1).clone())
         return out_cache_loc
 
     def _verify_batch(self, tokens, positions, mask, out_cache_loc):
@@ -993,7 +1004,7 @@ def _verify_batch_many(
     custom_mask,
     out_cache_loc,
     cached,
-    apply_prefix_custom_mask: bool = False,
+    is_bonus: bool = False,
 ):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -1026,7 +1037,8 @@ def _verify_batch_many(
         draft_token_num=width,
         num_tokens_per_req=width,
         capture_hidden_mode=CaptureHiddenMode.NULL,
-        apply_prefix_custom_mask=bool(apply_prefix_custom_mask),
+        apply_prefix_custom_mask=True,
+        is_bonus=bool(is_bonus),
     )
     _keep_raw_logits(batch)
     return batch
@@ -1227,8 +1239,12 @@ def _verify_layer_budget(scheduler) -> int:
     return budget + int(extra)
 
 
-def _forward_verify_fitting(scheduler, runners, steps):
-    """Run one layer in sub-batches that fit free plus evictable KV tokens."""
+def _forward_verify_fitting(scheduler, runners, steps, consume=None):
+    """Run one layer in sub-batches that fit free plus evictable KV tokens.
+
+    ``consume(group_runners, rows)`` runs before the next replay, while a
+    graph output view still holds this sub-batch.
+    """
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
     page = int(getattr(scheduler.tree_cache, "page_size", 1) or 1)
@@ -1246,7 +1262,10 @@ def _forward_verify_fitting(scheduler, runners, steps):
         count = len(group_runners)
         group_steps = [step for _runner, step in pending[:count]]
         logits = _forward_verify_batch(scheduler, group_runners, group_steps)
-        rows.extend(_as_layer_rows(logits, count, width))
+        group_rows = _as_layer_rows(logits, count, width)
+        if consume is not None:
+            consume(group_runners, group_rows)
+        rows.extend(group_rows)
         pending = pending[count:]
     return rows
 
@@ -1427,6 +1446,14 @@ def _decode_uncommitted_batch(scheduler, runners, phases=None) -> List[torch.Ten
     return [saved[id(runner)] for runner in runners]
 
 
+def _opt_draft_count(scheduler, name: str, n: int = 1) -> None:
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    get_sr_round_metrics(scheduler, "Draft").counts[name] += int(n)
+
+
 def ingest_tail_logits(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """Logits after each committed tail, without SR's per-token decode threshold."""
     phases = _phase_clock(phases)
@@ -1442,6 +1469,7 @@ def ingest_tail_logits(scheduler, runners, phases=None) -> List[torch.Tensor]:
         cached_row = take_cached_tail_logits(runner.req, runner.prefix_len)
         if cached_row is not None:
             logits[id(runner)] = cached_row
+            _opt_draft_count(scheduler, "opt_ingest_zero_fwd")
             continue
         mode = plan_opt_tail(runner.req, limit, page)
         if mode == "reprefill":
@@ -1546,25 +1574,39 @@ class _BonusCandidate:
     keep: bool = True
 
 
-def exclude_children_argmax(row: torch.Tensor, banned) -> Optional[int]:
-    """Highest-logit token that is not one of ``banned``.
+def _first_unbanned(ids, banned) -> Optional[int]:
+    """First ranked id that is not one of ``banned``.
 
-    Under greedy the bonus is never a verify child, so dropping those ids is
-    exact. A non-greedy bonus that was excluded simply misses.
+    The ids are already the node's top ``N + 1``. A verify child is one of
+    the first ``N``, so the next id is the bonus.
     """
-    work = row.detach().float().reshape(-1).clone()
-    if work.numel() == 0:
+    if ids is None or not torch.is_tensor(ids) or int(ids.numel()) == 0:
         return None
-    ids = [
-        int(token)
-        for token in banned
-        if 0 <= int(token) < int(work.numel())
-    ]
-    if ids:
-        work[torch.tensor(ids, dtype=torch.long)] = float("-inf")
-    if not bool(torch.isfinite(work).any()):
-        return None
-    return int(torch.argmax(work).item())
+    ban = {int(token) for token in banned}
+    for token in ids.detach().reshape(-1).tolist():
+        token = int(token)
+        if token not in ban:
+            return token
+    return None
+
+
+def _host_bonus_ids(row: torch.Tensor, k: int) -> torch.Tensor:
+    """Top-k token ids of one layer, on CPU before the next replay."""
+    ids = torch.topk(row.detach().float(), k=int(k), dim=-1).indices
+    return ids.detach().to(device="cpu", dtype=torch.long)
+
+
+def _append_layer_bonus_ids(runners, rows) -> None:
+    """Store one host ``[N, N + 1]`` id tensor per request in this sub-batch."""
+    for runner, row in zip(runners, rows):
+        if runner is None or not torch.is_tensor(row):
+            continue
+        width = int(runner.scheduler.server_args.opt_tree_width)
+        ids = getattr(runner, "bonus_ids", None)
+        if ids is None:
+            runner.bonus_ids = []
+            ids = runner.bonus_ids
+        ids.append(_host_bonus_ids(row, width + 1))
 
 
 def ancestor_columns(state, prefix: int, depth: int, col: int) -> Tuple[int, ...]:
@@ -1657,23 +1699,12 @@ def bonus_attention_mask(
 def _drop_stored_logits(runner) -> None:
     if runner is None:
         return
-    runner.tail_logits = None
-    if getattr(runner, "layer_logits", None):
-        runner.layer_logits = []
-
-
-def _stash_layer_logits(runner, row) -> None:
-    if runner is None or not torch.is_tensor(row):
-        return
-    rows = getattr(runner, "layer_logits", None)
-    if rows is None:
-        runner.layer_logits = []
-        rows = runner.layer_logits
-    rows.append(row.detach())
+    if getattr(runner, "bonus_ids", None):
+        runner.bonus_ids = []
 
 
 def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
-    """Argmax at the root and every verify node, excluding verify children."""
+    """First top-(N+1) id at the root and every verify node that is not a child."""
     if state is None or window is None or len(window) != 3 or runner is None:
         return []
     tokens, parents, cols = window
@@ -1686,27 +1717,25 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
         return []
     width = int(state.config.width)
     prefix = int(getattr(runner, "prefix_len", 0) or 0)
-    layer_logits = list(getattr(runner, "layer_logits", None) or [])
+    bonus_ids = list(getattr(runner, "bonus_ids", None) or [])
     plans: List[_BonusCandidate] = []
 
-    def add(parent, row, banned, position, chain):
-        if not torch.is_tensor(row):
-            return
-        token = exclude_children_argmax(row, banned)
+    def add(parent, ids, banned, position, chain):
+        token = _first_unbanned(ids, banned)
         if token is None:
             return
         plans.append(_BonusCandidate(int(parent), int(token), int(position), tuple(chain)))
 
-    tail = getattr(runner, "tail_logits", None)
-    if torch.is_tensor(tail):
+    if bonus_ids:
         banned = [int(tokens[i]) for i, parent in enumerate(parents) if int(parent) == -1]
-        add(-1, tail, banned, prefix, ())
+        add(-1, bonus_ids[0], banned, prefix, ())
     for index, depth in enumerate(depths):
         depth = int(depth)
         col = int(cols[index])
-        if depth < 0 or depth >= len(layer_logits) or not (0 <= col < width):
+        slot = depth + 1
+        if slot < 0 or slot >= len(bonus_ids) or not (0 <= col < width):
             continue
-        row = layer_logits[depth]
+        row = bonus_ids[slot]
         if not torch.is_tensor(row) or row.dim() < 1 or col >= int(row.shape[0]):
             continue
         banned = [int(tokens[j]) for j, parent in enumerate(parents) if int(parent) == index]
@@ -1751,7 +1780,7 @@ def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: in
             mask.reshape(-1),
             loc.reshape(-1),
             [tree_end],
-            apply_prefix_custom_mask=True,
+            is_bonus=True,
         )
         logits = _as_layer_rows(_run_batch(scheduler, batch), 1, width)[0]
     except Exception as exc:
@@ -1775,7 +1804,7 @@ def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: in
                 parent=int(plan.parent),
                 token=int(plan.token),
                 slot=slots[index],
-                logits=logits[index].detach().to(device="cpu").reshape(-1).clone(),
+                logits=logits[index].detach().clone(),
             )
         )
     try:
@@ -1823,16 +1852,21 @@ def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree) -> None:
     runner = job.runner
     try:
         if runner is None or _opt_page_size(scheduler) != 1:
+            _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
         if getattr(scheduler, "_sr_device_poisoned", False) or _request_finished(
             scheduler, job.req
         ):
+            _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
         if not hasattr(runner, "_alloc_layer_slots"):
+            _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
         plans = select_bonus_candidates(job.state, job.window, runner)
         if not plans:
+            _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
+        _opt_draft_count(scheduler, "opt_bonus_rounds")
         try:
             _forward_bonus_candidates(scheduler, runner, plans)
         except Exception as exc:
@@ -1918,13 +1952,12 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
             by_depth.setdefault(int(job.state.depth), []).append(job)
         for group in by_depth.values():
             try:
-                rows = _forward_verify_fitting(
+                _forward_verify_fitting(
                     scheduler,
                     [job.runner for job in group],
                     [final_layer_step(job.state) for job in group],
+                    consume=_append_layer_bonus_ids,
                 )
-                for job, row in zip(group, rows):
-                    _stash_layer_logits(job.runner, row)
             except Exception as exc:
                 for job in group:
                     _drop_unfinished_layer(scheduler, job)
@@ -2099,9 +2132,6 @@ def grow_batch(scheduler, reqs):
         phases = OptPhaseClock()
         t0 = time.perf_counter()
         tail_logits = ingest_tail_logits(scheduler, runners, phases=phases)
-        for runner, row in zip(runners, tail_logits):
-            if torch.is_tensor(row):
-                runner.tail_logits = row.detach()
         _sync()
         phases.lap("opt_ingest_forward")
         flush_opt_ingest_phases(metrics, phases.parts, time.perf_counter() - t0)
@@ -2116,17 +2146,22 @@ def grow_batch(scheduler, reqs):
         def forward_active(steps, indices):
             nonlocal layers
             layers += 1
-            rows = _forward_verify_fitting(
+            return _forward_verify_fitting(
                 scheduler, [runners[i] for i in indices], steps
             )
-            for index, row in zip(indices, rows):
-                _stash_layer_logits(runners[index], row)
-            return rows
 
         t1 = time.perf_counter()
+        topk_out = [[] for _ in runners]
         windows = grow_active_layers(
-            config, tail_logits, forward_active, scheduler, states_out=states
+            config,
+            tail_logits,
+            forward_active,
+            scheduler,
+            states_out=states,
+            topk_out=topk_out,
         )
+        for runner, ids in zip(runners, topk_out):
+            runner.bonus_ids = ids
         metrics.add_host("opt_grow", time.perf_counter() - t1)
         metrics.counts["opt_layer_forwards"] += layers
         metrics.counts["opt_rounds"] += 1

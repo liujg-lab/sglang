@@ -1184,15 +1184,16 @@ class OptTreeRemoteTest(CustomTestCase):
             draft_token_num=4,
             num_tokens_per_req=4,
             capture_hidden_mode=0,
-            apply_prefix_custom_mask=True,
+            is_bonus=True,
         )
+        self.assertTrue(spec.apply_prefix_custom_mask)
         self.assertTrue(opt_layer_verify_graph_matches(bonus, 4))
         self.assertEqual(opt_bonus_graph_extra(bonus), 0)
         self.assertIsNone(opt_bonus_graph_extra(spec))
         self.assertFalse(decode_cuda_graph_accepts_spec_info(spec))
         self.assertFalse(decode_cuda_graph_accepts_spec_info(width_one))
 
-    def test_bonus_batch_applies_prefix_mask_and_layer_batch_does_not(self):
+    def test_layer_and_bonus_batches_apply_prefix_mask(self):
         import sys
         from unittest.mock import patch
 
@@ -1279,10 +1280,12 @@ class OptTreeRemoteTest(CustomTestCase):
                 8,
                 4,
             )
-        self.assertFalse(layer.spec_info.apply_prefix_custom_mask)
+        self.assertTrue(layer.spec_info.apply_prefix_custom_mask)
+        self.assertFalse(layer.spec_info.is_bonus)
         self.assertTrue(opt_layer_verify_graph_matches(layer.spec_info, 4))
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0].spec_info.apply_prefix_custom_mask)
+        self.assertTrue(seen[0].spec_info.is_bonus)
         self.assertEqual(int(seen[0].spec_info.num_tokens_per_req), 4)
         self.assertTrue(opt_layer_verify_graph_matches(seen[0].spec_info, 4))
         self.assertEqual(opt_bonus_graph_extra(seen[0].spec_info), 0)
@@ -1316,7 +1319,7 @@ class OptTreeRemoteTest(CustomTestCase):
             draft_token_num=4,
             num_tokens_per_req=4,
             capture_hidden_mode=0,
-            apply_prefix_custom_mask=True,
+            is_bonus=True,
         )
         draft = SimpleNamespace(opt_tree_role="draft", opt_tree_width=4)
         target = SimpleNamespace(opt_tree_role="target", opt_tree_width=5)
@@ -1328,6 +1331,7 @@ class OptTreeRemoteTest(CustomTestCase):
         )
         self.assertEqual(opt_draft_capture_extra_keys(draft, 1), [None])
         self.assertEqual(opt_draft_capture_extra_keys(target, 5), [None])
+        self.assertTrue(layer.apply_prefix_custom_mask)
         self.assertIsNone(opt_bonus_graph_extra(layer))
         self.assertEqual(opt_bonus_graph_extra(bonus), OPT_BONUS_GRAPH_EXTRA)
         wide = OptLayerSpec(
@@ -1337,6 +1341,7 @@ class OptTreeRemoteTest(CustomTestCase):
             num_tokens_per_req=5,
             capture_hidden_mode=0,
             apply_prefix_custom_mask=True,
+            is_bonus=True,
         )
         self.assertTrue(opt_layer_verify_graph_matches(wide, 5))
         self.assertFalse(opt_layer_verify_graph_matches(layer, 5))
@@ -1895,12 +1900,12 @@ class OptTreeRemoteTest(CustomTestCase):
         def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
-        def grow(_config, _tails, forward_active, _scheduler, states_out=None):
+        def grow(_config, _tails, forward_active, _scheduler, states_out=None, **_kwargs):
             forward_active(["layer-0"], [0])
             forward_active(["layer-1"], [0])
             return [([1], [-1], [0])]
 
-        def fitting(_scheduler, _runners, _steps):
+        def fitting(_scheduler, _runners, _steps, **_kwargs):
             return [torch.zeros(1)]
 
         metrics = get_sr_round_metrics(host, "Draft")
@@ -1950,7 +1955,9 @@ class OptTreeRemoteTest(CustomTestCase):
         def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
-        def grow(_config, _tails, forward_active, _scheduler=None, states_out=None):
+        def grow(
+            _config, _tails, forward_active, _scheduler=None, states_out=None, **_kwargs
+        ):
             forward_active(["layer-0"], [0])
             forward_active(["layer-1"], [0])
             return [([1], [-1], [0])]
@@ -2410,7 +2417,9 @@ class OptTreeRemoteTest(CustomTestCase):
             runners[0].layer_slots.append(torch.tensor([10, 11]))
             return [torch.zeros(4)]
 
-        def grow(_config, _tails, _forward_active, _scheduler, states_out=None):
+        def grow(
+            _config, _tails, _forward_active, _scheduler, states_out=None, **_kwargs
+        ):
             return [([8], [-1], [1])]
 
         with patch(
@@ -2596,7 +2605,7 @@ class OptTreeRemoteTest(CustomTestCase):
             state=state,
         )
 
-        def fitting(_scheduler, runners, steps):
+        def fitting(_scheduler, runners, steps, **_kwargs):
             step = steps[0]
             active = runners[0]
             n = int(step.tokens.shape[0])
@@ -2671,7 +2680,7 @@ class OptTreeRemoteTest(CustomTestCase):
 
         host._opt_rollback = rollback
 
-        def fitting(_scheduler, runners, _steps):
+        def fitting(_scheduler, runners, _steps, **_kwargs):
             active = runners[0]
             active.layer_slots.append(torch.tensor([200, 201]))
             active.req.kv_allocated_len = active.cached_len + 2
@@ -2796,23 +2805,24 @@ class OptTreeRemoteTest(CustomTestCase):
 
     def test_bonus_argmax_excludes_verify_children(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _first_unbanned,
             ancestor_columns,
-            exclude_children_argmax,
             select_bonus_candidates,
         )
 
-        row = torch.tensor([0.1, 5.0, 0.2, 4.0])
-        self.assertEqual(exclude_children_argmax(row, [1]), 3)
-        self.assertEqual(exclude_children_argmax(row, []), 1)
-        self.assertIsNone(exclude_children_argmax(torch.tensor([-float("inf")]), []))
+        self.assertEqual(_first_unbanned(torch.tensor([1, 3, 2]), [1]), 3)
+        self.assertEqual(_first_unbanned(torch.tensor([1, 3, 2]), []), 1)
+        self.assertEqual(_first_unbanned(torch.tensor([4, 5, 6]), [4, 5]), 6)
+        self.assertIsNone(_first_unbanned(torch.tensor([4, 5]), [4, 5]))
+        self.assertIsNone(_first_unbanned(torch.empty(0, dtype=torch.long), []))
 
         state = _finished_two_layer_state()
         runner = SimpleNamespace(
             prefix_len=3,
-            tail_logits=torch.tensor([0.0, 0.2, 9.0, 4.0]),
-            layer_logits=[
-                torch.tensor([[0.0, 8.0, 1.0, 3.0], [0.0, 0.0, 0.0, 0.0]]),
-                torch.tensor([[0.0, 0.0, 0.4, 2.0], [0.0, 0.0, 0.0, 0.0]]),
+            bonus_ids=[
+                torch.tensor([2, 3, 1]),
+                torch.tensor([[1, 3, 2], [0, 1, 2]]),
+                torch.tensor([[3, 2, 0], [0, 1, 2]]),
             ],
         )
         # Token 2 is the root's verify child. Token 1 is node 0's child.
@@ -2825,6 +2835,13 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual([plan.position for plan in plans if plan.parent == 0], [4])
         self.assertEqual([plan.position for plan in plans if plan.parent == 1], [5])
         self.assertEqual(ancestor_columns(state, 3, 0, 0), (3,))
+
+        exhausted = SimpleNamespace(
+            prefix_len=3,
+            bonus_ids=[torch.tensor([7, 8, 9])],
+        )
+        extra = select_bonus_candidates(state, ([7, 8], [-1, -1], [0, 1]), exhausted)
+        self.assertEqual({plan.parent: plan.token for plan in extra}, {-1: 9})
 
     def test_bonus_mask_sees_prefix_ancestors_and_self(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -2977,8 +2994,7 @@ class OptTreeRemoteTest(CustomTestCase):
         runner = SimpleNamespace(
             prefix_len=3,
             cached_len=5,
-            tail_logits=torch.tensor([0.0, 4.0]),
-            layer_logits=[torch.tensor([[0.0, 3.0]])],
+            bonus_ids=[torch.tensor([1, 2, 3])],
             _alloc_layer_slots=lambda *_args, **_kwargs: calls.append(1),
         )
         req = _lease_req(keep=3, allocated=5)
@@ -2993,7 +3009,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(calls, [])
         self.assertIsNone(getattr(req, "opt_bonus_guesses", None))
         self.assertEqual(freed, [])
-        self.assertIsNone(runner.tail_logits)
+        self.assertEqual(runner.bonus_ids, [])
 
     def test_poisoned_bonus_forward_does_not_free(self):
         from unittest.mock import patch

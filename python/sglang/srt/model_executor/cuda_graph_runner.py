@@ -735,9 +735,9 @@ class CudaGraphRunner:
     def _capture_extra_keys(self, ntpb=None):
         """Optional extra graph-key dimension. CUDA default is a single None.
 
-        OPT Draft captures one ``r{N+1}_1_s0`` graph so the bonus forward can
-        apply the prefix mask. Layer graphs stay at width N. Other algorithms
-        keep one graph per batch size.
+        OPT Draft captures one ``r{N+1}_1_s0`` graph for the bonus width.
+        Layer graphs stay at width N and also apply the prefix mask. Other
+        algorithms keep one graph per batch size.
         """
         algo = self.model_runner.spec_algorithm
         if algo.is_opt_tree_remote():
@@ -750,7 +750,7 @@ class CudaGraphRunner:
         return [None]
 
     def _replay_graph_extra(self, forward_batch: ForwardBatch):
-        """Bonus verify replays the prefix-mask graph. Everything else uses None."""
+        """Bonus verify replays the N+1 graph. Layer verify uses None."""
         if not self.model_runner.spec_algorithm.is_opt_tree_remote():
             return None
         if getattr(self.model_runner.server_args, "opt_tree_role", None) != "draft":
@@ -1621,12 +1621,12 @@ class CudaGraphRunner:
                 return None
             width = int(self.model_runner.server_args.opt_tree_width)
             query_width = int(draft_token_num)
-            prefix_mask = (
+            is_bonus = (
                 query_width == width + 1
                 and getattr(self, "_active_capture_extra", None)
                 == OPT_BONUS_GRAPH_EXTRA
             )
-            if query_width != width and not prefix_mask:
+            if query_width != width and not is_bonus:
                 raise RuntimeError(
                     f"OPT draft TARGET_VERIFY graph ntpb {query_width} "
                     f"!= opt_tree_width {width}"
@@ -1637,7 +1637,8 @@ class CudaGraphRunner:
                 draft_token_num=query_width,
                 num_tokens_per_req=query_width,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                apply_prefix_custom_mask=prefix_mask,
+                apply_prefix_custom_mask=True,
+                is_bonus=is_bonus,
             )
 
         elif self.is_spectre:

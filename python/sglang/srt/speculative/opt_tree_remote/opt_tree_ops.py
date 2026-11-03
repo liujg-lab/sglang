@@ -234,23 +234,41 @@ def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
     expand_from_topk(state, child_scores, child_ids)
 
 
+def _query_width(row: torch.Tensor, *, seed: bool) -> int:
+    """Row count ``_probs_matrix`` checks. Independent of the top-k width."""
+    if seed:
+        return 1
+    t = row.detach()
+    if t.dim() == 2:
+        return int(t.shape[0])
+    if t.dim() == 3:
+        return int(t.shape[1])
+    raise ValueError(
+        f"expand expects [N, vocab] probabilities, got shape {tuple(row.shape)}"
+    )
+
+
 def host_topk_rows(
     rows: Sequence[torch.Tensor], k: int, *, seed: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k already-softmaxed rows on their device, then one host copy.
 
-    Seed rows become ``[B, N]``. Expand rows become ``[B, N, N]``. CPU inputs
-    stay on the no-copy path inside ``_host_scores_and_ids``.
+    ``k`` is the number of ids, not the row count. Seed rows become ``[B, k]``.
+    Expand rows stay ``[N, vocab]`` and become ``[B, N, k]``. CPU inputs stay
+    on the no-copy path inside ``_host_scores_and_ids``.
     """
     if not rows:
         raise ValueError("host_topk_rows needs at least one row")
-    width = int(k)
-    matrices = [_probs_matrix(row, seed=seed, width=width) for row in rows]
+    k = int(k)
+    matrices = [
+        _probs_matrix(row, seed=seed, width=_query_width(row, seed=seed))
+        for row in rows
+    ]
     vocab = int(matrices[0].shape[-1])
-    if vocab < width:
-        raise ValueError(f"vocab {vocab} < width {width}")
+    if vocab < k:
+        raise ValueError(f"vocab {vocab} < topk {k}")
     stacked = torch.stack(matrices, dim=0)
-    scores, ids = torch.topk(stacked, k=width, dim=-1)
+    scores, ids = torch.topk(stacked, k=k, dim=-1)
     return _host_scores_and_ids(scores, ids)
 
 

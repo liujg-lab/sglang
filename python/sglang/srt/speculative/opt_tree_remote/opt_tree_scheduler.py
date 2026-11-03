@@ -368,9 +368,6 @@ class OptTreeSchedulerMixin:
             phases = OptPhaseClock()
             t0 = time.perf_counter()
             tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
-            detach = getattr(tail_logits, "detach", None)
-            if callable(detach):
-                runner.tail_logits = detach()
             _sync()
             phases.lap("opt_ingest_forward")
             flush_opt_ingest_phases(
@@ -389,13 +386,16 @@ class OptTreeSchedulerMixin:
                 return runner.forward_layer(step)
 
             t1 = time.perf_counter()
+            topk_out = [[]]
             windows = grow_active_layers(
                 config,
                 [tail_logits],
                 lambda steps, _idx: [timed_forward(steps[0])],
                 self,
                 states_out=tree_states,
+                topk_out=topk_out,
             )
+            runner.bonus_ids = topk_out[0]
             if not windows or windows[0] is None:
                 raise RuntimeError("OPT layer forward failed")
             tokens, parents, cols = windows[0]
@@ -605,8 +605,12 @@ class OptTreeSchedulerMixin:
                         )
 
                         flush_sr_round_metrics(self, "session_reset")
+                    timing = False
                     try:
                         with metrics.round() if measure else nullcontext():
+                            # round() clears active on the way out, before the
+                            # post-reply finally. Capture it while it is still set.
+                            timing = bool(getattr(metrics, "active", False))
                             round_start = time.perf_counter()
                             if not supported_protocol(batch.protocol_version):
                                 reply = self._sr_protocol_mismatch_reply(batch)
@@ -642,7 +646,8 @@ class OptTreeSchedulerMixin:
                             started = time.perf_counter()
                             try:
                                 forward_deferred_final_layers(self, jobs)
-                                torch.get_device_module(self.device).synchronize()
+                                if timing:
+                                    torch.get_device_module(self.device).synchronize()
                             finally:
                                 metrics.counts["opt_post_reply_us"] += int(
                                     (time.perf_counter() - started) * 1e6

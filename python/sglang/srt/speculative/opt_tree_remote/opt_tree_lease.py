@@ -187,7 +187,7 @@ def publish_opt_tree_lease(scheduler, req, runner, keep: int, window) -> bool:
     depths = node_depths(parents)
     if depths is None or len(depths) != len(tokens):
         return False
-    layers = tuple(_layer_ids(layer) for layer in slots)
+    layers = _layer_slot_ids(slots)
     if not layers or any(len(layer) == 0 for layer in layers):
         return False
     span = sum(len(layer) for layer in layers)
@@ -239,6 +239,33 @@ def _window_fields(window):
     if not tokens or not (len(tokens) == len(parents) == len(cols)):
         return None
     return tokens, parents, cols
+
+
+def _layer_slot_ids(slots) -> Tuple[Tuple[int, ...], ...]:
+    """Copy every tree-layer slot id to the host in one transfer."""
+    tensors = []
+    for layer in slots:
+        if not torch.is_tensor(layer):
+            return tuple(_layer_ids(layer) for layer in slots)
+        tensors.append(layer.detach().reshape(-1))
+    if not tensors:
+        return ()
+    flat = torch.cat(tensors).to(device="cpu").tolist()
+    layers = []
+    offset = 0
+    for tensor in tensors:
+        count = int(tensor.numel())
+        layers.append(tuple(int(value) for value in flat[offset : offset + count]))
+        offset += count
+    return tuple(layers)
+
+
+def _draft_count(scheduler, name: str, n: int = 1) -> None:
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    get_sr_round_metrics(scheduler, "Draft").counts[name] += int(n)
 
 
 def _layer_ids(layer) -> Tuple[int, ...]:
@@ -442,6 +469,8 @@ def accept_opt_bonus_guess(scheduler, req, lease: OptTreeKVLease, kept: Sequence
     installed = False
     if hit is not None:
         installed = _install_bonus_slot(scheduler, req, bonus_at, int(hit.slot))
+    if installed:
+        _draft_count(scheduler, "opt_bonus_hits")
     if installed and bonus_at + 1 == _logical_len(req):
         req.opt_prefill_tail_logits = hit.logits.detach()
     release_opt_bonus_guesses(
