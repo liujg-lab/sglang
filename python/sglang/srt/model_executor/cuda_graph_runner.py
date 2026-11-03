@@ -733,9 +733,43 @@ class CudaGraphRunner:
         return torch.int64
 
     def _capture_extra_keys(self, ntpb=None):
-        """Optional extra graph-key dimension. CUDA default is a single None."""
+        """Optional extra graph-key dimension. CUDA default is a single None.
+
+        OPT Draft captures one ``r{N+1}_1_s0`` graph so the bonus forward can
+        apply the prefix mask. Layer graphs stay at width N. Other algorithms
+        keep one graph per batch size.
+        """
+        algo = self.model_runner.spec_algorithm
+        if algo.is_opt_tree_remote():
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                opt_draft_capture_extra_keys,
+            )
+
+            return opt_draft_capture_extra_keys(self.model_runner.server_args, ntpb)
         del ntpb
         return [None]
+
+    def _replay_graph_extra(self, forward_batch: ForwardBatch):
+        """Bonus verify replays the prefix-mask graph. Everything else uses None."""
+        if not self.model_runner.spec_algorithm.is_opt_tree_remote():
+            return None
+        if getattr(self.model_runner.server_args, "opt_tree_role", None) != "draft":
+            return None
+        if not forward_batch.forward_mode.is_target_verify():
+            return None
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            opt_bonus_graph_extra,
+        )
+
+        return opt_bonus_graph_extra(forward_batch.spec_info)
+
+    def _graph_bs_supported(self, graph_key, extra, cuda_graph_bs: int) -> bool:
+        """Bonus must hit its own key. A missing key stays eager."""
+        if extra is not None:
+            return graph_key in self.graphs
+        if self.disable_padding:
+            return self._graph_key_captured(graph_key)
+        return cuda_graph_bs <= self.max_bs
 
     def _make_graph_key(
         self,
@@ -792,16 +826,16 @@ class CudaGraphRunner:
             cuda_graph_bs = forward_batch.batch_size
 
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        replay_extra = self._replay_graph_extra(forward_batch)
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx,
             actual_ntpb if _uses_dual_ntpb(self) else None,
+            extra=replay_extra,
         )
 
-        is_bs_supported = (
-            self._graph_key_captured(graph_key)
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
+        is_bs_supported = self._graph_bs_supported(
+            graph_key, replay_extra, cuda_graph_bs
         )
 
         if _uses_dual_ntpb(self):
@@ -810,9 +844,19 @@ class CudaGraphRunner:
                 if actual_ntpb == 1 and forward_batch.spec_info is None
                 else self.capture_forward_mode
             )
+            ntpb_captured = actual_ntpb in self.spectre_ntpb_options
+            if not ntpb_captured and replay_extra is not None:
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                    opt_draft_bonus_ntpb,
+                )
+
+                bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
+                ntpb_captured = (
+                    bonus_ntpb is not None and int(actual_ntpb) == int(bonus_ntpb)
+                )
             is_bs_supported = (
                 is_bs_supported
-                and actual_ntpb in self.spectre_ntpb_options
+                and ntpb_captured
                 and forward_batch.forward_mode == expected_forward_mode
             )
 
@@ -941,10 +985,32 @@ class CudaGraphRunner:
                     )
 
                 is_dual = _uses_dual_ntpb(self)
-                ntpb_list = (
-                    getattr(self, "spectre_ntpb_options", None) if is_dual else None
-                ) or [self.num_tokens_per_bs]
+                ntpb_list = list(
+                    (
+                        getattr(self, "spectre_ntpb_options", None) if is_dual else None
+                    )
+                    or [self.num_tokens_per_bs]
+                )
+                bonus_ntpb = None
+                if is_dual and self.model_runner.spec_algorithm.is_opt_tree_remote():
+                    from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                        opt_draft_bonus_ntpb,
+                    )
+
+                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
+                    if bonus_ntpb is not None and bonus_ntpb not in ntpb_list:
+                        ntpb_list.append(bonus_ntpb)
                 for ntpb in ntpb_list:
+                    # The bonus graph is one request of N+1 queries. Larger
+                    # batch sizes would exceed the width-N input buffers.
+                    if (
+                        bonus_ntpb is not None
+                        and int(ntpb) == int(bonus_ntpb)
+                        and int(bs) != 1
+                    ):
+                        continue
+                    if int(bs) * int(ntpb) > int(self.max_num_token):
+                        continue
                     if is_dual:
                         tag = _dual_ntpb_log_tag(self)
                         log_info_on_rank0(
@@ -1400,6 +1466,7 @@ class CudaGraphRunner:
                 bs,
                 get_current_stream_idx() if self.enable_pdmux else None,
                 actual_ntpb,
+                extra=self._replay_graph_extra(forward_batch),
             )
 
         if self.model_runner.hisparse_coordinator is not None:
@@ -1431,6 +1498,7 @@ class CudaGraphRunner:
             self.bs,
             stream_idx,
             getattr(self, "actual_ntpb", None) if _uses_dual_ntpb(self) else None,
+            extra=self._replay_graph_extra(forward_batch),
         )
 
         self.graphs[graph_key].replay()
@@ -1538,6 +1606,7 @@ class CudaGraphRunner:
             == "draft"
         ):
             from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                OPT_BONUS_GRAPH_EXTRA,
                 OptLayerSpec,
             )
 
@@ -1551,17 +1620,24 @@ class CudaGraphRunner:
             if _uses_dual_ntpb(self) and draft_token_num == 1:
                 return None
             width = int(self.model_runner.server_args.opt_tree_width)
-            if int(draft_token_num) != width:
+            query_width = int(draft_token_num)
+            prefix_mask = (
+                query_width == width + 1
+                and getattr(self, "_active_capture_extra", None)
+                == OPT_BONUS_GRAPH_EXTRA
+            )
+            if query_width != width and not prefix_mask:
                 raise RuntimeError(
-                    f"OPT draft TARGET_VERIFY graph ntpb {int(draft_token_num)} "
+                    f"OPT draft TARGET_VERIFY graph ntpb {query_width} "
                     f"!= opt_tree_width {width}"
                 )
             spec_info = OptLayerSpec(
                 custom_mask=self.buffers.custom_mask,
                 positions=self.buffers.positions[:num_tokens],
-                draft_token_num=width,
-                num_tokens_per_req=width,
+                draft_token_num=query_width,
+                num_tokens_per_req=query_width,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                apply_prefix_custom_mask=prefix_mask,
             )
 
         elif self.is_spectre:

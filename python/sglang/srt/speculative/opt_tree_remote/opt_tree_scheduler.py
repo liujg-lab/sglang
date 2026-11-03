@@ -265,6 +265,7 @@ class OptTreeSchedulerMixin:
         from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
             opt_finish_req,
             opt_kv_release_allowed,
+            release_opt_bonus_guesses,
             release_opt_tree_lease,
         )
 
@@ -272,6 +273,7 @@ class OptTreeSchedulerMixin:
             req = opt_finish_req(self, rid, state)
             if req is not None:
                 release_opt_tree_lease(self, req)
+                release_opt_bonus_guesses(self, req)
         return super()._sr_finish_rid(
             rid, release_mm=release_mm, state=state, entry=entry
         )
@@ -284,11 +286,13 @@ class OptTreeSchedulerMixin:
             )
         from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
             opt_kv_release_allowed,
+            release_opt_bonus_guesses,
             release_opt_tree_lease,
         )
 
         if opt_kv_release_allowed(self):
             release_opt_tree_lease(self, req)
+            release_opt_bonus_guesses(self, req)
         return super()._sr_rollback_else_reprefill(req, fork, allocated, on_refused)
 
     def _sr_reset_linear_kv_state(self, req, fill_ids) -> None:
@@ -297,11 +301,13 @@ class OptTreeSchedulerMixin:
             return super()._sr_reset_linear_kv_state(req, fill_ids)
         from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
             opt_kv_release_allowed,
+            release_opt_bonus_guesses,
             release_opt_tree_lease,
         )
 
         if opt_kv_release_allowed(self):
             release_opt_tree_lease(self, req)
+            release_opt_bonus_guesses(self, req)
         return super()._sr_reset_linear_kv_state(req, fill_ids)
 
     def _sr_abandon_poisoned_kv(self, req) -> None:
@@ -362,6 +368,9 @@ class OptTreeSchedulerMixin:
             phases = OptPhaseClock()
             t0 = time.perf_counter()
             tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
+            detach = getattr(tail_logits, "detach", None)
+            if callable(detach):
+                runner.tail_logits = detach()
             _sync()
             phases.lap("opt_ingest_forward")
             flush_opt_ingest_phases(

@@ -1145,6 +1145,7 @@ class OptTreeRemoteTest(CustomTestCase):
     def test_opt_layer_verify_graph_matches_width_and_blocks_decode(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             OptLayerSpec,
+            opt_bonus_graph_extra,
             opt_layer_verify_graph_matches,
         )
         from sglang.srt.speculative.spec_info import (
@@ -1177,8 +1178,183 @@ class OptTreeRemoteTest(CustomTestCase):
         )
         self.assertFalse(opt_layer_verify_graph_matches(width_one, 1))
         self.assertFalse(opt_layer_verify_graph_matches(None, 4))
+        bonus = OptLayerSpec(
+            custom_mask=spec.custom_mask,
+            positions=spec.positions,
+            draft_token_num=4,
+            num_tokens_per_req=4,
+            capture_hidden_mode=0,
+            apply_prefix_custom_mask=True,
+        )
+        self.assertTrue(opt_layer_verify_graph_matches(bonus, 4))
+        self.assertEqual(opt_bonus_graph_extra(bonus), 0)
+        self.assertIsNone(opt_bonus_graph_extra(spec))
         self.assertFalse(decode_cuda_graph_accepts_spec_info(spec))
         self.assertFalse(decode_cuda_graph_accepts_spec_info(width_one))
+
+    def test_bonus_batch_applies_prefix_mask_and_layer_batch_does_not(self):
+        import sys
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+            _BonusCandidate,
+            _forward_one_bonus_group,
+            opt_bonus_graph_extra,
+            opt_layer_verify_graph_matches,
+        )
+
+        seen = []
+        pool = torch.full((1, 16), -1, dtype=torch.int64)
+
+        def make_batch(_reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                seq_lens=torch.tensor([4], dtype=torch.int64),
+                sampling_info=info,
+                has_grammar=True,
+                return_logprob=True,
+                return_hidden_states=True,
+            )
+
+        def run_batch(batch):
+            seen.append(batch)
+            width = int(batch.spec_info.num_tokens_per_req)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=torch.zeros(width, 3)
+                )
+            )
+
+        host = SimpleNamespace(
+            _sr_make_decode_batch=make_batch,
+            run_batch=run_batch,
+            cur_batch=None,
+            req_to_token_pool=SimpleNamespace(device="cpu", req_to_token=pool),
+        )
+        req = SimpleNamespace(req_pool_idx=0, kv_allocated_len=8)
+        runner = OptLayerForward.__new__(OptLayerForward)
+        runner.scheduler = host
+        runner.req = req
+        runner.cached_len = 4
+        runner.prefix_len = 4
+        runner._alloc_layer_slots = lambda n, start=None: torch.arange(
+            8, 8 + int(n), dtype=torch.int64
+        )
+
+        forward_info = SimpleNamespace(
+            ForwardMode=SimpleNamespace(TARGET_VERIFY=object()),
+            CaptureHiddenMode=SimpleNamespace(NULL=object()),
+        )
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.model_executor.forward_batch_info": forward_info},
+        ):
+            layer = runner._verify_batch(
+                torch.tensor([1, 2, 3, 4]),
+                torch.tensor([4, 5, 6, 7]),
+                torch.ones(4, 8, dtype=torch.bool),
+                torch.arange(4, dtype=torch.int64),
+            )
+            guesses = _forward_one_bonus_group(
+                host,
+                runner,
+                [
+                    _BonusCandidate(-1, 7, 4, ()),
+                    _BonusCandidate(0, 8, 5, (4,)),
+                    _BonusCandidate(1, 9, 6, (4, 5)),
+                    _BonusCandidate(2, 10, 7, (4, 5, 6)),
+                ],
+                8,
+                4,
+            )
+        self.assertFalse(layer.spec_info.apply_prefix_custom_mask)
+        self.assertTrue(opt_layer_verify_graph_matches(layer.spec_info, 4))
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].spec_info.apply_prefix_custom_mask)
+        self.assertEqual(int(seen[0].spec_info.num_tokens_per_req), 4)
+        self.assertTrue(opt_layer_verify_graph_matches(seen[0].spec_info, 4))
+        self.assertEqual(opt_bonus_graph_extra(seen[0].spec_info), 0)
+        self.assertIsNone(opt_bonus_graph_extra(layer.spec_info))
+        self.assertEqual([guess.token for guess in guesses], [7, 8, 9, 10])
+
+    def test_bonus_graph_key_does_not_reuse_layer_graph(self):
+        from pathlib import Path
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OPT_BONUS_GRAPH_EXTRA,
+            OptLayerSpec,
+            opt_bonus_graph_extra,
+            opt_draft_bonus_ntpb,
+            opt_draft_capture_extra_keys,
+            opt_layer_verify_graph_matches,
+        )
+
+        mask = torch.ones(4, dtype=torch.bool)
+        positions = torch.zeros(4, dtype=torch.long)
+        layer = OptLayerSpec(
+            custom_mask=mask,
+            positions=positions,
+            draft_token_num=4,
+            num_tokens_per_req=4,
+            capture_hidden_mode=0,
+        )
+        bonus = OptLayerSpec(
+            custom_mask=mask,
+            positions=positions,
+            draft_token_num=4,
+            num_tokens_per_req=4,
+            capture_hidden_mode=0,
+            apply_prefix_custom_mask=True,
+        )
+        draft = SimpleNamespace(opt_tree_role="draft", opt_tree_width=4)
+        target = SimpleNamespace(opt_tree_role="target", opt_tree_width=5)
+        self.assertEqual(opt_draft_bonus_ntpb(draft), 5)
+        self.assertIsNone(opt_draft_bonus_ntpb(target))
+        self.assertEqual(opt_draft_capture_extra_keys(draft, 4), [None])
+        self.assertEqual(
+            opt_draft_capture_extra_keys(draft, 5), [OPT_BONUS_GRAPH_EXTRA]
+        )
+        self.assertEqual(opt_draft_capture_extra_keys(draft, 1), [None])
+        self.assertEqual(opt_draft_capture_extra_keys(target, 5), [None])
+        self.assertIsNone(opt_bonus_graph_extra(layer))
+        self.assertEqual(opt_bonus_graph_extra(bonus), OPT_BONUS_GRAPH_EXTRA)
+        wide = OptLayerSpec(
+            custom_mask=torch.ones(5, dtype=torch.bool),
+            positions=torch.zeros(5, dtype=torch.long),
+            draft_token_num=5,
+            num_tokens_per_req=5,
+            capture_hidden_mode=0,
+            apply_prefix_custom_mask=True,
+        )
+        self.assertTrue(opt_layer_verify_graph_matches(wide, 5))
+        self.assertFalse(opt_layer_verify_graph_matches(layer, 5))
+        layer_key = "r4_1"
+        bonus_key = f"r5_1_s{opt_bonus_graph_extra(wide)}"
+        graphs = {layer_key: object()}
+        self.assertEqual(bonus_key, "r5_1_s0")
+        self.assertNotIn(bonus_key, graphs)
+        graphs[bonus_key] = object()
+        self.assertIn(bonus_key, graphs)
+
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/model_executor/cuda_graph_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("opt_draft_capture_extra_keys", source)
+        self.assertEqual(source.count("_replay_graph_extra(forward_batch)"), 3)
+        self.assertIn("== OPT_BONUS_GRAPH_EXTRA", source)
 
     def test_other_algorithms_keep_verify_graph_when_opt_role_is_draft(self):
         from unittest.mock import patch
@@ -2617,6 +2793,262 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(enabled._opt_deferred, [])
         commit_deferred_expands(enabled, [job], keep=True)
         self.assertEqual(enabled._opt_deferred, [job])
+
+    def test_bonus_argmax_excludes_verify_children(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            ancestor_columns,
+            exclude_children_argmax,
+            select_bonus_candidates,
+        )
+
+        row = torch.tensor([0.1, 5.0, 0.2, 4.0])
+        self.assertEqual(exclude_children_argmax(row, [1]), 3)
+        self.assertEqual(exclude_children_argmax(row, []), 1)
+        self.assertIsNone(exclude_children_argmax(torch.tensor([-float("inf")]), []))
+
+        state = _finished_two_layer_state()
+        runner = SimpleNamespace(
+            prefix_len=3,
+            tail_logits=torch.tensor([0.0, 0.2, 9.0, 4.0]),
+            layer_logits=[
+                torch.tensor([[0.0, 8.0, 1.0, 3.0], [0.0, 0.0, 0.0, 0.0]]),
+                torch.tensor([[0.0, 0.0, 0.4, 2.0], [0.0, 0.0, 0.0, 0.0]]),
+            ],
+        )
+        # Token 2 is the root's verify child. Token 1 is node 0's child.
+        plans = select_bonus_candidates(state, ([2, 1], [-1, 0], [0, 0]), runner)
+        chosen = {plan.parent: plan.token for plan in plans}
+        self.assertEqual(chosen[-1], 3)
+        self.assertEqual(chosen[0], 3)
+        self.assertEqual(chosen[1], 3)
+        self.assertEqual(plans[0].position, 3)
+        self.assertEqual([plan.position for plan in plans if plan.parent == 0], [4])
+        self.assertEqual([plan.position for plan in plans if plan.parent == 1], [5])
+        self.assertEqual(ancestor_columns(state, 3, 0, 0), (3,))
+
+    def test_bonus_mask_sees_prefix_ancestors_and_self(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            bonus_attention_mask,
+        )
+
+        mask = bonus_attention_mask(4, 8, [[4, 6], []], device="cpu")
+        self.assertEqual(mask.shape, (2, 10))
+        self.assertEqual(
+            mask[0].tolist(),
+            [True, True, True, True, True, False, True, False, True, False],
+        )
+        self.assertEqual(
+            mask[1].tolist(),
+            [True, True, True, True, False, False, False, False, False, True],
+        )
+
+    def test_bonus_forward_chunks_match_verify_width(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _BonusCandidate,
+            bonus_attention_mask,
+            bonus_verify_chunks,
+        )
+
+        plans = [
+            _BonusCandidate(index, 10 + index, 20 + index, (index,))
+            for index in range(5)
+        ]
+        chunks = bonus_verify_chunks(plans, 4)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual([len(chunk) for chunk in chunks], [4, 4])
+        self.assertTrue(all(item.keep for item in chunks[0]))
+        self.assertIs(chunks[1][0], plans[4])
+        self.assertTrue(chunks[1][0].keep)
+        for pad in chunks[1][1:]:
+            self.assertEqual(pad.token, chunks[1][0].token)
+            self.assertEqual(pad.position, chunks[1][0].position)
+            self.assertEqual(pad.chain, chunks[1][0].chain)
+            self.assertNotEqual(pad.token, 0)
+            self.assertFalse(pad.keep)
+        exact = bonus_verify_chunks(plans[:4], 4)
+        self.assertEqual(len(exact), 1)
+        self.assertTrue(all(item.keep for item in exact[0]))
+        one_group = bonus_verify_chunks(plans, 5)
+        self.assertEqual(len(one_group), 1)
+        self.assertEqual(len(one_group[0]), 5)
+        self.assertTrue(all(item.keep for item in one_group[0]))
+
+        mask = bonus_attention_mask(4, 8, [[4, 6]], device="cpu", query_width=4)
+        self.assertEqual(mask.shape, (4, 12))
+        self.assertEqual(
+            mask[0].tolist(),
+            [True, True, True, True, True, False, True, False, True, False, False, False],
+        )
+        for index in range(1, 4):
+            row = [False] * 12
+            row[8 + index] = True
+            self.assertEqual(mask[index].tolist(), row)
+
+    def test_bonus_hit_installs_slot_and_seeds_ingest(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            take_cached_tail_logits,
+        )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptBonusGuess,
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+        )
+
+        host, pool, freed = _lease_host()
+        req = _lease_req(keep=3, allocated=3)
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [20, 30]
+        req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        req.opt_tree_lease = OptTreeKVLease(
+            keep=3,
+            layer_slots=((100, 101),),
+            tokens=(20,),
+            parents=(-1,),
+            cols=(0,),
+            depths=(0,),
+        )
+        seed = torch.tensor([1.0, 2.0, 3.0])
+        req.opt_bonus_guesses = [
+            OptBonusGuess(parent=0, token=30, slot=200, logits=seed),
+            OptBonusGuess(parent=-1, token=8, slot=201, logits=torch.zeros(3)),
+        ]
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(req.kv_committed_len, 5)
+        self.assertEqual(req.kv_allocated_len, 5)
+        self.assertEqual(pool[0, 3].item(), 100)
+        self.assertEqual(pool[0, 4].item(), 200)
+        self.assertIsNone(req.opt_bonus_guesses)
+        self.assertTrue(torch.equal(take_cached_tail_logits(req, 5), seed))
+        self.assertCountEqual(freed, [101, 201])
+        self.assertEqual(
+            len(req.origin_input_ids) + len(req.output_ids) - req.kv_committed_len, 0
+        )
+
+    def test_bonus_miss_and_finish_release_slots(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptBonusGuess,
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+            release_opt_bonus_guesses,
+        )
+
+        host, pool, freed = _lease_host()
+        req = _lease_req(keep=3, allocated=3)
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [20, 99]
+        req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        req.opt_tree_lease = OptTreeKVLease(
+            keep=3,
+            layer_slots=((100, 101),),
+            tokens=(20,),
+            parents=(-1,),
+            cols=(0,),
+            depths=(0,),
+        )
+        req.opt_bonus_guesses = [
+            OptBonusGuess(parent=0, token=30, slot=200, logits=torch.zeros(2))
+        ]
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(req.kv_committed_len, 4)
+        self.assertEqual(pool[0, 3].item(), 100)
+        self.assertIsNone(req.opt_bonus_guesses)
+        self.assertIsNone(getattr(req, "opt_prefill_tail_logits", None))
+        self.assertCountEqual(freed, [101, 200])
+
+        host, _pool, freed = _lease_host()
+        finished = _lease_req(keep=3, allocated=3)
+        finished.opt_bonus_guesses = [
+            OptBonusGuess(parent=-1, token=7, slot=50, logits=torch.zeros(1)),
+            OptBonusGuess(parent=0, token=8, slot=51, logits=torch.zeros(1)),
+        ]
+        release_opt_bonus_guesses(host, finished)
+        self.assertCountEqual(freed, [50, 51])
+        self.assertIsNone(finished.opt_bonus_guesses)
+        release_opt_bonus_guesses(host, finished)
+        self.assertEqual(freed, [50, 51])
+
+    def test_bonus_forward_stays_off_when_page_is_not_1(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            maybe_attach_bonus_guesses,
+        )
+
+        host, _pool, freed = _lease_host(page=128)
+        calls = []
+        runner = SimpleNamespace(
+            prefix_len=3,
+            cached_len=5,
+            tail_logits=torch.tensor([0.0, 4.0]),
+            layer_logits=[torch.tensor([[0.0, 3.0]])],
+            _alloc_layer_slots=lambda *_args, **_kwargs: calls.append(1),
+        )
+        req = _lease_req(keep=3, allocated=5)
+        job = SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=3,
+            window=([1], [-1], [0]),
+            state=_finished_two_layer_state(),
+        )
+        maybe_attach_bonus_guesses(host, job)
+        self.assertEqual(calls, [])
+        self.assertIsNone(getattr(req, "opt_bonus_guesses", None))
+        self.assertEqual(freed, [])
+        self.assertIsNone(runner.tail_logits)
+
+    def test_poisoned_bonus_forward_does_not_free(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _BonusCandidate,
+            _forward_bonus_candidates,
+            _publish_or_rollback,
+        )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import OptBonusGuess
+
+        freed = []
+        host, _pool, _allocator_freed = _lease_host()
+        host._sr_device_poisoned = False
+        host._sr_clear_stamps_after_poison = lambda: None
+        host.server_args = SimpleNamespace(speculative_num_draft_tokens=4)
+        host.token_to_kv_pool_allocator.free = lambda index: freed.extend(
+            int(slot) for slot in index.detach().cpu().tolist()
+        )
+        host._opt_rollback = lambda *_args, **_kwargs: freed.append(-1)
+        runner = SimpleNamespace(cached_len=8, prefix_len=3, req=_lease_req(3, 8))
+        plans = [
+            _BonusCandidate(index, 10 + index, 20 + index, (index,))
+            for index in range(6)
+        ]
+        calls = {"n": 0}
+
+        def group(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [
+                    OptBonusGuess(
+                        parent=-1, token=3, slot=9, logits=torch.zeros(1)
+                    )
+                ]
+            raise RuntimeError(
+                "CUDA error: an illegal memory access was encountered"
+            )
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_one_bonus_group",
+            group,
+        ):
+            with self.assertRaises(RuntimeError):
+                _forward_bonus_candidates(host, runner, plans)
+        self.assertTrue(host._sr_device_poisoned)
+        self.assertEqual(freed, [])
+
+        req = _lease_req(keep=3, allocated=7)
+        req.opt_bonus_guesses = [
+            OptBonusGuess(parent=-1, token=3, slot=9, logits=torch.zeros(1))
+        ]
+        _publish_or_rollback(host, req, SimpleNamespace(layer_slots=[]), 3, ([1], [-1], [0]), True)
+        self.assertEqual(freed, [])
+        self.assertIsNotNone(req.opt_bonus_guesses)
 
 
 def _finished_two_layer_state():

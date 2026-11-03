@@ -21,6 +21,20 @@ _APPEND = ("append_one", "append_n")
 
 
 @dataclass
+class OptBonusGuess:
+    """One guessed bonus token written after the tree, outside the lease.
+
+    ``parent == -1`` is the committed tail. Any other parent is an index into
+    the verify window. ``logits`` is the distribution after this token.
+    """
+
+    parent: int
+    token: int
+    slot: int
+    logits: torch.Tensor
+
+
+@dataclass
 class OptTreeKVLease:
     """Uncommitted tree slots owned outside ``kv_allocated_len``.
 
@@ -134,6 +148,7 @@ def consume_opt_tree_lease(scheduler, req) -> None:
         return
     if opt_page_size(scheduler) != 1 or not _alignment_matches(req, lease):
         release_opt_tree_lease(scheduler, req)
+        release_opt_bonus_guesses(scheduler, req)
         return
     kept = _accepted_slots(req, lease)
     if kept is None:
@@ -143,9 +158,13 @@ def consume_opt_tree_lease(scheduler, req) -> None:
             lease.keep,
         )
         release_opt_tree_lease(scheduler, req)
+        release_opt_bonus_guesses(scheduler, req)
         return
     if not _install_accepted(scheduler, req, lease, kept):
         release_opt_tree_lease(scheduler, req)
+        release_opt_bonus_guesses(scheduler, req)
+        return
+    accept_opt_bonus_guess(scheduler, req, lease, kept)
 
 
 def publish_opt_tree_lease(scheduler, req, runner, keep: int, window) -> bool:
@@ -354,3 +373,79 @@ def _free_device(scheduler):
     if torch.is_tensor(pages):
         return pages.device
     return "cpu"
+
+
+def release_opt_bonus_guesses(scheduler, req, guesses=None) -> None:
+    """Free every guessed bonus slot. A second call does nothing."""
+    if guesses is None:
+        guesses = getattr(req, "opt_bonus_guesses", None)
+        req.opt_bonus_guesses = None
+    if (
+        not guesses
+        or opt_page_size(scheduler) != 1
+        or getattr(scheduler, "_sr_device_poisoned", False)
+    ):
+        return
+    _free_slot_ids(scheduler, [int(guess.slot) for guess in guesses])
+
+
+def _accepted_end(req, lease: OptTreeKVLease, n_kept: int) -> int:
+    """Verify index of the last installed node. ``-1`` is the committed tail."""
+    parent = -1
+    index = int(lease.keep)
+    for _ in range(int(n_kept)):
+        token = _logical_token(req, index)
+        child = None if token is None else _child_index(lease, parent, token)
+        if child is None:
+            return -1
+        parent = child
+        index += 1
+    return parent
+
+
+def _install_bonus_slot(scheduler, req, index: int, slot: int) -> bool:
+    row = getattr(req, "req_pool_idx", None)
+    pool = getattr(getattr(scheduler, "req_to_token_pool", None), "req_to_token", None)
+    if row is None or not torch.is_tensor(pool):
+        return False
+    index = int(index)
+    if int(row) < 0 or int(row) >= int(pool.shape[0]):
+        return False
+    if index < 0 or index >= int(pool.shape[1]):
+        return False
+    pool[int(row), index] = int(slot)
+    end = index + 1
+    req.kv_committed_len = end
+    req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), end)
+    return True
+
+
+def accept_opt_bonus_guess(scheduler, req, lease: OptTreeKVLease, kept: Sequence[int]) -> None:
+    """Install the guess at the rejected node when it is the bonus token.
+
+    Every other guess is freed. The stored row becomes the next seed only
+    when this bonus is the new committed tail.
+    """
+    guesses = list(getattr(req, "opt_bonus_guesses", None) or [])
+    req.opt_bonus_guesses = None
+    if not guesses:
+        return
+    bonus_at = int(lease.keep) + len(kept)
+    bonus = _logical_token(req, bonus_at)
+    v_end = _accepted_end(req, lease, len(kept))
+    hit = None
+    if bonus is not None:
+        for guess in guesses:
+            if int(guess.parent) == int(v_end) and int(guess.token) == int(bonus):
+                hit = guess
+                break
+    installed = False
+    if hit is not None:
+        installed = _install_bonus_slot(scheduler, req, bonus_at, int(hit.slot))
+    if installed and bonus_at + 1 == _logical_len(req):
+        req.opt_prefill_tail_logits = hit.logits.detach()
+    release_opt_bonus_guesses(
+        scheduler,
+        req,
+        [guess for guess in guesses if not installed or guess is not hit],
+    )
