@@ -810,10 +810,31 @@ class OptTreeRemoteTest(CustomTestCase):
             spectre_role=None,
             standalone_remote_role=None,
         )
-        self.assertFalse(opt.captures_target_verify_cuda_graph(draft))
-        self.assertFalse(opt.uses_dual_ntpb_cuda_graph(draft))
-        self.assertIsNone(opt.dual_ntpb_cuda_graph_options(draft))
-        self.assertEqual(opt.target_verify_cuda_graph_num_tokens_per_bs(draft), 1)
+        self.assertTrue(opt.captures_target_verify_cuda_graph(draft))
+        self.assertTrue(opt.uses_dual_ntpb_cuda_graph(draft))
+        self.assertEqual(opt.dual_ntpb_cuda_graph_options(draft), [width, 1])
+        self.assertEqual(
+            opt.target_verify_cuda_graph_num_tokens_per_bs(draft), width
+        )
+        self.assertFalse(
+            opt.captures_target_verify_cuda_graph(draft, is_draft_worker=True)
+        )
+        self.assertFalse(
+            opt.uses_dual_ntpb_cuda_graph(draft, is_draft_worker=True)
+        )
+        self.assertEqual(
+            opt.target_verify_cuda_graph_num_tokens_per_bs(
+                draft, is_draft_worker=True
+            ),
+            1,
+        )
+        narrow = SimpleNamespace(
+            opt_tree_role="draft",
+            speculative_num_draft_tokens=1,
+            spectre_role=None,
+            standalone_remote_role=None,
+        )
+        self.assertEqual(opt.dual_ntpb_cuda_graph_options(narrow), [1])
 
     def test_extend_past_prompt_mrope_keeps_token_width(self):
         import ast
@@ -1119,6 +1140,106 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertIsNone(info.logit_bias)
         self.assertIsNone(info.vocab_mask)
         self.assertFalse(batch.has_grammar)
+
+    def test_opt_layer_verify_graph_matches_width_and_blocks_decode(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerSpec,
+            opt_layer_verify_graph_matches,
+        )
+        from sglang.srt.speculative.spec_info import (
+            decode_cuda_graph_accepts_spec_info,
+        )
+
+        spec = OptLayerSpec(
+            custom_mask=torch.ones(4, dtype=torch.bool),
+            positions=torch.zeros(4, dtype=torch.long),
+            draft_token_num=4,
+            num_tokens_per_req=4,
+            capture_hidden_mode=0,
+        )
+        self.assertTrue(opt_layer_verify_graph_matches(spec, 4))
+        self.assertFalse(opt_layer_verify_graph_matches(spec, 1))
+        mismatch = OptLayerSpec(
+            custom_mask=spec.custom_mask,
+            positions=spec.positions,
+            draft_token_num=4,
+            num_tokens_per_req=2,
+            capture_hidden_mode=0,
+        )
+        self.assertFalse(opt_layer_verify_graph_matches(mismatch, 4))
+        width_one = OptLayerSpec(
+            custom_mask=spec.custom_mask[:1],
+            positions=spec.positions[:1],
+            draft_token_num=1,
+            num_tokens_per_req=1,
+            capture_hidden_mode=0,
+        )
+        self.assertFalse(opt_layer_verify_graph_matches(width_one, 1))
+        self.assertFalse(opt_layer_verify_graph_matches(None, 4))
+        self.assertFalse(decode_cuda_graph_accepts_spec_info(spec))
+        self.assertFalse(decode_cuda_graph_accepts_spec_info(width_one))
+
+    def test_other_algorithms_keep_verify_graph_when_opt_role_is_draft(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        both = SimpleNamespace(
+            standalone_remote_role="target",
+            spectre_role="target",
+            opt_tree_role="draft",
+            speculative_num_draft_tokens=5,
+        )
+        opt_draft = SimpleNamespace(
+            opt_tree_role="draft",
+            speculative_num_draft_tokens=4,
+            spectre_role=None,
+            standalone_remote_role=None,
+        )
+        opt_target = SimpleNamespace(
+            opt_tree_role="target",
+            speculative_num_draft_tokens=5,
+            spectre_role=None,
+            standalone_remote_role=None,
+        )
+        with patch("sglang.srt.utils.is_npu", return_value=True):
+            self.assertTrue(
+                SpeculativeAlgorithm.STANDALONE_REMOTE.captures_target_verify_cuda_graph(
+                    both
+                )
+            )
+            self.assertTrue(
+                SpeculativeAlgorithm.STANDALONE_REMOTE.uses_dual_ntpb_cuda_graph(
+                    both
+                )
+            )
+            self.assertTrue(
+                SpeculativeAlgorithm.SPECTRE.captures_target_verify_cuda_graph(both)
+            )
+            self.assertTrue(
+                SpeculativeAlgorithm.SPECTRE.uses_dual_ntpb_cuda_graph(both)
+            )
+            self.assertFalse(
+                SpeculativeAlgorithm.OPT_TREE_REMOTE.captures_target_verify_cuda_graph(
+                    opt_draft
+                )
+            )
+            self.assertFalse(
+                SpeculativeAlgorithm.OPT_TREE_REMOTE.uses_dual_ntpb_cuda_graph(
+                    opt_draft
+                )
+            )
+            self.assertTrue(
+                SpeculativeAlgorithm.OPT_TREE_REMOTE.captures_target_verify_cuda_graph(
+                    opt_target
+                )
+            )
+            self.assertTrue(
+                SpeculativeAlgorithm.OPT_TREE_REMOTE.uses_dual_ntpb_cuda_graph(
+                    opt_target
+                )
+            )
 
     def test_release_uncommitted_rolls_back_to_kv_committed_len(self):
         from types import SimpleNamespace

@@ -32,6 +32,22 @@ def remote_spec_role(server_args):
     )
 
 
+def _opt_tree_captures_verify_cuda_graph(server_args) -> bool:
+    """OPT Target captures verify graphs. OPT Draft does so only off NPU.
+
+    Ascend verify capture is the Target FIA path. Draft keeps DECODE there.
+    Callers must already know the algorithm is OPT.
+    """
+    role = getattr(server_args, "opt_tree_role", None)
+    if role == "target":
+        return True
+    if role != "draft":
+        return False
+    from sglang.srt.utils import is_npu
+
+    return not is_npu()
+
+
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
@@ -161,9 +177,11 @@ class SpeculativeAlgorithm(Enum):
     ) -> bool:
         """Whether CudaGraphRunner should capture TARGET_VERIFY (not DECODE).
 
-        STANDALONE_REMOTE and OPT_TREE_REMOTE Draft stay on DECODE so chain
-        ``run_batch`` can replay ordinary decode graphs. Only the Target role
-        captures verify.
+        STANDALONE_REMOTE Draft stays on DECODE so chain ``run_batch`` can
+        replay ordinary decode graphs. OPT_TREE_REMOTE Draft captures
+        TARGET_VERIFY for the N-token layer forward on CUDA. The 1-token
+        graph stays DECODE, and OPT Draft on NPU stays on DECODE. In-process
+        draft workers do not capture verify graphs.
         """
         if is_draft_worker:
             return False
@@ -176,9 +194,8 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "standalone_remote_role", None) == "target"
         ):
             return True
-        if (
-            self.is_opt_tree_remote()
-            and getattr(server_args, "opt_tree_role", None) == "target"
+        if self.is_opt_tree_remote() and _opt_tree_captures_verify_cuda_graph(
+            server_args
         ):
             return True
         return False
@@ -188,9 +205,11 @@ class SpeculativeAlgorithm(Enum):
     ) -> bool:
         """Capture both TARGET_VERIFY and ntpb=1 DECODE graphs.
 
-        Covers SPECTRE, STANDALONE_REMOTE Target, and OPT_TREE_REMOTE Target.
-        OPT Target options are ``{1, N + 1}``. DECODE graphs cover 1-token AR.
-        STANDALONE_REMOTE and OPT Draft stay on a single ordinary DECODE capture.
+        Covers SPECTRE, STANDALONE_REMOTE Target, and OPT_TREE_REMOTE Target
+        and CUDA Draft. OPT Target options are ``{1, N + 1}``. OPT Draft
+        options are ``{1, N}`` off NPU. DECODE graphs cover 1-token
+        autoregressive steps. STANDALONE_REMOTE Draft stays on a single
+        ordinary DECODE capture.
         """
         if is_draft_worker:
             return False
@@ -201,9 +220,8 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "standalone_remote_role", None) == "target"
         ):
             return True
-        if (
-            self.is_opt_tree_remote()
-            and getattr(server_args, "opt_tree_role", None) == "target"
+        if self.is_opt_tree_remote() and _opt_tree_captures_verify_cuda_graph(
+            server_args
         ):
             return True
         return False
@@ -221,10 +239,11 @@ class SpeculativeAlgorithm(Enum):
     def target_verify_cuda_graph_num_tokens_per_bs(
         self, server_args: "ServerArgs", is_draft_worker: bool = False
     ) -> int:
-        """Tokens per sequence captured into the Target CUDA graph.
+        """Tokens per sequence captured into the TARGET_VERIFY CUDA graph.
 
-        TARGET_VERIFY graphs use ``speculative_num_draft_tokens``. DECODE
-        (including STANDALONE_REMOTE Draft chain) stays at 1.
+        The width is ``speculative_num_draft_tokens``. On OPT Draft that value
+        is N, so the verify graph is N tokens wide. Callers that do not
+        capture verify graphs stay at 1, including STANDALONE_REMOTE Draft.
         """
         if self.captures_target_verify_cuda_graph(server_args, is_draft_worker):
             return int(

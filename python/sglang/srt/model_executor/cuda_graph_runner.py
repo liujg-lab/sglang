@@ -511,7 +511,7 @@ def _is_spectre(runner) -> bool:
 
 
 def _uses_dual_ntpb(runner) -> bool:
-    """SPECTRE, SR Target, and OPT Target capture verify + ntpb=1 DECODE."""
+    """SPECTRE, SR Target, and OPT Target/Draft capture verify + ntpb=1 DECODE."""
     return getattr(runner, "dual_ntpb", False)
 
 
@@ -815,6 +815,22 @@ class CudaGraphRunner:
                 and actual_ntpb in self.spectre_ntpb_options
                 and forward_batch.forward_mode == expected_forward_mode
             )
+
+        if (
+            self.model_runner.spec_algorithm.is_opt_tree_remote()
+            and getattr(self.model_runner.server_args, "opt_tree_role", None)
+            == "draft"
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                opt_layer_verify_graph_matches,
+            )
+
+            # Layer width must equal the captured ntpb. ntpb=1 is DECODE.
+            if not opt_layer_verify_graph_matches(
+                forward_batch.spec_info, actual_ntpb
+            ):
+                is_bs_supported = False
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -1514,6 +1530,38 @@ class CudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
+            )
+
+        elif (
+            self.model_runner.spec_algorithm.is_opt_tree_remote()
+            and getattr(self.model_runner.server_args, "opt_tree_role", None)
+            == "draft"
+        ):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                OptLayerSpec,
+            )
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            draft_token_num = (
+                ntpb_override
+                if ntpb_override is not None
+                else self.num_tokens_per_bs
+            )
+            if _uses_dual_ntpb(self) and draft_token_num == 1:
+                return None
+            width = int(self.model_runner.server_args.opt_tree_width)
+            if int(draft_token_num) != width:
+                raise RuntimeError(
+                    f"OPT draft TARGET_VERIFY graph ntpb {int(draft_token_num)} "
+                    f"!= opt_tree_width {width}"
+                )
+            spec_info = OptLayerSpec(
+                custom_mask=self.buffers.custom_mask,
+                positions=self.buffers.positions[:num_tokens],
+                draft_token_num=width,
+                num_tokens_per_req=width,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
         elif self.is_spectre:

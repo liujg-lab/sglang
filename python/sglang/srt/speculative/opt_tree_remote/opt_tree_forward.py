@@ -503,6 +503,19 @@ class OptLayerSpec:
         return batch.global_num_tokens, batch.global_num_tokens_for_logprob
 
 
+def opt_layer_verify_graph_matches(spec_info, actual_ntpb: int) -> bool:
+    """True when this layer spec may replay the TARGET_VERIFY graph.
+
+    The captured ntpb must be the layer width. The ntpb=1 dual graph is
+    DECODE, so width 1 stays eager.
+    """
+    if not isinstance(spec_info, OptLayerSpec):
+        return False
+    width = int(getattr(spec_info, "num_tokens_per_req", 0) or 0)
+    ntpb = int(actual_ntpb)
+    return ntpb != 1 and width == ntpb
+
+
 class OptLayerForward:
     """Tail logits plus one N-token extend per OPT layer. Batch size is 1."""
 
