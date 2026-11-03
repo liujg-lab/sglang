@@ -35,6 +35,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     _uses_dual_ntpb,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
+from sglang.srt.speculative.spec_info import remote_spec_role
 from sglang.srt.speculative.spec_utils import (
     NpuGraphPreparationError,
     NpuGraphReplaySubmittedError,
@@ -542,11 +543,15 @@ class NPUGraphRunner(CudaGraphRunner):
         runner = self.model_runner
         args = getattr(runner, "server_args", None)
         algo = getattr(runner, "spec_algorithm", None)
-        is_sr_target = (
-            getattr(args, "standalone_remote_role", None) == "target"
-            and callable(getattr(algo, "is_standalone_remote", None))
+        is_sr = (
+            callable(getattr(algo, "is_standalone_remote", None))
             and algo.is_standalone_remote()
         )
+        is_opt = (
+            callable(getattr(algo, "is_opt_tree_remote", None))
+            and algo.is_opt_tree_remote()
+        )
+        is_sr_target = remote_spec_role(args) == "target" and (is_sr or is_opt)
         backend = getattr(runner, "attn_backend", None)
         target_fia = bool(
             backend is not None

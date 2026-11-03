@@ -727,6 +727,36 @@ class OptTreeRemoteTest(CustomTestCase):
             (4, 10, 5),
         )
 
+    def test_remote_spec_role_reads_opt_when_sr_is_empty(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.spec_info import remote_spec_role
+
+        self.assertEqual(
+            remote_spec_role(SimpleNamespace(standalone_remote_role="target")),
+            "target",
+        )
+        self.assertEqual(
+            remote_spec_role(
+                SimpleNamespace(standalone_remote_role=None, opt_tree_role="draft")
+            ),
+            "draft",
+        )
+        self.assertIsNone(
+            remote_spec_role(
+                SimpleNamespace(standalone_remote_role=None, opt_tree_role=None)
+            )
+        )
+        self.assertEqual(
+            remote_spec_role(
+                SimpleNamespace(
+                    standalone_remote_role="target", opt_tree_role="draft"
+                )
+            ),
+            "target",
+        )
+        self.assertIsNone(remote_spec_role(None))
+
     def test_guess_tokens_per_step_uses_opt_width(self):
         from types import SimpleNamespace
 

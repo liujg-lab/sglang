@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.spec_info import remote_spec_role
 from sglang.srt.speculative.standalone_remote.sr_align import is_device_context_error
 from sglang.test.sr_reference import (
     dense_target_tree_fia_reference,
@@ -867,15 +868,28 @@ def _load_runner_methods(names, ns):
 
 
 class TestTargetUpdateOverlapGate(CustomTestCase):
-    def _runner(self, *, role="target", remote=True, fia=True, graphs=True, mapped=True):
+    def _runner(
+        self, *, role="target", remote=True, fia=True, graphs=True, mapped=True, opt=False
+    ):
         backend = SimpleNamespace(
             _use_target_tree_paged_fia=lambda: fia,
             tree_attention_impl="tree_paged_fia" if fia else "compact_fia",
         )
+        if opt:
+            server_args = SimpleNamespace(
+                standalone_remote_role=None, opt_tree_role=role
+            )
+            spec_algorithm = SimpleNamespace(
+                is_standalone_remote=lambda: False,
+                is_opt_tree_remote=lambda: True,
+            )
+        else:
+            server_args = SimpleNamespace(standalone_remote_role=role)
+            spec_algorithm = SimpleNamespace(is_standalone_remote=lambda: remote)
         runner = SimpleNamespace(
             model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(standalone_remote_role=role),
-                spec_algorithm=SimpleNamespace(is_standalone_remote=lambda: remote),
+                server_args=server_args,
+                spec_algorithm=spec_algorithm,
                 attn_backend=backend,
             ),
             graphs={1: object()} if graphs else {},
@@ -901,6 +915,7 @@ class TestTargetUpdateOverlapGate(CustomTestCase):
             ),
             "is_device_context_error": is_device_context_error,
             "logger": _Logger(),
+            "remote_spec_role": remote_spec_role,
         }
         fn = _load_runner_methods(["_maybe_enable_sr_target_update_overlap"], ns)[
             "_maybe_enable_sr_target_update_overlap"
@@ -923,6 +938,21 @@ class TestTargetUpdateOverlapGate(CustomTestCase):
         self.assertIn("requested=True", logs[0])
         self.assertIn("effective=True", logs[0])
         self.assertNotIn("reason=", logs[0])
+
+    def test_opt_target_with_map_enables(self):
+        runner = self._runner(opt=True)
+        logs = self._enable(runner, True, lambda: 2)
+        self.assertTrue(runner._npu_sr_target_update_overlap)
+        self.assertEqual(runner._npu_graph_device_id, 2)
+        self.assertIn("effective=True", logs[0])
+        self.assertNotIn("reason=", logs[0])
+
+    def test_opt_draft_stays_off(self):
+        runner = self._runner(opt=True, role="draft")
+        logs = self._enable(runner, True, lambda: 2)
+        self.assertFalse(runner._npu_sr_target_update_overlap)
+        self.assertIn("effective=False", logs[0])
+        self.assertIn("reason=not sr target", logs[0])
 
     def test_unrequested_stays_off_without_log(self):
         runner = self._runner()

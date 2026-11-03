@@ -18,6 +18,20 @@ if TYPE_CHECKING:
     )
 
 
+def remote_spec_role(server_args):
+    """Role shared by remote speculative servers.
+
+    ``STANDALONE_REMOTE`` stores it on ``standalone_remote_role``.
+    ``OPT_TREE_REMOTE`` stores it on ``opt_tree_role``. The SR field wins when
+    both are set. Neither algorithm is treated as the other.
+    """
+    if server_args is None:
+        return None
+    return getattr(server_args, "standalone_remote_role", None) or getattr(
+        server_args, "opt_tree_role", None
+    )
+
+
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 

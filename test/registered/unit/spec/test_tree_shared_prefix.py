@@ -18,6 +18,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.speculative import tree_shared_prefix as shared
+from sglang.srt.speculative.spec_info import remote_spec_role
 from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout import (
     SR_TREE_PAGED_ENV,
     SRTreeExpandTxn,
@@ -476,6 +477,8 @@ class TestSharedPrefix(unittest.TestCase):
                 read_sr_target_tree_fia_env=read_sr_target_tree_fia_env,
                 target_tree_fia_blocked_extra_combos=target_tree_fia_blocked_extra_combos,
                 maybe_select_target_tree_fia=maybe_select_target_tree_fia,
+                remote_spec_role=remote_spec_role,
+                IMPL_TREE_PAGED_FIA=IMPL_TREE_PAGED_FIA,
             ),
         )["_init_tree_shared_prefix"]
 
@@ -593,6 +596,27 @@ class TestSharedPrefix(unittest.TestCase):
             with isolated_sr_tree_paged_env(None):
                 runner.server_args.speculative_algorithm = "EAGLE"
                 runner.server_args.standalone_remote_role = "draft"
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "compact_fia")
+            with isolated_sr_tree_paged_env(None):
+                runner.server_args.speculative_algorithm = "OPT_TREE_REMOTE"
+                runner.server_args.standalone_remote_role = None
+                runner.server_args.opt_tree_role = "target"
+                backend.page_size = 128
+                backend.verify_tree_topk = 4
+                backend.draft_topk = 4
+                backend.use_mla = False
+                backend.use_fia = False
+                backend._use_tree_compact_fia = lambda: True
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, IMPL_TREE_PAGED_FIA)
+                runner.server_args.opt_tree_role = "draft"
+                fn(backend)
+                self.assertEqual(backend.tree_attention_impl, "compact_fia")
+            with isolated_sr_tree_paged_env(None, target_fia="0"):
+                runner.server_args.opt_tree_role = "target"
+                backend.page_size = 128
+                backend.verify_tree_topk = 4
                 fn(backend)
                 self.assertEqual(backend.tree_attention_impl, "compact_fia")
 

@@ -52,6 +52,7 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_ascend_use_fia,
     resolve_eager_page_buckets,
 )
+from sglang.srt.speculative.spec_info import remote_spec_role
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
@@ -463,12 +464,20 @@ class AscendAttnBackend(AttentionBackend):
         self.tree_attention_impl = (
             "compact_fia" if self._use_tree_compact_fia() else "chunked"
         )
+        # OPT keeps this choice unless Target selection upgrades it below.
+        initial_impl = self.tree_attention_impl
         reason = None
         args = self.model_runner.server_args
-        if (
-            args.speculative_algorithm != "STANDALONE_REMOTE"
-            or self.verify_tree_topk <= 1
-        ):
+        role = remote_spec_role(args)
+        algo = getattr(args, "speculative_algorithm", None)
+        if self.verify_tree_topk <= 1:
+            return
+        if algo == "OPT_TREE_REMOTE":
+            # Draft stays on the compact path. Entering the SR policy below
+            # would rewrite it to shared prefix.
+            if role != "target":
+                return
+        elif algo != "STANDALONE_REMOTE":
             return
         if self.use_mla or self.is_hybrid_swa or self.is_dllm_model or self.use_alibi:
             reason = "specialized attention architecture"
@@ -539,9 +548,14 @@ class AscendAttnBackend(AttentionBackend):
             capable=paged_capable,
             extra_reason=extra,
             page_size=self.page_size,
-            role=getattr(args, "standalone_remote_role", None),
+            role=role,
             verify_topk=self.verify_tree_topk,
         )
+        if (
+            algo == "OPT_TREE_REMOTE"
+            and self.tree_attention_impl != IMPL_TREE_PAGED_FIA
+        ):
+            self.tree_attention_impl = initial_impl
         logger.info(
             "NPU SR tree attention implementation=%s fallback_reason=%s",
             self.tree_attention_impl,
