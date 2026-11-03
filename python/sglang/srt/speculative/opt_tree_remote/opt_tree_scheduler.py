@@ -23,6 +23,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     clear_prefill_tail_logits,
     grow_with_forwards,
     ingest_tail_logits,
+    opt_other_seconds,
     produce_opt_windows,
     release_uncommitted,
 )
@@ -320,15 +321,22 @@ class OptTreeSchedulerMixin:
                 quarantine(self).retain((req, lease))
 
     def _opt_expand_one(self, req) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
+        import time
+
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptPhaseClock,
             _publish_or_rollback,
+            flush_opt_ingest_phases,
         )
         from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
             consume_opt_tree_lease,
         )
 
+        metrics = get_sr_round_metrics(self, "Draft")
+        resume_start = time.perf_counter()
         self._sr_resume_req(req)
         self._sr_isolate_need({req.rid})
+        metrics.add_host("opt_resume", time.perf_counter() - resume_start)
         committed = len(req.origin_input_ids or []) + len(req.output_ids or [])
         runner = None
         expanded = False
@@ -342,16 +350,19 @@ class OptTreeSchedulerMixin:
                 max_depth=int(self.server_args.opt_tree_max_depth),
             )
             runner = OptLayerForward(self, req, committed)
-            metrics = get_sr_round_metrics(self, "Draft")
 
             def _sync():
                 if metrics.active:
                     torch.get_device_module(self.device).synchronize()
 
+            phases = OptPhaseClock()
             t0 = time.perf_counter()
-            tail_logits = ingest_tail_logits(self, [runner])[0]
+            tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
             _sync()
-            metrics.add_host("opt_ingest", time.perf_counter() - t0)
+            phases.lap("opt_ingest_forward")
+            flush_opt_ingest_phases(
+                metrics, phases.parts, time.perf_counter() - t0
+            )
             written = int(getattr(req, "kv_committed_len", 0) or 0)
             if written != committed:
                 raise RuntimeError(
@@ -384,24 +395,28 @@ class OptTreeSchedulerMixin:
         finally:
             import sys
 
-            pending = sys.exc_info()[1]
-            clear_prefill_tail_logits(req)
-            rollback_error = None
+            finish_start = time.perf_counter()
             try:
-                _publish_or_rollback(self, req, runner, committed, window, expanded)
-            except Exception as rollback_exc:
-                logger.warning(
-                    "[OPT] rollback after expand failed for %s: %s",
-                    req.rid,
-                    rollback_exc,
-                )
-                rollback_error = rollback_exc
-            if not self._sr_is_finished(req):
-                self._sr_pause_req(req)
-            self.last_batch = None
-            self.cur_batch = None
-            if rollback_error is not None and pending is None:
-                raise rollback_error
+                pending = sys.exc_info()[1]
+                clear_prefill_tail_logits(req)
+                rollback_error = None
+                try:
+                    _publish_or_rollback(self, req, runner, committed, window, expanded)
+                except Exception as rollback_exc:
+                    logger.warning(
+                        "[OPT] rollback after expand failed for %s: %s",
+                        req.rid,
+                        rollback_exc,
+                    )
+                    rollback_error = rollback_exc
+                if not self._sr_is_finished(req):
+                    self._sr_pause_req(req)
+                self.last_batch = None
+                self.cur_batch = None
+                if rollback_error is not None and pending is None:
+                    raise rollback_error
+            finally:
+                metrics.add_host("opt_finish", time.perf_counter() - finish_start)
 
     def _opt_handle_batch_impl(self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
         metrics = get_sr_round_metrics(self, "Draft")
@@ -557,6 +572,7 @@ class OptTreeSchedulerMixin:
 
                         flush_sr_round_metrics(self, "session_reset")
                     with metrics.round() if measure else nullcontext():
+                        round_start = time.perf_counter()
                         if not supported_protocol(batch.protocol_version):
                             reply = self._sr_protocol_mismatch_reply(batch)
                             self._sr_note_handled(batch)
@@ -572,6 +588,18 @@ class OptTreeSchedulerMixin:
                         ):
                             with metrics.phase("reply_send"):
                                 self.sr_server.send_batch(reply)
+                        if measure and getattr(metrics, "active", False):
+                            host = getattr(metrics, "_round_host", None)
+                            ingest = 0.0 if host is None else host["opt_ingest"]
+                            grow = 0.0 if host is None else host["opt_grow"]
+                            metrics.add_host(
+                                "opt_other",
+                                opt_other_seconds(
+                                    time.perf_counter() - round_start,
+                                    ingest,
+                                    grow,
+                                ),
+                            )
                 self.last_batch = None
                 self._sr_resume_http_reqs()
                 self._sr_poll_deferred_finishes()

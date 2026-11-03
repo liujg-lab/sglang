@@ -33,6 +33,66 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
 
 logger = logging.getLogger(__name__)
 
+OPT_INGEST_PHASES = (
+    "opt_ingest_plan",
+    "opt_ingest_alloc",
+    "opt_ingest_batch",
+    "opt_ingest_forward",
+)
+
+
+class OptPhaseClock:
+    """Sequential host timer. Each lap covers the time since the previous one."""
+
+    def __init__(self):
+        self._mark = time.perf_counter()
+        self.parts = {}
+
+    def lap(self, name: str) -> None:
+        now = time.perf_counter()
+        self.parts[name] = self.parts.get(name, 0.0) + (now - self._mark)
+        self._mark = now
+
+
+def opt_other_seconds(elapsed, ingest, grow) -> float:
+    """Host time in one draft step that is neither ingest nor tree growth."""
+    return max(0.0, float(elapsed) - float(ingest) - float(grow))
+
+
+def flush_opt_ingest_phases(metrics, parts, wall: float) -> None:
+    """Publish plan, alloc, batch, and forward so they sum to ``wall``.
+
+    Unaccounted host time is added to plan. Time past ``wall`` is clipped
+    from forward first. ``opt_ingest`` is that sum, including the synchronize
+    the caller already added to forward.
+    """
+    if metrics is None or not getattr(metrics, "active", False):
+        return
+    wall = max(0.0, float(wall))
+    amounts = {
+        name: max(0.0, float(parts.get(name, 0.0) or 0.0))
+        for name in OPT_INGEST_PHASES
+    }
+    gap = wall - sum(amounts.values())
+    if gap >= 0.0:
+        amounts["opt_ingest_plan"] += gap
+    else:
+        rest = -gap
+        for name in OPT_INGEST_PHASES[::-1]:
+            take = min(amounts[name], rest)
+            amounts[name] -= take
+            rest -= take
+            if rest <= 1e-12:
+                break
+    for name in OPT_INGEST_PHASES:
+        if amounts[name] > 0.0:
+            metrics.add_host(name, amounts[name])
+    metrics.add_host("opt_ingest", sum(amounts[name] for name in OPT_INGEST_PHASES))
+
+
+def _phase_clock(phases: Optional["OptPhaseClock"]) -> "OptPhaseClock":
+    return phases if phases is not None else OptPhaseClock()
+
 
 def layer_positions(prefix_len: int, depth: int, width: int) -> torch.Tensor:
     """Absolute token index shared by one OPT layer.
@@ -907,9 +967,11 @@ def _verify_batch_many(
     return batch
 
 
-def _logits_at_tail_batch(scheduler, runners) -> List[torch.Tensor]:
+def _logits_at_tail_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """One DECODE row per request, reusing the committed tail slot."""
+    phases = _phase_clock(phases)
     if not runners:
+        phases.lap("opt_ingest_batch")
         return []
     pool = scheduler.req_to_token_pool.req_to_token
     slots = []
@@ -927,7 +989,9 @@ def _logits_at_tail_batch(scheduler, runners) -> List[torch.Tensor]:
     batch.out_cache_loc = torch.cat(slots)
     batch.output_ids = None
     _keep_raw_logits(batch)
+    phases.lap("opt_ingest_batch")
     logits = _flatten_logits(_run_batch(scheduler, batch))
+    phases.lap("opt_ingest_forward")
     if int(logits.shape[0]) != len(runners):
         raise RuntimeError(
             f"OPT tail logits rows {int(logits.shape[0])} != {len(runners)} requests"
@@ -935,7 +999,7 @@ def _logits_at_tail_batch(scheduler, runners) -> List[torch.Tensor]:
     return [logits[i] for i in range(len(runners))]
 
 
-def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
+def _extend_span_batch(scheduler, runners, ends, phases=None) -> List[torch.Tensor]:
     """EXTEND each runner from its committed KV to ``ends[i]``.
 
     A failed runner rolls back only to the start of this span. Earlier chunks
@@ -945,6 +1009,7 @@ def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
         read_token_span,
     )
 
+    phases = _phase_clock(phases)
     if len(runners) != len(ends):
         raise RuntimeError(
             f"OPT extend has {len(runners)} runners and {len(ends)} ends"
@@ -977,6 +1042,7 @@ def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
             spans.append(tokens)
             starts.append(start)
             locs.append(loc.reshape(-1))
+        phases.lap("opt_ingest_alloc")
         batch = _extend_batch_many(
             scheduler,
             runners,
@@ -984,7 +1050,9 @@ def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
             starts,
             torch.cat(locs),
         )
+        phases.lap("opt_ingest_batch")
         rows = _extend_request_rows(_run_batch(scheduler, batch), len(runners))
+        phases.lap("opt_ingest_forward")
     except Exception:
         for runner, start, _end in prepared:
             scheduler._opt_rollback(runner.req, start)
@@ -996,15 +1064,18 @@ def _extend_span_batch(scheduler, runners, ends) -> List[torch.Tensor]:
     return rows
 
 
-def _extend_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
+def _extend_uncommitted_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """Write every short tail in one EXTEND and keep each request's last row."""
     return _extend_span_batch(
-        scheduler, runners, [runner.prefix_len for runner in runners]
+        scheduler,
+        runners,
+        [runner.prefix_len for runner in runners],
+        phases=phases,
     )
 
 
 def _extend_uncommitted_chunked_batch(
-    scheduler, runners, chunk: int
+    scheduler, runners, chunk: int, phases=None
 ) -> List[torch.Tensor]:
     """Extend each long tail by ``chunk`` tokens. Keep the row that finishes it."""
     pending = list(runners)
@@ -1022,7 +1093,7 @@ def _extend_uncommitted_chunked_batch(
                     f"[{start}, {runner.prefix_len}) is empty"
                 )
             ends.append(bounds[0][1])
-        rows = _extend_span_batch(scheduler, pending, ends)
+        rows = _extend_span_batch(scheduler, pending, ends, phases=phases)
         nxt = []
         for runner, row, end in zip(pending, rows, ends):
             if int(end) >= int(runner.prefix_len):
@@ -1179,7 +1250,7 @@ def _opt_page_size(scheduler) -> int:
     return int(getattr(tree, "page_size", 1) or 1)
 
 
-def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
+def _decode_append_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """Write one missing token per request with a DECODE batch.
 
     ``spec_info`` stays unset so ntpb=1 can replay the captured DECODE graph.
@@ -1191,7 +1262,9 @@ def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
         read_token_span,
     )
 
+    phases = _phase_clock(phases)
     if not runners:
+        phases.lap("opt_ingest_alloc")
         return []
     prepared = []
     try:
@@ -1221,6 +1294,7 @@ def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
             tokens.append(int(span[0]))
             starts.append(start)
             locs.append(loc.reshape(-1))
+        phases.lap("opt_ingest_alloc")
         batch = scheduler._sr_make_decode_batch([runner.req for runner in runners])
         device = batch.seq_lens.device
         seq = [start + 1 for start in starts]
@@ -1236,7 +1310,9 @@ def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
         batch.seq_lens_sum = sum(seq)
         batch.out_cache_loc = torch.cat(locs)
         _keep_raw_logits(batch)
+        phases.lap("opt_ingest_batch")
         logits = _flatten_logits(_run_batch(scheduler, batch))
+        phases.lap("opt_ingest_forward")
         if int(logits.shape[0]) != len(runners):
             raise RuntimeError(
                 f"OPT decode append rows {int(logits.shape[0])} != {len(runners)}"
@@ -1253,7 +1329,7 @@ def _decode_append_batch(scheduler, runners) -> List[torch.Tensor]:
     return rows
 
 
-def _decode_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
+def _decode_uncommitted_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """Append a gap of one or two tokens, one DECODE step at a time."""
     pending = list(runners)
     saved = {}
@@ -1263,7 +1339,7 @@ def _decode_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
         before = [
             int(getattr(runner.req, "kv_committed_len", 0) or 0) for runner in pending
         ]
-        rows = _decode_append_batch(scheduler, pending)
+        rows = _decode_append_batch(scheduler, pending, phases=phases)
         nxt = []
         for runner, row in zip(pending, rows):
             if int(getattr(runner.req, "kv_committed_len", 0) or 0) >= int(
@@ -1286,8 +1362,9 @@ def _decode_uncommitted_batch(scheduler, runners) -> List[torch.Tensor]:
     return [saved[id(runner)] for runner in runners]
 
 
-def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
+def ingest_tail_logits(scheduler, runners, phases=None) -> List[torch.Tensor]:
     """Logits after each committed tail, without SR's per-token decode threshold."""
+    phases = _phase_clock(phases)
     limit = getattr(scheduler, "chunked_prefill_size", None)
     page = _opt_page_size(scheduler)
     logits = {}
@@ -1316,22 +1393,32 @@ def ingest_tail_logits(scheduler, runners) -> List[torch.Tensor]:
             raise RuntimeError(
                 f"OPT draft {runner.req.rid} ingest mode {mode} is unknown"
             )
+    phases.lap("opt_ingest_plan")
     if reprefill:
         rows = reprefill_tail_logits(scheduler, [runner.req for runner in reprefill])
+        phases.lap("opt_ingest_forward")
         for runner, row in zip(reprefill, rows):
             logits[id(runner)] = row
     if extend:
-        for runner, row in zip(extend, _extend_uncommitted_batch(scheduler, extend)):
+        for runner, row in zip(
+            extend, _extend_uncommitted_batch(scheduler, extend, phases=phases)
+        ):
             logits[id(runner)] = row
     if chunked:
-        rows = _extend_uncommitted_chunked_batch(scheduler, chunked, int(limit))
+        rows = _extend_uncommitted_chunked_batch(
+            scheduler, chunked, int(limit), phases=phases
+        )
         for runner, row in zip(chunked, rows):
             logits[id(runner)] = row
     if noop:
-        for runner, row in zip(noop, _logits_at_tail_batch(scheduler, noop)):
+        for runner, row in zip(
+            noop, _logits_at_tail_batch(scheduler, noop, phases=phases)
+        ):
             logits[id(runner)] = row
     if decode:
-        for runner, row in zip(decode, _decode_uncommitted_batch(scheduler, decode)):
+        for runner, row in zip(
+            decode, _decode_uncommitted_batch(scheduler, decode, phases=phases)
+        ):
             logits[id(runner)] = row
     return [logits[id(runner)] for runner in runners]
 
@@ -1392,14 +1479,21 @@ def grow_batch(scheduler, reqs):
         consume_opt_tree_lease,
     )
 
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
     committed = [_committed_len(req) for req in reqs]
     runners: List[OptLayerForward] = []
     windows = None
     expanded = False
+    metrics = get_sr_round_metrics(scheduler, "Draft")
     try:
+        resume_start = time.perf_counter()
         for req in reqs:
             scheduler._sr_resume_req(req)
         scheduler._sr_isolate_need({req.rid for req in reqs})
+        metrics.add_host("opt_resume", time.perf_counter() - resume_start)
         for req in reqs:
             consume_opt_tree_lease(scheduler, req)
         for req in reqs:
@@ -1412,20 +1506,17 @@ def grow_batch(scheduler, reqs):
         runners = [
             OptLayerForward(scheduler, req, keep) for req, keep in zip(reqs, committed)
         ]
-        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
-            get_sr_round_metrics,
-        )
-
-        metrics = get_sr_round_metrics(scheduler, "Draft")
 
         def _sync():
             if metrics.active:
                 torch.get_device_module(scheduler.device).synchronize()
 
+        phases = OptPhaseClock()
         t0 = time.perf_counter()
-        tail_logits = ingest_tail_logits(scheduler, runners)
+        tail_logits = ingest_tail_logits(scheduler, runners, phases=phases)
         _sync()
-        metrics.add_host("opt_ingest", time.perf_counter() - t0)
+        phases.lap("opt_ingest_forward")
+        flush_opt_ingest_phases(metrics, phases.parts, time.perf_counter() - t0)
         for runner, keep in zip(runners, committed):
             written = int(getattr(runner.req, "kv_committed_len", 0) or 0)
             if written != keep:
@@ -1451,26 +1542,32 @@ def grow_batch(scheduler, reqs):
         expanded = True
         return windows
     finally:
-        pending = sys.exc_info()[1]
-        rollback_error = None
-        for index, (req, keep) in enumerate(zip(reqs, committed)):
-            clear_prefill_tail_logits(req)
-            runner = runners[index] if index < len(runners) else None
-            window = None
-            if expanded and windows is not None and index < len(windows):
-                window = windows[index]
-            try:
-                _publish_or_rollback(scheduler, req, runner, keep, window, expanded)
-            except Exception as rollback_exc:
-                logger.warning(
-                    "[OPT] rollback after batch expand failed for %s: %s",
-                    getattr(req, "rid", None),
-                    rollback_exc,
-                )
-                rollback_error = rollback_exc
-            if not scheduler._sr_is_finished(req):
-                scheduler._sr_pause_req(req)
-        scheduler.last_batch = None
-        scheduler.cur_batch = None
-        if rollback_error is not None and pending is None:
-            raise rollback_error
+        finish_start = time.perf_counter()
+        try:
+            pending = sys.exc_info()[1]
+            rollback_error = None
+            for index, (req, keep) in enumerate(zip(reqs, committed)):
+                clear_prefill_tail_logits(req)
+                runner = runners[index] if index < len(runners) else None
+                window = None
+                if expanded and windows is not None and index < len(windows):
+                    window = windows[index]
+                try:
+                    _publish_or_rollback(
+                        scheduler, req, runner, keep, window, expanded
+                    )
+                except Exception as rollback_exc:
+                    logger.warning(
+                        "[OPT] rollback after batch expand failed for %s: %s",
+                        getattr(req, "rid", None),
+                        rollback_exc,
+                    )
+                    rollback_error = rollback_exc
+                if not scheduler._sr_is_finished(req):
+                    scheduler._sr_pause_req(req)
+            scheduler.last_batch = None
+            scheduler.cur_batch = None
+            if rollback_error is not None and pending is None:
+                raise rollback_error
+        finally:
+            metrics.add_host("opt_finish", time.perf_counter() - finish_start)

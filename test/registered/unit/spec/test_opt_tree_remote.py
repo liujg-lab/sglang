@@ -1716,7 +1716,7 @@ class OptTreeRemoteTest(CustomTestCase):
         host = _opt_stage_host()
         req = _opt_stage_req("opt-batch")
 
-        def ingest(_scheduler, _runners):
+        def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
         def grow(_config, _tails, forward_active, _scheduler):
@@ -1771,7 +1771,7 @@ class OptTreeRemoteTest(CustomTestCase):
 
         globals_["OptLayerForward"] = _Runner
 
-        def ingest(_scheduler, _runners):
+        def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
         def grow(_config, _tail, forward_layer):
@@ -1794,6 +1794,44 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertGreaterEqual(metrics.host["opt_grow"], 0)
         self.assertEqual(metrics.counts["opt_layer_forwards"], 2)
         self.assertEqual(metrics.counts["opt_rounds"], 1)
+
+    def test_ingest_phases_sum_to_opt_ingest_and_other_is_nonnegative(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OPT_INGEST_PHASES,
+            flush_opt_ingest_phases,
+            opt_other_seconds,
+        )
+
+        class _Metrics:
+            def __init__(self):
+                self.active = True
+                self.host = {}
+
+            def add_host(self, name, seconds):
+                self.host[name] = self.host.get(name, 0.0) + float(seconds)
+
+        metrics = _Metrics()
+        parts = {
+            "opt_ingest_plan": 0.001,
+            "opt_ingest_alloc": 0.002,
+            "opt_ingest_batch": 0.003,
+            "opt_ingest_forward": 0.004,
+        }
+        flush_opt_ingest_phases(metrics, parts, 0.010)
+        self.assertAlmostEqual(
+            sum(metrics.host[name] for name in OPT_INGEST_PHASES),
+            metrics.host["opt_ingest"],
+        )
+        self.assertAlmostEqual(metrics.host["opt_ingest"], 0.010)
+        self.assertAlmostEqual(metrics.host["opt_ingest_batch"], 0.003)
+
+        self.assertAlmostEqual(opt_other_seconds(0.020, 0.008, 0.011), 0.001)
+        self.assertEqual(opt_other_seconds(0.001, 0.008, 0.011), 0.0)
+
+        inactive = _Metrics()
+        inactive.active = False
+        flush_opt_ingest_phases(inactive, parts, 0.010)
+        self.assertEqual(inactive.host, {})
 
     def test_materialize_tree_seed_switch(self):
         from types import SimpleNamespace
@@ -2192,7 +2230,7 @@ class OptTreeRemoteTest(CustomTestCase):
         host.cur_batch = "stale"
         req = _lease_req(keep=3, allocated=5)
 
-        def ingest(_scheduler, runners):
+        def ingest(_scheduler, runners, phases=None):
             runners[0].layer_slots.append(torch.tensor([10, 11]))
             return [torch.zeros(4)]
 
