@@ -105,3 +105,5 @@ python -m sglang.launch_server \
 ```
 
 CUDA 使用 `--page-size 1` 和 `triton`。NPU 把 `--page-size` 改为 128，并改用该后端对应的 attention backend。
+
+page=1 时，Draft 在把验证窗口回包之后补算最后一层的 KV，下一轮 ingest 只缺 bonus 那一个 token。`SGLANG_OPT_TREE_KV_REUSE=0` 关掉这次补算。page=128 不补算，也不发布 tree lease，行为与补算引入之前相同。

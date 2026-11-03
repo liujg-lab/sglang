@@ -1719,7 +1719,7 @@ class OptTreeRemoteTest(CustomTestCase):
         def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
-        def grow(_config, _tails, forward_active, _scheduler):
+        def grow(_config, _tails, forward_active, _scheduler, states_out=None):
             forward_active(["layer-0"], [0])
             forward_active(["layer-1"], [0])
             return [([1], [-1], [0])]
@@ -1774,13 +1774,13 @@ class OptTreeRemoteTest(CustomTestCase):
         def ingest(_scheduler, _runners, phases=None):
             return [torch.zeros(4)]
 
-        def grow(_config, _tail, forward_layer):
-            forward_layer("layer-0")
-            forward_layer("layer-1")
-            return [1], [-1], [0]
+        def grow(_config, _tails, forward_active, _scheduler=None, states_out=None):
+            forward_active(["layer-0"], [0])
+            forward_active(["layer-1"], [0])
+            return [([1], [-1], [0])]
 
         globals_["ingest_tail_logits"] = ingest
-        globals_["grow_with_forwards"] = grow
+        globals_["grow_active_layers"] = grow
         host = _opt_stage_host()
         req = _opt_stage_req("opt-expand")
         metrics = get_sr_round_metrics(host, "Draft")
@@ -2234,7 +2234,7 @@ class OptTreeRemoteTest(CustomTestCase):
             runners[0].layer_slots.append(torch.tensor([10, 11]))
             return [torch.zeros(4)]
 
-        def grow(_config, _tails, _forward_active, _scheduler):
+        def grow(_config, _tails, _forward_active, _scheduler, states_out=None):
             return [([8], [-1], [1])]
 
         with patch(
@@ -2359,6 +2359,282 @@ class OptTreeRemoteTest(CustomTestCase):
 
         missing = opt_cls()
         assert_untouched(missing)
+
+    def test_grow_active_layers_exports_unforwarded_last_layer(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            grow_active_layers,
+        )
+
+        calls = []
+
+        def forward_active(steps, indices):
+            calls.append(len(indices))
+            return torch.zeros(len(indices), 2, 4)
+
+        states = []
+        windows = grow_active_layers(
+            OptTreeConfig(width=2, tau=-1.0, max_depth=3),
+            [torch.zeros(4)],
+            forward_active,
+            states_out=states,
+        )
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(windows), 1)
+        self.assertIsNotNone(windows[0])
+        self.assertEqual(len(states), 1)
+        self.assertTrue(states[0].finished)
+        self.assertEqual(states[0].depth, 2)
+        self.assertEqual(tuple(states[0].anc_mask.shape), (2, 4))
+
+    def test_deferred_last_layer_leaves_one_bonus_token(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            forward_deferred_final_layers,
+        )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+            OptTreeKVLease,
+            consume_opt_tree_lease,
+        )
+
+        host, pool, _freed = _lease_host(width=8)
+        host._sr_is_finished = lambda _req: False
+        host._sr_pause_req = lambda _req: None
+        host._opt_rollback = lambda _req, _keep: None
+        host.last_batch = "stale"
+        host.cur_batch = "stale"
+        req = _lease_req(keep=3, allocated=5)
+        req.kv_committed_len = 3
+        runner = SimpleNamespace(
+            req=req,
+            prefix_len=3,
+            cached_len=5,
+            layer_slots=[torch.tensor([100, 101])],
+        )
+        state = _finished_two_layer_state()
+        job = SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=3,
+            window=([20, 21], [-1, 0], [0, 0]),
+            state=state,
+        )
+
+        def fitting(_scheduler, runners, steps):
+            step = steps[0]
+            active = runners[0]
+            n = int(step.tokens.shape[0])
+            depth = int(step.positions.reshape(-1)[0].item())
+            self.assertEqual(active.cached_len + n, active.prefix_len + depth * n)
+            active.layer_slots.append(torch.tensor([200, 201]))
+            active.req.kv_allocated_len = active.cached_len + n
+            active.cached_len += n
+            return [torch.zeros(n, 4)]
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
+            fitting,
+        ):
+            forward_deferred_final_layers(host, [job])
+        self.assertEqual(req.opt_tree_lease.layer_slots, ((100, 101), (200, 201)))
+        req.output_ids = [20, 21, 99]
+        req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        consume_opt_tree_lease(host, req)
+        self.assertEqual(len(req.origin_input_ids) + len(req.output_ids) - req.kv_committed_len, 1)
+        self.assertEqual(pool[0, 3].item(), 100)
+        self.assertEqual(pool[0, 4].item(), 200)
+
+        bare, bare_pool, bare_freed = _lease_host(width=8)
+        bare_req = _lease_req(keep=3, allocated=3)
+        bare_req.origin_input_ids = [1, 2, 3]
+        bare_req.output_ids = [20, 21, 99]
+        bare_req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        bare_req.opt_tree_lease = OptTreeKVLease(
+            keep=3,
+            layer_slots=((100, 101),),
+            tokens=(20, 21),
+            parents=(-1, 0),
+            cols=(0, 0),
+            depths=(0, 1),
+        )
+        consume_opt_tree_lease(bare, bare_req)
+        self.assertEqual(
+            len(bare_req.origin_input_ids) + len(bare_req.output_ids) - bare_req.kv_committed_len,
+            2,
+        )
+        self.assertEqual(bare_pool[0, 3].item(), 100)
+        self.assertCountEqual(bare_freed, [101])
+
+    def test_deferred_forward_failure_pops_the_last_layer(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            forward_deferred_final_layers,
+        )
+
+        host, pool, freed = _lease_host(width=8)
+        host._sr_is_finished = lambda _req: False
+        host._sr_pause_req = lambda _req: None
+        host.last_batch = None
+        host.cur_batch = None
+        req = _lease_req(keep=3, allocated=5)
+        runner = SimpleNamespace(
+            req=req,
+            prefix_len=3,
+            cached_len=5,
+            layer_slots=[torch.tensor([100, 101])],
+        )
+
+        def rollback(target, keep_len):
+            allocated = int(target.kv_allocated_len)
+            if allocated <= int(keep_len):
+                return
+            freed.extend(int(slot) for slot in pool[0, keep_len:allocated].tolist())
+            target.kv_committed_len = int(keep_len)
+            target.kv_allocated_len = int(keep_len)
+
+        host._opt_rollback = rollback
+
+        def fitting(_scheduler, runners, _steps):
+            active = runners[0]
+            active.layer_slots.append(torch.tensor([200, 201]))
+            active.req.kv_allocated_len = active.cached_len + 2
+            pool[0, active.cached_len : active.cached_len + 2] = torch.tensor(
+                [200, 201], dtype=pool.dtype
+            )
+            raise RuntimeError("final layer failed")
+
+        job = SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=3,
+            window=([20, 21], [-1, 0], [0, 0]),
+            state=_finished_two_layer_state(),
+        )
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
+            fitting,
+        ):
+            forward_deferred_final_layers(host, [job])
+        self.assertEqual(req.opt_tree_lease.layer_slots, ((100, 101),))
+        self.assertNotIn(200, req.opt_tree_lease.all_slot_ids())
+        self.assertNotIn(201, req.opt_tree_lease.all_slot_ids())
+        self.assertEqual(req.kv_committed_len, 3)
+        self.assertEqual(pool[0, 5:7].tolist(), [-1, -1])
+        self.assertCountEqual(freed, [200, 201])
+
+    def test_deferred_finish_releases_tree_slots(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            forward_deferred_final_layers,
+        )
+
+        host, pool, freed = _lease_host(width=8)
+        req = _lease_req(keep=3, allocated=5)
+        req.finished = lambda: True
+        host._sr_is_finished = lambda target: target.finished()
+        host._sr_pause_req = lambda _req: None
+        host.last_batch = None
+        host.cur_batch = None
+        pool[0, 3:5] = torch.tensor([100, 101], dtype=pool.dtype)
+        runner = SimpleNamespace(
+            req=req,
+            prefix_len=3,
+            cached_len=5,
+            layer_slots=[torch.tensor([100, 101])],
+        )
+
+        def rollback(target, keep_len):
+            allocated = int(target.kv_allocated_len)
+            if allocated <= int(keep_len):
+                return
+            freed.extend(int(slot) for slot in pool[0, keep_len:allocated].tolist())
+            target.kv_committed_len = int(keep_len)
+            target.kv_allocated_len = int(keep_len)
+
+        host._opt_rollback = rollback
+        called = []
+        job = SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=3,
+            window=([20], [-1], [0]),
+            state=_finished_two_layer_state(),
+        )
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
+            lambda *_args, **_kwargs: called.append(1),
+        ):
+            forward_deferred_final_layers(host, [job])
+        self.assertEqual(called, [])
+        self.assertIsNone(req.opt_tree_lease)
+        self.assertCountEqual(freed, [100, 101])
+        self.assertEqual(req.kv_allocated_len, 3)
+
+    def test_deferred_queue_stays_empty_when_reuse_is_off(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            commit_deferred_expands,
+            finish_opt_expand_req,
+        )
+
+        state = _finished_two_layer_state()
+        window = ([20, 21], [-1, 0], [0, 0])
+
+        def host_for(page):
+            host, _pool, _freed = _lease_host(page=page)
+            host._opt_deferred = []
+            host._sr_is_finished = lambda _req: False
+            host._sr_pause_req = lambda _req: None
+            host._opt_rollback = lambda _req, _keep: None
+            req = _lease_req(keep=3, allocated=3)
+            runner = SimpleNamespace(
+                req=req, prefix_len=3, cached_len=3, layer_slots=[]
+            )
+            return host, req, runner
+
+        npu, npu_req, npu_runner = host_for(128)
+        self.assertIsNone(
+            finish_opt_expand_req(npu, npu_req, npu_runner, 3, window, True, state)
+        )
+        self.assertEqual(npu._opt_deferred, [])
+
+        disabled, disabled_req, disabled_runner = host_for(1)
+        with envs.SGLANG_OPT_TREE_KV_REUSE.override(False):
+            self.assertIsNone(
+                finish_opt_expand_req(
+                    disabled, disabled_req, disabled_runner, 3, window, True, state
+                )
+            )
+        self.assertEqual(disabled._opt_deferred, [])
+
+        enabled, enabled_req, enabled_runner = host_for(1)
+        job = finish_opt_expand_req(
+            enabled, enabled_req, enabled_runner, 3, window, True, state
+        )
+        self.assertIsNotNone(job)
+        self.assertEqual(enabled._opt_deferred, [])
+        commit_deferred_expands(enabled, [job], keep=True)
+        self.assertEqual(enabled._opt_deferred, [job])
+
+
+def _finished_two_layer_state():
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
+        OptTreeState,
+        expand_from_topk,
+        seed_from_topk,
+    )
+
+    state = OptTreeState.create(OptTreeConfig(width=2, tau=-1.0, max_depth=4))
+    seed_from_topk(state, torch.tensor([0.6, 0.4]), torch.tensor([20, 30]))
+    expand_from_topk(
+        state,
+        torch.tensor([[0.5, 0.2], [0.4, 0.1]]),
+        torch.tensor([[21, 31], [22, 32]]),
+    )
+    state.finished = True
+    return state
 
 
 def _load_opt_materialize_override():

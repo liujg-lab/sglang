@@ -8,7 +8,8 @@ keeps those slots in ``req.opt_tree_lease``. Every other path drops them.
 Several requests that are still growing share one forward at the same depth.
 A single request, and any batch that fails for a reason other than a device
 context error, still grow through ``_opt_expand_one``. A device context error
-poisons the draft and propagates.
+poisons the draft and propagates. On page size 1 the last layer's KV can be
+forwarded after the reply; the verify window is already fixed by then.
 """
 
 from __future__ import annotations
@@ -21,10 +22,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
 from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
     OptTreeState,
+    OptTreeStep,
+    _layer_positions,
     expand_from_topk,
     host_topk_rows,
     seed_from_topk,
@@ -487,6 +491,7 @@ def grow_active_layers(
     tail_logits,
     forward_active: Callable,
     scheduler=None,
+    states_out=None,
 ):
     """Grow one tree per tail. Requests still at one depth share a forward.
 
@@ -496,9 +501,14 @@ def grow_active_layers(
     ``[bs * N, vocab]``. A request that stops is absent from the next call.
     Each request is softmaxed on its own. One layer's top-k is copied back
     once, then each tree is updated on CPU.
+
+    ``states_out``, when given, receives each tree in tail order before any
+    forward. The last layer is present and is not forwarded.
     """
     tails = list(tail_logits)
     states = [OptTreeState.create(config) for _ in tails]
+    if states_out is not None:
+        states_out.extend(states)
     steps = [None] * len(tails)
     results = [None] * len(tails)
     active: List[int] = []
@@ -1427,6 +1437,201 @@ def _committed_len(req) -> int:
     return len(req.origin_input_ids or []) + len(req.output_ids or [])
 
 
+@dataclass
+class OptDeferredTree:
+    """One request whose last layer is forwarded after the reply is sent."""
+
+    req: object
+    runner: "OptLayerForward"
+    keep: int
+    window: tuple
+    state: OptTreeState
+
+
+def _request_finished(scheduler, req) -> bool:
+    checker = getattr(scheduler, "_sr_is_finished", None)
+    if not callable(checker):
+        return True
+    try:
+        return bool(checker(req))
+    except Exception:
+        return True
+
+
+def _can_defer(scheduler, req, expanded, window) -> bool:
+    """Page-1 OPT drafts can publish the tree after the last layer exists."""
+    deferred = getattr(scheduler, "_opt_deferred", None)
+    if not isinstance(deferred, list):
+        return False
+    return (
+        expanded
+        and window is not None
+        and _opt_page_size(scheduler) == 1
+        and not getattr(scheduler, "_sr_device_poisoned", False)
+        and not _request_finished(scheduler, req)
+        and envs.SGLANG_OPT_TREE_KV_REUSE.get()
+    )
+
+
+def _deferrable_state(state) -> bool:
+    return (
+        state is not None
+        and bool(getattr(state, "finished", False))
+        and int(getattr(state, "depth", 0) or 0) >= 1
+        and getattr(state, "anc_mask", None) is not None
+    )
+
+
+def final_layer_step(state) -> OptTreeStep:
+    """The layer ``step_after_layer`` closed without forwarding."""
+    return OptTreeStep(
+        is_final=False,
+        tokens=state.tokens[state.depth - 1].clone(),
+        positions=_layer_positions(state),
+        ancestor_mask=state.anc_mask,
+    )
+
+
+def _clear_req_to_token_span(scheduler, req, start: int, end: int) -> None:
+    row = getattr(req, "req_pool_idx", None)
+    pool = getattr(getattr(scheduler, "req_to_token_pool", None), "req_to_token", None)
+    if row is None or not torch.is_tensor(pool):
+        return
+    start = int(start)
+    end = min(int(end), int(pool.shape[1]))
+    if (
+        start < 0
+        or end <= start
+        or int(row) < 0
+        or int(row) >= int(pool.shape[0])
+    ):
+        return
+    pool[int(row), start:end] = -1
+
+
+def _drop_unfinished_layer(scheduler, job: OptDeferredTree) -> None:
+    """Pop a last layer whose forward did not finish.
+
+    ``local_rollback`` writes ``kv_committed_len`` to the fork point. That
+    point is the tree length, past the committed prefix, so OPT puts the
+    committed length back. The shared rollbacker is unchanged.
+    """
+    runner = job.runner
+    if runner is None:
+        return
+    depth = int(job.state.depth)
+    width = int(job.state.config.width)
+    if int(runner.cached_len) == int(runner.prefix_len) + depth * width:
+        return
+    if len(runner.layer_slots) < depth:
+        return
+    runner.layer_slots.pop()
+    cached = int(runner.cached_len)
+    try:
+        scheduler._opt_rollback(job.req, cached)
+    except Exception:
+        logger.warning(
+            "[OPT] rollback of unfinished layer failed for %s",
+            getattr(job.req, "rid", None),
+            exc_info=True,
+        )
+        return
+    job.req.kv_committed_len = int(job.keep)
+    _clear_req_to_token_span(scheduler, job.req, cached, cached + width)
+
+
+def forward_deferred_final_layers(scheduler, jobs) -> None:
+    """Forward each deferred last layer, then publish or roll it back."""
+    try:
+        by_depth = {}
+        for job in jobs:
+            if _request_finished(scheduler, job.req) or getattr(
+                scheduler, "_sr_device_poisoned", False
+            ):
+                continue
+            by_depth.setdefault(int(job.state.depth), []).append(job)
+        for group in by_depth.values():
+            try:
+                _forward_verify_fitting(
+                    scheduler,
+                    [job.runner for job in group],
+                    [final_layer_step(job.state) for job in group],
+                )
+            except Exception as exc:
+                for job in group:
+                    _drop_unfinished_layer(scheduler, job)
+                _reraise_device_context(scheduler, exc)
+                logger.warning("[OPT] deferred final layer failed: %s", exc)
+    finally:
+        for job in jobs:
+            try:
+                _publish_or_rollback(
+                    scheduler, job.req, job.runner, job.keep, job.window, True
+                )
+            finally:
+                if not _request_finished(scheduler, job.req):
+                    scheduler._sr_pause_req(job.req)
+        scheduler.last_batch = None
+        scheduler.cur_batch = None
+
+
+def finish_opt_expand_req(
+    scheduler, req, runner, keep, window, expanded: bool, state=None
+) -> Optional[OptDeferredTree]:
+    """Publish this expand, or return a job for the post-reply forward.
+
+    A returned job is not paused and its slots stay on the request until
+    ``commit_deferred_expands`` queues it.
+    """
+    if (
+        runner is not None
+        and _deferrable_state(state)
+        and _can_defer(scheduler, req, expanded, window)
+    ):
+        return OptDeferredTree(
+            req=req,
+            runner=runner,
+            keep=int(keep),
+            window=window,
+            state=state,
+        )
+    publish_error = None
+    try:
+        _publish_or_rollback(scheduler, req, runner, keep, window, expanded)
+    except Exception as exc:
+        publish_error = exc
+    if not _request_finished(scheduler, req):
+        scheduler._sr_pause_req(req)
+    if publish_error is not None:
+        raise publish_error
+    return None
+
+
+def commit_deferred_expands(scheduler, jobs, *, keep: bool) -> Optional[BaseException]:
+    """Queue jobs after a clean expand, or publish them when expand is failing."""
+    if keep:
+        bucket = getattr(scheduler, "_opt_deferred", None)
+        if isinstance(bucket, list):
+            bucket.extend(jobs)
+            return None
+    error = None
+    for job in jobs:
+        try:
+            _publish_or_rollback(
+                scheduler, job.req, job.runner, job.keep, job.window, True
+            )
+        except Exception as exc:
+            logger.warning(
+                "[OPT] rollback after deferred expand failed for %s: %s",
+                getattr(job.req, "rid", None),
+                exc,
+            )
+            error = exc
+        if not _request_finished(scheduler, job.req):
+            scheduler._sr_pause_req(job.req)
+    return error
+
+
 def _publish_or_rollback(scheduler, req, runner, keep, window, expanded: bool) -> None:
     """Keep a page-1 tree lease, or roll slots back to ``keep``.
 
@@ -1470,8 +1675,10 @@ def grow_batch(scheduler, reqs):
     is extended in ``chunked_prefill_size`` pieces, and only the last piece's
     row is kept. One or two missing tokens on page size 1 are DECODE steps.
     Requests that still have the same depth share one TARGET_VERIFY. On page
-    size 1, ``finally`` keeps forwarded slots in ``req.opt_tree_lease``.
-    Every other finish rolls those slots back to the committed length.
+    size 1, a clean finish keeps forwarded slots in ``req.opt_tree_lease``.
+    When post-reply reuse is on, that publish waits until the last layer has
+    been forwarded. Every other finish rolls those slots back to the committed
+    length.
     """
     if not reqs:
         return []
@@ -1485,6 +1692,7 @@ def grow_batch(scheduler, reqs):
 
     committed = [_committed_len(req) for req in reqs]
     runners: List[OptLayerForward] = []
+    states: List[OptTreeState] = []
     windows = None
     expanded = False
     metrics = get_sr_round_metrics(scheduler, "Draft")
@@ -1534,7 +1742,7 @@ def grow_batch(scheduler, reqs):
 
         t1 = time.perf_counter()
         windows = grow_active_layers(
-            config, tail_logits, forward_active, scheduler
+            config, tail_logits, forward_active, scheduler, states_out=states
         )
         metrics.add_host("opt_grow", time.perf_counter() - t1)
         metrics.counts["opt_layer_forwards"] += layers
@@ -1546,15 +1754,17 @@ def grow_batch(scheduler, reqs):
         try:
             pending = sys.exc_info()[1]
             rollback_error = None
+            deferred = []
             for index, (req, keep) in enumerate(zip(reqs, committed)):
                 clear_prefill_tail_logits(req)
                 runner = runners[index] if index < len(runners) else None
                 window = None
                 if expanded and windows is not None and index < len(windows):
                     window = windows[index]
+                state = states[index] if index < len(states) else None
                 try:
-                    _publish_or_rollback(
-                        scheduler, req, runner, keep, window, expanded
+                    job = finish_opt_expand_req(
+                        scheduler, req, runner, keep, window, expanded, state
                     )
                 except Exception as rollback_exc:
                     logger.warning(
@@ -1563,8 +1773,16 @@ def grow_batch(scheduler, reqs):
                         rollback_exc,
                     )
                     rollback_error = rollback_exc
-                if not scheduler._sr_is_finished(req):
-                    scheduler._sr_pause_req(req)
+                    job = None
+                if job is not None:
+                    deferred.append(job)
+            cancel_error = commit_deferred_expands(
+                scheduler,
+                deferred,
+                keep=pending is None and rollback_error is None,
+            )
+            if cancel_error is not None and rollback_error is None:
+                rollback_error = cancel_error
             scheduler.last_batch = None
             scheduler.cur_batch = None
             if rollback_error is not None and pending is None:

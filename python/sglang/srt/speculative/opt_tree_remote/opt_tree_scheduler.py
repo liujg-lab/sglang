@@ -21,7 +21,8 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     OptLayerForward,
     _reraise_device_context,
     clear_prefill_tail_logits,
-    grow_with_forwards,
+    forward_deferred_final_layers,
+    grow_active_layers,
     ingest_tail_logits,
     opt_other_seconds,
     produce_opt_windows,
@@ -201,6 +202,7 @@ class OptTreeSchedulerMixin:
         self.draft_paused_reqs = []
         self.sr_tree_drafter = None
         self._sr_device_poisoned = False
+        self._opt_deferred = []
         if self.tp_rank == 0:
             logger.info(
                 "[OPT] Draft scheduler ready width=%s max_depth=%s tau=%s addr=%s port=%s",
@@ -325,7 +327,8 @@ class OptTreeSchedulerMixin:
 
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             OptPhaseClock,
-            _publish_or_rollback,
+            commit_deferred_expands,
+            finish_opt_expand_req,
             flush_opt_ingest_phases,
         )
         from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
@@ -341,6 +344,7 @@ class OptTreeSchedulerMixin:
         runner = None
         expanded = False
         window = None
+        tree_states = []
         try:
             consume_opt_tree_lease(self, req)
             self._opt_release_uncommitted(req)
@@ -376,11 +380,16 @@ class OptTreeSchedulerMixin:
                 return runner.forward_layer(step)
 
             t1 = time.perf_counter()
-            tokens, parents, cols = grow_with_forwards(
+            windows = grow_active_layers(
                 config,
-                tail_logits,
-                timed_forward,
+                [tail_logits],
+                lambda steps, _idx: [timed_forward(steps[0])],
+                self,
+                states_out=tree_states,
             )
+            if not windows or windows[0] is None:
+                raise RuntimeError("OPT layer forward failed")
+            tokens, parents, cols = windows[0]
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             metrics.counts["opt_layer_forwards"] += layers
             metrics.counts["opt_rounds"] += 1
@@ -400,8 +409,19 @@ class OptTreeSchedulerMixin:
                 pending = sys.exc_info()[1]
                 clear_prefill_tail_logits(req)
                 rollback_error = None
+                deferred = []
                 try:
-                    _publish_or_rollback(self, req, runner, committed, window, expanded)
+                    job = finish_opt_expand_req(
+                        self,
+                        req,
+                        runner,
+                        committed,
+                        window,
+                        expanded,
+                        tree_states[0] if tree_states else None,
+                    )
+                    if job is not None:
+                        deferred.append(job)
                 except Exception as rollback_exc:
                     logger.warning(
                         "[OPT] rollback after expand failed for %s: %s",
@@ -409,8 +429,13 @@ class OptTreeSchedulerMixin:
                         rollback_exc,
                     )
                     rollback_error = rollback_exc
-                if not self._sr_is_finished(req):
-                    self._sr_pause_req(req)
+                cancel_error = commit_deferred_expands(
+                    self,
+                    deferred,
+                    keep=pending is None and rollback_error is None,
+                )
+                if cancel_error is not None and rollback_error is None:
+                    rollback_error = cancel_error
                 self.last_batch = None
                 self.cur_batch = None
                 if rollback_error is not None and pending is None:
@@ -571,35 +596,48 @@ class OptTreeSchedulerMixin:
                         )
 
                         flush_sr_round_metrics(self, "session_reset")
-                    with metrics.round() if measure else nullcontext():
-                        round_start = time.perf_counter()
-                        if not supported_protocol(batch.protocol_version):
-                            reply = self._sr_protocol_mismatch_reply(batch)
-                            self._sr_note_handled(batch)
-                        elif self._sr_spec_shape_rejected(batch):
-                            reply = self._sr_spec_shape_mismatch_reply(batch)
-                            self._sr_note_handled(batch)
-                        else:
-                            reply = self._opt_handle_batch_impl(batch, mm)
-                        if (
-                            (self.tp_size == 1 or self.tp_rank == 0)
-                            and self.sr_server is not None
-                            and batch.action not in (SRAction.FINISH, SRAction.ABORT)
-                        ):
-                            with metrics.phase("reply_send"):
-                                self.sr_server.send_batch(reply)
-                        if measure and getattr(metrics, "active", False):
-                            host = getattr(metrics, "_round_host", None)
-                            ingest = 0.0 if host is None else host["opt_ingest"]
-                            grow = 0.0 if host is None else host["opt_grow"]
-                            metrics.add_host(
-                                "opt_other",
-                                opt_other_seconds(
-                                    time.perf_counter() - round_start,
-                                    ingest,
-                                    grow,
-                                ),
-                            )
+                    try:
+                        with metrics.round() if measure else nullcontext():
+                            round_start = time.perf_counter()
+                            if not supported_protocol(batch.protocol_version):
+                                reply = self._sr_protocol_mismatch_reply(batch)
+                                self._sr_note_handled(batch)
+                            elif self._sr_spec_shape_rejected(batch):
+                                reply = self._sr_spec_shape_mismatch_reply(batch)
+                                self._sr_note_handled(batch)
+                            else:
+                                reply = self._opt_handle_batch_impl(batch, mm)
+                            if (
+                                (self.tp_size == 1 or self.tp_rank == 0)
+                                and self.sr_server is not None
+                                and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                            ):
+                                with metrics.phase("reply_send"):
+                                    self.sr_server.send_batch(reply)
+                            if measure and getattr(metrics, "active", False):
+                                host = getattr(metrics, "_round_host", None)
+                                ingest = 0.0 if host is None else host["opt_ingest"]
+                                grow = 0.0 if host is None else host["opt_grow"]
+                                metrics.add_host(
+                                    "opt_other",
+                                    opt_other_seconds(
+                                        time.perf_counter() - round_start,
+                                        ingest,
+                                        grow,
+                                    ),
+                                )
+                    finally:
+                        jobs = self._opt_deferred
+                        self._opt_deferred = []
+                        if jobs:
+                            started = time.perf_counter()
+                            try:
+                                forward_deferred_final_layers(self, jobs)
+                                torch.get_device_module(self.device).synchronize()
+                            finally:
+                                metrics.counts["opt_post_reply_us"] += int(
+                                    (time.perf_counter() - started) * 1e6
+                                )
                 self.last_batch = None
                 self._sr_resume_http_reqs()
                 self._sr_poll_deferred_finishes()
