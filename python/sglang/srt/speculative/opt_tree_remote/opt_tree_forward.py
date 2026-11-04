@@ -451,13 +451,31 @@ def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
 
 
 class _LayerTiming:
-    """One metered verify forward. Absent when round metrics are off."""
+    """One metered verify forward. Absent when round metrics are off.
 
-    __slots__ = ("metrics", "t0", "ev0", "ev1", "opened")
+    Per ``opt_layer_forwards``, read the counters as:
+
+    - host exposure = ``opt_layer_host_us + opt_layer_launch_us``
+    - true GPU time ≈ ``opt_layer_gpu_us - opt_layer_launch_us``
+    - layer wall ≈ host exposure + ``opt_layer_d2h_wait_us`` + a small CPU expand
+
+    ``opt_layer_d2h_wait_us`` near ``gpu_us - launch_us`` is a GPU bottleneck.
+    Host exposure above 2 ms is a host bottleneck. ``opt_seed_d2h_wait_us`` is
+    once per grow and is not divided by ``opt_layer_forwards``. ``ev0`` stays
+    before ``_run``. ``launch_us`` is the wall clock until ``_run`` returns
+    (ForwardBatch, ``replay_prepare``, and the launch). Logits stay on device;
+    the blocking copy is the later ``.cpu()``. Small copies inside
+    ``replay_prepare`` sit in both intervals, so the GPU figure is a
+    subtraction. Warmup samples include the first replay and are reference
+    only: about 1.35 ms of host and 5.2 ms of ``gpu_us`` per layer.
+    """
+
+    __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened")
 
     def __init__(self, metrics, t0, ev0, ev1):
         self.metrics = metrics
         self.t0 = t0
+        self.t_launch = None
         self.ev0 = ev0
         self.ev1 = ev1
         self.opened = False
@@ -492,12 +510,16 @@ def _begin_layer_timing(scheduler):
 
 
 def _mark_layer_launch(timing) -> None:
-    """Host time stops before the verify replay is queued."""
+    """Host time stops before the verify replay is queued.
+
+    ``t_launch`` starts the ``run_batch`` wall clock. A failed ``ev0`` leaves
+    ``opened`` false, so that sample records host time and skips launch time.
+    """
     if timing is None:
         return
-    timing.metrics.counts["opt_layer_host_us"] += int(
-        (time.perf_counter() - timing.t0) * 1e6
-    )
+    now = time.perf_counter()
+    timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+    timing.t_launch = now
     try:
         timing.ev0.record()
     except Exception:
@@ -506,9 +528,17 @@ def _mark_layer_launch(timing) -> None:
 
 
 def _finish_layer_timing(scheduler, timing) -> None:
-    """Queue the GPU interval. A failed replay never reaches this."""
+    """Queue the GPU interval. A failed replay never reaches this.
+
+    ``opt_layer_launch_us`` is host work inside ``run_batch``: ForwardBatch
+    construction, ``replay_prepare``, and the kernel launch. It is recorded
+    before ``ev1``, so ``gpu_us - launch_us`` drops that idle gap.
+    """
     if timing is None or not timing.opened:
         return
+    timing.metrics.counts["opt_layer_launch_us"] += int(
+        (time.perf_counter() - timing.t_launch) * 1e6
+    )
     try:
         timing.ev1.record()
     except Exception:
@@ -565,7 +595,9 @@ def _commit_prob_rows(
     and ``[N, N + 1]`` for a layer.
 
     ``metrics``, when active, times ``host_topk_rows``. That wall clock
-    includes the top-k and the ``.cpu()`` wait for earlier GPU work.
+    includes the top-k and the ``.cpu()`` wait for earlier GPU work. The seed
+    copy is ``opt_seed_d2h_wait_us`` (once per grow). Each layer copy is
+    ``opt_layer_d2h_wait_us``.
     """
     width = int(states[indices[0]].config.width)
     probs = [softmax_probs(row) for row in logits_rows]
@@ -573,9 +605,8 @@ def _commit_prob_rows(
     t0 = time.perf_counter() if timed else None
     scores, ids = host_topk_rows(probs, width + 1, seed=seed)
     if t0 is not None:
-        metrics.counts["opt_layer_d2h_wait_us"] += int(
-            (time.perf_counter() - t0) * 1e6
-        )
+        key = "opt_seed_d2h_wait_us" if seed else "opt_layer_d2h_wait_us"
+        metrics.counts[key] += int((time.perf_counter() - t0) * 1e6)
     written = []
     for row, index in enumerate(indices):
         state = states[index]

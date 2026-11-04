@@ -2130,8 +2130,10 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(touched, [])
         self.assertEqual(tuple(logits.shape), (2, 3))
         self.assertEqual(metrics.counts["opt_layer_host_us"], 0)
+        self.assertEqual(metrics.counts["opt_layer_launch_us"], 0)
         self.assertEqual(metrics.counts["opt_layer_gpu_us"], 0)
         self.assertEqual(metrics.counts["opt_layer_d2h_wait_us"], 0)
+        self.assertEqual(metrics.counts["opt_seed_d2h_wait_us"], 0)
         self.assertIsNone(getattr(host, "_opt_layer_events", None))
 
     def test_layer_timing_splits_host_gpu_and_d2h(self):
@@ -2151,10 +2153,14 @@ class OptTreeRemoteTest(CustomTestCase):
         samples = [
             10.0,
             10.0 + 250e-6,
+            10.0 + 250e-6 + 1800e-6,
             20.0,
             20.0 + 250e-6,
+            20.0 + 250e-6 + 1800e-6,
             30.0,
             30.0 + 400e-6,
+            40.0,
+            40.0 + 150e-6,
         ]
         clock = _SampleClock(samples)
         syncs = []
@@ -2195,6 +2201,13 @@ class OptTreeRemoteTest(CustomTestCase):
                     seed=True,
                     metrics=metrics,
                 )
+                _commit_prob_rows(
+                    [state],
+                    [0],
+                    [torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]])],
+                    seed=False,
+                    metrics=metrics,
+                )
                 self.assertEqual(len(host._opt_layer_events), 2)
                 self.assertEqual(syncs, [])
                 drain_opt_layer_gpu_us(host, metrics)
@@ -2204,11 +2217,20 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(
             metrics.counts["opt_layer_host_us"],
             int((samples[1] - samples[0]) * 1e6)
-            + int((samples[3] - samples[2]) * 1e6),
+            + int((samples[4] - samples[3]) * 1e6),
+        )
+        self.assertEqual(
+            metrics.counts["opt_layer_launch_us"],
+            int((samples[2] - samples[1]) * 1e6)
+            + int((samples[5] - samples[4]) * 1e6),
+        )
+        self.assertEqual(
+            metrics.counts["opt_seed_d2h_wait_us"],
+            int((samples[7] - samples[6]) * 1e6),
         )
         self.assertEqual(
             metrics.counts["opt_layer_d2h_wait_us"],
-            int((samples[5] - samples[4]) * 1e6),
+            int((samples[9] - samples[8]) * 1e6),
         )
         self.assertEqual(metrics.counts["opt_layer_gpu_us"], 3000)
         self.assertEqual(syncs, [1])
@@ -2254,6 +2276,7 @@ class OptTreeRemoteTest(CustomTestCase):
             metrics.counts["opt_layer_host_us"],
             int((samples[1] - samples[0]) * 1e6),
         )
+        self.assertEqual(metrics.counts["opt_layer_launch_us"], 0)
         self.assertIsNone(getattr(host, "_opt_layer_events", None))
         self.assertEqual(runner.cached_len, 4)
 
