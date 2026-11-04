@@ -2194,7 +2194,12 @@ def _free_bonus_ids(scheduler, slot_ids) -> None:
 
 @dataclass
 class _BonusAdmit:
-    """One template admission for every bonus group of this request."""
+    """Whether this round already tried to admit the bonus template.
+
+    A successful template and its M-RoPE delta stay on
+    ``_opt_la_batches[rid]`` until the KV pool index changes or the request
+    is dropped. This object only stops a second ``init_new`` inside one round.
+    """
 
     tried: bool = False
     template: object = None
@@ -2213,11 +2218,12 @@ class _BonusLaunch:
 
 
 def _alloc_bonus_slots(scheduler, runner, n: int, start: int) -> torch.Tensor:
-    """Page-1 bonus slots. Length tensors are cached device buffers.
+    """Page-1 bonus slots. Length tensors live on the scheduler.
 
     ``fill_`` writes the current prefix and, when it changes, the pool index.
-    No ``tree_cache`` keeps the caller's ``_alloc_layer_slots`` stub. These
-    slots are not appended to ``layer_slots``.
+    The two length-1 buffers are keyed by device in ``_opt_la_cache`` and
+    survive a new ``OptLayerForward``. No ``tree_cache`` keeps the caller's
+    ``_alloc_layer_slots`` stub. These slots are not appended to ``layer_slots``.
     """
     tree_cache = getattr(scheduler, "tree_cache", None)
     token_pool = getattr(scheduler, "req_to_token_pool", None)
@@ -2236,21 +2242,8 @@ def _alloc_bonus_slots(scheduler, runner, n: int, start: int) -> torch.Tensor:
     from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
     device = token_pool.device
-    cache = getattr(runner, "_bonus_len", None)
+    cache = _bonus_len_cache(scheduler, device)
     pool_idx = int(pool_idx)
-    if (
-        not isinstance(cache, dict)
-        or cache.get("device") != device
-        or not torch.is_tensor(cache.get("seq"))
-        or not torch.is_tensor(cache.get("pool"))
-    ):
-        cache = {
-            "device": device,
-            "seq": torch.empty(1, dtype=torch.int64, device=device),
-            "pool": torch.empty(1, dtype=torch.int64, device=device),
-            "pool_idx": None,
-        }
-        runner._bonus_len = cache
     if cache["pool_idx"] != pool_idx:
         cache["pool"].fill_(pool_idx)
         cache["pool_idx"] = pool_idx
@@ -2397,10 +2390,48 @@ def _bonus_template_forward(scheduler, batch, template, delta, width: int):
     return _as_layer_rows(logits, 1, width)[0]
 
 
+def _bonus_batch_hit(scheduler, req):
+    """The lookahead batch entry for this request and its current pool."""
+    batches = getattr(scheduler, "_opt_la_batches", None)
+    if not batches:
+        return None
+    hit = batches.get(getattr(req, "rid", None))
+    if hit is None or hit.get("pool_idx") != getattr(req, "req_pool_idx", None):
+        return None
+    return hit
+
+
+def _load_bonus_admit(scheduler, req):
+    """Return a cached bonus template, or None when this pool has none."""
+    hit = _bonus_batch_hit(scheduler, req)
+    if hit is None:
+        return None
+    template = hit.get("bonus_template")
+    if template is None:
+        return None
+    return template, hit.get("bonus_delta")
+
+
+def _store_bonus_admit(scheduler, req, template, delta) -> None:
+    """Keep a successful admission. A miss is not stored."""
+    if template is None:
+        return
+    hit = _bonus_batch_hit(scheduler, req)
+    if hit is None:
+        return
+    hit["bonus_template"] = template
+    hit["bonus_delta"] = delta
+
+
 def _bonus_group_logits(
     scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int, admit: _BonusAdmit
 ):
-    """One group. Admit the N+1 template once; otherwise ``run_batch``."""
+    """One group. Reuse the cached N+1 template, or admit it once.
+
+    ``_fill_bonus_schedule_batch`` refreshes the lookahead batch first, so a
+    pool change has already dropped the previous template. Later groups in
+    this round only copy lengths, the mask, and positions onto that template.
+    """
     model_runner = _bonus_model_runner(scheduler)
     if model_runner is not None and (not admit.tried or admit.template is not None):
         batch = _fill_bonus_schedule_batch(
@@ -2408,12 +2439,19 @@ def _bonus_group_logits(
         )
         if not admit.tried:
             admit.tried = True
-            admit.template = _lookahead_forward_template(scheduler, batch)
-            admit.delta = (
-                _mrope_delta_from_template(admit.template)
-                if admit.template is not None
-                else None
-            )
+            cached = _load_bonus_admit(scheduler, runner.req)
+            if cached is not None:
+                admit.template, admit.delta = cached
+            else:
+                admit.template = _lookahead_forward_template(scheduler, batch)
+                admit.delta = (
+                    _mrope_delta_from_template(admit.template)
+                    if admit.template is not None
+                    else None
+                )
+                _store_bonus_admit(
+                    scheduler, runner.req, admit.template, admit.delta
+                )
         if admit.template is not None:
             return _bonus_template_forward(
                 scheduler, batch, admit.template, admit.delta, width
@@ -2438,6 +2476,8 @@ def _launch_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int, ad
         logits = _bonus_group_logits(
             scheduler, runner, tokens, positions, mask, loc, tree_end, width, admit
         )
+        # The next replay overwrites this graph output buffer.
+        logits = logits.detach().clone()
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
         _abort_bonus_slots(scheduler, runner, loc, tree_end, width)
@@ -2499,8 +2539,10 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
     last real candidate. Publish sees only the tree span. Real guess slots
     stay allocated until the next step installs one or frees them.
 
-    Every group of this request shares one template admission. Slot ids stay
-    on device until the last group returns, then one copy reads them all.
+    Every group of this round shares one admission attempt. A successful
+    template stays on the lookahead batch until the pool index changes or
+    the request is dropped. Slot ids stay on device until the last group
+    returns, then one copy reads them all.
     """
     from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
         release_opt_bonus_guesses,
@@ -2871,6 +2913,36 @@ def _refresh_lookahead_forward(template, batch, delta):
     if delta is not None:
         fb.mrope_positions = _lookahead_mrope_positions(fb.positions, delta)
     return fb
+
+
+def _bonus_len_cache(scheduler, device):
+    """Length-1 seq and pool-index buffers for bonus slot assignment.
+
+    Stored on the scheduler next to the width cache and keyed by device.
+    A new ``OptLayerForward`` each step still reuses the same pair.
+    """
+    cache = getattr(scheduler, "_opt_la_cache", None)
+    if cache is None:
+        cache = {}
+        scheduler._opt_la_cache = cache
+    by_device = cache.get("_bonus_len")
+    if not isinstance(by_device, dict):
+        by_device = {}
+        cache["_bonus_len"] = by_device
+    key = device if isinstance(device, torch.device) else torch.device(device)
+    hit = by_device.get(key)
+    if (
+        hit is None
+        or not torch.is_tensor(hit.get("seq"))
+        or not torch.is_tensor(hit.get("pool"))
+    ):
+        hit = {
+            "seq": torch.empty(1, dtype=torch.int64, device=key),
+            "pool": torch.empty(1, dtype=torch.int64, device=key),
+            "pool_idx": None,
+        }
+        by_device[key] = hit
+    return hit
 
 
 def _lookahead_width_cache(scheduler, width: int, device):

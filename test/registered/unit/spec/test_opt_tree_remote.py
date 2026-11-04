@@ -1393,6 +1393,207 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(counts["opt_bonus_template_fallbacks"], 0)
         self.assertEqual(counts["opt_bonus_eager_groups"], 0)
 
+    def test_bonus_template_reused_until_pool_or_finish(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _BonusCandidate,
+            _forward_one_bonus_group,
+            drop_lookahead_request,
+        )
+
+        _import_or_stub_forward_batch()
+        admits = {"n": 0}
+        forwards = {"n": 0}
+
+        def make_batch(reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                reqs=list(reqs),
+                seq_lens=torch.tensor([8], dtype=torch.int64),
+                orig_seq_lens=torch.tensor([8], dtype=torch.int32),
+                sampling_info=info,
+                has_grammar=False,
+                return_logprob=False,
+                return_hidden_states=False,
+            )
+
+        def run_batch(_batch):
+            raise AssertionError("run_batch")
+
+        def forward(forward_batch):
+            forwards["n"] += 1
+            width = int(forward_batch.spec_info.num_tokens_per_req)
+            return SimpleNamespace(
+                can_run_graph=True,
+                logits_output=SimpleNamespace(
+                    next_token_logits=torch.zeros(width, 3)
+                ),
+            )
+
+        def admit(_scheduler, _batch):
+            admits["n"] += 1
+            return SimpleNamespace()
+
+        host = SimpleNamespace(
+            _sr_make_decode_batch=make_batch,
+            run_batch=run_batch,
+            cur_batch=None,
+            req_to_token_pool=SimpleNamespace(
+                device="cpu",
+                req_to_token=torch.full((1, 16), -1, dtype=torch.int64),
+            ),
+            model_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(forward=forward)
+            ),
+        )
+        req = SimpleNamespace(req_pool_idx=0, kv_allocated_len=8, rid="bonus")
+        runner = SimpleNamespace(
+            scheduler=host,
+            req=req,
+            cached_len=4,
+            prefix_len=4,
+        )
+        runner._alloc_layer_slots = lambda n, start=None: torch.arange(
+            8, 8 + int(n), dtype=torch.int64
+        )
+        chunk = [
+            _BonusCandidate(-1, 7, 4, ()),
+            _BonusCandidate(0, 8, 5, (4,)),
+            _BonusCandidate(1, 9, 6, (4, 5)),
+            _BonusCandidate(2, 10, 7, (4, 5, 6)),
+        ]
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._lookahead_forward_template",
+            admit,
+        ):
+            _forward_one_bonus_group(host, runner, chunk, 8, 4)
+            _forward_one_bonus_group(host, runner, chunk, 8, 4)
+            self.assertEqual(admits["n"], 1)
+            self.assertEqual(forwards["n"], 2)
+
+            req.req_pool_idx = 1
+            _forward_one_bonus_group(host, runner, chunk, 8, 4)
+            self.assertEqual(admits["n"], 2)
+
+            drop_lookahead_request(host, req.rid)
+            req.req_pool_idx = 0
+            _forward_one_bonus_group(host, runner, chunk, 8, 4)
+            self.assertEqual(admits["n"], 3)
+            self.assertEqual(forwards["n"], 4)
+
+    def test_bonus_group_logits_survive_next_replay(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _BonusCandidate,
+            _forward_bonus_candidates,
+        )
+
+        _import_or_stub_forward_batch()
+
+        patterns = [
+            torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            torch.tensor([[0.0, 0.0, 1.0], [1.0, 1.0, 0.0]]),
+        ]
+        buffer = torch.empty(2, 3)
+        calls = {"n": 0}
+
+        def make_batch(reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                reqs=list(reqs),
+                seq_lens=torch.tensor([8], dtype=torch.int64),
+                orig_seq_lens=torch.tensor([8], dtype=torch.int32),
+                sampling_info=info,
+                has_grammar=False,
+                return_logprob=False,
+                return_hidden_states=False,
+            )
+
+        def run_batch(_batch):
+            raise AssertionError("run_batch")
+
+        def forward(_forward_batch):
+            pattern = patterns[calls["n"]]
+            calls["n"] += 1
+            buffer.copy_(pattern)
+            return SimpleNamespace(
+                can_run_graph=True,
+                logits_output=SimpleNamespace(next_token_logits=buffer),
+            )
+
+        host = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_num_draft_tokens=1),
+            _sr_make_decode_batch=make_batch,
+            run_batch=run_batch,
+            cur_batch=None,
+            req_to_token_pool=SimpleNamespace(
+                device="cpu",
+                req_to_token=torch.full((1, 16), -1, dtype=torch.int64),
+            ),
+            model_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(forward=forward)
+            ),
+        )
+        req = SimpleNamespace(req_pool_idx=0, kv_allocated_len=8, rid="bonus")
+        runner = SimpleNamespace(
+            scheduler=host,
+            req=req,
+            cached_len=4,
+            prefix_len=4,
+        )
+        next_slot = {"n": 8}
+
+        def alloc(n, start=None):
+            begin = next_slot["n"]
+            next_slot["n"] += int(n)
+            return torch.arange(begin, begin + int(n), dtype=torch.int64)
+
+        runner._alloc_layer_slots = alloc
+        plans = [
+            _BonusCandidate(index, 10 + index, 20 + index, (index,))
+            for index in range(4)
+        ]
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._lookahead_forward_template",
+            return_value=SimpleNamespace(),
+        ):
+            _forward_bonus_candidates(host, runner, plans)
+        guesses = req.opt_bonus_guesses
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(len(guesses), 4)
+        for index, guess in enumerate(guesses):
+            row = patterns[index // 2][index % 2]
+            self.assertTrue(torch.equal(guess.logits, row))
+            self.assertNotEqual(guess.logits.data_ptr(), buffer.data_ptr())
+        buffer.fill_(-1.0)
+        for index, guess in enumerate(guesses):
+            row = patterns[index // 2][index % 2]
+            self.assertTrue(torch.equal(guess.logits, row))
+
     def test_bonus_graph_key_does_not_reuse_layer_graph(self):
         from pathlib import Path
 
@@ -4221,6 +4422,25 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertIs(first["launch_event"], second["launch_event"])
         wider = _lookahead_width_cache(sched, 8, device)
         self.assertIsNot(wider, first)
+
+    def test_bonus_len_cache_reused_across_runners(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _bonus_len_cache,
+        )
+
+        width_hit = {"width": True}
+        sched = SimpleNamespace(_opt_la_cache={4: width_hit})
+        cpu = torch.device("cpu")
+        first = _bonus_len_cache(sched, cpu)
+        second = _bonus_len_cache(sched, "cpu")
+        self.assertIs(first["seq"], second["seq"])
+        self.assertIs(first["pool"], second["pool"])
+        self.assertIsNone(first["pool_idx"])
+        other = _bonus_len_cache(sched, torch.device("meta"))
+        self.assertIsNot(other["seq"], first["seq"])
+        self.assertIsNot(other["pool"], first["pool"])
+        self.assertIs(sched._opt_la_cache[4], width_hit)
+        self.assertIs(sched._opt_la_cache["_bonus_len"][cpu]["seq"], first["seq"])
 
     def test_lookahead_kv_budget_covers_tree_and_bonus(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
