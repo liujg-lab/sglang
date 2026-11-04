@@ -3741,6 +3741,27 @@ def _load_opt_lease_overrides():
     return ns["_Opt"]
 
 
+def _load_run_opt_draft_round():
+    """Load ``run_opt_draft_round`` without importing the scheduler module.
+
+    That import pulls sampler and quantization kernels the CPU suite lacks.
+    """
+    import textwrap
+    from contextlib import nullcontext
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("def run_opt_draft_round(")
+    end = src.index("\nclass OptTreeSchedulerMixin:")
+    ns = {"nullcontext": nullcontext}
+    exec(compile(textwrap.dedent(src[start:end]), str(path), "exec"), ns)
+    return ns["run_opt_draft_round"]
+
+
 def _load_opt_expand_one():
     """Load ``_opt_expand_one`` from source.
 
@@ -4288,6 +4309,88 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertFalse(finish_runner.lookahead_inflight)
         with self.assertRaises(RuntimeError):
             finish_bonus.clone_cpu()
+
+    def test_settle_drop_clears_req_to_token_span(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _settle_lookahead_job,
+        )
+
+        class _Event:
+            def synchronize(self):
+                return None
+
+        class _Bonus:
+            def __init__(self):
+                self.event = _Event()
+                self.ready = True
+
+        def drop_job():
+            req = SimpleNamespace(
+                rid="r",
+                req_pool_idx=0,
+                kv_allocated_len=8,
+                kv_committed_len=8,
+            )
+            runner = SimpleNamespace(
+                req=req,
+                prefix_len=4,
+                cached_len=8,
+                lookahead_inflight=True,
+                lookahead_dropped=False,
+                _lookahead_launch_event=_Event(),
+                _lookahead_bonus=_Bonus(),
+                layer_slots=[torch.tensor([1, 2])],
+            )
+            job = SimpleNamespace(
+                req=req,
+                runner=runner,
+                keep=4,
+                state=SimpleNamespace(depth=1, config=SimpleNamespace(width=2)),
+            )
+            return req, job
+
+        prefix = [10, 11, 12, 13]
+        tree = [20, 21, 22, 23]
+        pool = torch.tensor([prefix + tree], dtype=torch.int64)
+        _req, job = drop_job()
+        rolls = []
+
+        def rollback(rolled, keep):
+            rolls.append(int(keep))
+            rolled.kv_allocated_len = int(keep)
+
+        scheduler = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_is_finished=lambda _req: False,
+            tree_cache=SimpleNamespace(page_size=1),
+            req_to_token_pool=SimpleNamespace(req_to_token=pool),
+            _opt_rollback=rollback,
+        )
+
+        _settle_lookahead_job(scheduler, job)
+
+        self.assertEqual(rolls, [4])
+        self.assertEqual(pool[0, :4].tolist(), prefix)
+        self.assertEqual(pool[0, 4:].tolist(), [-1, -1, -1, -1])
+
+        stale = torch.tensor([prefix + tree], dtype=torch.int64)
+        stale_req, stale_job = drop_job()
+
+        def fail_rollback(_req, _keep):
+            raise RuntimeError("rollback failed")
+
+        fail_scheduler = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_is_finished=lambda _req: False,
+            tree_cache=SimpleNamespace(page_size=1),
+            req_to_token_pool=SimpleNamespace(req_to_token=stale),
+            _opt_rollback=fail_rollback,
+        )
+
+        _settle_lookahead_job(fail_scheduler, stale_job)
+
+        self.assertEqual(stale[0].tolist(), prefix + tree)
+        self.assertEqual(stale_req.kv_allocated_len, 4)
 
     def test_bonus_attach_failure_is_counted_and_publish_still_runs(self):
         from unittest.mock import patch
@@ -4846,6 +4949,40 @@ class OptLookaheadOpsTest(unittest.TestCase):
             get_sr_round_metrics(host, "Draft").counts["opt_lookahead_template_fallbacks"],
             1,
         )
+
+    def test_post_reply_counts_stay_in_closed_window(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            SRRoundMetrics,
+            WINDOW_LIMIT,
+        )
+
+        run_opt_draft_round = _load_run_opt_draft_round()
+
+        keys = ("opt_post_reply_us", "opt_bonus_rounds", "opt_layer_gpu_us")
+        metrics = SRRoundMetrics("Draft")
+        flushed = []
+        original = metrics._emit_window
+
+        def capture(reason):
+            flushed.append({key: metrics.counts[key] for key in keys})
+            original(reason)
+
+        metrics._emit_window = capture
+
+        def one_step(counts):
+            for key in keys:
+                counts[key] += 1
+
+        for _ in range(WINDOW_LIMIT):
+            run_opt_draft_round(metrics, True, one_step)
+
+        self.assertEqual(flushed, [{key: WINDOW_LIMIT for key in keys}])
+        for key in keys:
+            self.assertEqual(metrics.counts[key], 0)
+
+        run_opt_draft_round(metrics, True, one_step)
+        for key in keys:
+            self.assertEqual(metrics.counts[key], 1)
 
 
 if __name__ == "__main__":

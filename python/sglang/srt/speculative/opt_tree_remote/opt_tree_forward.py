@@ -2872,7 +2872,7 @@ def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtim
 
 
 def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
-    """Install the speculative last layer, or roll it back before anyone frees it."""
+    """Install the speculative last layer, or roll the lookahead tree back to ``keep``."""
     runner = job.runner
     if runner is None or not getattr(runner, "lookahead_inflight", False):
         return
@@ -2896,11 +2896,15 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
             if bonus is not None:
                 _await_lookahead_event(scheduler, getattr(bonus, "event", None))
                 bonus.ready = False
+            # ``keep`` is the committed prefix. Rollback frees the whole tree,
+            # and local_rollback then sets ``kv_allocated_len`` to ``keep``.
+            end = int(getattr(job.req, "kv_allocated_len", job.keep) or job.keep)
             scheduler._opt_rollback(job.req, int(job.keep))
+            _clear_req_to_token_span(scheduler, job.req, int(job.keep), end)
         except Exception as exc:
             _reraise_device_context(scheduler, exc)
             logger.warning(
-                "[OPT] lookahead rollback of the extra layer failed for %s",
+                "[OPT] rollback of the lookahead tree failed for %s",
                 getattr(job.req, "rid", None),
                 exc_info=True,
             )

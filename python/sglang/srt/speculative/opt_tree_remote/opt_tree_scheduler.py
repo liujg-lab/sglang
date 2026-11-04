@@ -77,6 +77,16 @@ def make_opt_tree_transport(server_args):
     return SRTargetClient(addr, port, timeout_ms=timeout_ms)
 
 
+def run_opt_draft_round(metrics, measure, work) -> None:
+    """Run one draft step, then ``work``'s post-reply, before the window flushes.
+
+    ``round`` snapshots and clears ``counts`` on the way out of a full window.
+    ``work`` receives that same counter and must finish its adds before return.
+    """
+    with metrics.round() if measure else nullcontext():
+        work(metrics.counts)
+
+
 class OptTreeSchedulerMixin:
     @property
     def is_remote_spec_draft(self) -> bool:
@@ -690,53 +700,61 @@ class OptTreeSchedulerMixin:
                         flush_sr_round_metrics(self, "session_reset")
                     timing = False
                     try:
-                        with metrics.round() if measure else nullcontext():
-                            # round() clears active on the way out, before the
-                            # post-reply finally. Capture it while it is still set.
+                        def _work(counts):
+                            nonlocal timing
+                            # Sync stays outside round(), after active is cleared.
                             timing = bool(getattr(metrics, "active", False))
-                            round_start = time.perf_counter()
-                            if not supported_protocol(batch.protocol_version):
-                                reply = self._sr_protocol_mismatch_reply(batch)
-                                self._sr_note_handled(batch)
-                            elif self._sr_spec_shape_rejected(batch):
-                                reply = self._sr_spec_shape_mismatch_reply(batch)
-                                self._sr_note_handled(batch)
-                            else:
-                                reply = self._opt_handle_batch_impl(batch, mm)
-                            if (
-                                (self.tp_size == 1 or self.tp_rank == 0)
-                                and self.sr_server is not None
-                                and batch.action not in (SRAction.FINISH, SRAction.ABORT)
-                            ):
-                                with metrics.phase("reply_send"):
-                                    self.sr_server.send_batch(reply)
-                            if measure and getattr(metrics, "active", False):
-                                host = getattr(metrics, "_round_host", None)
-                                ingest = 0.0 if host is None else host["opt_ingest"]
-                                grow = 0.0 if host is None else host["opt_grow"]
-                                metrics.add_host(
-                                    "opt_other",
-                                    opt_other_seconds(
-                                        time.perf_counter() - round_start,
-                                        ingest,
-                                        grow,
-                                    ),
-                                )
-                    finally:
-                        jobs = self._opt_deferred
-                        self._opt_deferred = []
-                        defer_drain = bool(getattr(self, "_opt_defer_layer_drain", False))
-                        self._opt_defer_layer_drain = False
-                        if jobs:
-                            started = time.perf_counter()
                             try:
-                                forward_deferred_final_layers(self, jobs)
+                                round_start = time.perf_counter()
+                                if not supported_protocol(batch.protocol_version):
+                                    reply = self._sr_protocol_mismatch_reply(batch)
+                                    self._sr_note_handled(batch)
+                                elif self._sr_spec_shape_rejected(batch):
+                                    reply = self._sr_spec_shape_mismatch_reply(batch)
+                                    self._sr_note_handled(batch)
+                                else:
+                                    reply = self._opt_handle_batch_impl(batch, mm)
+                                if (
+                                    (self.tp_size == 1 or self.tp_rank == 0)
+                                    and self.sr_server is not None
+                                    and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                                ):
+                                    with metrics.phase("reply_send"):
+                                        self.sr_server.send_batch(reply)
+                                if measure and getattr(metrics, "active", False):
+                                    host = getattr(metrics, "_round_host", None)
+                                    ingest = 0.0 if host is None else host["opt_ingest"]
+                                    grow = 0.0 if host is None else host["opt_grow"]
+                                    metrics.add_host(
+                                        "opt_other",
+                                        opt_other_seconds(
+                                            time.perf_counter() - round_start,
+                                            ingest,
+                                            grow,
+                                        ),
+                                    )
                             finally:
-                                metrics.counts["opt_post_reply_us"] += int(
-                                    (time.perf_counter() - started) * 1e6
+                                # Still inside round(), so a full-window clear
+                                # cannot move these adds into the next window.
+                                jobs = self._opt_deferred
+                                self._opt_deferred = []
+                                defer_drain = bool(
+                                    getattr(self, "_opt_defer_layer_drain", False)
                                 )
-                        if defer_drain:
-                            drain_opt_layer_gpu_us(self, metrics)
+                                self._opt_defer_layer_drain = False
+                                if jobs:
+                                    started = time.perf_counter()
+                                    try:
+                                        forward_deferred_final_layers(self, jobs)
+                                    finally:
+                                        counts["opt_post_reply_us"] += int(
+                                            (time.perf_counter() - started) * 1e6
+                                        )
+                                if defer_drain:
+                                    drain_opt_layer_gpu_us(self, metrics)
+
+                        run_opt_draft_round(metrics, measure, _work)
+                    finally:
                         if timing:
                             torch.get_device_module(self.device).synchronize()
                 self.last_batch = None
