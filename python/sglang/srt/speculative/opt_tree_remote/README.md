@@ -116,6 +116,6 @@ Draft 的 `[SR Draft round]` 里，`host_mean_ms["total"]` 和 `busy_ms` 覆盖�
 
 `SGLANG_OPT_PROBE_LAYER_WAIT=1` 在每一层 `_run` 之前插入一次 stream sync，把上一层等待拆进 `opt_lookahead_launch_wait_us`。默认关闭。打开后测到的不是线上路径。默认的 `opt_layer_launch_us` 是整段 `_run` 的墙钟，包含其中隐含的等待。`opt_layer_gpu_us` 含 `_run` 期间流上空闲，GPU 忙闲用 nsys 看。
 
-lookahead 在 admission 时保存一份 `ForwardBatch`，之后每层浅拷贝并直接 `model_runner.forward`，不再每层调用 `init_new`，也不跑 sampler 的 argmax。模板不可用时这一层退回 `run_batch`，并计 `opt_lookahead_template_fallbacks`。`model_runner.forward` 返回的 `can_run_graph` 为 False 时，这一层已经走 eager，计入 `opt_lookahead_eager_layers`。
+lookahead 在 admission 时保存一份 `ForwardBatch`，之后每层浅拷贝并直接 `model_runner.forward`，不再每层调用 `init_new`，也不跑 sampler 的 argmax。层模板和它的 M-RoPE delta 跟 bonus 模板一样留在 `_opt_la_batches[rid]`，直到 KV pool 下标变化或请求结束。命中后这一步不再调用 `init_new`。模板不可用时这一层退回 `run_batch`，并计 `opt_lookahead_template_fallbacks`。`model_runner.forward` 返回的 `can_run_graph` 为 False 时，这一层已经走 eager，计入 `opt_lookahead_eager_layers`。缓存命中之后，每一层是否走图由这个计数兜底，admission 不再重复 `can_run`。
 
-admission 在 ingest 入队之前完成。这时 GPU 是空的，`prefix_len` 已经是 committed 长度。失败则不开 lookahead，退回原来的按层扩树，并计 `opt_lookahead_fallbacks`。这次检查的墙钟是 `opt_lookahead_admit_us`。
+admission 在 ingest 入队之前完成。这时 GPU 是空的，`prefix_len` 已经是 committed 长度。每步仍检查 KV 预算：`available_size` 是 free list 的长度，不会同步。空闲 slot 不够整棵树加一组 bonus，就不开 lookahead，已有的层模板留在缓存里。第一次没有层模板，或者图没有命中，也退回原来的按层扩树，并计 `opt_lookahead_fallbacks`。这次检查的墙钟是 `opt_lookahead_admit_us`。这份缓存只覆盖 batch size 为 1 的 lookahead。batch size 大于 1 仍走 `grow_batch` / `grow_active_layers`，不建层模板。

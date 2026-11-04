@@ -6,9 +6,11 @@ and draft weights:
     OPT_DRAFT_MODEL=/path/to/model \\
         PYTHONPATH=python python3 test/manual/test_opt_lookahead_template_equiv.py
 
-Batch size is 1. Depths are 1, 2, and 3. The template is admitted once.
-Each layer builds the old batch with ``_verify_batch`` plus ``init_new``
-and the template batch with ``_refresh_lookahead_forward``.
+Batch size is 1. Depths are 1, 2, and 3. The layer template is admitted
+once, then checked again at a longer prefix. Each layer builds the old
+batch with ``_verify_batch`` plus ``init_new`` and the template batch with
+``_refresh_lookahead_forward``. The bonus check does the same for one N+1
+group.
 """
 
 import dataclasses
@@ -282,7 +284,79 @@ class OptLookaheadTemplateEquivTest(CustomTestCase):
             with self.subTest(depth=depth):
                 self._compare_layer(layer, template, tree_cache, req, depth)
 
-    def _compare_layer(self, layer, template, tree_cache, req, depth: int):
+    def test_template_matches_init_new_at_a_longer_prefix(self):
+        runner = self.model_runner
+        req, tree_cache = self._prefill()
+        host = _draft_host_cls()(runner, self.server_args, tree_cache)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+            _admit_lookahead,
+            prepare_lookahead_runtime,
+        )
+
+        layer = OptLayerForward(host, req, PREFIX)
+        runtime = prepare_lookahead_runtime(host, layer)
+        _admit_lookahead(host, layer, runtime[0])
+        template = layer._la_forward_template
+        self.assertIsNotNone(template)
+        longer = PREFIX + WIDTH
+        self._alloc_layer(tree_cache, req, PREFIX)
+        layer.prefix_len = longer
+        self._compare_layer(
+            layer, template, tree_cache, req, 1, prefix=longer
+        )
+
+    def test_bonus_template_matches_init_new(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+            _fill_bonus_schedule_batch,
+            _lookahead_forward_template,
+            _mrope_delta_from_template,
+            _refresh_lookahead_forward,
+            bonus_attention_mask,
+            prepare_lookahead_runtime,
+        )
+
+        runner = self.model_runner
+        req, tree_cache = self._prefill()
+        host = _draft_host_cls()(runner, self.server_args, tree_cache)
+        layer = OptLayerForward(host, req, PREFIX)
+        prepare_lookahead_runtime(host, layer)
+        width = WIDTH + 1
+        tree_end = PREFIX
+        device = runner.device
+        chains = [tuple(range(index)) for index in range(width)]
+        mask = bonus_attention_mask(PREFIX, tree_end, chains, device=device)
+        positions = torch.arange(tree_end, tree_end + width, device=device)
+        tokens = torch.arange(40, 40 + width, dtype=torch.long, device=device)
+        loc = self._alloc_layer(tree_cache, req, tree_end, n=width)
+        batch = _fill_bonus_schedule_batch(
+            host, layer, tokens, positions, mask, loc, tree_end, width
+        )
+        template = _lookahead_forward_template(host, batch)
+        self.assertIsNotNone(template)
+        self.assertTrue(batch.spec_info.is_bonus)
+        delta = _mrope_delta_from_template(template)
+        reference = ForwardBatch.init_new(batch.get_model_worker_batch(), runner)
+        fresh = _refresh_lookahead_forward(template, batch, delta)
+        mismatches = forward_batch_mismatches(reference, fresh)
+        self.assertEqual(mismatches, [])
+        with torch.no_grad():
+            reference_out = runner.forward(reference)
+            fresh_out = runner.forward(fresh)
+        self.assertTrue(reference_out.can_run_graph)
+        self.assertTrue(fresh_out.can_run_graph)
+        self.assertTrue(
+            torch.equal(
+                reference_out.logits_output.next_token_logits,
+                fresh_out.logits_output.next_token_logits,
+            )
+        )
+
+    def _compare_layer(
+        self, layer, template, tree_cache, req, depth: int, prefix: int = PREFIX
+    ):
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             _refresh_lookahead_forward,
@@ -292,11 +366,11 @@ class OptLookaheadTemplateEquivTest(CustomTestCase):
 
         runner = self.model_runner
         device = runner.device
-        cached = PREFIX + (depth - 1) * WIDTH
+        cached = prefix + (depth - 1) * WIDTH
         layer.cached_len = cached
         tokens = torch.arange(20, 20 + WIDTH, dtype=torch.long, device=device)
-        positions = layer_positions(PREFIX, depth, WIDTH)
-        mask = layer_attention_mask(PREFIX, _ancestor(WIDTH, depth), device)
+        positions = layer_positions(prefix, depth, WIDTH)
+        mask = layer_attention_mask(prefix, _ancestor(WIDTH, depth), device)
         out_cache_loc = self._alloc_layer(tree_cache, req, cached)
         schedule = layer._verify_batch(tokens, positions, mask, out_cache_loc)
         reference = ForwardBatch.init_new(schedule.get_model_worker_batch(), runner)
@@ -356,13 +430,13 @@ class OptLookaheadTemplateEquivTest(CustomTestCase):
         req.kv_allocated_len = PREFIX
         return req, tree_cache
 
-    def _alloc_layer(self, tree_cache, req, cached: int):
+    def _alloc_layer(self, tree_cache, req, cached: int, n: int = WIDTH):
         from sglang.srt.mem_cache.common import alloc_token_slots
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         runner = self.model_runner
         device = runner.device
-        loc = alloc_token_slots(tree_cache, WIDTH)
+        loc = alloc_token_slots(tree_cache, n)
         pool_index = torch.tensor(
             [int(req.req_pool_idx)], dtype=torch.int64, device=device
         )
@@ -371,7 +445,7 @@ class OptLookaheadTemplateEquivTest(CustomTestCase):
             pool_index,
             runner.req_to_token_pool.req_to_token,
             start,
-            start + WIDTH,
+            start + n,
             loc,
             1,
         )

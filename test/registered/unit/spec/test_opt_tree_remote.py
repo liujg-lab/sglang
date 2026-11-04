@@ -1493,6 +1493,111 @@ class OptTreeRemoteTest(CustomTestCase):
             self.assertEqual(admits["n"], 3)
             self.assertEqual(forwards["n"], 4)
 
+    def test_layer_template_reused_until_pool_or_finish(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            LookaheadFallback,
+            _admit_lookahead,
+            _lookahead_batch,
+            drop_lookahead_request,
+        )
+
+        _import_or_stub_forward_batch()
+        builds = {"n": 0}
+        evict = {"on": False}
+        width = 4
+
+        def make_batch(reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                reqs=list(reqs),
+                sampling_info=info,
+                has_grammar=False,
+                return_logprob=False,
+                return_hidden_states=False,
+            )
+
+        def build_template(_scheduler, _batch):
+            builds["n"] += 1
+            return SimpleNamespace(tag=builds["n"])
+
+        def would_evict(_scheduler, _ingest=0):
+            return evict["on"]
+
+        host = SimpleNamespace(
+            _sr_make_decode_batch=make_batch,
+            server_args=SimpleNamespace(opt_tree_width=width),
+            req_to_token_pool=SimpleNamespace(device="cpu"),
+        )
+        req = SimpleNamespace(rid="layer", req_pool_idx=0, kv_committed_len=8)
+        runner = SimpleNamespace(
+            req=req,
+            prefix_len=8,
+            cached_len=8,
+            _la_positions=torch.empty(width, dtype=torch.long),
+            _la_seq=torch.empty(1, dtype=torch.int64),
+            _la_seq_cpu=torch.empty(1, dtype=torch.int64),
+            _la_orig=torch.empty(1, dtype=torch.int32),
+            _la_dummy_tokens=torch.zeros(width, dtype=torch.long),
+            _la_forward_template=None,
+            _la_mrope_delta=None,
+        )
+
+        def admit():
+            batch = _lookahead_batch(host, req)
+            _admit_lookahead(host, runner, batch)
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._lookahead_forward_template",
+            build_template,
+        ), patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._lookahead_would_evict",
+            would_evict,
+        ):
+            admit()
+            first = runner._la_forward_template
+            admit()
+            self.assertEqual(builds["n"], 1)
+            self.assertIs(runner._la_forward_template, first)
+            self.assertIs(host._opt_la_batches[req.rid]["layer_template"], first)
+            self.assertIsNone(runner._la_mrope_delta)
+
+            evict["on"] = True
+            with self.assertRaises(LookaheadFallback) as caught:
+                admit()
+            self.assertIn("kv evict", str(caught.exception))
+            self.assertEqual(builds["n"], 1)
+            self.assertIs(host._opt_la_batches[req.rid]["layer_template"], first)
+
+            evict["on"] = False
+            req.req_pool_idx = 1
+            admit()
+            self.assertEqual(builds["n"], 2)
+            self.assertIsNot(runner._la_forward_template, first)
+
+            second = runner._la_forward_template
+            drop_lookahead_request(host, req.rid)
+            req.req_pool_idx = 0
+            admit()
+            self.assertEqual(builds["n"], 3)
+            self.assertIsNot(runner._la_forward_template, second)
+            self.assertIs(
+                host._opt_la_batches[req.rid]["layer_template"],
+                runner._la_forward_template,
+            )
+
     def test_bonus_group_logits_survive_next_replay(self):
         from unittest.mock import patch
 

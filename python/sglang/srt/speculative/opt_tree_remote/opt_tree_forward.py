@@ -2423,6 +2423,28 @@ def _store_bonus_admit(scheduler, req, template, delta) -> None:
     hit["bonus_delta"] = delta
 
 
+def _load_layer_admit(scheduler, req):
+    """Return a cached layer template, or None when this pool has none."""
+    hit = _bonus_batch_hit(scheduler, req)
+    if hit is None:
+        return None
+    template = hit.get("layer_template")
+    if template is None:
+        return None
+    return template, hit.get("layer_delta")
+
+
+def _store_layer_admit(scheduler, req, template, delta) -> None:
+    """Keep a successful layer admission. A miss is not stored."""
+    if template is None:
+        return
+    hit = _bonus_batch_hit(scheduler, req)
+    if hit is None:
+        return
+    hit["layer_template"] = template
+    hit["layer_delta"] = delta
+
+
 def _bonus_group_logits(
     scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int, admit: _BonusAdmit
 ):
@@ -3106,17 +3128,26 @@ def _private_seed_logits(runner, tail_logits) -> torch.Tensor:
 
 
 def _admit_lookahead(scheduler, runner, batch) -> None:
-    """One graph and KV-budget check while the GPU is still idle.
+    """KV-budget check, then reuse or build the layer template.
 
     Call this before ingest is queued. ``prefix_len`` and ``cached_len`` are
     already the committed length, and ingest does not change them. The budget
-    includes the slots ingest still has to allocate. Later layers keep the
-    same width and batch, so they do not call ``can_run`` or re-read the
-    free list.
+    includes the slots ingest still has to allocate. ``available_size`` is the
+    free-list length and does not sync. A short list raises
+    ``LookaheadFallback`` and leaves a cached template in place.
+
+    A template and its M-RoPE delta stay on ``_opt_la_batches[rid]`` until the
+    KV pool index changes or the request is dropped. A hit skips ``init_new``
+    and ``can_run``. Later layers still report a graph miss through
+    ``opt_lookahead_eager_layers``.
     """
     n = int(scheduler.server_args.opt_tree_width)
     if _lookahead_would_evict(scheduler, _lookahead_ingest_slots(runner)):
         raise LookaheadFallback("kv evict")
+    cached = _load_layer_admit(scheduler, runner.req)
+    if cached is not None:
+        runner._la_forward_template, runner._la_mrope_delta = cached
+        return
     device = scheduler.req_to_token_pool.device
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -3155,8 +3186,10 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     template = _lookahead_forward_template(scheduler, batch)
     if template is None:
         raise LookaheadFallback("cuda graph miss")
+    delta = _mrope_delta_from_template(template)
     runner._la_forward_template = template
-    runner._la_mrope_delta = _mrope_delta_from_template(template)
+    runner._la_mrope_delta = delta
+    _store_layer_admit(scheduler, runner.req, template, delta)
 
 
 def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtime):
