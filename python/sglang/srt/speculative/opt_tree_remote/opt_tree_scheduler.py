@@ -20,6 +20,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     LookaheadFallback,
     OptLayerForward,
+    _admit_lookahead,
     _reraise_device_context,
     clear_prefill_tail_logits,
     _begin_ingest_gpu,
@@ -378,7 +379,6 @@ class OptTreeSchedulerMixin:
                 t_prep = time.perf_counter()
                 try:
                     lookahead_runtime = prepare_lookahead_runtime(self, runner)
-                    self._opt_lookahead_active = True
                 except Exception as exc:
                     _reraise_device_context(self, exc)
                     logger.info("[OPT] lookahead setup fell back: %s", exc)
@@ -388,6 +388,20 @@ class OptTreeSchedulerMixin:
                     metrics.add_host(
                         "opt_lookahead_prepare", time.perf_counter() - t_prep
                     )
+            if lookahead_runtime is not None:
+                t_admit = time.perf_counter()
+                try:
+                    _admit_lookahead(self, runner, lookahead_runtime[0])
+                    self._opt_lookahead_active = True
+                except LookaheadFallback as exc:
+                    logger.info("[OPT] lookahead admit fell back: %s", exc)
+                    metrics.counts["opt_lookahead_fallbacks"] += 1
+                    lookahead_runtime = None
+                finally:
+                    if metrics.active:
+                        metrics.counts["opt_lookahead_admit_us"] += int(
+                            (time.perf_counter() - t_admit) * 1e6
+                        )
 
             def _sync():
                 # Metrics sync here waits out the ingest forward and leaves no

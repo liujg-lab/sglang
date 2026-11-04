@@ -44,11 +44,26 @@ def longest_draft_chain(config: OptTreeConfig) -> int:
     return int(config.max_depth) - 1
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
 def opt_draft_lookahead_enabled() -> bool:
     """Draft layer lookahead. Default off.
 
     The hot path overlaps the next layer's launch with host tree updates.
     It is only taken for CUDA, page size 1, batch size 1, and Triton.
     """
-    value = os.environ.get("SGLANG_OPT_DRAFT_LOOKAHEAD", "")
-    return value.strip().lower() in {"1", "true", "yes", "y"}
+    return _env_flag("SGLANG_OPT_DRAFT_LOOKAHEAD")
+
+
+def opt_probe_layer_wait_enabled() -> bool:
+    """Force a stream sync before each lookahead ``_run``. Default off.
+
+    This splits the previous-layer wait into ``opt_lookahead_launch_wait_us``.
+    It is a diagnostic, not the online path: the host waits for the previous
+    layer to finish before preparing the next launch. Leave it unset when
+    reading ``opt_layer_launch_us``.
+    """
+    return _env_flag("SGLANG_OPT_PROBE_LAYER_WAIT")

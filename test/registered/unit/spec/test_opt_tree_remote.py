@@ -3484,6 +3484,38 @@ class _SyncProbe:
         self.calls.append(1)
 
 
+def _import_or_stub_forward_batch():
+    """Load ``ForwardMode``, or a stand-in when this interpreter lacks ``dill``.
+
+    ``launch_layer`` imports it lazily. The CPU suite on the editing machine
+    does not install that dependency. The stub is only inserted when the real
+    module is absent, and it stays for the rest of the process.
+    """
+    import sys
+    from enum import IntEnum
+    from types import ModuleType
+
+    key = "sglang.srt.model_executor.forward_batch_info"
+    if key in sys.modules:
+        return
+    try:
+        import sglang.srt.model_executor.forward_batch_info  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        sys.modules.pop(key, None)
+
+    class _Mode(IntEnum):
+        TARGET_VERIFY = 8
+
+    class _Hidden:
+        NULL = 0
+
+    module = ModuleType(key)
+    module.ForwardMode = _Mode
+    module.CaptureHiddenMode = _Hidden
+    sys.modules[key] = module
+
+
 class _SampleClock:
     def __init__(self, samples):
         self.samples = list(samples)
@@ -3814,20 +3846,31 @@ class OptLookaheadOpsTest(unittest.TestCase):
 
         from sglang.srt.speculative.opt_tree_remote.opt_tree_config import (
             opt_draft_lookahead_enabled,
+            opt_probe_layer_wait_enabled,
         )
 
         old = os.environ.pop("SGLANG_OPT_DRAFT_LOOKAHEAD", None)
+        probe = os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
         try:
             self.assertFalse(opt_draft_lookahead_enabled())
             os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = "1"
             self.assertTrue(opt_draft_lookahead_enabled())
             os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = "no"
             self.assertFalse(opt_draft_lookahead_enabled())
+            self.assertFalse(opt_probe_layer_wait_enabled())
+            os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = "1"
+            self.assertTrue(opt_probe_layer_wait_enabled())
+            os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = "no"
+            self.assertFalse(opt_probe_layer_wait_enabled())
         finally:
             if old is None:
                 os.environ.pop("SGLANG_OPT_DRAFT_LOOKAHEAD", None)
             else:
                 os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = old
+            if probe is None:
+                os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
+            else:
+                os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = probe
 
     def test_expand_on_device_matches_cpu_expand_including_ties(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
@@ -3952,6 +3995,7 @@ class OptLookaheadOpsTest(unittest.TestCase):
 
     def test_lookahead_kv_budget_covers_tree_and_bonus(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _lookahead_ingest_slots,
             _lookahead_kv_need,
             _lookahead_would_evict,
         )
@@ -3973,9 +4017,10 @@ class OptLookaheadOpsTest(unittest.TestCase):
 
         args = SimpleNamespace(opt_tree_width=10, opt_tree_max_depth=10)
         need = (10 - 1) * 10 + (10 + 1)
-        self.assertEqual(
-            _lookahead_kv_need(SimpleNamespace(server_args=args)), need
-        )
+        host_args = SimpleNamespace(server_args=args)
+        self.assertEqual(_lookahead_kv_need(host_args), need)
+        self.assertEqual(_lookahead_kv_need(host_args, 0), need)
+        self.assertEqual(_lookahead_kv_need(host_args, 3), need + 3)
 
         def host(free, chunk=False):
             return SimpleNamespace(
@@ -3987,6 +4032,20 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertFalse(_lookahead_would_evict(host(need)))
         self.assertTrue(_lookahead_would_evict(host(need - 1, chunk=True)))
         self.assertFalse(_lookahead_would_evict(host(need, chunk=True)))
+        self.assertTrue(_lookahead_would_evict(host(need), ingest_slots=1))
+        self.assertFalse(_lookahead_would_evict(host(need + 1), ingest_slots=1))
+        self.assertEqual(
+            _lookahead_ingest_slots(
+                SimpleNamespace(prefix_len=12, req=SimpleNamespace(kv_committed_len=9))
+            ),
+            3,
+        )
+        self.assertEqual(
+            _lookahead_ingest_slots(
+                SimpleNamespace(prefix_len=12, req=SimpleNamespace(kv_committed_len=12))
+            ),
+            0,
+        )
 
     def test_settle_clone_failure_drops_bonus_without_a_second_forward(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -4119,6 +4178,7 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertIsNone(host._opt_ingest_events)
 
     def test_launch_wait_syncs_only_after_a_previous_layer(self):
+        import os
         from unittest.mock import patch
 
         from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
@@ -4141,18 +4201,31 @@ class OptLookaheadOpsTest(unittest.TestCase):
 
         host = _layer_timing_host()
         metrics = get_sr_round_metrics(host, "Draft")
-        runner = SimpleNamespace(scheduler=host, _lookahead_queued=False)
+        runner = SimpleNamespace(scheduler=host, _lookahead_queued=True)
         samples = [1.0, 1.0 + 400e-6]
-        with patch.object(
-            forward.torch, "get_device_module", lambda _device: _Device()
-        ), patch.object(forward.time, "perf_counter", _SampleClock(samples)):
-            metrics.active = True
-            _note_lookahead_launch_wait(runner)
-            self.assertEqual(syncs, [])
-            runner._lookahead_queued = True
-            _note_lookahead_launch_wait(runner)
+        probe = os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
+        try:
+            with patch.object(
+                forward.torch, "get_device_module", lambda _device: _Device()
+            ), patch.object(forward.time, "perf_counter", _SampleClock(samples)):
+                metrics.active = True
+                _note_lookahead_launch_wait(runner)
+                self.assertEqual(syncs, [])
+                self.assertEqual(metrics.counts["opt_lookahead_launch_wait_us"], 0)
+                os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = "1"
+                runner._lookahead_queued = False
+                _note_lookahead_launch_wait(runner)
+                self.assertEqual(syncs, [])
+                runner._lookahead_queued = True
+                _note_lookahead_launch_wait(runner)
+                metrics.active = False
+                _note_lookahead_launch_wait(runner)
+        finally:
             metrics.active = False
-            _note_lookahead_launch_wait(runner)
+            if probe is None:
+                os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
+            else:
+                os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = probe
         self.assertEqual(syncs, [1])
         self.assertEqual(
             metrics.counts["opt_lookahead_launch_wait_us"],
@@ -4160,6 +4233,7 @@ class OptLookaheadOpsTest(unittest.TestCase):
         )
 
     def test_layer_wait_is_outside_host_and_launch(self):
+        import os
         from unittest.mock import patch
 
         from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
@@ -4201,6 +4275,8 @@ class OptLookaheadOpsTest(unittest.TestCase):
         ]
         timing = _LayerTiming(metrics, start, _TimingEvent(), _TimingEvent())
         runner = SimpleNamespace(scheduler=host, _lookahead_queued=True)
+        probe = os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
+        os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = "1"
         try:
             with patch.object(
                 forward.torch, "get_device_module", lambda _device: _Device()
@@ -4211,6 +4287,10 @@ class OptLookaheadOpsTest(unittest.TestCase):
                 _finish_layer_timing(host, timing)
         finally:
             metrics.active = False
+            if probe is None:
+                os.environ.pop("SGLANG_OPT_PROBE_LAYER_WAIT", None)
+            else:
+                os.environ["SGLANG_OPT_PROBE_LAYER_WAIT"] = probe
         self.assertEqual(
             metrics.counts["opt_layer_host_us"], int((samples[0] - start) * 1e6)
         )
@@ -4229,6 +4309,225 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertLess(
             metrics.counts["opt_layer_launch_us"],
             metrics.counts["opt_lookahead_launch_wait_us"],
+        )
+
+    def test_lookahead_template_copy_keeps_the_admission_batch(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerSpec,
+            _refresh_lookahead_forward,
+        )
+
+        old_ids = torch.zeros(2, dtype=torch.long)
+        old_loc = torch.zeros(2, dtype=torch.long)
+        old_mask = torch.zeros(6, dtype=torch.bool)
+        template = SimpleNamespace(
+            input_ids=old_ids,
+            seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_cpu=torch.zeros(1, dtype=torch.long),
+            orig_seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_sum=0,
+            out_cache_loc=old_loc,
+            spec_info=OptLayerSpec(
+                custom_mask=old_mask,
+                positions=torch.zeros(2, dtype=torch.long),
+                draft_token_num=2,
+                num_tokens_per_req=2,
+            ),
+            positions=torch.zeros(2, dtype=torch.long),
+            extend_num_tokens=0,
+            extend_seq_lens_cpu=None,
+            extend_prefix_lens_cpu=None,
+            extend_logprob_start_lens_cpu=None,
+            mrope_positions=None,
+            req_pool_indices=torch.tensor([7]),
+            forward_mode="verify",
+            sampling_info="greedy",
+        )
+        new_ids = torch.tensor([8, 9])
+        new_loc = torch.tensor([3, 4])
+        new_mask = torch.ones(6, dtype=torch.bool)
+        positions = torch.tensor([11, 11])
+        batch = SimpleNamespace(
+            input_ids=new_ids,
+            seq_lens=torch.tensor([6]),
+            seq_lens_cpu=torch.tensor([6]),
+            orig_seq_lens=torch.tensor([6]),
+            seq_lens_sum=6,
+            out_cache_loc=new_loc,
+            spec_info=OptLayerSpec(
+                custom_mask=new_mask,
+                positions=positions,
+                draft_token_num=2,
+                num_tokens_per_req=2,
+            ),
+            extend_num_tokens=2,
+            extend_lens=[2],
+            prefix_lens=[6],
+            extend_logprob_start_lens=[6],
+        )
+        fresh = _refresh_lookahead_forward(template, batch, None)
+        self.assertTrue(torch.equal(fresh.input_ids, new_ids))
+        self.assertTrue(torch.equal(fresh.spec_info.custom_mask, new_mask))
+        self.assertEqual(fresh.seq_lens_sum, 6)
+        self.assertTrue(torch.equal(fresh.out_cache_loc, new_loc))
+        self.assertEqual(fresh.extend_seq_lens_cpu, [2])
+        self.assertEqual(fresh.extend_prefix_lens_cpu, [6])
+        self.assertIs(fresh.req_pool_indices, template.req_pool_indices)
+        self.assertIs(fresh.sampling_info, template.sampling_info)
+        self.assertTrue(torch.equal(template.input_ids, old_ids))
+        self.assertTrue(torch.equal(template.spec_info.custom_mask, old_mask))
+        self.assertEqual(template.seq_lens_sum, 0)
+        self.assertTrue(torch.equal(template.out_cache_loc, old_loc))
+
+    def test_lookahead_mrope_reuses_the_device_delta(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _lookahead_mrope_positions,
+            _mrope_delta_from_template,
+        )
+
+        positions = torch.tensor([10, 10])
+        mrope = torch.tensor([[13, 13], [13, 13], [13, 13]])
+        template = SimpleNamespace(positions=positions, mrope_positions=mrope)
+        delta = _mrope_delta_from_template(template)
+        self.assertTrue(torch.equal(delta, torch.tensor([[3]])))
+        later = torch.tensor([20, 20])
+        calls = []
+        real_to = torch.Tensor.to
+
+        def _spy_to(tensor, *args, **kwargs):
+            calls.append(args)
+            return real_to(tensor, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "to", _spy_to):
+            rows = _lookahead_mrope_positions(later, delta)
+        self.assertEqual(calls, [])
+        self.assertEqual(tuple(rows.shape), (3, 2))
+        self.assertTrue(torch.equal(rows, torch.full((3, 2), 23)))
+
+    def test_launch_layer_forwards_the_template_without_sampling(self):
+        _import_or_stub_forward_batch()
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host = _layer_timing_host()
+        seen = {}
+
+        class _ModelRunner:
+            def forward(self, forward_batch):
+                seen["batch"] = forward_batch
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros(2, 4)
+                    )
+                )
+
+            def sample(self, *_args, **_kwargs):
+                raise AssertionError("sample")
+
+        def run_batch(_batch):
+            raise AssertionError("run_batch")
+
+        host.run_batch = run_batch
+        host.model_worker = SimpleNamespace(model_runner=_ModelRunner())
+        runner = OptLayerForward.__new__(OptLayerForward)
+        runner.scheduler = host
+        runner.prefix_len = 4
+        runner.cached_len = 4
+        runner.req = SimpleNamespace(kv_allocated_len=0)
+        runner._la_positions = torch.empty(2, dtype=torch.long)
+        runner._la_seq = torch.zeros(1, dtype=torch.long)
+        runner._la_orig = torch.zeros(1, dtype=torch.long)
+        runner._lookahead_launch_event = None
+        runner._lookahead_queued = False
+        runner._alloc_lookahead_slots = lambda n: torch.arange(n)
+        old_ids = torch.zeros(2, dtype=torch.long)
+        runner._la_forward_template = SimpleNamespace(
+            input_ids=old_ids,
+            seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_cpu=torch.zeros(1, dtype=torch.long),
+            orig_seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_sum=0,
+            out_cache_loc=torch.zeros(2, dtype=torch.long),
+            spec_info=None,
+            positions=torch.zeros(2, dtype=torch.long),
+            extend_num_tokens=0,
+            mrope_positions=torch.zeros(3, 2, dtype=torch.long),
+            req_pool_indices=torch.tensor([7]),
+            forward_mode="verify",
+            sampling_info="greedy",
+        )
+        runner._la_mrope_delta = torch.tensor([[5]])
+        tokens = torch.tensor([8, 9])
+        ancestor = torch.ones(2, 2, dtype=torch.int8)
+        batch = SimpleNamespace()
+        logits = runner.launch_layer(tokens, ancestor, 1, batch)
+        self.assertEqual(tuple(logits.shape), (2, 4))
+        self.assertIs(seen["batch"].input_ids, batch.input_ids)
+        self.assertTrue(torch.equal(runner._la_forward_template.input_ids, old_ids))
+        self.assertEqual(runner._la_forward_template.seq_lens_sum, 0)
+        self.assertTrue(
+            torch.equal(seen["batch"].mrope_positions, torch.full((3, 2), 9))
+        )
+        self.assertEqual(
+            get_sr_round_metrics(host, "Draft").counts["opt_lookahead_template_fallbacks"],
+            0,
+        )
+
+    def test_launch_layer_without_a_template_uses_run_batch(self):
+        _import_or_stub_forward_batch()
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host = _layer_timing_host()
+        seen = {"forward": 0, "run_batch": 0}
+
+        class _ModelRunner:
+            def forward(self, _forward_batch):
+                seen["forward"] += 1
+                raise AssertionError("forward")
+
+            def sample(self, *_args, **_kwargs):
+                raise AssertionError("sample")
+
+        def run_batch(_batch):
+            seen["run_batch"] += 1
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(next_token_logits=torch.zeros(2, 4))
+            )
+
+        host.run_batch = run_batch
+        host.model_worker = SimpleNamespace(model_runner=_ModelRunner())
+        runner = OptLayerForward.__new__(OptLayerForward)
+        runner.scheduler = host
+        runner.prefix_len = 4
+        runner.cached_len = 4
+        runner.req = SimpleNamespace(kv_allocated_len=0)
+        runner._la_positions = torch.empty(2, dtype=torch.long)
+        runner._la_seq = torch.zeros(1, dtype=torch.long)
+        runner._la_orig = torch.zeros(1, dtype=torch.long)
+        runner._lookahead_launch_event = None
+        runner._lookahead_queued = False
+        runner._alloc_lookahead_slots = lambda n: torch.arange(n)
+        runner._la_forward_template = None
+        runner._la_mrope_delta = None
+        logits = runner.launch_layer(
+            torch.tensor([8, 9]), torch.ones(2, 2, dtype=torch.int8), 1, SimpleNamespace()
+        )
+        self.assertEqual(tuple(logits.shape), (2, 4))
+        self.assertEqual(seen, {"forward": 0, "run_batch": 1})
+        self.assertEqual(
+            get_sr_round_metrics(host, "Draft").counts["opt_lookahead_template_fallbacks"],
+            1,
         )
 
 

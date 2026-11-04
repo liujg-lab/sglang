@@ -14,6 +14,7 @@ forwarded after the reply; the verify window is already fixed by then.
 
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 import time
@@ -26,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import (
     OptTreeConfig,
     opt_draft_lookahead_enabled,
+    opt_probe_layer_wait_enabled,
 )
 from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
 from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
@@ -461,26 +463,31 @@ class _LayerTiming:
 
     Per ``opt_layer_forwards``, read the counters as:
 
-    - ``opt_layer_host_us`` is preparation before any wait for the previous layer.
-    - ``opt_lookahead_launch_wait_us`` is that wait. It is in neither
-      ``host_us`` nor ``launch_us``.
-    - ``opt_layer_launch_us`` starts after the wait and stops when ``_run``
-      returns. Replaying the same ``r{N}_1`` graph returns immediately.
-      On one lookahead layer these three sum to the host wall from the start
-      of preparation through ``_run``.
-    - ``opt_layer_gpu_us`` brackets ``ev0``..``ev1``. Subtracting ``launch_us``
-      does not remove the previous-layer wait from the GPU time.
+    - ``opt_layer_host_us`` is preparation before ``_run``.
+    - ``opt_layer_launch_us`` is the wall clock from ``_mark_layer_launch``
+      until the layer forward returns. The lookahead template path calls
+      ``model_runner.forward`` and does not enter ``ForwardBatch.init_new``.
+      The ``run_batch`` fallback still includes the wait inside ``init_new``.
+      Replaying the same ``r{N}_1`` graph returns once that wait is gone.
+    - ``opt_lookahead_launch_wait_us`` stays zero unless
+      ``SGLANG_OPT_PROBE_LAYER_WAIT`` is set. The probe synchronizes the
+      stream before ``_run`` and records that stall here, outside ``host_us``
+      and ``launch_us``. That schedule is not the online path: the host waits
+      for the previous layer to finish before starting ``_run``.
+    - ``opt_layer_gpu_us`` is ``ev0.elapsed_time(ev1)``. ``ev0`` is recorded at
+      the start of the ``_run`` window, so the interval includes host
+      preparation while the stream is idle. It is not GPU-busy time. Confirm
+      busy and idle with nsys; do not subtract ``launch_us``.
     - ``opt_layer_forwards`` counts every queued layer, including the last one
       lookahead submits early. ``opt_layer_forwards_critical`` is that count
       minus one, matching the old path's pre-reply forwards.
     - ``opt_ingest_gpu_us`` is the ingest forward on the device. Its events are
       read in the same drain as the layer events.
 
-    ``opt_layer_d2h_wait_us`` near the GPU interval is a GPU bottleneck.
     ``opt_seed_d2h_wait_us`` is once per grow and is not divided by
-    ``opt_layer_forwards``. Logits stay on device; the blocking copy is the
-    later ``.cpu()``. Warmup samples include the first replay and are
-    reference only.
+    ``opt_layer_forwards``. ``opt_layer_d2h_wait_us`` is the later ``.cpu()``
+    of each layer. Logits stay on device until that copy. Warmup samples
+    include the first replay and are reference only.
     """
 
     __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened", "host_closed")
@@ -524,7 +531,7 @@ def _begin_layer_timing(scheduler):
 
 
 def _close_layer_host(timing) -> None:
-    """Stop the preparation clock before waiting for the previous layer."""
+    """Stop the preparation clock before ``_run``."""
     if timing is None or timing.host_closed:
         return
     now = time.perf_counter()
@@ -555,8 +562,11 @@ def _mark_layer_launch(timing) -> None:
 def _finish_layer_timing(scheduler, timing) -> None:
     """Queue the GPU interval. A failed replay never reaches this.
 
-    ``opt_layer_launch_us`` stops before ``ev1``. Waiting for the previous
-    layer is ``opt_lookahead_launch_wait_us``, recorded before this window.
+    ``opt_layer_launch_us`` is the wall clock of ``_run`` and stops before
+    ``ev1``. An explicit previous-layer wait is recorded only when
+    ``SGLANG_OPT_PROBE_LAYER_WAIT`` is set, and it sits outside this window.
+    ``ev0``..``ev1`` includes host time while the stream is idle; it is not
+    GPU-busy time.
     """
     if timing is None or not timing.opened:
         return
@@ -607,12 +617,20 @@ def _finish_ingest_gpu(scheduler) -> None:
 
 
 def _note_lookahead_launch_wait(runner) -> None:
-    """Time the wait for the previous layer, then let ``_run`` launch this one.
+    """Optionally time an explicit wait for the previous layer.
 
-    The first layer waits for ingest, not for another layer. Metrics off does
-    not synchronize here; ``ForwardBatch.init_new`` still does.
+    Default does not synchronize. The template path does not call
+    ``init_new``. A missing template falls back to ``run_batch``, and that
+    path still waits inside ``ForwardBatch.init_new``.
+    ``SGLANG_OPT_PROBE_LAYER_WAIT`` inserts ``current_stream().synchronize()``
+    before ``_run`` and records that stall in
+    ``opt_lookahead_launch_wait_us``. The probe runs only when round metrics
+    are active and a previous layer is already queued. That path is not the
+    online schedule. The first layer waits for ingest, not for another layer.
     """
     if not getattr(runner, "_lookahead_queued", False):
+        return
+    if not opt_probe_layer_wait_enabled():
         return
     scheduler = runner.scheduler
     metrics = _draft_metrics(scheduler)
@@ -1081,7 +1099,7 @@ class OptLayerForward:
         _note_lookahead_launch_wait(self)
         _mark_layer_launch(timing)
         self._lookahead_queued = True
-        logits = self._run(batch)
+        logits = self._run_lookahead(batch)
         if self._lookahead_launch_event is not None:
             self._lookahead_launch_event.record()
         _finish_layer_timing(self.scheduler, timing)
@@ -1228,6 +1246,27 @@ class OptLayerForward:
 
     def _run(self, batch) -> torch.Tensor:
         return _run_batch(self.scheduler, batch)
+
+    def _run_lookahead(self, batch) -> torch.Tensor:
+        """Replay from the admission template. A missing template uses ``run_batch``.
+
+        ``model_runner.forward`` returns logits and does not sample. A forward
+        that raises is not retried: the slots for this layer are already
+        allocated, and a second launch would queue the same work again.
+        """
+        template = getattr(self, "_la_forward_template", None)
+        delta = getattr(self, "_la_mrope_delta", None)
+        if template is None or (
+            getattr(template, "mrope_positions", None) is not None and delta is None
+        ):
+            _opt_draft_count(self.scheduler, "opt_lookahead_template_fallbacks")
+            return self._run(batch)
+        forward_batch = _refresh_lookahead_forward(template, batch, delta)
+        out = self.scheduler.model_worker.model_runner.forward(forward_batch)
+        logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
+        if logits is None:
+            raise RuntimeError("OPT lookahead forward returned no logits")
+        return logits
 
 
 def raw_logits_survive_sampling(batch) -> bool:
@@ -2415,26 +2454,34 @@ def lookahead_supported(scheduler) -> bool:
     return _lookahead_backend_is_triton(scheduler)
 
 
-def _lookahead_kv_need(scheduler) -> int:
-    """Slots held together: every forwarded layer plus one bonus group.
+def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
+    """Slots held together: ingest, every forwarded layer, and one bonus group.
 
     ``depth_rule`` stops once ``depth`` reaches ``max_depth - 1``. Lookahead
     forwards that last layer before the host decides to stop, so the tree
     takes ``(max_depth - 1) * n`` slots. The bonus forward then allocates
-    ``n + 1`` while those slots are still mapped.
+    ``n + 1`` while those slots are still mapped. ``ingest_slots`` is the
+    span ingest still has to allocate. Admission runs before that alloc.
     """
     n = int(scheduler.server_args.opt_tree_width)
     depth = int(scheduler.server_args.opt_tree_max_depth)
-    return (depth - 1) * n + (n + 1)
+    return int(ingest_slots) + (depth - 1) * n + (n + 1)
 
 
-def _lookahead_would_evict(scheduler) -> bool:
-    """True when the free list cannot cover the whole lookahead tree.
+def _lookahead_ingest_slots(runner) -> int:
+    """Tokens ingest will allocate. ``prefix_len`` is already the committed length."""
+    committed = int(runner.prefix_len)
+    have = int(getattr(runner.req, "kv_committed_len", 0) or 0)
+    return max(committed - have, 0)
+
+
+def _lookahead_would_evict(scheduler, ingest_slots: int = 0) -> bool:
+    """True when the free list cannot cover ingest plus the lookahead tree.
 
     ``available_size`` is ``len`` of the device free list and does not sync.
     A short radix free list would evict, and that eviction can sync. A short
     chunk-cache free list fails the alloc and still resets the step. Either
-    case falls back before the first layer is queued.
+    case falls back before ingest is queued.
     """
     tree = getattr(scheduler, "tree_cache", None)
     if tree is None:
@@ -2444,35 +2491,104 @@ def _lookahead_would_evict(scheduler) -> bool:
         return True
     try:
         available = allocator.available_size()
-        need = _lookahead_kv_need(scheduler)
+        need = _lookahead_kv_need(scheduler, ingest_slots)
     except Exception:
         return True
     return int(available) < int(need)
 
 
-def _lookahead_graph_ready(scheduler, batch) -> bool:
-    """False when this layer would miss the captured verify graph and run eager."""
+def _lookahead_forward_template(scheduler, batch):
+    """One ``ForwardBatch`` for every later layer, or None when replay cannot run.
+
+    ``init_new`` may synchronize while copying a pageable M-RoPE delta. That
+    happens here, before the layer loop. Later layers copy this object and
+    do not call ``init_new`` again.
+    """
     worker = getattr(scheduler, "model_worker", None)
     model_runner = getattr(worker, "model_runner", None)
     graph_runner = getattr(model_runner, "graph_runner", None)
     if model_runner is None or graph_runner is None:
-        return False
+        return None
     try:
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        forward_batch = ForwardBatch.init_new(batch.get_model_worker_batch(), model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch.get_model_worker_batch(), model_runner
+        )
     except Exception:
         logger.warning("[OPT] lookahead graph check failed", exc_info=True)
-        return False
+        return None
     if not forward_batch.forward_mode.is_cuda_graph():
-        return False
+        return None
     if getattr(forward_batch, "is_sr_tail_extend", False):
-        return False
+        return None
     try:
-        return bool(graph_runner.can_run(forward_batch))
+        ready = bool(graph_runner.can_run(forward_batch))
     except Exception:
         logger.warning("[OPT] lookahead can_run failed", exc_info=True)
-        return False
+        return None
+    if not ready:
+        return None
+    return forward_batch
+
+
+def _lookahead_graph_ready(scheduler, batch) -> bool:
+    """False when this layer would miss the captured verify graph and run eager."""
+    return _lookahead_forward_template(scheduler, batch) is not None
+
+
+def _mrope_delta_from_template(forward_batch):
+    """Device ``[1, 1]`` M-RoPE delta taken from the admission forward.
+
+    ``None`` when the model has no M-RoPE. Later layers add this tensor on
+    device. They do not copy the CPU delta, which would synchronize the stream.
+    """
+    mrope = getattr(forward_batch, "mrope_positions", None)
+    positions = getattr(forward_batch, "positions", None)
+    if mrope is None or positions is None:
+        return None
+    pos = positions.detach().reshape(-1)
+    rows = mrope.detach().reshape(3, -1)
+    if pos.numel() < 1 or rows.shape[1] < 1:
+        return None
+    return (rows[0, :1] - pos[:1]).to(dtype=torch.int64).reshape(1, 1)
+
+
+def _lookahead_mrope_positions(positions, delta) -> torch.Tensor:
+    """Target-verify M-RoPE: one device delta added to every position, three rows."""
+    seq_positions = positions.detach().reshape(1, -1)
+    return (seq_positions + delta).flatten().unsqueeze(0).repeat(3, 1)
+
+
+def _cpu_len_list(value):
+    if value is None:
+        return None
+    return list(value)
+
+
+def _refresh_lookahead_forward(template, batch, delta):
+    """Shallow copy with this layer's tokens, lengths, mask, and positions.
+
+    The template object keeps its own tensors. ``req_pool_indices``,
+    ``forward_mode``, ``sampling_info``, and the attention backend stay shared.
+    ``seq_lens_cpu`` is the new pageable tensor already installed on ``batch``.
+    """
+    fb = copy.copy(template)
+    fb.input_ids = batch.input_ids
+    fb.seq_lens = batch.seq_lens
+    fb.seq_lens_cpu = batch.seq_lens_cpu
+    fb.orig_seq_lens = batch.orig_seq_lens
+    fb.seq_lens_sum = batch.seq_lens_sum
+    fb.out_cache_loc = batch.out_cache_loc
+    fb.spec_info = batch.spec_info
+    fb.positions = batch.spec_info.positions
+    fb.extend_num_tokens = batch.extend_num_tokens
+    fb.extend_seq_lens_cpu = _cpu_len_list(batch.extend_lens)
+    fb.extend_prefix_lens_cpu = _cpu_len_list(batch.prefix_lens)
+    fb.extend_logprob_start_lens_cpu = _cpu_len_list(batch.extend_logprob_start_lens)
+    if delta is not None:
+        fb.mrope_positions = _lookahead_mrope_positions(fb.positions, delta)
+    return fb
 
 
 def _lookahead_width_cache(scheduler, width: int, device):
@@ -2563,6 +2679,8 @@ def prepare_lookahead_runtime(scheduler, runner):
     runner._lookahead_satisfied = False
     runner._last_logits = None
     runner.bonus_ids = []
+    runner._la_forward_template = None
+    runner._la_mrope_delta = None
     return batch, shared["slots"], shared["bonus"]
 
 
@@ -2596,6 +2714,8 @@ def _reset_lookahead_runner(scheduler, runner) -> None:
     runner.lookahead_inflight = False
     runner._lookahead_queued = False
     runner._last_logits = None
+    runner._la_forward_template = None
+    runner._la_mrope_delta = None
 
 
 def _await_lookahead_event(scheduler, event) -> None:
@@ -2632,14 +2752,16 @@ def _private_seed_logits(runner, tail_logits) -> torch.Tensor:
 
 
 def _admit_lookahead(scheduler, runner, batch) -> None:
-    """One graph and KV-budget check before the first layer is queued.
+    """One graph and KV-budget check while the GPU is still idle.
 
-    The budget is the full tree plus one bonus group. Later layers keep the
+    Call this before ingest is queued. ``prefix_len`` and ``cached_len`` are
+    already the committed length, and ingest does not change them. The budget
+    includes the slots ingest still has to allocate. Later layers keep the
     same width and batch, so they do not call ``can_run`` or re-read the
     free list.
     """
     n = int(scheduler.server_args.opt_tree_width)
-    if _lookahead_would_evict(scheduler):
+    if _lookahead_would_evict(scheduler, _lookahead_ingest_slots(runner)):
         raise LookaheadFallback("kv evict")
     device = scheduler.req_to_token_pool.device
     from sglang.srt.model_executor.forward_batch_info import (
@@ -2674,8 +2796,13 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
         num_tokens_per_req=n,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
-    if not _lookahead_graph_ready(scheduler, batch):
+    runner._la_forward_template = None
+    runner._la_mrope_delta = None
+    template = _lookahead_forward_template(scheduler, batch)
+    if template is None:
         raise LookaheadFallback("cuda graph miss")
+    runner._la_forward_template = template
+    runner._la_mrope_delta = _mrope_delta_from_template(template)
 
 
 def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtime):
@@ -2691,7 +2818,6 @@ def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtim
     layers = 0
     try:
         logits = _private_seed_logits(runner, tail_logits)
-        _admit_lookahead(scheduler, runner, batch)
         scores, ids = _vocab_topk(logits, n + 1)
         top_scores, tokens, anc = seed_on_device(scores, ids, n)
         slot = slots[turn]
