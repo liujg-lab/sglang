@@ -1250,9 +1250,12 @@ class OptLayerForward:
     def _run_lookahead(self, batch) -> torch.Tensor:
         """Replay from the admission template. A missing template uses ``run_batch``.
 
-        ``model_runner.forward`` returns logits and does not sample. A forward
-        that raises is not retried: the slots for this layer are already
-        allocated, and a second launch would queue the same work again.
+        ``model_runner.forward`` returns logits and does not sample. It also
+        decides again whether this layer can replay a CUDA graph. A false
+        ``can_run_graph`` means the layer already ran eager; count it and
+        still return the logits. A forward that raises is not retried: the
+        slots for this layer are already allocated, and a second launch
+        would queue the same work again.
         """
         template = getattr(self, "_la_forward_template", None)
         delta = getattr(self, "_la_mrope_delta", None)
@@ -1263,6 +1266,8 @@ class OptLayerForward:
             return self._run(batch)
         forward_batch = _refresh_lookahead_forward(template, batch, delta)
         out = self.scheduler.model_worker.model_runner.forward(forward_batch)
+        if not bool(getattr(out, "can_run_graph", True)):
+            _opt_draft_count(self.scheduler, "opt_lookahead_eager_layers")
         logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
         if logits is None:
             raise RuntimeError("OPT lookahead forward returned no logits")
@@ -2560,18 +2565,14 @@ def _lookahead_mrope_positions(positions, delta) -> torch.Tensor:
     return (seq_positions + delta).flatten().unsqueeze(0).repeat(3, 1)
 
 
-def _cpu_len_list(value):
-    if value is None:
-        return None
-    return list(value)
-
-
 def _refresh_lookahead_forward(template, batch, delta):
     """Shallow copy with this layer's tokens, lengths, mask, and positions.
 
     The template object keeps its own tensors. ``req_pool_indices``,
     ``forward_mode``, ``sampling_info``, and the attention backend stay shared.
     ``seq_lens_cpu`` is the new pageable tensor already installed on ``batch``.
+    ``TARGET_VERIFY`` ``init_new`` does not fill ``extend_num_tokens`` or the
+    extend CPU lists, so this copy leaves those admission values in place.
     """
     fb = copy.copy(template)
     fb.input_ids = batch.input_ids
@@ -2582,10 +2583,6 @@ def _refresh_lookahead_forward(template, batch, delta):
     fb.out_cache_loc = batch.out_cache_loc
     fb.spec_info = batch.spec_info
     fb.positions = batch.spec_info.positions
-    fb.extend_num_tokens = batch.extend_num_tokens
-    fb.extend_seq_lens_cpu = _cpu_len_list(batch.extend_lens)
-    fb.extend_prefix_lens_cpu = _cpu_len_list(batch.prefix_lens)
-    fb.extend_logprob_start_lens_cpu = _cpu_len_list(batch.extend_logprob_start_lens)
     if delta is not None:
         fb.mrope_positions = _lookahead_mrope_positions(fb.positions, delta)
     return fb
@@ -2895,6 +2892,10 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
             _await_lookahead_event(
                 scheduler, getattr(runner, "_lookahead_launch_event", None)
             )
+            bonus = getattr(runner, "_lookahead_bonus", None)
+            if bonus is not None:
+                _await_lookahead_event(scheduler, getattr(bonus, "event", None))
+                bonus.ready = False
             scheduler._opt_rollback(job.req, int(job.keep))
         except Exception as exc:
             _reraise_device_context(scheduler, exc)
@@ -3017,10 +3018,16 @@ def finish_opt_expand_req(
         )
     ):
         # This publish frees slots before the reply. The extra layer is still
-        # queued, so wait for it first. The deferred path waits after the reply.
+        # queued, so wait for it first. The bonus copy is queued after that
+        # event; drop it here so a later clone_cpu cannot read the old ids.
+        # The deferred path waits after the reply.
         _await_lookahead_event(
             scheduler, getattr(runner, "_lookahead_launch_event", None)
         )
+        bonus = getattr(runner, "_lookahead_bonus", None)
+        if bonus is not None:
+            _await_lookahead_event(scheduler, getattr(bonus, "event", None))
+            bonus.ready = False
         runner.lookahead_inflight = False
         runner.lookahead_dropped = True
     if (

@@ -397,6 +397,13 @@ class OptTreeSchedulerMixin:
                     logger.info("[OPT] lookahead admit fell back: %s", exc)
                     metrics.counts["opt_lookahead_fallbacks"] += 1
                     lookahead_runtime = None
+                except Exception as exc:
+                    # Admission has not allocated KV. An ordinary error, including
+                    # OOM, can still grow this step one layer at a time.
+                    _reraise_device_context(self, exc)
+                    logger.info("[OPT] lookahead admit fell back: %s", exc)
+                    metrics.counts["opt_lookahead_fallbacks"] += 1
+                    lookahead_runtime = None
                 finally:
                     if metrics.active:
                         metrics.counts["opt_lookahead_admit_us"] += int(

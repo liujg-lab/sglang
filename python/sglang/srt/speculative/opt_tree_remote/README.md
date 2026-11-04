@@ -112,6 +112,6 @@ page=1 时，Draft 在把验证窗口回包之后补算最后一层的 KV，下�
 
 `SGLANG_OPT_PROBE_LAYER_WAIT=1` 在每一层 `_run` 之前插入一次 stream sync，把上一层等待拆进 `opt_lookahead_launch_wait_us`。默认关闭。打开后测到的不是线上路径。默认的 `opt_layer_launch_us` 是整段 `_run` 的墙钟，包含其中隐含的等待。`opt_layer_gpu_us` 含 `_run` 期间流上空闲，GPU 忙闲用 nsys 看。
 
-lookahead 在 admission 时保存一份 `ForwardBatch`，之后每层浅拷贝并直接 `model_runner.forward`，不再每层调用 `init_new`，也不跑 sampler 的 argmax。模板不可用时这一层退回 `run_batch`，并计 `opt_lookahead_template_fallbacks`。
+lookahead 在 admission 时保存一份 `ForwardBatch`，之后每层浅拷贝并直接 `model_runner.forward`，不再每层调用 `init_new`，也不跑 sampler 的 argmax。模板不可用时这一层退回 `run_batch`，并计 `opt_lookahead_template_fallbacks`。`model_runner.forward` 返回的 `can_run_graph` 为 False 时，这一层已经走 eager，计入 `opt_lookahead_eager_layers`。
 
 admission 在 ingest 入队之前完成。这时 GPU 是空的，`prefix_len` 已经是 committed 长度。失败则不开 lookahead，退回原来的按层扩树，并计 `opt_lookahead_fallbacks`。这次检查的墙钟是 `opt_lookahead_admit_us`。

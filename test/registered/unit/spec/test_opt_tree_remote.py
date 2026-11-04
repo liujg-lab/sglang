@@ -2092,6 +2092,55 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(metrics.counts["opt_layer_forwards"], 2)
         self.assertEqual(metrics.counts["opt_rounds"], 1)
 
+    def test_admit_ordinary_error_falls_back_to_layer_grow(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        def admit(*_args, **_kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+        expand, called = _load_expand_with_admit(admit)
+        host = _expand_admit_host()
+        req = _opt_stage_req("opt-admit-oom")
+        metrics = get_sr_round_metrics(host, "Draft")
+        with metrics.round():
+            window = expand(host, req)
+        self.assertEqual(window, ([1], [-1], [0]))
+        self.assertEqual(called["grow"], 1)
+        self.assertEqual(called["ingest"], 1)
+        self.assertEqual(called["lookahead"], 0)
+        self.assertEqual(metrics.counts["opt_lookahead_fallbacks"], 1)
+        self.assertEqual(metrics.counts["opt_expand_failures"], 0)
+        self.assertFalse(host._sr_device_poisoned)
+        self.assertFalse(host._opt_lookahead_active)
+
+    def test_admit_device_error_reraises(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        def admit(*_args, **_kwargs):
+            raise RuntimeError("cudaErrorIllegalAddress")
+
+        expand, called = _load_expand_with_admit(admit)
+        host = _expand_admit_host()
+        cleared = []
+        host._sr_clear_stamps_after_poison = lambda: cleared.append(1)
+        req = _opt_stage_req("opt-admit-device")
+        metrics = get_sr_round_metrics(host, "Draft")
+        with self.assertRaises(RuntimeError) as ctx:
+            with metrics.round():
+                expand(host, req)
+        self.assertIn("cudaErrorIllegalAddress", str(ctx.exception))
+        self.assertTrue(host._sr_device_poisoned)
+        self.assertEqual(cleared, [1, 1])
+        self.assertEqual(called["grow"], 0)
+        self.assertEqual(called["ingest"], 0)
+        self.assertEqual(called["lookahead"], 0)
+        self.assertEqual(metrics.counts["opt_expand_failures"], 0)
+        self.assertEqual(metrics.counts["opt_lookahead_fallbacks"], 0)
+
     def test_layer_timing_stays_off_without_an_active_round(self):
         from unittest.mock import patch
 
@@ -3739,6 +3788,64 @@ def _load_opt_expand_one():
     return ns["_opt_expand_one"]
 
 
+def _expand_admit_host():
+    host = _opt_stage_host()
+    host._sr_device_poisoned = False
+    host._sr_clear_stamps_after_poison = lambda: None
+    return host
+
+
+def _load_expand_with_admit(admit):
+    """Load ``_opt_expand_one`` with lookahead admission under test control."""
+    import time
+
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+        LookaheadFallback,
+    )
+
+    expand = _load_opt_expand_one()
+    globals_ = expand.__globals__
+    globals_["time"] = time
+    globals_["torch"] = SimpleNamespace(
+        get_device_module=lambda _device: _SyncProbe([])
+    )
+    globals_["OptTreeConfig"] = OptTreeConfig
+    globals_["LookaheadFallback"] = LookaheadFallback
+    globals_["lookahead_supported"] = lambda _scheduler: True
+    globals_["prepare_lookahead_runtime"] = lambda *_args, **_kwargs: (object(),)
+    globals_["_admit_lookahead"] = admit
+    called = {"grow": 0, "lookahead": 0, "ingest": 0}
+
+    class _Runner:
+        def __init__(self, _scheduler, _req, _prefix_len):
+            self.steps = []
+
+        def forward_layer(self, step):
+            self.steps.append(step)
+            return torch.zeros(1)
+
+    def ingest(_scheduler, _runners, phases=None):
+        called["ingest"] += 1
+        return [torch.zeros(4)]
+
+    def grow(
+        _config, _tails, forward_active, _scheduler=None, states_out=None, **_kwargs
+    ):
+        called["grow"] += 1
+        forward_active(["layer-0"], [0])
+        return [([1], [-1], [0])]
+
+    def grow_lookahead(*_args, **_kwargs):
+        called["lookahead"] += 1
+        raise AssertionError("lookahead grow should not run after admit fails")
+
+    globals_["OptLayerForward"] = _Runner
+    globals_["ingest_tail_logits"] = ingest
+    globals_["grow_active_layers"] = grow
+    globals_["grow_lookahead"] = grow_lookahead
+    return expand, called
+
+
 def _materialize_host():
     """Host whose ``_sr_materialize_prefix_batch`` is the real method.
 
@@ -4085,6 +4192,103 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertFalse(runner.lookahead_inflight)
         self.assertEqual(len(bonus_ids), 1)
 
+    def test_settle_drop_syncs_bonus_and_clears_ready(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _settle_lookahead_job,
+            finish_opt_expand_req,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        class _Event:
+            def __init__(self):
+                self.syncs = 0
+
+            def synchronize(self):
+                self.syncs += 1
+
+        class _Bonus:
+            def __init__(self):
+                self.event = _Event()
+                self.ready = True
+
+            def clone_cpu(self):
+                if not self.ready:
+                    raise RuntimeError("lookahead bonus ids were read before the copy")
+                self.event.synchronize()
+                self.ready = False
+                return torch.tensor([9])
+
+        def dropped_runner(bonus):
+            req = SimpleNamespace(
+                rid="r",
+                kv_allocated_len=8,
+                kv_committed_len=8,
+            )
+            return req, SimpleNamespace(
+                req=req,
+                prefix_len=4,
+                cached_len=8,
+                lookahead_inflight=True,
+                lookahead_dropped=False,
+                _lookahead_launch_event=_Event(),
+                _lookahead_bonus=bonus,
+                layer_slots=[torch.tensor([1, 2])],
+            )
+
+        bonus = _Bonus()
+        req, runner = dropped_runner(bonus)
+        rolls = []
+        job = SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=4,
+            state=SimpleNamespace(depth=1, config=SimpleNamespace(width=2)),
+        )
+        scheduler = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_is_finished=lambda _req: False,
+            tree_cache=SimpleNamespace(page_size=1),
+            _opt_rollback=lambda _req, keep: rolls.append(int(keep)),
+        )
+
+        _settle_lookahead_job(scheduler, job)
+
+        self.assertEqual(bonus.event.syncs, 1)
+        self.assertFalse(bonus.ready)
+        self.assertEqual(rolls, [4])
+        self.assertEqual(
+            get_sr_round_metrics(scheduler, "Draft").counts["opt_lookahead_rollbacks"],
+            1,
+        )
+        self.assertTrue(runner.lookahead_dropped)
+        self.assertFalse(runner.lookahead_inflight)
+        with self.assertRaises(RuntimeError):
+            bonus.clone_cpu()
+
+        finish_bonus = _Bonus()
+        finish_req, finish_runner = dropped_runner(finish_bonus)
+        finish_rolls = []
+        finish_host = SimpleNamespace(
+            _sr_device_poisoned=False,
+            _sr_is_finished=lambda _req: False,
+            _sr_pause_req=lambda _req: None,
+            tree_cache=SimpleNamespace(page_size=1),
+            _opt_rollback=lambda _req, keep: finish_rolls.append(int(keep)),
+        )
+        self.assertIsNone(
+            finish_opt_expand_req(
+                finish_host, finish_req, finish_runner, 4, None, False, None
+            )
+        )
+        self.assertEqual(finish_bonus.event.syncs, 1)
+        self.assertFalse(finish_bonus.ready)
+        self.assertTrue(finish_runner.lookahead_dropped)
+        self.assertFalse(finish_runner.lookahead_inflight)
+        with self.assertRaises(RuntimeError):
+            finish_bonus.clone_cpu()
+
     def test_bonus_attach_failure_is_counted_and_publish_still_runs(self):
         from unittest.mock import patch
 
@@ -4370,8 +4574,10 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertTrue(torch.equal(fresh.spec_info.custom_mask, new_mask))
         self.assertEqual(fresh.seq_lens_sum, 6)
         self.assertTrue(torch.equal(fresh.out_cache_loc, new_loc))
-        self.assertEqual(fresh.extend_seq_lens_cpu, [2])
-        self.assertEqual(fresh.extend_prefix_lens_cpu, [6])
+        self.assertEqual(fresh.extend_num_tokens, 0)
+        self.assertIsNone(fresh.extend_seq_lens_cpu)
+        self.assertIsNone(fresh.extend_prefix_lens_cpu)
+        self.assertIsNone(fresh.extend_logprob_start_lens_cpu)
         self.assertIs(fresh.req_pool_indices, template.req_pool_indices)
         self.assertIs(fresh.sampling_info, template.sampling_info)
         self.assertTrue(torch.equal(template.input_ids, old_ids))
@@ -4405,6 +4611,52 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(tuple(rows.shape), (3, 2))
         self.assertTrue(torch.equal(rows, torch.full((3, 2), 23)))
+
+    def test_mrope_delta_uses_only_the_first_text_offset(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _lookahead_mrope_positions,
+            _mrope_delta_from_template,
+        )
+
+        self.assertIsNone(_mrope_delta_from_template(SimpleNamespace()))
+        self.assertIsNone(
+            _mrope_delta_from_template(SimpleNamespace(positions=torch.tensor([1])))
+        )
+        self.assertIsNone(
+            _mrope_delta_from_template(
+                SimpleNamespace(
+                    mrope_positions=torch.zeros(3, 1),
+                    positions=torch.empty(0, dtype=torch.long),
+                )
+            )
+        )
+        self.assertIsNone(
+            _mrope_delta_from_template(
+                SimpleNamespace(
+                    mrope_positions=torch.zeros(3, 0),
+                    positions=torch.tensor([1]),
+                )
+            )
+        )
+        positions = torch.tensor([4, 4])
+        mrope = torch.tensor(
+            [
+                [10, 11],
+                [20, 21],
+                [30, 31],
+            ]
+        )
+        delta = _mrope_delta_from_template(
+            SimpleNamespace(positions=positions, mrope_positions=mrope)
+        )
+        self.assertTrue(torch.equal(delta, torch.tensor([[6]])))
+        rows = _lookahead_mrope_positions(torch.tensor([7, 8]), delta)
+        self.assertTrue(
+            torch.equal(
+                rows,
+                torch.tensor([[13, 14], [13, 14], [13, 14]]),
+            )
+        )
 
     def test_launch_layer_forwards_the_template_without_sampling(self):
         _import_or_stub_forward_batch()
@@ -4474,10 +4726,75 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(seen["batch"].mrope_positions, torch.full((3, 2), 9))
         )
-        self.assertEqual(
-            get_sr_round_metrics(host, "Draft").counts["opt_lookahead_template_fallbacks"],
-            0,
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_lookahead_template_fallbacks"], 0)
+        self.assertEqual(counts["opt_lookahead_eager_layers"], 0)
+
+    def test_launch_layer_counts_an_eager_graph_miss(self):
+        _import_or_stub_forward_batch()
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            OptLayerForward,
         )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host = _layer_timing_host()
+
+        class _ModelRunner:
+            def forward(self, _forward_batch):
+                return SimpleNamespace(
+                    can_run_graph=False,
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros(2, 4)
+                    ),
+                )
+
+            def sample(self, *_args, **_kwargs):
+                raise AssertionError("sample")
+
+        def run_batch(_batch):
+            raise AssertionError("run_batch")
+
+        host.run_batch = run_batch
+        host.model_worker = SimpleNamespace(model_runner=_ModelRunner())
+        runner = OptLayerForward.__new__(OptLayerForward)
+        runner.scheduler = host
+        runner.prefix_len = 4
+        runner.cached_len = 4
+        runner.req = SimpleNamespace(kv_allocated_len=0)
+        runner._la_positions = torch.empty(2, dtype=torch.long)
+        runner._la_seq = torch.zeros(1, dtype=torch.long)
+        runner._la_orig = torch.zeros(1, dtype=torch.long)
+        runner._lookahead_launch_event = None
+        runner._lookahead_queued = False
+        runner._alloc_lookahead_slots = lambda n: torch.arange(n)
+        runner._la_forward_template = SimpleNamespace(
+            input_ids=torch.zeros(2, dtype=torch.long),
+            seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_cpu=torch.zeros(1, dtype=torch.long),
+            orig_seq_lens=torch.zeros(1, dtype=torch.long),
+            seq_lens_sum=0,
+            out_cache_loc=torch.zeros(2, dtype=torch.long),
+            spec_info=None,
+            positions=torch.zeros(2, dtype=torch.long),
+            extend_num_tokens=0,
+            mrope_positions=None,
+            req_pool_indices=torch.tensor([7]),
+            forward_mode="verify",
+            sampling_info="greedy",
+        )
+        runner._la_mrope_delta = None
+        logits = runner.launch_layer(
+            torch.tensor([8, 9]),
+            torch.ones(2, 2, dtype=torch.int8),
+            1,
+            SimpleNamespace(),
+        )
+        self.assertEqual(tuple(logits.shape), (2, 4))
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_lookahead_eager_layers"], 1)
+        self.assertEqual(counts["opt_lookahead_template_fallbacks"], 0)
 
     def test_launch_layer_without_a_template_uses_run_batch(self):
         _import_or_stub_forward_batch()
