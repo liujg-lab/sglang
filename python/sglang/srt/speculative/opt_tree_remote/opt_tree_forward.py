@@ -23,15 +23,21 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
+from sglang.srt.speculative.opt_tree_remote.opt_tree_config import (
+    OptTreeConfig,
+    opt_draft_lookahead_enabled,
+)
 from sglang.srt.speculative.opt_tree_remote.opt_tree_grow import grow_opt_tree
 from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
     OptTreeState,
     OptTreeStep,
     _layer_positions,
     expand_from_topk,
+    expand_on_device,
     host_topk_rows,
+    mirror_layer,
     seed_from_topk,
+    seed_on_device,
     step_after_layer,
 )
 
@@ -924,6 +930,100 @@ class OptLayerForward:
         logits = _row_logits(logits, n, tail=False)
         self.cached_len += n
         return logits
+
+    def launch_layer(self, tokens_dev, anc_dev, depth: int, batch) -> torch.Tensor:
+        """Queue one layer from tensors already on device.
+
+        Lengths and the pool index are ``fill_`` into buffers allocated while
+        the GPU was idle. This does not build a new ``SamplingBatchInfo``.
+        """
+        tokens = tokens_dev
+        if not torch.is_tensor(tokens):
+            raise RuntimeError("lookahead tokens must already be a tensor")
+        n = int(tokens.shape[0])
+        width = int(self.scheduler.server_args.opt_tree_width)
+        if n != width:
+            raise RuntimeError(
+                f"OPT layer has {n} tokens but attention was built for {width}"
+            )
+        depth = int(depth)
+        ancestor = anc_dev
+        if int(ancestor.shape[0]) != n or int(ancestor.shape[1]) != depth * n:
+            raise RuntimeError(
+                f"OPT ancestor mask {tuple(ancestor.shape)} != [{n}, {depth * n}]"
+            )
+        if self.cached_len + n != self.prefix_len + depth * n:
+            raise RuntimeError(
+                f"OPT cache length {self.cached_len} is not layer {depth} "
+                f"after prefix {self.prefix_len}"
+            )
+        device = self.scheduler.req_to_token_pool.device
+        timing = _begin_layer_timing(self.scheduler)
+        self._la_positions.fill_(self.prefix_len + depth - 1)
+        mask = layer_attention_mask(self.prefix_len, ancestor, device)
+        out_cache_loc = self._alloc_lookahead_slots(n)
+        self.req.kv_allocated_len = self.cached_len + n
+        self._la_seq.fill_(self.cached_len)
+        self._la_seq_cpu.fill_(self.cached_len)
+        self._la_orig.fill_(self.cached_len)
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.global_forward_mode = ForwardMode.TARGET_VERIFY
+        batch.input_ids = tokens.to(dtype=torch.int64).reshape(-1)
+        batch.output_ids = None
+        batch.seq_lens = self._la_seq
+        batch.seq_lens_cpu = self._la_seq_cpu
+        batch.orig_seq_lens = self._la_orig
+        batch.seq_lens_sum = int(self.cached_len)
+        batch.out_cache_loc = out_cache_loc
+        batch.extend_lens = [n]
+        batch.prefix_lens = [self.cached_len]
+        batch.extend_num_tokens = n
+        batch.extend_logprob_start_lens = [self.cached_len]
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        batch.spec_info = OptLayerSpec(
+            custom_mask=mask.reshape(-1),
+            positions=self._la_positions.reshape(-1),
+            draft_token_num=n,
+            num_tokens_per_req=n,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        _mark_layer_launch(timing)
+        self._lookahead_queued = True
+        logits = self._run(batch)
+        if self._lookahead_launch_event is not None:
+            self._lookahead_launch_event.record()
+        _finish_layer_timing(self.scheduler, timing)
+        logits = _row_logits(logits, n, tail=False)
+        self._last_logits = logits
+        self.cached_len += n
+        _opt_draft_count(self.scheduler, "opt_lookahead_layers")
+        return logits
+
+    def _alloc_lookahead_slots(self, n: int) -> torch.Tensor:
+        """Page-1 slot alloc using the prepared device index buffers."""
+        from sglang.srt.mem_cache.common import alloc_token_slots
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        scheduler = self.scheduler
+        self._la_seq.fill_(self.cached_len)
+        out_cache_loc = alloc_token_slots(scheduler.tree_cache, n)
+        if int(out_cache_loc.numel()) != n:
+            raise RuntimeError(
+                f"OPT layer allocated {int(out_cache_loc.numel())} slots for {n} tokens"
+            )
+        assign_req_to_token_pool_func(
+            self._la_pool,
+            scheduler.req_to_token_pool.req_to_token,
+            self._la_seq,
+            self._la_seq + n,
+            out_cache_loc,
+            1,
+        )
+        self.layer_slots.append(out_cache_loc.detach().reshape(-1).clone())
+        return out_cache_loc
 
     def _alloc_layer_slots(self, n: int, start: Optional[int] = None) -> torch.Tensor:
         from sglang.srt.mem_cache.common import (
@@ -2104,18 +2204,461 @@ def _drop_unfinished_layer(scheduler, job: OptDeferredTree) -> None:
     _clear_req_to_token_span(scheduler, job.req, cached, cached + width)
 
 
+class LookaheadFallback(RuntimeError):
+    """Leave the overlapped path and grow this tree the original way."""
+
+
+class _PinnedLayer:
+    """One host buffer for an in-flight layer copy.
+
+    Two of these alternate. The host clones a slot only after its event, and
+    the next copy into that slot waits until that clone has happened.
+    """
+
+    def __init__(self, width: int):
+        n = int(width)
+        pin = {"device": "cpu", "pin_memory": True}
+        self.scores = torch.empty(n, dtype=torch.float32, **pin)
+        self.tokens = torch.empty(n, dtype=torch.long, **pin)
+        self.parents = torch.empty(n, dtype=torch.long, **pin)
+        self.ids = torch.empty(n, n + 1, dtype=torch.long, **pin)
+        self.event = torch.cuda.Event()
+        self.kind = "seed"
+        self.ready = False
+
+    def copy_seed(self, scores: torch.Tensor, ids: torch.Tensor) -> None:
+        n = int(self.scores.shape[0])
+        flat_ids = ids.reshape(-1)
+        self.scores.copy_(scores.reshape(-1)[:n].float(), non_blocking=True)
+        self.tokens.copy_(flat_ids[:n].to(dtype=torch.long), non_blocking=True)
+        self.ids[0, : int(flat_ids.numel())].copy_(
+            flat_ids.to(dtype=torch.long), non_blocking=True
+        )
+        self.kind = "seed"
+        self.event.record()
+        self.ready = True
+
+    def copy_expand(
+        self,
+        top_scores: torch.Tensor,
+        tokens: torch.Tensor,
+        parents: torch.Tensor,
+        vocab_ids: torch.Tensor,
+    ) -> None:
+        self.scores.copy_(top_scores.reshape(-1).float(), non_blocking=True)
+        self.tokens.copy_(tokens.reshape(-1).to(dtype=torch.long), non_blocking=True)
+        self.parents.copy_(parents.reshape(-1).to(dtype=torch.long), non_blocking=True)
+        self.ids.copy_(vocab_ids.to(dtype=torch.long), non_blocking=True)
+        self.kind = "expand"
+        self.event.record()
+        self.ready = True
+
+    def clone_cpu(self):
+        if not self.ready:
+            raise RuntimeError("lookahead pinned slot was read before a copy")
+        self.event.synchronize()
+        self.ready = False
+        return (
+            self.scores.clone(),
+            self.tokens.clone(),
+            self.parents.clone(),
+            self.ids.clone(),
+            self.kind,
+        )
+
+
+class _PinnedBonus:
+    """Top-(N+1) ids of the speculative last layer. Not one of the two layer slots."""
+
+    def __init__(self, width: int):
+        n = int(width)
+        self.ids = torch.empty(n, n + 1, dtype=torch.long, device="cpu", pin_memory=True)
+        self.event = torch.cuda.Event()
+        self.ready = False
+
+    def copy(self, vocab_ids: torch.Tensor) -> None:
+        self.ids.copy_(vocab_ids.to(dtype=torch.long), non_blocking=True)
+        self.event.record()
+        self.ready = True
+
+    def clone_cpu(self) -> torch.Tensor:
+        if not self.ready:
+            raise RuntimeError("lookahead bonus ids were read before the copy")
+        self.event.synchronize()
+        self.ready = False
+        return self.ids.clone()
+
+
+def _vocab_topk(logits: torch.Tensor, k: int):
+    """Temperature-1 top-k on the probability device. No host copy."""
+    work = logits.detach()
+    if work.dim() == 3 and int(work.shape[0]) == 1:
+        work = work[0]
+    probs = torch.softmax(work.float(), dim=-1)
+    width = int(probs.shape[-1])
+    k = min(max(int(k), 1), width)
+    return torch.topk(probs, k=k, dim=-1)
+
+
+def _lookahead_backend_is_triton(scheduler) -> bool:
+    args = getattr(scheduler, "server_args", None)
+    name = str(getattr(args, "attention_backend", None) or "").lower()
+    if name == "triton":
+        return True
+    worker = getattr(scheduler, "model_worker", None)
+    runner = getattr(worker, "model_runner", None)
+    backend = getattr(runner, "attn_backend", None)
+    return "triton" in type(backend).__name__.lower()
+
+
+def lookahead_supported(scheduler) -> bool:
+    """CUDA page-1 Triton only. Anything else keeps ``grow_active_layers``."""
+    if not opt_draft_lookahead_enabled():
+        return False
+    device = getattr(scheduler, "device", None)
+    try:
+        if device is None or torch.device(device).type != "cuda":
+            return False
+    except Exception:
+        return False
+    if _opt_page_size(scheduler) != 1:
+        return False
+    return _lookahead_backend_is_triton(scheduler)
+
+
+def _lookahead_would_evict(scheduler, n: int) -> bool:
+    """True when the next page-1 alloc would enter tree eviction.
+
+    ``available_size`` is ``len`` of the device free list and does not sync.
+    Eviction itself can. Chunk cache never evicts here.
+    """
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return False
+    try:
+        if tree.is_chunk_cache():
+            return False
+    except Exception:
+        return True
+    allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return True
+    try:
+        available = allocator.available_size()
+    except Exception:
+        return True
+    return int(available) < int(n)
+
+
+def _lookahead_graph_ready(scheduler, batch) -> bool:
+    """False when this layer would miss the captured verify graph and run eager."""
+    worker = getattr(scheduler, "model_worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    graph_runner = getattr(model_runner, "graph_runner", None)
+    if model_runner is None or graph_runner is None:
+        return False
+    try:
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        forward_batch = ForwardBatch.init_new(batch.get_model_worker_batch(), model_runner)
+    except Exception:
+        logger.warning("[OPT] lookahead graph check failed", exc_info=True)
+        return False
+    if not forward_batch.forward_mode.is_cuda_graph():
+        return False
+    if getattr(forward_batch, "is_sr_tail_extend", False):
+        return False
+    try:
+        return bool(graph_runner.can_run(forward_batch))
+    except Exception:
+        logger.warning("[OPT] lookahead can_run failed", exc_info=True)
+        return False
+
+
+def prepare_lookahead_runtime(scheduler, runner):
+    """Build the reused batch and pinned slots while the GPU is still idle.
+
+    ``_sr_make_decode_batch`` copies sampling tensors with ``torch.tensor``.
+    That has to happen before the ingest forward is queued.
+    """
+    batch = scheduler._sr_make_decode_batch([runner.req])
+    _keep_raw_logits(batch)
+    width = int(scheduler.server_args.opt_tree_width)
+    device = scheduler.req_to_token_pool.device
+    runner._la_batch = batch
+    runner._la_seq = batch.seq_lens
+    runner._la_seq_cpu = batch.seq_lens_cpu
+    runner._la_orig = batch.orig_seq_lens
+    runner._la_pool = batch.req_pool_indices
+    runner._la_positions = torch.empty(width, dtype=torch.long, device=device)
+    runner._la_dummy_tokens = torch.zeros(width, dtype=torch.long, device=device)
+    runner._lookahead_tail = None
+    runner._lookahead_launch_event = torch.cuda.Event()
+    runner._lookahead_queued = False
+    runner.lookahead_inflight = False
+    runner.lookahead_dropped = False
+    runner._lookahead_satisfied = False
+    runner._last_logits = None
+    runner.bonus_ids = []
+    slots = (_PinnedLayer(width), _PinnedLayer(width))
+    bonus = _PinnedBonus(width)
+    return batch, slots, bonus
+
+
+def _reset_lookahead_runner(scheduler, runner) -> None:
+    """Wait for queued lookahead kernels, then free every uncommitted tree slot."""
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    try:
+        torch.get_device_module(scheduler.device).synchronize()
+    except Exception as exc:
+        if is_device_context_error(exc):
+            _reraise_device_context(scheduler, exc)
+        logger.warning("[OPT] lookahead reset sync failed", exc_info=True)
+    keep = int(runner.prefix_len)
+    end = int(getattr(runner.req, "kv_allocated_len", keep) or keep)
+    try:
+        scheduler._opt_rollback(runner.req, keep)
+    except Exception:
+        logger.warning(
+            "[OPT] lookahead rollback failed for %s",
+            getattr(runner.req, "rid", None),
+            exc_info=True,
+        )
+    runner.layer_slots.clear()
+    runner.cached_len = keep
+    runner.req.kv_allocated_len = keep
+    runner.req.kv_committed_len = keep
+    _clear_req_to_token_span(scheduler, runner.req, keep, end)
+    runner.lookahead_inflight = False
+    runner._lookahead_queued = False
+    runner._last_logits = None
+
+
+def _await_lookahead_event(scheduler, event) -> None:
+    if event is None:
+        return
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    try:
+        event.synchronize()
+    except Exception as exc:
+        if is_device_context_error(exc):
+            _reraise_device_context(scheduler, exc)
+        raise
+
+
+def _private_seed_logits(runner, tail_logits) -> torch.Tensor:
+    """Copy the seed row before any verify replay can reuse its buffer.
+
+    EXTEND ingest returns a view of the graph output. A later fallback must
+    read this copy, not that view.
+    """
+    cloned = tail_logits.detach().clone()
+    runner._lookahead_tail = cloned
+    logits = cloned
+    if logits.dim() == 2 and int(logits.shape[0]) == 1:
+        logits = logits[0]
+    if logits.dim() != 1:
+        raise LookaheadFallback(
+            f"lookahead seed logits must be one row, got {tuple(tail_logits.shape)}"
+        )
+    return logits
+
+
+def _admit_lookahead(scheduler, runner, batch) -> None:
+    """One graph and eviction check before the first layer is queued.
+
+    Later layers keep the same width and batch, so they do not call
+    ``can_run`` again.
+    """
+    n = int(scheduler.server_args.opt_tree_width)
+    if _lookahead_would_evict(scheduler, n):
+        raise LookaheadFallback("kv evict")
+    device = scheduler.req_to_token_pool.device
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    runner._la_positions.fill_(int(runner.prefix_len))
+    runner._la_seq.fill_(int(runner.cached_len))
+    runner._la_seq_cpu.fill_(int(runner.cached_len))
+    runner._la_orig.fill_(int(runner.cached_len))
+    mask = torch.ones(
+        n * (int(runner.prefix_len) + n), dtype=torch.bool, device=device
+    )
+    batch.forward_mode = ForwardMode.TARGET_VERIFY
+    batch.global_forward_mode = ForwardMode.TARGET_VERIFY
+    batch.input_ids = runner._la_dummy_tokens
+    batch.output_ids = None
+    batch.seq_lens = runner._la_seq
+    batch.seq_lens_cpu = runner._la_seq_cpu
+    batch.orig_seq_lens = runner._la_orig
+    batch.seq_lens_sum = int(runner.cached_len)
+    batch.out_cache_loc = runner._la_dummy_tokens
+    batch.extend_lens = [n]
+    batch.prefix_lens = [int(runner.cached_len)]
+    batch.extend_num_tokens = n
+    batch.extend_logprob_start_lens = [int(runner.cached_len)]
+    batch.spec_info = OptLayerSpec(
+        custom_mask=mask,
+        positions=runner._la_positions,
+        draft_token_num=n,
+        num_tokens_per_req=n,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+    )
+    if not _lookahead_graph_ready(scheduler, batch):
+        raise LookaheadFallback("cuda graph miss")
+
+
+def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtime):
+    """Grow one tree with the next layer already queued.
+
+    The host mirrors whatever the device top-k selected. It does not run a
+    second top-k. A graph miss or an eviction falls back to the caller.
+    """
+    batch, slots, bonus = runtime
+    state = OptTreeState.create(config)
+    n = int(config.width)
+    turn = 0
+    layers = 0
+    try:
+        logits = _private_seed_logits(runner, tail_logits)
+        _admit_lookahead(scheduler, runner, batch)
+        scores, ids = _vocab_topk(logits, n + 1)
+        top_scores, tokens, anc = seed_on_device(scores, ids, n)
+        slot = slots[turn]
+        turn ^= 1
+        slot.copy_seed(scores, ids)
+        runner._la_weight = top_scores
+        runner._la_anc = anc
+        runner.launch_layer(tokens, anc, 1, batch)
+        layers += 1
+        guard = 0
+        while True:
+            guard += 1
+            if guard > int(config.max_depth) + 1:
+                raise RuntimeError(
+                    f"OPT lookahead did not finish within max_depth {config.max_depth}"
+                )
+            cpu_scores, cpu_tokens, _cpu_parents, cpu_ids, kind = slot.clone_cpu()
+            if kind == "seed":
+                mirror_layer(state, cpu_scores, cpu_tokens, None, seed=True)
+                runner.bonus_ids.append(cpu_ids[0, : n + 1].contiguous())
+            else:
+                mirror_layer(
+                    state, cpu_scores, cpu_tokens, _cpu_parents, seed=False
+                )
+                runner.bonus_ids.append(cpu_ids.contiguous())
+            step = step_after_layer(state)
+            if step.is_final:
+                bonus_scores, bonus_ids = _vocab_topk(runner._last_logits, n + 1)
+                del bonus_scores
+                bonus.copy(bonus_ids)
+                runner._lookahead_bonus = bonus
+                runner.lookahead_inflight = True
+                return [_verify_window(step)], state, layers
+            child_scores, child_ids = _vocab_topk(runner._last_logits, n + 1)
+            top_scores, tokens, parents, anc = expand_on_device(
+                runner._la_weight, runner._la_anc, child_scores, child_ids, n
+            )
+            slot = slots[turn]
+            turn ^= 1
+            slot.copy_expand(top_scores, tokens, parents, child_ids)
+            next_depth = int(state.depth) + 1
+            runner._la_weight = top_scores
+            runner._la_anc = anc
+            runner.launch_layer(tokens, anc, next_depth, batch)
+            layers += 1
+    except LookaheadFallback:
+        _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
+        _reset_lookahead_runner(scheduler, runner)
+        raise
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
+        _reset_lookahead_runner(scheduler, runner)
+        raise LookaheadFallback(str(exc)) from exc
+
+
+def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
+    """Install the speculative last layer, or roll it back before anyone frees it."""
+    runner = job.runner
+    if runner is None or not getattr(runner, "lookahead_inflight", False):
+        return
+    poisoned = bool(getattr(scheduler, "_sr_device_poisoned", False))
+    drop = (
+        poisoned
+        or _request_finished(scheduler, job.req)
+        or _opt_page_size(scheduler) != 1
+        or int(runner.cached_len) != int(runner.prefix_len) + int(job.state.depth) * int(job.state.config.width)
+    )
+    if poisoned:
+        runner.lookahead_dropped = True
+        runner.lookahead_inflight = False
+        return
+    if drop:
+        try:
+            _await_lookahead_event(
+                scheduler, getattr(runner, "_lookahead_launch_event", None)
+            )
+            scheduler._opt_rollback(job.req, int(job.keep))
+        except Exception as exc:
+            _reraise_device_context(scheduler, exc)
+            logger.warning(
+                "[OPT] lookahead rollback of the extra layer failed for %s",
+                getattr(job.req, "rid", None),
+                exc_info=True,
+            )
+        runner.layer_slots.clear()
+        runner.cached_len = int(runner.prefix_len)
+        job.req.kv_allocated_len = int(job.keep)
+        job.req.kv_committed_len = int(job.keep)
+        runner.lookahead_dropped = True
+        runner.lookahead_inflight = False
+        _opt_draft_count(scheduler, "opt_lookahead_rollbacks")
+        return
+    bonus = getattr(runner, "_lookahead_bonus", None)
+    try:
+        if bonus is not None:
+            runner.bonus_ids.append(bonus.clone_cpu())
+    finally:
+        # The layer forward is already queued. A second forward would allocate
+        # another N slots on top of it.
+        runner.lookahead_inflight = False
+        runner._lookahead_satisfied = True
+
+
 def forward_deferred_final_layers(scheduler, jobs) -> None:
     """Forward each deferred last layer, then publish or roll it back.
 
     Bonus guesses are written while the tree columns are still mapped.
     Publish clears those columns, so the guess forward cannot follow it.
+    A lookahead job already queued that last layer. It only installs the
+    top-k ids, unless the request can no longer keep the slots.
     """
     try:
+        for job in jobs:
+            try:
+                _settle_lookahead_job(scheduler, job)
+            except Exception as exc:
+                _reraise_device_context(scheduler, exc)
+                logger.warning("[OPT] lookahead settle failed: %s", exc)
         by_depth = {}
         skipped = []
         for job in jobs:
-            if _request_finished(scheduler, job.req) or getattr(
-                scheduler, "_sr_device_poisoned", False
+            runner = job.runner
+            if getattr(runner, "_lookahead_satisfied", False):
+                continue
+            if (
+                getattr(runner, "lookahead_dropped", False)
+                or _request_finished(scheduler, job.req)
+                or getattr(scheduler, "_sr_device_poisoned", False)
             ):
                 skipped.append(job)
                 continue
@@ -2161,6 +2704,20 @@ def finish_opt_expand_req(
     A returned job is not paused and its slots stay on the request until
     ``commit_deferred_expands`` queues it.
     """
+    if (
+        runner is not None
+        and getattr(runner, "lookahead_inflight", False)
+        and not (
+            _deferrable_state(state) and _can_defer(scheduler, req, expanded, window)
+        )
+    ):
+        # This publish frees slots before the reply. The extra layer is still
+        # queued, so wait for it first. The deferred path waits after the reply.
+        _await_lookahead_event(
+            scheduler, getattr(runner, "_lookahead_launch_event", None)
+        )
+        runner.lookahead_inflight = False
+        runner.lookahead_dropped = True
     if (
         runner is not None
         and _deferrable_state(state)

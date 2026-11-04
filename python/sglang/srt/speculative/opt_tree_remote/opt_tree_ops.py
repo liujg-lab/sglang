@@ -226,6 +226,116 @@ def expand_from_topk(
     state.depth += 1
 
 
+def seed_on_device(
+    scores: torch.Tensor, ids: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Device root tokens and an identity ancestor mask.
+
+    ``scores`` and ``ids`` are the root top-k, at least ``n`` wide. The first
+    ``n`` become the layer. No host copy and no second top-k.
+    """
+    n = int(n)
+    flat_scores = scores.reshape(-1)
+    flat_ids = ids.reshape(-1)
+    if int(flat_scores.numel()) < n or int(flat_ids.numel()) < n:
+        raise ValueError(
+            f"seed top-k {int(flat_ids.numel())} is shorter than width {n}"
+        )
+    top_scores = flat_scores[:n].to(dtype=torch.float32)
+    tokens = flat_ids[:n].to(dtype=torch.long)
+    anc = torch.eye(n, dtype=torch.int8, device=tokens.device)
+    return top_scores, tokens, anc
+
+
+def expand_on_device(
+    weight_prev: torch.Tensor,
+    anc: torch.Tensor,
+    scores: torch.Tensor,
+    ids: torch.Tensor,
+    n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same selection as ``expand_from_topk``, kept on ``scores``' device.
+
+    ``scores`` and ``ids`` are ``[N, K]`` with ``K >= n``. Only the first ``n``
+    children of each parent enter the path-score top-k. The returned ancestor
+    mask is the parent's row plus a new identity block.
+    """
+    n = int(n)
+    if scores.dim() != 2 or ids.dim() != 2:
+        raise ValueError(
+            f"expand_on_device expects [N, K] scores and ids, "
+            f"got {tuple(scores.shape)} and {tuple(ids.shape)}"
+        )
+    if int(scores.shape[0]) != n or int(ids.shape[0]) != n:
+        raise ValueError(
+            f"expand_on_device row count {int(scores.shape[0])} != width {n}"
+        )
+    if int(scores.shape[1]) < n or int(ids.shape[1]) < n:
+        raise ValueError(
+            f"expand_on_device needs at least {n} children, "
+            f"got {int(scores.shape[1])}"
+        )
+    if int(weight_prev.reshape(-1).numel()) < n:
+        raise ValueError("expand_on_device weight_prev is shorter than width")
+    if anc.dim() != 2 or int(anc.shape[0]) != n:
+        raise ValueError(
+            f"expand_on_device ancestor mask {tuple(anc.shape)} != [{n}, cols]"
+        )
+    child_scores = scores[:, :n]
+    child_ids = ids[:, :n]
+    path_scores = child_scores * weight_prev.reshape(-1)[:n].unsqueeze(1)
+    flat_scores = path_scores.reshape(-1)
+    flat_ids = child_ids.reshape(-1)
+    top_scores, top_index = torch.topk(flat_scores, k=n, dim=-1)
+    parent_cols = torch.div(top_index, n, rounding_mode="floor")
+    tokens = flat_ids[top_index].to(dtype=torch.long)
+    eye = torch.eye(n, dtype=anc.dtype, device=anc.device)
+    anc_new = torch.cat([anc[parent_cols.to(dtype=torch.long)], eye], dim=1)
+    return top_scores.to(dtype=torch.float32), tokens, parent_cols.to(dtype=torch.long), anc_new
+
+
+def mirror_layer(
+    state: OptTreeState,
+    top_scores: torch.Tensor,
+    tokens: torch.Tensor,
+    parent_cols: Optional[torch.Tensor],
+    *,
+    seed: bool,
+) -> None:
+    """Write one host layer from values already chosen on device.
+
+    The ancestor mask is rebuilt from ``parent_cols``. This does not run top-k.
+    CUDA and CPU break score ties differently, so a second top-k would point
+    KV at the wrong node.
+    """
+    n = state.config.width
+    scores = top_scores.detach().to(dtype=torch.float32, device="cpu").reshape(-1)[:n]
+    toks = tokens.detach().to(dtype=torch.long, device="cpu").reshape(-1)[:n]
+    if int(scores.numel()) != n or int(toks.numel()) != n:
+        raise ValueError(f"mirror layer needs {n} scores and tokens")
+    if seed:
+        seed_from_topk(state, scores, toks)
+        return
+    if state.finished or state.depth < 1 or state.anc_mask is None:
+        raise RuntimeError("mirror_layer requires a seeded, unfinished tree")
+    if state.depth >= state.config.max_depth:
+        raise RuntimeError(
+            f"mirror_layer at depth {state.depth} would pass max_depth "
+            f"{state.config.max_depth}"
+        )
+    if parent_cols is None:
+        raise ValueError("mirror_layer expand needs parent_cols")
+    cols = parent_cols.detach().to(dtype=torch.long, device="cpu").reshape(-1)[:n]
+    if int(cols.numel()) != n:
+        raise ValueError(f"mirror_layer needs {n} parent columns")
+    state.parents[state.depth].copy_(cols)
+    state.weight[state.depth].copy_(scores)
+    state.tokens[state.depth].copy_(toks)
+    eye = torch.eye(n, dtype=torch.int8)
+    state.anc_mask = torch.cat([state.anc_mask[cols], eye], dim=1)
+    state.depth += 1
+
+
 def expand_layer(state: OptTreeState, probs: torch.Tensor) -> None:
     """Append one layer of N nodes and extend the ancestor mask."""
     n = state.config.width

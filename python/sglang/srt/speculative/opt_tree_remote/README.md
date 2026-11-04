@@ -107,3 +107,5 @@ python -m sglang.launch_server \
 CUDA 使用 `--page-size 1` 和 `triton`。NPU 把 `--page-size` 改为 128，并改用该后端对应的 attention backend。
 
 page=1 时，Draft 在把验证窗口回包之后补算最后一层的 KV，下一轮 ingest 只缺 bonus 那一个 token。同一段空闲里还会为每个验证节点和根预测一个不含验证子节点的 bonus；下一轮只有这个 token 确实是 bonus 时才装上它的 slot，并用暂存 logits 当种子，ingest 不再前向。`SGLANG_OPT_TREE_KV_REUSE=0` 关掉这两次补算。page=128 不补算，也不发布 tree lease，行为与补算引入之前相同。
+
+`SGLANG_OPT_DRAFT_LOOKAHEAD=1` 让 CUDA Draft 在设备上扩树，并在 host 看到这一层之前把下一层前向提交出去。默认关闭。只在 page size 为 1、batch size 为 1、attention backend 为 triton、并且该层能命中已捕获的 CUDA graph 时生效。图没有命中，或者这一层分配会触发 KV 驱逐，就退回原来的按层等待，并计 `opt_lookahead_fallbacks`。NPU 的 page size 是 128，没有回包后的补算；停层时提前提交的那一层只能回滚，所以不启用。batch size 大于 1 仍走原来的 `grow_active_layers`。CPU 树只按设备拷回的 parent、token 和 score 重建，不再自己做一次 top-k。

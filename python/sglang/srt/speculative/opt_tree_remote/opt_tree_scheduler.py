@@ -18,13 +18,18 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.speculative.opt_tree_remote.opt_tree_config import OptTreeConfig
 from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+    LookaheadFallback,
     OptLayerForward,
     _reraise_device_context,
     clear_prefill_tail_logits,
+    drain_opt_layer_gpu_us,
     forward_deferred_final_layers,
     grow_active_layers,
+    grow_lookahead,
     ingest_tail_logits,
+    lookahead_supported,
     opt_other_seconds,
+    prepare_lookahead_runtime,
     produce_opt_windows,
     release_uncommitted,
 )
@@ -361,9 +366,23 @@ class OptTreeSchedulerMixin:
                 max_depth=int(self.server_args.opt_tree_max_depth),
             )
             runner = OptLayerForward(self, req, committed)
+            self._opt_lookahead_active = False
+            self._opt_defer_layer_drain = False
+            lookahead_runtime = None
+            if lookahead_supported(self):
+                try:
+                    lookahead_runtime = prepare_lookahead_runtime(self, runner)
+                    self._opt_lookahead_active = True
+                except Exception as exc:
+                    _reraise_device_context(self, exc)
+                    logger.info("[OPT] lookahead setup fell back: %s", exc)
+                    metrics.counts["opt_lookahead_fallbacks"] += 1
+                    lookahead_runtime = None
 
             def _sync():
-                if metrics.active:
+                # Metrics sync here waits out the ingest forward and leaves no
+                # room to overlap the seed. Lookahead times layers with events.
+                if metrics.active and not self._opt_lookahead_active:
                     torch.get_device_module(self.device).synchronize()
 
             phases = OptPhaseClock()
@@ -388,15 +407,35 @@ class OptTreeSchedulerMixin:
 
             t1 = time.perf_counter()
             topk_out = [[]]
-            windows = grow_active_layers(
-                config,
-                [tail_logits],
-                lambda steps, _idx: [timed_forward(steps[0])],
-                self,
-                states_out=tree_states,
-                topk_out=topk_out,
-            )
-            runner.bonus_ids = topk_out[0]
+            windows = None
+            seed_logits = tail_logits
+            if lookahead_runtime is not None:
+                try:
+                    windows, state, launched = grow_lookahead(
+                        self, runner, config, tail_logits, lookahead_runtime
+                    )
+                    tree_states.append(state)
+                    layers += launched
+                    self._opt_defer_layer_drain = True
+                except LookaheadFallback:
+                    logger.info("[OPT] lookahead fell back for %s", req.rid)
+                    windows = None
+                    tree_states.clear()
+                    saved = getattr(runner, "_lookahead_tail", None)
+                    if saved is not None:
+                        seed_logits = saved
+            if windows is None:
+                self._opt_lookahead_active = False
+                self._opt_defer_layer_drain = False
+                windows = grow_active_layers(
+                    config,
+                    [seed_logits],
+                    lambda steps, _idx: [timed_forward(steps[0])],
+                    self,
+                    states_out=tree_states,
+                    topk_out=topk_out,
+                )
+                runner.bonus_ids = topk_out[0]
             if not windows or windows[0] is None:
                 raise RuntimeError("OPT layer forward failed")
             tokens, parents, cols = windows[0]
@@ -414,7 +453,8 @@ class OptTreeSchedulerMixin:
         finally:
             import sys
 
-            drain_opt_layer_gpu_us(self, metrics)
+            if not getattr(self, "_opt_defer_layer_drain", False):
+                drain_opt_layer_gpu_us(self, metrics)
             finish_start = time.perf_counter()
             try:
                 pending = sys.exc_info()[1]
@@ -644,16 +684,20 @@ class OptTreeSchedulerMixin:
                     finally:
                         jobs = self._opt_deferred
                         self._opt_deferred = []
+                        defer_drain = bool(getattr(self, "_opt_defer_layer_drain", False))
+                        self._opt_defer_layer_drain = False
                         if jobs:
                             started = time.perf_counter()
                             try:
                                 forward_deferred_final_layers(self, jobs)
-                                if timing:
-                                    torch.get_device_module(self.device).synchronize()
                             finally:
                                 metrics.counts["opt_post_reply_us"] += int(
                                     (time.perf_counter() - started) * 1e6
                                 )
+                        if defer_drain:
+                            drain_opt_layer_gpu_us(self, metrics)
+                        if timing:
+                            torch.get_device_module(self.device).synchronize()
                 self.last_batch = None
                 self._sr_resume_http_reqs()
                 self._sr_poll_deferred_finishes()

@@ -6,6 +6,7 @@ N and tau do not change inside a round. There is no AdaCost policy switch.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 
@@ -41,3 +42,13 @@ class OptTreeConfig:
 def longest_draft_chain(config: OptTreeConfig) -> int:
     """Most draft tokens on one root-to-leaf path. The cap is ``max_depth - 1``."""
     return int(config.max_depth) - 1
+
+
+def opt_draft_lookahead_enabled() -> bool:
+    """Draft layer lookahead. Default off.
+
+    The hot path overlaps the next layer's launch with host tree updates.
+    It is only taken for CUDA, page size 1, batch size 1, and Triton.
+    """
+    value = os.environ.get("SGLANG_OPT_DRAFT_LOOKAHEAD", "")
+    return value.strip().lower() in {"1", "true", "yes", "y"}

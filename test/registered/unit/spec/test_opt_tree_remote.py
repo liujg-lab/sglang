@@ -3680,6 +3680,11 @@ def _load_opt_expand_one():
         "logger": logging.getLogger("opt-expand-test"),
         "clear_prefill_tail_logits": clear_prefill_tail_logits,
         "_reraise_device_context": _reraise_device_context,
+        # The extracted method stays on grow_active_layers. Lookahead is off.
+        "lookahead_supported": lambda _scheduler: False,
+        "prepare_lookahead_runtime": lambda *_args, **_kwargs: None,
+        "grow_lookahead": lambda *_args, **_kwargs: None,
+        "LookaheadFallback": RuntimeError,
     }
     code = "from __future__ import annotations\n" + textwrap.dedent(src[start:end])
     exec(compile(code, str(path), "exec"), ns)
@@ -3785,6 +3790,84 @@ class _OptWindowHost:
     def _opt_expand_one(self, req):
         self.calls.append("expand")
         return [7], [-1], [0]
+
+
+class OptLookaheadOpsTest(unittest.TestCase):
+    def test_env_default_off(self):
+        import os
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_config import (
+            opt_draft_lookahead_enabled,
+        )
+
+        old = os.environ.pop("SGLANG_OPT_DRAFT_LOOKAHEAD", None)
+        try:
+            self.assertFalse(opt_draft_lookahead_enabled())
+            os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = "1"
+            self.assertTrue(opt_draft_lookahead_enabled())
+            os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = "no"
+            self.assertFalse(opt_draft_lookahead_enabled())
+        finally:
+            if old is None:
+                os.environ.pop("SGLANG_OPT_DRAFT_LOOKAHEAD", None)
+            else:
+                os.environ["SGLANG_OPT_DRAFT_LOOKAHEAD"] = old
+
+    def test_expand_on_device_matches_cpu_expand_including_ties(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
+            expand_from_topk,
+            expand_on_device,
+            mirror_layer,
+            seed_from_topk,
+        )
+
+        scores = torch.tensor([[0.5, 0.5], [0.5, 0.5]])
+        ids = torch.tensor([[10, 11], [12, 13]])
+        weight = torch.tensor([0.4, 0.4])
+        anc = torch.eye(2, dtype=torch.int8)
+        top_scores, tokens, parents, anc_new = expand_on_device(
+            weight, anc, scores, ids, 2
+        )
+
+        device_state = OptTreeState.create(OptTreeConfig(width=2, tau=0.0, max_depth=4))
+        seed_from_topk(device_state, weight.clone(), torch.tensor([1, 2]))
+        device_state.anc_mask = anc.clone()
+        mirror_layer(device_state, top_scores, tokens, parents, seed=False)
+
+        cpu_state = OptTreeState.create(OptTreeConfig(width=2, tau=0.0, max_depth=4))
+        seed_from_topk(cpu_state, weight.clone(), torch.tensor([1, 2]))
+        cpu_state.anc_mask = anc.clone()
+        expand_from_topk(cpu_state, scores, ids)
+
+        self.assertTrue(torch.equal(device_state.tokens[1], cpu_state.tokens[1]))
+        self.assertTrue(torch.equal(device_state.parents[1], cpu_state.parents[1]))
+        self.assertTrue(torch.equal(device_state.weight[1], cpu_state.weight[1]))
+        self.assertTrue(torch.equal(device_state.anc_mask, cpu_state.anc_mask))
+        self.assertTrue(torch.equal(device_state.anc_mask, anc_new))
+        self.assertEqual(int(device_state.depth), 2)
+
+    def test_mirror_rebuilds_ancestor_mask_from_parent_cols(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_ops import (
+            mirror_layer,
+            seed_from_topk,
+        )
+
+        state = OptTreeState.create(OptTreeConfig(width=2, tau=0.0, max_depth=4))
+        seed_from_topk(state, torch.tensor([0.6, 0.3]), torch.tensor([4, 5]))
+        parents = torch.tensor([1, 0])
+        mirror_layer(
+            state,
+            torch.tensor([0.2, 0.1]),
+            torch.tensor([8, 9]),
+            parents,
+            seed=False,
+        )
+        eye = torch.eye(2, dtype=torch.int8)
+        base = torch.eye(2, dtype=torch.int8)
+        expect = torch.cat([base[parents], eye], dim=1)
+        self.assertTrue(torch.equal(state.anc_mask, expect))
+        self.assertTrue(torch.equal(state.tokens[1], torch.tensor([8, 9])))
+        self.assertTrue(torch.equal(state.parents[1], parents))
 
 
 if __name__ == "__main__":
