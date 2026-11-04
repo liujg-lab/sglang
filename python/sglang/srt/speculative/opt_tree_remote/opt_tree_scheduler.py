@@ -22,7 +22,11 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     OptLayerForward,
     _reraise_device_context,
     clear_prefill_tail_logits,
+    _begin_ingest_gpu,
+    _finish_ingest_gpu,
+    critical_layer_forwards,
     drain_opt_layer_gpu_us,
+    drop_lookahead_request,
     forward_deferred_final_layers,
     grow_active_layers,
     grow_lookahead,
@@ -279,6 +283,7 @@ class OptTreeSchedulerMixin:
             if req is not None:
                 release_opt_tree_lease(self, req)
                 release_opt_bonus_guesses(self, req)
+        drop_lookahead_request(self, rid)
         return super()._sr_finish_rid(
             rid, release_mm=release_mm, state=state, entry=entry
         )
@@ -370,6 +375,7 @@ class OptTreeSchedulerMixin:
             self._opt_defer_layer_drain = False
             lookahead_runtime = None
             if lookahead_supported(self):
+                t_prep = time.perf_counter()
                 try:
                     lookahead_runtime = prepare_lookahead_runtime(self, runner)
                     self._opt_lookahead_active = True
@@ -378,6 +384,10 @@ class OptTreeSchedulerMixin:
                     logger.info("[OPT] lookahead setup fell back: %s", exc)
                     metrics.counts["opt_lookahead_fallbacks"] += 1
                     lookahead_runtime = None
+                finally:
+                    metrics.add_host(
+                        "opt_lookahead_prepare", time.perf_counter() - t_prep
+                    )
 
             def _sync():
                 # Metrics sync here waits out the ingest forward and leaves no
@@ -387,7 +397,11 @@ class OptTreeSchedulerMixin:
 
             phases = OptPhaseClock()
             t0 = time.perf_counter()
-            tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
+            _begin_ingest_gpu(self)
+            try:
+                tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
+            finally:
+                _finish_ingest_gpu(self)
             _sync()
             phases.lap("opt_ingest_forward")
             flush_opt_ingest_phases(
@@ -409,6 +423,7 @@ class OptTreeSchedulerMixin:
             topk_out = [[]]
             windows = None
             seed_logits = tail_logits
+            lookahead_launched = None
             if lookahead_runtime is not None:
                 try:
                     windows, state, launched = grow_lookahead(
@@ -416,6 +431,7 @@ class OptTreeSchedulerMixin:
                     )
                     tree_states.append(state)
                     layers += launched
+                    lookahead_launched = int(launched)
                     self._opt_defer_layer_drain = True
                 except LookaheadFallback:
                     logger.info("[OPT] lookahead fell back for %s", req.rid)
@@ -441,6 +457,10 @@ class OptTreeSchedulerMixin:
             tokens, parents, cols = windows[0]
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             metrics.counts["opt_layer_forwards"] += layers
+            if lookahead_launched is not None:
+                metrics.counts["opt_layer_forwards_critical"] += critical_layer_forwards(
+                    lookahead_launched
+                )
             metrics.counts["opt_rounds"] += 1
             window = (tokens, parents, cols)
             expanded = True

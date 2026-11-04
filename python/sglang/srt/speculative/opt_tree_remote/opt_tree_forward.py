@@ -461,22 +461,29 @@ class _LayerTiming:
 
     Per ``opt_layer_forwards``, read the counters as:
 
-    - host exposure = ``opt_layer_host_us + opt_layer_launch_us``
-    - true GPU time ≈ ``opt_layer_gpu_us - opt_layer_launch_us``
-    - layer wall ≈ host exposure + ``opt_layer_d2h_wait_us`` + a small CPU expand
+    - ``opt_layer_host_us`` is preparation before any wait for the previous layer.
+    - ``opt_lookahead_launch_wait_us`` is that wait. It is in neither
+      ``host_us`` nor ``launch_us``.
+    - ``opt_layer_launch_us`` starts after the wait and stops when ``_run``
+      returns. Replaying the same ``r{N}_1`` graph returns immediately.
+      On one lookahead layer these three sum to the host wall from the start
+      of preparation through ``_run``.
+    - ``opt_layer_gpu_us`` brackets ``ev0``..``ev1``. Subtracting ``launch_us``
+      does not remove the previous-layer wait from the GPU time.
+    - ``opt_layer_forwards`` counts every queued layer, including the last one
+      lookahead submits early. ``opt_layer_forwards_critical`` is that count
+      minus one, matching the old path's pre-reply forwards.
+    - ``opt_ingest_gpu_us`` is the ingest forward on the device. Its events are
+      read in the same drain as the layer events.
 
-    ``opt_layer_d2h_wait_us`` near ``gpu_us - launch_us`` is a GPU bottleneck.
-    Host exposure above 2 ms is a host bottleneck. ``opt_seed_d2h_wait_us`` is
-    once per grow and is not divided by ``opt_layer_forwards``. ``ev0`` stays
-    before ``_run``. ``launch_us`` is the wall clock until ``_run`` returns
-    (ForwardBatch, ``replay_prepare``, and the launch). Logits stay on device;
-    the blocking copy is the later ``.cpu()``. Small copies inside
-    ``replay_prepare`` sit in both intervals, so the GPU figure is a
-    subtraction. Warmup samples include the first replay and are reference
-    only: about 1.35 ms of host and 5.2 ms of ``gpu_us`` per layer.
+    ``opt_layer_d2h_wait_us`` near the GPU interval is a GPU bottleneck.
+    ``opt_seed_d2h_wait_us`` is once per grow and is not divided by
+    ``opt_layer_forwards``. Logits stay on device; the blocking copy is the
+    later ``.cpu()``. Warmup samples include the first replay and are
+    reference only.
     """
 
-    __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened")
+    __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened", "host_closed")
 
     def __init__(self, metrics, t0, ev0, ev1):
         self.metrics = metrics
@@ -485,6 +492,7 @@ class _LayerTiming:
         self.ev0 = ev0
         self.ev1 = ev1
         self.opened = False
+        self.host_closed = False
 
 
 def _draft_metrics(scheduler):
@@ -515,16 +523,27 @@ def _begin_layer_timing(scheduler):
     return _LayerTiming(metrics, time.perf_counter(), ev0, ev1)
 
 
-def _mark_layer_launch(timing) -> None:
-    """Host time stops before the verify replay is queued.
+def _close_layer_host(timing) -> None:
+    """Stop the preparation clock before waiting for the previous layer."""
+    if timing is None or timing.host_closed:
+        return
+    now = time.perf_counter()
+    timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+    timing.host_closed = True
 
-    ``t_launch`` starts the ``run_batch`` wall clock. A failed ``ev0`` leaves
-    ``opened`` false, so that sample records host time and skips launch time.
+
+def _mark_layer_launch(timing) -> None:
+    """Start the ``run_batch`` clock. Preparation is closed here if still open.
+
+    A failed ``ev0`` leaves ``opened`` false, so that sample records host time
+    and skips launch time.
     """
     if timing is None:
         return
     now = time.perf_counter()
-    timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+    if not timing.host_closed:
+        timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+        timing.host_closed = True
     timing.t_launch = now
     try:
         timing.ev0.record()
@@ -536,9 +555,8 @@ def _mark_layer_launch(timing) -> None:
 def _finish_layer_timing(scheduler, timing) -> None:
     """Queue the GPU interval. A failed replay never reaches this.
 
-    ``opt_layer_launch_us`` is host work inside ``run_batch``: ForwardBatch
-    construction, ``replay_prepare``, and the kernel launch. It is recorded
-    before ``ev1``, so ``gpu_us - launch_us`` drops that idle gap.
+    ``opt_layer_launch_us`` stops before ``ev1``. Waiting for the previous
+    layer is ``opt_lookahead_launch_wait_us``, recorded before this window.
     """
     if timing is None or not timing.opened:
         return
@@ -556,18 +574,76 @@ def _finish_layer_timing(scheduler, timing) -> None:
     events.append((timing.ev0, timing.ev1))
 
 
+def critical_layer_forwards(launched: int) -> int:
+    """Layers on the pre-reply path. The early final launch is excluded."""
+    return max(int(launched) - 1, 0)
+
+
+def _begin_ingest_gpu(scheduler) -> None:
+    """Queue the start of the ingest GPU interval. No host synchronize."""
+    scheduler._opt_ingest_events = None
+    if _draft_metrics(scheduler) is None:
+        return
+    try:
+        event = torch.get_device_module(scheduler.device).Event(enable_timing=True)
+        event.record()
+    except Exception:
+        return
+    scheduler._opt_ingest_events = event
+
+
+def _finish_ingest_gpu(scheduler) -> None:
+    """Queue the end of the ingest GPU interval. No host synchronize."""
+    start = getattr(scheduler, "_opt_ingest_events", None)
+    if start is None or isinstance(start, tuple):
+        return
+    try:
+        end = torch.get_device_module(scheduler.device).Event(enable_timing=True)
+        end.record()
+    except Exception:
+        scheduler._opt_ingest_events = None
+        return
+    scheduler._opt_ingest_events = (start, end)
+
+
+def _note_lookahead_launch_wait(runner) -> None:
+    """Time the wait for the previous layer, then let ``_run`` launch this one.
+
+    The first layer waits for ingest, not for another layer. Metrics off does
+    not synchronize here; ``ForwardBatch.init_new`` still does.
+    """
+    if not getattr(runner, "_lookahead_queued", False):
+        return
+    scheduler = runner.scheduler
+    metrics = _draft_metrics(scheduler)
+    if metrics is None:
+        return
+    started = time.perf_counter()
+    try:
+        torch.get_device_module(scheduler.device).current_stream().synchronize()
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        return
+    metrics.counts["opt_lookahead_launch_wait_us"] += int(
+        (time.perf_counter() - started) * 1e6
+    )
+
+
 def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
-    """Read queued verify events once, after the grow clock has stopped.
+    """Read queued verify and ingest events once, after the grow clock has stopped.
 
     An empty queue does not synchronize. A poisoned device drops the events.
     ``elapsed_time`` is milliseconds. Other timing errors increment
     ``device_timing_dropped_opt_layer`` and do not replace a business result
     unless the accelerator context is already dead.
     """
-    events = getattr(scheduler, "_opt_layer_events", None)
-    if not events:
-        return
+    events = list(getattr(scheduler, "_opt_layer_events", None) or [])
+    ingest = getattr(scheduler, "_opt_ingest_events", None)
     scheduler._opt_layer_events = []
+    scheduler._opt_ingest_events = None
+    ingest_pair = ingest if isinstance(ingest, tuple) and len(ingest) == 2 else None
+    if not events and ingest_pair is None:
+        return
     if metrics is None or getattr(scheduler, "_sr_device_poisoned", False):
         return
     from sglang.srt.speculative.standalone_remote.sr_align import (
@@ -588,6 +664,16 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
             if is_device_context_error(exc):
                 raise
             metrics.counts["device_timing_dropped_opt_layer"] += 1
+    if ingest_pair is None:
+        return
+    try:
+        metrics.counts["opt_ingest_gpu_us"] += int(
+            ingest_pair[0].elapsed_time(ingest_pair[1]) * 1000
+        )
+    except Exception as exc:
+        if is_device_context_error(exc):
+            raise
+        metrics.counts["device_timing_dropped_opt_layer"] += 1
 
 
 def _commit_prob_rows(
@@ -934,8 +1020,10 @@ class OptLayerForward:
     def launch_layer(self, tokens_dev, anc_dev, depth: int, batch) -> torch.Tensor:
         """Queue one layer from tensors already on device.
 
-        Lengths and the pool index are ``fill_`` into buffers allocated while
-        the GPU was idle. This does not build a new ``SamplingBatchInfo``.
+        Device lengths and the pool index are ``fill_`` into buffers allocated
+        while the GPU was idle. ``seq_lens_cpu`` is a new pageable CPU tensor
+        each layer, so a later fill cannot overwrite an in-flight copy.
+        This does not build a new ``SamplingBatchInfo``.
         """
         tokens = tokens_dev
         if not torch.is_tensor(tokens):
@@ -964,7 +1052,6 @@ class OptLayerForward:
         out_cache_loc = self._alloc_lookahead_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         self._la_seq.fill_(self.cached_len)
-        self._la_seq_cpu.fill_(self.cached_len)
         self._la_orig.fill_(self.cached_len)
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -973,7 +1060,7 @@ class OptLayerForward:
         batch.input_ids = tokens.to(dtype=torch.int64).reshape(-1)
         batch.output_ids = None
         batch.seq_lens = self._la_seq
-        batch.seq_lens_cpu = self._la_seq_cpu
+        batch.seq_lens_cpu = torch.tensor([self.cached_len], dtype=torch.int64)
         batch.orig_seq_lens = self._la_orig
         batch.seq_lens_sum = int(self.cached_len)
         batch.out_cache_loc = out_cache_loc
@@ -990,6 +1077,8 @@ class OptLayerForward:
             num_tokens_per_req=n,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        _close_layer_host(timing)
+        _note_lookahead_launch_wait(self)
         _mark_layer_launch(timing)
         self._lookahead_queued = True
         logits = self._run(batch)
@@ -2326,28 +2415,39 @@ def lookahead_supported(scheduler) -> bool:
     return _lookahead_backend_is_triton(scheduler)
 
 
-def _lookahead_would_evict(scheduler, n: int) -> bool:
-    """True when the next page-1 alloc would enter tree eviction.
+def _lookahead_kv_need(scheduler) -> int:
+    """Slots held together: every forwarded layer plus one bonus group.
+
+    ``depth_rule`` stops once ``depth`` reaches ``max_depth - 1``. Lookahead
+    forwards that last layer before the host decides to stop, so the tree
+    takes ``(max_depth - 1) * n`` slots. The bonus forward then allocates
+    ``n + 1`` while those slots are still mapped.
+    """
+    n = int(scheduler.server_args.opt_tree_width)
+    depth = int(scheduler.server_args.opt_tree_max_depth)
+    return (depth - 1) * n + (n + 1)
+
+
+def _lookahead_would_evict(scheduler) -> bool:
+    """True when the free list cannot cover the whole lookahead tree.
 
     ``available_size`` is ``len`` of the device free list and does not sync.
-    Eviction itself can. Chunk cache never evicts here.
+    A short radix free list would evict, and that eviction can sync. A short
+    chunk-cache free list fails the alloc and still resets the step. Either
+    case falls back before the first layer is queued.
     """
     tree = getattr(scheduler, "tree_cache", None)
     if tree is None:
         return False
-    try:
-        if tree.is_chunk_cache():
-            return False
-    except Exception:
-        return True
     allocator = getattr(tree, "token_to_kv_pool_allocator", None)
     if allocator is None:
         return True
     try:
         available = allocator.available_size()
+        need = _lookahead_kv_need(scheduler)
     except Exception:
         return True
-    return int(available) < int(n)
+    return int(available) < int(need)
 
 
 def _lookahead_graph_ready(scheduler, batch) -> bool:
@@ -2375,34 +2475,95 @@ def _lookahead_graph_ready(scheduler, batch) -> bool:
         return False
 
 
+def _lookahead_width_cache(scheduler, width: int, device):
+    """Pinned slots, events, and device scratch for one tree width.
+
+    The first call allocates. Later steps reuse the same objects. A slot is
+    copied again only after ``clone_cpu`` clears ``ready``; the previous
+    step's settle or reset has already synchronized that event.
+    """
+    cache = getattr(scheduler, "_opt_la_cache", None)
+    if cache is None:
+        cache = {}
+        scheduler._opt_la_cache = cache
+    width = int(width)
+    hit = cache.get(width)
+    if hit is not None:
+        return hit
+    hit = {
+        "slots": (_PinnedLayer(width), _PinnedLayer(width)),
+        "bonus": _PinnedBonus(width),
+        "positions": torch.empty(width, dtype=torch.long, device=device),
+        "dummy_tokens": torch.zeros(width, dtype=torch.long, device=device),
+        "launch_event": torch.cuda.Event(),
+    }
+    cache[width] = hit
+    return hit
+
+
+def _lookahead_batch(scheduler, req):
+    """Reuse one decode batch for this request.
+
+    A new ``rid`` or a new KV pool index rebuilds the batch and its sampling
+    info. The same request only keeps the existing length tensors; later
+    ``fill_`` writes the current lengths.
+    """
+    batches = getattr(scheduler, "_opt_la_batches", None)
+    if batches is None:
+        batches = {}
+        scheduler._opt_la_batches = batches
+    rid = getattr(req, "rid", None)
+    pool = getattr(req, "req_pool_idx", None)
+    hit = batches.get(rid)
+    if (
+        hit is not None
+        and hit["pool_idx"] == pool
+        and hit["batch"] is not None
+    ):
+        batch = hit["batch"]
+        if not batch.reqs or batch.reqs[0] is not req:
+            batch.reqs[0] = req
+        return batch
+    batch = scheduler._sr_make_decode_batch([req])
+    _keep_raw_logits(batch)
+    batches[rid] = {"pool_idx": pool, "batch": batch}
+    return batch
+
+
+def drop_lookahead_request(scheduler, rid) -> None:
+    """Drop a finished request's cached decode batch."""
+    batches = getattr(scheduler, "_opt_la_batches", None)
+    if batches is not None:
+        batches.pop(rid, None)
+
+
 def prepare_lookahead_runtime(scheduler, runner):
-    """Build the reused batch and pinned slots while the GPU is still idle.
+    """Attach the cached batch and pinned slots while the GPU is still idle.
 
     ``_sr_make_decode_batch`` copies sampling tensors with ``torch.tensor``.
-    That has to happen before the ingest forward is queued.
+    That has to happen before the ingest forward is queued, and only when
+    this request does not already have a batch.
     """
-    batch = scheduler._sr_make_decode_batch([runner.req])
-    _keep_raw_logits(batch)
+    batch = _lookahead_batch(scheduler, runner.req)
     width = int(scheduler.server_args.opt_tree_width)
     device = scheduler.req_to_token_pool.device
+    shared = _lookahead_width_cache(scheduler, width, device)
     runner._la_batch = batch
     runner._la_seq = batch.seq_lens
     runner._la_seq_cpu = batch.seq_lens_cpu
     runner._la_orig = batch.orig_seq_lens
     runner._la_pool = batch.req_pool_indices
-    runner._la_positions = torch.empty(width, dtype=torch.long, device=device)
-    runner._la_dummy_tokens = torch.zeros(width, dtype=torch.long, device=device)
+    runner._la_positions = shared["positions"]
+    runner._la_dummy_tokens = shared["dummy_tokens"]
     runner._lookahead_tail = None
-    runner._lookahead_launch_event = torch.cuda.Event()
+    runner._lookahead_launch_event = shared["launch_event"]
     runner._lookahead_queued = False
     runner.lookahead_inflight = False
     runner.lookahead_dropped = False
     runner._lookahead_satisfied = False
     runner._last_logits = None
     runner.bonus_ids = []
-    slots = (_PinnedLayer(width), _PinnedLayer(width))
-    bonus = _PinnedBonus(width)
-    return batch, slots, bonus
+    return batch, shared["slots"], shared["bonus"]
 
 
 def _reset_lookahead_runner(scheduler, runner) -> None:
@@ -2471,13 +2632,14 @@ def _private_seed_logits(runner, tail_logits) -> torch.Tensor:
 
 
 def _admit_lookahead(scheduler, runner, batch) -> None:
-    """One graph and eviction check before the first layer is queued.
+    """One graph and KV-budget check before the first layer is queued.
 
-    Later layers keep the same width and batch, so they do not call
-    ``can_run`` again.
+    The budget is the full tree plus one bonus group. Later layers keep the
+    same width and batch, so they do not call ``can_run`` or re-read the
+    free list.
     """
     n = int(scheduler.server_args.opt_tree_width)
-    if _lookahead_would_evict(scheduler, n):
+    if _lookahead_would_evict(scheduler):
         raise LookaheadFallback("kv evict")
     device = scheduler.req_to_token_pool.device
     from sglang.srt.model_executor.forward_batch_info import (
@@ -2624,14 +2786,26 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
         _opt_draft_count(scheduler, "opt_lookahead_rollbacks")
         return
     bonus = getattr(runner, "_lookahead_bonus", None)
+    bonus_failed = False
     try:
         if bonus is not None:
             runner.bonus_ids.append(bonus.clone_cpu())
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        bonus_failed = True
+        logger.warning(
+            "[OPT] lookahead bonus ids failed for %s: %s",
+            getattr(getattr(runner, "req", None), "rid", None),
+            exc,
+        )
     finally:
         # The layer forward is already queued. A second forward would allocate
-        # another N slots on top of it.
+        # another N slots on top of it. A failed id copy still counts as
+        # settled, and the dropped flag skips the bonus forward.
         runner.lookahead_inflight = False
         runner._lookahead_satisfied = True
+        if bonus_failed:
+            runner.lookahead_dropped = True
 
 
 def forward_deferred_final_layers(scheduler, jobs) -> None:
@@ -2653,14 +2827,14 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
         skipped = []
         for job in jobs:
             runner = job.runner
-            if getattr(runner, "_lookahead_satisfied", False):
-                continue
             if (
                 getattr(runner, "lookahead_dropped", False)
                 or _request_finished(scheduler, job.req)
                 or getattr(scheduler, "_sr_device_poisoned", False)
             ):
                 skipped.append(job)
+                continue
+            if getattr(runner, "_lookahead_satisfied", False):
                 continue
             by_depth.setdefault(int(job.state.depth), []).append(job)
         for group in by_depth.values():
@@ -2682,7 +2856,12 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
         for job in jobs:
             if id(job) in skipped_ids:
                 continue
-            maybe_attach_bonus_guesses(scheduler, job)
+            try:
+                maybe_attach_bonus_guesses(scheduler, job)
+            except Exception as exc:
+                _reraise_device_context(scheduler, exc)
+                logger.warning("[OPT] bonus attach failed: %s", exc)
+                _opt_draft_count(scheduler, "opt_bonus_attach_failed")
     finally:
         for job in jobs:
             try:
