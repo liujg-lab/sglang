@@ -1292,6 +1292,107 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertIsNone(opt_bonus_graph_extra(layer.spec_info))
         self.assertEqual([guess.token for guess in guesses], [7, 8, 9, 10])
 
+    def test_bonus_slot_ids_share_one_host_copy(self):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _read_bonus_slot_ids,
+        )
+
+        rows = _read_bonus_slot_ids(
+            [torch.tensor([8, 9]), torch.tensor([10, 11, 12])]
+        )
+        self.assertEqual(rows, [[8, 9], [10, 11, 12]])
+
+    def test_bonus_template_forward_skips_run_batch(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _BonusCandidate,
+            _forward_one_bonus_group,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        seen = []
+
+        def make_batch(reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                reqs=list(reqs),
+                seq_lens=torch.tensor([8], dtype=torch.int64),
+                orig_seq_lens=torch.tensor([8], dtype=torch.int32),
+                sampling_info=info,
+                has_grammar=False,
+                return_logprob=False,
+                return_hidden_states=False,
+            )
+
+        def run_batch(_batch):
+            raise AssertionError("run_batch")
+
+        def forward(forward_batch):
+            seen.append(forward_batch)
+            width = int(forward_batch.spec_info.num_tokens_per_req)
+            return SimpleNamespace(
+                can_run_graph=True,
+                logits_output=SimpleNamespace(
+                    next_token_logits=torch.zeros(width, 3)
+                ),
+            )
+
+        host = SimpleNamespace(
+            _sr_make_decode_batch=make_batch,
+            run_batch=run_batch,
+            cur_batch=None,
+            req_to_token_pool=SimpleNamespace(
+                device="cpu",
+                req_to_token=torch.full((1, 16), -1, dtype=torch.int64),
+            ),
+            model_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(forward=forward)
+            ),
+        )
+        req = SimpleNamespace(req_pool_idx=0, kv_allocated_len=8, rid="bonus")
+        runner = SimpleNamespace(
+            scheduler=host,
+            req=req,
+            cached_len=4,
+            prefix_len=4,
+        )
+        runner._alloc_layer_slots = lambda n, start=None: torch.arange(
+            8, 8 + int(n), dtype=torch.int64
+        )
+        chunk = [
+            _BonusCandidate(-1, 7, 4, ()),
+            _BonusCandidate(0, 8, 5, (4,)),
+            _BonusCandidate(1, 9, 6, (4, 5)),
+            _BonusCandidate(2, 10, 7, (4, 5, 6)),
+        ]
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._lookahead_forward_template",
+            return_value=SimpleNamespace(),
+        ):
+            guesses = _forward_one_bonus_group(host, runner, chunk, 8, 4)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].spec_info.is_bonus)
+        self.assertEqual(int(seen[0].spec_info.num_tokens_per_req), 4)
+        self.assertEqual([guess.token for guess in guesses], [7, 8, 9, 10])
+        self.assertEqual([guess.slot for guess in guesses], [8, 9, 10, 11])
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_bonus_template_fallbacks"], 0)
+        self.assertEqual(counts["opt_bonus_eager_groups"], 0)
+
     def test_bonus_graph_key_does_not_reuse_layer_graph(self):
         from pathlib import Path
 
@@ -3463,7 +3564,7 @@ class OptTreeRemoteTest(CustomTestCase):
             )
 
         with patch(
-            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_one_bonus_group",
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._launch_bonus_group",
             group,
         ):
             with self.assertRaises(RuntimeError):

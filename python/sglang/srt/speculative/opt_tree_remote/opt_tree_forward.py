@@ -2061,6 +2061,36 @@ def bonus_verify_chunks(plans, width: int) -> List[list]:
     return chunks
 
 
+def _host_device_is_cpu(device) -> bool:
+    if device is None:
+        return True
+    return torch.device(device).type == "cpu"
+
+
+def _copy_bonus_host(host: torch.Tensor, device) -> torch.Tensor:
+    """Copy one CPU tensor to ``device``.
+
+    CUDA destinations use pinned memory and one ``non_blocking`` copy. CPU
+    destinations keep ``host``. Other devices use a blocking copy.
+    """
+    if _host_device_is_cpu(device):
+        return host
+    if torch.device(device).type == "cuda":
+        if not host.is_pinned():
+            host = host.pin_memory()
+        out = torch.empty(host.shape, dtype=host.dtype, device=device)
+        out.copy_(host, non_blocking=True)
+        return out
+    return host.to(device=device)
+
+
+def _bonus_long_tensor(values, device) -> torch.Tensor:
+    """Build one long vector on the CPU, then copy it once."""
+    pinned = not _host_device_is_cpu(device) and torch.device(device).type == "cuda"
+    host = torch.tensor(list(values), dtype=torch.long, pin_memory=pinned)
+    return _copy_bonus_host(host, device)
+
+
 def bonus_attention_mask(
     prefix_len: int,
     cached_len: int,
@@ -2075,6 +2105,9 @@ def bonus_attention_mask(
     themselves. A real token does not see a dummy column. The self column is
     the index inside this group, and every row is ``cached_len + query_width``
     wide.
+
+    The mask is written on the CPU. The real rows' prefix is one slice. A
+    CUDA ``device`` then receives one pinned copy.
     """
     real = len(chains)
     queries = real if query_width is None else int(query_width)
@@ -2083,12 +2116,13 @@ def bonus_attention_mask(
             f"OPT bonus query width {queries} is smaller than {real} real tokens"
         )
     row_width = int(cached_len) + queries
-    mask = torch.zeros((queries, row_width), dtype=torch.bool, device=device)
+    pinned = not _host_device_is_cpu(device) and torch.device(device).type == "cuda"
+    mask = torch.zeros((queries, row_width), dtype=torch.bool, pin_memory=pinned)
     prefix = int(prefix_len)
     tree_end = int(cached_len)
+    if prefix > 0 and real > 0:
+        mask[:real, :prefix] = True
     for index, chain in enumerate(chains):
-        if prefix > 0:
-            mask[index, :prefix] = True
         for col in chain:
             col = int(col)
             if 0 <= col < tree_end:
@@ -2096,7 +2130,7 @@ def bonus_attention_mask(
         mask[index, tree_end + index] = True
     for index in range(real, queries):
         mask[index, tree_end + index] = True
-    return mask
+    return _copy_bonus_host(mask, device)
 
 
 def _drop_stored_logits(runner) -> None:
@@ -2158,56 +2192,287 @@ def _free_bonus_ids(scheduler, slot_ids) -> None:
     _free_slot_ids(scheduler, slot_ids)
 
 
-def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int):
-    """Forward one width-N group. Return guesses and free the padded slots."""
-    from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import OptBonusGuess
+@dataclass
+class _BonusAdmit:
+    """One template admission for every bonus group of this request."""
 
+    tried: bool = False
+    template: object = None
+    delta: object = None
+
+
+@dataclass
+class _BonusLaunch:
+    """One bonus group whose slot ids are still on device."""
+
+    loc: Optional[torch.Tensor]
+    logits: torch.Tensor
+    chunk: list
+    tree_end: int
+    width: int
+
+
+def _alloc_bonus_slots(scheduler, runner, n: int, start: int) -> torch.Tensor:
+    """Page-1 bonus slots. Length tensors are cached device buffers.
+
+    ``fill_`` writes the current prefix and, when it changes, the pool index.
+    No ``tree_cache`` keeps the caller's ``_alloc_layer_slots`` stub. These
+    slots are not appended to ``layer_slots``.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    token_pool = getattr(scheduler, "req_to_token_pool", None)
+    pool = getattr(token_pool, "req_to_token", None)
+    page = int(getattr(tree_cache, "page_size", 1) or 1) if tree_cache is not None else 1
+    pool_idx = getattr(getattr(runner, "req", None), "req_pool_idx", None)
+    if (
+        tree_cache is None
+        or token_pool is None
+        or pool is None
+        or page != 1
+        or pool_idx is None
+    ):
+        return runner._alloc_layer_slots(n, start=start)
+    from sglang.srt.mem_cache.common import alloc_token_slots
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    device = token_pool.device
+    cache = getattr(runner, "_bonus_len", None)
+    pool_idx = int(pool_idx)
+    if (
+        not isinstance(cache, dict)
+        or cache.get("device") != device
+        or not torch.is_tensor(cache.get("seq"))
+        or not torch.is_tensor(cache.get("pool"))
+    ):
+        cache = {
+            "device": device,
+            "seq": torch.empty(1, dtype=torch.int64, device=device),
+            "pool": torch.empty(1, dtype=torch.int64, device=device),
+            "pool_idx": None,
+        }
+        runner._bonus_len = cache
+    if cache["pool_idx"] != pool_idx:
+        cache["pool"].fill_(pool_idx)
+        cache["pool_idx"] = pool_idx
+    cache["seq"].fill_(int(start))
+    out_cache_loc = alloc_token_slots(tree_cache, n)
+    if out_cache_loc is None or int(out_cache_loc.numel()) != n:
+        raise RuntimeError(
+            f"OPT bonus allocated "
+            f"{0 if out_cache_loc is None else int(out_cache_loc.numel())} "
+            f"slots for {n} tokens"
+        )
+    assign_req_to_token_pool_func(
+        cache["pool"],
+        pool,
+        cache["seq"],
+        cache["seq"] + n,
+        out_cache_loc,
+        1,
+    )
+    return out_cache_loc
+
+
+def _copy_ids_to_host(flat: torch.Tensor) -> List[int]:
+    """Read slot ids. CUDA uses one pinned ``non_blocking`` copy and one sync."""
+    flat = flat.detach().reshape(-1).to(dtype=torch.long)
+    if flat.device.type == "cpu":
+        return [int(value) for value in flat.tolist()]
+    if flat.device.type == "cuda":
+        host = torch.empty(int(flat.numel()), dtype=torch.long, pin_memory=True)
+        host.copy_(flat, non_blocking=True)
+        torch.get_device_module(flat.device).current_stream().synchronize()
+        return [int(value) for value in host.tolist()]
+    return [int(value) for value in flat.cpu().tolist()]
+
+
+def _read_bonus_slot_ids(locs: Sequence[torch.Tensor]) -> List[List[int]]:
+    """Split one host copy of every group's slot ids."""
+    pieces = []
+    for loc in locs:
+        if loc is None:
+            raise RuntimeError("OPT bonus slot ids were read after the buffer was cleared")
+        pieces.append(loc.detach().reshape(-1))
+    if not pieces:
+        return []
+    widths = [int(piece.numel()) for piece in pieces]
+    values = _copy_ids_to_host(torch.cat(pieces))
+    rows = []
+    start = 0
+    for width in widths:
+        rows.append(values[start : start + width])
+        start += width
+    return rows
+
+
+def _abort_bonus_slots(scheduler, runner, loc, tree_end: int, width: int) -> None:
+    """Sync one failed group's ids, clear the map, and free those slots."""
+    slots = _read_bonus_slot_ids([loc])[0]
+    _clear_req_to_token_span(scheduler, runner.req, tree_end, tree_end + width)
+    runner.req.kv_allocated_len = tree_end
+    _free_bonus_ids(scheduler, slots)
+
+
+def _free_open_bonus_groups(scheduler, runner, groups: Sequence[_BonusLaunch]) -> None:
+    for group in groups:
+        if group.loc is None:
+            continue
+        loc = group.loc
+        group.loc = None
+        _abort_bonus_slots(scheduler, runner, loc, group.tree_end, group.width)
+
+
+def _bonus_model_runner(scheduler):
+    worker = getattr(scheduler, "model_worker", None)
+    return getattr(worker, "model_runner", None)
+
+
+def _fill_bonus_schedule_batch(
+    scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int
+):
+    """Install this group on the cached decode batch.
+
+    Device ``seq_lens`` and ``orig_seq_lens`` are filled in place. ``seq_lens_cpu``
+    is a new pageable tensor so a later fill cannot overwrite an in-flight copy.
+    """
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    batch = _lookahead_batch(scheduler, runner.req)
+    batch.forward_mode = ForwardMode.TARGET_VERIFY
+    batch.global_forward_mode = ForwardMode.TARGET_VERIFY
+    batch.input_ids = tokens.reshape(-1).to(dtype=torch.int64)
+    batch.output_ids = None
+    batch.seq_lens.fill_(int(tree_end))
+    batch.orig_seq_lens.fill_(int(tree_end))
+    batch.seq_lens_cpu = torch.tensor([int(tree_end)], dtype=torch.int64)
+    batch.seq_lens_sum = int(tree_end)
+    batch.out_cache_loc = loc.reshape(-1)
+    batch.extend_lens = [int(width)]
+    batch.prefix_lens = [int(tree_end)]
+    batch.extend_num_tokens = int(width)
+    batch.extend_logprob_start_lens = [int(tree_end)]
+    batch.spec_info = OptLayerSpec(
+        custom_mask=mask.reshape(-1),
+        positions=positions.reshape(-1).to(dtype=torch.int64),
+        draft_token_num=int(width),
+        num_tokens_per_req=int(width),
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        apply_prefix_custom_mask=True,
+        is_bonus=True,
+    )
+    return batch
+
+
+def _bonus_fallback_logits(
+    scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int
+):
+    batch = _verify_batch_many(
+        scheduler,
+        [runner],
+        [tokens],
+        positions,
+        mask.reshape(-1),
+        loc.reshape(-1),
+        [tree_end],
+        is_bonus=True,
+    )
+    return _as_layer_rows(_run_batch(scheduler, batch), 1, width)[0]
+
+
+def _bonus_template_forward(scheduler, batch, template, delta, width: int):
+    """Replay the N+1 bonus graph. A false ``can_run_graph`` already ran eager.
+
+    Do not call ``run_batch`` after that forward: the slots were just written.
+    """
+    forward_batch = _refresh_lookahead_forward(template, batch, delta)
+    out = scheduler.model_worker.model_runner.forward(forward_batch)
+    if getattr(out, "can_run_graph", True) is False:
+        _opt_draft_count(scheduler, "opt_bonus_eager_groups")
+    logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
+    if logits is None:
+        raise RuntimeError("OPT bonus forward returned no logits")
+    return _as_layer_rows(logits, 1, width)[0]
+
+
+def _bonus_group_logits(
+    scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int, admit: _BonusAdmit
+):
+    """One group. Admit the N+1 template once; otherwise ``run_batch``."""
+    model_runner = _bonus_model_runner(scheduler)
+    if model_runner is not None and (not admit.tried or admit.template is not None):
+        batch = _fill_bonus_schedule_batch(
+            scheduler, runner, tokens, positions, mask, loc, tree_end, width
+        )
+        if not admit.tried:
+            admit.tried = True
+            admit.template = _lookahead_forward_template(scheduler, batch)
+            admit.delta = (
+                _mrope_delta_from_template(admit.template)
+                if admit.template is not None
+                else None
+            )
+        if admit.template is not None:
+            return _bonus_template_forward(
+                scheduler, batch, admit.template, admit.delta, width
+            )
+    _opt_draft_count(scheduler, "opt_bonus_template_fallbacks")
+    return _bonus_fallback_logits(
+        scheduler, runner, tokens, positions, mask, loc, tree_end, width
+    )
+
+
+def _launch_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int, admit: _BonusAdmit):
+    """Forward one group and leave its slot ids on device."""
     width = len(chunk)
     device = scheduler.req_to_token_pool.device
     chains = [plan.chain for plan in chunk]
     mask = bonus_attention_mask(prefix, tree_end, chains, device=device)
-    positions = torch.tensor(
-        [plan.position for plan in chunk], dtype=torch.long, device=device
-    )
-    tokens = torch.tensor(
-        [plan.token for plan in chunk], dtype=torch.long, device=device
-    )
-    loc = runner._alloc_layer_slots(width, start=tree_end)
+    positions = _bonus_long_tensor([plan.position for plan in chunk], device)
+    tokens = _bonus_long_tensor([plan.token for plan in chunk], device)
+    loc = _alloc_bonus_slots(scheduler, runner, width, tree_end)
     runner.req.kv_allocated_len = tree_end + width
     try:
-        batch = _verify_batch_many(
-            scheduler,
-            [runner],
-            [tokens],
-            positions,
-            mask.reshape(-1),
-            loc.reshape(-1),
-            [tree_end],
-            is_bonus=True,
+        logits = _bonus_group_logits(
+            scheduler, runner, tokens, positions, mask, loc, tree_end, width, admit
         )
-        logits = _as_layer_rows(_run_batch(scheduler, batch), 1, width)[0]
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
-        slots = [int(slot) for slot in loc.detach().cpu().reshape(-1).tolist()]
-        _clear_req_to_token_span(scheduler, runner.req, tree_end, tree_end + width)
-        runner.req.kv_allocated_len = tree_end
-        _free_bonus_ids(scheduler, slots)
+        _abort_bonus_slots(scheduler, runner, loc, tree_end, width)
         raise
-    slots = [int(slot) for slot in loc.detach().cpu().reshape(-1).tolist()]
     _clear_req_to_token_span(scheduler, runner.req, tree_end, tree_end + width)
     runner.req.kv_allocated_len = tree_end
+    return _BonusLaunch(
+        loc=loc,
+        logits=logits,
+        chunk=list(chunk),
+        tree_end=int(tree_end),
+        width=int(width),
+    )
+
+
+def _materialize_bonus_guesses(scheduler, group: _BonusLaunch, slots: Sequence[int]):
+    """Turn host slot ids into guesses and free the padded ones."""
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import OptBonusGuess
+
+    if len(slots) != len(group.chunk):
+        raise RuntimeError(
+            f"OPT bonus returned {len(slots)} slots for {len(group.chunk)} queries"
+        )
     guesses = []
     dummy_slots = []
-    for index, plan in enumerate(chunk):
+    for index, plan in enumerate(group.chunk):
         if not plan.keep:
-            dummy_slots.append(slots[index])
+            dummy_slots.append(int(slots[index]))
             continue
         guesses.append(
             OptBonusGuess(
                 parent=int(plan.parent),
                 token=int(plan.token),
-                slot=slots[index],
-                logits=logits[index].detach().clone(),
+                slot=int(slots[index]),
+                logits=group.logits[index].detach().clone(),
             )
         )
     try:
@@ -2218,6 +2483,14 @@ def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: in
     return guesses
 
 
+def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int):
+    """Forward one bonus group. Return guesses and free the padded slots."""
+    group = _launch_bonus_group(scheduler, runner, chunk, tree_end, prefix, _BonusAdmit())
+    slots = _read_bonus_slot_ids([group.loc])[0]
+    group.loc = None
+    return _materialize_bonus_guesses(scheduler, group, slots)
+
+
 def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate]) -> None:
     """Write guess KV past the tree, then detach those columns from the map.
 
@@ -2225,6 +2498,9 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
     node. That matches the bonus CUDA graph. A short tail still repeats the
     last real candidate. Publish sees only the tree span. Real guess slots
     stay allocated until the next step installs one or frees them.
+
+    Every group of this request shares one template admission. Slot ids stay
+    on device until the last group returns, then one copy reads them all.
     """
     from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
         release_opt_bonus_guesses,
@@ -2233,12 +2509,21 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
     width = int(scheduler.server_args.speculative_num_draft_tokens) + 1
     tree_end = int(runner.cached_len)
     prefix = int(runner.prefix_len)
+    launched: List[_BonusLaunch] = []
     kept = []
+    admit = _BonusAdmit()
     try:
         for chunk in bonus_verify_chunks(plans, width):
-            kept.extend(_forward_one_bonus_group(scheduler, runner, chunk, tree_end, prefix))
+            launched.append(
+                _launch_bonus_group(scheduler, runner, chunk, tree_end, prefix, admit)
+            )
+        id_rows = _read_bonus_slot_ids([group.loc for group in launched])
+        for group, slots in zip(launched, id_rows):
+            group.loc = None
+            kept.extend(_materialize_bonus_guesses(scheduler, group, slots))
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
+        _free_open_bonus_groups(scheduler, runner, launched)
         if not getattr(scheduler, "_sr_device_poisoned", False):
             release_opt_bonus_guesses(scheduler, runner.req, kept)
         raise

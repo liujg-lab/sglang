@@ -108,6 +108,10 @@ CUDA 使用 `--page-size 1` 和 `triton`。NPU 把 `--page-size` 改为 128，�
 
 page=1 时，Draft 在把验证窗口回包之后补算最后一层的 KV，下一轮 ingest 只缺 bonus 那一个 token。同一段空闲里还会为每个验证节点和根预测一个不含验证子节点的 bonus；下一轮只有这个 token 确实是 bonus 时才装上它的 slot，并用暂存 logits 当种子，ingest 不再前向。`SGLANG_OPT_TREE_KV_REUSE=0` 关掉这两次补算。page=128 不补算，也不发布 tree lease，行为与补算引入之前相同。
 
+Bonus 的 mask、positions、tokens 在 CPU 上拼好后一次拷上设备，真实行的前缀按整段赋值。槽长用缓存在设备上的 buffer `fill_`。前向走宽度 `N+1` 的模板和 `model_runner.forward`；没有模板时退回 `run_batch`，并计 `opt_bonus_template_fallbacks`。`model_runner.forward` 返回的 `can_run_graph` 为 False 时这一组已经走 eager，计入 `opt_bonus_eager_groups`，不再第二次前向。一个请求的全部分组共用一次模板准入，slot id 在最后一组返回后一次拷回主机。
+
+Draft 的 `[SR Draft round]` 里，`host_mean_ms["total"]` 和 `busy_ms` 覆盖整个计量轮：从进入 `round()` 到回包之后的最后一层补算，以及延后的 `drain_opt_layer_gpu_us` 结束。`total` 含回包之后的工作。`counters["opt_pre_reply_us"]` 是本步 `round_start` 到回复路径结束（`send_batch` 返回，或本 rank 不发送）的墙钟，单位微秒，按窗口累加。和旧日志里回包前的 total 对齐时，用 `opt_pre_reply_us / rounds / 1000` 得到毫秒均值。`counters["opt_post_reply_us"]` 只覆盖 `forward_deferred_final_layers`。`total` 减去回包前时间，还可能包含延后的事件读取同步，不要把这两个差当成同一个数。
+
 `SGLANG_OPT_DRAFT_LOOKAHEAD=1` 让 CUDA Draft 在设备上扩树，并在 host 看到这一层之前把下一层前向提交出去。默认关闭。只在 page size 为 1、batch size 为 1、attention backend 为 triton、并且该层能命中已捕获的 CUDA graph 时生效。图没有命中，或者空闲 slot 不够整棵树加一组 bonus，就退回原来的按层等待，并计 `opt_lookahead_fallbacks`。NPU 的 page size 是 128，没有回包后的补算；停层时提前提交的那一层只能回滚，所以不启用。batch size 大于 1 仍走原来的 `grow_active_layers`。CPU 树只按设备拷回的 parent、token 和 score 重建，不再自己做一次 top-k。
 
 `SGLANG_OPT_PROBE_LAYER_WAIT=1` 在每一层 `_run` 之前插入一次 stream sync，把上一层等待拆进 `opt_lookahead_launch_wait_us`。默认关闭。打开后测到的不是线上路径。默认的 `opt_layer_launch_us` 是整段 `_run` 的墙钟，包含其中隐含的等待。`opt_layer_gpu_us` 含 `_run` 期间流上空闲，GPU 忙闲用 nsys 看。

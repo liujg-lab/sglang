@@ -82,6 +82,9 @@ def run_opt_draft_round(metrics, measure, work) -> None:
 
     ``round`` snapshots and clears ``counts`` on the way out of a full window.
     ``work`` receives that same counter and must finish its adds before return.
+    ``host["total"]`` covers this whole call, including the deferred final
+    layer and a later layer-event drain. The pre-reply wall clock is
+    ``counts["opt_pre_reply_us"]``.
     """
     with metrics.round() if measure else nullcontext():
         work(metrics.counts)
@@ -722,6 +725,11 @@ class OptTreeSchedulerMixin:
                                     with metrics.phase("reply_send"):
                                         self.sr_server.send_batch(reply)
                                 if measure and getattr(metrics, "active", False):
+                                    # Reply path is done, whether or not this rank sent.
+                                    # A failed send skips this stamp.
+                                    counts["opt_pre_reply_us"] += int(
+                                        (time.perf_counter() - round_start) * 1e6
+                                    )
                                     host = getattr(metrics, "_round_host", None)
                                     ingest = 0.0 if host is None else host["opt_ingest"]
                                     grow = 0.0 if host is None else host["opt_grow"]
