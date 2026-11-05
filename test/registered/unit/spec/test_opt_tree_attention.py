@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -12,6 +13,7 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
     PrefixPlan,
     _captured_cascade,
     attention_layer_accepts,
+    bind_opt_cascade,
     cascade_query_block,
     cdiv,
     ensure_workspace,
@@ -129,6 +131,34 @@ class OptTreeCascadeTest(CustomTestCase):
         self.assertEqual(workspace.prefix_meta_writes, meta_writes)
         self.assertEqual(workspace.stage2_writes, stage2_writes + 1)
 
+    def test_single_runner_after_batch_rewrites_tree_columns(self):
+        backend = _cpu_backend(draft_tokens=2)
+        backend.speculative_num_steps = 4
+        pool = torch.full((1, 64), -1, dtype=torch.int32)
+        pool[0, :6] = torch.arange(6, dtype=torch.int32)
+        pool[0, 6:8] = torch.tensor([10, 11], dtype=torch.int32)
+        attn = OptTreeAttention(PrefixPlan(pool[0, :6], 6), active=True)
+        runner = SimpleNamespace(
+            prefix_len=6,
+            cached_len=8,
+            req=SimpleNamespace(req_pool_idx=0),
+            scheduler=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=pool)
+            ),
+        )
+        module = "sglang.srt.speculative.opt_tree_remote.opt_tree_attention"
+        with mock.patch(f"{module}._attention_for", return_value=attn):
+            bind_opt_cascade(
+                SimpleNamespace(),
+                runner,
+                torch.tensor([20, 21]),
+                torch.ones(2, 4, dtype=torch.uint8),
+                append_slots=True,
+            )
+        self.assertTrue(attn.prepare(backend, bs=1))
+        workspace = ensure_workspace(backend, 2)
+        self.assertEqual(workspace.tree_indices[:4].tolist(), [10, 11, 20, 21])
+
     def test_capture_resets_prefix_generation(self):
         backend = _cpu_backend()
         plan = PrefixPlan(torch.arange(6), 6)
@@ -186,8 +216,26 @@ class OptTreeCascadeTest(CustomTestCase):
         )
         with self.assertRaises(RuntimeError) as ctx:
             runtime.prepare(backend, bs=1)
-        self.assertIn("OPT cascade prepare failed on a cascade graph", str(ctx.exception))
+        self.assertIn(
+            "OPT cascade prepare failed without a usable fallback",
+            str(ctx.exception),
+        )
         self.assertFalse(runtime.ready)
+
+        incomplete = OptTreeAttention(plan, active=True)
+        incomplete.note_layer(
+            torch.eye(4, dtype=torch.uint8),
+            torch.arange(4),
+            prefix_rows=torch.ones(2, dtype=torch.int32),
+            spec_mask_complete=False,
+        )
+        with self.assertRaises(RuntimeError) as eager_ctx:
+            incomplete.prepare(backend, batch=SimpleNamespace(batch_size=1))
+        self.assertIn(
+            "OPT cascade prepare failed without a usable fallback",
+            str(eager_ctx.exception),
+        )
+        self.assertFalse(incomplete.ready)
 
         missing = OptTreeAttention(plan, active=True)
         with self.assertRaises(RuntimeError):

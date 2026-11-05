@@ -376,12 +376,16 @@ class OptTreeAttention:
         self._tree_mask = None
         self._tree_indices = None
         self._prefix_rows = None
+        self._spec_mask_complete = True
         self.ready = False
 
-    def note_layer(self, tree_mask, tree_indices, prefix_rows=None) -> None:
+    def note_layer(
+        self, tree_mask, tree_indices, prefix_rows=None, spec_mask_complete=True
+    ) -> None:
         self._tree_mask = tree_mask
         self._tree_indices = tree_indices
         self._prefix_rows = prefix_rows
+        self._spec_mask_complete = bool(spec_mask_complete)
 
     def prepare(
         self,
@@ -394,8 +398,9 @@ class OptTreeAttention:
     ) -> bool:
         """Fill static buffers. False leaves the caller's metadata path unchanged.
 
-        Replay of a bs=1 graph that already captured this cascade kernel raises
-        when the fill does not fit. That graph cannot fall back to ordinary metadata.
+        An incomplete spec mask has no ordinary fallback. Replay of a bs=1
+        graph that already captured this cascade kernel also raises when the
+        fill does not fit.
         """
         del req_pool_indices, seq_lens, spec_info
         self.ready = False
@@ -411,13 +416,14 @@ class OptTreeAttention:
                 _captured_cascade.add((id(backend), int(self.capture_query_width)))
         else:
             ok = self._fill_runtime(backend)
-        if (
-            not ok
-            and batch is None
-            and self.plan is not None
-            and _replay_uses_captured_cascade(backend, self._tree_mask)
+        if not ok and self.plan is not None and (
+            not self._spec_mask_complete
+            or (
+                batch is None
+                and _replay_uses_captured_cascade(backend, self._tree_mask)
+            )
         ):
-            raise RuntimeError("OPT cascade prepare failed on a cascade graph")
+            raise RuntimeError("OPT cascade prepare failed without a usable fallback")
         self.ready = bool(ok)
         return bool(ok)
 
@@ -546,6 +552,17 @@ def _attention_for(runner) -> Optional[OptTreeAttention]:
     return attn
 
 
+def _workspace_holds_tree(attn, tree_cols: int) -> bool:
+    """True when this prefix generation's earlier tree columns are already stored."""
+    ws = _WORKSPACE
+    return (
+        ws is not None
+        and attn.plan is not None
+        and ws.prefix_generation == attn.plan.generation
+        and int(ws.tree_filled) == int(tree_cols)
+    )
+
+
 def bind_opt_cascade(
     spec,
     runner,
@@ -557,8 +574,9 @@ def bind_opt_cascade(
 ) -> None:
     """Attach this step's cascade object and this layer's tree columns.
 
-    ``append_slots`` records only this layer's new slots. The workspace already
-    holds the earlier tree columns for this prefix generation.
+    ``append_slots`` records only this layer's new slots when the workspace
+    already holds this prefix generation's earlier tree columns. Otherwise the
+    call writes every tree column, including slots left by a batched forward.
     """
     attn = _attention_for(runner)
     if attn is None:
@@ -570,19 +588,22 @@ def bind_opt_cascade(
     cached = int(runner.cached_len if cached_len is None else cached_len)
     pool = runner.scheduler.req_to_token_pool.req_to_token
     device = pool.device
-    if append_slots:
-        indices = out_cache_loc.reshape(-1).to(dtype=torch.int64, device=device)
-        indices = indices.contiguous()
+    prefix = int(runner.prefix_len)
+    appended = append_slots and _workspace_holds_tree(attn, cached - prefix)
+    if appended:
+        indices = (
+            out_cache_loc.reshape(-1).to(dtype=torch.int64, device=device).contiguous()
+        )
     else:
         indices = tree_kv_indices(
             pool,
             runner.req.req_pool_idx,
-            runner.prefix_len,
+            prefix,
             cached,
             out_cache_loc,
         )
     mask = tree_mask.to(device=device, dtype=torch.uint8).contiguous()
-    if not append_slots and int(indices.shape[0]) != int(mask.shape[1]):
+    if not appended and int(indices.shape[0]) != int(mask.shape[1]):
         raise RuntimeError(
             f"OPT cascade tree indices {int(indices.shape[0])} != "
             f"mask columns {int(mask.shape[1])}"
@@ -595,7 +616,7 @@ def bind_opt_cascade(
                 f"OPT cascade prefix rows {int(rows.shape[0])} != "
                 f"queries {int(mask.shape[0])}"
             )
-    attn.note_layer(mask, indices, rows)
+    attn.note_layer(mask, indices, rows, spec_mask_complete=rows is not None)
     spec.target_verify_attention = attn
 
 

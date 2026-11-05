@@ -3234,6 +3234,13 @@ class OptTreeRemoteTest(CustomTestCase):
             depths=(0, 1, 0),
         )
         consume_opt_tree_lease(host, req)
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_tree_depth_2"], 1)
+        self.assertEqual(counts["opt_accept_depth_2"], 1)
         self.assertEqual(pool[0, 3].item(), 101)
         self.assertEqual(pool[0, 4].item(), 200)
         self.assertEqual(req.kv_committed_len, 5)

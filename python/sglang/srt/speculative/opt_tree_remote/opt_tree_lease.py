@@ -160,6 +160,8 @@ def consume_opt_tree_lease(scheduler, req) -> None:
         release_opt_tree_lease(scheduler, req)
         release_opt_bonus_guesses(scheduler, req)
         return
+    _draft_count(scheduler, f"opt_tree_depth_{len(lease.layer_slots)}")
+    _draft_count(scheduler, f"opt_accept_depth_{len(kept)}")
     if not _install_accepted(scheduler, req, lease, kept):
         release_opt_tree_lease(scheduler, req)
         release_opt_bonus_guesses(scheduler, req)
