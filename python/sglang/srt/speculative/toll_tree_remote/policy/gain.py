@@ -1,59 +1,77 @@
-"""φ_d(x) with a flat prior of 1 and linear interpolation after observations."""
+"""φ_d(x) = EMA of Σ(a − x)⁺ on a log grid. Empty bins stay at 0."""
 
 from __future__ import annotations
 
 import numpy as np
 
+# Positive knots are logarithmic. 0 is the endpoint Σ(a − 0)⁺.
+# 0.014 and 0.1 are distinct knots; a linear 5-bin grid would merge them.
+_DEFAULT_GRID = np.unique(
+    np.concatenate(
+        [
+            np.array([0.0, 0.014, 0.1], dtype=np.float64),
+            np.geomspace(1e-3, 1.0, 12),
+        ]
+    )
+)
+
 
 class GainTable:
     """Expected extra factor φ at x = cut / π̂.
 
-    Before any observation, φ is 1, so a node contributes its whole path mass.
-    Observations are binned by x. ``estimate`` interpolates neighboring bins.
+    ``observe`` takes one parent's sibling acceptance values and updates
+    Σ(a − x)⁺ at every grid knot. The first sample at a depth writes the
+    value; later samples are an EMA. ``estimate`` interpolates neighboring
+    knots. A depth with no samples returns 0.
     """
 
-    def __init__(self, bins: int = 5) -> None:
-        if int(bins) < 2:
-            raise ValueError("bins must be >= 2")
-        self.bins = int(bins)
-        self._sum: dict[tuple[int, int], float] = {}
-        self._count: dict[tuple[int, int], int] = {}
+    def __init__(self, alpha: float = 0.02, grid=None) -> None:
+        if not 0.0 < float(alpha) <= 1.0:
+            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+        knots = _DEFAULT_GRID if grid is None else np.asarray(grid, dtype=np.float64)
+        knots = np.unique(knots.reshape(-1))
+        if knots.size < 2 or np.any(knots < 0.0) or np.any(knots > 1.0):
+            raise ValueError("phi grid must lie in [0, 1] and have at least 2 knots")
+        self.alpha = float(alpha)
+        self.grid = knots
+        self._ema: dict[int, np.ndarray] = {}
 
-    def observe(self, child_a: float, depth: int, x: float | None = None) -> None:
-        if x is None:
-            key = (int(depth), -1)
-        else:
-            clipped = float(np.clip(x, 0.0, 1.0))
-            bucket = int(round(clipped * (self.bins - 1)))
-            key = (int(depth), bucket)
-        self._sum[key] = self._sum.get(key, 0.0) + float(child_a)
-        self._count[key] = self._count.get(key, 0) + 1
+    def bin_index(self, x: float) -> int:
+        """Knot index of ``x``. 0.014 and 0.1 land on different knots."""
+        clipped = float(np.clip(x, 0.0, 1.0))
+        idx = int(np.searchsorted(self.grid, clipped, side="left"))
+        return int(np.clip(idx, 0, int(self.grid.size) - 1))
+
+    def observe(self, siblings, depth: int) -> None:
+        accepted = np.asarray(siblings, dtype=np.float64).reshape(-1)
+        values = np.array(
+            [float(np.maximum(accepted - float(x), 0.0).sum()) for x in self.grid],
+            dtype=np.float64,
+        )
+        key = int(depth)
+        current = self._ema.get(key)
+        if current is None:
+            self._ema[key] = values
+            return
+        self._ema[key] = (1.0 - self.alpha) * current + self.alpha * values
 
     def estimate(self, pi: float, cut: float, depth: int) -> float:
         if float(pi) <= 0.0:
             return 0.0
+        curve = self._ema.get(int(depth))
+        if curve is None:
+            return 0.0
         x = float(np.clip(float(cut) / float(pi), 0.0, 1.0))
-        points = []
-        for bucket in range(self.bins):
-            key = (int(depth), bucket)
-            count = self._count.get(key, 0)
-            if count:
-                center = bucket / (self.bins - 1)
-                points.append((center, self._sum[key] / count))
-        if not points:
-            key = (int(depth), -1)
-            count = self._count.get(key, 0)
-            if count:
-                return self._sum[key] / count
-            return 1.0
-        if x <= points[0][0]:
-            return points[0][1]
-        if x >= points[-1][0]:
-            return points[-1][1]
-        for (x0, y0), (x1, y1) in zip(points, points[1:]):
-            if x0 <= x <= x1:
-                if x1 == x0:
-                    return y0
-                weight = (x - x0) / (x1 - x0)
-                return y0 + weight * (y1 - y0)
-        return points[-1][1]
+        grid = self.grid
+        if x <= float(grid[0]):
+            return float(curve[0])
+        if x >= float(grid[-1]):
+            return float(curve[-1])
+        hi = int(np.searchsorted(grid, x, side="left"))
+        lo = hi - 1
+        x0 = float(grid[lo])
+        x1 = float(grid[hi])
+        if x1 == x0:
+            return float(curve[lo])
+        weight = (x - x0) / (x1 - x0)
+        return float(curve[lo] + weight * (curve[hi] - curve[lo]))

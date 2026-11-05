@@ -1,4 +1,4 @@
-"""Per-batch-size token price λ = slow mean tokens / slow mean step time."""
+"""Token price λ = slow mean tokens / slow mean step time, bucketed by b."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 @dataclass
 class _Bucket:
-    last_ns: int | None = None
     sum_tokens: float = 0.0
     sum_dt: float = 0.0
     count: int = 0
@@ -15,6 +14,7 @@ class _Bucket:
     fast_dt: float = 0.0
     fast_ready: bool = False
     diverge_streak: int = 0
+    anomaly_streak: int = 0
 
     @property
     def slow_lambda(self) -> float:
@@ -30,14 +30,15 @@ class _Bucket:
 
 
 class PriceTracker:
-    """λ bucketed by batch size.
+    """One clock for every batch size.
 
-    The first timestamp only starts the clock. A later step counts only when
-    ``continuous`` is true, so an idle gap does not move the means. λ is the
-    ratio of means, not the mean of ratios. A step longer than three times the
-    slow mean duration is dropped once the slow mean has enough samples. When
-    the fast EMA and the slow mean stay 30% apart, the slow mean adopts the
-    fast level.
+    The first timestamp only starts the clock. Each later step's duration is
+    charged to the ``b`` of that ``on_step``, not to a per-bucket clock.
+    ``continuous=False`` moves the clock and does not move the means. λ is the
+    ratio of means. One step longer than three times the slow mean duration is
+    dropped. After ``persist`` consecutive anomalies, that step is written as
+    the new level of its ``b`` bucket. A fast EMA that stays 30% away from the
+    slow mean also replaces the slow mean.
     """
 
     def __init__(
@@ -57,6 +58,7 @@ class PriceTracker:
         self.diverge = float(diverge)
         self.persist = int(persist)
         self.min_anomaly_samples = int(min_anomaly_samples)
+        self._last_ns: int | None = None
         self._buckets: dict[int, _Bucket] = {}
 
     def _bucket(self, bs: int) -> _Bucket:
@@ -72,20 +74,37 @@ class PriceTracker:
     def on_step(self, now_ns: int, committed: int, bs: int, continuous: bool) -> None:
         slot = self._bucket(bs)
         now = int(now_ns)
-        if slot.last_ns is None:
-            slot.last_ns = now
+        if self._last_ns is None:
+            self._last_ns = now
             return
-        dt_s = (now - slot.last_ns) / 1e9
-        slot.last_ns = now
+        dt_s = (now - self._last_ns) / 1e9
+        self._last_ns = now
         if not continuous or dt_s <= 0.0:
             return
-        if (
+        slow_dt = slot.sum_dt / slot.count if slot.count else 0.0
+        is_anomaly = (
             slot.count >= self.min_anomaly_samples
-            and slot.sum_dt > 0.0
-            and dt_s > self.anomaly_factor * (slot.sum_dt / slot.count)
-        ):
+            and slow_dt > 0.0
+            and dt_s > self.anomaly_factor * slow_dt
+        )
+        if is_anomaly:
+            slot.anomaly_streak += 1
+            if slot.anomaly_streak < self.persist:
+                return
+            self._adopt_level(slot, float(committed), dt_s)
             return
+        slot.anomaly_streak = 0
         self._blend(slot, float(committed), dt_s)
+
+    def _adopt_level(self, slot: _Bucket, tokens: float, dt_s: float) -> None:
+        slot.sum_tokens = tokens
+        slot.sum_dt = dt_s
+        slot.count = 1
+        slot.fast_tokens = tokens
+        slot.fast_dt = dt_s
+        slot.fast_ready = True
+        slot.anomaly_streak = 0
+        slot.diverge_streak = 0
 
     def _blend(self, slot: _Bucket, tokens: float, dt_s: float) -> None:
         if not slot.fast_ready:

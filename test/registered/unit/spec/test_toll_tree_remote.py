@@ -5,6 +5,9 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=30, suite="stage-a-test-cpu")
 
 try:
     from sglang.srt.server_args import ServerArgs

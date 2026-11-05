@@ -46,6 +46,28 @@ def _seed(state: _FixedState, probs: np.ndarray) -> None:
     state.depth = 1
 
 
+class FixedPolicy:
+    """Same N / τ loop as OPT, one method per step."""
+
+    def __init__(self, width: int, tau: float, max_depth: int) -> None:
+        self.tau = float(tau)
+        self.state = _FixedState(int(width), int(max_depth))
+
+    def seed(self, probs) -> None:
+        _seed(self.state, probs)
+
+    def expand(self, probs) -> None:
+        # Record the mass before this layer so the next should_grow sees the increment.
+        self.state.prev_e = self.state.mass()
+        _expand(self.state, probs)
+
+    def should_grow(self) -> bool:
+        return _should_grow(self.state, self.tau)
+
+    def finish(self) -> FixedVerify:
+        return _finish(self.state)
+
+
 def _expand(state: _FixedState, probs: np.ndarray) -> None:
     matrix = np.asarray(probs, dtype=np.float32)
     if matrix.shape[0] != state.width:
@@ -107,12 +129,11 @@ def fixed_verify(root_probs, expand_probs, width: int, tau: float, max_depth: in
     stop as OPT applies: grow while the top-N mass increases by more than τ
     and ``depth < max_depth - 1``.
     """
-    state = _FixedState(int(width), int(max_depth))
-    _seed(state, root_probs)
+    policy = FixedPolicy(int(width), float(tau), int(max_depth))
+    policy.seed(root_probs)
     upcoming = list(expand_probs)
-    while _should_grow(state, float(tau)):
-        state.prev_e = state.mass()
+    while policy.should_grow():
         if not upcoming:
             break
-        _expand(state, upcoming.pop(0))
-    return _finish(state)
+        policy.expand(upcoming.pop(0))
+    return policy.finish()

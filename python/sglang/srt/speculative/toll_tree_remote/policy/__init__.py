@@ -1,6 +1,7 @@
 """CPU TollTree policy. No device code and no other speculative packages."""
 
 from sglang.srt.speculative.toll_tree_remote.policy.baselines import (
+    FixedPolicy,
     FixedVerify,
     fixed_verify,
 )
@@ -17,6 +18,7 @@ from sglang.srt.speculative.toll_tree_remote.policy.decide import (
     choose_k,
     decide_layer,
     should_speculate,
+    uses_fixed_policy,
 )
 from sglang.srt.speculative.toll_tree_remote.policy.gain import GainTable
 from sglang.srt.speculative.toll_tree_remote.policy.price import PriceTracker
@@ -25,6 +27,7 @@ __all__ = [
     "PATHS",
     "Calibrator",
     "CostPoint",
+    "FixedPolicy",
     "FixedVerify",
     "GainTable",
     "KChoice",
@@ -36,4 +39,5 @@ __all__ = [
     "decide_layer",
     "fixed_verify",
     "should_speculate",
+    "uses_fixed_policy",
 ]
