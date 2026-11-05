@@ -88,6 +88,19 @@ def run_opt_draft_round(metrics, measure, work) -> None:
         work(metrics.counts)
 
 
+def drain_deferred_layer_events(scheduler, metrics, *, defer_drain, jobs) -> None:
+    """Read layer events after the reply when this step still has queued work.
+
+    Lookahead sets ``defer_drain`` because its last layer was submitted before
+    the reply. ``grow_batch`` and a non-lookahead expand do not. A deferred
+    final layer still queues events inside ``forward_deferred_final_layers``.
+    Either case is drained here, after the reply, so the sync stays in this
+    step. An empty queue does not synchronize.
+    """
+    if defer_drain or jobs:
+        drain_opt_layer_gpu_us(scheduler, metrics)
+
+
 class OptTreeSchedulerMixin:
     @property
     def is_remote_spec_draft(self) -> bool:
@@ -752,8 +765,12 @@ class OptTreeSchedulerMixin:
                                         counts["opt_post_reply_us"] += int(
                                             (time.perf_counter() - started) * 1e6
                                         )
-                                if defer_drain:
-                                    drain_opt_layer_gpu_us(self, metrics)
+                                drain_deferred_layer_events(
+                                    self,
+                                    metrics,
+                                    defer_drain=defer_drain,
+                                    jobs=jobs,
+                                )
 
                         run_opt_draft_round(metrics, measure, _work)
                     finally:

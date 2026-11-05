@@ -143,17 +143,22 @@ def consume_opt_tree_lease(scheduler, req) -> None:
     """Install accepted slots, or free the lease when this step cannot reuse it.
 
     Reuse requires page size 1, an ``append_*`` alignment, and the same
-    prefix the tree was built on. Any other alignment frees the whole lease.
+    prefix the tree was built on. Any other alignment frees the whole lease
+    and counts ``opt_lease_dropped_misaligned``. An illegal accepted path
+    counts ``opt_lease_dropped_path``. A missing or already released lease
+    is not counted.
     """
     lease = getattr(req, "opt_tree_lease", None)
     if not isinstance(lease, OptTreeKVLease) or lease.released:
         return
     if opt_page_size(scheduler) != 1 or not _alignment_matches(req, lease):
+        _draft_count(scheduler, "opt_lease_dropped_misaligned")
         release_opt_tree_lease(scheduler, req)
         release_opt_bonus_guesses(scheduler, req)
         return
     kept = _accepted_slots(req, lease)
     if kept is None:
+        _draft_count(scheduler, "opt_lease_dropped_path")
         logger.warning(
             "[OPT] draft %s dropped tree lease at prefix %s",
             getattr(req, "rid", None),
@@ -464,6 +469,9 @@ def accept_opt_bonus_guess(scheduler, req, lease: OptTreeKVLease, kept: Sequence
     bonus_at = int(lease.keep) + len(kept)
     bonus = _logical_token(req, bonus_at)
     v_end = _accepted_end(req, lease, len(kept))
+    end_guess = next((g for g in guesses if int(g.parent) == int(v_end)), None)
+    if end_guess is not None:
+        _draft_count(scheduler, f"opt_end_rank_{min(int(end_guess.end_rank), 3)}")
     hit = None
     if bonus is not None:
         for guess in guesses:

@@ -496,6 +496,11 @@ class _LayerTiming:
     - ``opt_layer_forwards`` counts every queued layer, including the last one
       lookahead submits early. ``opt_layer_forwards_critical`` is that count
       minus one, matching the old path's pre-reply forwards.
+      ``opt_layer_forwards_deferred`` counts a last layer that
+      ``forward_deferred_final_layers`` actually forwards after the reply.
+      Requests that share a depth count once. A lookahead layer already in
+      ``opt_layer_forwards`` is not counted again. A failed replay is not
+      counted.
     - ``opt_ingest_gpu_us`` is each ingest ``_run_batch``. The start event is
       recorded immediately before that call, so host planning and allocation
       are outside the interval. Stream idle inside ``_run_batch`` can still
@@ -503,10 +508,13 @@ class _LayerTiming:
       pair. The pairs are read in the same drain as the layer events. An
       unpaired start is dropped.
 
-    ``opt_seed_d2h_wait_us`` is once per grow and is not divided by
-    ``opt_layer_forwards``. ``opt_layer_d2h_wait_us`` is the later ``.cpu()``
-    of each layer. Logits stay on device until that copy. Warmup samples
-    include the first replay and are reference only.
+    Per-layer ``opt_layer_host_us``, ``opt_layer_launch_us``, and
+    ``opt_layer_gpu_us`` use
+    ``opt_layer_forwards + opt_layer_forwards_deferred`` as the denominator.
+    ``opt_seed_d2h_wait_us`` is once per grow and is not divided by that sum.
+    ``opt_layer_d2h_wait_us`` is the later ``.cpu()`` of each layer. Logits
+    stay on device until that copy. Warmup samples include the first replay
+    and are reference only.
     """
 
     __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened", "host_closed")
@@ -3455,7 +3463,8 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
     Bonus guesses are written while the tree columns are still mapped.
     Publish clears those columns, so the guess forward cannot follow it.
     A lookahead job already queued that last layer. It only installs the
-    top-k ids, unless the request can no longer keep the slots.
+    top-k ids, unless the request can no longer keep the slots. Each
+    successful depth group increments ``opt_layer_forwards_deferred``.
     """
     try:
         for job in jobs:
@@ -3491,6 +3500,8 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
                     _drop_unfinished_layer(scheduler, job)
                 _reraise_device_context(scheduler, exc)
                 logger.warning("[OPT] deferred final layer failed: %s", exc)
+            else:
+                _opt_draft_count(scheduler, "opt_layer_forwards_deferred")
         skipped_ids = {id(job) for job in skipped}
         for job in skipped:
             _drop_stored_logits(job.runner)

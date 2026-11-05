@@ -3241,6 +3241,8 @@ class OptTreeRemoteTest(CustomTestCase):
         counts = get_sr_round_metrics(host, "Draft").counts
         self.assertEqual(counts["opt_tree_depth_2"], 1)
         self.assertEqual(counts["opt_accept_depth_2"], 1)
+        self.assertEqual(counts["opt_lease_dropped_misaligned"], 0)
+        self.assertEqual(counts["opt_lease_dropped_path"], 0)
         self.assertEqual(pool[0, 3].item(), 101)
         self.assertEqual(pool[0, 4].item(), 200)
         self.assertEqual(req.kv_committed_len, 5)
@@ -3293,6 +3295,9 @@ class OptTreeRemoteTest(CustomTestCase):
             OptTreeKVLease,
             consume_opt_tree_lease,
         )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
 
         host, pool, freed = _lease_host()
         req = _lease_req(keep=3, allocated=3)
@@ -3312,6 +3317,9 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(req.kv_committed_len, 3)
         self.assertIsNone(req.opt_tree_lease)
         self.assertCountEqual(freed, [100, 101])
+        path_counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(path_counts["opt_lease_dropped_path"], 1)
+        self.assertEqual(path_counts["opt_lease_dropped_misaligned"], 0)
 
         host, _pool, freed = _lease_host()
         req = _lease_req(keep=3, allocated=3)
@@ -3321,6 +3329,9 @@ class OptTreeRemoteTest(CustomTestCase):
         consume_opt_tree_lease(host, req)
         self.assertIsNone(req.opt_tree_lease)
         self.assertCountEqual(freed, [100, 101])
+        align_counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(align_counts["opt_lease_dropped_misaligned"], 1)
+        self.assertEqual(align_counts["opt_lease_dropped_path"], 0)
 
     def test_grow_batch_publishes_on_success_and_rolls_back_on_failure(self):
         from unittest.mock import patch
@@ -3696,6 +3707,149 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertCountEqual(freed, [100, 101])
         self.assertEqual(req.kv_allocated_len, 3)
 
+    def test_deferred_layer_forwards_count_one_per_depth_group(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            forward_deferred_final_layers,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        groups = []
+
+        def fitting(_scheduler, runners, _steps, **_kwargs):
+            groups.append([runner.req.rid for runner in runners])
+
+        def host():
+            return SimpleNamespace(
+                _sr_device_poisoned=False,
+                _sr_is_finished=lambda _req: False,
+                _sr_pause_req=lambda _req: None,
+                _opt_rollback=lambda _req, _keep: None,
+                last_batch=None,
+                cur_batch=None,
+            )
+
+        def job(rid, depth):
+            req = SimpleNamespace(rid=rid)
+            runner = SimpleNamespace(
+                req=req,
+                lookahead_inflight=False,
+                lookahead_dropped=False,
+                _lookahead_satisfied=False,
+                prefix_len=1,
+                cached_len=1,
+                layer_slots=[],
+            )
+            return SimpleNamespace(
+                req=req,
+                runner=runner,
+                keep=1,
+                window=None,
+                state=SimpleNamespace(depth=depth, config=SimpleNamespace(width=2)),
+            )
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
+            fitting,
+        ), patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.final_layer_step",
+            lambda state: state,
+        ):
+            shared = host()
+            forward_deferred_final_layers(shared, [job("a", 2), job("b", 2)])
+            self.assertEqual(groups, [["a", "b"]])
+            self.assertEqual(
+                get_sr_round_metrics(shared, "Draft").counts[
+                    "opt_layer_forwards_deferred"
+                ],
+                1,
+            )
+            groups.clear()
+            split = host()
+            forward_deferred_final_layers(split, [job("a", 1), job("b", 2)])
+            self.assertEqual(groups, [["a"], ["b"]])
+            self.assertEqual(
+                get_sr_round_metrics(split, "Draft").counts[
+                    "opt_layer_forwards_deferred"
+                ],
+                2,
+            )
+
+    def test_deferred_layer_forwards_skip_unforwarded_jobs(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            forward_deferred_final_layers,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        calls = []
+        fail = {"on": False}
+
+        def fitting(_scheduler, _runners, _steps, **_kwargs):
+            calls.append(1)
+            if fail["on"]:
+                raise RuntimeError("final layer failed")
+
+        def host(finished=False):
+            return SimpleNamespace(
+                _sr_device_poisoned=False,
+                _sr_is_finished=lambda _req: finished,
+                _sr_pause_req=lambda _req: None,
+                _opt_rollback=lambda _req, _keep: None,
+                last_batch=None,
+                cur_batch=None,
+            )
+
+        def job(*, satisfied=False):
+            req = SimpleNamespace(rid="r")
+            runner = SimpleNamespace(
+                req=req,
+                lookahead_inflight=False,
+                lookahead_dropped=False,
+                _lookahead_satisfied=satisfied,
+                prefix_len=3,
+                cached_len=5,
+                layer_slots=[],
+            )
+            return SimpleNamespace(
+                req=req,
+                runner=runner,
+                keep=3,
+                window=None,
+                state=SimpleNamespace(depth=2, config=SimpleNamespace(width=2)),
+            )
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
+            fitting,
+        ), patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_forward.final_layer_step",
+            lambda state: state,
+        ):
+            satisfied = host()
+            forward_deferred_final_layers(satisfied, [job(satisfied=True)])
+            finished = host(finished=True)
+            forward_deferred_final_layers(finished, [job()])
+            self.assertEqual(calls, [])
+            fail["on"] = True
+            failed = host()
+            forward_deferred_final_layers(failed, [job()])
+
+        self.assertEqual(calls, [1])
+        for scheduler in (satisfied, finished, failed):
+            self.assertEqual(
+                get_sr_round_metrics(scheduler, "Draft").counts[
+                    "opt_layer_forwards_deferred"
+                ],
+                0,
+            )
+
     def test_deferred_queue_stays_empty_when_reuse_is_off(self):
         from sglang.srt.environ import envs
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -3881,6 +4035,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(counts["opt_bonus_hits"], 1)
         self.assertEqual(counts["opt_bonus_hit_rank_3"], 1)
         self.assertEqual(counts["opt_bonus_hit_rank_0"], 0)
+        self.assertEqual(counts["opt_end_rank_3"], 1)
         self.assertEqual(req.kv_committed_len, 5)
         self.assertEqual(req.kv_allocated_len, 5)
         self.assertEqual(pool[0, 3].item(), 100)
@@ -3924,6 +4079,7 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(counts["opt_bonus_hits"], 0)
         for rank in range(4):
             self.assertEqual(counts[f"opt_bonus_hit_rank_{rank}"], 0)
+        self.assertEqual(counts["opt_end_rank_0"], 1)
         self.assertEqual(req.kv_committed_len, 4)
         self.assertEqual(pool[0, 3].item(), 100)
         self.assertIsNone(req.opt_bonus_guesses)
@@ -4305,6 +4461,29 @@ def _load_run_opt_draft_round():
     ns = {"nullcontext": nullcontext}
     exec(compile(textwrap.dedent(src[start:end]), str(path), "exec"), ns)
     return ns["run_opt_draft_round"]
+
+
+def _load_drain_deferred_layer_events():
+    """Load the post-reply drain without the scheduler's kernel imports."""
+    import textwrap
+    from contextlib import nullcontext
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("def run_opt_draft_round(")
+    end = src.index("\nclass OptTreeSchedulerMixin:")
+    calls = []
+
+    def drain(scheduler, metrics):
+        calls.append((scheduler, metrics))
+
+    ns = {"nullcontext": nullcontext, "drain_opt_layer_gpu_us": drain}
+    exec(compile(textwrap.dedent(src[start:end]), str(path), "exec"), ns)
+    return ns["drain_deferred_layer_events"], calls
 
 
 def _load_opt_expand_one():
@@ -5555,6 +5734,19 @@ class OptLookaheadOpsTest(unittest.TestCase):
         run_opt_draft_round(metrics, True, one_step)
         for key in keys:
             self.assertEqual(metrics.counts[key], 1)
+
+    def test_post_reply_drain_follows_deferred_jobs(self):
+        drain, calls = _load_drain_deferred_layer_events()
+        host = object()
+        metrics = object()
+        drain(host, metrics, defer_drain=False, jobs=[object()])
+        self.assertEqual(calls, [(host, metrics)])
+        calls.clear()
+        drain(host, metrics, defer_drain=True, jobs=[])
+        self.assertEqual(calls, [(host, metrics)])
+        calls.clear()
+        drain(host, metrics, defer_drain=False, jobs=[])
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
