@@ -369,11 +369,98 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
         request = TollTargetSchedulerMixin._toll_request(host, "STEP", batch)
         self.assertEqual(request.session, "abc")
         self.assertLess(request.t_target_ns, 1_000_000_000)
+        self.assertEqual(request.reqs[0].input_ids, [1, 2, 3, 4])
+        host.toll_need_snapshot.clear()
+        host._toll_last_reply_ns = time.perf_counter_ns()
+        incremental = host._toll_request("STEP", batch)
+        self.assertEqual(incremental.reqs[0].input_ids, [])
+        self.assertEqual(incremental.reqs[0].new_tokens, [4])
         inner = object()
-        worker = TollTreeRemoteWorker(server_args=SimpleNamespace(), target_worker=inner)
+        worker = TollTreeRemoteWorker(
+            server_args=SimpleNamespace(page_size=128), target_worker=inner
+        )
         self.assertIs(worker.target_worker, inner)
+        self.assertEqual(worker.page_size, 128)
+        self.assertIsNone(worker.draft_model_runner)
+
+        class _PoolWorker:
+            def get_memory_pool(self):
+                return "req-pool", "kv-pool"
+
+        pooled = TollTreeRemoteWorker(
+            server_args=SimpleNamespace(page_size=128), target_worker=_PoolWorker()
+        )
+        self.assertEqual(pooled.req_to_token_pool, "req-pool")
+        self.assertEqual(pooled.token_to_kv_pool_allocator, "kv-pool")
         for width, bucket in WarmupSchedule(TollConfig()).pairs:
             self.assertLessEqual(width, bucket)
+
+    def test_greedy_health_and_abort(self):
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.toll_tree_remote.protocol import TollAction
+        from sglang.srt.speculative.toll_tree_remote.target.scheduler_mixin import (
+            TollTargetSchedulerMixin,
+            skip_speculative,
+        )
+
+        params = SamplingParams(temperature=0.0)
+        self.assertEqual(params.temperature, 1.0)
+        self.assertEqual(params.top_k, 1)
+        greedy = SimpleNamespace(
+            is_all_greedy=True, penalizer_orchestrator=None, logit_bias=None
+        )
+        plain = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="a")], sampling_info=greedy, has_grammar=False
+        )
+        self.assertFalse(skip_speculative(plain))
+        health = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="HEALTH_CHECK_1")],
+            sampling_info=greedy,
+            has_grammar=False,
+        )
+        self.assertTrue(skip_speculative(health))
+        biased = SimpleNamespace(
+            is_all_greedy=True, penalizer_orchestrator=None, logit_bias=object()
+        )
+        self.assertTrue(
+            skip_speculative(
+                SimpleNamespace(
+                    reqs=[SimpleNamespace(rid="a")],
+                    sampling_info=biased,
+                    has_grammar=False,
+                )
+            )
+        )
+        sampled = SimpleNamespace(
+            is_all_greedy=False, penalizer_orchestrator=None, logit_bias=None
+        )
+        self.assertTrue(
+            skip_speculative(
+                SimpleNamespace(
+                    reqs=[SimpleNamespace(rid="a")],
+                    sampling_info=sampled,
+                    has_grammar=False,
+                )
+            )
+        )
+
+        host = TollTargetSchedulerMixin()
+        host.spec_algorithm = SpeculativeAlgorithm.TOLL_TREE_REMOTE
+        host.server_args = SimpleNamespace(toll_tree_role="target")
+        host.tp_rank = 0
+        host.toll_seq = 0
+        host.toll_session = "abc"
+        host._toll_last_reply_ns = 0
+        host.toll_cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=2)
+        host.toll_sent_len = {"a": 3}
+        host.toll_need_snapshot = set()
+        sent = []
+        host.toll_client = SimpleNamespace(send_request=sent.append)
+        host.maybe_abort_remote_target()
+        self.assertNotEqual(host.toll_session, "abc")
+        self.assertEqual(host.toll_sent_len, {})
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].action, TollAction.ABORT)
 
     def test_inproc_commit_kv_and_snapshot(self):
         import time
@@ -392,7 +479,14 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
         spec = importlib.util.spec_from_file_location("toll_fake_draft", path)
         fake = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fake)
-        fake.check()
+        baseline = [1, 2, 3, 10, 11, 12]
+        gold = fake.draft_window("gold", baseline, 3, 3)
+        self.assertEqual(gold, ([10, 11, 12], [-1, 0, 1]))
+        wrong = fake.draft_window("wrong", baseline, 3, 3)
+        self.assertEqual(wrong[0], [11, 12, 13])
+        pad = fake.draft_window("pad", baseline, 3, 3)
+        self.assertEqual(pad, ([10], [-1]))
+        self.assertIsNone(fake.draft_window("silent", baseline, 3, 3))
 
         cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=4)
         pool = _SlotPool()
@@ -415,6 +509,16 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
             ids = np.arange(int(width) * int(width)).reshape(int(width), int(width))
             return [(scores, ids, 0.0)]
 
+        def make_req(rid, ids):
+            return SimpleNamespace(
+                rid=rid,
+                origin_input_ids=list(ids),
+                output_ids=[],
+                fill_ids=list(ids),
+                req_pool_idx=None,
+                kv_committed_len=0,
+            )
+
         service = TollDraftService(
             cfg,
             forward=lambda item, slots: ([], []),
@@ -423,6 +527,7 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
             ttl_s=1.0,
             root_topk=root,
             layer_forward=layer,
+            req_factory=make_req,
         )
         box["service"] = service
         self.assertEqual(service.round.price.alpha, cfg.price_alpha)
@@ -503,7 +608,103 @@ class _SlotPool:
             self.live.remove(slot)
 
 
-def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len):
+class TestTollDraftPool(CustomTestCase):
+    def test_requests_past_the_pool_size_return_their_slots(self):
+        from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import TollDraftService
+
+        class IndexPool:
+            def __init__(self, size: int) -> None:
+                self.free_slots = list(range(size))
+
+            def alloc(self, req) -> None:
+                if not self.free_slots:
+                    raise RuntimeError("request pool is empty")
+                req.req_pool_idx = self.free_slots.pop(0)
+
+            def free(self, req) -> None:
+                self.free_slots.append(req.req_pool_idx)
+                req.req_pool_idx = None
+
+        indexes = IndexPool(2)
+        kv = _SlotPool()
+
+        def make_req(rid, ids):
+            req = SimpleNamespace(
+                rid=rid,
+                origin_input_ids=list(ids),
+                output_ids=[],
+                fill_ids=list(ids),
+                req_pool_idx=None,
+                kv_committed_len=0,
+            )
+            indexes.alloc(req)
+            return req
+
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=2)
+        service = TollDraftService(
+            cfg,
+            forward=lambda item, slots: ([], []),
+            alloc=kv.alloc,
+            free=kv.free,
+            ttl_s=1.0,
+            req_factory=make_req,
+            release_req=indexes.free,
+        )
+        for index in range(3):
+            reply = service.handle(
+                _toll_request(cfg, TollAction.PREFILL, index + 1, [], [1, 2], 2, rid=f"r{index}")
+            )
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            done = service.handle(
+                _toll_request(cfg, TollAction.FINISH, index + 10, [], [1, 2], 2, rid=f"r{index}")
+            )
+            self.assertEqual(done.reqs[0].status, TollStatus.OK)
+        self.assertEqual(sorted(indexes.free_slots), [0, 1])
+        self.assertEqual(kv.live, [])
+
+    def test_idle_expiry_frees_prefix_slots(self):
+        from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import TollDraftService
+
+        kv = _SlotPool()
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=2)
+        service = TollDraftService(
+            cfg,
+            forward=lambda item, slots: ([], []),
+            alloc=kv.alloc,
+            free=kv.free,
+            ttl_s=1.0,
+            req_factory=lambda rid, ids: SimpleNamespace(
+                rid=rid,
+                origin_input_ids=list(ids),
+                output_ids=[],
+                fill_ids=list(ids),
+                req_pool_idx=None,
+                kv_committed_len=0,
+            ),
+        )
+        service.state.upsert("stale", 1, 1)
+        service.state.reqs["stale"].last_seen = 0
+        service.prefix_slots["stale"] = kv.alloc(2)
+        service.expire_idle()
+        self.assertNotIn("stale", service.prefix_slots)
+        self.assertEqual(kv.live, [])
+
+    def test_padding_row_is_not_part_of_the_logit_check(self):
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[3] / "manual" / "toll_draft_logits_check.py"
+        spec = importlib.util.spec_from_file_location("toll_draft_logits_check", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        decode = torch.tensor([0.1, 0.7, 0.2])
+        layer = torch.tensor([[0.1, 0.7, 0.2], [9.0, 9.0, 9.0]])
+        self.assertTrue(module.row_matches_decode(layer, decode))
+        layer[0, 0] = 5.0
+        self.assertFalse(module.row_matches_decode(layer, decode))
+
+
+def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len, rid="a"):
     return TollRequest(
         proto=PROTO_VERSION,
         session="s",
@@ -513,7 +714,7 @@ def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len):
         t_target_ns=1_000_000,
         reqs=[
             TollReqItem(
-                rid="a",
+                rid=rid,
                 commit_len=int(commit_len),
                 new_tokens=list(new_tokens),
                 input_ids=list(input_ids),

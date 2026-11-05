@@ -32,12 +32,22 @@ def tail_token(req) -> int:
     return int(origin[-1]) if origin else 0
 
 
-def skip_speculative(req) -> bool:
-    if getattr(req, "is_health_check", False):
+def skip_speculative(batch) -> bool:
+    """Ordinary decode for health checks and anything that is not plain greedy."""
+    for req in getattr(batch, "reqs", None) or []:
+        if str(getattr(req, "rid", "")).startswith("HEALTH_CHECK"):
+            return True
+    info = getattr(batch, "sampling_info", None)
+    if info is None or not bool(getattr(info, "is_all_greedy", False)):
         return True
-    params = getattr(req, "sampling_params", None)
-    temperature = float(getattr(params, "temperature", 0.0) or 0.0) if params else 0.0
-    return temperature > 0.0
+    if bool(getattr(batch, "has_grammar", False)):
+        return True
+    orchestrator = getattr(info, "penalizer_orchestrator", None)
+    if orchestrator is not None and bool(getattr(orchestrator, "is_required", False)):
+        return True
+    if getattr(info, "logit_bias", None) is not None:
+        return True
+    return False
 
 
 class TollTargetSchedulerMixin:
@@ -92,12 +102,13 @@ class TollTargetSchedulerMixin:
         reqs = []
         for req in batch.reqs:
             delta, total, full = self._toll_delta(req)
+            snapshot = req.rid in self.toll_need_snapshot or req.rid not in self.toll_sent_len
             reqs.append(
                 TollReqItem(
                     rid=req.rid,
                     commit_len=total,
                     new_tokens=[int(token) for token in delta],
-                    input_ids=[int(token) for token in full],
+                    input_ids=[int(token) for token in full] if snapshot else [],
                     sampling={"temperature": 0.0},
                 )
             )
@@ -173,7 +184,15 @@ class TollTargetSchedulerMixin:
     def maybe_abort_remote_target(self) -> None:
         if not self.spec_algorithm.is_toll_tree_remote():
             return super().maybe_abort_remote_target()
-        return
+        if getattr(self.server_args, "toll_tree_role", None) != "target":
+            return
+        for rid in list(getattr(self, "toll_sent_len", {})):
+            req = type("Req", (), {"rid": rid, "origin_input_ids": [], "output_ids": []})()
+            self._toll_send_control(TollAction.ABORT, req)
+        self.toll_session = uuid.uuid4().hex
+        self.toll_seq = 0
+        self.toll_sent_len.clear()
+        self.toll_need_snapshot.clear()
 
     def _toll_send_control(self, action: str, req) -> None:
         if self.tp_rank != 0 or self.toll_client is None:
@@ -188,7 +207,7 @@ class TollTargetSchedulerMixin:
             raise RuntimeError("TOLL_TREE_REMOTE serving currently requires batch size 1")
         req = batch.reqs[0]
         extend = batch.forward_mode is not None and batch.forward_mode.is_extend()
-        if not extend and skip_speculative(req):
+        if not extend and skip_speculative(batch):
             batch.draft_num_tokens = 1
             result = self.run_batch(batch)
             self.process_batch_result(batch, result)

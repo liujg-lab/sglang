@@ -10,12 +10,10 @@ def layer_positions(prefix_len: int, depth: int, width: int) -> list[int]:
 
 
 def make_draft_req(rid: str, input_ids: list[int]):
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
     origin = [int(token) for token in input_ids]
-    try:
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.sampling.sampling_params import SamplingParams
-    except ModuleNotFoundError:
-        return _DraftReq(rid, origin)
     req = Req(rid, "", origin, SamplingParams(temperature=0.0, top_k=1))
     req.origin_input_ids = origin
     req.output_ids = []
@@ -23,17 +21,26 @@ def make_draft_req(rid: str, input_ids: list[int]):
     return req
 
 
-class _DraftReq:
-    """Stand-in used only when this interpreter cannot import ``Req``."""
+def keep_raw_logits(batch) -> None:
+    """Leave next-token logits as a temperature-1 distribution.
 
-    def __init__(self, rid: str, origin: list[int]) -> None:
-        self.rid = rid
-        self.origin_input_text = ""
-        self.origin_input_ids = list(origin)
-        self.output_ids = []
-        self.fill_ids = list(origin)
-        self.req_pool_idx = None
-        self.kv_committed_len = 0
+    The sampler rewrites non-greedy logits in place. Penalty, logit bias,
+    grammar, and logprob are cleared on this batch only.
+    """
+    info = batch.sampling_info
+    info.is_all_greedy = True
+    info.need_top_p_sampling = False
+    info.need_top_k_sampling = False
+    info.need_min_p_sampling = False
+    info.temperatures = info.temperatures.new_ones(info.temperatures.shape)
+    info.acc_additive_penalties = None
+    info.acc_scaling_penalties = None
+    info.penalizer_orchestrator = None
+    info.logit_bias = None
+    info.vocab_mask = None
+    batch.has_grammar = False
+    batch.return_logprob = False
+    batch.return_hidden_states = False
 
 
 def _device(scheduler):
@@ -76,6 +83,7 @@ def _batch(scheduler, req, seq_len: int):
     batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
         batch, scheduler.model_config.vocab_size
     )
+    keep_raw_logits(batch)
     return batch
 
 
@@ -96,10 +104,17 @@ def _assign(scheduler, req, start: int, slots) -> None:
     )
 
 
-def ingest_prefix(scheduler, req, slots) -> None:
+def _logits_of(result, rid: str):
+    logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
+    if logits is None:
+        raise RuntimeError(f"draft {rid} forward returned no logits")
+    return logits
+
+
+def ingest_prefix(scheduler, req, slots):
     """Write the committed prefix into KV, then one extend over those tokens."""
     if scheduler is None or not hasattr(scheduler, "req_to_token_pool"):
-        return
+        return None
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -113,70 +128,75 @@ def ingest_prefix(scheduler, req, slots) -> None:
         _assign(scheduler, req, 0, slots)
     req.kv_committed_len = len(tokens)
     if not tokens:
-        return
-    batch = _batch(scheduler, req, len(tokens))
+        return None
+    return extend_committed(scheduler, req, 0, tokens, slots)
+
+
+def extend_committed(scheduler, req, start: int, tokens, slots):
+    """EXTEND ``[start, start + len(tokens))``. The last row is the next distribution."""
+    import torch
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    tokens = [int(token) for token in tokens]
+    if not tokens:
+        return None
+    if slots:
+        _assign(scheduler, req, int(start), slots)
+    end = int(start) + len(tokens)
+    batch = _batch(scheduler, req, end)
     device = batch.seq_lens.device
     batch.forward_mode = ForwardMode.EXTEND
     batch.global_forward_mode = ForwardMode.EXTEND
     batch.input_ids = torch.tensor(tokens, dtype=torch.int64, device=device)
     batch.output_ids = None
+    batch.seq_lens = torch.tensor([end], dtype=torch.int64, device=device)
+    batch.seq_lens_cpu = torch.tensor([end], dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor([end], dtype=torch.int32, device=device)
+    batch.seq_lens_sum = end
     batch.out_cache_loc = torch.tensor(list(slots), dtype=torch.int64, device=device)
     batch.extend_lens = [len(tokens)]
-    batch.prefix_lens = [0]
+    batch.prefix_lens = [int(start)]
     batch.extend_num_tokens = len(tokens)
-    batch.extend_logprob_start_lens = [0]
-    scheduler.run_batch(batch)
-
-
-def tail_logits(scheduler, req):
-    """Logits at the committed tail. The tail already has a KV slot."""
-    import torch
-
-    length = len(req.fill_ids)
-    if length < 1 or req.req_pool_idx is None:
-        raise RuntimeError(f"draft {req.rid} has no committed tail")
-    slot = scheduler.req_to_token_pool.req_to_token[req.req_pool_idx, length - 1]
-    batch = _batch(scheduler, req, length)
-    device = batch.seq_lens.device
-    batch.input_ids = torch.tensor([int(req.fill_ids[-1])], dtype=torch.int64, device=device)
-    batch.out_cache_loc = slot.reshape(1)
-    batch.output_ids = None
+    batch.extend_logprob_start_lens = [int(start)]
     result = scheduler.run_batch(batch)
-    logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
-    if logits is None:
-        raise RuntimeError(f"draft {req.rid} tail forward returned no logits")
-    return logits
+    req.kv_committed_len = end
+    req.kv_allocated_len = end
+    return _logits_of(result, req.rid)
 
 
-def run_layer_logits(scheduler, req, tokens, positions, mask, slots):
-    """One layer extend. ``slots`` are this layer's physical KV ids."""
+def run_layer_logits(scheduler, req, tokens, positions, mask, slots, cached_len: int):
+    """One layer extend. ``cached_len`` already includes earlier physical slots."""
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
     from sglang.srt.speculative.toll_tree_remote.draft.spec_input import TollLayerSpec
 
     width = len(tokens)
-    prefix = len(req.fill_ids)
-    batch = _batch(scheduler, req, prefix)
+    cached = int(cached_len)
+    if slots:
+        _assign(scheduler, req, cached, slots)
+    batch = _batch(scheduler, req, cached)
     device = batch.seq_lens.device
     batch.forward_mode = ForwardMode.TARGET_VERIFY
     batch.global_forward_mode = ForwardMode.TARGET_VERIFY
     batch.input_ids = torch.tensor(list(tokens), dtype=torch.int64, device=device)
     batch.output_ids = None
+    batch.seq_lens = torch.tensor([cached], dtype=torch.int64, device=device)
+    batch.seq_lens_cpu = torch.tensor([cached], dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor([cached], dtype=torch.int32, device=device)
+    batch.seq_lens_sum = cached
     batch.out_cache_loc = torch.tensor(list(slots), dtype=torch.int64, device=device)
     batch.extend_lens = [width]
-    batch.prefix_lens = [prefix]
+    batch.prefix_lens = [cached]
     batch.extend_num_tokens = width
-    batch.extend_logprob_start_lens = [prefix]
+    batch.extend_logprob_start_lens = [cached]
     batch.spec_info = TollLayerSpec(
-        custom_mask=mask.reshape(-1),
+        custom_mask=torch.as_tensor(mask, dtype=torch.bool, device=device).reshape(-1),
         positions=torch.tensor(list(positions), dtype=torch.int64, device=device),
         draft_token_num=width,
         num_tokens_per_req=width,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
     result = scheduler.run_batch(batch)
-    logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
-    if logits is None:
-        raise RuntimeError(f"draft {req.rid} layer forward returned no logits")
-    return logits
+    return _logits_of(result, req.rid)
