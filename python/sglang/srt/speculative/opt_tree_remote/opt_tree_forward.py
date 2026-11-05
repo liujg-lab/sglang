@@ -850,6 +850,8 @@ class OptLayerSpec:
     # part of the mask. ``is_bonus`` only selects the N+1 graph key.
     apply_prefix_custom_mask: bool = True
     is_bonus: bool = False
+    # OPT draft cascade only. Other algorithms leave this unset.
+    target_verify_attention: object = None
 
     def is_draft_input(self) -> bool:
         return False
@@ -1028,6 +1030,11 @@ class OptLayerForward:
         out_cache_loc = self._alloc_layer_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+            bind_opt_cascade,
+        )
+
+        bind_opt_cascade(batch.spec_info, self, out_cache_loc, ancestor)
         _mark_layer_launch(timing)
         logits = self._run(batch)
         _finish_layer_timing(self.scheduler, timing)
@@ -1095,6 +1102,11 @@ class OptLayerForward:
             num_tokens_per_req=n,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+            bind_opt_cascade,
+        )
+
+        bind_opt_cascade(batch.spec_info, self, out_cache_loc, ancestor)
         _close_layer_host(timing)
         _note_lookahead_launch_wait(self)
         _mark_layer_launch(timing)
@@ -1722,6 +1734,18 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         torch.cat(locs),
         cached,
     )
+    if len(runners) == 1:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+            bind_opt_cascade,
+        )
+
+        bind_opt_cascade(
+            batch.spec_info,
+            runners[0],
+            locs[0],
+            ancestors[0],
+            cached_len=cached[0],
+        )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
     _finish_layer_timing(scheduler, timing)
@@ -2355,6 +2379,23 @@ def _fill_bonus_schedule_batch(
         capture_hidden_mode=CaptureHiddenMode.NULL,
         apply_prefix_custom_mask=True,
         is_bonus=True,
+    )
+    mask_rows = mask.reshape(int(width), int(tree_end) + int(width))
+    prefix = int(getattr(runner, "prefix_len", 0) or 0)
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+        bind_opt_cascade,
+    )
+
+    prefix_rows = None
+    if prefix > 0:
+        prefix_rows = mask_rows[:, 0]
+    bind_opt_cascade(
+        batch.spec_info,
+        runner,
+        loc,
+        mask_rows[:, prefix:],
+        prefix_rows=prefix_rows,
+        cached_len=int(tree_end),
     )
     return batch
 

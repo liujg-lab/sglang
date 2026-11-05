@@ -1640,6 +1640,14 @@ class CudaGraphRunner:
                 apply_prefix_custom_mask=True,
                 is_bonus=is_bonus,
             )
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+                capture_attention,
+            )
+
+            capture_bs = num_tokens // query_width if query_width else 0
+            spec_info.target_verify_attention = capture_attention(
+                self.model_runner, query_width, capture_bs
+            )
 
         elif self.is_spectre:
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
