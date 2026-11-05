@@ -26,12 +26,14 @@ class OptBonusGuess:
 
     ``parent == -1`` is the committed tail. Any other parent is an index into
     the verify window. ``logits`` is the distribution after this token.
+    ``end_rank`` is that parent's residual-probability order.
     """
 
     parent: int
     token: int
     slot: int
     logits: torch.Tensor
+    end_rank: int = 0
 
 
 @dataclass
@@ -473,6 +475,9 @@ def accept_opt_bonus_guess(scheduler, req, lease: OptTreeKVLease, kept: Sequence
         installed = _install_bonus_slot(scheduler, req, bonus_at, int(hit.slot))
     if installed:
         _draft_count(scheduler, "opt_bonus_hits")
+        _draft_count(
+            scheduler, f"opt_bonus_hit_rank_{min(int(hit.end_rank), 3)}"
+        )
     if installed and bonus_at + 1 == _logical_len(req):
         req.opt_prefill_tail_logits = hit.logits.detach()
     release_opt_bonus_guesses(

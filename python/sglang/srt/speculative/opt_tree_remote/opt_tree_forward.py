@@ -2053,6 +2053,7 @@ class _BonusCandidate:
     position: int
     chain: Tuple[int, ...]
     keep: bool = True
+    end_rank: int = 0
 
 
 def _first_unbanned(ids, banned) -> Optional[int]:
@@ -2219,7 +2220,11 @@ def _drop_stored_logits(runner) -> None:
 
 
 def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
-    """First top-(N+1) id at the root and every verify node that is not a child."""
+    """First top-(N+1) id at the root and every verify node that is not a child.
+
+    ``end_rank`` orders those candidates by residual path mass. This list stays
+    in insertion order.
+    """
     if state is None or window is None or len(window) != 3 or runner is None:
         return []
     tokens, parents, cols = window
@@ -2261,6 +2266,19 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
             prefix + depth + 1,
             ancestor_columns(state, prefix, depth, col),
         )
+    if plans:
+        end_score = {-1: 1.0}
+        for i, depth in enumerate(depths):
+            end_score[i] = float(state.weight[int(depth), int(cols[i])])
+        for i, parent in enumerate(parents):
+            end_score[int(parent)] -= float(
+                state.weight[int(depths[i]), int(cols[i])]
+            )
+        ranked = sorted(
+            plans, key=lambda plan: end_score[int(plan.parent)], reverse=True
+        )
+        for rank, plan in enumerate(ranked):
+            plan.end_rank = rank
     return plans
 
 
@@ -2636,6 +2654,7 @@ def _materialize_bonus_guesses(scheduler, group: _BonusLaunch, slots: Sequence[i
                 token=int(plan.token),
                 slot=int(slots[index]),
                 logits=group.logits[index].detach().clone(),
+                end_rank=int(plan.end_rank),
             )
         )
     try:

@@ -3770,6 +3770,10 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(chosen[-1], 3)
         self.assertEqual(chosen[0], 3)
         self.assertEqual(chosen[1], 3)
+        self.assertEqual([plan.parent for plan in plans], [-1, 0, 1])
+        self.assertEqual(
+            {plan.parent: plan.end_rank for plan in plans}, {-1: 0, 0: 1, 1: 2}
+        )
         self.assertEqual(plans[0].position, 3)
         self.assertEqual([plan.position for plan in plans if plan.parent == 0], [4])
         self.assertEqual([plan.position for plan in plans if plan.parent == 1], [5])
@@ -3781,6 +3785,7 @@ class OptTreeRemoteTest(CustomTestCase):
         )
         extra = select_bonus_candidates(state, ([7, 8], [-1, -1], [0, 1]), exhausted)
         self.assertEqual({plan.parent: plan.token for plan in extra}, {-1: 9})
+        self.assertEqual(extra[0].end_rank, 0)
 
     def test_bonus_mask_sees_prefix_ancestors_and_self(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
@@ -3849,6 +3854,9 @@ class OptTreeRemoteTest(CustomTestCase):
             OptTreeKVLease,
             consume_opt_tree_lease,
         )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
 
         host, pool, freed = _lease_host()
         req = _lease_req(keep=3, allocated=3)
@@ -3865,10 +3873,14 @@ class OptTreeRemoteTest(CustomTestCase):
         )
         seed = torch.tensor([1.0, 2.0, 3.0])
         req.opt_bonus_guesses = [
-            OptBonusGuess(parent=0, token=30, slot=200, logits=seed),
-            OptBonusGuess(parent=-1, token=8, slot=201, logits=torch.zeros(3)),
+            OptBonusGuess(parent=0, token=30, slot=200, logits=seed, end_rank=4),
+            OptBonusGuess(parent=-1, token=8, slot=201, logits=torch.zeros(3), end_rank=1),
         ]
         consume_opt_tree_lease(host, req)
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_bonus_hits"], 1)
+        self.assertEqual(counts["opt_bonus_hit_rank_3"], 1)
+        self.assertEqual(counts["opt_bonus_hit_rank_0"], 0)
         self.assertEqual(req.kv_committed_len, 5)
         self.assertEqual(req.kv_allocated_len, 5)
         self.assertEqual(pool[0, 3].item(), 100)
@@ -3887,6 +3899,9 @@ class OptTreeRemoteTest(CustomTestCase):
             consume_opt_tree_lease,
             release_opt_bonus_guesses,
         )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
 
         host, pool, freed = _lease_host()
         req = _lease_req(keep=3, allocated=3)
@@ -3902,9 +3917,13 @@ class OptTreeRemoteTest(CustomTestCase):
             depths=(0,),
         )
         req.opt_bonus_guesses = [
-            OptBonusGuess(parent=0, token=30, slot=200, logits=torch.zeros(2))
+            OptBonusGuess(parent=0, token=30, slot=200, logits=torch.zeros(2), end_rank=0)
         ]
         consume_opt_tree_lease(host, req)
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_bonus_hits"], 0)
+        for rank in range(4):
+            self.assertEqual(counts[f"opt_bonus_hit_rank_{rank}"], 0)
         self.assertEqual(req.kv_committed_len, 4)
         self.assertEqual(pool[0, 3].item(), 100)
         self.assertIsNone(req.opt_bonus_guesses)
