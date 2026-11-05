@@ -106,6 +106,10 @@ python -m sglang.launch_server \
 
 CUDA 使用 `--page-size 1` 和 `triton`。NPU 把 `--page-size` 改为 128，并改用该后端对应的 attention backend。
 
+## 级联注意力
+
+Draft 的 TARGET_VERIFY 可以走 `opt_tree_attention.py`。前缀按 flash-decoding 切分，树列单独一块。只在 CUDA、`--page-size 1`、attention backend 为 triton、batch size 为 1，并且 `model_supports` 通过时生效。`model_supports` 还要求非 deterministic、非 MLA，且每一层是普通 decoder attention。NPU 和 page size 128 不走级联，仍用原来的 mask kernel。已经捕获了级联 kernel 的图不能退回普通 metadata；eager 下 prepare 失败时才退回。
+
 page=1 时，Draft 在把验证窗口回包之后补算最后一层的 KV，下一轮 ingest 只缺 bonus 那一个 token。同一段空闲里还会为每个验证节点和根预测一个不含验证子节点的 bonus；下一轮只有这个 token 确实是 bonus 时才装上它的 slot，并用暂存 logits 当种子，ingest 不再前向。`SGLANG_OPT_TREE_KV_REUSE=0` 关掉这两次补算。page=128 不补算，也不发布 tree lease，行为与补算引入之前相同。
 
 Bonus 的 mask、positions、tokens 在 CPU 上拼好后一次拷上设备，真实行的前缀按整段赋值。槽长用缓存在设备上的 buffer `fill_`。前向走宽度 `N+1` 的模板和 `model_runner.forward`；没有模板时退回 `run_batch`，并计 `opt_bonus_template_fallbacks`。`model_runner.forward` 返回的 `can_run_graph` 为 False 时这一组已经走 eager，计入 `opt_bonus_eager_groups`，不再第二次前向。一个请求的全部分组共用一次模板准入，slot id 在最后一组返回后一次拷回主机。

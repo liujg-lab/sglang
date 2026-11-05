@@ -141,6 +141,21 @@ def layer_attention_mask(
     return out.reshape(-1)
 
 
+def layer_verify_mask(runner, ancestor, device) -> torch.Tensor:
+    """Mask stored on the verify spec.
+
+    Cascade attention reads the ancestor columns from its own workspace, so
+    the prefix of ones is not allocated. The ordinary kernel still needs it.
+    """
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+        _attention_for,
+    )
+
+    if _attention_for(runner) is not None:
+        return ancestor.reshape(-1).to(device=device, dtype=torch.bool)
+    return layer_attention_mask(runner.prefix_len, ancestor, device)
+
+
 def pack_verify_attention(
     prefix_lens: Sequence[int],
     ancestors: Sequence[torch.Tensor],
@@ -481,8 +496,12 @@ class _LayerTiming:
     - ``opt_layer_forwards`` counts every queued layer, including the last one
       lookahead submits early. ``opt_layer_forwards_critical`` is that count
       minus one, matching the old path's pre-reply forwards.
-    - ``opt_ingest_gpu_us`` is the ingest forward on the device. Its events are
-      read in the same drain as the layer events.
+    - ``opt_ingest_gpu_us`` is each ingest ``_run_batch``. The start event is
+      recorded immediately before that call, so host planning and allocation
+      are outside the interval. Stream idle inside ``_run_batch`` can still
+      be included. Chunked extend and a two-token decode gap each add one
+      pair. The pairs are read in the same drain as the layer events. An
+      unpaired start is dropped.
 
     ``opt_seed_d2h_wait_us`` is once per grow and is not divided by
     ``opt_layer_forwards``. ``opt_layer_d2h_wait_us`` is the later ``.cpu()``
@@ -590,8 +609,12 @@ def critical_layer_forwards(launched: int) -> int:
 
 
 def _begin_ingest_gpu(scheduler) -> None:
-    """Queue the start of the ingest GPU interval. No host synchronize."""
-    scheduler._opt_ingest_events = None
+    """Record the start of one ingest ``_run_batch``. No host synchronize.
+
+    Host planning and batch setup sit before this call. A previous open
+    start is dropped so a missed finish cannot pair with the next forward.
+    """
+    scheduler._opt_ingest_open = None
     if _draft_metrics(scheduler) is None:
         return
     try:
@@ -599,21 +622,25 @@ def _begin_ingest_gpu(scheduler) -> None:
         event.record()
     except Exception:
         return
-    scheduler._opt_ingest_events = event
+    scheduler._opt_ingest_open = event
 
 
 def _finish_ingest_gpu(scheduler) -> None:
-    """Queue the end of the ingest GPU interval. No host synchronize."""
-    start = getattr(scheduler, "_opt_ingest_events", None)
-    if start is None or isinstance(start, tuple):
+    """Close the open ingest interval and keep the pair. No host synchronize."""
+    start = getattr(scheduler, "_opt_ingest_open", None)
+    scheduler._opt_ingest_open = None
+    if start is None:
         return
     try:
         end = torch.get_device_module(scheduler.device).Event(enable_timing=True)
         end.record()
     except Exception:
-        scheduler._opt_ingest_events = None
         return
-    scheduler._opt_ingest_events = (start, end)
+    pairs = getattr(scheduler, "_opt_ingest_events", None)
+    if not isinstance(pairs, list):
+        pairs = []
+        scheduler._opt_ingest_events = pairs
+    pairs.append((start, end))
 
 
 def _note_lookahead_launch_wait(runner) -> None:
@@ -658,9 +685,14 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
     events = list(getattr(scheduler, "_opt_layer_events", None) or [])
     ingest = getattr(scheduler, "_opt_ingest_events", None)
     scheduler._opt_layer_events = []
-    scheduler._opt_ingest_events = None
-    ingest_pair = ingest if isinstance(ingest, tuple) and len(ingest) == 2 else None
-    if not events and ingest_pair is None:
+    scheduler._opt_ingest_events = []
+    scheduler._opt_ingest_open = None
+    pairs = [
+        pair
+        for pair in (ingest if isinstance(ingest, list) else [])
+        if isinstance(pair, tuple) and len(pair) == 2
+    ]
+    if not events and not pairs:
         return
     if metrics is None or getattr(scheduler, "_sr_device_poisoned", False):
         return
@@ -682,16 +714,15 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
             if is_device_context_error(exc):
                 raise
             metrics.counts["device_timing_dropped_opt_layer"] += 1
-    if ingest_pair is None:
-        return
-    try:
-        metrics.counts["opt_ingest_gpu_us"] += int(
-            ingest_pair[0].elapsed_time(ingest_pair[1]) * 1000
-        )
-    except Exception as exc:
-        if is_device_context_error(exc):
-            raise
-        metrics.counts["device_timing_dropped_opt_layer"] += 1
+    for start, end in pairs:
+        try:
+            metrics.counts["opt_ingest_gpu_us"] += int(
+                start.elapsed_time(end) * 1000
+            )
+        except Exception as exc:
+            if is_device_context_error(exc):
+                raise
+            metrics.counts["device_timing_dropped_opt_layer"] += 1
 
 
 def _commit_prob_rows(
@@ -1026,7 +1057,7 @@ class OptLayerForward:
         device = self.scheduler.req_to_token_pool.device
         timing = _begin_layer_timing(self.scheduler)
         positions = layer_positions(self.prefix_len, depth, n).to(device)
-        mask = layer_attention_mask(self.prefix_len, ancestor, device)
+        mask = layer_verify_mask(self, ancestor, device)
         out_cache_loc = self._alloc_layer_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
@@ -1034,7 +1065,9 @@ class OptLayerForward:
             bind_opt_cascade,
         )
 
-        bind_opt_cascade(batch.spec_info, self, out_cache_loc, ancestor)
+        bind_opt_cascade(
+            batch.spec_info, self, out_cache_loc, ancestor, append_slots=True
+        )
         _mark_layer_launch(timing)
         logits = self._run(batch)
         _finish_layer_timing(self.scheduler, timing)
@@ -1073,7 +1106,7 @@ class OptLayerForward:
         device = self.scheduler.req_to_token_pool.device
         timing = _begin_layer_timing(self.scheduler)
         self._la_positions.fill_(self.prefix_len + depth - 1)
-        mask = layer_attention_mask(self.prefix_len, ancestor, device)
+        mask = layer_verify_mask(self, ancestor, device)
         out_cache_loc = self._alloc_lookahead_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         self._la_seq.fill_(self.cached_len)
@@ -1106,7 +1139,9 @@ class OptLayerForward:
             bind_opt_cascade,
         )
 
-        bind_opt_cascade(batch.spec_info, self, out_cache_loc, ancestor)
+        bind_opt_cascade(
+            batch.spec_info, self, out_cache_loc, ancestor, append_slots=True
+        )
         _close_layer_host(timing)
         _note_lookahead_launch_wait(self)
         _mark_layer_launch(timing)
@@ -1474,7 +1509,11 @@ def _logits_at_tail_batch(scheduler, runners, phases=None) -> List[torch.Tensor]
     batch.output_ids = None
     _keep_raw_logits(batch)
     phases.lap("opt_ingest_batch")
-    logits = _flatten_logits(_run_batch(scheduler, batch))
+    _begin_ingest_gpu(scheduler)
+    try:
+        logits = _flatten_logits(_run_batch(scheduler, batch))
+    finally:
+        _finish_ingest_gpu(scheduler)
     phases.lap("opt_ingest_forward")
     if int(logits.shape[0]) != len(runners):
         raise RuntimeError(
@@ -1535,7 +1574,11 @@ def _extend_span_batch(scheduler, runners, ends, phases=None) -> List[torch.Tens
             torch.cat(locs),
         )
         phases.lap("opt_ingest_batch")
-        rows = _extend_request_rows(_run_batch(scheduler, batch), len(runners))
+        _begin_ingest_gpu(scheduler)
+        try:
+            rows = _extend_request_rows(_run_batch(scheduler, batch), len(runners))
+        finally:
+            _finish_ingest_gpu(scheduler)
         phases.lap("opt_ingest_forward")
     except Exception:
         for runner, start, _end in prepared:
@@ -1715,9 +1758,15 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         token_rows.append(tokens.to(dtype=torch.long, device=device))
         ancestors.append(ancestor)
     prefix_lens = [runner.prefix_len for runner in runners]
-    flat_mask, flat_positions = pack_verify_attention(
-        prefix_lens, ancestors, depth, width, device
-    )
+    if len(runners) == 1:
+        flat_positions = layer_positions(prefix_lens[0], depth, width).to(
+            device=device
+        )
+        flat_mask = layer_verify_mask(runners[0], ancestors[0], device)
+    else:
+        flat_mask, flat_positions = pack_verify_attention(
+            prefix_lens, ancestors, depth, width, device
+        )
     locs = []
     cached = []
     for runner in runners:
@@ -1745,6 +1794,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
             locs[0],
             ancestors[0],
             cached_len=cached[0],
+            append_slots=True,
         )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
@@ -1822,7 +1872,11 @@ def _decode_append_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
         batch.out_cache_loc = torch.cat(locs)
         _keep_raw_logits(batch)
         phases.lap("opt_ingest_batch")
-        logits = _flatten_logits(_run_batch(scheduler, batch))
+        _begin_ingest_gpu(scheduler)
+        try:
+            logits = _flatten_logits(_run_batch(scheduler, batch))
+        finally:
+            _finish_ingest_gpu(scheduler)
         phases.lap("opt_ingest_forward")
         if int(logits.shape[0]) != len(runners):
             raise RuntimeError(
@@ -2344,6 +2398,27 @@ def _bonus_model_runner(scheduler):
     return getattr(worker, "model_runner", None)
 
 
+def _bind_bonus_cascade(batch, runner, mask, loc, tree_end: int, width: int) -> None:
+    """Attach this bonus group's cascade buffers before replay or eager forward."""
+    mask_rows = mask.reshape(int(width), int(tree_end) + int(width))
+    prefix = int(getattr(runner, "prefix_len", 0) or 0)
+    from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+        bind_opt_cascade,
+    )
+
+    prefix_rows = None
+    if prefix > 0:
+        prefix_rows = mask_rows[:, 0]
+    bind_opt_cascade(
+        batch.spec_info,
+        runner,
+        loc,
+        mask_rows[:, prefix:],
+        prefix_rows=prefix_rows,
+        cached_len=int(tree_end),
+    )
+
+
 def _fill_bonus_schedule_batch(
     scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int
 ):
@@ -2380,23 +2455,7 @@ def _fill_bonus_schedule_batch(
         apply_prefix_custom_mask=True,
         is_bonus=True,
     )
-    mask_rows = mask.reshape(int(width), int(tree_end) + int(width))
-    prefix = int(getattr(runner, "prefix_len", 0) or 0)
-    from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
-        bind_opt_cascade,
-    )
-
-    prefix_rows = None
-    if prefix > 0:
-        prefix_rows = mask_rows[:, 0]
-    bind_opt_cascade(
-        batch.spec_info,
-        runner,
-        loc,
-        mask_rows[:, prefix:],
-        prefix_rows=prefix_rows,
-        cached_len=int(tree_end),
-    )
+    _bind_bonus_cascade(batch, runner, mask, loc, tree_end, width)
     return batch
 
 
@@ -2413,6 +2472,7 @@ def _bonus_fallback_logits(
         [tree_end],
         is_bonus=True,
     )
+    _bind_bonus_cascade(batch, runner, mask, loc, tree_end, width)
     return _as_layer_rows(_run_batch(scheduler, batch), 1, width)[0]
 
 

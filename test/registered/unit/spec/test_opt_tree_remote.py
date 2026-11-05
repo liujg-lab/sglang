@@ -919,6 +919,26 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertTrue(torch.equal(rows[:, :3], torch.ones(2, 3, dtype=torch.bool)))
         self.assertTrue(torch.equal(rows[:, 3:], ancestor.to(dtype=torch.bool)))
 
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            layer_verify_mask,
+        )
+
+        runner = SimpleNamespace(prefix_len=3)
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_attention._attention_for",
+            return_value=object(),
+        ):
+            cascade = layer_verify_mask(runner, ancestor, "cpu")
+        self.assertEqual(cascade.numel(), ancestor.numel())
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_attention._attention_for",
+            return_value=None,
+        ):
+            ordinary = layer_verify_mask(runner, ancestor, "cpu")
+        self.assertEqual(ordinary.numel(), 2 * (3 + 2))
+
     def test_forward_once_per_kept_layer(self):
         from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
             grow_with_forwards,
@@ -1698,6 +1718,98 @@ class OptTreeRemoteTest(CustomTestCase):
         for index, guess in enumerate(guesses):
             row = patterns[index // 2][index % 2]
             self.assertTrue(torch.equal(guess.logits, row))
+
+    def test_bonus_fallback_binds_cascade(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            _bonus_fallback_logits,
+            _fill_bonus_schedule_batch,
+        )
+
+        _import_or_stub_forward_batch()
+        width = 3
+        tree_end = 8
+        prefix = 4
+        mask = torch.arange(width * (tree_end + width), dtype=torch.uint8).reshape(
+            width, tree_end + width
+        )
+        positions = torch.arange(tree_end, tree_end + width)
+        tokens = torch.arange(width, dtype=torch.long)
+        loc = torch.arange(20, 20 + width)
+
+        def make_batch(reqs):
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_p_sampling=True,
+                need_top_k_sampling=True,
+                need_min_p_sampling=True,
+                temperatures=torch.tensor([0.7]),
+                acc_additive_penalties=torch.ones(1),
+                acc_scaling_penalties=torch.ones(1),
+                penalizer_orchestrator=object(),
+                logit_bias=torch.ones(1),
+                vocab_mask=torch.ones(1),
+            )
+            return SimpleNamespace(
+                reqs=list(reqs),
+                seq_lens=torch.tensor([tree_end], dtype=torch.int64),
+                orig_seq_lens=torch.tensor([tree_end], dtype=torch.int32),
+                sampling_info=info,
+                has_grammar=False,
+                return_logprob=False,
+                return_hidden_states=False,
+            )
+
+        def run_batch(_batch):
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(next_token_logits=torch.zeros(width, 2))
+            )
+
+        host = SimpleNamespace(
+            _sr_make_decode_batch=make_batch,
+            run_batch=run_batch,
+            cur_batch=None,
+        )
+        req = SimpleNamespace(req_pool_idx=0, rid="bonus")
+        runner = SimpleNamespace(scheduler=host, req=req, prefix_len=prefix)
+        calls = []
+
+        def record(
+            spec, bound_runner, bound_loc, tree_mask, prefix_rows=None, cached_len=None
+        ):
+            calls.append(
+                (
+                    spec,
+                    bound_runner,
+                    bound_loc.detach().clone(),
+                    tree_mask.detach().clone(),
+                    None if prefix_rows is None else prefix_rows.detach().clone(),
+                    cached_len,
+                )
+            )
+
+        with patch(
+            "sglang.srt.speculative.opt_tree_remote.opt_tree_attention.bind_opt_cascade",
+            side_effect=record,
+        ):
+            _bonus_fallback_logits(
+                host, runner, tokens, positions, mask, loc, tree_end, width
+            )
+            _fill_bonus_schedule_batch(
+                host, runner, tokens, positions, mask, loc, tree_end, width
+            )
+
+        self.assertEqual(len(calls), 2)
+        expected_tree = mask[:, prefix:]
+        expected_rows = mask[:, 0]
+        for spec, bound_runner, bound_loc, tree_mask, prefix_rows, cached_len in calls:
+            self.assertTrue(spec.is_bonus)
+            self.assertIs(bound_runner, runner)
+            self.assertTrue(torch.equal(bound_loc, loc))
+            self.assertTrue(torch.equal(tree_mask, expected_tree))
+            self.assertTrue(torch.equal(prefix_rows, expected_rows))
+            self.assertEqual(cached_len, tree_end)
 
     def test_bonus_graph_key_does_not_reuse_layer_graph(self):
         from pathlib import Path
@@ -4180,8 +4292,6 @@ def _load_opt_expand_one():
     from pathlib import Path
 
     from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
-        _begin_ingest_gpu,
-        _finish_ingest_gpu,
         _reraise_device_context,
         clear_prefill_tail_logits,
         critical_layer_forwards,
@@ -4201,8 +4311,6 @@ def _load_opt_expand_one():
         "get_sr_round_metrics": get_sr_round_metrics,
         "logger": logging.getLogger("opt-expand-test"),
         "clear_prefill_tail_logits": clear_prefill_tail_logits,
-        "_begin_ingest_gpu": _begin_ingest_gpu,
-        "_finish_ingest_gpu": _finish_ingest_gpu,
         "critical_layer_forwards": critical_layer_forwards,
         "_reraise_device_context": _reraise_device_context,
         # The extracted method stays on grow_active_layers. Lookahead is off.
@@ -4897,18 +5005,30 @@ class OptLookaheadOpsTest(unittest.TestCase):
                 return 4.0
 
         host._opt_layer_events = [(_TimingEvent(), _TimingEvent())]
-        host._opt_ingest_events = (_IngestEvent(), _IngestEvent())
+        host._opt_ingest_events = [(_IngestEvent(), _IngestEvent())]
+        host._opt_ingest_open = _TimingEvent()
 
         with patch.object(
             forward.torch, "get_device_module", lambda _device: _TimingDevice(syncs, [])
         ):
             drain_opt_layer_gpu_us(host, metrics)
+            self.assertEqual(syncs, [1])
+            self.assertEqual(metrics.counts["opt_layer_gpu_us"], 1500)
+            self.assertEqual(metrics.counts["opt_ingest_gpu_us"], 4000)
+            self.assertEqual(host._opt_layer_events, [])
+            self.assertEqual(host._opt_ingest_events, [])
+            self.assertIsNone(host._opt_ingest_open)
 
-        self.assertEqual(syncs, [1])
-        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 1500)
-        self.assertEqual(metrics.counts["opt_ingest_gpu_us"], 4000)
-        self.assertEqual(host._opt_layer_events, [])
-        self.assertIsNone(host._opt_ingest_events)
+            metrics.counts["opt_ingest_gpu_us"] = 0
+            host._opt_ingest_events = [
+                (_IngestEvent(), _IngestEvent()),
+                (_TimingEvent(), _TimingEvent()),
+            ]
+            drain_opt_layer_gpu_us(host, metrics)
+
+        self.assertEqual(syncs, [1, 1])
+        self.assertEqual(metrics.counts["opt_ingest_gpu_us"], 5500)
+        self.assertEqual(host._opt_ingest_events, [])
 
     def test_launch_wait_syncs_only_after_a_previous_layer(self):
         import os

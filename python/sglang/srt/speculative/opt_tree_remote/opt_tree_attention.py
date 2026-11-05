@@ -32,19 +32,27 @@ import torch
 STAGE2_MIN_BLOCK_KV = 32
 MAX_SPLITS = 32
 MAX_PREFIX_SPLITS = MAX_SPLITS - 1
-BLOCK_Q = 32
 BLOCK_N = 32
+_MAX_QUERY_BLOCK = 64
 _EMPTY_LSE = -1.0e20
 
 _generation = 0
 _WORKSPACE = None
 _support_cache = {}
+# (id(backend), query_width) of bs=1 graphs whose capture admitted the cascade kernel.
+_captured_cascade = set()
 
 
 def _next_generation() -> int:
     global _generation
     _generation += 1
     return _generation
+
+
+def cascade_query_block(rows: int) -> int:
+    """``min(64, next_power_of_2(rows))``. Width 19 with group 2 stays one tile."""
+    rows = max(int(rows), 1)
+    return min(_MAX_QUERY_BLOCK, 1 << (rows - 1).bit_length())
 
 
 def cdiv(value: int, block: int) -> int:
@@ -233,6 +241,10 @@ class _Workspace:
         self.max_prefix = int(max_prefix)
         self.max_tree = int(max_tree)
         self.prefix_generation = None
+        self.tree_filled = 0
+        self.stage2_queries = None
+        self.prefix_meta_writes = 0
+        self.stage2_writes = 0
         self.prefix_indices = torch.zeros(
             self.max_prefix, dtype=torch.int64, device=self.device
         )
@@ -270,16 +282,32 @@ class _Workspace:
         )
 
     @classmethod
-    def allocate(cls, device, max_queries, heads, dim, context):
+    def allocate(cls, device, max_queries, heads, dim, context, tree_limit):
         context = max(int(context), 1)
+        tree_limit = max(int(tree_limit), 1)
         return cls(
             device,
             max_queries,
             heads,
             dim,
             max_prefix=context,
-            max_tree=context,
+            max_tree=tree_limit,
         )
+
+
+def tree_limit(backend) -> int:
+    """Tree columns the cascade workspace must hold.
+
+    A full draft is ``(max_depth - 1) * N`` slots, and the bonus group adds
+    ``N + 1``. That is ``speculative_num_steps * num_draft_tokens + 1``.
+    Without a step count, the cap is one layer plus the bonus column, not
+    the context length.
+    """
+    width = int(getattr(backend, "num_draft_tokens", 0) or 0)
+    steps = int(getattr(backend, "speculative_num_steps", 0) or 0)
+    if steps >= 1 and width >= 1:
+        return steps * width + 1
+    return width + 1
 
 
 def ensure_workspace(backend, query_width: int) -> _Workspace:
@@ -291,6 +319,7 @@ def ensure_workspace(backend, query_width: int) -> _Workspace:
     heads = int(backend.num_head)
     dim = int(backend.v_head_dim)
     context = int(getattr(backend, "max_context_len", 1) or 1)
+    columns = tree_limit(backend)
     ws = _WORKSPACE
     if (
         ws is None
@@ -299,9 +328,9 @@ def ensure_workspace(backend, query_width: int) -> _Workspace:
         or ws.heads != heads
         or ws.dim != dim
         or ws.max_prefix < context
-        or ws.max_tree < context
+        or ws.max_tree < columns
     ):
-        ws = _Workspace.allocate(device, max_q, heads, dim, context)
+        ws = _Workspace.allocate(device, max_q, heads, dim, context, columns)
         _WORKSPACE = ws
     return ws
 
@@ -311,6 +340,25 @@ def write_stage2_metadata(ws: _Workspace, queries: int, prefix_splits: int) -> N
     seq = synthetic_kv_len(prefix_splits)
     ws.kv_indptr[: queries + 1].copy_(ws.arange[: queries + 1] * seq)
     ws.num_kv_splits[:queries].fill_(int(prefix_splits) + 1)
+
+
+def _mask_query_width(tree_mask):
+    """Query rows of a noted tree mask, or None when the mask cannot name a graph."""
+    if tree_mask is None or not hasattr(tree_mask, "dim") or tree_mask.dim() != 2:
+        return None
+    queries = int(tree_mask.shape[0])
+    if queries < 1:
+        return None
+    return queries
+
+
+def _replay_uses_captured_cascade(backend, tree_mask) -> bool:
+    """True when this replay would run a cascade kernel already frozen into a graph."""
+    backend_id = id(backend)
+    width = _mask_query_width(tree_mask)
+    if width is None:
+        return any(stored == backend_id for stored, _stored_width in _captured_cascade)
+    return (backend_id, width) in _captured_cascade
 
 
 class OptTreeAttention:
@@ -344,7 +392,11 @@ class OptTreeAttention:
         seq_lens=None,
         spec_info=None,
     ) -> bool:
-        """Fill static buffers. False leaves the caller's metadata path unchanged."""
+        """Fill static buffers. False leaves the caller's metadata path unchanged.
+
+        Replay of a bs=1 graph that already captured this cascade kernel raises
+        when the fill does not fit. That graph cannot fall back to ordinary metadata.
+        """
         del req_pool_indices, seq_lens, spec_info
         self.ready = False
         if not self.active:
@@ -355,8 +407,17 @@ class OptTreeAttention:
             return False
         if self.plan is None:
             ok = self._fill_capture(backend)
+            if ok:
+                _captured_cascade.add((id(backend), int(self.capture_query_width)))
         else:
             ok = self._fill_runtime(backend)
+        if (
+            not ok
+            and batch is None
+            and self.plan is not None
+            and _replay_uses_captured_cascade(backend, self._tree_mask)
+        ):
+            raise RuntimeError("OPT cascade prepare failed on a cascade graph")
         self.ready = bool(ok)
         return bool(ok)
 
@@ -375,6 +436,7 @@ class OptTreeAttention:
         ws.tree_mask[:queries, :queries].fill_(1)
         ws.prefix_rows[:queries].fill_(1)
         write_stage2_metadata(ws, queries, 1)
+        ws.prefix_generation = None
         return True
 
     def _fill_runtime(self, backend) -> bool:
@@ -386,8 +448,12 @@ class OptTreeAttention:
         if mask.dim() != 2 or indices.dim() != 1:
             return False
         queries = int(mask.shape[0])
-        cols = int(indices.shape[0])
-        if queries < 1 or cols != int(mask.shape[1]):
+        cols = int(mask.shape[1])
+        n_idx = int(indices.shape[0])
+        if queries < 1 or cols < 1 or n_idx < 1:
+            return False
+        rows = self._prefix_rows
+        if rows is not None and int(rows.shape[0]) != queries:
             return False
         ws = ensure_workspace(backend, queries)
         if (
@@ -396,26 +462,40 @@ class OptTreeAttention:
             or queries > ws.max_queries
         ):
             return False
-        if ws.prefix_generation != plan.generation:
+        new_gen = ws.prefix_generation != plan.generation
+        filled = 0 if new_gen else int(ws.tree_filled)
+        if n_idx == cols:
+            append = False
+        elif cols == filled + n_idx:
+            append = True
+        else:
+            return False
+        if new_gen:
             if plan.prefix_len > 0:
                 ws.prefix_indices[: plan.prefix_len].copy_(plan.indices)
             ws.prefix_generation = plan.generation
             plan.prefix_copies += 1
-        splits = prefix_split_count(plan.prefix_len)
-        ws.prefix_len.fill_(int(plan.prefix_len))
-        ws.prefix_splits.fill_(int(splits))
-        ws.tree_cols.fill_(int(cols))
-        if cols > 0:
+            splits = prefix_split_count(plan.prefix_len)
+            ws.prefix_len.fill_(int(plan.prefix_len))
+            ws.prefix_splits.fill_(int(splits))
+            ws.prefix_meta_writes += 1
+        else:
+            splits = prefix_split_count(plan.prefix_len)
+        if append:
+            ws.tree_indices[filled:cols].copy_(indices)
+        else:
             ws.tree_indices[:cols].copy_(indices)
-            ws.tree_mask[:queries, :cols].copy_(mask.to(dtype=torch.uint8))
-        if self._prefix_rows is None:
+        ws.tree_filled = cols
+        ws.tree_cols.fill_(int(cols))
+        ws.tree_mask[:queries, :cols].copy_(mask.to(dtype=torch.uint8))
+        if rows is None:
             ws.prefix_rows[:queries].fill_(1)
         else:
-            rows = self._prefix_rows
-            if int(rows.shape[0]) != queries:
-                return False
             ws.prefix_rows[:queries].copy_(rows.to(dtype=torch.int32))
-        write_stage2_metadata(ws, queries, splits)
+        if new_gen or ws.stage2_queries != queries:
+            write_stage2_metadata(ws, queries, splits)
+            ws.stage2_queries = queries
+            ws.stage2_writes += 1
         return True
 
     def forward(self, q, k, v, o, layer, forward_batch, sinks=None):
@@ -473,8 +553,13 @@ def bind_opt_cascade(
     tree_mask,
     prefix_rows=None,
     cached_len=None,
+    append_slots=False,
 ) -> None:
-    """Attach this step's cascade object and this layer's tree columns."""
+    """Attach this step's cascade object and this layer's tree columns.
+
+    ``append_slots`` records only this layer's new slots. The workspace already
+    holds the earlier tree columns for this prefix generation.
+    """
     attn = _attention_for(runner)
     if attn is None:
         return
@@ -485,15 +570,19 @@ def bind_opt_cascade(
     cached = int(runner.cached_len if cached_len is None else cached_len)
     pool = runner.scheduler.req_to_token_pool.req_to_token
     device = pool.device
-    indices = tree_kv_indices(
-        pool,
-        runner.req.req_pool_idx,
-        runner.prefix_len,
-        cached,
-        out_cache_loc,
-    )
+    if append_slots:
+        indices = out_cache_loc.reshape(-1).to(dtype=torch.int64, device=device)
+        indices = indices.contiguous()
+    else:
+        indices = tree_kv_indices(
+            pool,
+            runner.req.req_pool_idx,
+            runner.prefix_len,
+            cached,
+            out_cache_loc,
+        )
     mask = tree_mask.to(device=device, dtype=torch.uint8).contiguous()
-    if int(indices.shape[0]) != int(mask.shape[1]):
+    if not append_slots and int(indices.shape[0]) != int(mask.shape[1]):
         raise RuntimeError(
             f"OPT cascade tree indices {int(indices.shape[0])} != "
             f"mask columns {int(mask.shape[1])}"
@@ -636,10 +725,12 @@ def _launch(
         raise RuntimeError("triton is required for OPT cascade attention")
     block_d = triton.next_power_of_2(int(dim))
     kernel = _stage1
+    rows = int(queries) * group
+    block_q = cascade_query_block(rows)
     grid = (
         int(kv_heads),
         MAX_SPLITS,
-        cdiv(int(queries) * group, BLOCK_Q),
+        cdiv(rows, block_q),
     )
     kernel[grid](
         q,
@@ -669,7 +760,7 @@ def _launch(
         lse.stride(1),
         int(queries),
         GROUP=group,
-        BLOCK_Q=BLOCK_Q,
+        BLOCK_Q=block_q,
         BLOCK_N=BLOCK_N,
         BLOCK_D=block_d,
         DIM=int(dim),

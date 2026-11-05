@@ -951,7 +951,7 @@ class TritonAttnBackend(AttentionBackend):
             "target_verify_attention",
             None,
         )
-        if _attn is not None and getattr(_attn, "active", False):
+        if _attn is not None and getattr(_attn, "ready", False):
             _attn.forward(q, k, v, o, layer, forward_batch, sinks)
             return o
 

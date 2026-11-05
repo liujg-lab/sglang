@@ -23,8 +23,6 @@ from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
     _admit_lookahead,
     _reraise_device_context,
     clear_prefill_tail_logits,
-    _begin_ingest_gpu,
-    _finish_ingest_gpu,
     critical_layer_forwards,
     drain_opt_layer_gpu_us,
     drop_lookahead_request,
@@ -431,11 +429,7 @@ class OptTreeSchedulerMixin:
 
             phases = OptPhaseClock()
             t0 = time.perf_counter()
-            _begin_ingest_gpu(self)
-            try:
-                tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
-            finally:
-                _finish_ingest_gpu(self)
+            tail_logits = ingest_tail_logits(self, [runner], phases=phases)[0]
             _sync()
             phases.lap("opt_ingest_forward")
             flush_opt_ingest_phases(
