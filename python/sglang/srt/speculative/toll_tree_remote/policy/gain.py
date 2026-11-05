@@ -1,4 +1,4 @@
-"""φ_d(x) = EMA of Σ(a − x)⁺ on a log grid. Empty bins stay at 0."""
+"""φ_d(x) = EMA of Σ(a − x)⁺ on a log grid. An empty table stays at 0."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ class GainTable:
     ``observe`` takes one parent's sibling acceptance values and updates
     Σ(a − x)⁺ at every grid knot. The first sample at a depth writes the
     value; later samples are an EMA. ``estimate`` interpolates neighboring
-    knots. A depth with no samples returns 0.
+    knots. A missing depth uses the nearest shallower curve, then the nearest
+    observed depth. The table returns 0 only when it has no samples at all.
     """
 
     def __init__(self, alpha: float = 0.02, grid=None) -> None:
@@ -44,10 +45,10 @@ class GainTable:
 
     def observe(self, siblings, depth: int) -> None:
         accepted = np.asarray(siblings, dtype=np.float64).reshape(-1)
-        values = np.array(
-            [float(np.maximum(accepted - float(x), 0.0).sum()) for x in self.grid],
-            dtype=np.float64,
-        )
+        if accepted.size == 0:
+            values = np.zeros(self.grid.size, dtype=np.float64)
+        else:
+            values = np.maximum(accepted[:, None] - self.grid[None, :], 0.0).sum(axis=0)
         key = int(depth)
         current = self._ema.get(key)
         if current is None:
@@ -55,23 +56,51 @@ class GainTable:
             return
         self._ema[key] = (1.0 - self.alpha) * current + self.alpha * values
 
-    def estimate(self, pi: float, cut: float, depth: int) -> float:
-        if float(pi) <= 0.0:
-            return 0.0
-        curve = self._ema.get(int(depth))
-        if curve is None:
-            return 0.0
-        x = float(np.clip(float(cut) / float(pi), 0.0, 1.0))
+    def _curve_for(self, depth: int):
+        key = int(depth)
+        curve = self._ema.get(key)
+        if curve is not None:
+            return curve
+        if not self._ema:
+            return None
+        shallower = [item for item in self._ema if item < key]
+        if shallower:
+            return self._ema[max(shallower)]
+        nearest = min(self._ema, key=lambda item: (abs(item - key), item))
+        return self._ema[nearest]
+
+    def _interp(self, curve: np.ndarray, x: np.ndarray) -> np.ndarray:
         grid = self.grid
-        if x <= float(grid[0]):
-            return float(curve[0])
-        if x >= float(grid[-1]):
-            return float(curve[-1])
-        hi = int(np.searchsorted(grid, x, side="left"))
-        lo = hi - 1
-        x0 = float(grid[lo])
-        x1 = float(grid[hi])
-        if x1 == x0:
-            return float(curve[lo])
-        weight = (x - x0) / (x1 - x0)
-        return float(curve[lo] + weight * (curve[hi] - curve[lo]))
+        y = np.empty(x.shape, dtype=np.float64)
+        left = x <= float(grid[0])
+        right = x >= float(grid[-1])
+        middle = ~left & ~right
+        y[left] = float(curve[0])
+        y[right] = float(curve[-1])
+        if np.any(middle):
+            xm = x[middle]
+            hi = np.clip(np.searchsorted(grid, xm, side="left"), 1, int(grid.size) - 1)
+            lo = hi - 1
+            x0 = grid[lo]
+            x1 = grid[hi]
+            span = x1 - x0
+            weight = np.divide(xm - x0, span, out=np.zeros_like(xm), where=span != 0.0)
+            y[middle] = curve[lo] + weight * (curve[hi] - curve[lo])
+        return y
+
+    def estimate_many(self, pis, cut: float, depth: int) -> np.ndarray:
+        values = np.asarray(pis, dtype=np.float64).reshape(-1)
+        out = np.zeros(values.size, dtype=np.float64)
+        curve = self._curve_for(depth)
+        if curve is None:
+            return out
+        positive = values > 0.0
+        if not np.any(positive):
+            return out
+        ratio = np.zeros(values.size, dtype=np.float64)
+        ratio[positive] = np.clip(float(cut) / values[positive], 0.0, 1.0)
+        out[positive] = self._interp(curve, ratio[positive])
+        return out
+
+    def estimate(self, pi: float, cut: float, depth: int) -> float:
+        return float(self.estimate_many([pi], cut, depth)[0])

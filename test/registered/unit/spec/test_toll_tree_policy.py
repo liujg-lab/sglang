@@ -190,6 +190,7 @@ class TestTollCostAndCalibration(CustomTestCase):
             for rows in (2, 8, 16):
                 ms = 1.0 + 0.2 * prefix + 0.3 * rows
                 model.observe_layer("sync", prefix, rows, ms)
+        model.refresh()
         point = model.snapshot("sync")
         self.assertAlmostEqual(point.w, 1.0, places=6)
         self.assertAlmostEqual(point.kappa, 0.2, places=6)
@@ -202,6 +203,7 @@ class TestTollCostAndCalibration(CustomTestCase):
                 knee = max(rows - 10.0, 0.0)
                 ms = 0.5 * prefix + 0.1 * rows + 0.4 * knee
                 model.observe_target(prefix, rows, ms)
+        model.refresh()
         point = model.snapshot("sync")
         self.assertAlmostEqual(point.beta, 0.1, places=5)
         self.assertAlmostEqual(point.beta_plus, 0.4, places=5)
@@ -210,6 +212,7 @@ class TestTollCostAndCalibration(CustomTestCase):
         model.observe_net(0.0, 3.0)
         model.observe_net(10.0, 3.0 + 0.25 * 10.0)
         model.observe_net(40.0, 3.0 + 0.25 * 40.0)
+        model.refresh()
         point = model.snapshot("sync")
         self.assertAlmostEqual(point.rtt_ms, 3.0, places=6)
         self.assertAlmostEqual(point.ms_per_byte, 0.25, places=6)
@@ -226,7 +229,9 @@ class TestTollCostAndCalibration(CustomTestCase):
         negative = TierCostModel(probe_interval=1, warmup_rounds=1)
         for rows in (0.0, 2.0, 4.0, 6.0, 8.0):
             negative.observe_layer("eager", 0.0, rows, 1.0 - 0.2 * rows)
+        negative.refresh()
         point = negative.snapshot("eager")
+        self.assertAlmostEqual(point.w, 1.0, places=6)
         self.assertAlmostEqual(point.eps, 0.0)
         self.assertGreaterEqual(point.w, 0.0)
         self.assertGreaterEqual(point.kappa, 0.0)
@@ -235,6 +240,7 @@ class TestTollCostAndCalibration(CustomTestCase):
         noisy = TierCostModel(probe_interval=1, warmup_rounds=1)
         for rows in range(8):
             noisy.observe_layer("batch", 0.0, float(rows), 1.0 + 0.3 * rows)
+        noisy.refresh()
         point = noisy.snapshot("batch")
         self.assertEqual(point.row_knee, 10**9)
         self.assertAlmostEqual(point.eps, 0.3, places=6)
@@ -244,6 +250,7 @@ class TestTollCostAndCalibration(CustomTestCase):
             for level in np.linspace(0.0, 20.0, 10):
                 ms = 1.0 + 0.2 * prefix + 0.3 * level + float(rng.normal(0.0, 0.01))
                 shaken.observe_layer("lookahead_cascade", float(prefix), float(level), ms)
+        shaken.refresh()
         shaken_point = shaken.snapshot("lookahead_cascade")
         self.assertEqual(shaken_point.row_knee, 10**9)
         self.assertAlmostEqual(shaken_point.eps, 0.3, places=3)
@@ -255,6 +262,11 @@ class TestTollCostAndCalibration(CustomTestCase):
         self.assertFalse(cached.ready("sync"))
         self.assertEqual(cached.snapshot("sync").w, 0.0)
         cached.observe_layer("sync", 1.0, 4.0, 1.0 + 0.2 * 1.0 + 0.3 * 4.0)
+        for rows in (2.0, 8.0, 16.0, 4.0):
+            cached.observe_target(0.0, rows, 1.0 + 0.1 * rows)
+        self.assertTrue(cached.ready("sync"))
+        self.assertEqual(cached.snapshot("sync").w, 0.0)
+        cached.refresh()
         self.assertTrue(cached.ready("sync"))
         self.assertFalse(uses_fixed_policy(cached, "sync"))
         fitted = cached.snapshot("sync")
@@ -262,6 +274,7 @@ class TestTollCostAndCalibration(CustomTestCase):
         self.assertAlmostEqual(fitted.kappa, 0.2, places=5)
         self.assertAlmostEqual(fitted.eps, 0.3, places=5)
         cached.observe_layer("sync", 0.0, 2.0, 100.0)
+        cached.refresh()
         self.assertAlmostEqual(cached.snapshot("sync").w, fitted.w)
 
     def test_sibling_cap_and_censored_labels(self):
@@ -282,7 +295,14 @@ class TestTollCostAndCalibration(CustomTestCase):
         self.assertLessEqual(float(learned.sum()), 1.0 + 1e-12)
 
     def test_upward_calibration_uses_a_and_does_not_compound(self):
-        calibrator = Calibrator(alpha=1.0, edges=[1e-3, 0.5, 1.0])
+        calibrator = Calibrator(
+            alpha=1.0,
+            edges=[1e-3, 0.5, 1.0],
+            min_samples=1,
+            prior_count=0.0,
+            scale_min=0.0,
+            scale_max=1e6,
+        )
         tree = TollTree(prefix_len=1)
         parent = tree.add_child(-1, token=7, raw_p=1.0, a=1.0)
         tree.add_child(parent, token=9, raw_p=0.2, a=0.2)
@@ -297,6 +317,80 @@ class TestTollCostAndCalibration(CustomTestCase):
         self.assertAlmostEqual(float(tree.a[child]), 0.5)
         capped = calibrator.map([0.4, 0.4], depth=2)
         self.assertLessEqual(float(capped.sum()), 1.0 + 1e-12)
+
+    def test_below_cut_token_is_labeled_when_it_is_real(self):
+        calibrator = Calibrator(
+            alpha=1.0,
+            edges=[1e-4, 0.5, 1.0],
+            min_samples=1,
+            prior_count=0.0,
+            scale_min=0.0,
+            scale_max=1e6,
+        )
+        tree = TollTree(prefix_len=1)
+        parent = tree.add_child(-1, token=7, raw_p=1.0, a=1.0)
+        tree.reject(parent, token=9, raw_p=0.2, a=0.2)
+        calibrator.observe(tree, [7, 9])
+        self.assertEqual(calibrator.labeled, 2)
+        self.assertEqual(calibrator.censored, 0)
+        self.assertAlmostEqual(float(calibrator.map([0.2], depth=2)[0]), 1.0)
+
+    def test_children_of_the_last_committed_node_are_censored(self):
+        calibrator = Calibrator(
+            alpha=1.0,
+            edges=[1e-3, 0.5, 1.0],
+            min_samples=1,
+            prior_count=0.0,
+            scale_min=0.0,
+            scale_max=1e6,
+        )
+        tree = TollTree(prefix_len=1)
+        parent = tree.add_child(-1, token=7, raw_p=1.0, a=1.0)
+        tree.add_child(parent, token=9, raw_p=0.2, a=0.2)
+        calibrator.observe(tree, [7])
+        self.assertEqual(calibrator.labeled, 1)
+        self.assertEqual(calibrator.censored, 1)
+        self.assertAlmostEqual(float(calibrator.map([0.2], depth=2)[0]), 0.2)
+
+    def test_one_sample_does_not_raise_the_scale(self):
+        calibrator = Calibrator()
+        tree = TollTree(prefix_len=1)
+        parent = tree.add_child(-1, token=7, raw_p=1.0, a=1.0)
+        tree.add_child(parent, token=9, raw_p=1e-4, a=1e-4)
+        untouched = Calibrator().map([1e-4], depth=2)
+        calibrator.observe(tree, [7, 9])
+        self.assertTrue(np.allclose(calibrator.map([1e-4], depth=2), untouched))
+
+    def test_fixed_width_and_fixed_k_are_not_ready(self):
+        model = TierCostModel(probe_interval=1, warmup_rounds=1)
+        for _ in range(8):
+            model.observe_layer("sync", 0.0, 19.0, 5.4)
+            model.observe_target(0.0, 19.0, 39.0)
+        model.refresh()
+        self.assertFalse(model.ready("sync"))
+        self.assertTrue(uses_fixed_policy(model, "sync"))
+        point = model.snapshot("sync")
+        self.assertAlmostEqual(point.w, 5.4, places=4)
+        self.assertAlmostEqual(point.eps, 0.0)
+        self.assertFalse(point.layer_rows_identified)
+        self.assertAlmostEqual(point.w_t, 39.0, places=4)
+        self.assertAlmostEqual(point.beta, 0.0)
+        self.assertFalse(point.target_rows_identified)
+        self.assertAlmostEqual(model.t_ar_s(2), 0.039, places=6)
+        self.assertAlmostEqual(model.lambda_prior(2), 2.0 / 0.039, places=6)
+
+    def test_autoregressive_time_feeds_price_and_speculation(self):
+        model = TierCostModel(probe_interval=1, warmup_rounds=1)
+        for rows in (1.0, 2.0, 4.0):
+            model.observe_layer("sync", 0.0, rows, 1.0 + 0.1 * rows)
+            model.observe_target(0.0, rows, 1000.0)
+        model.refresh()
+        self.assertAlmostEqual(model.t_ar_s(2), 1.0, places=6)
+        self.assertAlmostEqual(model.lambda_prior(2), 2.0, places=6)
+        tracker = PriceTracker()
+        self.assertAlmostEqual(tracker.price(2, model.lambda_prior(2)), 2.0)
+        self.assertTrue(should_speculate(2.0, bs=2, t_ar=model.t_ar_s(2)))
+        self.assertFalse(should_speculate(1.0, bs=2, t_ar=model.t_ar_s(2)))
 
     def test_gain_log_grid_ema_and_empty_prior(self):
         table = GainTable()
@@ -526,6 +620,31 @@ class TestTollDecide(CustomTestCase):
         self.assertFalse(should_speculate(0.5, bs=2, t_ar=1.0))
         self.assertTrue(should_speculate(2.0, bs=2, t_ar=1.0))
         self.assertFalse(should_speculate(2.0, bs=2, t_ar=1.0, delta=0.1))
+
+    def test_unseen_depth_reuses_shallower_phi(self):
+        cfg = TollConfig()
+        cost = CostPoint(
+            w=0.25,
+            kappa=0.0,
+            eps=0.0,
+            eps_plus=0.0,
+            row_knee=10**9,
+            beta=0.0,
+            beta_plus=0.0,
+            node_knee=10**9,
+            rtt_ms=0.0,
+            ms_per_byte=0.0,
+        )
+        gain = GainTable(grid=_HAND_GRID)
+        gain.observe([1.0], depth=1)
+        tree = TollTree(prefix_len=1)
+        root = tree.add_child(-1, token=1, raw_p=0.8, a=0.8)
+        child = tree.add_child(root, token=2, raw_p=0.8, a=0.8)
+        tree.set_frontier([child])
+        decision = decide_layer([tree], 1.0, cost, gain, cfg)
+        self.assertTrue(decision.grow)
+        self.assertFalse(tree.exited)
+        self.assertAlmostEqual(decision.gains[0], 0.64, places=6)
 
 
 class TestTollTree(CustomTestCase):

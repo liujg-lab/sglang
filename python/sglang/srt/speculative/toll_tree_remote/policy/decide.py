@@ -54,12 +54,13 @@ def _bucket_at_least(buckets: tuple[int, ...], need: int) -> int:
     return int(buckets[-1])
 
 
-def _kth_largest(values: list[float], k: int) -> float:
+def _kth_largest(values, k: int) -> float:
     """1-based order statistic. Missing ranks contribute 0."""
-    if k <= 0 or len(values) < k:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if k <= 0 or array.size < int(k):
         return 0.0
-    ordered = sorted(values, reverse=True)
-    return float(ordered[k - 1])
+    pivot = array.size - int(k)
+    return float(np.partition(array, pivot)[pivot])
 
 
 def _layer_toll(lam: float, cost: CostPoint, n_active: int, width: int) -> float:
@@ -123,19 +124,20 @@ def decide_layer(
             cuts.append(0.0)
             depth_blocked = True
             continue
-        masses = [float(v) for v in tree.pi.tolist()]
-        cut = max(cut_floor, _kth_largest(masses, int(cfg.k_max)))
-        ranked = sorted(
-            (int(i) for i in tree.frontier.tolist()),
-            key=lambda i: float(tree.pi[i]),
-            reverse=True,
-        )
-        kept = [i for i in ranked if float(tree.pi[i]) > cut][: int(cfg.w_max)]
-        total = 0.0
+        cut = max(cut_floor, _kth_largest(tree.pi, int(cfg.k_max)))
+        frontier = np.asarray(tree.frontier, dtype=np.int64)
+        if frontier.size:
+            ranked = frontier[np.argsort(-tree.pi[frontier], kind="stable")]
+            kept_ids = ranked[tree.pi[ranked] > cut][: int(cfg.w_max)]
+        else:
+            kept_ids = frontier
+        kept = [int(node) for node in kept_ids.tolist()]
         depth = int(tree.depth[kept[0]]) if kept else 0
-        for node in kept:
-            pi = float(tree.pi[node])
-            total += pi * float(gain.estimate(pi, cut, depth))
+        if kept:
+            kept_pi = tree.pi[kept_ids]
+            total = float(np.sum(kept_pi * gain.estimate_many(kept_pi, cut, depth)))
+        else:
+            total = 0.0
         variable = float(cost.kappa) * float(tree.prefix_len) + float(cost.eps) * float(len(kept))
         score = total - float(lam) * variable
         gains.append(total)
