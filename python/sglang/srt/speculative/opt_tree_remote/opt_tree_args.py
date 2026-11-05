@@ -32,12 +32,15 @@ def apply_opt_tree_settings(server_args, *, on_npu: bool) -> None:
             "Max running requests is reset to 48 for OPT_TREE_REMOTE. "
             "You can override this by explicitly setting --max-running-requests."
         )
-    if server_args.speculative_verify_mode == "rpd":
-        raise ValueError(
-            "OPT_TREE_REMOTE does not support --speculative-verify-mode rpd."
-        )
     if server_args.opt_tree_role not in ("target", "draft"):
         raise ValueError("OPT_TREE_REMOTE requires --opt-tree-role {target|draft}.")
+    if (
+        server_args.speculative_verify_mode == "rpd"
+        and server_args.opt_tree_role != "target"
+    ):
+        raise ValueError(
+            "OPT_TREE_REMOTE accepts --speculative-verify-mode rpd only on the target."
+        )
     if server_args.opt_tree_width is None:
         raise ValueError("OPT_TREE_REMOTE requires --opt-tree-width.")
     if server_args.opt_tree_max_depth is None:

@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.opt_tree_remote.opt_tree_layout import (
     build_tree_from_parents,
+    clear_opt_no_draft_links,
     pack_verify_draft_token,
 )
 from sglang.srt.speculative.standalone_remote.verifier.sr_worker import (
@@ -63,6 +64,7 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
         roots: List[int] = []
         token_rows: List[List[int]] = []
         parent_rows: List[List[int]] = []
+        no_draft: List[bool] = []
         for req in list(batch.reqs)[:bs]:
             if len(req.output_ids) > 0:
                 roots.append(int(req.output_ids[-1]))
@@ -74,7 +76,9 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
             if parents is None:
                 parents = [-1] * len(tokens)
             parents = [int(p) for p in parents]
-            if len(tokens) != width or len(parents) != width:
+            missing = len(tokens) != width or len(parents) != width
+            no_draft.append(missing)
+            if missing:
                 tokens = (tokens + [0] * width)[:width]
                 parents = (parents + [-1] * width)[:width]
             token_rows.append(tokens)
@@ -82,6 +86,9 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
 
         parent_index = torch.tensor(parent_rows, dtype=torch.long)
         layout = build_tree_from_parents(parent_index, cpu_lens[:bs].long())
+        clear_opt_no_draft_links(
+            layout.retrive_next_token, layout.retrive_next_sibling, no_draft
+        )
         draft_token = pack_verify_draft_token(roots, token_rows).to(device=device)
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -115,6 +122,28 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        self._opt_rpd_owner = self._attach_rpd_input(
+            spec_info, batch, roots, token_rows, parent_rows, no_draft, device
+        )
         if not wrote_mask or not wrote_pos:
             self._maybe_update_graph_verify_buffers(spec_info)
         return spec_info
+
+    def _attach_rpd_input(
+        self, spec_info, batch, roots, token_rows, parent_rows, no_draft, device
+    ):
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_rpd import (
+            attach_opt_rpd_input,
+        )
+
+        return attach_opt_rpd_input(
+            getattr(self, "_opt_rpd_owner", None),
+            self.server_args,
+            spec_info,
+            batch,
+            roots,
+            token_rows,
+            parent_rows,
+            no_draft,
+            device,
+        )

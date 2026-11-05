@@ -210,6 +210,22 @@ def _reference_triples(ref):
     return sorted(triples)
 
 
+def _link_children(layout):
+    nxt = layout.retrive_next_token
+    sib = layout.retrive_next_sibling
+    batch, width = nxt.shape
+    children = []
+    for row in range(int(batch)):
+        kids = [[] for _ in range(int(width))]
+        for parent in range(int(width)):
+            child = int(nxt[row, parent])
+            while child != -1:
+                kids[parent].append(child)
+                child = int(sib[row, child])
+        children.append(kids)
+    return children
+
+
 class OptTreeRemoteTest(CustomTestCase):
     def test_config_rejects_bad_values(self):
         with self.assertRaises(ValueError):
@@ -626,8 +642,25 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(ok.speculative_num_draft_tokens, ok.opt_tree_width + 1)
 
         rpd = self._opt_server_args(speculative_verify_mode="rpd")
-        with self.assertRaises(ValueError):
-            apply_opt_tree_settings(rpd, on_npu=False)
+        apply_opt_tree_settings(rpd, on_npu=False)
+        self.assertEqual(rpd.speculative_eagle_topk, rpd.opt_tree_width)
+
+        draft_rpd = self._opt_server_args(
+            opt_tree_role="draft",
+            speculative_verify_mode="rpd",
+            speculative_num_draft_tokens=4,
+        )
+        with self.assertRaises(ValueError) as draft_rpd_err:
+            apply_opt_tree_settings(draft_rpd, on_npu=False)
+        self.assertIn("only on the target", str(draft_rpd_err.exception))
+
+        bad_role = self._opt_server_args(
+            opt_tree_role="verifier", speculative_verify_mode="rpd"
+        )
+        with self.assertRaises(ValueError) as bad_role_err:
+            apply_opt_tree_settings(bad_role, on_npu=False)
+        self.assertIn("--opt-tree-role", str(bad_role_err.exception))
+        self.assertNotIn("rpd", str(bad_role_err.exception))
 
         target_short = self._opt_server_args(speculative_num_draft_tokens=4)
         with self.assertRaises(ValueError):
@@ -687,6 +720,244 @@ class OptTreeRemoteTest(CustomTestCase):
         self.assertEqual(
             filled_draft.speculative_num_steps, filled_draft.opt_tree_max_depth
         )
+
+    def test_opt_rpd_parent_slots_match_tree(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_layout import (
+            clear_opt_no_draft_links,
+            opt_parent_slots,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            build_sr_rpd_input,
+        )
+
+        parent_rows = [[-1, 0, 1, -1], [-1, -1, 0, 1]]
+        no_draft = [False, False]
+        slots = opt_parent_slots(parent_rows, no_draft)
+        for row, parents in zip(slots, parent_rows):
+            self.assertEqual(
+                row,
+                [-1] + [0 if parent < 0 else parent + 1 for parent in parents],
+            )
+        layout = build_tree_from_parents(
+            torch.tensor(parent_rows, dtype=torch.long),
+            torch.tensor([3, 5], dtype=torch.long),
+        )
+        tokens = [[2, 3, 4, 5], [6, 7, 8, 9]]
+        owner = SimpleNamespace(generation=1, rpd_input=None, unresolved=False)
+        context = build_sr_rpd_input(
+            torch.tensor([1, 1], dtype=torch.int64),
+            torch.tensor(tokens, dtype=torch.int64),
+            torch.tensor(parent_rows, dtype=torch.int64),
+            torch.zeros((2, 4), dtype=torch.int64),
+            topk=4,
+            steps=6,
+            width=5,
+            vocab=32,
+            owner=owner,
+            generation=owner.generation,
+            parent_slots=slots,
+        )
+        self.assertIsNotNone(context)
+        self.assertEqual(
+            context.topology.children, _link_children(layout)
+        )
+        for batch, slot, parent in context.edges:
+            self.assertEqual(parent, slots[batch][slot])
+
+        missing = [False, True]
+        missing_slots = opt_parent_slots(parent_rows, missing)
+        self.assertEqual(missing_slots[1], [-1, -1, -1, -1, -1])
+        clear_opt_no_draft_links(
+            layout.retrive_next_token, layout.retrive_next_sibling, missing
+        )
+        self.assertTrue(torch.all(layout.retrive_next_token[1] == -1))
+        self.assertTrue(torch.all(layout.retrive_next_sibling[1] == -1))
+        self.assertGreater(int(layout.retrive_next_token[0, 0]), 0)
+        missing_owner = SimpleNamespace(generation=1, rpd_input=None, unresolved=False)
+        missing_context = build_sr_rpd_input(
+            torch.tensor([1, 1], dtype=torch.int64),
+            torch.tensor(tokens, dtype=torch.int64),
+            torch.tensor(parent_rows, dtype=torch.int64),
+            torch.zeros((2, 4), dtype=torch.int64),
+            topk=4,
+            steps=6,
+            width=5,
+            vocab=32,
+            owner=missing_owner,
+            generation=1,
+            parent_slots=missing_slots,
+        )
+        self.assertTrue(all(batch == 0 for batch, _slot, _parent in missing_context.edges))
+        self.assertEqual(
+            missing_context.topology.children[1], [[] for _ in range(5)]
+        )
+
+    def test_opt_rpd_tau0_matches_greedy(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_layout import (
+            opt_parent_slots,
+        )
+        from sglang.srt.speculative.rpd_verify import _rpd_select_host
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            build_sr_rpd_input,
+        )
+        from sglang.srt.speculative.tree_verify import verify_tree_greedy_ref
+
+        draft_n = 4
+        width = draft_n + 1
+        vocab = 64
+        gen = torch.Generator().manual_seed(5)
+        parent_rows = [[-1, 0, 1, -1]]
+        token_rows = [[2, 3, 4, 5]]
+        roots = [1]
+        for _ in range(5):
+            parents = [-1]
+            for index in range(1, draft_n):
+                parents.append(int(torch.randint(-1, index, (1,), generator=gen).item()))
+            parent_rows.append(parents)
+            token_rows.append([20 + index for index in range(draft_n)])
+            roots.append(8)
+        bs = len(parent_rows)
+        slots = opt_parent_slots(parent_rows, [False] * bs)
+        layout = build_tree_from_parents(
+            torch.tensor(parent_rows, dtype=torch.long),
+            torch.ones(bs, dtype=torch.long),
+        )
+        candidates = torch.tensor(
+            [[root, *tokens] for root, tokens in zip(roots, token_rows)],
+            dtype=torch.long,
+        )
+        logits = torch.randn(bs * width, vocab, generator=gen)
+        logits[0].fill_(-1)
+        logits[0, 2] = 10
+        logits[1].fill_(-1)
+        logits[1, 3] = 10
+        logits[2].fill_(-1)
+        logits[2, 4] = 10
+        logits[3].fill_(-1)
+        logits[3, 9] = 10
+        logits[4].fill_(-1)
+        logits[4, 0] = 10
+        star = logits.argmax(dim=-1).reshape(bs, width)
+        predicts = torch.zeros(bs * width, dtype=torch.int32)
+        accept_index = torch.full((bs, width), -1, dtype=torch.int32)
+        accept_length = torch.empty(bs, dtype=torch.int32)
+        verify_tree_greedy_ref(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            retrive_index=layout.retrive_index,
+            retrive_next_token=layout.retrive_next_token,
+            retrive_next_sibling=layout.retrive_next_sibling,
+            target_predict=star,
+        )
+        owner = SimpleNamespace(generation=1, rpd_input=None, unresolved=False)
+        context = build_sr_rpd_input(
+            torch.tensor(roots, dtype=torch.int64),
+            torch.tensor(token_rows, dtype=torch.int64),
+            torch.tensor(parent_rows, dtype=torch.int64),
+            torch.zeros((bs, draft_n), dtype=torch.int64),
+            topk=draft_n,
+            steps=8,
+            width=width,
+            vocab=vocab,
+            owner=owner,
+            generation=1,
+            parent_slots=slots,
+        )
+        edge_count = len(context.edges)
+        accept, _lengths, _folded = _rpd_select_host(
+            context.topology,
+            star.tolist(),
+            [[0.0] * edge_count, [0.0] * edge_count],
+            0.0,
+            True,
+            width,
+            bs * width,
+            bs * width + 1,
+        )
+        self.assertEqual(accept, accept_index.tolist())
+        self.assertEqual(accept[0][:4], [0, 1, 2, 3])
+
+    def test_opt_rpd_attach_keeps_sr_packet(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_rpd import (
+            attach_opt_rpd_input,
+        )
+
+        server_args = SimpleNamespace(
+            speculative_verify_mode="auto",
+            opt_tree_width=3,
+            opt_tree_max_depth=6,
+        )
+        packet = SimpleNamespace(generation=7, rpd_input="sr-packet", unresolved=False)
+        roots = [1, 4]
+        token_rows = [[2, 3, 4], [0, 0, 0]]
+        parent_rows = [[-1, 0, 1], [-1, -1, -1]]
+        no_draft = [False, True]
+        reqs = [
+            SimpleNamespace(output_ids=[1], sr_step_id=None),
+            SimpleNamespace(output_ids=[4, 5], sr_step_id=2),
+        ]
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(vocab_size=32),
+            reqs=reqs,
+        )
+        device = torch.device("cpu")
+        skipped = SimpleNamespace()
+        owner = attach_opt_rpd_input(
+            None, server_args, skipped, batch, roots, token_rows, parent_rows, no_draft, device
+        )
+        self.assertIsNone(owner)
+        self.assertFalse(hasattr(skipped, "sr_rpd_input"))
+
+        server_args.speculative_verify_mode = "rpd"
+        server_args.opt_tree_width = 1
+        narrow = SimpleNamespace()
+        owner = attach_opt_rpd_input(
+            owner, server_args, narrow, batch, [1], [[2]], [[-1]], [False], device
+        )
+        self.assertIsNone(owner)
+        self.assertFalse(hasattr(narrow, "sr_rpd_input"))
+
+        server_args.opt_tree_width = 3
+        spec = SimpleNamespace()
+        owner = attach_opt_rpd_input(
+            owner, server_args, spec, batch, roots, token_rows, parent_rows, no_draft, device
+        )
+        self.assertIs(spec.sr_rpd_input, owner.rpd_input)
+        self.assertTrue(spec.sr_rpd_input.current())
+        self.assertEqual(packet.generation, 7)
+        self.assertEqual(packet.rpd_input, "sr-packet")
+        self.assertTrue(
+            all(row == 0 for row, _slot, _parent in spec.sr_rpd_input.edges)
+        )
+        self.assertEqual(spec.sr_rpd_input.topology.children[1], [[] for _ in range(4)])
+        spec_next = SimpleNamespace()
+        owner = attach_opt_rpd_input(
+            owner, server_args, spec_next, batch, roots, token_rows, parent_rows, no_draft, device
+        )
+        self.assertFalse(spec.sr_rpd_input.current())
+        self.assertTrue(spec_next.sr_rpd_input.current())
+        self.assertEqual(owner.generation, 2)
+        owner.unresolved = True
+        with self.assertRaises(RuntimeError):
+            attach_opt_rpd_input(
+                owner,
+                server_args,
+                SimpleNamespace(),
+                batch,
+                roots,
+                token_rows,
+                parent_rows,
+                no_draft,
+                device,
+            )
 
     def test_local_spec_shape_opt_uses_tree_width(self):
         from types import SimpleNamespace

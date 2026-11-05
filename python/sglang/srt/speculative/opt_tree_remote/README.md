@@ -68,7 +68,7 @@ PYTHONPATH=python python3.10 test/registered/unit/spec/test_opt_tree_remote.py -
 
 ## 启动命令
 
-先启动 Target，等服务就绪后再启动 Draft。HTTP 请求只发到 Target 端口。两端的 N、τ 和 `max_depth` 必须相同。`--opt-tree-width` 是树宽 N，`--opt-tree-max-depth` 含种子层。未写 `--speculative-num-draft-tokens` 时，Target 填 N + 1（验证 token 数，含已提交尾 token），Draft 填 N（每层前向宽度）。手写该参数必须等于本角色的期望值。未写 `--speculative-num-steps` 时它等于 `max_depth`，手写时也必须等于 `max_depth`。线上 `spec_shape` 是 `(N, max_depth, N)`，与角色无关。不要开启 RPD。CUDA 的 `--page-size` 是 1，NPU 是 128。
+先启动 Target，等服务就绪后再启动 Draft。HTTP 请求只发到 Target 端口。两端的 N、τ 和 `max_depth` 必须相同。`--opt-tree-width` 是树宽 N，`--opt-tree-max-depth` 含种子层。未写 `--speculative-num-draft-tokens` 时，Target 填 N + 1（验证 token 数，含已提交尾 token），Draft 填 N（每层前向宽度）。手写该参数必须等于本角色的期望值。未写 `--speculative-num-steps` 时它等于 `max_depth`，手写时也必须等于 `max_depth`。线上 `spec_shape` 是 `(N, max_depth, N)`，与角色无关。默认验证是 greedy。Target 可以额外加 `--speculative-verify-mode rpd` 和 `--speculative-rpd-tau`。`--opt-tree-tau` 决定树长多深，`--speculative-rpd-tau` 决定验证放宽多少。Draft 不接受 RPD，建树规则不变。CUDA 的 `--page-size` 是 1，NPU 是 128。
 
 Target：
 
@@ -80,6 +80,25 @@ python -m sglang.launch_server \
   --opt-tree-width 4 \
   --opt-tree-tau 0.5 \
   --opt-tree-max-depth 10 \
+  --opt-tree-addr <draft-host> \
+  --opt-tree-port <rpc-port> \
+  --attention-backend triton \
+  --page-size 1 \
+  --port <target-http-port>
+```
+
+Target，开启 RPD 时再加验证参数。Draft 命令不加这两项：
+
+```bash
+python -m sglang.launch_server \
+  --model-path <target-model> \
+  --speculative-algorithm OPT_TREE_REMOTE \
+  --opt-tree-role target \
+  --opt-tree-width 4 \
+  --opt-tree-tau 0.5 \
+  --opt-tree-max-depth 10 \
+  --speculative-verify-mode rpd \
+  --speculative-rpd-tau 0.2 \
   --opt-tree-addr <draft-host> \
   --opt-tree-port <rpc-port> \
   --attention-backend triton \

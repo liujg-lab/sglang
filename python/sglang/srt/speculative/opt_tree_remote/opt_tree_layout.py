@@ -63,6 +63,57 @@ def _validate_parents(row: Sequence[int]) -> List[int]:
     return hops
 
 
+def opt_parent_slots(
+    parent_rows: Sequence[Sequence[int]],
+    no_draft: Sequence[bool],
+) -> List[List[int]]:
+    """Verify-slot parents for one OPT batch.
+
+    Slot 0 is the committed tail and stays ``-1``. A draft parent of ``-1``
+    attaches to that tail at slot 0; any other parent shifts by one. A row
+    with no draft keeps every slot at ``-1``, so RPD builds no edges there.
+    """
+    if len(parent_rows) != len(no_draft):
+        raise ValueError(
+            f"parent rows {len(parent_rows)} != no_draft flags {len(no_draft)}"
+        )
+    slots: List[List[int]] = []
+    for row, missing in zip(parent_rows, no_draft):
+        if missing:
+            slots.append([-1] * (len(row) + 1))
+            continue
+        slots.append(
+            [-1] + [0 if int(parent) < 0 else int(parent) + 1 for parent in row]
+        )
+    return slots
+
+
+def clear_opt_no_draft_links(
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    no_draft: Sequence[bool],
+) -> None:
+    """Drop draft children on rows that have no real draft.
+
+    The verify kernel still reads slot 0. Clearing both link rows leaves only
+    the root bonus for those requests, including the token-0 padding OPT writes
+    when a draft row is short.
+    """
+    rows = [i for i, flag in enumerate(no_draft) if flag]
+    if not rows:
+        return
+    for tensor in (retrive_next_token, retrive_next_sibling):
+        if tensor is None or not torch.is_tensor(tensor) or tensor.numel() == 0:
+            continue
+        limit = int(tensor.shape[0])
+        kept = [row for row in rows if 0 <= row < limit]
+        if not kept:
+            continue
+        tensor.index_fill_(
+            0, torch.tensor(kept, dtype=torch.long, device=tensor.device), -1
+        )
+
+
 def pack_verify_draft_token(
     roots: Sequence[int],
     token_rows: Sequence[Sequence[int]],
