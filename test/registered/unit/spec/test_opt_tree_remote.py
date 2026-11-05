@@ -2207,12 +2207,14 @@ class OptTreeRemoteTest(CustomTestCase):
         original = forward._forward_verify_batch
         try:
             forward._forward_verify_batch = fake_batch
-            rows = forward._forward_verify_fitting(radix, runners, steps)
+            rows, forwards = forward._forward_verify_fitting(radix, runners, steps)
             self.assertEqual(seen, [2, 1])
             self.assertEqual(len(rows), 3)
+            self.assertEqual(forwards, 2)
             seen.clear()
-            forward._forward_verify_fitting(chunk, runners, steps)
+            _rows, forwards = forward._forward_verify_fitting(chunk, runners, steps)
             self.assertEqual(seen, [1, 1, 1])
+            self.assertEqual(forwards, 3)
         finally:
             forward._forward_verify_batch = original
 
@@ -2264,7 +2266,10 @@ class OptTreeRemoteTest(CustomTestCase):
 
             def forward_active(steps, indices):
                 chosen = [runners[i] for i in indices]
-                return forward._forward_verify_fitting(scheduler, chosen, steps)
+                rows, _n_forwards = forward._forward_verify_fitting(
+                    scheduler, chosen, steps
+                )
+                return rows
 
             original = forward._forward_verify_batch
             try:
@@ -2539,7 +2544,7 @@ class OptTreeRemoteTest(CustomTestCase):
             return [([1], [-1], [0])]
 
         def fitting(_scheduler, _runners, _steps, **_kwargs):
-            return [torch.zeros(1)]
+            return [torch.zeros(1)], 1
 
         metrics = get_sr_round_metrics(host, "Draft")
         with patch.object(forward, "ingest_tail_logits", ingest), patch.object(
@@ -3564,7 +3569,7 @@ class OptTreeRemoteTest(CustomTestCase):
             active.layer_slots.append(torch.tensor([200, 201]))
             active.req.kv_allocated_len = active.cached_len + n
             active.cached_len += n
-            return [torch.zeros(n, 4)]
+            return [torch.zeros(n, 4)], 1
 
         with patch(
             "sglang.srt.speculative.opt_tree_remote.opt_tree_forward._forward_verify_fitting",
@@ -3718,9 +3723,11 @@ class OptTreeRemoteTest(CustomTestCase):
         )
 
         groups = []
+        forwards = {"n": 1}
 
         def fitting(_scheduler, runners, _steps, **_kwargs):
             groups.append([runner.req.rid for runner in runners])
+            return [], forwards["n"]
 
         def host():
             return SimpleNamespace(
@@ -3773,6 +3780,17 @@ class OptTreeRemoteTest(CustomTestCase):
             self.assertEqual(groups, [["a"], ["b"]])
             self.assertEqual(
                 get_sr_round_metrics(split, "Draft").counts[
+                    "opt_layer_forwards_deferred"
+                ],
+                2,
+            )
+            groups.clear()
+            forwards["n"] = 2
+            tight = host()
+            forward_deferred_final_layers(tight, [job("a", 2), job("b", 2)])
+            self.assertEqual(groups, [["a", "b"]])
+            self.assertEqual(
+                get_sr_round_metrics(tight, "Draft").counts[
                     "opt_layer_forwards_deferred"
                 ],
                 2,
@@ -4529,6 +4547,42 @@ def _load_opt_expand_one():
     return ns["_opt_expand_one"]
 
 
+def _load_opt_step_rtt_host():
+    """Load the STEP RTT overrides without the scheduler's kernel imports."""
+    import time
+    from pathlib import Path
+
+    from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+        get_sr_round_metrics,
+    )
+
+    class _Parent:
+        def _sr_send_step(self, reqs):
+            return self.sent
+
+        def _sr_recv(self, inflight):
+            return inflight
+
+    class _Clock:
+        perf_counter = time.perf_counter
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/speculative/opt_tree_remote/opt_tree_scheduler.py"
+    )
+    src = path.read_text()
+    start = src.index("    def _opt_step_rtt_enabled(")
+    end = src.index("\n    @property\n    def is_remote_spec_draft(")
+    ns = {
+        "_Parent": _Parent,
+        "time": _Clock,
+        "get_sr_round_metrics": get_sr_round_metrics,
+    }
+    code = "class _Host(_Parent):\n" + src[start:end]
+    exec(compile(code, str(path), "exec"), ns)
+    return ns["_Host"], _Clock
+
+
 def _expand_admit_host():
     host = _opt_stage_host()
     host._sr_device_poisoned = False
@@ -5234,6 +5288,110 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertEqual(syncs, [1, 1])
         self.assertEqual(metrics.counts["opt_ingest_gpu_us"], 5500)
         self.assertEqual(host._opt_ingest_events, [])
+
+    def test_drain_reads_select_events_and_drops_them_when_poisoned(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.opt_tree_remote import opt_tree_forward as forward
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+            drain_opt_layer_gpu_us,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        syncs = []
+        host = _layer_timing_host()
+        metrics = get_sr_round_metrics(host, "Draft")
+        host._opt_select_events = [(_TimingEvent(), _TimingEvent())]
+
+        with patch.object(
+            forward.torch, "get_device_module", lambda _device: _TimingDevice(syncs, [])
+        ):
+            drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(syncs, [1])
+        self.assertEqual(metrics.counts["opt_layer_select_gpu_us"], 1500)
+        self.assertEqual(host._opt_select_events, [])
+        self.assertEqual(metrics.counts["opt_layer_gpu_us"], 0)
+
+        syncs.clear()
+        drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(syncs, [])
+        self.assertEqual(metrics.counts["opt_layer_select_gpu_us"], 1500)
+
+        host._sr_device_poisoned = True
+        host._opt_select_events = [(_TimingEvent(), _TimingEvent())]
+        with patch.object(
+            forward.torch, "get_device_module", lambda _device: _TimingDevice(syncs, [])
+        ):
+            drain_opt_layer_gpu_us(host, metrics)
+        self.assertEqual(syncs, [])
+        self.assertEqual(metrics.counts["opt_layer_select_gpu_us"], 1500)
+        self.assertEqual(host._opt_select_events, [])
+
+    def test_opt_step_rtt_counts_only_a_successful_target_step(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        Host, clock = _load_opt_step_rtt_host()
+
+        def make(opt, role):
+            host = Host()
+            host.spec_algorithm = SimpleNamespace(is_opt_tree_remote=lambda: opt)
+            host.server_args = SimpleNamespace(opt_tree_role=role)
+            return host
+
+        inflight = SimpleNamespace(send_ok=True, wait_reply=True)
+        host = make(True, "target")
+        host.sent = ([], [], inflight)
+        with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
+            self.assertIs(host._sr_send_step([])[2], inflight)
+            self.assertIs(host._sr_recv(inflight), inflight)
+        metrics = get_sr_round_metrics(host, "Target")
+        self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
+        self.assertIsNone(host._opt_step_sent_at)
+
+        failed = SimpleNamespace(send_ok=False, wait_reply=True)
+        host.sent = ([], [], failed)
+        host._sr_send_step([])
+        host._sr_recv(failed)
+        self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
+        self.assertIsNone(host._opt_step_sent_at)
+
+        quiet = SimpleNamespace(send_ok=True, wait_reply=False)
+        host.sent = ([], [], quiet)
+        with patch.object(clock, "perf_counter", _SampleClock([5.0])):
+            host._sr_send_step([])
+        host._sr_recv(quiet)
+        self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(host._opt_step_sent_at, 5.0)
+
+        other_inflight = SimpleNamespace(send_ok=True, wait_reply=True)
+        step = SimpleNamespace(send_ok=True, wait_reply=True)
+        paired = make(True, "target")
+        paired.sent = ([], [], step)
+        with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
+            paired._sr_send_step([])
+            paired._sr_recv(other_inflight)
+            paired._sr_recv(step)
+        self.assertEqual(
+            get_sr_round_metrics(paired, "Target").counts["opt_step_rtt_us"], 250
+        )
+        self.assertIsNone(paired._opt_step_sent_at)
+
+        for opt, role in ((False, "target"), (True, "draft")):
+            skipped = make(opt, role)
+            skipped.sent = ([], [], inflight)
+            skipped._sr_send_step([])
+            skipped._sr_recv(inflight)
+            self.assertEqual(
+                get_sr_round_metrics(skipped, "Target").counts["opt_step_rtt_us"],
+                0,
+            )
+            self.assertFalse(hasattr(skipped, "_opt_step_sent_at"))
 
     def test_launch_wait_syncs_only_after_a_previous_layer(self):
         import os

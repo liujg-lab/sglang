@@ -102,6 +102,47 @@ def drain_deferred_layer_events(scheduler, metrics, *, defer_drain, jobs) -> Non
 
 
 class OptTreeSchedulerMixin:
+    def _opt_step_rtt_enabled(self) -> bool:
+        """STEP RTT is an OPT Target counter. This mixin is on every scheduler."""
+        algo = getattr(self, "spec_algorithm", None)
+        args = getattr(self, "server_args", None)
+        return (
+            algo is not None
+            and algo.is_opt_tree_remote()
+            and getattr(args, "opt_tree_role", None) == "target"
+        )
+
+    def _sr_send_step(self, reqs):
+        result = super()._sr_send_step(reqs)
+        if not self._opt_step_rtt_enabled():
+            return result
+        inflight = result[2]
+        if inflight is not None and getattr(inflight, "send_ok", False):
+            self._opt_step_sent_at = time.perf_counter()
+            self._opt_step_inflight_id = id(inflight)
+        else:
+            self._opt_step_sent_at = None
+            self._opt_step_inflight_id = None
+        return result
+
+    def _sr_recv(self, inflight):
+        sent = getattr(self, "_opt_step_sent_at", None)
+        expected = getattr(self, "_opt_step_inflight_id", None)
+        result = super()._sr_recv(inflight)
+        if (
+            self._opt_step_rtt_enabled()
+            and sent is not None
+            and inflight is not None
+            and getattr(inflight, "wait_reply", False)
+            and id(inflight) == expected
+        ):
+            self._opt_step_sent_at = None
+            self._opt_step_inflight_id = None
+            get_sr_round_metrics(self, "Target").counts["opt_step_rtt_us"] += int(
+                (time.perf_counter() - sent) * 1e6
+            )
+        return result
+
     @property
     def is_remote_spec_draft(self) -> bool:
         if (

@@ -493,20 +493,30 @@ class _LayerTiming:
       the start of the ``_run`` window, so the interval includes host
       preparation while the stream is idle. It is not GPU-busy time. Confirm
       busy and idle with nsys; do not subtract ``launch_us``.
-    - ``opt_layer_forwards`` counts every queued layer, including the last one
-      lookahead submits early. ``opt_layer_forwards_critical`` is that count
-      minus one, matching the old path's pre-reply forwards.
-      ``opt_layer_forwards_deferred`` counts a last layer that
-      ``forward_deferred_final_layers`` actually forwards after the reply.
-      Requests that share a depth count once. A lookahead layer already in
-      ``opt_layer_forwards`` is not counted again. A failed replay is not
-      counted.
+    - ``opt_layer_forwards`` counts every queued ``_forward_verify_batch``
+      and every lookahead ``launch_layer``, including the last one lookahead
+      submits early. Requests that share a depth and fit in one forward count
+      once. A KV-budget split counts once per sub-batch.
+      ``opt_layer_forwards_critical`` is the lookahead launch count minus
+      one, matching the old path's pre-reply forwards.
+      ``opt_layer_forwards_deferred`` counts each finished
+      ``_forward_verify_batch`` that ``forward_deferred_final_layers`` runs
+      after the reply. A depth group that fits in one forward still counts
+      once. A group split by the KV budget counts once per sub-batch. A
+      lookahead layer already in ``opt_layer_forwards`` is not counted again.
+      A failed replay is not counted.
     - ``opt_ingest_gpu_us`` is each ingest ``_run_batch``. The start event is
       recorded immediately before that call, so host planning and allocation
       are outside the interval. Stream idle inside ``_run_batch`` can still
       be included. Chunked extend and a two-token decode gap each add one
       pair. The pairs are read in the same drain as the layer events. An
       unpaired start is dropped.
+    - ``opt_layer_select_gpu_us`` is ``ev0.elapsed_time(ev1)`` around
+      ``_vocab_topk``, ``expand_on_device``, and ``copy_expand`` on each
+      non-final lookahead expansion. The seed top-k, the stopping bonus
+      top-k, ``clone_cpu``, and ``launch_layer`` sit outside. A fallback
+      drops pairs already queued. Divide by ``opt_layer_forwards_critical``.
+      A zero denominator means the window did not finish a lookahead expand.
 
     Per-layer ``opt_layer_host_us``, ``opt_layer_launch_us``, and
     ``opt_layer_gpu_us`` use
@@ -682,8 +692,36 @@ def _note_lookahead_launch_wait(runner) -> None:
     )
 
 
+def _begin_select_timing(scheduler):
+    """Start one expand top-k interval. Absent when round metrics are off."""
+    if _draft_metrics(scheduler) is None:
+        return None
+    try:
+        factory = torch.get_device_module(scheduler.device).Event
+        pair = (factory(enable_timing=True), factory(enable_timing=True))
+        pair[0].record()
+    except Exception:
+        return None
+    return pair
+
+
+def _finish_select_timing(scheduler, pair) -> None:
+    """Queue the expand interval. A raise before this leaves it uncounted."""
+    if pair is None:
+        return
+    try:
+        pair[1].record()
+    except Exception:
+        return
+    events = getattr(scheduler, "_opt_select_events", None)
+    if not isinstance(events, list):
+        events = []
+        scheduler._opt_select_events = events
+    events.append(pair)
+
+
 def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
-    """Read queued verify and ingest events once, after the grow clock has stopped.
+    """Read queued verify, ingest, and select events once.
 
     An empty queue does not synchronize. A poisoned device drops the events.
     ``elapsed_time`` is milliseconds. Other timing errors increment
@@ -692,15 +730,22 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
     """
     events = list(getattr(scheduler, "_opt_layer_events", None) or [])
     ingest = getattr(scheduler, "_opt_ingest_events", None)
+    select = getattr(scheduler, "_opt_select_events", None)
     scheduler._opt_layer_events = []
     scheduler._opt_ingest_events = []
     scheduler._opt_ingest_open = None
+    scheduler._opt_select_events = []
     pairs = [
         pair
         for pair in (ingest if isinstance(ingest, list) else [])
         if isinstance(pair, tuple) and len(pair) == 2
     ]
-    if not events and not pairs:
+    select_pairs = [
+        pair
+        for pair in (select if isinstance(select, list) else [])
+        if isinstance(pair, tuple) and len(pair) == 2
+    ]
+    if not events and not pairs and not select_pairs:
         return
     if metrics is None or getattr(scheduler, "_sr_device_poisoned", False):
         return
@@ -726,6 +771,15 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
         try:
             metrics.counts["opt_ingest_gpu_us"] += int(
                 start.elapsed_time(end) * 1000
+            )
+        except Exception as exc:
+            if is_device_context_error(exc):
+                raise
+            metrics.counts["device_timing_dropped_opt_layer"] += 1
+    for ev0, ev1 in select_pairs:
+        try:
+            metrics.counts["opt_layer_select_gpu_us"] += int(
+                ev0.elapsed_time(ev1) * 1000
             )
         except Exception as exc:
             if is_device_context_error(exc):
@@ -1705,6 +1759,10 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
     is copied: the next replay overwrites that output buffer before
     ``_commit_prob_rows`` reads the returned rows. The last group stays a
     view because the caller reads it before the next layer.
+
+    The second return is the number of ``_forward_verify_batch`` calls that
+    finished. A later sub-batch that raises leaves those earlier calls
+    uncounted: the exception propagates and this function does not return.
     """
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
@@ -1712,6 +1770,7 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
     width = int(scheduler.server_args.opt_tree_width)
     pending = list(zip(runners, steps))
     rows = []
+    forwards = 0
     while pending:
         group_pairs = _take_verify_group(
             [runner for runner, _step in pending],
@@ -1723,6 +1782,7 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
         count = len(group_runners)
         group_steps = [step for _runner, step in pending[:count]]
         logits = _forward_verify_batch(scheduler, group_runners, group_steps)
+        forwards += 1
         group_rows = _as_layer_rows(logits, count, width)
         if consume is not None:
             consume(group_runners, group_rows)
@@ -1730,7 +1790,7 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
             group_rows = [row.clone() for row in group_rows]
         rows.extend(group_rows)
         pending = pending[count:]
-    return rows
+    return rows, forwards
 
 
 def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
@@ -3366,6 +3426,7 @@ def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtim
                 runner._lookahead_bonus = bonus
                 runner.lookahead_inflight = True
                 return [_verify_window(step)], state, layers
+            select = _begin_select_timing(scheduler)
             child_scores, child_ids = _vocab_topk(runner._last_logits, n + 1)
             top_scores, tokens, parents, anc = expand_on_device(
                 runner._la_weight, runner._la_anc, child_scores, child_ids, n
@@ -3373,16 +3434,19 @@ def grow_lookahead(scheduler, runner, config: OptTreeConfig, tail_logits, runtim
             slot = slots[turn]
             turn ^= 1
             slot.copy_expand(top_scores, tokens, parents, child_ids)
+            _finish_select_timing(scheduler, select)
             next_depth = int(state.depth) + 1
             runner._la_weight = top_scores
             runner._la_anc = anc
             runner.launch_layer(tokens, anc, next_depth, batch)
             layers += 1
     except LookaheadFallback:
+        scheduler._opt_select_events = []
         _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
         _reset_lookahead_runner(scheduler, runner)
         raise
     except Exception as exc:
+        scheduler._opt_select_events = []
         _reraise_device_context(scheduler, exc)
         _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
         _reset_lookahead_runner(scheduler, runner)
@@ -3464,7 +3528,10 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
     Publish clears those columns, so the guess forward cannot follow it.
     A lookahead job already queued that last layer. It only installs the
     top-k ids, unless the request can no longer keep the slots. Each
-    successful depth group increments ``opt_layer_forwards_deferred``.
+    finished ``_forward_verify_batch`` increments
+    ``opt_layer_forwards_deferred``. A depth group that fits in one forward
+    still counts once. A group split by the KV budget counts once per
+    sub-batch. A failed group adds nothing.
     """
     try:
         for job in jobs:
@@ -3489,7 +3556,7 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
             by_depth.setdefault(int(job.state.depth), []).append(job)
         for group in by_depth.values():
             try:
-                _forward_verify_fitting(
+                _rows, n_forwards = _forward_verify_fitting(
                     scheduler,
                     [job.runner for job in group],
                     [final_layer_step(job.state) for job in group],
@@ -3501,7 +3568,9 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
                 _reraise_device_context(scheduler, exc)
                 logger.warning("[OPT] deferred final layer failed: %s", exc)
             else:
-                _opt_draft_count(scheduler, "opt_layer_forwards_deferred")
+                _opt_draft_count(
+                    scheduler, "opt_layer_forwards_deferred", n_forwards
+                )
         skipped_ids = {id(job) for job in skipped}
         for job in skipped:
             _drop_stored_logits(job.runner)
@@ -3709,10 +3778,11 @@ def grow_batch(scheduler, reqs):
 
         def forward_active(steps, indices):
             nonlocal layers
-            layers += 1
-            return _forward_verify_fitting(
+            rows, n_forwards = _forward_verify_fitting(
                 scheduler, [runners[i] for i in indices], steps
             )
+            layers += n_forwards
+            return rows
 
         t1 = time.perf_counter()
         topk_out = [[] for _ in runners]
