@@ -4552,6 +4552,7 @@ def _load_opt_step_rtt_host():
     import time
     from pathlib import Path
 
+    from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
     from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
         get_sr_round_metrics,
     )
@@ -4559,6 +4560,10 @@ def _load_opt_step_rtt_host():
     class _Parent:
         def _sr_send_step(self, reqs):
             return self.sent
+
+        def _sr_send(self, action, reqs, include_full_context):
+            self.sent_action = action
+            return self.direct
 
         def _sr_recv(self, inflight):
             return inflight
@@ -4577,6 +4582,7 @@ def _load_opt_step_rtt_host():
         "_Parent": _Parent,
         "time": _Clock,
         "get_sr_round_metrics": get_sr_round_metrics,
+        "SRAction": SRAction,
     }
     code = "class _Host(_Parent):\n" + src[start:end]
     exec(compile(code, str(path), "exec"), ns)
@@ -5332,6 +5338,7 @@ class OptLookaheadOpsTest(unittest.TestCase):
     def test_opt_step_rtt_counts_only_a_successful_target_step(self):
         from unittest.mock import patch
 
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
             get_sr_round_metrics,
         )
@@ -5392,6 +5399,34 @@ class OptLookaheadOpsTest(unittest.TestCase):
                 0,
             )
             self.assertFalse(hasattr(skipped, "_opt_step_sent_at"))
+
+        fetched = make(True, "target")
+        direct = SimpleNamespace(send_ok=True, wait_reply=True)
+        fetched.direct = direct
+        with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
+            self.assertIs(fetched._sr_send(SRAction.STEP, [], False), direct)
+            self.assertIs(fetched._sr_recv(direct), direct)
+        self.assertEqual(
+            get_sr_round_metrics(fetched, "Target").counts["opt_step_rtt_us"], 250
+        )
+        self.assertIsNone(fetched._opt_step_sent_at)
+
+        fetched._opt_step_sent_at = 9.0
+        fetched._opt_step_inflight_id = 123
+        prefill = SimpleNamespace(send_ok=True, wait_reply=True)
+        fetched.direct = prefill
+        fetched._sr_send(SRAction.PREFILL, [], True)
+        self.assertEqual(fetched._opt_step_sent_at, 9.0)
+        self.assertEqual(fetched._opt_step_inflight_id, 123)
+        fetched._sr_recv(prefill)
+        self.assertEqual(
+            get_sr_round_metrics(fetched, "Target").counts["opt_step_rtt_us"], 250
+        )
+
+        fetched.direct = None
+        fetched._sr_send(SRAction.STEP, [], False)
+        self.assertIsNone(fetched._opt_step_sent_at)
+        self.assertIsNone(fetched._opt_step_inflight_id)
 
     def test_launch_wait_syncs_only_after_a_previous_layer(self):
         import os

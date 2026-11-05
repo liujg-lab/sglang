@@ -112,6 +112,29 @@ class OptTreeSchedulerMixin:
             and getattr(args, "opt_tree_role", None) == "target"
         )
 
+    def _sr_send(self, action, reqs, include_full_context):
+        """Stamp every OPT Target STEP, including ``rpc_next_draft``.
+
+        ``_sr_send_step`` calls this and then stamps again, so the accept path
+        keeps its existing start. PREFILL, FINISH, and ABORT leave a previous
+        STEP stamp alone. A failed STEP clears it.
+        """
+        inflight = super()._sr_send(action, reqs, include_full_context)
+        if not self._opt_step_rtt_enabled() or action != SRAction.STEP:
+            return inflight
+        ok = (
+            inflight is not None
+            and getattr(inflight, "send_ok", False)
+            and getattr(inflight, "wait_reply", False)
+        )
+        if ok:
+            self._opt_step_sent_at = time.perf_counter()
+            self._opt_step_inflight_id = id(inflight)
+        else:
+            self._opt_step_sent_at = None
+            self._opt_step_inflight_id = None
+        return inflight
+
     def _sr_send_step(self, reqs):
         result = super()._sr_send_step(reqs)
         if not self._opt_step_rtt_enabled():
