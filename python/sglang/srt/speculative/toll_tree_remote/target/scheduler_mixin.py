@@ -68,7 +68,8 @@ class TollTargetSchedulerMixin:
         self._toll_last_reply_ns = time.perf_counter_ns()
         url = f"tcp://{self.server_args.toll_tree_addr}:{self.server_args.toll_tree_port}"
         if self.tp_rank == 0:
-            self.toll_client = TollTargetClient(url, self.toll_cfg)
+            timeout_ms = int(getattr(self.server_args, "toll_tree_rpc_timeout_ms", 5000) or 5000)
+            self.toll_client = TollTargetClient(url, self.toll_cfg, timeout_ms=timeout_ms)
         else:
             self.toll_client = None
 
@@ -229,7 +230,8 @@ class TollTargetSchedulerMixin:
             self.process_batch_result(batch, result)
             return
         req.toll_reply = reply
-        result = self.model_worker.forward_batch_generation(batch)
+        batch.draft_num_tokens = int(self.server_args.speculative_num_draft_tokens)
+        result = self.run_batch(batch)
         self.process_batch_result(batch, result)
 
     @DynamicGradMode()

@@ -148,6 +148,16 @@ def sync_kv_from_cpu_lengths(batch, seq_lens_cpu_pre, accept_length_per_req_cpu)
         req.kv_allocated_len = committed
 
 
+def note_decode_token(req, token: int) -> None:
+    """Append one ordinary-decode token and apply the request's own stop rule."""
+    req.output_ids.append(int(token))
+    req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
+    req.len_output_ids = len(req.output_ids)
+    checker = getattr(req, "check_finished", None)
+    if callable(checker):
+        checker()
+
+
 def account_verify_step(batch) -> None:
     for req in getattr(batch, "reqs", None) or ():
         if is_health_check(req):
@@ -265,9 +275,10 @@ class TollTreeRemoteWorker:
             if is_health_check(req):
                 continue
             if index < len(next_ids) and next_ids[index] is not None:
-                req.output_ids.append(int(next_ids[index]))
-            req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
-            req.len_output_ids = len(req.output_ids)
+                note_decode_token(req, int(next_ids[index]))
+            else:
+                req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
+                req.len_output_ids = len(req.output_ids)
             counted = True
         if counted:
             self.ar_fallback_rounds += 1

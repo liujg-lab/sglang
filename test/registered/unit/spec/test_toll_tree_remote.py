@@ -99,6 +99,11 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
         args.disable_cuda_graph = False
         with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
+        args.disable_cuda_graph = True
+        args.toll_tree_role = "draft"
+        args.tp_size = 2
+        with self.assertRaises(ValueError):
+            args._handle_speculative_decoding()
 
 
 def _request(cfg, seq=1):
@@ -482,6 +487,17 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
         baseline = [1, 2, 3, 10, 11, 12]
         gold = fake.draft_window("gold", baseline, 3, 3)
         self.assertEqual(gold, ([10, 11, 12], [-1, 0, 1]))
+        reply = fake.make_reply("s", 1, "a", 3, gold[0], gold[1], 8, "OK")
+        decoded = decode_reply(encode_reply(reply), TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0))
+        self.assertEqual(decoded.reqs[0].tokens, [10, 11, 12])
+        rejected = fake.make_reply("s", 1, "a", 3, gold[0], gold[1], 3, "OK")
+        empty = decode_reply(
+            encode_reply(rejected),
+            TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0),
+        )
+        self.assertEqual(empty.reqs[0].tokens, [])
+        with self.assertRaises(SystemExit):
+            fake.draft_window("gold", baseline, 99, 3)
         wrong = fake.draft_window("wrong", baseline, 3, 3)
         self.assertEqual(wrong[0], [11, 12, 13])
         pad = fake.draft_window("pad", baseline, 3, 3)
@@ -702,6 +718,56 @@ class TestTollDraftPool(CustomTestCase):
         self.assertTrue(module.row_matches_decode(layer, decode))
         layer[0, 0] = 5.0
         self.assertFalse(module.row_matches_decode(layer, decode))
+
+    def test_a_missing_draft_state_accepts_a_full_step(self):
+        from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import TollDraftService
+
+        kv = _SlotPool()
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=10.0, max_depth=2)
+
+        def root(_item):
+            scores = np.full(8, 0.2, dtype=np.float64)
+            return scores, np.arange(8)
+
+        service = TollDraftService(
+            cfg,
+            forward=lambda item, slots: ([], []),
+            alloc=kv.alloc,
+            free=kv.free,
+            req_factory=lambda rid, ids: SimpleNamespace(
+                rid=rid,
+                origin_input_ids=list(ids),
+                output_ids=[],
+                fill_ids=list(ids),
+                req_pool_idx=None,
+                kv_committed_len=0,
+            ),
+            root_topk=root,
+            layer_forward=lambda *args: [],
+        )
+        service.state.reqs.clear()
+        reply = service.handle(
+            _toll_request(cfg, TollAction.STEP, 1, [1, 2, 3, 4], [1, 2, 3, 4], 4)
+        )
+        self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+        self.assertGreater(len(reply.reqs[0].tokens), 0)
+        self.assertEqual(service._pending_commits["a"], [])
+
+    def test_ordinary_decode_stops_on_eos_and_length(self):
+        try:
+            from sglang.srt.managers.schedule_batch import Req
+            from sglang.srt.sampling.sampling_params import SamplingParams
+        except ImportError:
+            self.skipTest("request objects are not importable")
+        from sglang.srt.speculative.toll_tree_remote.target.worker import note_decode_token
+
+        short = Req("len", "", [1], SamplingParams(max_new_tokens=1, temperature=0.0))
+        note_decode_token(short, 7)
+        self.assertTrue(short.finished())
+        eos = Req("eos", "", [1], SamplingParams(max_new_tokens=8, temperature=0.0))
+        eos.eos_token_ids = {99}
+        note_decode_token(eos, 99)
+        self.assertTrue(eos.finished())
 
 
 def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len, rid="a"):

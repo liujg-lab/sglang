@@ -20,6 +20,29 @@ class DraftForwardError(RuntimeError):
     """A real draft forward failed. The step returns an empty draft."""
 
 
+def is_device_context_error(exc: BaseException) -> bool:
+    """True when the accelerator context is already dead and must not become an empty draft."""
+    name = type(exc).__name__
+    if name in ("AcceleratorError", "CUDAError", "NPUError", "XPUError"):
+        return True
+    try:
+        import torch
+
+        accel = getattr(torch, "AcceleratorError", None)
+    except Exception:
+        accel = None
+    if accel is not None and isinstance(exc, accel):
+        return True
+    message = str(exc).lower()
+    return (
+        "illegal memory access" in message
+        or "device-side assert" in message
+        or "cudaerrorillegaladdress" in message
+        or "npu error" in message
+        or ("ascend" in message and "illegal" in message)
+    )
+
+
 class TollDraftService:
     """PREFILL writes the prefix. STEP appends the commit, then runs one round."""
 
@@ -52,6 +75,8 @@ class TollDraftService:
         self._round_open = False
         self._pending_commits: dict[str, list[int]] = {}
         self._pending_target_ms = 0.0
+        self._net_ms = 0.0
+        self._net_bytes = 0.0
         self.state = DraftStateStore(ttl_s)
         self.kv: dict[str, TreeKV] = {}
         self.prefix_slots: dict[str, list[int]] = {}
@@ -106,53 +131,72 @@ class TollDraftService:
         for rid in self.state.expire():
             self._drop(rid)
 
-    def close_round(self, net_ms: float, net_bytes: float, now_ns: int | None = None) -> None:
-        """Record this RPC after the reply has been sent, then label the previous tree."""
+    def begin_round(self, net_ms: float, net_bytes: float) -> None:
+        """Network figures for the RPC that is about to run. The first RPC is zero."""
+        self._net_ms = max(0.0, float(net_ms))
+        self._net_bytes = max(0.0, float(net_bytes))
+
+    def close_round(self) -> None:
+        """Label the previous tree after the reply has been sent."""
         if not self._round_open:
             return
-        self.round.on_step(
-            time.perf_counter_ns() if now_ns is None else int(now_ns),
-            self._pending_commits,
-            bs_prev=1,
-            continuous=True,
-            net_ms=float(net_ms),
-            net_bytes=float(net_bytes),
-            target_ms=float(self._pending_target_ms),
-        )
         self.round.after_reply()
         self._round_open = False
 
-    def _prefill(self, request, item) -> TollReply:
-        from sglang.srt.speculative.toll_tree_remote.draft.reqs import make_draft_req
+    def _empty_after_error(self, request, exc: BaseException) -> TollReply:
+        if is_device_context_error(exc):
+            raise exc
+        self.empty_forwards += 1
+        return self._reply(request, [], TollStatus.EMPTY)
 
+    def _prefill(self, request, item) -> TollReply:
         ids = [int(token) for token in item.input_ids]
         if not ids:
             ids = [0] * int(item.commit_len)
+        try:
+            self._materialize(item.rid, ids, int(item.commit_len) or len(ids))
+        except Exception as exc:
+            return self._empty_after_error(request, exc)
+        return self._reply(request, [], TollStatus.OK)
+
+    def _materialize(self, rid: str, ids: list[int], commit_len: int) -> None:
+        from sglang.srt.speculative.toll_tree_remote.draft.reqs import make_draft_req
+
         factory = self.req_factory or make_draft_req
-        req = factory(item.rid, ids)
+        req = factory(rid, ids)
         slots = self._alloc_exact(len(ids)) if ids else []
         if ids and slots is None:
-            return self._reply(request, [], TollStatus.EMPTY)
-        self.prefix_slots[item.rid] = list(slots or [])
-        self.reqs[item.rid] = req
-        self.kv[item.rid] = TreeKV(self.alloc, self.free)
+            raise DraftForwardError(f"draft {rid} has no prefix slots")
+        self.prefix_slots[rid] = list(slots or [])
+        self.reqs[rid] = req
+        self.kv[rid] = TreeKV(self.alloc, self.free)
         if self.ingest is not None:
-            self.ingest(req, self.prefix_slots[item.rid])
+            self.ingest(req, self.prefix_slots[rid])
         prefix = len(ids)
-        self.state.upsert(item.rid, prefix, int(item.commit_len) or prefix)
-        return self._reply(request, [], TollStatus.OK)
+        self.state.upsert(rid, prefix, int(commit_len) or prefix)
 
     def _step(self, request, item) -> TollReply:
         from sglang.srt.speculative.toll_tree_remote.policy.round import RoundReq
 
+        full = [int(token) for token in item.input_ids]
         stored = self.state.get(item.rid)
         if stored is None:
-            return self._reply(request, [], TollStatus.NEED_SNAPSHOT)
+            if not full:
+                return self._reply(request, [], TollStatus.NEED_SNAPSHOT)
+            try:
+                self._materialize(item.rid, full, len(full))
+            except Exception as exc:
+                return self._empty_after_error(request, exc)
+            stored = self.state.get(item.rid)
+            if stored is None:
+                return self._reply(request, [], TollStatus.EMPTY)
         try:
-            delta = self._take_commit(item, stored)
-        except DraftForwardError:
-            self.empty_forwards += 1
-            return self._reply(request, [], TollStatus.EMPTY)
+            if int(item.commit_len) == int(stored.commit_len) and full and int(item.commit_len) == len(full):
+                delta = []
+            else:
+                delta = self._take_commit(item, stored)
+        except Exception as exc:
+            return self._empty_after_error(request, exc)
         if delta is None:
             return self._reply(request, [], TollStatus.NEED_SNAPSHOT)
         self._rid = item.rid
@@ -161,6 +205,15 @@ class TollDraftService:
         self._pending_commits = {item.rid: list(delta)}
         self._pending_target_ms = int(request.t_target_ns) / 1e6
         try:
+            self.round.on_step(
+                time.perf_counter_ns(),
+                {item.rid: list(delta)},
+                bs_prev=1,
+                continuous=True,
+                net_ms=self._net_ms,
+                net_bytes=self._net_bytes,
+                target_ms=self._pending_target_ms,
+            )
             top = self._root(item)
             result = self.round.run(
                 [RoundReq(item.rid, stored.prefix_len)],
@@ -168,11 +221,10 @@ class TollDraftService:
                 self._forward,
                 kv_ok=self._kv_ok,
             )
-        except DraftForwardError:
-            self.empty_forwards += 1
+        except Exception as exc:
             self._rollback_tree(item.rid)
             self._round_open = False
-            return self._reply(request, [], TollStatus.EMPTY)
+            return self._empty_after_error(request, exc)
         self._rollback_tree(item.rid)
         self.cols.clear()
         self.slot_of_node = {}
@@ -256,7 +308,7 @@ class TollDraftService:
                 return None
             stored.commit_len = len(full)
             stored.prefix_len = len(full)
-            return full
+            return []
         return None
 
     def _suffix_matches(self, stored, delta, full) -> bool:
@@ -353,9 +405,12 @@ class TollDraftSchedulerMixin:
         from sglang.srt.speculative.toll_tree_remote.transport import TollDraftServer
 
         cfg = TollConfig.from_server_args(self.server_args, "draft")
-        url = f"tcp://{self.server_args.toll_tree_addr}:{self.server_args.toll_tree_port}"
+        url = f"tcp://*:{self.server_args.toll_tree_port}"
         self.toll_cfg = cfg
         self._toll_root_logits = None
+        self._toll_last_send_ns = None
+        self._toll_rpc_bytes = 0
+        self._toll_check_left = 4
         self.toll_server = TollDraftServer(url)
         self.toll_draft = TollDraftService(
             cfg,
@@ -453,6 +508,7 @@ class TollDraftSchedulerMixin:
                 slots,
                 int(self.toll_draft.cached_len),
             )
+            self._toll_maybe_check_layer(tree, kept, logits)
             elapsed = (time.perf_counter() - started) * 1000.0
             probs, ids = topc_from_logits(logits, int(width))
             outputs.append(
@@ -463,6 +519,29 @@ class TollDraftSchedulerMixin:
                 )
             )
         return outputs
+
+    def _toll_reject_http(self) -> None:
+        waiting = list(getattr(self, "waiting_queue", []) or [])
+        if not waiting:
+            return
+        self.waiting_queue.clear()
+        message = "TOLL_TREE_REMOTE draft does not accept HTTP. Send requests to the target."
+        for req in waiting:
+            req.set_finish_with_abort(message)
+            if callable(getattr(req, "check_finished", None)):
+                req.check_finished()
+            self.stream_output([req], bool(getattr(req, "return_logprob", False)))
+
+    def _toll_maybe_check_layer(self, tree, kept, logits) -> None:
+        from sglang.srt.speculative.toll_tree_remote.draft.check_layer import (
+            check_enabled,
+            reference_and_report,
+        )
+
+        if not kept or not check_enabled() or self._toll_check_left <= 0:
+            return
+        self._toll_check_left -= 1
+        reference_and_report(self, self.toll_draft.reqs[self.toll_draft._rid], tree, int(kept[0]), logits)
 
     @property
     def is_remote_spec_draft(self) -> bool:
@@ -478,15 +557,23 @@ class TollDraftSchedulerMixin:
         self.init_toll_tree_communication()
         while True:
             self.process_input_requests(self.recv_requests())
+            self._toll_reject_http()
+            before = int(self.toll_server.bytes_recv) + int(self.toll_server.bytes_sent)
             request = self.toll_server.recv_request(timeout_ms=50)
             if request is None:
                 self.toll_draft.expire_idle()
                 continue
-            started = time.perf_counter()
-            before = int(self.toll_server.bytes_recv) + int(self.toll_server.bytes_sent)
+            now = time.perf_counter_ns()
+            if self._toll_last_send_ns is None:
+                net_ms = 0.0
+            else:
+                gap_ns = now - int(self._toll_last_send_ns) - int(request.t_target_ns)
+                net_ms = max(0.0, gap_ns / 1e6)
+            self.toll_draft.begin_round(net_ms, self._toll_rpc_bytes)
             reply = self.toll_draft.handle(request)
             reply.residence_ns = self.toll_server.residence_ns()
             self.toll_server.send_reply(reply)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._toll_last_send_ns = time.perf_counter_ns()
             after = int(self.toll_server.bytes_recv) + int(self.toll_server.bytes_sent)
-            self.toll_draft.close_round(elapsed_ms, max(0, after - before))
+            self._toll_rpc_bytes = max(0, after - before)
+            self.toll_draft.close_round()

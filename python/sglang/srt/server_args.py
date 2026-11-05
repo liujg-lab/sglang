@@ -574,6 +574,7 @@ class ServerArgs:
     toll_tree_role: Optional[Literal["target", "draft"]] = None
     toll_tree_addr: str = "127.0.0.1"
     toll_tree_port: str = "30039"
+    toll_tree_rpc_timeout_ms: int = 5000
 
     # Expert parallelism
     ep_size: int = 1
@@ -3057,6 +3058,8 @@ class ServerArgs:
             raise ValueError(
                 "TOLL_TREE_REMOTE requires --toll-tree-role target or draft."
             )
+        if self.toll_tree_role == "draft" and int(self.tp_size) != 1:
+            raise ValueError("TOLL_TREE_REMOTE draft requires tp=1.")
         if not self.disable_cuda_graph or not self.disable_piecewise_cuda_graph:
             raise ValueError(
                 "TOLL_TREE_REMOTE requires --disable-cuda-graph and "
@@ -5736,6 +5739,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.toll_tree_port,
             help="TCP port for the TOLL_TREE_REMOTE control RPC.",
+        )
+        parser.add_argument(
+            "--toll-tree-rpc-timeout-ms",
+            type=int,
+            default=ServerArgs.toll_tree_rpc_timeout_ms,
+            help="How long the target waits for one draft reply.",
         )
 
         # Expert parallelism

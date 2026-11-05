@@ -294,7 +294,7 @@ class TollRound:
         for col in range(state.width):
             key = (int(state.parents[depth, col]), int(state.tokens[depth, col]))
             chosen[key] = chosen.get(key, 0) + 1
-        fresh = []
+        node_of: dict[tuple[int, int], list[int]] = {}
         for parent_col in range(taken.shape[0]):
             parent = previous[parent_col]
             mapped = self._mapped_group(tree, parent, taken[parent_col])
@@ -302,9 +302,20 @@ class TollRound:
                 key = (parent_col, int(token))
                 if chosen.get(key, 0) > 0:
                     chosen[key] -= 1
-                    fresh.append(tree.add_child(parent, int(token), float(raw), float(cond)))
+                    node_of.setdefault(key, []).append(
+                        tree.add_child(parent, int(token), float(raw), float(cond))
+                    )
                 else:
                     tree.reject(parent, int(token), float(raw), float(cond))
+        fresh = []
+        for col in range(state.width):
+            key = (int(state.parents[depth, col]), int(state.tokens[depth, col]))
+            bucket = node_of.get(key) or []
+            if not bucket:
+                raise RuntimeError(
+                    f"fixed frontier is missing state column {col} parent/token {key}"
+                )
+            fresh.append(bucket.pop(0))
         tree.set_frontier(fresh)
 
     def _observe_phi(self, tree: TollTree) -> None:

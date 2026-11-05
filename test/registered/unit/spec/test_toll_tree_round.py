@@ -232,6 +232,72 @@ class TestTollRound(CustomTestCase):
         driver.after_reply()
         self.assertAlmostEqual(float(calib.map([0.01], depth=2)[0]), 1.0)
 
+    def test_token_dependent_children_match_opt(self):
+        width, vocab, tau, max_depth = 8, 32, 0.0, 4
+        cfg = TollConfig(policy="fixed", fixed_width=width, fixed_tau=tau, max_depth=max_depth)
+
+        def row_for(token):
+            center = (int(token) + 1) % vocab
+            raw = np.asarray(
+                [
+                    1.0 / (1.0 + abs(index - center)) + (vocab - index) * 1e-4
+                    for index in range(vocab)
+                ],
+                dtype=np.float64,
+            )
+            return (raw / raw.sum()).astype(np.float32)
+
+        def matrix_for(parent_tokens):
+            return np.stack([row_for(token) for token in parent_tokens])
+
+        def top_rows(matrix):
+            order = np.argsort(-matrix, axis=-1, kind="stable")[:, :width]
+            scores = np.take_along_axis(matrix, order, axis=-1)
+            return scores, order
+
+        root = row_for(3)
+        root_order = np.argsort(-root, kind="stable")[:width]
+
+        def forward(trees, frontiers, asked):
+            tree = trees[0]
+            parents = [int(tree.token[int(node)]) for node in list(frontiers[0])]
+            self.assertEqual(len(parents), width)
+            return [(*top_rows(matrix_for(parents)), 1.0)]
+
+        driver = _driver(cfg)
+        driver.on_step(0, {}, bs_prev=1, continuous=True, net_ms=1.0, net_bytes=0.0, target_ms=1.0)
+        result = driver.run([RoundReq("r", 4)], [(root[root_order], root_order)], forward)
+        state = OptTreeState.create(OptTreeConfig(width=width, tau=tau, max_depth=max_depth))
+        step = update(state, torch.tensor(root))
+        while not step.is_final:
+            parents = state.tokens[state.depth - 1].tolist()
+            step = update(state, torch.tensor(matrix_for(parents)))
+        verify = step.verify
+        self.assertEqual(result.verify[0].tokens, tuple(int(v) for v in verify.tokens.tolist()))
+        self.assertEqual(result.verify[0].parents, tuple(int(v) for v in verify.parents.tolist()))
+
+    def test_target_cost_uses_the_previous_round(self):
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=10.0, max_depth=2)
+        cost = TierCostModel(probe_interval=1, warmup_rounds=0)
+        driver = _driver(cfg, cost=cost)
+        scores = np.full(8, 0.1, dtype=np.float64)
+        ids = np.arange(8)
+        driver.on_step(0, {}, bs_prev=1, continuous=True, net_ms=0.0, net_bytes=0.0, target_ms=0.0)
+        driver.run([RoundReq("a", 3)], [(scores, ids)], lambda *args: [])
+        driver.on_step(
+            1_000_000,
+            {"a": []},
+            bs_prev=1,
+            continuous=True,
+            net_ms=1.0,
+            net_bytes=0.0,
+            target_ms=2.5,
+        )
+        prefix, rows, ms = cost._target[-1]
+        self.assertEqual(prefix, 3.0)
+        self.assertEqual(rows, 8.0)
+        self.assertEqual(ms, 2.5)
+
 
 if __name__ == "__main__":
     unittest.main()
