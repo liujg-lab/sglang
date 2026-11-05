@@ -4559,14 +4559,15 @@ def _load_opt_step_rtt_host():
 
     class _Parent:
         def _sr_send_step(self, reqs):
-            return self.sent
+            inflight = self._sr_send(SRAction.STEP, reqs, False)
+            return [], [], inflight
 
         def _sr_send(self, action, reqs, include_full_context):
             self.sent_action = action
             return self.direct
 
         def _sr_recv(self, inflight):
-            return inflight
+            return self.replies, self.pending
 
     class _Clock:
         perf_counter = time.perf_counter
@@ -5351,64 +5352,75 @@ class OptLookaheadOpsTest(unittest.TestCase):
             host.server_args = SimpleNamespace(opt_tree_role=role)
             return host
 
+        reply = {"rid": object()}
         inflight = SimpleNamespace(send_ok=True, wait_reply=True)
         host = make(True, "target")
-        host.sent = ([], [], inflight)
+        host.direct = inflight
+        host.replies = reply
+        host.pending = {}
         with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
             self.assertIs(host._sr_send_step([])[2], inflight)
-            self.assertIs(host._sr_recv(inflight), inflight)
+            self.assertEqual(host._sr_recv(inflight), (reply, {}))
         metrics = get_sr_round_metrics(host, "Target")
         self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(metrics.counts["opt_step_rtt_samples"], 1)
         self.assertIsNone(host._opt_step_sent_at)
 
         failed = SimpleNamespace(send_ok=False, wait_reply=True)
-        host.sent = ([], [], failed)
+        host.direct = failed
         host._sr_send_step([])
         host._sr_recv(failed)
         self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(metrics.counts["opt_step_rtt_samples"], 1)
         self.assertIsNone(host._opt_step_sent_at)
 
         quiet = SimpleNamespace(send_ok=True, wait_reply=False)
-        host.sent = ([], [], quiet)
+        host.direct = quiet
         with patch.object(clock, "perf_counter", _SampleClock([5.0])):
             host._sr_send_step([])
         host._sr_recv(quiet)
         self.assertEqual(metrics.counts["opt_step_rtt_us"], 250)
-        self.assertEqual(host._opt_step_sent_at, 5.0)
+        self.assertEqual(metrics.counts["opt_step_rtt_samples"], 1)
+        self.assertIsNone(getattr(host, "_opt_step_sent_at", None))
 
         other_inflight = SimpleNamespace(send_ok=True, wait_reply=True)
         step = SimpleNamespace(send_ok=True, wait_reply=True)
         paired = make(True, "target")
-        paired.sent = ([], [], step)
+        paired.direct = step
+        paired.replies = reply
+        paired.pending = {}
         with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
             paired._sr_send_step([])
             paired._sr_recv(other_inflight)
             paired._sr_recv(step)
-        self.assertEqual(
-            get_sr_round_metrics(paired, "Target").counts["opt_step_rtt_us"], 250
-        )
+        paired_metrics = get_sr_round_metrics(paired, "Target")
+        self.assertEqual(paired_metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(paired_metrics.counts["opt_step_rtt_samples"], 1)
         self.assertIsNone(paired._opt_step_sent_at)
 
         for opt, role in ((False, "target"), (True, "draft")):
             skipped = make(opt, role)
-            skipped.sent = ([], [], inflight)
+            skipped.direct = inflight
+            skipped.replies = reply
+            skipped.pending = {}
             skipped._sr_send_step([])
             skipped._sr_recv(inflight)
-            self.assertEqual(
-                get_sr_round_metrics(skipped, "Target").counts["opt_step_rtt_us"],
-                0,
-            )
+            skipped_metrics = get_sr_round_metrics(skipped, "Target")
+            self.assertEqual(skipped_metrics.counts["opt_step_rtt_us"], 0)
+            self.assertEqual(skipped_metrics.counts["opt_step_rtt_samples"], 0)
             self.assertFalse(hasattr(skipped, "_opt_step_sent_at"))
 
         fetched = make(True, "target")
         direct = SimpleNamespace(send_ok=True, wait_reply=True)
         fetched.direct = direct
+        fetched.replies = reply
+        fetched.pending = {}
         with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
             self.assertIs(fetched._sr_send(SRAction.STEP, [], False), direct)
-            self.assertIs(fetched._sr_recv(direct), direct)
-        self.assertEqual(
-            get_sr_round_metrics(fetched, "Target").counts["opt_step_rtt_us"], 250
-        )
+            self.assertEqual(fetched._sr_recv(direct), (reply, {}))
+        fetched_metrics = get_sr_round_metrics(fetched, "Target")
+        self.assertEqual(fetched_metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(fetched_metrics.counts["opt_step_rtt_samples"], 1)
         self.assertIsNone(fetched._opt_step_sent_at)
 
         fetched._opt_step_sent_at = 9.0
@@ -5419,14 +5431,26 @@ class OptLookaheadOpsTest(unittest.TestCase):
         self.assertEqual(fetched._opt_step_sent_at, 9.0)
         self.assertEqual(fetched._opt_step_inflight_id, 123)
         fetched._sr_recv(prefill)
-        self.assertEqual(
-            get_sr_round_metrics(fetched, "Target").counts["opt_step_rtt_us"], 250
-        )
+        self.assertEqual(fetched_metrics.counts["opt_step_rtt_us"], 250)
+        self.assertEqual(fetched_metrics.counts["opt_step_rtt_samples"], 1)
 
         fetched.direct = None
         fetched._sr_send(SRAction.STEP, [], False)
         self.assertIsNone(fetched._opt_step_sent_at)
         self.assertIsNone(fetched._opt_step_inflight_id)
+
+        empty = make(True, "target")
+        missed = SimpleNamespace(send_ok=True, wait_reply=True)
+        empty.direct = missed
+        empty.replies = {}
+        empty.pending = {"rid": object()}
+        with patch.object(clock, "perf_counter", _SampleClock([1.0, 1.0 + 250e-6])):
+            empty._sr_send(SRAction.STEP, [], False)
+            self.assertEqual(empty._sr_recv(missed), ({}, empty.pending))
+        empty_metrics = get_sr_round_metrics(empty, "Target")
+        self.assertEqual(empty_metrics.counts["opt_step_rtt_us"], 0)
+        self.assertEqual(empty_metrics.counts["opt_step_rtt_samples"], 0)
+        self.assertIsNone(empty._opt_step_sent_at)
 
     def test_launch_wait_syncs_only_after_a_previous_layer(self):
         import os

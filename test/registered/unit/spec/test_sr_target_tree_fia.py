@@ -662,6 +662,7 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         self.assertNotIn("graph.update", baked)
         self.assertNotIn("fill_fia_cpu_update_payload", baked)
         self.assertIn("graph.replay", baked)
+        self.assertIn("NpuGraphReplaySubmittedError", baked)
         self.assertIn('record_stage("update_call", 0.0, completed=True)', baked)
         self.assertIn("replay_call", baked)
         capture = _fn_source(_RUNNER, "NPUGraphRunner", "_capture_graph")

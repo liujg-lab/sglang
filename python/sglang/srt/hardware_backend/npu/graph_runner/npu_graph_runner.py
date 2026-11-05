@@ -638,7 +638,12 @@ class NPUGraphRunner(CudaGraphRunner):
                 sample = None
 
         def replay():
-            measure_call(sample, "replay_call", graph.replay)
+            try:
+                measure_call(sample, "replay_call", graph.replay)
+            except Exception as exc:
+                raise NpuGraphReplaySubmittedError(
+                    "NPU baked graph replay failed"
+                ) from exc
 
         def _submit():
             if sample is not None:
