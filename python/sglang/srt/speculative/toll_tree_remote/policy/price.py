@@ -136,8 +136,17 @@ class PriceTracker:
         return abs(fast - slow) / slow >= self.diverge
 
     def price(self, bs: int, model_prior: float) -> float:
-        """λ for this batch size. An empty bucket returns ``model_prior``."""
+        """λ for this batch size, in tokens per second.
+
+        An empty bucket returns ``model_prior``. Decision code converts with
+        ``price_per_ms`` before multiplying a millisecond cost.
+        """
         slot = self._buckets.get(int(bs))
         if slot is None or slot.count <= 0 or slot.sum_dt <= 0.0:
             return float(model_prior)
         return slot.slow_lambda
+
+
+def price_per_ms(lam_tok_per_s: float) -> float:
+    """Convert tok/s into tok/ms. Decision code multiplies costs in milliseconds."""
+    return float(lam_tok_per_s) / 1000.0

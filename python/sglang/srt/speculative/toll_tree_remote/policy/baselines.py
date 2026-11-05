@@ -40,10 +40,7 @@ class _FixedState:
 def _seed(state: _FixedState, probs: np.ndarray) -> None:
     row = np.asarray(probs, dtype=np.float32).reshape(-1)
     scores, ids = _topk_last(row, state.width)
-    state.weight[0] = scores
-    state.tokens[0] = ids
-    state.parents[0] = np.arange(state.width)
-    state.depth = 1
+    _write_seed(state, scores, ids)
 
 
 class FixedPolicy:
@@ -61,11 +58,51 @@ class FixedPolicy:
         self.state.prev_e = self.state.mass()
         _expand(self.state, probs)
 
+    def seed_topk(self, scores, ids) -> None:
+        """Seed from an already chosen top-N. ``scores`` and ``ids`` are ``[N]``."""
+        _write_seed(self.state, scores, ids)
+
+    def expand_topk(self, scores, ids) -> None:
+        """Expand from already chosen child top-N. Both arrays are ``[N, N]``."""
+        self.state.prev_e = self.state.mass()
+        _write_expand(self.state, scores, ids)
+
     def should_grow(self) -> bool:
         return _should_grow(self.state, self.tau)
 
     def finish(self) -> FixedVerify:
         return _finish(self.state)
+
+
+def _write_seed(state: _FixedState, scores, ids) -> None:
+    taken = np.asarray(scores, dtype=np.float32).reshape(-1)
+    tokens = np.asarray(ids, dtype=np.int64).reshape(-1)
+    if taken.size < state.width or tokens.size < state.width:
+        raise ValueError(
+            f"seed top-k {int(taken.size)} is shorter than width {state.width}"
+        )
+    state.weight[0] = taken[: state.width]
+    state.tokens[0] = tokens[: state.width]
+    state.parents[0] = np.arange(state.width)
+    state.depth = 1
+
+
+def _write_expand(state: _FixedState, scores, ids) -> None:
+    taken = np.asarray(scores, dtype=np.float32)
+    tokens = np.asarray(ids, dtype=np.int64)
+    if taken.shape != (state.width, state.width) or tokens.shape != taken.shape:
+        raise ValueError(
+            f"expand top-k shape {taken.shape} != ({state.width}, {state.width})"
+        )
+    path = taken * state.weight[state.depth - 1][:, None]
+    flat_scores = path.reshape(-1)
+    flat_ids = tokens.reshape(-1)
+    top_scores, top_index = _topk_last(flat_scores, state.width)
+    parent_cols = top_index // state.width
+    state.parents[state.depth] = parent_cols
+    state.weight[state.depth] = top_scores
+    state.tokens[state.depth] = flat_ids[top_index]
+    state.depth += 1
 
 
 def _expand(state: _FixedState, probs: np.ndarray) -> None:
@@ -75,15 +112,7 @@ def _expand(state: _FixedState, probs: np.ndarray) -> None:
             f"fixed expand rows {matrix.shape[0]} != width {state.width}"
         )
     child_scores, child_ids = _topk_last(matrix, state.width)
-    path = child_scores * state.weight[state.depth - 1][:, None]
-    flat_scores = path.reshape(-1)
-    flat_ids = child_ids.reshape(-1)
-    top_scores, top_index = _topk_last(flat_scores, state.width)
-    parent_cols = top_index // state.width
-    state.parents[state.depth] = parent_cols
-    state.weight[state.depth] = top_scores
-    state.tokens[state.depth] = flat_ids[top_index]
-    state.depth += 1
+    _write_expand(state, child_scores, child_ids)
 
 
 def _should_grow(state: _FixedState, tau: float) -> bool:

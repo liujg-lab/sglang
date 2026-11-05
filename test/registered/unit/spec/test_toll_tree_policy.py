@@ -1,7 +1,7 @@
 """CPU checks for the TollTree price, cost, and tree rules.
 
 Hand example, one request, λ = 1, w = 0.25, κ = 0, ε = 0, β̃ = 0.03125.
-φ is installed per depth, not left at the empty-table prior of 0.
+φ is installed at the parent depth. Layer 1 uses depth 0.
 
 Layers 1–3 each have eight nodes at π̂ = 0.25. Fewer than K_max = 32 nodes
 are present, so the cut is the floor λ·β̃ = 0.03125 and x = cut/π̂ = 0.125.
@@ -48,7 +48,7 @@ from sglang.srt.speculative.toll_tree_remote.policy.decide import (
     uses_fixed_policy,
 )
 from sglang.srt.speculative.toll_tree_remote.policy.gain import GainTable
-from sglang.srt.speculative.toll_tree_remote.policy.price import PriceTracker
+from sglang.srt.speculative.toll_tree_remote.policy.price import PriceTracker, price_per_ms
 from sglang.srt.speculative.toll_tree_remote.tree.state import TollTree
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -84,7 +84,7 @@ def _hand_cost() -> CostPoint:
 
 def _hand_gain() -> GainTable:
     table = GainTable(grid=_HAND_GRID)
-    for depth, (x, phi) in enumerate(zip(_LAYER_X, _LAYER_PHI), start=1):
+    for depth, (x, phi) in enumerate(zip(_LAYER_X, _LAYER_PHI), start=0):
         table.observe([phi + x], depth)
     return table
 
@@ -264,7 +264,7 @@ class TestTollCostAndCalibration(CustomTestCase):
         cached.observe_layer("sync", 1.0, 4.0, 1.0 + 0.2 * 1.0 + 0.3 * 4.0)
         for rows in (2.0, 8.0, 16.0, 4.0):
             cached.observe_target(0.0, rows, 1.0 + 0.1 * rows)
-        self.assertTrue(cached.ready("sync"))
+        self.assertFalse(cached.ready("sync"))
         self.assertEqual(cached.snapshot("sync").w, 0.0)
         cached.refresh()
         self.assertTrue(cached.ready("sync"))
@@ -460,7 +460,7 @@ class TestTollDecide(CustomTestCase):
         cfg = TollConfig(verify_buckets=(8, 16))
         cost = _hand_cost()
         gain = GainTable(grid=_HAND_GRID)
-        gain.observe([1.0], depth=1)
+        gain.observe([1.0], depth=0)
         tree = TollTree(prefix_len=4)
         nodes = []
         for pi, count, token in ((0.25, 8, 10), (0.125, 8, 20), (0.0625, 4, 30)):
@@ -488,7 +488,7 @@ class TestTollDecide(CustomTestCase):
 
     def test_row_hinge_raises_the_layer_toll(self):
         cfg = TollConfig()
-        gain = _unit_gain(1)
+        gain = _unit_gain(0)
         tree = TollTree(prefix_len=1)
         tree.set_frontier(
             [tree.add_child(-1, token=slot, raw_p=0.05, a=0.05) for slot in range(8)]
@@ -537,7 +537,7 @@ class TestTollDecide(CustomTestCase):
             rtt_ms=0.0,
             ms_per_byte=0.0,
         )
-        gain = _unit_gain(1)
+        gain = _unit_gain(0)
         hard = TollTree(prefix_len=100)
         easy = TollTree(prefix_len=1)
         hard.set_frontier([hard.add_child(-1, token=1, raw_p=0.20, a=0.20)])
@@ -566,7 +566,7 @@ class TestTollDecide(CustomTestCase):
             rtt_ms=0.0,
             ms_per_byte=0.0,
         )
-        gain = _unit_gain(1)
+        gain = _unit_gain(0)
         wide = TollTree(prefix_len=2)
         narrow = TollTree(prefix_len=2)
         wide.set_frontier(
@@ -586,7 +586,7 @@ class TestTollDecide(CustomTestCase):
     def test_depth_matches_brute_force_on_random_chains(self):
         cfg = TollConfig(max_depth=8)
         cost = _hand_cost()
-        gain = _unit_gain(*range(1, 9))
+        gain = _unit_gain(*range(0, 9))
         rng = np.random.default_rng(11)
         for _ in range(20):
             draw = np.sort(rng.random(5))[::-1]
@@ -695,6 +695,10 @@ class TestTollTree(CustomTestCase):
             TollConfig(dp_attention=True)
         with self.assertRaises(ValueError):
             TollConfig(draft_on_npu=True)
+        with self.assertRaises(ValueError):
+            TollConfig(policy="fixed", fixed_width=1, fixed_tau=0.0)
+        with self.assertRaises(ValueError):
+            TollConfig(policy="fixed", fixed_width=19, fixed_tau=0.0)
 
 
 class TestFixedMatchesOpt(CustomTestCase):
@@ -738,6 +742,76 @@ class TestFixedMatchesOpt(CustomTestCase):
             self.assertIsNotNone(verify)
             self.assertEqual(got.tokens, tuple(int(v) for v in verify.tokens.tolist()))
             self.assertEqual(got.parents, tuple(int(v) for v in verify.parents.tolist()))
+
+    def test_expand_topk_matches_full_vocab_and_opt(self):
+        rng = np.random.default_rng(5)
+        width, max_depth, vocab, tau = 4, 4, 20, 0.02
+        root = rng.random(vocab).astype(np.float32)
+        expands = [rng.random((width, vocab)).astype(np.float32) for _ in range(max_depth)]
+        full = FixedPolicy(width, tau, max_depth)
+        top = FixedPolicy(width, tau, max_depth)
+        full.seed(root)
+        order = np.argsort(-root, kind="stable")[:width]
+        top.seed_topk(root[order], order)
+        self.assertTrue(np.array_equal(full.state.tokens[0], top.state.tokens[0]))
+        cursor = 0
+        while full.should_grow() and cursor < len(expands):
+            matrix = expands[cursor]
+            child_order = np.argsort(-matrix, axis=-1, kind="stable")[:, :width]
+            child_scores = np.take_along_axis(matrix, child_order, axis=-1)
+            self.assertTrue(full.should_grow())
+            full.expand(matrix)
+            top.expand_topk(child_scores, child_order)
+            self.assertTrue(np.array_equal(full.state.tokens[full.state.depth - 1], top.state.tokens[top.state.depth - 1]))
+            cursor += 1
+        self.assertEqual(full.finish(), top.finish())
+        opt = fixed_verify(root, expands, width, tau, max_depth)
+        state = OptTreeState.create(OptTreeConfig(width=width, tau=tau, max_depth=max_depth))
+        step = update(state, torch.tensor(root))
+        opt_cursor = 0
+        while not step.is_final:
+            step = update(state, torch.tensor(expands[opt_cursor]))
+            opt_cursor += 1
+        self.assertEqual(opt.tokens, tuple(int(v) for v in step.verify.tokens.tolist()))
+        self.assertEqual(full.finish().tokens, opt.tokens)
+
+
+class TestRealUnits(CustomTestCase):
+    def test_millisecond_price_keeps_the_tree_growing(self):
+        lam_per_ms = price_per_ms(50.6)
+        self.assertAlmostEqual(lam_per_ms, 0.0506)
+        cost = CostPoint(
+            w=4.55,
+            kappa=0.0,
+            eps=0.0,
+            eps_plus=0.0,
+            row_knee=10**9,
+            beta=0.0,
+            beta_plus=0.0,
+            node_knee=10**9,
+            rtt_ms=0.0,
+            ms_per_byte=0.0,
+        )
+        gain = GainTable(grid=_HAND_GRID)
+        gain.observe([1.0], depth=0)
+        tree = TollTree(prefix_len=1)
+        tree.set_frontier([tree.add_child(-1, token=1, raw_p=0.5, a=0.5)])
+        grown = decide_layer([tree], lam_per_ms, cost, gain, TollConfig())
+        self.assertTrue(grown.grow)
+        self.assertAlmostEqual(grown.gains[0], 0.5, places=6)
+        raw = decide_layer([tree], 50.6, cost, gain, TollConfig())
+        self.assertFalse(raw.grow)
+        self.assertEqual(raw.reason, "layer_toll")
+
+    def test_ready_is_false_before_the_fit_runs(self):
+        model = TierCostModel(probe_interval=8, warmup_rounds=2)
+        for rows in (2.0, 8.0, 16.0):
+            model.observe_layer("sync", 0.0, rows, 1.0 + 0.3 * rows)
+            model.observe_target(0.0, rows, 1.0 + 0.1 * rows)
+        model.refresh()
+        self.assertFalse(model.ready("sync"))
+        self.assertEqual(model.snapshot("sync").w, 0.0)
+        self.assertTrue(uses_fixed_policy(model, "sync"))
 
 
 if __name__ == "__main__":

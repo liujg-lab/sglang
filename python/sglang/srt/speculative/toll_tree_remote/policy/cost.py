@@ -194,6 +194,10 @@ class TierCostModel:
     def ready(self, path: str) -> bool:
         if path not in self._layer:
             raise ValueError(f"unknown cost path {path}")
+        if self._layer_gen[path] <= 0 or self._target_gen <= 0:
+            return False
+        if not self._layer_fit[path][5] or not self._target_fit[5]:
+            return False
         if self._seen[path] < self.warmup_rounds or self._target_seen < self.warmup_rounds:
             return False
         return _row_values(self._layer[path]) >= 2 and _row_values(self._target) >= 2
@@ -252,22 +256,23 @@ class TierCostModel:
             target_rows_identified=target_rows,
         )
 
-    def t_ar_s(self, bs: int) -> float:
+    def t_ar_s(self, bs: int, prefix_sum: float = 0.0) -> float:
         """Seconds for one autoregressive token at batch size ``bs``.
 
-        The row term is ``β·b`` milliseconds. An unidentified ``β`` is omitted.
+        Milliseconds are ``w_t + κ_t·prefix_sum + β·b``. An unidentified ``β``
+        is omitted. Measured K=0 rounds are left for a later phase.
         """
         if int(bs) < 1:
             return 0.0
-        w_t, _kappa_t, beta, _beta_plus, _knee, rows_ok = self._target_fit
-        ms = float(w_t)
+        w_t, kappa_t, beta, _beta_plus, _knee, rows_ok = self._target_fit
+        ms = float(w_t) + float(kappa_t) * float(prefix_sum)
         if rows_ok:
             ms += float(beta) * float(bs)
         return ms / 1000.0
 
-    def lambda_prior(self, bs: int) -> float:
+    def lambda_prior(self, bs: int, prefix_sum: float = 0.0) -> float:
         """Tokens per second implied by ``t_ar_s``. Empty fits return 0."""
-        elapsed = self.t_ar_s(bs)
+        elapsed = self.t_ar_s(bs, prefix_sum)
         if elapsed <= 0.0 or int(bs) < 1:
             return 0.0
         return float(bs) / elapsed

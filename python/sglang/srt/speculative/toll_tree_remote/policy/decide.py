@@ -63,11 +63,11 @@ def _kth_largest(values, k: int) -> float:
     return float(np.partition(array, pivot)[pivot])
 
 
-def _layer_toll(lam: float, cost: CostPoint, n_active: int, width: int) -> float:
-    """λ·w + λ·ε⁺·(rows − M̂)⁺. Rows are active requests times the width bucket."""
+def _layer_toll(lam_per_ms: float, cost: CostPoint, n_active: int, width: int) -> float:
+    """λ·w + λ·ε⁺·(rows − M̂)⁺. ``λ`` is tokens per millisecond."""
     rows = float(n_active) * float(width)
     hinge = max(rows - float(cost.row_knee), 0.0)
-    return float(lam) * float(cost.w) + float(lam) * float(cost.eps_plus) * hinge
+    return float(lam_per_ms) * float(cost.w) + float(lam_per_ms) * float(cost.eps_plus) * hinge
 
 
 def _empty_forward(n: int) -> tuple[tuple[int, ...], ...]:
@@ -76,7 +76,7 @@ def _empty_forward(n: int) -> tuple[tuple[int, ...], ...]:
 
 def decide_layer(
     trees,
-    lam: float,
+    lam_per_ms: float,
     cost: CostPoint,
     gain: GainTable,
     cfg: TollConfig,
@@ -85,11 +85,10 @@ def decide_layer(
 ) -> LayerDecision:
     """Stop when the shared layer toll is not covered, a request's surplus is ≤ 0, depth, or KV.
 
-    ``cut`` is ``max(λ·β̃, π̂_(K_max))`` over every node already in the tree,
-    including the frontier being cut. ``F`` is the current layer above that
-    cut, capped at ``W_max``. ``s`` subtracts only ``λ·(κ·ℓ + ε·|F|)``. The
-    round stops when the positive surplus does not beat
-    ``λ·w + λ·ε⁺·(rows − M̂)⁺``.
+    ``lam_per_ms`` is tokens per millisecond. ``cut`` is ``max(λ·β̃, π̂_(K_max))``
+    over every node already in the tree, including the frontier. ``φ`` is read
+    at the parent depth. ``F`` is the current layer above that cut, capped at
+    ``W_max``.
     """
     n = len(trees)
     if not kv_ok:
@@ -103,7 +102,7 @@ def decide_layer(
             _empty_forward(n),
             tuple(0.0 for _ in trees),
         )
-    cut_floor = float(lam) * beta_tilde(cost, cfg)
+    cut_floor = float(lam_per_ms) * beta_tilde(cost, cfg)
     gains = []
     surplus = []
     chosen = []
@@ -132,14 +131,15 @@ def decide_layer(
         else:
             kept_ids = frontier
         kept = [int(node) for node in kept_ids.tolist()]
-        depth = int(tree.depth[kept[0]]) if kept else 0
+        node_depth = int(tree.depth[kept[0]]) if kept else 0
+        phi_depth = max(node_depth - 1, 0)
         if kept:
             kept_pi = tree.pi[kept_ids]
-            total = float(np.sum(kept_pi * gain.estimate_many(kept_pi, cut, depth)))
+            total = float(np.sum(kept_pi * gain.estimate_many(kept_pi, cut, phi_depth)))
         else:
             total = 0.0
         variable = float(cost.kappa) * float(tree.prefix_len) + float(cost.eps) * float(len(kept))
-        score = total - float(lam) * variable
+        score = total - float(lam_per_ms) * variable
         gains.append(total)
         surplus.append(score)
         chosen.append(kept)
@@ -167,7 +167,7 @@ def decide_layer(
         )
     width_need = max(len(chosen[index]) for index in active)
     width = _bucket_at_least(tuple(cfg.width_buckets), width_need)
-    toll = _layer_toll(lam, cost, len(active), width)
+    toll = _layer_toll(lam_per_ms, cost, len(active), width)
     if positive <= toll:
         return LayerDecision(
             False,
@@ -199,11 +199,11 @@ def _top_mass(tree, k: int) -> float:
     return float(ordered[: min(int(k), ordered.size)].sum())
 
 
-def choose_k(trees, lam: float, cost: CostPoint, cfg: TollConfig) -> KChoice:
+def choose_k(trees, lam_per_ms: float, cost: CostPoint, cfg: TollConfig) -> KChoice:
     """Pick the verify bucket maximizing mass minus the linear and hinge toll.
 
-    ``b`` is ``len(trees)``, including requests that already exited. Their
-    nodes still contribute path mass. An empty forest returns K = 0.
+    ``lam_per_ms`` is tokens per millisecond. ``b`` is ``len(trees)``, including
+    requests that already exited. Their nodes still contribute path mass.
     """
     if cfg.fixed_k is not None:
         return KChoice(int(cfg.fixed_k), 0.0)
@@ -218,8 +218,8 @@ def choose_k(trees, lam: float, cost: CostPoint, cfg: TollConfig) -> KChoice:
         extra = max(batch * float(bucket) - float(cost.node_knee), 0.0)
         score = (
             mass
-            - float(lam) * slope * batch * float(bucket)
-            - float(lam) * float(cost.beta_plus) * extra
+            - float(lam_per_ms) * slope * batch * float(bucket)
+            - float(lam_per_ms) * float(cost.beta_plus) * extra
         )
         if score > best_score or (score == best_score and int(bucket) < best_k):
             best_score = score

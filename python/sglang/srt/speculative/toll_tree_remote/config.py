@@ -61,10 +61,17 @@ class TollConfig:
         if policy not in ("toll", "fixed"):
             raise ValueError(f"policy must be toll or fixed, got {policy}")
         if policy == "fixed":
-            if self.fixed_width is None or int(self.fixed_width) < 1:
-                raise ValueError("fixed policy requires fixed_width >= 1")
+            if self.fixed_width is None:
+                raise ValueError("fixed policy requires fixed_width")
             if self.fixed_tau is None or not math.isfinite(float(self.fixed_tau)):
                 raise ValueError("fixed policy requires a finite fixed_tau")
+        if self.fixed_width is not None:
+            width = int(self.fixed_width)
+            if width not in widths or width not in verifies:
+                raise ValueError(
+                    f"fixed_width {width} must be on both width buckets {widths} "
+                    f"and verify buckets {verifies}"
+                )
         if not 0.0 < float(self.price_alpha) <= 1.0:
             raise ValueError(
                 f"price_alpha must be in (0, 1], got {self.price_alpha}"
@@ -103,6 +110,20 @@ class TollConfig:
             object.__setattr__(self, "fixed_tau", float(self.fixed_tau))
         if self.fixed_k is not None:
             object.__setattr__(self, "fixed_k", int(self.fixed_k))
+
+    @classmethod
+    def from_server_args(cls, args, role: str):
+        """Build a config from one args object. Graphs are refused.
+
+        This does not read process-wide state and does not start a server.
+        """
+        if role not in ("draft", "target"):
+            raise ValueError(f"role must be draft or target, got {role}")
+        if not bool(getattr(args, "disable_cuda_graph", False)):
+            raise ValueError("TOLL_TREE_REMOTE refuses CUDA graph")
+        if not bool(getattr(args, "disable_piecewise_cuda_graph", False)):
+            raise ValueError("TOLL_TREE_REMOTE refuses piecewise CUDA graph")
+        return cls()
 
     @property
     def w_max(self) -> int:
