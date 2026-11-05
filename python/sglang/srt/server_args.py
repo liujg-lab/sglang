@@ -3031,6 +3031,12 @@ class ServerArgs:
             )
 
     def _handle_speculative_decoding(self):
+        if self.speculative_algorithm == "TOLL_TREE_REMOTE":
+            raise ValueError(
+                "TOLL_TREE_REMOTE serving loop is not implemented. "
+                "Startup is refused until the algorithm is specified."
+            )
+
         self._validate_speculative_verify_args()
 
         if (
@@ -5165,6 +5171,7 @@ class ServerArgs:
                 "SPECTRE",
                 "STANDALONE_REMOTE",
                 "OPT_TREE_REMOTE",
+                "TOLL_TREE_REMOTE",
             ],
             help="Speculative algorithm.",
         )

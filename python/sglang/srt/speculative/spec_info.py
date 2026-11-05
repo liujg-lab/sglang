@@ -58,6 +58,7 @@ class SpeculativeAlgorithm(Enum):
     SPECTRE = auto()
     STANDALONE_REMOTE = auto()
     OPT_TREE_REMOTE = auto()
+    TOLL_TREE_REMOTE = auto()
     NONE = auto()
 
     @classmethod
@@ -93,6 +94,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_opt_tree_remote(self) -> bool:
         return self == SpeculativeAlgorithm.OPT_TREE_REMOTE
+
+    def is_toll_tree_remote(self) -> bool:
+        return self == SpeculativeAlgorithm.TOLL_TREE_REMOTE
 
     def skips_colocated_draft_worker(self, server_args) -> bool:
         """Draft role runs the target model itself and does not launch a colocated worker."""
@@ -279,6 +283,12 @@ class SpeculativeAlgorithm(Enum):
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
+
+        if self.is_toll_tree_remote():
+            raise ValueError(
+                "TOLL_TREE_REMOTE serving loop is not implemented. "
+                "create_worker is not available."
+            )
 
         enable_overlap = not server_args.disable_overlap_schedule
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
