@@ -3,16 +3,41 @@
 from __future__ import annotations
 
 import time
+import uuid
 
-from sglang.srt.speculative.toll_tree_remote.target.breaker import TollRpcBreaker
 from sglang.srt.speculative.toll_tree_remote.protocol import (
     PROTO_VERSION,
     TollAction,
     TollReply,
     TollReqItem,
     TollRequest,
+    TollStatus,
     spec_shape_of,
 )
+from sglang.srt.speculative.toll_tree_remote.target.breaker import TollRpcBreaker
+from sglang.srt.utils import DynamicGradMode
+
+
+def committed_len(req) -> int:
+    return len(list(getattr(req, "origin_input_ids", []) or [])) + len(
+        list(getattr(req, "output_ids", []) or [])
+    )
+
+
+def tail_token(req) -> int:
+    output = list(getattr(req, "output_ids", []) or [])
+    if output:
+        return int(output[-1])
+    origin = list(getattr(req, "origin_input_ids", []) or [])
+    return int(origin[-1]) if origin else 0
+
+
+def skip_speculative(req) -> bool:
+    if getattr(req, "is_health_check", False):
+        return True
+    params = getattr(req, "sampling_params", None)
+    temperature = float(getattr(params, "temperature", 0.0) or 0.0) if params else 0.0
+    return temperature > 0.0
 
 
 class TollTargetSchedulerMixin:
@@ -27,6 +52,10 @@ class TollTargetSchedulerMixin:
         self.toll_cfg = TollConfig.from_server_args(self.server_args, "target")
         self.toll_breaker = TollRpcBreaker()
         self.toll_seq = 0
+        self.toll_session = uuid.uuid4().hex
+        self.toll_sent_len: dict[str, int] = {}
+        self.toll_need_snapshot: set[str] = set()
+        self._toll_last_reply_ns = time.perf_counter_ns()
         url = f"tcp://{self.server_args.toll_tree_addr}:{self.server_args.toll_tree_port}"
         if self.tp_rank == 0:
             self.toll_client = TollTargetClient(url, self.toll_cfg)
@@ -34,86 +63,157 @@ class TollTargetSchedulerMixin:
             self.toll_client = None
 
     def _toll_broadcast(self, payload):
+        if int(getattr(self, "tp_size", 1)) <= 1:
+            return payload
         from sglang.srt.utils import broadcast_pyobj
 
+        wrapped = [payload] if self.tp_rank == 0 else []
         return broadcast_pyobj(
-            [payload] if self.tp_rank == 0 else None,
-            self.tp_rank,
-            self.dist_port if hasattr(self, "dist_port") else 0,
-            self.tp_cpu_group if hasattr(self, "tp_cpu_group") else None,
+            wrapped,
+            self.tp_group.rank,
+            self.tp_cpu_group,
+            src=self.tp_group.ranks[0],
         )[0]
+
+    def _toll_delta(self, req) -> tuple[list[int], int, list[int]]:
+        origin = list(getattr(req, "origin_input_ids", []) or [])
+        output = list(getattr(req, "output_ids", []) or [])
+        full = origin + output
+        total = len(full)
+        if req.rid in self.toll_need_snapshot or req.rid not in self.toll_sent_len:
+            return full, total, full
+        sent = int(self.toll_sent_len[req.rid])
+        return full[sent:], total, full
 
     def _toll_request(self, action: str, batch) -> TollRequest:
         self.toll_seq += 1
+        now = time.perf_counter_ns()
+        elapsed = max(0, now - int(self._toll_last_reply_ns))
         reqs = []
         for req in batch.reqs:
+            delta, total, full = self._toll_delta(req)
             reqs.append(
                 TollReqItem(
                     rid=req.rid,
-                    commit_len=len(getattr(req, "output_ids", []) or []),
-                    new_tokens=list(getattr(req, "output_ids", []) or [])[-1:],
-                    input_ids=list(getattr(req, "origin_input_ids", []) or []),
+                    commit_len=total,
+                    new_tokens=[int(token) for token in delta],
+                    input_ids=[int(token) for token in full],
                     sampling={"temperature": 0.0},
                 )
             )
         return TollRequest(
             proto=PROTO_VERSION,
-            session="toll",
+            session=self.toll_session,
             seq=self.toll_seq,
             action=action,
             spec_shape=spec_shape_of(self.toll_cfg),
-            t_target_ns=time.perf_counter_ns(),
+            t_target_ns=elapsed,
             reqs=reqs,
         )
 
-    def _toll_exchange(self, request: TollRequest) -> TollReply | None:
+    def _toll_note_reply(self, reply: TollReply | None, timed_out: bool) -> None:
+        self._toll_last_reply_ns = time.perf_counter_ns()
+        if timed_out:
+            self.toll_breaker.record_failure()
+            return
+        if reply is None:
+            return
+        status = reply.reqs[0].status if reply.reqs else TollStatus.EMPTY
+        if status == TollStatus.REJECT:
+            self.toll_breaker.record_failure()
+            return
+        if status == TollStatus.NEED_SNAPSHOT and reply.reqs:
+            self.toll_need_snapshot.add(reply.reqs[0].rid)
+        self.toll_breaker.record_success()
+
+    def _toll_exchange(self, request: TollRequest, wait: bool = True) -> TollReply | None:
         if not self.toll_breaker.should_send():
             self.toll_breaker.note_skipped_step()
             return None
         reply = None
-        if self.tp_rank == 0:
+        timed_out = False
+        if self.tp_rank == 0 and self.toll_client is not None:
+            before = self.toll_client.timeouts
             self.toll_client.send_request(request)
-            reply = self.toll_client.recv_reply(request.session, request.seq)
-        reply = self._toll_broadcast(reply)
-        if reply is None or not reply.reqs or not reply.reqs[0].tokens:
-            self.toll_breaker.record_failure()
-            return None
-        self.toll_breaker.record_success()
+            if wait:
+                reply = self.toll_client.recv_reply(request.session, request.seq)
+                timed_out = self.toll_client.timeouts > before
+        if wait:
+            outcome = self._toll_broadcast({"reply": reply, "timed_out": timed_out})
+            reply = outcome["reply"]
+            timed_out = bool(outcome["timed_out"])
+            self._toll_note_reply(reply, timed_out)
         return reply
+
+    def _toll_mark_sent(self, batch, reply: TollReply | None) -> None:
+        if reply is None or not reply.reqs:
+            return
+        status = reply.reqs[0].status
+        if status in (TollStatus.REJECT, TollStatus.NEED_SNAPSHOT):
+            return
+        for req in batch.reqs:
+            self.toll_sent_len[req.rid] = committed_len(req)
+            self.toll_need_snapshot.discard(req.rid)
+
+    def maybe_notify_remote_draft_finished(self, req) -> None:
+        if not self.spec_algorithm.is_toll_tree_remote():
+            return super().maybe_notify_remote_draft_finished(req)
+        if getattr(self.server_args, "toll_tree_role", None) != "target":
+            return
+        self._toll_send_control(TollAction.FINISH, req)
+
+    def maybe_notify_remote_draft_aborted(self, reqs) -> None:
+        if not self.spec_algorithm.is_toll_tree_remote():
+            return super().maybe_notify_remote_draft_aborted(reqs)
+        if getattr(self.server_args, "toll_tree_role", None) != "target":
+            return
+        for req in reqs or []:
+            self._toll_send_control(TollAction.ABORT, req)
+
+    def maybe_abort_remote_target(self) -> None:
+        if not self.spec_algorithm.is_toll_tree_remote():
+            return super().maybe_abort_remote_target()
+        return
+
+    def _toll_send_control(self, action: str, req) -> None:
+        if self.tp_rank != 0 or self.toll_client is None:
+            return
+        batch = type("Batch", (), {"reqs": [req]})()
+        self.toll_client.send_request(self._toll_request(action, batch))
+        self.toll_sent_len.pop(req.rid, None)
+        self.toll_need_snapshot.discard(req.rid)
 
     def _toll_run_batch(self, batch) -> None:
         if len(batch.reqs) != 1:
             raise RuntimeError("TOLL_TREE_REMOTE serving currently requires batch size 1")
-        extend = batch.forward_mode is not None and batch.forward_mode.is_extend()
-        action = TollAction.PREFILL if extend else TollAction.STEP
-        reply = self._toll_exchange(self._toll_request(action, batch))
-        if reply is None or not reply.reqs[0].tokens:
-            batch.draft_num_tokens = 1
-            result = self.run_batch(batch)
-            self.process_batch_result(batch, result)
-            return
-        worker = self.tp_worker
-        spec = worker.build_verify_input(
-            batch,
-            [reply.reqs[0].tokens],
-            [reply.reqs[0].parents],
-            [reply.reqs[0].tokens[0]],
-            int(self.tp_worker.model_config.vocab_size),
-            int(self.toll_cfg.max_depth),
-        )
-        if spec is None:
-            batch.draft_num_tokens = 1
-            result = self.run_batch(batch)
-            self.process_batch_result(batch, result)
-            return
-        batch.spec_info = spec
-        batch.draft_num_tokens = spec.draft_token_num
-        result = self.run_batch(batch)
-        self.process_batch_result(batch, result)
         req = batch.reqs[0]
-        if req.finished():
-            self._toll_exchange(self._toll_request(TollAction.FINISH, batch))
+        extend = batch.forward_mode is not None and batch.forward_mode.is_extend()
+        if not extend and skip_speculative(req):
+            batch.draft_num_tokens = 1
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+            return
+        action = TollAction.PREFILL if extend else TollAction.STEP
+        request = self._toll_request(action, batch)
+        reply = self._toll_exchange(request)
+        self._toll_mark_sent(batch, reply)
+        useful = (
+            reply is not None
+            and reply.reqs
+            and reply.reqs[0].status == TollStatus.OK
+            and reply.reqs[0].tokens
+        )
+        if not useful:
+            batch.draft_num_tokens = 1
+            req.toll_reply = None
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+            return
+        req.toll_reply = reply
+        result = self.model_worker.forward_batch_generation(batch)
+        self.process_batch_result(batch, result)
 
+    @DynamicGradMode()
     def event_loop_normal_toll_tree_target(self) -> None:
         self.init_toll_tree_communication()
         while True:

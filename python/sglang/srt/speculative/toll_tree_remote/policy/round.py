@@ -109,12 +109,13 @@ class TollRound:
         )
         self.last_lam = float(lam)
         lam_ms = price_per_ms(lam)
+        checker = kv_ok if callable(kv_ok) else (lambda _depth=0: bool(kv_ok))
         if self.cfg.policy == "fixed":
-            result = self._run_fixed(ordered, root_topk, forward)
+            result = self._run_fixed(ordered, root_topk, forward, checker)
         elif not self.cost.ready(self.path):
-            result = self._run_warmup(ordered, root_topk, forward)
+            result = self._run_warmup(ordered, root_topk, forward, checker)
         else:
-            result = self._run_toll(ordered, root_topk, forward, lam_ms, kv_ok)
+            result = self._run_toll(ordered, root_topk, forward, lam_ms, checker)
         self.last_k = int(result.k)
         self.last_result = result
         return result
@@ -156,59 +157,56 @@ class TollRound:
             cost=self.cost.snapshot(self.path),
         )
 
-    def _alen(self, reqs) -> float:
+    def _alen(self, reqs, k: int) -> float:
         mass = 0.0
+        keep = max(int(k), 0)
         for tree in self._trees(reqs):
-            if len(tree):
-                mass += float(np.sum(tree.pi))
+            if not len(tree) or keep == 0:
+                continue
+            order = np.argsort(tree.pi)[-keep:]
+            mass += float(np.sum(tree.pi[order]))
         return float(len(reqs)) + mass
 
-    def _run_fixed(self, reqs, root_topk, forward) -> RoundResult:
-        width = int(self.cfg.fixed_width)
-        tau = float(self.cfg.fixed_tau)
-        policies = []
-        for req, top in zip(reqs, root_topk):
-            policy = FixedPolicy(width, tau, int(self.cfg.max_depth))
-            policy.seed_topk(top[0], top[1])
-            self._install_fixed_seed(self._current[req.rid], policy)
-            policies.append(policy)
-        layers: list[LayerRecord] = []
-        guard = 0
-        while any(policy.should_grow() for policy in policies) and guard < int(self.cfg.max_depth):
-            guard += 1
-            outputs = forward(self._trees(reqs), [tree.frontier for tree in self._trees(reqs)], width)
-            grew = False
-            layer_ms = 0.0
-            for policy, req, output in zip(policies, reqs, outputs):
-                if not policy.should_grow():
-                    continue
-                scores, ids, ms = output
-                policy.expand_topk(scores, ids)
-                self._install_fixed_children(self._current[req.rid], policy, scores, ids)
-                layer_ms = max(layer_ms, float(ms))
-                grew = True
-            if not grew:
-                break
-            rows = len(reqs) * width
-            self.cost.observe_layer(self.path, self.last_prefix_sum, float(rows), layer_ms)
-            layers.append(LayerRecord(rows, len(reqs), layer_ms, "grow", 0.0, width))
-        verify = [policy.finish() for policy in policies]
-        return RoundResult(verify, width, layers, self._alen(reqs), 0.0)
+    def _run_fixed(self, reqs, root_topk, forward, kv_ok) -> RoundResult:
+        return self._run_width(
+            reqs,
+            root_topk,
+            forward,
+            int(self.cfg.fixed_width),
+            float(self.cfg.fixed_tau),
+            int(self.cfg.fixed_width),
+            "grow",
+            kv_ok,
+        )
 
-    def _run_warmup(self, reqs, root_topk, forward) -> RoundResult:
+    def _run_warmup(self, reqs, root_topk, forward, kv_ok) -> RoundResult:
         width, bucket = self.warmup.next()
         tau = 0.0 if self.cfg.fixed_tau is None else float(self.cfg.fixed_tau)
+        return self._run_width(
+            reqs,
+            root_topk,
+            forward,
+            int(width),
+            tau,
+            int(bucket),
+            "warmup",
+            kv_ok,
+        )
+
+    def _run_width(self, reqs, root_topk, forward, width, tau, k, reason, kv_ok) -> RoundResult:
         policies = []
         for req, top in zip(reqs, root_topk):
-            policy = FixedPolicy(int(width), tau, int(self.cfg.max_depth))
+            policy = FixedPolicy(int(width), float(tau), int(self.cfg.max_depth))
             policy.seed_topk(top[0], top[1])
             self._install_fixed_seed(self._current[req.rid], policy)
             policies.append(policy)
         layers: list[LayerRecord] = []
         guard = 0
         while any(policy.should_grow() for policy in policies) and guard < int(self.cfg.max_depth):
+            if not kv_ok(guard):
+                break
             guard += 1
-            outputs = forward(self._trees(reqs), [tree.frontier for tree in self._trees(reqs)], width)
+            outputs = forward(self._trees(reqs), [tree.frontier for tree in self._trees(reqs)], int(width))
             grew = False
             layer_ms = 0.0
             for policy, req, output in zip(policies, reqs, outputs):
@@ -223,9 +221,9 @@ class TollRound:
                 break
             rows = len(reqs) * int(width)
             self.cost.observe_layer(self.path, self.last_prefix_sum, float(rows), layer_ms)
-            layers.append(LayerRecord(rows, len(reqs), layer_ms, "warmup", 0.0, int(width)))
+            layers.append(LayerRecord(rows, len(reqs), layer_ms, reason, 0.0, int(width)))
         verify = [policy.finish() for policy in policies]
-        return RoundResult(verify, int(bucket), layers, self._alen(reqs), 0.0)
+        return RoundResult(verify, int(k), layers, self._alen(reqs, int(k)), 0.0)
 
     def _run_toll(self, reqs, root_topk, forward, lam_ms: float, kv_ok: bool) -> RoundResult:
         limit = int(self.cfg.child_topk)
@@ -239,9 +237,11 @@ class TollRound:
             tree.set_frontier(list(range(len(tree))))
         layers: list[LayerRecord] = []
         ghat = 0.0
-        for _ in range(int(self.cfg.max_depth)):
+        for _depth in range(int(self.cfg.max_depth)):
             point = self.cost.snapshot(self.path)
-            decision = decide_layer(trees, lam_ms, point, self.gain, self.cfg, kv_ok=kv_ok)
+            decision = decide_layer(
+                trees, lam_ms, point, self.gain, self.cfg, kv_ok=bool(kv_ok(_depth))
+            )
             ghat += float(sum(decision.gains))
             if not decision.grow:
                 layers.append(LayerRecord(0, len(decision.active), 0.0, decision.reason, float(sum(decision.gains)), 0))
@@ -253,13 +253,13 @@ class TollRound:
                     continue
                 scores, ids, ms = output
                 layer_ms = max(layer_ms, float(ms))
-                self._admit_children(tree, kept, scores, ids, float(cut), int(decision.width))
+                self._admit_children(tree, kept, scores, ids, float(cut), int(self.cfg.k_max))
             rows = len(decision.active) * int(decision.width)
             self.cost.observe_layer(self.path, self.last_prefix_sum, float(rows), layer_ms)
             layers.append(LayerRecord(rows, len(decision.active), layer_ms, "grow", float(sum(decision.gains)), int(decision.width)))
         choice = choose_k(trees, lam_ms, self.cost.snapshot(self.path), self.cfg)
         verify = [tree.finish(min(int(choice.k), len(tree))) for tree in trees]
-        return RoundResult(verify, int(choice.k), layers, self._alen(reqs), ghat)
+        return RoundResult(verify, int(choice.k), layers, self._alen(reqs, int(choice.k)), ghat)
 
     def _admit_children(self, tree, kept, scores, ids, cut: float, limit: int) -> None:
         taken, tokens = _as_rows(scores, ids)

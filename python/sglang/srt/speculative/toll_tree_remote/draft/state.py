@@ -27,7 +27,10 @@ class DraftStateStore:
         self.session = session
 
     def get(self, rid: str) -> DraftReqState | None:
-        return self.reqs.get(rid)
+        state = self.reqs.get(rid)
+        if state is not None:
+            state.last_seen = time.time()
+        return state
 
     def upsert(self, rid: str, prefix_len: int, commit_len: int) -> DraftReqState:
         state = DraftReqState(

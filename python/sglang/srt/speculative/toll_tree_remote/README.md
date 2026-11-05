@@ -4,7 +4,7 @@
 
 当前服务循环只接受同时满足这些条件的启动：`--disable-cuda-graph`、`--disable-piecewise-cuda-graph`、`--toll-tree-policy=fixed`、`--max-running-requests=1`，以及 `--toll-tree-role=target` 或 `draft`。`policy=toll`、更大的 batch、开启 CUDA graph 仍然会拒绝。这一步没有 CUDA graph，也没有 lease。NPU Target 不走 `tree_paged_fia`。
 
-Draft 按层生成 top-C，回包后回滚树区 KV。Target 用 `K+1` 个槽做验证，padding 填 0。`K=0` 或空回包退回普通一步解码。
+Draft 按层生成 top-C，回包后回滚树区 KV。Target 用 `K+1` 个槽做验证，槽 0 是已提交尾 token，padding 填 0。`commit_len` 是前缀加已输出 token 的长度，STEP 只带增量；对不上时 Draft 回 `NEED_SNAPSHOT`，Target 下一轮重发完整前缀。`K=0` 或空回包退回普通一步解码，超时和 `REJECT` 才记熔断。
 
 ## 策略
 

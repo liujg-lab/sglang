@@ -23,10 +23,14 @@ def remote_spec_role(server_args):
 
     ``STANDALONE_REMOTE`` stores it on ``standalone_remote_role``.
     ``OPT_TREE_REMOTE`` stores it on ``opt_tree_role``. The SR field wins when
-    both are set. Neither algorithm is treated as the other.
+    both are set. ``TOLL_TREE_REMOTE`` reads ``toll_tree_role`` and does not
+    use either of those fields.
     """
     if server_args is None:
         return None
+    algo = getattr(server_args, "speculative_algorithm", None)
+    if getattr(algo, "name", algo) == "TOLL_TREE_REMOTE":
+        return getattr(server_args, "toll_tree_role", None)
     return getattr(server_args, "standalone_remote_role", None) or getattr(
         server_args, "opt_tree_role", None
     )
@@ -142,6 +146,11 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "opt_tree_role", None) == "draft"
         ):
             return True
+        if (
+            self.is_toll_tree_remote()
+            and getattr(server_args, "toll_tree_role", None) == "draft"
+        ):
+            return True
         return False
 
     def uses_ordinary_decode_prepare(self, server_args) -> bool:
@@ -156,6 +165,11 @@ class SpeculativeAlgorithm(Enum):
         if (
             self.is_opt_tree_remote()
             and getattr(server_args, "opt_tree_role", None) == "draft"
+        ):
+            return True
+        if (
+            self.is_toll_tree_remote()
+            and getattr(server_args, "toll_tree_role", None) == "draft"
         ):
             return True
         return False
@@ -175,7 +189,11 @@ class SpeculativeAlgorithm(Enum):
 
     def reports_remote_spec_metrics(self) -> bool:
         """Zero-verify and fallback counts are part of the client totals."""
-        return self.is_standalone_remote() or self.is_opt_tree_remote()
+        return (
+            self.is_standalone_remote()
+            or self.is_opt_tree_remote()
+            or self.is_toll_tree_remote()
+        )
 
     def uses_spec_topk_cuda_graph_layout(self) -> bool:
         """Draft-tree CUDA graph pads tokens as ``bs * topk`` (EAGLE / STANDALONE / SR)."""

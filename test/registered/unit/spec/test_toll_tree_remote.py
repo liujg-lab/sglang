@@ -305,5 +305,223 @@ class TestTollVerifyBounds(CustomTestCase):
         self.assertEqual(tokens, [[4, 5]])
 
 
+class TestTollSpecInfo(CustomTestCase):
+    def test_toll_role_does_not_leak_into_opt(self):
+        from sglang.srt.speculative.spec_info import remote_spec_role
+
+        algo = SpeculativeAlgorithm.from_string("TOLL_TREE_REMOTE")
+        draft = SimpleNamespace(
+            speculative_algorithm="TOLL_TREE_REMOTE",
+            toll_tree_role="draft",
+            standalone_remote_role="target",
+            opt_tree_role="target",
+        )
+        self.assertEqual(remote_spec_role(draft), "draft")
+        self.assertTrue(algo.uses_draft_paused_reqs(draft))
+        self.assertTrue(algo.uses_ordinary_decode_prepare(draft))
+        self.assertTrue(algo.reports_remote_spec_metrics())
+        target = SimpleNamespace(speculative_algorithm="TOLL_TREE_REMOTE", toll_tree_role="target")
+        self.assertFalse(algo.uses_draft_paused_reqs(target))
+        self.assertFalse(algo.uses_ordinary_decode_prepare(target))
+        opt = SimpleNamespace(
+            speculative_algorithm="OPT_TREE_REMOTE",
+            opt_tree_role="draft",
+            toll_tree_role="target",
+        )
+        self.assertEqual(remote_spec_role(opt), "draft")
+        self.assertTrue(SpeculativeAlgorithm.OPT_TREE_REMOTE.reports_remote_spec_metrics())
+
+
+class TestTollCommitAndFakeDraft(CustomTestCase):
+    def test_target_sends_the_commit_delta_and_keeps_the_worker(self):
+        import time
+
+        from sglang.srt.speculative.toll_tree_remote.policy.warmup import WarmupSchedule
+        from sglang.srt.speculative.toll_tree_remote.target.scheduler_mixin import (
+            TollTargetSchedulerMixin,
+            committed_len,
+            tail_token,
+        )
+        from sglang.srt.speculative.toll_tree_remote.target.worker import TollTreeRemoteWorker
+
+        req = SimpleNamespace(origin_input_ids=[1, 2], output_ids=[3])
+        self.assertEqual(committed_len(req), 3)
+        self.assertEqual(tail_token(req), 3)
+        self.assertEqual(tail_token(SimpleNamespace(origin_input_ids=[1, 2], output_ids=[])), 2)
+        host = TollTargetSchedulerMixin()
+        host.toll_sent_len = {}
+        host.toll_need_snapshot = set()
+        host.toll_seq = 0
+        host.toll_session = "abc"
+        host._toll_last_reply_ns = time.perf_counter_ns()
+        host.toll_cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=2)
+        step = SimpleNamespace(rid="a", origin_input_ids=[1, 2, 3], output_ids=[4])
+        delta, total, full = TollTargetSchedulerMixin._toll_delta(host, step)
+        self.assertEqual((delta, total, full), ([1, 2, 3, 4], 4, [1, 2, 3, 4]))
+        host.toll_sent_len["a"] = 3
+        delta, total, _full = TollTargetSchedulerMixin._toll_delta(host, step)
+        self.assertEqual(delta, [4])
+        self.assertEqual(total, 4)
+        host.toll_need_snapshot.add("a")
+        delta, _total, full = TollTargetSchedulerMixin._toll_delta(host, step)
+        self.assertEqual(delta, full)
+        batch = SimpleNamespace(reqs=[step])
+        request = TollTargetSchedulerMixin._toll_request(host, "STEP", batch)
+        self.assertEqual(request.session, "abc")
+        self.assertLess(request.t_target_ns, 1_000_000_000)
+        inner = object()
+        worker = TollTreeRemoteWorker(server_args=SimpleNamespace(), target_worker=inner)
+        self.assertIs(worker.target_worker, inner)
+        for width, bucket in WarmupSchedule(TollConfig()).pairs:
+            self.assertLessEqual(width, bucket)
+
+    def test_inproc_commit_kv_and_snapshot(self):
+        import time
+        from pathlib import Path
+
+        import importlib.util
+
+        from sglang.srt.speculative.toll_tree_remote.draft.kv import TreeKV
+        from sglang.srt.speculative.toll_tree_remote.draft.reqs import layer_positions
+        from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import TollDraftService
+
+        self.assertEqual(layer_positions(4, 1, 3), [4, 4, 4])
+        self.assertEqual(layer_positions(4, 2, 2), [5, 5])
+
+        path = Path(__file__).resolve().parents[3] / "manual" / "toll_fake_draft.py"
+        spec = importlib.util.spec_from_file_location("toll_fake_draft", path)
+        fake = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fake)
+        fake.check()
+
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=4)
+        pool = _SlotPool()
+        box = {}
+
+        def root(_item):
+            scores = np.full(8, 0.1, dtype=np.float64)
+            scores[0] = 0.5
+            return scores, np.arange(8)
+
+        def layer(trees, frontiers, width):
+            tree = trees[0]
+            front = [int(node) for node in list(frontiers[0])]
+            if front:
+                parent = int(tree.parent[front[0]])
+                if parent != -1:
+                    box["ancestor"] = parent in box["service"].slot_of_node
+            time.sleep(0.002)
+            scores = np.full((int(width), int(width)), 0.9, dtype=np.float64)
+            ids = np.arange(int(width) * int(width)).reshape(int(width), int(width))
+            return [(scores, ids, 0.0)]
+
+        service = TollDraftService(
+            cfg,
+            forward=lambda item, slots: ([], []),
+            alloc=pool.alloc,
+            free=pool.free,
+            ttl_s=1.0,
+            root_topk=root,
+            layer_forward=layer,
+        )
+        box["service"] = service
+        self.assertEqual(service.round.price.alpha, cfg.price_alpha)
+        self.assertEqual(service.round.cost.probe_interval, cfg.probe_interval)
+        self.assertEqual(service.round.cost.warmup_rounds, cfg.warmup_rounds)
+        zmq = pytest_zmq()
+        server = client = None
+        if zmq is not None:
+            url = f"inproc://toll-{uuid.uuid4().hex}"
+            server = TollDraftServer(url)
+            client = TollTargetClient(url, cfg, timeout_ms=1000)
+
+        def exchange(request):
+            if server is None:
+                return service.handle(request)
+            client.send_request(request)
+            got = server.recv_request(timeout_ms=1000)
+            reply = service.handle(got)
+            server.send_reply(reply)
+            return client.recv_reply(request.session, request.seq)
+
+        try:
+            prefill = _toll_request(cfg, TollAction.PREFILL, 1, [1, 2, 3], [1, 2, 3], 3)
+            reply = exchange(prefill)
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            step = _toll_request(cfg, TollAction.STEP, 2, [4], [1, 2, 3, 4], 4)
+            reply = exchange(step)
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            self.assertGreater(len(reply.reqs[0].tokens), 0)
+            self.assertEqual(list(service.reqs["a"].fill_ids), [1, 2, 3, 4])
+            self.assertTrue(box.get("ancestor"))
+            self.assertGreaterEqual(service.round.last_result.layers[0].ms, 1.0)
+            self.assertEqual(len(pool.live), 4)
+            more = _toll_request(cfg, TollAction.STEP, 3, [5, 6], [1, 2, 3, 4, 5, 6], 6)
+            reply = exchange(more)
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            self.assertEqual(list(service.reqs["a"].fill_ids), [1, 2, 3, 4, 5, 6])
+            bad = _toll_request(cfg, TollAction.STEP, 4, [9], [1, 2, 3, 4, 5, 6], 99)
+            reply = exchange(bad)
+            self.assertEqual(reply.reqs[0].status, TollStatus.NEED_SNAPSHOT)
+            self.assertEqual(len(service.reqs["a"].fill_ids), 6)
+            snap = _toll_request(cfg, TollAction.STEP, 5, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 5)
+            reply = exchange(snap)
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            self.assertEqual(list(service.reqs["a"].fill_ids), [1, 2, 3, 4, 5])
+            service.prefix_slots["stale"] = pool.alloc(2)
+            service.state.upsert("stale", 1, 1)
+            service.state.reqs["stale"].last_seen = 0
+            service.kv["stale"] = TreeKV(pool.alloc, pool.free)
+            service.state.get("a")
+            self.assertGreater(service.state.reqs["a"].last_seen, 0)
+            done = _toll_request(cfg, TollAction.FINISH, 6, [], [1, 2, 3, 4, 5], 5)
+            reply = exchange(done)
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+            self.assertEqual(pool.live, [])
+            self.assertNotIn("a", service.reqs)
+            self.assertNotIn("stale", service.prefix_slots)
+        finally:
+            if client is not None:
+                client.close()
+            if server is not None:
+                server.close()
+
+
+class _SlotPool:
+    def __init__(self) -> None:
+        self.live = []
+        self._next = 0
+
+    def alloc(self, width: int):
+        slots = list(range(self._next, self._next + int(width)))
+        self._next += int(width)
+        self.live.extend(slots)
+        return slots
+
+    def free(self, slots) -> None:
+        for slot in slots:
+            self.live.remove(slot)
+
+
+def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len):
+    return TollRequest(
+        proto=PROTO_VERSION,
+        session="s",
+        seq=seq,
+        action=action,
+        spec_shape=spec_shape_of(cfg),
+        t_target_ns=1_000_000,
+        reqs=[
+            TollReqItem(
+                rid="a",
+                commit_len=int(commit_len),
+                new_tokens=list(new_tokens),
+                input_ids=list(input_ids),
+                sampling={"temperature": 0.0},
+            )
+        ],
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

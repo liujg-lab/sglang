@@ -18,6 +18,9 @@ class WarmupSchedule:
         for pair in extra:
             if pair not in pairs:
                 pairs.append(pair)
+        pairs = [pair for pair in pairs if pair[0] <= pair[1]]
+        if not pairs:
+            raise ValueError("warmup needs a width that fits in a verify bucket")
         self.pairs = tuple(pairs)
         self._cursor = 0
 

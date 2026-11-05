@@ -60,8 +60,82 @@ def walk_accept(layout, spec_steps: int) -> None:
 
 
 class TollTreeRemoteWorker:
-    def __init__(self, server_args=None, **kwargs) -> None:
+    """Target verifier. ``verify`` uses Eagle's path and does not import SR."""
+
+    def __init__(self, server_args=None, target_worker=None, **kwargs) -> None:
         self.server_args = server_args
+        self.target_worker = target_worker
+        self.page_size = int(getattr(target_worker, "page_size", 1) or 1)
+        self.verify_rounds = 0
+        self.accepted_draft_tokens = 0
+
+    @property
+    def model_runner(self):
+        return self.target_worker.model_runner
+
+    @property
+    def token_to_kv_pool_allocator(self):
+        return self.model_runner.token_to_kv_pool_allocator
+
+    def forward_batch_generation(self, batch):
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+
+        if batch.forward_mode.is_extend() or getattr(batch, "is_extend_in_batch", False):
+            return self._forward_plain(batch, CaptureHiddenMode.NULL)
+        reply = getattr(batch.reqs[0], "toll_reply", None) if batch.reqs else None
+        if reply is None or not reply.reqs or not reply.reqs[0].tokens:
+            return self._forward_plain(batch, CaptureHiddenMode.NULL)
+        spec = self.build_verify_input(
+            batch,
+            [reply.reqs[0].tokens],
+            [reply.reqs[0].parents],
+            [self._tail_token(batch.reqs[0])],
+            int(self.model_runner.model_config.vocab_size),
+            int(self.server_args.toll_tree_max_depth),
+        )
+        if spec is None:
+            batch.draft_num_tokens = 1
+            return self._forward_plain(batch, CaptureHiddenMode.NULL)
+        spec.capture_hidden_mode = CaptureHiddenMode.NULL
+        spec.prepare_for_verify(batch, self.page_size)
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.spec_info = spec
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        result = self.target_worker.forward_batch_generation(model_worker_batch, is_verify=True)
+        verified = spec.verify(
+            batch,
+            result.logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            None,
+            prepare_local_draft_hidden=False,
+            sr_accept_state=None,
+        )
+        lengths = list(verified.accept_length_per_req_cpu)
+        self.verify_rounds += 1
+        self.accepted_draft_tokens += sum(lengths)
+        return GenerationBatchResult(
+            logits_output=result.logits_output,
+            next_token_ids=verified.verified_id,
+            num_accepted_tokens=sum(lengths),
+            accept_length_per_req_cpu=lengths,
+            can_run_cuda_graph=result.can_run_cuda_graph,
+        )
+
+    def _forward_plain(self, batch, hidden_mode):
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = hidden_mode
+        return self.target_worker.forward_batch_generation(model_worker_batch)
+
+    @staticmethod
+    def _tail_token(req) -> int:
+        output = list(getattr(req, "output_ids", []) or [])
+        if output:
+            return int(output[-1])
+        origin = list(getattr(req, "origin_input_ids", []) or [])
+        return int(origin[-1]) if origin else 0
 
     def build_verify_input(self, batch, token_rows, parent_rows, tails, vocab_size: int, max_depth: int):
         tokens, parents = filter_vocab(token_rows, parent_rows, vocab_size)
@@ -71,6 +145,7 @@ class TollTreeRemoteWorker:
         seq_lens = [int(v) for v in batch.seq_lens_cpu.tolist()]
         layout = build_verify_layout(parents, seq_lens, num_verify)
         walk_accept(layout, int(max_depth))
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         device = batch.seq_lens.device
@@ -90,7 +165,7 @@ class TollTreeRemoteWorker:
             spec_steps=int(max_depth),
             topk=max(num_verify - 1, 1),
             draft_token_num=num_verify,
-            capture_hidden_mode=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             seq_lens_sum=int(batch.seq_lens_sum),
             seq_lens_cpu=batch.seq_lens_cpu,
         )
