@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 
 class TollMetrics:
-    """Keep the latest round line for tests and logs."""
+    """Keep a fixed window of round lines."""
 
-    def __init__(self) -> None:
-        self.lines: list[str] = []
+    def __init__(self, window: int = 64) -> None:
+        self.lines: deque = deque(maxlen=int(window))
 
     def record(
         self,
@@ -15,6 +17,7 @@ class TollMetrics:
         lam: float,
         elapsed_ms: float,
         expected_alen: float,
+        ghat: float,
         actual_gain: float,
         layers,
         k: int,
@@ -30,7 +33,7 @@ class TollMetrics:
         line = (
             f"[TOLL round] lam={float(lam):.4f} T={float(elapsed_ms):.3f} "
             f"alen={float(expected_alen):.4f} W={widths} active={active} "
-            f"K={int(k)} stop={reasons or '-'} ghat={float(expected_alen):.4f} "
+            f"K={int(k)} stop={reasons or '-'} ghat={float(ghat):.4f} "
             f"gain={float(actual_gain):.4f} R={float(rtt_ms):.3f} "
             f"target={float(target_ms):.3f} w={float(cost.w):.4f} "
             f"beta={float(cost.beta):.4f} ready={bool(ready)}"

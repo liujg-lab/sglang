@@ -57,11 +57,17 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
             SpeculativeAlgorithm.STANDALONE_REMOTE.is_toll_tree_remote()
         )
 
-    def test_create_worker_refuses(self):
+    def test_create_worker_is_target_only(self):
         algo = SpeculativeAlgorithm.from_string("TOLL_TREE_REMOTE")
         with self.assertRaises(ValueError) as ctx:
-            algo.create_worker(SimpleNamespace(disable_overlap_schedule=True))
-        self.assertIn("not implemented", str(ctx.exception))
+            algo.create_worker(
+                SimpleNamespace(disable_overlap_schedule=True, toll_tree_role="draft")
+            )
+        self.assertIn("TpModelWorker", str(ctx.exception))
+        worker = algo.create_worker(
+            SimpleNamespace(disable_overlap_schedule=True, toll_tree_role="target")
+        )
+        self.assertEqual(worker.__name__, "TollTreeRemoteWorker")
 
     @unittest.skipIf(ServerArgs is None, "sglang.srt.server_args is not importable")
     def test_cli_accepts_algorithm_name(self):
@@ -73,12 +79,26 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
         self.assertEqual(parsed.speculative_algorithm, "TOLL_TREE_REMOTE")
 
     @unittest.skipIf(ServerArgs is None, "sglang.srt.server_args is not importable")
-    def test_startup_refuses(self):
+    def test_startup_accepts_fixed_batch_one_without_graphs(self):
         args = ServerArgs(model_path="dummy")
         args.speculative_algorithm = "TOLL_TREE_REMOTE"
-        with self.assertRaises(ValueError) as ctx:
+        args.toll_tree_role = "target"
+        args.toll_tree_policy = "fixed"
+        args.toll_tree_fixed_width = 8
+        args.toll_tree_fixed_tau = 0.1
+        args.disable_cuda_graph = True
+        args.disable_piecewise_cuda_graph = True
+        args.max_running_requests = 1
+        args._handle_speculative_decoding()
+        self.assertEqual(args.speculative_num_draft_tokens, 9)
+        self.assertEqual(args.speculative_num_steps, 10)
+        args.toll_tree_policy = "toll"
+        with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
-        self.assertIn("not implemented", str(ctx.exception))
+        args.toll_tree_policy = "fixed"
+        args.disable_cuda_graph = False
+        with self.assertRaises(ValueError):
+            args._handle_speculative_decoding()
 
 
 def _request(cfg, seq=1):
@@ -150,8 +170,16 @@ class TestTollProtocol(CustomTestCase):
         self.assertFalse(request_ok(foreign, cfg))
 
     def test_graph_flags_are_refused(self):
-        allowed = SimpleNamespace(disable_cuda_graph=True, disable_piecewise_cuda_graph=True)
-        self.assertEqual(TollConfig.from_server_args(allowed, "target").max_depth, 10)
+        allowed = SimpleNamespace(
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+            toll_tree_max_depth=6,
+            toll_tree_width_buckets="2,4,8",
+            toll_tree_verify_buckets="8,16",
+        )
+        built = TollConfig.from_server_args(allowed, "target")
+        self.assertEqual(built.max_depth, 6)
+        self.assertEqual(built.width_buckets, (2, 4, 8))
         with self.assertRaises(ValueError):
             TollConfig.from_server_args(
                 SimpleNamespace(disable_cuda_graph=False, disable_piecewise_cuda_graph=True),
@@ -256,6 +284,25 @@ class TestTollLayout(CustomTestCase):
         self.assertTrue(np.all(mask[1, :3]))
         self.assertTrue(mask[1, 3 + 4 + 1])
         self.assertFalse(mask[1, 3])
+
+
+class TestTollVerifyBounds(CustomTestCase):
+    def test_spec_steps_stay_inside_the_verify_slots(self):
+        from sglang.srt.speculative.toll_tree_remote.target.worker import walk_accept
+
+        max_depth = 4
+        parents = [[-1, 0, 1, 2]]
+        layout = build_verify_layout(parents, [3], num_verify=max_depth + 1)
+        walk_accept(layout, max_depth)
+
+    def test_tokens_outside_the_vocab_are_dropped(self):
+        from sglang.srt.speculative.toll_tree_remote.target.worker import filter_vocab
+
+        tokens, parents = filter_vocab([[4, 1000]], [[-1, 0]], vocab_size=128)
+        self.assertEqual(tokens, [[]])
+        self.assertEqual(parents, [[]])
+        tokens, parents = filter_vocab([[4, 5]], [[-1, 0]], vocab_size=128)
+        self.assertEqual(tokens, [[4, 5]])
 
 
 if __name__ == "__main__":

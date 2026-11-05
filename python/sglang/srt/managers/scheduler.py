@@ -218,6 +218,12 @@ from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin impo
 from sglang.srt.speculative.opt_tree_remote.opt_tree_scheduler import (
     OptTreeSchedulerMixin,
 )
+from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import (
+    TollDraftSchedulerMixin,
+)
+from sglang.srt.speculative.toll_tree_remote.target.scheduler_mixin import (
+    TollTargetSchedulerMixin,
+)
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
     StandaloneRemoteDraftSchedulerMixin as SchedulerStandaloneRemoteDraftMixin,
 )
@@ -306,6 +312,8 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerSpectreDraftMixin,
     SchedulerSpectreTargetMixin,
+    TollDraftSchedulerMixin,
+    TollTargetSchedulerMixin,
     OptTreeSchedulerMixin,
     SchedulerStandaloneRemoteDraftMixin,
     SchedulerStandaloneRemoteTargetMixin,
@@ -453,6 +461,7 @@ class Scheduler(
         self.init_spectre_communication()
         self.init_standalone_remote_communication()
         self.init_opt_tree_communication()
+        self.init_toll_tree_communication()
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -3805,6 +3814,16 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
+        elif (
+            scheduler.spec_algorithm.is_toll_tree_remote()
+            and server_args.toll_tree_role == "draft"
+        ):
+            scheduler.event_loop_normal_toll_tree_draft()
+        elif (
+            scheduler.spec_algorithm.is_toll_tree_remote()
+            and server_args.toll_tree_role == "target"
+        ):
+            scheduler.event_loop_normal_toll_tree_target()
         elif (
             scheduler.spec_algorithm.is_standalone_remote()
             and server_args.standalone_remote_role == "draft"

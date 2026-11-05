@@ -112,6 +112,11 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "opt_tree_role", None) == "draft"
         ):
             return True
+        if (
+            self.is_toll_tree_remote()
+            and getattr(server_args, "toll_tree_role", None) == "draft"
+        ):
+            return True
         return False
 
     def needs_draft_multimodal_processor(self, server_args) -> bool:
@@ -284,13 +289,23 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
+        enable_overlap = not server_args.disable_overlap_schedule
         if self.is_toll_tree_remote():
-            raise ValueError(
-                "TOLL_TREE_REMOTE serving loop is not implemented. "
-                "create_worker is not available."
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+            if getattr(server_args, "toll_tree_role", None) != "target":
+                raise ValueError(
+                    "TOLL_TREE_REMOTE draft uses TpModelWorker. "
+                    "create_worker is only valid for --toll-tree-role target."
+                )
+            from sglang.srt.speculative.toll_tree_remote.target.worker import (
+                TollTreeRemoteWorker,
             )
 
-        enable_overlap = not server_args.disable_overlap_schedule
+            return TollTreeRemoteWorker
+
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker
             if enable_overlap:

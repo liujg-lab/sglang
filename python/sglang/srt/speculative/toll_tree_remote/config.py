@@ -18,6 +18,12 @@ def _strict_buckets(values: Sequence[int], *, kind: str) -> tuple[int, ...]:
     return buckets
 
 
+def _bucket_values(value) -> tuple[int, ...]:
+    if isinstance(value, str):
+        return tuple(int(part) for part in value.split(",") if part)
+    return tuple(int(part) for part in value)
+
+
 @dataclass(frozen=True)
 class TollConfig:
     """Bucket and policy checks for ``TOLL_TREE_REMOTE``.
@@ -123,7 +129,23 @@ class TollConfig:
             raise ValueError("TOLL_TREE_REMOTE refuses CUDA graph")
         if not bool(getattr(args, "disable_piecewise_cuda_graph", False)):
             raise ValueError("TOLL_TREE_REMOTE refuses piecewise CUDA graph")
-        return cls()
+        return cls(
+            width_buckets=_bucket_values(getattr(args, "toll_tree_width_buckets", "2,4,8,16,32")),
+            verify_buckets=_bucket_values(getattr(args, "toll_tree_verify_buckets", "8,16,32")),
+            max_depth=getattr(args, "toll_tree_max_depth", 10),
+            child_topk=getattr(args, "toll_tree_child_topk", 16),
+            policy=getattr(args, "toll_tree_policy", "toll"),
+            fixed_width=getattr(args, "toll_tree_fixed_width", None),
+            fixed_tau=getattr(args, "toll_tree_fixed_tau", None),
+            fixed_k=getattr(args, "toll_tree_fixed_k", None),
+            price_alpha=getattr(args, "toll_tree_price_alpha", 0.02),
+            warmup_rounds=getattr(args, "toll_tree_warmup_rounds", 64),
+            probe_interval=getattr(args, "toll_tree_probe_interval", 64),
+            no_exit=bool(getattr(args, "toll_tree_no_exit", False)),
+            verify_mode=getattr(args, "toll_tree_verify_mode", "greedy"),
+            speculate_delta=getattr(args, "toll_tree_speculate_delta", 0.0),
+            bytes_per_token=getattr(args, "toll_tree_bytes_per_token", 0.0),
+        )
 
     @property
     def w_max(self) -> int:

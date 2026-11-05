@@ -555,6 +555,26 @@ class ServerArgs:
     opt_tree_addr: str = "127.0.0.1"
     opt_tree_port: str = "30029"
 
+    # TOLL_TREE_REMOTE. The serving loop still refuses to start.
+    toll_tree_width_buckets: str = "2,4,8,16,32"
+    toll_tree_verify_buckets: str = "8,16,32"
+    toll_tree_max_depth: int = 10
+    toll_tree_child_topk: int = 16
+    toll_tree_policy: str = "toll"
+    toll_tree_fixed_width: Optional[int] = None
+    toll_tree_fixed_tau: Optional[float] = None
+    toll_tree_fixed_k: Optional[int] = None
+    toll_tree_price_alpha: float = 0.02
+    toll_tree_warmup_rounds: int = 64
+    toll_tree_probe_interval: int = 64
+    toll_tree_no_exit: bool = False
+    toll_tree_verify_mode: str = "greedy"
+    toll_tree_speculate_delta: float = 0.0
+    toll_tree_bytes_per_token: float = 0.0
+    toll_tree_role: Optional[Literal["target", "draft"]] = None
+    toll_tree_addr: str = "127.0.0.1"
+    toll_tree_port: str = "30039"
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -3030,12 +3050,33 @@ class ServerArgs:
                 f"got {self.speculative_rpd_tau}."
             )
 
+    def _handle_toll_tree_remote(self):
+        from sglang.srt.speculative.toll_tree_remote.config import TollConfig
+
+        if self.toll_tree_role not in ("target", "draft"):
+            raise ValueError(
+                "TOLL_TREE_REMOTE requires --toll-tree-role target or draft."
+            )
+        if not self.disable_cuda_graph or not self.disable_piecewise_cuda_graph:
+            raise ValueError(
+                "TOLL_TREE_REMOTE requires --disable-cuda-graph and "
+                "--disable-piecewise-cuda-graph."
+            )
+        if self.toll_tree_policy != "fixed":
+            raise ValueError("TOLL_TREE_REMOTE serving currently requires policy=fixed.")
+        if self.max_running_requests not in (None, 1):
+            raise ValueError("TOLL_TREE_REMOTE serving currently requires batch size 1.")
+        self.max_running_requests = 1
+        self.disable_overlap_schedule = True
+        cfg = TollConfig.from_server_args(self, self.toll_tree_role)
+        width = int(cfg.fixed_width)
+        self.speculative_num_steps = int(cfg.max_depth)
+        self.speculative_num_draft_tokens = width + 1 if self.toll_tree_role == "target" else width
+
     def _handle_speculative_decoding(self):
         if self.speculative_algorithm == "TOLL_TREE_REMOTE":
-            raise ValueError(
-                "TOLL_TREE_REMOTE serving loop is not implemented. "
-                "Startup is refused until the algorithm is specified."
-            )
+            self._handle_toll_tree_remote()
+            return
 
         self._validate_speculative_verify_args()
 
@@ -5585,6 +5626,116 @@ class ServerArgs:
             type=str,
             default=ServerArgs.opt_tree_port,
             help="TCP port for the OPT_TREE_REMOTE sync RPC.",
+        )
+        parser.add_argument(
+            "--toll-tree-width-buckets",
+            type=str,
+            default=ServerArgs.toll_tree_width_buckets,
+            help="Comma-separated TollTree draft width buckets. Each value is >= 2.",
+        )
+        parser.add_argument(
+            "--toll-tree-verify-buckets",
+            type=str,
+            default=ServerArgs.toll_tree_verify_buckets,
+            help="Comma-separated TollTree verify buckets.",
+        )
+        parser.add_argument(
+            "--toll-tree-max-depth",
+            type=int,
+            default=ServerArgs.toll_tree_max_depth,
+            help="Maximum TollTree depth, including the first draft layer.",
+        )
+        parser.add_argument(
+            "--toll-tree-child-topk",
+            type=int,
+            default=ServerArgs.toll_tree_child_topk,
+            help="How many children each forwarded node keeps before the cut.",
+        )
+        parser.add_argument(
+            "--toll-tree-policy",
+            type=str,
+            choices=["toll", "fixed"],
+            default=ServerArgs.toll_tree_policy,
+            help="toll learns the width. fixed keeps one OPT width.",
+        )
+        parser.add_argument(
+            "--toll-tree-fixed-width",
+            type=int,
+            default=ServerArgs.toll_tree_fixed_width,
+            help="OPT width N used when --toll-tree-policy=fixed.",
+        )
+        parser.add_argument(
+            "--toll-tree-fixed-tau",
+            type=float,
+            default=ServerArgs.toll_tree_fixed_tau,
+            help="OPT acceptance-mass threshold used when policy=fixed.",
+        )
+        parser.add_argument(
+            "--toll-tree-fixed-k",
+            type=int,
+            default=ServerArgs.toll_tree_fixed_k,
+            help="Optional fixed verify bucket. It must belong to the verify buckets.",
+        )
+        parser.add_argument(
+            "--toll-tree-price-alpha",
+            type=float,
+            default=ServerArgs.toll_tree_price_alpha,
+            help="EMA factor for the token-price tracker.",
+        )
+        parser.add_argument(
+            "--toll-tree-warmup-rounds",
+            type=int,
+            default=ServerArgs.toll_tree_warmup_rounds,
+            help="Samples required before the learned cost can be used.",
+        )
+        parser.add_argument(
+            "--toll-tree-probe-interval",
+            type=int,
+            default=ServerArgs.toll_tree_probe_interval,
+            help="How many new samples to collect before refitting the cost.",
+        )
+        parser.add_argument(
+            "--toll-tree-no-exit",
+            action="store_true",
+            help="Keep a request in the round even when its surplus is <= 0.",
+        )
+        parser.add_argument(
+            "--toll-tree-verify-mode",
+            type=str,
+            choices=["greedy", "auto"],
+            default=ServerArgs.toll_tree_verify_mode,
+            help="TOLL_TREE_REMOTE accepts greedy only. rpd is rejected.",
+        )
+        parser.add_argument(
+            "--toll-tree-speculate-delta",
+            type=float,
+            default=ServerArgs.toll_tree_speculate_delta,
+            help="Extra margin required before speculative decoding is worth it.",
+        )
+        parser.add_argument(
+            "--toll-tree-bytes-per-token",
+            type=float,
+            default=ServerArgs.toll_tree_bytes_per_token,
+            help="Bytes charged per verified token when converting the network slope.",
+        )
+        parser.add_argument(
+            "--toll-tree-role",
+            type=str,
+            choices=["target", "draft"],
+            default=ServerArgs.toll_tree_role,
+            help="target verifies. draft grows the tree.",
+        )
+        parser.add_argument(
+            "--toll-tree-addr",
+            type=str,
+            default=ServerArgs.toll_tree_addr,
+            help="Draft bind address, or the address the Target connects to.",
+        )
+        parser.add_argument(
+            "--toll-tree-port",
+            type=str,
+            default=ServerArgs.toll_tree_port,
+            help="TCP port for the TOLL_TREE_REMOTE control RPC.",
         )
 
         # Expert parallelism

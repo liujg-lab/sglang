@@ -43,6 +43,8 @@ class TollDraftServer:
         self.url = url
         self.bytes_sent = 0
         self.bytes_recv = 0
+        self.bad_frames = 0
+        self.last_recv_ns = 0
         self._ctx = zmq.Context.instance()
         sock = self._ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 0)
@@ -64,10 +66,21 @@ class TollDraftServer:
         except zmq.Again:
             return None
         self.bytes_recv += _nbytes(frames)
+        self.last_recv_ns = time.perf_counter_ns()
         if len(frames) < 3 or frames[1] != _MAGIC:
+            self.bad_frames += 1
             return None
         self._identity = frames[0]
-        return decode_request(frames[2])
+        try:
+            return decode_request(frames[2])
+        except Exception:
+            self.bad_frames += 1
+            return None
+
+    def residence_ns(self) -> int:
+        if not self.last_recv_ns:
+            return 0
+        return int(time.perf_counter_ns() - self.last_recv_ns)
 
     def send_reply(self, reply: TollReply) -> None:
         if self._identity is None or self._socket is None:
@@ -91,6 +104,7 @@ class TollTargetClient:
         self.bytes_recv = 0
         self.timeouts = 0
         self.stale_replies = 0
+        self._rpc_mark = 0
         self._ctx = zmq.Context.instance()
         self._identity = b"toll-target-" + uuid.uuid4().hex[:8].encode()
         self._socket = None
@@ -157,3 +171,10 @@ class TollTargetClient:
                 self.stale_replies += 1
                 continue
             return reply
+
+    def take_rpc_bytes(self) -> int:
+        """Bytes sent and received since the previous call."""
+        total = int(self.bytes_sent) + int(self.bytes_recv)
+        delta = total - int(self._rpc_mark)
+        self._rpc_mark = total
+        return delta
