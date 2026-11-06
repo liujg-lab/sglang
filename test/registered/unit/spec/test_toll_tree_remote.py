@@ -92,6 +92,7 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
         args._handle_speculative_decoding()
         self.assertEqual(args.speculative_num_draft_tokens, 9)
         self.assertEqual(args.speculative_num_steps, 10)
+        self.assertFalse(args.skip_server_warmup)
         args.toll_tree_policy = "toll"
         with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
@@ -101,6 +102,10 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
             args._handle_speculative_decoding()
         args.disable_cuda_graph = True
         args.toll_tree_role = "draft"
+        args.tp_size = 1
+        args.skip_server_warmup = False
+        args._handle_speculative_decoding()
+        self.assertTrue(args.skip_server_warmup)
         args.tp_size = 2
         with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
@@ -768,6 +773,134 @@ class TestTollDraftPool(CustomTestCase):
         eos.eos_token_ids = {99}
         note_decode_token(eos, 99)
         self.assertTrue(eos.finished())
+
+    def test_multimodal_requests_skip_prefill_and_step(self):
+        from sglang.srt.speculative.toll_tree_remote.target.scheduler_mixin import (
+            skip_toll_exchange,
+        )
+
+        greedy = SimpleNamespace(
+            is_all_greedy=True, penalizer_orchestrator=None, logit_bias=None
+        )
+        image = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="a", multimodal_inputs=object())],
+            sampling_info=greedy,
+            has_grammar=False,
+        )
+        self.assertTrue(skip_toll_exchange(image, True))
+        self.assertTrue(skip_toll_exchange(image, False))
+        text = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="a", multimodal_inputs=None)],
+            sampling_info=greedy,
+            has_grammar=False,
+        )
+        self.assertFalse(skip_toll_exchange(text, True))
+
+    def test_layer_check_restores_the_token_row(self):
+        from sglang.srt.speculative.toll_tree_remote.draft import reqs as draft_reqs
+        from sglang.srt.speculative.toll_tree_remote.draft.check_layer import (
+            reference_and_report,
+        )
+
+        table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+        original = table.clone()
+
+        class Pool:
+            req_to_token = table
+
+        class Scheduler:
+            req_to_token_pool = Pool()
+
+            def _toll_alloc(self, width):
+                return list(range(int(width)))
+
+            def _toll_free(self, slots):
+                return None
+
+        req = SimpleNamespace(
+            rid="a",
+            req_pool_idx=0,
+            kv_committed_len=4,
+            kv_allocated_len=4,
+            fill_ids=[1, 2, 3, 4],
+        )
+        tree = SimpleNamespace(token=[7], parent=[-1])
+
+        def overwrite(scheduler, request, start, tokens, slots):
+            scheduler.req_to_token_pool.req_to_token[0, start : start + len(tokens)] = 99
+            return torch.zeros(len(tokens), 3)
+
+        previous = draft_reqs.extend_committed
+        draft_reqs.extend_committed = overwrite
+        try:
+            reference_and_report(Scheduler(), req, tree, 0, torch.zeros(1, 3))
+        finally:
+            draft_reqs.extend_committed = previous
+        self.assertTrue(torch.equal(table, original))
+        self.assertEqual(req.kv_committed_len, 4)
+
+    def test_repeated_prefill_does_not_grow_the_pools(self):
+        from sglang.srt.speculative.toll_tree_remote.draft.scheduler_mixin import TollDraftService
+
+        class IndexPool:
+            def __init__(self) -> None:
+                self.free_slots = list(range(4))
+                self.live = 0
+
+            def alloc(self, request) -> None:
+                if not self.free_slots:
+                    raise RuntimeError("request pool is empty")
+                request.req_pool_idx = self.free_slots.pop(0)
+                self.live += 1
+
+            def free(self, request) -> None:
+                self.free_slots.append(request.req_pool_idx)
+                request.req_pool_idx = None
+                self.live -= 1
+
+        indexes = IndexPool()
+        kv = _SlotPool()
+        cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=2)
+
+        def make_req(rid, ids):
+            req = SimpleNamespace(
+                rid=rid,
+                origin_input_ids=list(ids),
+                output_ids=[],
+                fill_ids=list(ids),
+                req_pool_idx=None,
+                kv_committed_len=0,
+            )
+            indexes.alloc(req)
+            return req
+
+        service = TollDraftService(
+            cfg,
+            forward=lambda item, slots: ([], []),
+            alloc=kv.alloc,
+            free=kv.free,
+            req_factory=make_req,
+            release_req=indexes.free,
+        )
+        for seq in range(3):
+            reply = service.handle(_toll_request(cfg, TollAction.PREFILL, seq + 1, [], [1, 2], 2))
+            self.assertEqual(reply.reqs[0].status, TollStatus.OK)
+        self.assertEqual(len(kv.live), 2)
+        self.assertEqual(indexes.live, 1)
+
+    def test_layer_spec_is_a_verify_input(self):
+        from sglang.srt.speculative.spec_info import SpecInput
+        from sglang.srt.speculative.toll_tree_remote.draft.spec_input import TollLayerSpec
+
+        spec = TollLayerSpec(
+            custom_mask=[True, False],
+            positions=[0, 1],
+            draft_token_num=2,
+            num_tokens_per_req=2,
+        )
+        self.assertIsInstance(spec, SpecInput)
+        self.assertFalse(spec.is_draft_input())
+        self.assertEqual(spec.get_spec_adjust_token_coefficient(), (1, 1))
 
 
 def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len, rid="a"):

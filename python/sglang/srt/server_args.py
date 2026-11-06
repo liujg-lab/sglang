@@ -3071,6 +3071,8 @@ class ServerArgs:
             raise ValueError("TOLL_TREE_REMOTE serving currently requires batch size 1.")
         self.max_running_requests = 1
         self.disable_overlap_schedule = True
+        if self.toll_tree_role == "draft":
+            self.skip_server_warmup = True
         cfg = TollConfig.from_server_args(self, self.toll_tree_role)
         width = int(cfg.fixed_width)
         self.speculative_num_steps = int(cfg.max_depth)

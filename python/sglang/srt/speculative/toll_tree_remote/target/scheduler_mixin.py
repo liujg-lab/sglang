@@ -32,6 +32,20 @@ def tail_token(req) -> int:
     return int(origin[-1]) if origin else 0
 
 
+def has_multimodal(batch) -> bool:
+    for req in getattr(batch, "reqs", None) or []:
+        if getattr(req, "multimodal_inputs", None) is not None:
+            return True
+    return False
+
+
+def skip_toll_exchange(batch, extend: bool) -> bool:
+    """Multimodal requests stay on ordinary prefill and decode."""
+    if has_multimodal(batch):
+        return True
+    return (not extend) and skip_speculative(batch)
+
+
 def skip_speculative(batch) -> bool:
     """Ordinary decode for health checks and anything that is not plain greedy."""
     for req in getattr(batch, "reqs", None) or []:
@@ -56,6 +70,8 @@ class TollTargetSchedulerMixin:
             return
         if getattr(self.server_args, "toll_tree_role", None) != "target":
             return
+        if getattr(self, "_toll_comm_ready", False):
+            return
         from sglang.srt.speculative.toll_tree_remote.config import TollConfig
         from sglang.srt.speculative.toll_tree_remote.transport import TollTargetClient
 
@@ -72,6 +88,7 @@ class TollTargetSchedulerMixin:
             self.toll_client = TollTargetClient(url, self.toll_cfg, timeout_ms=timeout_ms)
         else:
             self.toll_client = None
+        self._toll_comm_ready = True
 
     def _toll_broadcast(self, payload):
         if int(getattr(self, "tp_size", 1)) <= 1:
@@ -208,7 +225,7 @@ class TollTargetSchedulerMixin:
             raise RuntimeError("TOLL_TREE_REMOTE serving currently requires batch size 1")
         req = batch.reqs[0]
         extend = batch.forward_mode is not None and batch.forward_mode.is_extend()
-        if not extend and skip_speculative(batch):
+        if skip_toll_exchange(batch, extend):
             batch.draft_num_tokens = 1
             result = self.run_batch(batch)
             self.process_batch_result(batch, result)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 from sglang.srt.speculative.toll_tree_remote.draft.kv import TreeKV
@@ -14,6 +15,9 @@ from sglang.srt.speculative.toll_tree_remote.protocol import (
     request_ok,
 )
 from sglang.srt.utils import DynamicGradMode
+
+
+logger = logging.getLogger(__name__)
 
 
 class DraftForwardError(RuntimeError):
@@ -146,6 +150,7 @@ class TollDraftService:
     def _empty_after_error(self, request, exc: BaseException) -> TollReply:
         if is_device_context_error(exc):
             raise exc
+        logger.exception("[TOLL draft] forward failed")
         self.empty_forwards += 1
         return self._reply(request, [], TollStatus.EMPTY)
 
@@ -162,18 +167,23 @@ class TollDraftService:
     def _materialize(self, rid: str, ids: list[int], commit_len: int) -> None:
         from sglang.srt.speculative.toll_tree_remote.draft.reqs import make_draft_req
 
+        self._drop(rid)
         factory = self.req_factory or make_draft_req
-        req = factory(rid, ids)
-        slots = self._alloc_exact(len(ids)) if ids else []
-        if ids and slots is None:
-            raise DraftForwardError(f"draft {rid} has no prefix slots")
-        self.prefix_slots[rid] = list(slots or [])
-        self.reqs[rid] = req
-        self.kv[rid] = TreeKV(self.alloc, self.free)
-        if self.ingest is not None:
-            self.ingest(req, self.prefix_slots[rid])
-        prefix = len(ids)
-        self.state.upsert(rid, prefix, int(commit_len) or prefix)
+        try:
+            req = factory(rid, ids)
+            self.reqs[rid] = req
+            slots = self._alloc_exact(len(ids)) if ids else []
+            if ids and slots is None:
+                raise DraftForwardError(f"draft {rid} has no prefix slots")
+            self.prefix_slots[rid] = list(slots or [])
+            self.kv[rid] = TreeKV(self.alloc, self.free)
+            if self.ingest is not None:
+                self.ingest(req, self.prefix_slots[rid])
+            prefix = len(ids)
+            self.state.upsert(rid, prefix, int(commit_len) or prefix)
+        except Exception:
+            self._drop(rid)
+            raise
 
     def _step(self, request, item) -> TollReply:
         from sglang.srt.speculative.toll_tree_remote.policy.round import RoundReq
@@ -400,6 +410,8 @@ class TollDraftSchedulerMixin:
             return
         if getattr(self.server_args, "toll_tree_role", None) != "draft":
             super().init_toll_tree_communication()
+            return
+        if getattr(self, "toll_server", None) is not None:
             return
         from sglang.srt.speculative.toll_tree_remote.config import TollConfig
         from sglang.srt.speculative.toll_tree_remote.transport import TollDraftServer

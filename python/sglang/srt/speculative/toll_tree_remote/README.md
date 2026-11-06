@@ -4,6 +4,8 @@
 
 当前服务循环只接受同时满足这些条件的启动：`--disable-cuda-graph`、`--disable-piecewise-cuda-graph`、`--toll-tree-policy=fixed`、`--max-running-requests=1`，以及 `--toll-tree-role=target` 或 `draft`。`policy=toll`、更大的 batch、开启 CUDA graph 仍然会拒绝。这一步没有 CUDA graph，也没有 lease。NPU Target 不走 `tree_paged_fia`。
 
+带 `multimodal_inputs` 的请求不进入投机。Qwen3-VL 的启动 warmup 会带图片，而当前 PREFILL 只发送 `input_ids`，所以这类请求的 PREFILL 和 STEP 都走普通解码。
+
 Draft 按层生成 top-C，回包后回滚树区 KV。Target 用 `K+1` 个槽做验证，槽 0 是已提交尾 token，padding 填 0。`commit_len` 是前缀加已输出 token 的长度，STEP 只带增量；对不上时 Draft 回 `NEED_SNAPSHOT`，Target 下一轮重发完整前缀。`K=0` 或空回包退回普通一步解码，超时和 `REJECT` 才记熔断。
 
 ## 策略

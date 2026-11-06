@@ -22,6 +22,21 @@ def ancestor_tokens(tree, node: int) -> list[int]:
     return chain
 
 
+def save_token_row(pool, pool_idx, start: int, length: int):
+    """Clone the tree columns a reference extend is about to overwrite."""
+    if pool is None or pool_idx is None or length <= 0:
+        return None
+    row = pool.req_to_token[int(pool_idx), int(start) : int(start) + int(length)]
+    return row.detach().clone()
+
+
+def restore_token_row(pool, pool_idx, start: int, saved) -> None:
+    if pool is None or pool_idx is None or saved is None:
+        return
+    end = int(start) + int(saved.shape[0])
+    pool.req_to_token[int(pool_idx), int(start) : end] = saved
+
+
 def reference_and_report(scheduler, req, tree, node: int, layer_logits) -> None:
     """EXTEND the ancestor path and log how far row 0 is from that distribution."""
     path = ancestor_tokens(tree, node)
@@ -35,6 +50,8 @@ def reference_and_report(scheduler, req, tree, node: int, layer_logits) -> None:
         return
     saved_committed = int(getattr(req, "kv_committed_len", 0) or 0)
     saved_allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    saved_row = save_token_row(pool, getattr(req, "req_pool_idx", None), saved_committed, len(path))
     try:
         from sglang.srt.speculative.toll_tree_remote.draft.reqs import extend_committed
 
@@ -49,6 +66,7 @@ def reference_and_report(scheduler, req, tree, node: int, layer_logits) -> None:
         logger.info("[TOLL check] reference extend failed: %s", exc)
         return
     finally:
+        restore_token_row(pool, getattr(req, "req_pool_idx", None), saved_committed, saved_row)
         req.kv_committed_len = saved_committed
         req.kv_allocated_len = saved_allocated
         scheduler._toll_free(slots)
