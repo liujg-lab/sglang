@@ -52,6 +52,10 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_ascend_use_fia,
     resolve_eager_page_buckets,
 )
+from sglang.srt.hardware_backend.npu.attention.tree_fia_select import (
+    enter_target_tree_fia,
+    restore_initial_tree_impl,
+)
 from sglang.srt.speculative.spec_info import remote_spec_role
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
@@ -469,15 +473,7 @@ class AscendAttnBackend(AttentionBackend):
         reason = None
         args = self.model_runner.server_args
         role = remote_spec_role(args)
-        algo = getattr(args, "speculative_algorithm", None)
-        if self.verify_tree_topk <= 1:
-            return
-        if algo == "OPT_TREE_REMOTE":
-            # Draft stays on the compact path. Entering the SR policy below
-            # would rewrite it to shared prefix.
-            if role != "target":
-                return
-        elif algo != "STANDALONE_REMOTE":
+        if not enter_target_tree_fia(args, self.verify_tree_topk):
             return
         if self.use_mla or self.is_hybrid_swa or self.is_dllm_model or self.use_alibi:
             reason = "specialized attention architecture"
@@ -551,11 +547,9 @@ class AscendAttnBackend(AttentionBackend):
             role=role,
             verify_topk=self.verify_tree_topk,
         )
-        if (
-            algo == "OPT_TREE_REMOTE"
-            and self.tree_attention_impl != IMPL_TREE_PAGED_FIA
-        ):
-            self.tree_attention_impl = initial_impl
+        self.tree_attention_impl = restore_initial_tree_impl(
+            args, self.tree_attention_impl, initial_impl
+        )
         logger.info(
             "NPU SR tree attention implementation=%s fallback_reason=%s",
             self.tree_attention_impl,
@@ -1632,6 +1626,25 @@ class AscendAttnBackend(AttentionBackend):
         n_rows = tables.shape[0]
         dest[:n_rows].copy_(tables)
         dest[n_rows:].fill_(0)
+
+    def _paged_metadata_workspace(self):
+        workspace = getattr(self, "_sr_target_paged_workspace", None)
+        view = getattr(self, "_sr_draft_paged_view", None)
+        if view is not None:
+            workspace = view.workspace
+        return workspace
+
+    def finish_forward_metadata(self) -> None:
+        """Record that this forward consumed the paged metadata workspace."""
+        workspace = self._paged_metadata_workspace()
+        if workspace is not None:
+            workspace.consumed()
+
+    def poison_forward_metadata(self) -> None:
+        """Make a failed forward's workspace unusable for the next upload."""
+        workspace = self._paged_metadata_workspace()
+        if workspace is not None and workspace.pending_consumer:
+            workspace.poison()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

@@ -3,6 +3,7 @@
 import argparse
 import unittest
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -90,9 +91,33 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
         args.disable_piecewise_cuda_graph = True
         args.max_running_requests = 1
         args._handle_speculative_decoding()
+        from sglang.srt.speculative.tree_attn_fallback import (
+            verify_tree_topk_from_server_args,
+        )
+
         self.assertEqual(args.speculative_num_draft_tokens, 9)
         self.assertEqual(args.speculative_num_steps, 10)
+        self.assertIsNone(args.speculative_eagle_topk)
+        self.assertTrue(args.npu_target_tree_fia)
+        self.assertEqual(verify_tree_topk_from_server_args(args), 8)
         self.assertFalse(args.skip_server_warmup)
+        draft = ServerArgs(model_path="dummy")
+        draft.speculative_algorithm = "TOLL_TREE_REMOTE"
+        draft.toll_tree_role = "draft"
+        draft.toll_tree_policy = "fixed"
+        draft.toll_tree_fixed_width = 8
+        draft.toll_tree_fixed_tau = 0.1
+        draft.disable_cuda_graph = True
+        draft.disable_piecewise_cuda_graph = True
+        draft.max_running_requests = 1
+        draft._handle_speculative_decoding()
+        self.assertIsNone(draft.speculative_eagle_topk)
+        self.assertFalse(draft.npu_target_tree_fia)
+        self.assertEqual(verify_tree_topk_from_server_args(draft), 1)
+        args.enable_dp_attention = True
+        with self.assertRaisesRegex(ValueError, "dp attention"):
+            args._handle_speculative_decoding()
+        args.enable_dp_attention = False
         args.toll_tree_policy = "toll"
         with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
@@ -109,6 +134,29 @@ class TestTollTreeRemoteRegistration(CustomTestCase):
         args.tp_size = 2
         with self.assertRaises(ValueError):
             args._handle_speculative_decoding()
+
+    def test_config_rejects_dp_attention_and_an_npu_draft(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.toll_tree_remote.config import TollConfig
+
+        common = dict(
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+            toll_tree_policy="fixed",
+            toll_tree_fixed_width=8,
+            toll_tree_fixed_tau=0.1,
+        )
+        with self.assertRaisesRegex(ValueError, "dp attention"):
+            TollConfig.from_server_args(
+                SimpleNamespace(enable_dp_attention=True, device="cuda", **common),
+                "target",
+            )
+        with self.assertRaisesRegex(ValueError, "npu draft"):
+            TollConfig.from_server_args(
+                SimpleNamespace(enable_dp_attention=False, device="npu", **common),
+                "draft",
+            )
 
 
 def _request(cfg, seq=1):
@@ -405,6 +453,35 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
         for width, bucket in WarmupSchedule(TollConfig()).pairs:
             self.assertLessEqual(width, bucket)
 
+    def test_ordinary_decode_counts_spec_fallback(self):
+        from sglang.srt.speculative.toll_tree_remote.target.worker import (
+            record_fallback_tokens,
+        )
+
+        live = SimpleNamespace(
+            rid="a",
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            spec_cnt=0,
+            spec_fallback_ct=0,
+            len_output_ids=1,
+        )
+        health = SimpleNamespace(
+            rid="HEALTH_CHECK",
+            origin_input_ids=[9],
+            output_ids=[],
+            spec_cnt=0,
+            spec_fallback_ct=0,
+            len_output_ids=0,
+        )
+        counted = record_fallback_tokens([live, health], [11, 22])
+        self.assertTrue(counted)
+        self.assertEqual(live.spec_fallback_ct, 1)
+        self.assertEqual(live.output_ids[-1], 11)
+        self.assertEqual(health.spec_fallback_ct, 0)
+        self.assertEqual(health.output_ids, [])
+        self.assertFalse(record_fallback_tokens([health], [22]))
+
     def test_greedy_health_and_abort(self):
         from sglang.srt.sampling.sampling_params import SamplingParams
         from sglang.srt.speculative.toll_tree_remote.protocol import TollAction
@@ -508,6 +585,8 @@ class TestTollCommitAndFakeDraft(CustomTestCase):
         pad = fake.draft_window("pad", baseline, 3, 3)
         self.assertEqual(pad, ([10], [-1]))
         self.assertIsNone(fake.draft_window("silent", baseline, 3, 3))
+        branch = fake.draft_window("branch", baseline, 3, 3)
+        self.assertEqual(branch, ([11, 10, 11, 12], [-1, -1, 1, 2]))
 
         cfg = TollConfig(policy="fixed", fixed_width=8, fixed_tau=0.0, max_depth=4)
         pool = _SlotPool()
@@ -901,6 +980,164 @@ class TestTollDraftPool(CustomTestCase):
         self.assertIsInstance(spec, SpecInput)
         self.assertFalse(spec.is_draft_input())
         self.assertEqual(spec.get_spec_adjust_token_coefficient(), (1, 1))
+
+
+class TestForwardMetadataHooks(CustomTestCase):
+    def test_success_finishes_and_failure_poisons(self):
+        from sglang.srt.model_executor.attn_metadata_hook import (
+            run_forward_with_metadata_hooks,
+        )
+
+        class Backend:
+            def __init__(self):
+                self.calls = []
+
+            def finish_forward_metadata(self):
+                self.calls.append("finish")
+
+            def poison_forward_metadata(self):
+                self.calls.append("poison")
+
+        ok = Backend()
+        self.assertEqual(run_forward_with_metadata_hooks(ok, lambda: "out"), "out")
+        self.assertEqual(ok.calls, ["finish"])
+
+        def fail():
+            raise RuntimeError("forward failed")
+
+        bad = Backend()
+        with self.assertRaises(RuntimeError):
+            run_forward_with_metadata_hooks(bad, fail)
+        self.assertEqual(bad.calls, ["poison"])
+
+        self.assertEqual(run_forward_with_metadata_hooks(object(), lambda: "out"), "out")
+
+    def test_model_runner_wraps_both_raw_forwards(self):
+        root = Path(__file__).resolve().parents[4]
+        text = (root / "python/sglang/srt/model_executor/model_runner.py").read_text()
+        self.assertEqual(text.count("self._run_forward_raw("), 2)
+        self.assertIn("run_forward_with_metadata_hooks", text)
+
+    def test_toll_package_does_not_import_other_algorithms(self):
+        root = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/toll_tree_remote"
+        )
+        forbidden = ("standalone_remote", "opt_tree_remote", "spectre")
+        hits = []
+        for path in root.rglob("*.py"):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if any(name in line for name in forbidden):
+                    hits.append(f"{path}:{lineno}:{line.strip()}")
+        self.assertEqual(hits, [])
+
+
+class TestTreeFiaSelect(CustomTestCase):
+    def test_entry_matches_the_old_algorithm_split(self):
+        from sglang.srt.hardware_backend.npu.attention.tree_fia_select import (
+            TREE_PAGED_FIA,
+            enter_target_tree_fia,
+            restore_initial_tree_impl,
+        )
+
+        opt_target = SimpleNamespace(
+            speculative_algorithm="OPT_TREE_REMOTE",
+            opt_tree_role="target",
+            npu_target_tree_fia=False,
+        )
+        opt_draft = SimpleNamespace(
+            speculative_algorithm="OPT_TREE_REMOTE",
+            opt_tree_role="draft",
+            npu_target_tree_fia=False,
+        )
+        toll_target = SimpleNamespace(
+            speculative_algorithm="TOLL_TREE_REMOTE",
+            toll_tree_role="target",
+            npu_target_tree_fia=True,
+        )
+        toll_draft = SimpleNamespace(
+            speculative_algorithm="TOLL_TREE_REMOTE",
+            toll_tree_role="draft",
+            npu_target_tree_fia=False,
+        )
+        sr_target = SimpleNamespace(
+            speculative_algorithm="STANDALONE_REMOTE",
+            standalone_remote_role="target",
+            npu_target_tree_fia=False,
+        )
+        eagle = SimpleNamespace(
+            speculative_algorithm="EAGLE",
+            npu_target_tree_fia=False,
+        )
+
+        self.assertTrue(enter_target_tree_fia(opt_target, 8))
+        self.assertFalse(enter_target_tree_fia(opt_draft, 8))
+        self.assertTrue(enter_target_tree_fia(toll_target, 8))
+        self.assertFalse(enter_target_tree_fia(toll_draft, 8))
+        self.assertTrue(enter_target_tree_fia(sr_target, 8))
+        self.assertFalse(enter_target_tree_fia(eagle, 8))
+        self.assertFalse(enter_target_tree_fia(sr_target, 1))
+
+        self.assertEqual(
+            restore_initial_tree_impl(opt_target, "compact_fia", "chunked"), "chunked"
+        )
+        self.assertEqual(
+            restore_initial_tree_impl(opt_target, TREE_PAGED_FIA, "chunked"),
+            TREE_PAGED_FIA,
+        )
+        self.assertEqual(
+            restore_initial_tree_impl(toll_target, "shared_prefix", "compact_fia"),
+            "compact_fia",
+        )
+        self.assertEqual(
+            restore_initial_tree_impl(sr_target, "shared_prefix", "chunked"),
+            "shared_prefix",
+        )
+        from sglang.srt.speculative.tree_attn_fallback import (
+            verify_tree_topk_from_server_args,
+        )
+
+        toll_target.toll_tree_fixed_width = 8
+        toll_target.speculative_eagle_topk = None
+        self.assertEqual(verify_tree_topk_from_server_args(toll_target), 8)
+        self.assertEqual(
+            verify_tree_topk_from_server_args(
+                SimpleNamespace(
+                    npu_target_tree_fia=True,
+                    toll_tree_fixed_width=8,
+                    speculative_eagle_topk=3,
+                )
+            ),
+            8,
+        )
+        self.assertEqual(
+            verify_tree_topk_from_server_args(
+                SimpleNamespace(speculative_eagle_topk=3)
+            ),
+            3,
+        )
+
+    def test_backend_does_not_name_toll_or_import_sr_from_the_hooks(self):
+        root = Path(__file__).resolve().parents[4]
+        text = (
+            root / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+        ).read_text()
+        self.assertNotIn("TOLL_TREE_REMOTE", text)
+        body = "\n".join(
+            _method_body(text, name)
+            for name in ("finish_forward_metadata", "poison_forward_metadata")
+        )
+        self.assertNotIn("standalone_remote", body)
+
+
+def _method_body(text: str, name: str) -> str:
+    marker = f"def {name}"
+    start = text.index(marker)
+    rest = text[start:]
+    nxt = rest.find("\n    def ")
+    if nxt == -1:
+        return rest
+    return rest[:nxt]
 
 
 def _toll_request(cfg, action, seq, new_tokens, input_ids, commit_len, rid="a"):

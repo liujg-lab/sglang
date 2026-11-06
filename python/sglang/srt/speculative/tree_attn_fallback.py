@@ -65,15 +65,22 @@ _LOGGED_TREE_VERIFY_LAYOUT = False
 
 
 def verify_tree_topk_from_server_args(server_args) -> int:
-    """Target verify tree width from launch args, not Draft ``draft_topk``."""
+    """Target verify tree width from launch args, not Draft ``draft_topk``.
+
+    A flagged target publishes its width on ``toll_tree_fixed_width`` and leaves
+    ``speculative_eagle_topk`` unset, so ordinary forwards keep the topk-one
+    attention and KV budget.
+    """
+    if bool(getattr(server_args, "npu_target_tree_fia", False)):
+        return max(int(getattr(server_args, "toll_tree_fixed_width", 1) or 1), 1)
     return max(int(getattr(server_args, "speculative_eagle_topk", 1) or 1), 1)
 
 
 def resolve_backend_topks(ctor_draft_topk, server_args):
     """Mirror AscendAttnBackend construction: Draft layout vs Target verify width.
 
-    Target factory leaves ``ctor_draft_topk=1``. Verify fallback must use
-    ``speculative_eagle_topk`` from ``server_args``.
+    Target factory leaves ``ctor_draft_topk=1``. Verify width comes from
+    ``verify_tree_topk_from_server_args``.
     """
     draft_topk = max(int(ctor_draft_topk), 1)
     verify_tree_topk = verify_tree_topk_from_server_args(server_args)

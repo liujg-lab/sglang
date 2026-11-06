@@ -575,6 +575,9 @@ class ServerArgs:
     toll_tree_addr: str = "127.0.0.1"
     toll_tree_port: str = "30039"
     toll_tree_rpc_timeout_ms: int = 5000
+    # Toll Target sets this so NPU tree selection can run without naming Toll.
+    # The verify width is toll_tree_fixed_width, not speculative_eagle_topk.
+    npu_target_tree_fia: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -3073,10 +3076,20 @@ class ServerArgs:
         self.disable_overlap_schedule = True
         if self.toll_tree_role == "draft":
             self.skip_server_warmup = True
+        if self.enable_dp_attention:
+            raise ValueError("TOLL_TREE_REMOTE rejects dp attention.")
+        if self.toll_tree_role == "draft" and is_npu():
+            raise ValueError("TOLL_TREE_REMOTE draft on NPU is not supported yet.")
         cfg = TollConfig.from_server_args(self, self.toll_tree_role)
         width = int(cfg.fixed_width)
         self.speculative_num_steps = int(cfg.max_depth)
         self.speculative_num_draft_tokens = width + 1 if self.toll_tree_role == "target" else width
+        if self.toll_tree_role == "target":
+            # Width stays off eagle_topk. That field changes attention selection
+            # and the paged req_to_token budget for every forward, including
+            # ordinary decode. NPU tree selection reads toll_tree_fixed_width
+            # when npu_target_tree_fia is set.
+            self.npu_target_tree_fia = True
 
     def _handle_speculative_decoding(self):
         if self.speculative_algorithm == "TOLL_TREE_REMOTE":
@@ -6823,6 +6836,8 @@ class ServerArgs:
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        if not hasattr(args, "npu_target_tree_fia"):
+            args.npu_target_tree_fia = False
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})

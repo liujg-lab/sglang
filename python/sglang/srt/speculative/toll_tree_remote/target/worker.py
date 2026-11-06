@@ -148,6 +148,31 @@ def sync_kv_from_cpu_lengths(batch, seq_lens_cpu_pre, accept_length_per_req_cpu)
         req.kv_allocated_len = committed
 
 
+def alloc_decode_slot(batch):
+    """One new KV slot per request. Tests replace this without importing the pool."""
+    from sglang.srt.mem_cache.common import alloc_for_decode
+
+    return alloc_for_decode(batch, token_per_req=1)
+
+
+def record_fallback_tokens(reqs, next_ids) -> bool:
+    """Count one ordinary-decode round. Health checks stay out of the total."""
+    counted = False
+    ids = list(next_ids or [])
+    for index, req in enumerate(reqs):
+        if is_health_check(req):
+            continue
+        token = ids[index] if index < len(ids) else None
+        if token is not None:
+            note_decode_token(req, int(token))
+        else:
+            req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
+            req.len_output_ids = len(getattr(req, "output_ids", []) or [])
+        req.spec_fallback_ct = int(getattr(req, "spec_fallback_ct", 0) or 0) + 1
+        counted = True
+    return counted
+
+
 def note_decode_token(req, token: int) -> None:
     """Append one ordinary-decode token and apply the request's own stop rule."""
     req.output_ids.append(int(token))
@@ -234,7 +259,6 @@ class TollTreeRemoteWorker:
 
     def _forward_normal_decode(self, batch):
         from sglang.srt.managers.utils import GenerationBatchResult
-        from sglang.srt.mem_cache.common import alloc_for_decode
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 
         last_token_ids = [self._tail_token(req) for req in batch.reqs]
@@ -255,7 +279,7 @@ class TollTreeRemoteWorker:
         if batch.global_num_tokens_for_logprob is not None:
             batch.global_num_tokens_for_logprob = [bs]
         align_seq_lens_to_committed(batch)
-        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+        batch.out_cache_loc = alloc_decode_slot(batch)
         for req in batch.reqs:
             req.kv_committed_len = int(getattr(req, "kv_committed_len", 0) or 0) + 1
             req.kv_allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0) + 1
@@ -270,16 +294,7 @@ class TollTreeRemoteWorker:
         next_ids = result.next_token_ids
         if hasattr(next_ids, "tolist"):
             next_ids = next_ids.tolist()
-        counted = False
-        for index, req in enumerate(batch.reqs):
-            if is_health_check(req):
-                continue
-            if index < len(next_ids) and next_ids[index] is not None:
-                note_decode_token(req, int(next_ids[index]))
-            else:
-                req.spec_cnt = int(getattr(req, "spec_cnt", 0) or 0) + 1
-                req.len_output_ids = len(req.output_ids)
-            counted = True
+        counted = record_fallback_tokens(batch.reqs, next_ids)
         if counted:
             self.ar_fallback_rounds += 1
             self._log_target()

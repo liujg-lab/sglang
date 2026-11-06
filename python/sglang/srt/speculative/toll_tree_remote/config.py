@@ -129,6 +129,9 @@ class TollConfig:
             raise ValueError("TOLL_TREE_REMOTE refuses CUDA graph")
         if not bool(getattr(args, "disable_piecewise_cuda_graph", False)):
             raise ValueError("TOLL_TREE_REMOTE refuses piecewise CUDA graph")
+        from sglang.srt.utils.common import is_npu
+
+        on_npu = getattr(args, "device", None) == "npu" or is_npu()
         return cls(
             width_buckets=_bucket_values(getattr(args, "toll_tree_width_buckets", "2,4,8,16,32")),
             verify_buckets=_bucket_values(getattr(args, "toll_tree_verify_buckets", "8,16,32")),
@@ -143,6 +146,8 @@ class TollConfig:
             probe_interval=getattr(args, "toll_tree_probe_interval", 64),
             no_exit=bool(getattr(args, "toll_tree_no_exit", False)),
             verify_mode=getattr(args, "toll_tree_verify_mode", "greedy"),
+            dp_attention=bool(getattr(args, "enable_dp_attention", False)),
+            draft_on_npu=role == "draft" and on_npu,
             speculate_delta=getattr(args, "toll_tree_speculate_delta", 0.0),
             bytes_per_token=getattr(args, "toll_tree_bytes_per_token", 0.0),
         )

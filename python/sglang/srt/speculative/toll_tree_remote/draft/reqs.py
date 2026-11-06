@@ -80,6 +80,7 @@ def _batch(scheduler, req, seq_len: int):
     tail = req.fill_ids[-1] if req.fill_ids else 0
     batch.output_ids = torch.tensor([int(tail)], dtype=torch.int64, device=device)
     batch.return_logprob = False
+    batch.multimodal_inputs = [getattr(req, "multimodal_inputs", None)]
     batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
         batch, scheduler.model_config.vocab_size
     )

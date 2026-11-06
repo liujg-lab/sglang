@@ -17,6 +17,8 @@ target log.
   padding slot is not accepted.
 * silent: no reply. Output matches ordinary decode, the breaker opens, and it
   closes again after this process is restarted in another mode.
+* branch: a wrong sibling shares the root with the gold chain. Accept count
+  matches gold. A visible sibling KV changes the output.
 """
 
 from __future__ import annotations
@@ -61,6 +63,12 @@ def draft_window(mode: str, baseline: list[int], commit_len: int, depth: int):
         tokens = [int(token) + 1 for token in future] or [1] * depth
     elif mode == "pad":
         tokens = future[:1]
+    elif mode == "branch":
+        if not future:
+            return [], []
+        tokens = [int(future[0]) + 1] + list(future)
+        parents = [-1, -1] + list(range(1, len(future)))
+        return tokens, parents
     else:
         raise ValueError(f"unknown mode {mode}")
     if not tokens:
@@ -141,7 +149,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--addr", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30039)
-    parser.add_argument("--mode", choices=("gold", "wrong", "pad", "silent"), default="gold")
+    parser.add_argument(
+        "--mode", choices=("gold", "wrong", "pad", "silent", "branch"), default="gold"
+    )
     parser.add_argument("--baseline", default="")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument(

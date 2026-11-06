@@ -2740,6 +2740,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    def _run_forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool,
+        split_forward_count: int,
+    ):
+        from sglang.srt.model_executor.attn_metadata_hook import (
+            run_forward_with_metadata_hooks,
+        )
+
+        return run_forward_with_metadata_hooks(
+            getattr(self, "attn_backend", None),
+            lambda: self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            ),
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -2754,7 +2777,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
-            output = self._forward_raw(
+            output = self._run_forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
                 pp_proxy_tensors,
@@ -2775,7 +2798,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         next(gen)
                     except StopIteration:
                         break
-                output = self._forward_raw(
+                output = self._run_forward_raw(
                     forward_batch,
                     skip_attn_backend_init,
                     pp_proxy_tensors,
