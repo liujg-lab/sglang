@@ -58,6 +58,63 @@ def opt_draft_lookahead_enabled() -> bool:
     return _env_flag("SGLANG_OPT_DRAFT_LOOKAHEAD")
 
 
+def opt_draft_kv_window():
+    """Draft tree-layer KV window. Empty disables it.
+
+    ``full`` copies the real prefix into a shadow row. A positive integer is
+    the number of recent prefix tokens kept after the sink. This is read on
+    the Draft only and is not a server argument.
+    """
+    raw = os.environ.get("SGLANG_OPT_DRAFT_KV_WINDOW", "").strip().lower()
+    if not raw:
+        return None
+    if raw == "full":
+        return "full"
+    try:
+        width = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SGLANG_OPT_DRAFT_KV_WINDOW must be empty, full, or a positive int, "
+            f"got {raw!r}"
+        ) from exc
+    if width < 1:
+        raise ValueError(
+            f"SGLANG_OPT_DRAFT_KV_WINDOW must be >= 1, got {width}"
+        )
+    return width
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+def opt_draft_kv_sink() -> int:
+    """Prefix tokens kept at the start of a truncated window. Default 64."""
+    return _env_int("SGLANG_OPT_DRAFT_KV_SINK", 64)
+
+
+def opt_draft_kv_window_min_len() -> int:
+    """Real prefix length that must be exceeded before a window is used."""
+    return _env_int("SGLANG_OPT_DRAFT_KV_WINDOW_MIN_LEN", 2048)
+
+
+def opt_draft_kv_window_check() -> bool:
+    """Recompute a windowed layer on the real row and compare logits.
+
+    Sampling still uses the shadow-row result. Default off.
+    """
+    return _env_flag("SGLANG_OPT_DRAFT_KV_WINDOW_CHECK")
+
+
 def opt_probe_layer_wait_enabled() -> bool:
     """Force a stream sync before each lookahead ``_run``. Default off.
 

@@ -162,17 +162,25 @@ def pack_verify_attention(
     depth: int,
     width: int,
     device,
+    position_lens: Optional[Sequence[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Concatenate per-request TARGET_VERIFY masks and positions on ``device``.
 
     Mask segment ``b`` is ``[N, prefix_lens[b] + depth * N]`` flattened, which
     is ``[N, cached_len_b + N]`` once ``cached_len`` counts layers already
-    forwarded. Positions for one request are identical.
+    forwarded. Positions for one request are identical. ``position_lens``
+    overrides the prefix used for RoPE; the mask still uses ``prefix_lens``.
     """
     if len(prefix_lens) != len(ancestors):
         raise ValueError(
             f"OPT verify pack has {len(prefix_lens)} prefixes and "
             f"{len(ancestors)} masks"
+        )
+    pos_lens = prefix_lens if position_lens is None else position_lens
+    if len(pos_lens) != len(prefix_lens):
+        raise ValueError(
+            f"OPT verify pack has {len(prefix_lens)} mask prefixes and "
+            f"{len(pos_lens)} position prefixes"
         )
     masks = [
         layer_attention_mask(prefix, ancestor, device)
@@ -180,7 +188,7 @@ def pack_verify_attention(
     ]
     positions = [
         layer_positions(prefix, depth, width).to(device=device)
-        for prefix in prefix_lens
+        for prefix in pos_lens
     ]
     if not masks:
         return (
@@ -1290,6 +1298,15 @@ class OptLayerForward:
             out_cache_loc,
             1,
         )
+        dest = getattr(self, "_opt_shadow_dest", None)
+        if start is None and dest is not None:
+            shadow_idx, new_at = dest
+            table = scheduler.req_to_token_pool.req_to_token
+            flat = out_cache_loc.detach().reshape(-1).to(dtype=table.dtype)
+            table[int(shadow_idx), int(new_at) : int(new_at) + n] = flat
+            self.req.opt_kv_window_cached = int(base) + n
+            self._opt_shadow_dest = None
+            self._opt_shadow_written = True
         if start is None:
             # Ingest passes start= and must not become part of the tree lease.
             # Stay on the allocator device; publish copies every layer once.
@@ -1439,6 +1456,16 @@ def _row_logits(logits: torch.Tensor, n: int, *, tail: bool) -> torch.Tensor:
 def _run_batch(scheduler, batch) -> torch.Tensor:
     scheduler.cur_batch = batch
     result = scheduler.run_batch(batch)
+    mode = getattr(batch, "forward_mode", None)
+    is_verify = bool(getattr(mode, "is_target_verify", lambda: False)())
+    if is_verify and len(getattr(batch, "reqs", []) or []) > 1:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import _draft_count
+
+        hit = bool(getattr(result, "can_run_cuda_graph", False))
+        _draft_count(
+            scheduler,
+            "opt_verify_graph_layers" if hit else "opt_verify_eager_layers",
+        )
     logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
     if logits is None:
         raise RuntimeError("OPT draft forward returned no logits")
@@ -1505,6 +1532,8 @@ def _verify_batch_many(
     out_cache_loc,
     cached,
     is_bonus: bool = False,
+    seq_lens=None,
+    pool_indices=None,
 ):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -1515,6 +1544,7 @@ def _verify_batch_many(
     batch = scheduler._sr_make_decode_batch(reqs)
     device = batch.seq_lens.device
     width = int(tokens[0].shape[0]) if tokens else 0
+    lengths = [int(n) for n in (cached if seq_lens is None else seq_lens)]
     cached = [int(n) for n in cached]
     batch.forward_mode = ForwardMode.TARGET_VERIFY
     batch.global_forward_mode = ForwardMode.TARGET_VERIFY
@@ -1522,15 +1552,26 @@ def _verify_batch_many(
         dtype=torch.int64, device=device
     )
     batch.output_ids = None
-    batch.seq_lens = torch.tensor(cached, dtype=torch.int64, device=device)
-    batch.seq_lens_cpu = torch.tensor(cached, dtype=torch.int64)
-    batch.orig_seq_lens = torch.tensor(cached, dtype=torch.int32, device=device)
-    batch.seq_lens_sum = sum(cached)
+    batch.seq_lens = torch.tensor(lengths, dtype=torch.int64, device=device)
+    batch.seq_lens_cpu = torch.tensor(lengths, dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    batch.seq_lens_sum = sum(lengths)
+    if pool_indices is not None:
+        key = tuple(int(idx) for idx in pool_indices)
+        cached_buf = getattr(scheduler, "_opt_window_pool_buf", None)
+        if (
+            cached_buf is None
+            or cached_buf[0] != key
+            or cached_buf[1].device != device
+        ):
+            tensor = torch.tensor(list(key), dtype=torch.int64, device=device)
+            scheduler._opt_window_pool_buf = (key, tensor)
+        batch.req_pool_indices = scheduler._opt_window_pool_buf[1]
     batch.out_cache_loc = out_cache_loc
     batch.extend_lens = [width] * len(runners)
-    batch.prefix_lens = list(cached)
+    batch.prefix_lens = list(lengths)
     batch.extend_num_tokens = width * len(runners)
-    batch.extend_logprob_start_lens = list(cached)
+    batch.extend_logprob_start_lens = list(lengths)
     batch.spec_info = OptLayerSpec(
         custom_mask=custom_mask.reshape(-1),
         positions=positions.reshape(-1).to(dtype=torch.int64, device=device),
@@ -1826,15 +1867,31 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         token_rows.append(tokens.to(dtype=torch.long, device=device))
         ancestors.append(ancestor)
     prefix_lens = [runner.prefix_len for runner in runners]
+    window = None
     if len(runners) == 1:
         flat_positions = layer_positions(prefix_lens[0], depth, width).to(
             device=device
         )
         flat_mask = layer_verify_mask(runners[0], ancestors[0], device)
     else:
-        flat_mask, flat_positions = pack_verify_attention(
-            prefix_lens, ancestors, depth, width, device
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            prepare_layer_window,
         )
+
+        window = prepare_layer_window(scheduler, runners, _opt_page_size(scheduler))
+        if window is None:
+            flat_mask, flat_positions = pack_verify_attention(
+                prefix_lens, ancestors, depth, width, device
+            )
+        else:
+            flat_mask, flat_positions = pack_verify_attention(
+                window.mask_prefixes(),
+                ancestors,
+                depth,
+                width,
+                device,
+                position_lens=window.position_prefixes(),
+            )
     locs = []
     cached = []
     for runner in runners:
@@ -1842,6 +1899,12 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         runner.req.kv_allocated_len = runner.cached_len + width
         locs.append(loc.reshape(-1))
         cached.append(runner.cached_len)
+    if window is not None:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            mirror_new_slots,
+        )
+
+        mirror_new_slots(scheduler, runners, window, locs)
     batch = _verify_batch_many(
         scheduler,
         runners,
@@ -1850,6 +1913,8 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         flat_mask,
         torch.cat(locs),
         cached,
+        seq_lens=None if window is None else window.seq_lens(),
+        pool_indices=None if window is None else window.pool_indices(runners),
     )
     if len(runners) == 1:
         from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
@@ -1866,6 +1931,40 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
+    if window is not None and window.active:
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            layer_is_truncated,
+            maybe_check_indices,
+            maybe_check_logits,
+            note_windowed_layer,
+        )
+
+        if note_windowed_layer(scheduler):
+            try:
+                if layer_is_truncated(window):
+                    maybe_check_indices(scheduler, runners, window, locs)
+                else:
+                    real_mask, real_positions = pack_verify_attention(
+                        prefix_lens, ancestors, depth, width, device
+                    )
+                    real_batch = _verify_batch_many(
+                        scheduler,
+                        runners,
+                        token_rows,
+                        real_positions,
+                        real_mask,
+                        torch.cat(locs),
+                        cached,
+                    )
+                    real_logits = _run_batch(scheduler, real_batch)
+                    maybe_check_logits(scheduler, logits, real_logits, width)
+            except Exception:
+                logger.exception("[OPT] kv window check failed")
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_lease import (
+                    _draft_count,
+                )
+
+                _draft_count(scheduler, "opt_kv_window_check_errors", 1)
     _finish_layer_timing(scheduler, timing)
     for runner in runners:
         runner.cached_len += width

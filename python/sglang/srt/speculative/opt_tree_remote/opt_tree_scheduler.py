@@ -350,11 +350,18 @@ class OptTreeSchedulerMixin:
             release_opt_tree_lease,
         )
 
-        if opt_kv_release_allowed(self):
-            req = opt_finish_req(self, rid, state)
-            if req is not None:
-                release_opt_tree_lease(self, req)
-                release_opt_bonus_guesses(self, req)
+        req = opt_finish_req(self, rid, state)
+        if opt_kv_release_allowed(self) and req is not None:
+            release_opt_tree_lease(self, req)
+            release_opt_bonus_guesses(self, req)
+        if req is not None:
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+                log_request_accept,
+                release_kv_window,
+            )
+
+            log_request_accept(req)
+            release_kv_window(self, req)
         drop_lookahead_request(self, rid)
         return super()._sr_finish_rid(
             rid, release_mm=release_mm, state=state, entry=entry
@@ -375,6 +382,11 @@ class OptTreeSchedulerMixin:
         if opt_kv_release_allowed(self):
             release_opt_tree_lease(self, req)
             release_opt_bonus_guesses(self, req)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            release_kv_window,
+        )
+
+        release_kv_window(self, req)
         return super()._sr_rollback_else_reprefill(req, fork, allocated, on_refused)
 
     def _sr_reset_linear_kv_state(self, req, fill_ids) -> None:
@@ -390,6 +402,11 @@ class OptTreeSchedulerMixin:
         if opt_kv_release_allowed(self):
             release_opt_tree_lease(self, req)
             release_opt_bonus_guesses(self, req)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            release_kv_window,
+        )
+
+        release_kv_window(self, req)
         return super()._sr_reset_linear_kv_state(req, fill_ids)
 
     def _sr_abandon_poisoned_kv(self, req) -> None:
@@ -404,6 +421,11 @@ class OptTreeSchedulerMixin:
         )
 
         lease = detach_opt_tree_lease(req)
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_kv_window import (
+            release_kv_window,
+        )
+
+        release_kv_window(self, req)
         try:
             return super()._sr_abandon_poisoned_kv(req)
         finally:
