@@ -276,6 +276,7 @@ sgl-kernel/csrc/**/*_musa/
 
 # liujg
 test_sglang_liujg/result/
+python/sglang/srt/speculative/toll_tree_remote/test_result/
 .cursor
 
 # sgl-kernel FetchContent local mirrors (do not commit)

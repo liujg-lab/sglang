@@ -2,7 +2,7 @@
 
 原版 OPT-Tree 的 CPU 实现，行为对照 `opt_classic_qwen3/tree.py` 里的 `Tree`。一轮里的宽度 N 和阈值 τ 固定。
 
-`OPT_TREE_REMOTE` 已经注册为 `--speculative-algorithm` 的一个选项。Target 和 Draft 是两个进程：Target 用 `build_tree_from_parents` 做验证，Draft 的每一层调用 `update`，不走 EAGLE 的 top-k 树。这个包不包含 AdaCost、代价模型或在线宽度控制器。
+`OPT_TREE_REMOTE` 已经注册为 `--speculative-algorithm` 的一个选项。Target 和 Draft 是两个进程：Target 用 `build_tree_from_parents` 做验证，Draft 的每一层调用 `update`，不走 EAGLE 的 top-k 树。这个包不包含 AdaCost、代价模型或在线宽度控制器。尚未实现的全局价格设计记在 [PRICE.md](PRICE.md)，默认关闭，不改变这里的固定 N 和 τ。
 
 ## 算法
 
