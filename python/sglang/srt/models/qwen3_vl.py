@@ -15,6 +15,7 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
+import os
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -1020,6 +1021,12 @@ class Qwen3LLMModel(Qwen3Model):
                 residual,
                 post_residual_addition=deepstack_embeds,
             )
+            if os.environ.get("SGLANG_FORK_RESID"):
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_residual import (
+                    note_layer,
+                )
+
+                note_layer(layer_idx, hidden_states, residual, forward_batch)
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
@@ -1041,6 +1048,18 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states, _ = self.norm(
                         hidden_states, residual, post_residual_addition=last_deepstack
                     )
+            if os.environ.get("SGLANG_FORK_RESID"):
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_residual import (
+                    note_norm,
+                )
+
+                note_norm(hidden_states, forward_batch)
+            if os.environ.get("SGLANG_FORK_SUB"):
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import (
+                    flush_decode,
+                )
+
+                flush_decode(forward_batch)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

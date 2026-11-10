@@ -626,6 +626,8 @@ class AscendAttnBackend(AttentionBackend):
             raw_bs,
             dummy_page=int(getattr(self, "_target_fia_dummy_page", 0)),
         )
+        if os.environ.get("SGLANG_FORK_DUMP"):
+            self._fork_dump_fia = md
         self.forward_metadata.sr_target_tree_fia = md
         from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
             report_paged_metadata,
@@ -633,6 +635,40 @@ class AscendAttnBackend(AttentionBackend):
 
         report_paged_metadata(self, "target", getattr(self, "_sr_paged_metrics", None))
         return True
+
+    def _maybe_dump_prefill(self, forward_batch, layer) -> None:
+        if not os.environ.get("SGLANG_FORK_PREFILL"):
+            return
+        try:
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_layer_check import (
+                maybe_dump_prefill,
+            )
+
+            maybe_dump_prefill(forward_batch, layer, self.page_size)
+        except Exception as exc:
+            logging.warning("FORKCHECK_ERR %s", exc)
+
+    def _checked_tree_fia(self, q, k_cache, v_cache, layer, forward_batch):
+        output = self._run_sr_target_tree_fia(q, k_cache, v_cache, layer)
+        if os.environ.get("SGLANG_FORK_DUMP"):
+            try:
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_layer_check import (
+                    maybe_layer_check,
+                )
+
+                maybe_layer_check(
+                    forward_batch,
+                    q,
+                    k_cache,
+                    v_cache,
+                    layer,
+                    output,
+                    self.page_size,
+                    getattr(self.forward_metadata, "sr_target_tree_fia", None),
+                )
+            except Exception as exc:
+                logging.warning("FORKCHECK_ERR %s", exc)
+        return output
 
     def _run_sr_target_tree_fia(self, q, k_cache, v_cache, layer):
         md = getattr(self.forward_metadata, "sr_target_tree_fia", None)
@@ -2132,6 +2168,8 @@ class AscendAttnBackend(AttentionBackend):
                 ),
             )
             metadata.sr_target_tree_fia = md
+            if os.environ.get("SGLANG_FORK_DUMP"):
+                self._fork_dump_fia = md
             from sglang.srt.speculative.standalone_remote.sr_paged_metadata import (
                 report_paged_metadata,
             )
@@ -2865,6 +2903,7 @@ class AscendAttnBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                self._maybe_dump_prefill(forward_batch, layer)
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -3374,17 +3413,33 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
+                md = getattr(self.forward_metadata, "sr_target_tree_fia", None)
+                kv_cpu = getattr(md, "kv_lens_cpu", None) if md is not None else None
+                if (
+                    os.environ.get("SGLANG_FORK_TREE")
+                    and kv_cpu is not None
+                    and int(kv_cpu[0]) == 4172
+                ):
+                    try:
+                        from sglang.srt.speculative.opt_tree_remote.opt_tree_slot_check import (
+                            note_written,
+                        )
+
+                        note_written(forward_batch, k, v, layer)
+                    except Exception as exc:
+                        logging.warning("FORKTREE_ERR e2 %s", exc)
 
         if (
             self._use_target_tree_paged_fia()
             and forward_batch.forward_mode.is_target_verify()
             and getattr(self.forward_metadata, "sr_target_tree_fia", None) is not None
         ):
-            return self._run_sr_target_tree_fia(
+            return self._checked_tree_fia(
                 q,
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 layer,
+                forward_batch,
             )
 
         if (

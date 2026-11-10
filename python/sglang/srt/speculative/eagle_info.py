@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -123,6 +124,188 @@ def _eagle_output_from_fixed(raw, batch, topk: int):
         accepted_indices=raw.accepted_indices,
         accepted_tree_candidate_indices=raw.tree_paths,
     )
+
+
+_FORK_POS = None
+_FORK_LOGIT = 0
+_FORK_HEAD = (2441, 38891, 891, 220)
+
+
+def _fork_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def _fork_logit_target(batch, draft_token_num: int):
+    if not os.environ.get("SGLANG_FORK_DUMP"):
+        return None
+    md = getattr(batch, "_fork_dump_fia", None)
+    reqs = list(getattr(batch, "reqs", []) or [])
+    if md is None or not reqs:
+        return None
+    for index, req in enumerate(reqs):
+        origin = tuple(
+            int(token) for token in list(getattr(req, "origin_input_ids", []) or [])[:4]
+        )
+        kv = int(md.kv_lens_cpu[index]) if index < len(md.kv_lens_cpu) else -1
+        if origin == _FORK_HEAD and kv == 4172:
+            return req, index * int(draft_token_num) + 4
+    return None
+
+
+def _fork_top2(logits, row: int):
+    values, index = torch.topk(logits[row].detach().float(), 2)
+    return [(int(index[i]), float(values[i])) for i in range(2)]
+
+
+def _fork_logit_before(batch, sampling_info, logits, draft_token_num: int):
+    """Top-2 of the watched row before the in-place penalty. Returns the row or None."""
+    global _FORK_LOGIT
+    if _FORK_LOGIT or _fork_rank() != 0:
+        return None
+    found = _fork_logit_target(batch, draft_token_num)
+    if found is None:
+        return None
+    req, row = found
+    if row >= logits.shape[0]:
+        logging.warning("FORKLOGIT_ERR row=%s width=%s", row, logits.shape[0])
+        return None
+    _FORK_LOGIT = 1
+    pairs = _fork_top2(logits, row)
+    params = getattr(req, "sampling_params", None)
+    logging.warning(
+        "FORKLOGIT before %s %s",
+        " ".join(f"top{i + 1}={token}:{value:.4f}" for i, (token, value) in enumerate(pairs)),
+        (
+            f"required={int(bool(sampling_info.penalizer_orchestrator.is_required))} "
+            f"bias={int(sampling_info.logit_bias is not None)} "
+            f"custom={int(bool(sampling_info.has_custom_logit_processor))} "
+            f"rep={getattr(params, 'repetition_penalty', None)} "
+            f"freq={getattr(params, 'frequency_penalty', None)} "
+            f"pres={getattr(params, 'presence_penalty', None)} "
+            f"min_new={getattr(params, 'min_new_tokens', None)} "
+            f"temp={getattr(params, 'temperature', None)}"
+        ),
+    )
+    return row
+
+
+def _fork_logit_after(logits, row: int) -> None:
+    global _FORK_LOGIT
+    if row is None or _FORK_LOGIT != 1 or _fork_rank() != 0:
+        return
+    _FORK_LOGIT = 2
+    pairs = _fork_top2(logits, row)
+    logging.warning(
+        "FORKLOGIT after %s",
+        " ".join(f"top{i + 1}={token}:{value:.4f}" for i, (token, value) in enumerate(pairs)),
+    )
+
+
+def _fork_positions() -> set[int]:
+    global _FORK_POS
+    if _FORK_POS is None:
+        raw = os.environ.get("SGLANG_FORK_DUMP", "")
+        found = set()
+        for item in raw.split(","):
+            item = item.strip()
+            if item:
+                found.add(int(item))
+        _FORK_POS = found
+    return _FORK_POS
+
+
+def _fork_lock(req, index: int):
+    node = getattr(req, "last_node", None)
+    chain = []
+    while node is not None and getattr(node, "parent", None) is not None:
+        chain.append(node)
+        node = node.parent
+    chain.reverse()
+    cursor = 0
+    for node in chain:
+        span = len(node.key) if getattr(node, "key", None) is not None else 0
+        if span and cursor <= index < cursor + span:
+            return int(node.lock_ref), cursor + span
+        cursor += span
+    return -1, cursor
+
+
+def _fork_dump_commit(
+    batch, logits, accept_index, accept_length, page_size: int, draft_token_num: int
+) -> None:
+    """One line at a watched commit. Does not change which token is accepted."""
+    positions = _fork_positions()
+    if not positions or logits is None or accept_index is None or accept_index.ndim != 2:
+        return
+    try:
+        lengths = [int(item) for item in batch.seq_lens_cpu.tolist()]
+        counts = [int(item) for item in accept_length.detach().cpu().tolist()]
+        hits = []
+        for row, (start, count) in enumerate(zip(lengths, counts)):
+            for offset in range(count + 1):
+                if start + offset in positions and offset < accept_index.shape[1]:
+                    hits.append((row, offset, start + offset))
+        if not hits:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        reqs = list(getattr(batch, "reqs", []) or [])
+        md = getattr(batch, "_fork_dump_fia", None)
+        pool = batch.req_pool_indices.detach().cpu().tolist()
+        table = batch.req_to_token_pool.req_to_token
+        for row, offset, index in hits:
+            flat = int(accept_index[row, offset].item())
+            if flat < 0 or flat >= logits.shape[0]:
+                continue
+            chosen = torch.topk(logits[flat].float(), 2)
+            logp = torch.log_softmax(logits[flat].float(), dim=-1)
+            ids = [int(item) for item in chosen.indices.tolist()]
+            probs = [float(logp[item].item()) for item in ids]
+            req = reqs[row] if row < len(reqs) else None
+            lock_ref, radix_end = _fork_lock(req, index) if req is not None else (-1, -1)
+            head = ""
+            if req is not None:
+                origin = list(getattr(req, "origin_input_ids", []) or [])[:4]
+                head = ",".join(str(int(token)) for token in origin)
+            page_col = index // max(int(page_size), 1)
+            page_req = -1
+            if row < len(pool):
+                slot_at = page_col * max(int(page_size), 1)
+                if 0 <= slot_at < table.shape[1]:
+                    page_req = int(table[int(pool[row]), slot_at].item()) // max(int(page_size), 1)
+            page_bt = -1
+            visible = -1
+            visible_run = -1
+            kv_len = -1
+            if md is not None and row < md.block_tables.shape[0]:
+                if page_col < md.block_tables.shape[1]:
+                    page_bt = int(md.block_tables[row, page_col].item())
+                local_q = flat - row * int(draft_token_num)
+                mask = md.blocked_mask
+                if mask.ndim == 4 and 0 <= local_q < mask.shape[2]:
+                    flags = mask[row, 0, local_q].detach().cpu().tolist()
+                    visible = sum(1 for flag in flags if not flag)
+                    run = 0
+                    for flag in flags:
+                        if flag:
+                            break
+                        run += 1
+                    visible_run = run
+                if row < len(md.kv_lens_cpu):
+                    kv_len = int(md.kv_lens_cpu[row])
+            logging.warning(
+                "FORKDUMP rank=%s index=%s lock_ref=%s radix_end=%s top1=%s:%.4f "
+                "top2=%s:%.4f q_off=%s vis=%s vis0=%s kv=%s page_bt=%s page_req=%s head=%s",
+                rank, index, lock_ref, radix_end, ids[0], probs[0], ids[1], probs[1],
+                offset, visible, visible_run, kv_len, page_bt, page_req, head,
+            )
+    except Exception as exc:
+        logging.warning("FORKDUMP_ERR %s", exc)
 
 
 @dataclass
@@ -448,6 +631,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 num_tokens_in_batch=self.draft_token_num,
             )
 
+        fork_logit_row = None
+        try:
+            fork_logit_row = _fork_logit_before(
+                batch, sampling_info, logits_output.next_token_logits, self.draft_token_num
+            )
+        except Exception as exc:
+            logging.warning("FORKLOGIT_ERR %s", exc)
         # Apply penalty
         if (
             sampling_info.penalizer_orchestrator.is_required
@@ -470,6 +660,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
+        try:
+            _fork_logit_after(logits_output.next_token_logits, fork_logit_row)
+        except Exception as exc:
+            logging.warning("FORKLOGIT_ERR %s", exc)
 
         # Sample tokens. SPECTRE/SR must not silently fall back to greedy.
         is_all_greedy = sampling_info.is_all_greedy
@@ -766,6 +960,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_ready = getattr(batch, "sr_accept_ready_hook", None)
         if accept_ready is not None:
             accept_ready(batch)
+
+        if resolved_verify == "greedy" and host_v1_plan is None:
+            _fork_dump_commit(
+                batch,
+                logits_output.next_token_logits,
+                accept_index,
+                accept_length,
+                page_size,
+                self.draft_token_num,
+            )
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them

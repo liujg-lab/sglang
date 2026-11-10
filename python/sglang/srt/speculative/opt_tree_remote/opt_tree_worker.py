@@ -9,6 +9,7 @@ from ``build_tree_from_parents``.
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import torch
@@ -122,6 +123,8 @@ class OptTreeRemoteWorker(StandaloneRemoteWorker):
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        if os.environ.get("SGLANG_FORK_DUMP") or os.environ.get("SGLANG_FORK_SUB"):
+            spec_info._fork_parents = parent_rows
         self._opt_rpd_owner = self._attach_rpd_input(
             spec_info, batch, roots, token_rows, parent_rows, no_draft, device
         )

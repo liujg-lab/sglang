@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -166,6 +167,10 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_qkv
+
+            note_qkv(qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -180,6 +185,10 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_qkv
+
+            note_qkv(qkv)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -296,12 +305,25 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_qk
+
+            note_qk(self, q, k)
+
         if get_global_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_attn
+
+            note_attn(attn_output)
         output, _ = self.o_proj(attn_output)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_oproj
+
+            note_oproj(output)
         return output
 
 
@@ -381,6 +403,48 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sub = os.environ.get("SGLANG_FORK_SUB")
+        if sub:
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import (
+                begin_layer,
+                end_layer,
+                note_input_norm,
+                note_mlp,
+                note_pair,
+                note_post_norm,
+            )
+
+            begin_layer(self, hidden_states, forward_batch)
+        try:
+            return self._forward_body(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                post_residual_addition,
+                sub,
+                note_input_norm if sub else None,
+                note_post_norm if sub else None,
+                note_mlp if sub else None,
+                note_pair if sub else None,
+            )
+        finally:
+            if sub:
+                end_layer()
+
+    def _forward_body(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual,
+        post_residual_addition,
+        sub,
+        note_input_norm,
+        note_post_norm,
+        note_mlp,
+        note_pair,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -388,6 +452,8 @@ class Qwen3DecoderLayer(nn.Module):
             forward_batch,
             post_residual_addition=post_residual_addition,
         )
+        if sub:
+            note_input_norm(hidden_states, residual)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -411,12 +477,18 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
+        if sub:
+            note_post_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        if sub:
+            note_mlp(hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if sub:
+            note_pair(hidden_states, residual)
         return hidden_states, residual
 
 

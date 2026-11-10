@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -513,6 +514,9 @@ class StandaloneRemoteWorker:
             fixed_state.metrics = metrics
         if rpd_workspace is not None:
             rpd_workspace.metrics = metrics
+        if os.environ.get("SGLANG_FORK_DUMP"):
+            backend = self._attn_backend()
+            batch._fork_dump_fia = getattr(backend, "_fork_dump_fia", None)
         try:
             res: EagleVerifyOutput = spec_info.verify(
                 batch,
@@ -529,6 +533,41 @@ class StandaloneRemoteWorker:
                 fixed_state.metrics = None
             if rpd_workspace is not None:
                 rpd_workspace.metrics = None
+        if os.environ.get("SGLANG_FORK_RESID"):
+            try:
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_residual import (
+                    flush_pending,
+                )
+
+                flush_pending(spec_info)
+            except Exception as exc:
+                logging.warning("FORKRESID_ERR flush %s", exc)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            try:
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import (
+                    flush_spec,
+                )
+
+                flush_spec(spec_info)
+            except Exception as exc:
+                logging.warning("FORKSUB_ERR flush %s", exc)
+        if os.environ.get("SGLANG_FORK_DUMP") and not batch.forward_mode.is_idle():
+            try:
+                from sglang.srt.speculative.opt_tree_remote.opt_tree_fork_check import (
+                    fork_check,
+                )
+
+                fork_check(
+                    batch,
+                    spec_info,
+                    res,
+                    seq_lens_cpu_pre,
+                    self.model_runner.model,
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    self.page_size,
+                )
+            except Exception as exc:
+                logging.warning("FORKCHECK_ERR %s", exc)
         if not batch.forward_mode.is_idle():
             if seq_lens_cpu_pre is None:
                 raise RuntimeError("seq_lens_cpu snapshot is missing")

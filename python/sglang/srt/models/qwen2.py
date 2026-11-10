@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -96,6 +97,10 @@ class Qwen2MLP(nn.Module):
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
+        if os.environ.get("SGLANG_FORK_SUB"):
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_sublayer import note_gate
+
+            note_gate(gate_up)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
