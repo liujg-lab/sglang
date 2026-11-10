@@ -10,7 +10,7 @@ Draft 按层生成 top-C，回包后回滚树区 KV。Target 用 `K+1` 个槽做
 
 **2026-11-07 起停止开发。** 这个目录保留 `fixed` 路径和 CPU 策略代码，不再做 T3 以后的阶段。只调 τ 的上界收益是 0.36%，调 τ 和 N 是 3.57%。下一份算法是全局价格的树控制，计划作为默认关闭的开关放进 `OPT_TREE_REMOTE`，见 [../opt_tree_remote/PRICE.md](../opt_tree_remote/PRICE.md)。
 
-停止前的设计和缺口记在 [DESIGN.md](DESIGN.md)。窗口、4096 分叉和 V0–V6 的结论在 `test_result/raw/gate-window/DECISION.md` 与 `test_result/validate/DECISION.md`，这两份记录留在本机，不进仓库。
+停止前的设计和缺口记在 [DESIGN.md](DESIGN.md)。窗口和 4096 分叉的结论在 [notes/gate-window/DECISION.md](notes/gate-window/DECISION.md)，V0–V6 的结论在 [notes/validate/DECISION.md](notes/validate/DECISION.md)。
 
 ## 策略
 

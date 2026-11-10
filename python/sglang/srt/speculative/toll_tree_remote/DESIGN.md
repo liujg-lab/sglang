@@ -32,7 +32,7 @@
   - 用 b=1 推出的模型预测 4096 b=2，误差 −29.7%（预测 75.3，实测 58.0 tok/s）；
   - "长前缀要更深"只在 b=1 成立，b=4 时 τ=0.4（86.3）反而好于 τ=0.2（84）。
 - **b=4 和 b=8 的短前缀：** 吞吐在 τ=0.8（扫描上限）还在上升，最优 τ 还没测到。
-- **NPU 输出与 Target-only 不同：** 当时看到的分叉都落在 top-2 内，最大差距 0.25 nat，Target-only 自己重复也只有 15/16 一致。后来 4096、t=72 的分叉被记成数值放大，见 `test_result/raw/gate-window/DECISION.md`；V1 又把 ≥3 nat 的一档标成疑似 bug，没有改代码，见 `test_result/validate/DECISION.md`。
+- **NPU 输出与 Target-only 不同：** 当时看到的分叉都落在 top-2 内，最大差距 0.25 nat，Target-only 自己重复也只有 15/16 一致。后来 4096、t=72 的分叉被记成数值放大，见 [notes/gate-window/DECISION.md](notes/gate-window/DECISION.md)；V1 又把 ≥3 nat 的一档标成疑似 bug，没有改代码，见 [notes/validate/DECISION.md](notes/validate/DECISION.md)。
 - **N=8 和 N=16 的图内存：** 分别多 0.20 GB 和 0.53 GB，都走 `tree_paged_fia`，没有回退。
 
 ## TollTree 实现状态（停在 T2）

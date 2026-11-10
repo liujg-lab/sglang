@@ -2,7 +2,7 @@
 
 **状态：** 设计阶段，没有实现，也没有实测。计划作为默认关闭的开关写在 `opt_tree_remote/`，不放进已停止的 `toll_tree_remote/`。本文是 2026-11-09 版，取代 11-07 版的“批共享价格规则”。当前 `OPT_TREE_REMOTE` 仍是固定的 N 和 τ。
 
-实验步骤不写在这里。窗口和 4096 分叉的结论在 `toll_tree_remote/test_result/raw/gate-window/DECISION.md`，V0–V6 的结论在 `toll_tree_remote/test_result/validate/DECISION.md`。这两份记录留在本机，不进仓库。
+实验步骤不写在这里。窗口和 4096 分叉的结论在 [../toll_tree_remote/notes/gate-window/DECISION.md](../toll_tree_remote/notes/gate-window/DECISION.md)，V0–V6 的结论在 [../toll_tree_remote/notes/validate/DECISION.md](../toll_tree_remote/notes/validate/DECISION.md)。
 
 ### 一句话
 
@@ -138,7 +138,7 @@ S_b 的上界 < 1 − 余量，并持续 k 个窗口  →  切到 Target-only（
 
 ### 无损判据
 
-在 bf16 下，只要验证的计算形状变了（行数、图还是 eager、batch 组成），Target-only 自己也做不到逐 token 一致。4096 t=72 的分叉已逐层确认是数值放大，记录在 `toll_tree_remote/test_result/raw/gate-window/DECISION.md`。
+在 bf16 下，只要验证的计算形状变了（行数、图还是 eager、batch 组成），Target-only 自己也做不到逐 token 一致。4096 t=72 的分叉已逐层确认是数值放大，记录在 [../toll_tree_remote/notes/gate-window/DECISION.md](../toll_tree_remote/notes/gate-window/DECISION.md)。
 
 | 项 | 定义 |
 |---|---|
