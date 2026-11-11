@@ -1,0 +1,21 @@
+{"scen": "pure", "kind": "mid", "b": 8, "seed": 8, "res": {"v2 simplified": [254.14814076971322, {"4,16": 466, "4,32": 10, "8,32": 8}]}, "sec": 8.6}
+{"scen": "mixed", "kind": null, "b": 8, "seed": 8, "res": {"v2 simplified": [220.547039684026, {"4,16": 180, "4,32": 49}]}, "sec": 3.6}
+{"scen": "pure", "kind": "low", "b": 8, "seed": 9, "res": {"v2 simplified": [214.87732925483368, {"4,16": 42, "4,32": 3, "8,32": 5}]}, "sec": 0.6}
+{"scen": "pure", "kind": "high", "b": 8, "seed": 9, "res": {"v2 simplified": [382.8279766011676, {"4,16": 20, "2,16": 237, "4,32": 9, "8,32": 4}]}, "sec": 5.7}
+{"scen": "phased", "kind": null, "b": 8, "seed": 9, "res": {"v2 simplified": [237.11721533309057, {"4,16": 196, "2,16": 20, "4,32": 22, "8,32": 1}]}, "sec": 4.0}
+{"scen": "pure", "kind": "mid", "b": 8, "seed": 10, "res": {"v2 simplified": [238.91917391705158, {"4,16": 467, "4,32": 35, "8,32": 29}]}, "sec": 8.8}
+{"scen": "mixed", "kind": null, "b": 8, "seed": 10, "res": {"v2 simplified": [217.80745292947392, {"4,16": 218, "4,32": 43, "8,32": 8}]}, "sec": 4.1}
+{"scen": "pure", "kind": "low", "b": 4, "seed": 8, "res": {"v2 simplified": [110.33941375599365, {"4,32": 150, "8,32": 37}]}, "sec": 1.1}
+{"scen": "pure", "kind": "high", "b": 4, "seed": 8, "res": {"v2 simplified": [242.68015780752617, {"4,32": 248, "8,32": 6}]}, "sec": 3.9}
+{"scen": "phased", "kind": null, "b": 4, "seed": 8, "res": {"v2 simplified": [151.50407435020074, {"4,32": 340, "8,32": 28}]}, "sec": 3.8}
+{"scen": "pure", "kind": "mid", "b": 4, "seed": 9, "res": {"v2 simplified": [154.0867543074988, {"4,32": 472, "8,32": 22}]}, "sec": 4.7}
+{"scen": "mixed", "kind": null, "b": 4, "seed": 9, "res": {"v2 simplified": [138.36567374395253, {"4,32": 497, "8,32": 82}]}, "sec": 5.1}
+{"scen": "pure", "kind": "low", "b": 4, "seed": 10, "res": {"v2 simplified": [109.25964559346097, {"4,32": 226, "8,32": 65}]}, "sec": 1.8}
+{"scen": "pure", "kind": "high", "b": 4, "seed": 10, "res": {"v2 simplified": [247.80555728910056, {"4,32": 241, "8,32": 7}]}, "sec": 3.7}
+{"scen": "phased", "kind": null, "b": 4, "seed": 10, "res": {"v2 simplified": [147.84622845258653, {"4,32": 357, "8,32": 18}]}, "sec": 3.9}
+{"scen": "pure", "kind": "mid", "b": 1, "seed": 8, "res": {"v2 simplified": [55.523915794984234, {"8,32": 872}]}, "sec": 3.6}
+{"scen": "mixed", "kind": null, "b": 1, "seed": 8, "res": {"v2 simplified": [52.66885710609121, {"8,32": 1039}]}, "sec": 4.1}
+{"scen": "pure", "kind": "mid", "b": 1, "seed": 9, "res": {"v2 simplified": [57.685909997954454, {"8,32": 818}]}, "sec": 3.5}
+{"scen": "mixed", "kind": null, "b": 1, "seed": 9, "res": {"v2 simplified": [53.16578793626644, {"8,32": 1018}]}, "sec": 4.4}
+{"scen": "pure", "kind": "mid", "b": 1, "seed": 10, "res": {"v2 simplified": [58.984832985851035, {"8,32": 802}]}, "sec": 3.5}
+{"scen": "mixed", "kind": null, "b": 1, "seed": 10, "res": {"v2 simplified": [50.55329055613761, {"8,32": 1085}]}, "sec": 4.4}

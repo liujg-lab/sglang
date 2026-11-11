@@ -1,0 +1,3 @@
+{"kind": "mid", "b": 8, "res": {"rate": 238.49, "tok_req_round": 4.185, "ms_round": 130.61, "layers_round": 4.392, "ahat": 2.852, "ghat": 0.958, "audit": {"stop_dG_mu": 1.0098, "stop_dA_mu": 1.0276, "grow_dA_mu": 1.0019, "all_dA_mu": 1.005}}, "sec": 23.0}
+{"kind": "mid", "b": 4, "res": {"rate": 152.32, "tok_req_round": 4.481, "ms_round": 103.62, "layers_round": 4.493, "ahat": 2.825, "ghat": 0.983, "audit": {"stop_dG_mu": 1.0157, "stop_dA_mu": 0.9978, "grow_dA_mu": 0.9821, "all_dA_mu": 0.9836}}, "sec": 12.2}
+{"kind": "mid", "b": 1, "res": {"rate": 55.12, "tok_req_round": 4.587, "ms_round": 83.21, "layers_round": 4.495, "ahat": 10.002, "ghat": 4.998, "audit": {"stop_dG_mu": 1.0379, "stop_dA_mu": 0.8425, "grow_dA_mu": 0.9168, "all_dA_mu": 0.9119}}, "sec": 5.0}

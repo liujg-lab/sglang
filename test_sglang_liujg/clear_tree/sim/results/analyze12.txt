@@ -1,0 +1,78 @@
+== R: rho by workload over (W, K) x tau (b=4, seed 9): old estimator / opportunity-based
+   low  old 0.652 (range 0.598-0.715, sd 0.033) | opp 0.674 (range 0.612-0.730, sd 0.035)
+        W,K=2,16  tau0.05: 0.598/0.612 tau0.4: 0.602/0.615 tau0.8: 0.623/0.627
+        W,K=4,16  tau0.05: 0.630/0.672 tau0.4: 0.658/0.684 tau0.8: 0.679/0.694
+        W,K=4,32  tau0.05: 0.643/0.675 tau0.4: 0.657/0.681 tau0.8: 0.678/0.691
+        W,K=8,32  tau0.05: 0.660/0.699 tau0.4: 0.678/0.704 tau0.8: 0.715/0.730
+   mid  old 0.852 (range 0.806-0.915, sd 0.034) | opp 0.876 (range 0.821-0.933, sd 0.034)
+        W,K=2,16  tau0.05: 0.806/0.821 tau0.4: 0.812/0.824 tau0.8: 0.833/0.839
+        W,K=4,16  tau0.05: 0.813/0.862 tau0.4: 0.850/0.876 tau0.8: 0.894/0.906
+        W,K=4,32  tau0.05: 0.838/0.862 tau0.4: 0.852/0.880 tau0.8: 0.896/0.912
+        W,K=8,32  tau0.05: 0.840/0.887 tau0.4: 0.875/0.906 tau0.8: 0.915/0.933
+   high old 0.968 (range 0.952-0.990, sd 0.012) | opp 0.974 (range 0.957-0.992, sd 0.010)
+        W,K=2,16  tau0.05: 0.952/0.957 tau0.4: 0.953/0.958 tau0.8: 0.960/0.962
+        W,K=4,16  tau0.05: 0.952/0.968 tau0.4: 0.964/0.974 tau0.8: 0.978/0.982
+        W,K=4,32  tau0.05: 0.967/0.974 tau0.4: 0.968/0.974 tau0.8: 0.980/0.982
+        W,K=8,32  tau0.05: 0.972/0.982 tau0.4: 0.975/0.983 tau0.8: 0.990/0.992
+   opportunity-based high threshold (midpoint of mid and high means): 0.925
+
+== S: seeds 8-10; regression v11 repro == round 11: OK
+   % vs round 11's tuned static (switch off at b=1), mean over seeds
+mixed       b=1 | v11 repro:  -0.6% | +rho opp:  -0.6% | +c decay+freeze:  -0.4% | Theta global+reset:  -0.7% | K<=16 table:  -4.4% | switch tok b=1:  -0.6% | v12 all:  -0.4% | v12 all K<=16:  -4.1%
+mixed       b=4 | v11 repro:  +3.1% | +rho opp:  +3.1% | +c decay+freeze:  +3.0% | Theta global+reset:  +3.4% | K<=16 table:  +3.1% | switch tok b=1:  +3.1% | v12 all:  +3.0% | v12 all K<=16:  +3.7%
+mixed       b=8 | v11 repro:  +3.2% | +rho opp:  +2.9% | +c decay+freeze:  +2.7% | Theta global+reset:  +2.9% | K<=16 table:  +3.3% | switch tok b=1:  +3.2% | v12 all:  +2.4% | v12 all K<=16:  +2.4%
+phased      b=4 | v11 repro:  +9.8% | +rho opp:  +9.8% | +c decay+freeze:  +8.3% | Theta global+reset:  +6.0% | K<=16 table:  +7.2% | switch tok b=1:  +9.8% | v12 all:  +8.3% | v12 all K<=16:  +5.0%
+phased      b=8 | v11 repro:  +3.5% | +rho opp:  +3.2% | +c decay+freeze:  +3.2% | Theta global+reset:  +3.4% | K<=16 table:  +3.4% | switch tok b=1:  +3.5% | v12 all:  +3.4% | v12 all K<=16:  +3.5%
+pure   high b=1 | v11 repro:  -0.6% | +rho opp:  -0.6% | +c decay+freeze:  -0.4% | Theta global+reset:  -0.6% | K<=16 table:  -5.0% | switch tok b=1:  -0.6% | v12 all:  -0.4% | v12 all K<=16:  -4.9%
+pure   high b=4 | v11 repro:  +0.6% | +rho opp:  +0.6% | +c decay+freeze:  +0.3% | Theta global+reset:  +0.6% | K<=16 table:  -4.3% | switch tok b=1:  +0.6% | v12 all:  +0.3% | v12 all K<=16:  -4.6%
+pure   high b=8 | v11 repro:  -0.2% | +rho opp:  -0.2% | +c decay+freeze:  -0.7% | Theta global+reset:  -0.5% | K<=16 table:  -0.5% | switch tok b=1:  -0.2% | v12 all:  -0.7% | v12 all K<=16:  -0.8%
+pure   low  b=1 | v11 repro:  -1.9% | +rho opp:  -1.9% | +c decay+freeze:  -1.7% | Theta global+reset:  -1.5% | K<=16 table:  -3.3% | switch tok b=1:  -1.9% | v12 all:  -1.7% | v12 all K<=16:  -3.0%
+pure   low  b=4 | v11 repro:  -1.4% | +rho opp:  -1.4% | +c decay+freeze:  -1.2% | Theta global+reset:  -2.0% | K<=16 table:  -2.0% | switch tok b=1:  -1.4% | v12 all:  -1.2% | v12 all K<=16:  -3.1%
+pure   low  b=8 | v11 repro:  -0.2% | +rho opp:  -0.2% | +c decay+freeze:  -0.1% | Theta global+reset:  -0.3% | K<=16 table:  -0.2% | switch tok b=1:  -0.2% | v12 all:  -0.1% | v12 all K<=16:  -0.1%
+pure   mid  b=1 | v11 repro:  -0.0% | +rho opp:  -0.0% | +c decay+freeze:  -0.5% | Theta global+reset:  -0.0% | K<=16 table:  -6.7% | switch tok b=1:  -0.0% | v12 all:  -0.5% | v12 all K<=16:  -6.4%
+pure   mid  b=4 | v11 repro:  +7.4% | +rho opp:  +7.4% | +c decay+freeze:  +7.3% | Theta global+reset:  +7.4% | K<=16 table:  +6.7% | switch tok b=1:  +7.4% | v12 all:  +7.3% | v12 all K<=16:  +6.1%
+pure   mid  b=8 | v11 repro:  +7.6% | +rho opp:  +7.6% | +c decay+freeze:  +7.5% | Theta global+reset:  +8.1% | K<=16 table:  +7.3% | switch tok b=1:  +7.6% | v12 all:  +7.5% | v12 all K<=16:  +7.4%
+  group means (min):
+   pure: v11 repro +1.26% (-1.9); +rho opp +1.26% (-1.9); +c decay+freeze +1.15% (-1.7); Theta global+reset +1.25% (-2.0); K<=16 table -0.89% (-6.7); switch tok b=1 +1.26% (-1.9); v12 all +1.15% (-1.7); v12 all K<=16 -1.04% (-6.4)
+   mixed: v11 repro +1.91% (-0.6); +rho opp +1.79% (-0.6); +c decay+freeze +1.79% (-0.4); Theta global+reset +1.89% (-0.7); K<=16 table +0.66% (-4.4); switch tok b=1 +1.91% (-0.6); v12 all +1.68% (-0.4); v12 all K<=16 +0.65% (-4.1)
+   phased: v11 repro +6.63% (+3.5); +rho opp +6.51% (+3.2); +c decay+freeze +5.71% (+3.2); Theta global+reset +4.69% (+3.4); K<=16 table +5.32% (+3.4); switch tok b=1 +6.63% (+3.5); v12 all +5.84% (+3.4); v12 all K<=16 +4.24% (+3.5)
+  all 14 scenarios: v11 repro +2.17%; +rho opp +2.13%; +c decay+freeze +1.94%; Theta global+reset +1.88%; K<=16 table +0.33%; switch tok b=1 +2.17%; v12 all +1.93%; v12 all K<=16 +0.08%
+
+== Exit audit (v12 all; 15% of layer decisions; true increments from cloned trees grown 1-2 layers)
+   regret_pred: greedy choice with true next-layer increments minus the choice made (one step, tokens net of Theta*cost)
+   gap_struct : two-layer optimum (any kept subset, then the best bucket) minus greedy with true increments
+   mixed       b=1: no audited decisions
+   mixed       b=4: audited  1227 | regret_pred 0.232 tok/decision, 65% > 0, ~7.9% of tokens | gap_struct 0.0000 tok/decision, 0.0% > 0, ~0.00% of tokens
+   mixed       b=8: audited   836 | regret_pred 0.418 tok/decision, 56% > 0, ~8.4% of tokens | gap_struct 0.0186 tok/decision, 2.0% > 0, ~0.37% of tokens
+   phased      b=4: audited   880 | regret_pred 0.218 tok/decision, 55% > 0, ~6.9% of tokens | gap_struct 0.0000 tok/decision, 0.0% > 0, ~0.00% of tokens
+   phased      b=8: audited   710 | regret_pred 0.378 tok/decision, 46% > 0, ~6.2% of tokens | gap_struct 0.0288 tok/decision, 3.0% > 0, ~0.47% of tokens
+   pure   high b=1: no audited decisions
+   pure   high b=4: audited   764 | regret_pred 0.089 tok/decision, 17% > 0, ~1.8% of tokens | gap_struct 0.0008 tok/decision, 0.1% > 0, ~0.02% of tokens
+   pure   high b=8: audited   928 | regret_pred 0.140 tok/decision, 16% > 0, ~1.8% of tokens | gap_struct 0.0184 tok/decision, 1.7% > 0, ~0.23% of tokens
+   pure   low  b=1: no audited decisions
+   pure   low  b=4: audited   252 | regret_pred 0.329 tok/decision, 77% > 0, ~12.2% of tokens | gap_struct 0.0000 tok/decision, 0.0% > 0, ~0.00% of tokens
+   pure   low  b=8: audited    67 | regret_pred 0.568 tok/decision, 79% > 0, ~10.6% of tokens | gap_struct 0.0000 tok/decision, 0.0% > 0, ~0.00% of tokens
+   pure   mid  b=1: no audited decisions
+   pure   mid  b=4: audited  1116 | regret_pred 0.264 tok/decision, 61% > 0, ~8.0% of tokens | gap_struct 0.0000 tok/decision, 0.0% > 0, ~0.00% of tokens
+   pure   mid  b=8: audited  1265 | regret_pred 0.506 tok/decision, 52% > 0, ~8.8% of tokens | gap_struct 0.0073 tok/decision, 1.0% > 0, ~0.13% of tokens
+
+== 12b: % vs round 11's tuned static, mean over seeds 8-10 (all with Theta per b, simplified table, conservative b=1 switch)
+mixed       b=1 | base:  -0.6% | freeze only:  -1.0% | c decay 0.95 only:  +0.1% | c decay 0.99 only:  -0.4% | no-lag oracle:  +1.8% | top1 classifier:  -0.6%
+mixed       b=4 | base:  +3.1% | freeze only:  +3.2% | c decay 0.95 only:  +2.7% | c decay 0.99 only:  +3.1% | no-lag oracle:  +3.3% | top1 classifier:  +3.1%
+mixed       b=8 | base:  +3.2% | freeze only:  +2.9% | c decay 0.95 only:  +3.1% | c decay 0.99 only:  +3.0% | no-lag oracle:  +2.5% | top1 classifier:  +3.1%
+phased      b=4 | base:  +9.8% | freeze only:  +7.6% | c decay 0.95 only:  +8.2% | c decay 0.99 only:  +3.9% | no-lag oracle:  +6.6% | top1 classifier:  +9.8%
+phased      b=8 | base:  +3.5% | freeze only:  +3.3% | c decay 0.95 only:  +3.1% | c decay 0.99 only:  +3.3% | no-lag oracle:  +4.3% | top1 classifier:  +3.4%
+pure   high b=1 | base:  -0.6% | freeze only:  -0.4% | c decay 0.95 only:  -0.5% | c decay 0.99 only:  -0.6% | no-lag oracle:  -0.5% | top1 classifier:  -0.6%
+pure   high b=4 | base:  +0.6% | freeze only:  +0.2% | c decay 0.95 only:  +0.2% | c decay 0.99 only:  +0.4% | no-lag oracle:  -0.7% | top1 classifier:  +0.6%
+pure   high b=8 | base:  -0.2% | freeze only:  -0.6% | c decay 0.95 only:  -0.2% | c decay 0.99 only:  -0.4% | no-lag oracle:  -1.0% | top1 classifier:  -0.2%
+pure   low  b=1 | base:  -1.9% | freeze only:  -2.4% | c decay 0.95 only:  -1.6% | c decay 0.99 only:  -2.8% | no-lag oracle:  +3.2% | top1 classifier:  -1.9%
+pure   low  b=4 | base:  -1.4% | freeze only:  -1.7% | c decay 0.95 only:  -1.9% | c decay 0.99 only:  -1.6% | no-lag oracle:  -1.9% | top1 classifier:  -1.4%
+pure   low  b=8 | base:  -0.2% | freeze only:  -0.2% | c decay 0.95 only:  -0.2% | c decay 0.99 only:  -0.2% | no-lag oracle:  -0.1% | top1 classifier:  -0.2%
+pure   mid  b=1 | base:  -0.0% | freeze only:  -0.8% | c decay 0.95 only:  -0.9% | c decay 0.99 only:  -1.2% | no-lag oracle:  +0.1% | top1 classifier:  -0.0%
+pure   mid  b=4 | base:  +7.4% | freeze only:  +7.7% | c decay 0.95 only:  +7.7% | c decay 0.99 only:  +7.4% | no-lag oracle:  +7.9% | top1 classifier:  +7.4%
+pure   mid  b=8 | base:  +7.6% | freeze only:  +7.8% | c decay 0.95 only:  +7.6% | c decay 0.99 only:  +7.7% | no-lag oracle:  +9.9% | top1 classifier:  +7.7%
+  group means (min):
+   pure: base +1.26% (-1.9); freeze only +1.07% (-2.4); c decay 0.95 only +1.13% (-1.9); c decay 0.99 only +0.96% (-2.8); no-lag oracle +1.88% (-1.9); top1 classifier +1.27% (-1.9)
+   mixed: base +1.91% (-0.6); freeze only +1.72% (-1.0); c decay 0.95 only +1.95% (+0.1); c decay 0.99 only +1.90% (-0.4); no-lag oracle +2.54% (+1.8); top1 classifier +1.85% (-0.6)
+   phased: base +6.63% (+3.5); freeze only +5.44% (+3.3); c decay 0.95 only +5.66% (+3.1); c decay 0.99 only +3.57% (+3.3); no-lag oracle +5.49% (+4.3); top1 classifier +6.57% (+3.4)
+  all 14 scenarios: base +2.17%; freeze only +1.83%; c decay 0.95 only +1.95%; c decay 0.99 only +1.54%; no-lag oracle +2.54%; top1 classifier +2.15%

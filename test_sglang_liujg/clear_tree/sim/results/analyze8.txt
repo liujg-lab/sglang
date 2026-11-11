@@ -1,0 +1,47 @@
+== A: best static (W,K,tau) per workload and b (seed 7), tok/s; Target-only for reference
+low   b=1: 8,32,0.4 37.3 (Target-only 30.4) | b=4: 4,8,0.8 101.8 (Target-only 116.3) | b=8: 4,8,0.8 160.9 (Target-only 219.8)
+mid   b=1: 8,32,0.4 58.0 (Target-only 30.4) | b=4: 4,32,0.2 149.3 (Target-only 116.3) | b=8: 4,16,0.4 227.2 (Target-only 219.8)
+high  b=1: 4,32,0.4 83.4 (Target-only 30.4) | b=4: 4,32,0.05 244.0 (Target-only 116.3) | b=8: 2,16,0.05 386.5 (Target-only 219.8)
+
+== B: loss from using another workload's best config (% vs the evaluated workload's own best, same b)
+b=1: rows = config taken from, columns = evaluated on
+   low   8,32,0.4     low:  +0.0%  mid:  +0.0%  high:  -2.1%
+   mid   8,32,0.4     low:  +0.0%  mid:  +0.0%  high:  -2.1%
+   high  4,32,0.4     low:  -2.5%  mid:  -4.8%  high:  +0.0%
+b=4: rows = config taken from, columns = evaluated on
+   low   4,8,0.8      low:  +0.0%  mid:  -9.0%  high: -22.1%
+   mid   4,32,0.2     low: -12.8%  mid:  +0.0%  high:  -0.0%
+   high  4,32,0.05    low: -24.3%  mid:  -2.7%  high:  +0.0%
+b=8: rows = config taken from, columns = evaluated on
+   low   4,8,0.8      low:  +0.0%  mid:  -7.2%  high: -23.3%
+   mid   4,16,0.4     low:  -6.5%  mid:  +0.0%  high:  -8.8%
+   high  2,16,0.05    low: -26.8%  mid:  -7.6%  high:  +0.0%
+
+== B2: same, with an ideal switch (each side is max(Target-only, the config); % vs max(Target-only, own best))
+   b=1 low   8,32,0.4     low:  +0.0%  mid:  +0.0%  high:  -2.1%
+   b=1 mid   8,32,0.4     low:  +0.0%  mid:  +0.0%  high:  -2.1%
+   b=1 high  4,32,0.4     low:  -2.5%  mid:  -4.8%  high:  +0.0%
+   b=4 low   4,8,0.8      low:  +0.0%  mid:  -9.0%  high: -22.1%
+   b=4 mid   4,32,0.2     low:  +0.0%  mid:  +0.0%  high:  -0.0%
+   b=4 high  4,32,0.05    low:  +0.0%  mid:  -2.7%  high:  +0.0%
+   b=8 low   4,8,0.8      low:  +0.0%  mid:  -3.2%  high: -23.3%
+   b=8 mid   4,16,0.4     low:  +0.0%  mid:  +0.0%  high:  -8.8%
+   b=8 high  2,16,0.05    low:  +0.0%  mid:  -3.2%  high:  +0.0%
+
+== C: one config for everything (all workloads and b)
+   max-min         4,16,0.4     mean -3.99%, worst -8.80% at ('high', 8)
+   max-mean        4,32,0.4     mean -3.71%, worst -9.39% at ('low', 8)
+   round-7 global  4,16,0.4     mean -3.99%, worst -8.80% at ('high', 8)
+   low   one config across b: 8,16,0.8 worst -3.77%
+   mid   one config across b: 8,32,0.4 worst -3.26%
+   high  one config across b: 4,32,0.2 worst -3.60%
+
+== D: ClearTree core with no tuning, per workload (better of W=4 and W=8; % vs that workload's best static; and vs the mid workload's best static config transferred)
+   low   b=1: 37.9 (+1.7% vs own best, +1.7% vs mid's config) | b=4: 104.4 (+2.5% vs own best, +17.5% vs mid's config) | b=8: 167.0 (+3.8% vs own best, +11.0% vs mid's config)
+   mid   b=1: 56.1 (-3.2% vs own best, -3.2% vs mid's config) | b=4: 152.6 (+2.2% vs own best, +2.2% vs mid's config) | b=8: 233.3 (+2.7% vs own best, +2.7% vs mid's config)
+   high  b=1: 80.3 (-3.8% vs own best, -1.7% vs mid's config) | b=4: 228.8 (-6.2% vs own best, -6.2% vs mid's config) | b=8: 329.1 (-14.8% vs own best, -6.6% vs mid's config)
+
+== E: mixed workload (a third from each, interleaved; seed 8), tok/s and % vs the best static for the mix
+   b=1 {'low': 6, 'mid': 6, 'high': 6} best static for mix 8,32,0.4 52.8 | low's 8,32,0.4: +0.0% mid's 8,32,0.4: +0.0% high's 4,32,0.4: -0.7% | typed tau (W=8,K=32,{'low': 0.4, 'mid': 0.4, 'high': 0.4}) 52.8 (+0.0%) | ClearTree W=4 51.1 (-3.1%) W=8 52.6 (-0.4%) | Target-only 30.4
+   b=4 {'low': 11, 'mid': 11, 'high': 11} best static for mix 4,16,0.4 132.9 | low's 4,8,0.8: -5.3% mid's 4,32,0.2: -3.6% high's 4,32,0.05: -8.9% | typed tau (W=4,K=16,{'low': 0.8, 'mid': 0.4, 'high': 0.05}) 130.5 (-1.8%) | ClearTree W=4 136.1 (+2.4%) W=8 134.4 (+1.1%) | Target-only 116.3
+   b=8 {'low': 22, 'mid': 22, 'high': 22} best static for mix 4,16,0.4 200.9 | low's 4,8,0.8: -1.3% mid's 4,16,0.4: +0.0% high's 2,16,0.05: -9.0% | typed tau (W=4,K=16,{'low': 0.8, 'mid': 0.4, 'high': 0.1}) 197.8 (-1.6%) | ClearTree W=4 218.0 (+8.5%) W=8 205.7 (+2.4%) | Target-only 219.8

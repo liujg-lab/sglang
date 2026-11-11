@@ -1,0 +1,41 @@
+== % vs the best fixed (W, K) for the scenario (hindsight over the same seeds); [best fixed]; mean over seeds 8-10
+known      high    b=1 | best fixed 4,32    83.9 | table:  -0.8% | online K:  -0.8% | online W:  -3.6% | online W+K:  -3.2% | W+K uses W2:78%,W4:18%,W8:4% K8:16%,K16:61%,K32:23%
+known      high    b=4 | best fixed 4,32   247.4 | table:  -0.1% | online K:  -0.0% | online W:  -0.7% | online W+K:  +0.3% | W+K uses W2:5%,W4:95%,W8:0% K8:1%,K16:10%,K32:89%
+known      high    b=8 | best fixed 2,16   376.9 | table:  -0.3% | online K:  +0.2% | online W:  -0.2% | online W+K:  -1.1% | W+K uses W2:10%,W4:90%,W8:0% K8:0%,K16:16%,K32:83%
+known      low     b=1 | best fixed 8,32    34.5 | table:  +0.0% | online K:  +0.1% | online W:  +0.5% | online W+K:  +0.6% | W+K uses W4:1%,W8:99% K8:1%,K16:6%,K32:93%
+known      low     b=4 | best fixed 2,16   111.7 | table:  -0.7% | online K:  -1.8% | online W:  -0.8% | online W+K:  -1.9% | W+K uses W4:53%,W8:47% K8:2%,K16:41%,K32:57%
+known      low     b=8 | best fixed 4,32   214.7 | table:  -0.1% | online K:  +0.1% | online W:  -0.2% | online W+K:  +0.1% | W+K uses W4:89%,W8:11% K8:4%,K16:86%,K32:11%
+known      mid     b=1 | best fixed 8,32    56.9 | table:  +0.0% | online K:  +0.1% | online W:  -1.4% | online W+K:  -1.5% | W+K uses W2:7%,W4:4%,W8:89% K8:4%,K16:7%,K32:89%
+known      mid     b=4 | best fixed 4,32   158.8 | table:  +0.0% | online K:  +0.6% | online W:  +0.2% | online W+K:  -0.0% | W+K uses W4:51%,W8:49% K8:0%,K16:15%,K32:85%
+known      mid     b=8 | best fixed 4,16   245.5 | table:  +0.1% | online K:  +0.3% | online W:  +0.1% | online W+K:  +0.3% | W+K uses W4:98%,W8:2% K8:0%,K16:56%,K32:44%
+unseen     flat    b=1 | best fixed 8,32    54.1 | table:  +0.0% | online K:  +0.0% | online W:  -1.4% | online W+K:  -1.5% | W+K uses W2:1%,W4:41%,W8:58% K8:2%,K16:13%,K32:85%
+unseen     flat    b=4 | best fixed 8,32   150.1 | table:  -0.1% | online K:  +0.3% | online W:  +0.3% | online W+K:  +0.8% | W+K uses W4:78%,W8:22% K8:0%,K16:20%,K32:80%
+unseen     flat    b=8 | best fixed 4,32   232.1 | table:  -0.4% | online K:  +0.2% | online W:  -0.4% | online W+K:  +0.2% | W+K uses W4:97%,W8:3% K8:0%,K16:56%,K32:44%
+unseen     flatlow b=1 | best fixed 8,32    46.4 | table:  +0.0% | online K:  -0.1% | online W:  -0.3% | online W+K:  -0.1% | W+K uses W2:0%,W4:9%,W8:90% K8:1%,K16:4%,K32:95%
+unseen     flatlow b=4 | best fixed 4,32   129.9 | table:  -0.1% | online K:  -0.3% | online W:  -0.9% | online W+K:  -0.9% | W+K uses W4:22%,W8:78% K8:0%,K16:4%,K32:96%
+unseen     flatlow b=8 | best fixed 4,16   216.0 | table:  -0.1% | online K:  -0.3% | online W:  -0.1% | online W+K:  -0.3% | W+K uses W4:90%,W8:10% K8:1%,K16:48%,K32:51%
+unseen     midhigh b=1 | best fixed 8,32    70.6 | table:  +0.0% | online K:  -0.1% | online W:  -1.7% | online W+K:  -2.1% | W+K uses W2:2%,W4:62%,W8:36% K8:3%,K16:16%,K32:80%
+unseen     midhigh b=4 | best fixed 4,32   198.6 | table:  +0.1% | online K:  +0.7% | online W:  +0.4% | online W+K:  +0.5% | W+K uses W2:0%,W4:100%,W8:0% K8:0%,K16:10%,K32:89%
+unseen     midhigh b=8 | best fixed 4,32   304.5 | table:  -0.8% | online K:  -0.9% | online W:  -2.1% | online W+K:  -0.0% | W+K uses W2:0%,W4:99%,W8:0% K8:0%,K16:14%,K32:86%
+unseen     midlow  b=1 | best fixed 8,32    45.2 | table:  +0.0% | online K:  +0.0% | online W:  +0.5% | online W+K:  +0.3% | W+K uses W4:2%,W8:98% K8:1%,K16:3%,K32:96%
+unseen     midlow  b=4 | best fixed 4,16   127.8 | table:  -1.8% | online K:  -0.6% | online W:  -1.1% | online W+K:  -0.8% | W+K uses W4:37%,W8:63% K8:0%,K16:24%,K32:76%
+unseen     midlow  b=8 | best fixed 4,16   217.6 | table:  +0.0% | online K:  -0.1% | online W:  +0.1% | online W+K:  -0.0% | W+K uses W4:90%,W8:10% K8:3%,K16:73%,K32:24%
+verify x10 high    b=1 | best fixed 4,16    78.2 | table:  -1.3% | online K:  -0.1% | online W:  -4.4% | online W+K:  -0.5% | W+K uses W2:74%,W4:22%,W8:4% K8:19%,K16:70%,K32:12%
+verify x10 high    b=4 | best fixed 2,16   216.3 | table:  -6.0% | online K:  -2.7% | online W:  -6.5% | online W+K:  -2.9% | W+K uses W2:6%,W4:94%,W8:0% K8:2%,K16:91%,K32:7%
+verify x10 high    b=8 | best fixed 2,16   318.4 | table:  -0.3% | online K:  -0.3% | online W:  -0.3% | online W+K:  -3.6% | W+K uses W2:16%,W4:84%,W8:0% K8:2%,K16:96%,K32:2%
+verify x10 low     b=1 | best fixed 8,16    32.7 | table:  -3.2% | online K:  -5.2% | online W:  -2.8% | online W+K:  -2.6% | W+K uses W4:1%,W8:99% K8:1%,K16:35%,K32:64%
+verify x10 low     b=4 | best fixed 8,16   112.6 | table:  -1.7% | online K:  -0.0% | online W:  -1.9% | online W+K:  -0.4% | W+K uses W4:68%,W8:32% K8:18%,K16:65%,K32:18%
+verify x10 low     b=8 | best fixed 8,16   212.4 | table:  -0.6% | online K:  -0.0% | online W:  -0.6% | online W+K:  -0.2% | W+K uses W4:70%,W8:30% K8:43%,K16:56%,K32:1%
+verify x10 mid     b=1 | best fixed 8,32    52.2 | table:  +0.0% | online K:  +0.5% | online W:  -1.4% | online W+K:  -0.8% | W+K uses W2:3%,W4:16%,W8:81% K8:3%,K16:19%,K32:78%
+verify x10 mid     b=4 | best fixed 4,16   136.4 | table:  -8.8% | online K:  -1.7% | online W:  -8.5% | online W+K:  -1.8% | W+K uses W4:97%,W8:3% K8:4%,K16:89%,K32:6%
+verify x10 mid     b=8 | best fixed 8,16   216.9 | table:  -1.0% | online K:  +0.4% | online W:  -0.8% | online W+K:  +0.4% | W+K uses W4:97%,W8:3% K8:16%,K16:82%,K32:2%
+
+  group means (min) vs best fixed (W, K):
+   known     : table -0.21% (-0.8); online K -0.14% (-1.8); online W -0.68% (-3.6); online W+K -0.71% (-3.2)
+   unseen    : table -0.26% (-1.8); online K -0.10% (-0.9); online W -0.55% (-2.1); online W+K -0.33% (-2.1)
+   verify x10: table -2.55% (-8.8); online K -1.00% (-5.2); online W -3.00% (-8.5); online W+K -1.35% (-3.6)
+
+  online vs table (mean of per-scenario differences, percentage points):
+   known     : online K +0.07; online W -0.47; online W+K -0.50
+   unseen    : online K +0.16; online W -0.29; online W+K -0.07
+   verify x10: online K +1.55; online W -0.45; online W+K +1.20

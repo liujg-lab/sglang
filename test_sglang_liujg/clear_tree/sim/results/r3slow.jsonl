@@ -1,0 +1,8 @@
+{"test": "slow", "b": 1, "seed": 7, "res": {"fixed W=4": 147.20906738850772, "fixed W=8": 147.29721478084383, "UCB": 146.56425441679428, "guided": 146.94905280644332, "guided final W": {"1": 8}, "guided switches": 0}}
+{"test": "slow", "b": 1, "seed": 8, "res": {"fixed W=4": 143.29343518408558, "fixed W=8": 142.29000760084307, "UCB": 143.57270799193384, "guided": 140.7144957161438, "guided final W": {"1": 8}, "guided switches": 4}}
+{"test": "slow", "b": 4, "seed": 7, "res": {"fixed W=4": 400.46894757327846, "fixed W=8": 389.590106694043, "UCB": 387.05781113799395, "guided": 390.34409174763414, "guided final W": {"4": 8, "1": 8}, "guided switches": 2}}
+{"test": "slow", "b": 4, "seed": 8, "res": {"fixed W=4": 404.1273478679079, "fixed W=8": 394.5064590319579, "UCB": 399.6686536098816, "guided": 404.93838975102574, "guided final W": {"4": 4, "1": 8}, "guided switches": 1}}
+{"test": "slow", "b": 8, "seed": 7, "res": {"fixed W=4": 661.7386844664036, "fixed W=8": 645.0934157003395, "UCB": 655.2351383920268, "guided": 643.6518189370981, "guided final W": {"8": 8, "4": 4, "1": 8}, "guided switches": 5}}
+{"test": "slow", "b": 8, "seed": 8, "res": {"fixed W=4": 649.2730907451843, "fixed W=8": 634.5744135521957, "UCB": 636.6157655112253, "guided": 646.0107005773897, "guided final W": {"8": 4, "4": 8, "1": 8}, "guided switches": 1}}
+{"test": "slow_mixed", "seed": 7, "res": {"fixed W=4": 409.3278007121508, "UCB": 401.7830136240976, "guided": 406.0172259587969, "guided final W": {"1": 8, "4": 4, "8": 4}}}
+{"test": "slow_mixed", "seed": 8, "res": {"fixed W=4": 408.88498398900333, "UCB": 403.0178676848497, "guided": 406.2213621658359, "guided final W": {"1": 16, "4": 4, "8": 4}}}

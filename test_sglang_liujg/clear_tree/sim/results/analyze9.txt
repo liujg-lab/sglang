@@ -1,0 +1,48 @@
+== D: ClearTree core variants (W=4, seed 7). Cells: % vs the workload's best static | tokens per request per round | layer forwards per round
+low   b=1: base:  -1.5% 2.37 1.42 | K16:  -1.4% 2.41 1.54 | K32:  -1.8% 2.41 1.56 | fd1.0:  -1.5% 2.37 1.42 | K32 fd1.0:  -1.8% 2.41 1.56
+low   b=4: base:  +2.5% 2.10 1.19 | K16:  +2.2% 2.12 1.26 | K32:  +0.1% 2.12 1.30 | fd1.0:  +2.7% 2.16 1.48 | K32 fd1.0:  +1.4% 2.17 1.53
+low   b=8: base:  +3.8% 2.04 1.13 | K16:  +2.3% 2.06 1.24 | K32:  -1.4% 2.08 1.34 | fd1.0:  +3.4% 2.09 1.33 | K32 fd1.0:  -0.9% 2.14 1.55
+mid   b=1: base:  -7.3% 3.92 2.81 | K16:  -6.1% 4.06 3.11 | K32:  -5.8% 4.17 3.28 | fd1.0:  -7.3% 3.92 2.81 | K32 fd1.0:  -5.8% 4.17 3.28
+mid   b=4: base:  +1.2% 3.68 2.79 | K16:  +2.7% 3.97 3.33 | K32:  +2.4% 4.14 3.63 | fd1.0:  -0.5% 3.71 2.92 | K32 fd1.0:  +2.9% 4.35 4.08
+mid   b=8: base:  +2.7% 3.40 2.71 | K16:  +6.7% 3.79 3.36 | K32:  +4.6% 3.91 3.68 | fd1.0:  +2.9% 3.48 3.04 | K32 fd1.0:  +4.8% 4.13 4.22
+high  b=1: base:  -3.8% 7.30 5.82 | K16:  -4.4% 7.39 6.15 | K32:  -0.7% 7.88 6.48 | fd1.0:  -3.8% 7.30 5.82 | K32 fd1.0:  -0.7% 7.88 6.48 | oracle K32 fd1.0:  +2.9% 8.92 8.00
+high  b=4: base:  -6.2% 7.07 6.25 | K16:  -7.5% 7.12 6.52 | K32:  -4.6% 7.66 6.93 | fd1.0:  -8.8% 6.78 6.06 | K32 fd1.0:  -6.8% 7.97 7.43 | oracle K32 fd1.0:  +2.1% 8.82 8.29
+high  b=8: base: -14.8% 6.28 5.58 | K16: -13.8% 6.95 6.14 | K32: -12.5% 7.72 6.81 | fd1.0: -14.6% 6.67 6.04 | K32 fd1.0: -11.2% 8.20 7.60 | oracle K32 fd1.0:  -4.9% 8.79 7.75
+  mean % vs best static: base -2.60% (n=9), K16 -2.16% (n=9), K32 -2.19% (n=9), fd1.0 -3.04% (n=9), K32 fd1.0 -2.00% (n=9), oracle K32 fd1.0 +0.01% (n=3)
+
+   stop-boundary audit (actual / predicted; boundary = |margin| <= 0.1 token)
+   high  b=1 base       n= 3340 stop dG/mu 1.048 dA/mu 1.670 | grow dA/mu 1.064 | boundary n=336 dA/mu 1.447 flips 47% regret 35.5/1000
+   high  b=1 K32 fd1.0  n= 3333 stop dG/mu 1.060 dA/mu 1.615 | grow dA/mu 1.074 | boundary n=337 dA/mu 1.489 flips 41% regret 38.6/1000
+   high  b=4 base       n= 6513 stop dG/mu 1.013 dA/mu 1.191 | grow dA/mu 1.072 | boundary n=75 dA/mu 4.954 flips 4% regret 599.9/1000
+   high  b=4 K32 fd1.0  n= 6839 stop dG/mu 1.019 dA/mu 1.241 | grow dA/mu 1.070 | boundary n=51 dA/mu 0.873 flips 29% regret 1.0/1000
+   high  b=8 base       n=12860 stop dG/mu 1.012 dA/mu 1.102 | grow dA/mu 1.030 | boundary n=175 dA/mu 0.818 flips 0% regret 1.0/1000
+   high  b=8 K32 fd1.0  n=13562 stop dG/mu 1.010 dA/mu 1.127 | grow dA/mu 1.054 | boundary n=24 dA/mu -0.410 flips 100% regret 2521.1/1000
+   mid   b=1 base       n= 3794 stop dG/mu 1.042 dA/mu 1.369 | grow dA/mu 1.110 | boundary n=980 dA/mu 1.288 flips 48% regret 21.2/1000
+   mid   b=1 K32 fd1.0  n= 3969 stop dG/mu 1.042 dA/mu 1.421 | grow dA/mu 1.121 | boundary n=1194 dA/mu 1.320 flips 49% regret 30.9/1000
+   mid   b=4 base       n= 7120 stop dG/mu 1.011 dA/mu 1.048 | grow dA/mu 1.038 | boundary n=286 dA/mu 0.791 flips 22% regret 14.6/1000
+   mid   b=4 K32 fd1.0  n= 8535 stop dG/mu 1.017 dA/mu 1.108 | grow dA/mu 1.056 | boundary n=245 dA/mu 0.883 flips 24% regret 1.0/1000
+   mid   b=8 base       n=13526 stop dG/mu 1.011 dA/mu 1.047 | grow dA/mu 1.017 | boundary n=135 dA/mu 0.456 flips 10% regret 331.9/1000
+   mid   b=8 K32 fd1.0  n=16546 stop dG/mu 1.008 dA/mu 1.076 | grow dA/mu 1.037 | boundary n=88 dA/mu 0.741 flips 10% regret 10.0/1000
+
+== R setup: rule (W,K)=(4,32), its best-tau share of each workload's optimum 97.9%; tau table {'8': {'low': 0.8, 'high': 0.2, 'mid': 0.2}, '4': {'mid': 0.2, 'low': 0.8, 'high': 0.05}, '1': {'low': 0.4, 'high': 0.4, 'mid': 0.2}}; rho at tau 0.05/0.4/0.8 {'low': [0.6432, 0.6568, 0.6775], 'mid': [0.8377, 0.8522, 0.8963], 'high': [0.9673, 0.9679, 0.9798]}; thresholds [0.7606, 0.9169]
+
+== R pure workloads (seed 7; % vs the workload's best static on the full round-8 grid, in-sample)
+low   b=1 best static   37.3 | global static (4,16,0.4):  -2.6% | ClearTree base:  -1.5% | ClearTree K32 fd1.0:  -1.8% | batch accounting W=4 K=16:  -4.9% | batch accounting W=4 K=32:  -5.1% | rho->tau W=4 K=32:  -3.0% | tau share {'0.2': 0.052, '0.4': 0.948}
+low   b=4 best static  101.8 | global static (4,16,0.4):  -4.2% | ClearTree base:  +2.5% | ClearTree K32 fd1.0:  +1.4% | batch accounting W=4 K=16:  -0.8% | batch accounting W=4 K=32:  -2.0% | rho->tau W=4 K=32:  -3.5% | tau share {'0.2': 0.001, '0.4': 0.088, '0.8': 0.911}
+low   b=8 best static  160.9 | global static (4,16,0.4):  -6.5% | ClearTree base:  +3.8% | ClearTree K32 fd1.0:  -0.9% | batch accounting W=4 K=16:  -1.1% | batch accounting W=4 K=32:  -4.0% | rho->tau W=4 K=32:  -4.5% | tau share {'0.4': 0.047, '0.8': 0.953}
+mid   b=1 best static   58.0 | global static (4,16,0.4):  -5.8% | ClearTree base:  -7.3% | ClearTree K32 fd1.0:  -5.8% | batch accounting W=4 K=16:  -6.1% | batch accounting W=4 K=32:  -4.2% | rho->tau W=4 K=32:  -5.6% | tau share {'0.2': 0.798, '0.4': 0.202}
+mid   b=4 best static  149.3 | global static (4,16,0.4):  -0.9% | ClearTree base:  +1.2% | ClearTree K32 fd1.0:  +2.9% | batch accounting W=4 K=16:  +4.1% | batch accounting W=4 K=32:  +4.9% | rho->tau W=4 K=32:  +0.3% | tau share {'0.2': 0.918, '0.4': 0.082}
+mid   b=8 best static  227.2 | global static (4,16,0.4):  +0.0% | ClearTree base:  +2.7% | ClearTree K32 fd1.0:  +4.8% | batch accounting W=4 K=16:  +8.6% | batch accounting W=4 K=32:  +7.3% | rho->tau W=4 K=32:  -1.4% | tau share {'0.2': 0.956, '0.4': 0.044}
+high  b=1 best static   83.4 | global static (4,16,0.4):  -2.5% | ClearTree base:  -3.8% | ClearTree K32 fd1.0:  -0.7% | batch accounting W=4 K=16:  -2.9% | batch accounting W=4 K=32:  -0.5% | rho->tau W=4 K=32:  -0.1% | tau share {'0.2': 0.014, '0.4': 0.986}
+high  b=4 best static  244.0 | global static (4,16,0.4):  -4.5% | ClearTree base:  -6.2% | ClearTree K32 fd1.0:  -6.8% | batch accounting W=4 K=16:  -4.4% | batch accounting W=4 K=32:  -0.3% | rho->tau W=4 K=32:  -0.5% | tau share {'0.05': 0.891, '0.4': 0.109}
+high  b=8 best static  386.5 | global static (4,16,0.4):  -8.8% | ClearTree base: -14.8% | ClearTree K32 fd1.0: -11.2% | batch accounting W=4 K=16:  -7.1% | batch accounting W=4 K=32:  -4.8% | rho->tau W=4 K=32:  -4.3% | tau share {'0.05': 0.024, '0.2': 0.879, '0.4': 0.097}
+  mean: global static (4,16,0.4) -3.99% (min -8.8); ClearTree base -2.60% (min -14.8); ClearTree K32 fd1.0 -2.00% (min -11.2); batch accounting W=4 K=16 -1.64% (min -7.1); batch accounting W=4 K=32 -0.97% (min -5.1); rho->tau W=4 K=32 -2.51% (min -5.6)
+
+== R mixed (interleaved, seed 8; % vs the best static for the mix from round 8)
+b=1 best static   52.8 | ClearTree base (r8):  -0.4% | batch accounting W=4 K=16:  -4.7% | batch accounting W=4 K=32:  -1.9% | rho->tau W=4 K=32:  -2.2% | ClearTree K32 fd1.0:  -1.9% | ClearTree K16:  -2.1% | Target-only 30.4
+b=4 best static  132.9 | ClearTree base (r8):  +2.4% | batch accounting W=4 K=16:  +3.9% | batch accounting W=4 K=32:  +3.0% | rho->tau W=4 K=32:  -1.0% | ClearTree K32 fd1.0:  +1.9% | ClearTree K16:  +4.1% | Target-only 116.3
+b=8 best static  200.9 | ClearTree base (r8):  +8.5% | batch accounting W=4 K=16:  +7.5% | batch accounting W=4 K=32:  +5.4% | rho->tau W=4 K=32:  -1.2% | ClearTree K32 fd1.0:  +6.5% | ClearTree K16:  +9.6% | Target-only 219.8
+
+== R phased (low, then high, then mid requests; seed 8; % vs the best static candidate run on the same requests)
+b=4 best static static (4, 32, 0.4)  135.2 | batch accounting W=4 K=16:  +2.5% | batch accounting W=4 K=32:  +2.8% | rho->tau W=4 K=32:  +1.1% | static (4, 32, 0.4):  +0.0% | ClearTree base:  +4.0% | ClearTree K32 fd1.0:  +3.5% | ClearTree K16:  +4.0% | other statics (4, 8, 0.8) -4.9%, (4, 16, 0.2) -4.0%, (4, 16, 0.4) -0.0%, (4, 32, 0.05) -11.2%, (4, 32, 0.2) -3.4%
+b=8 best static static (4, 16, 0.4)  214.1 | batch accounting W=4 K=16:  +6.0% | batch accounting W=4 K=32:  +5.7% | rho->tau W=4 K=32:  +0.3% | static (4, 16, 0.4):  +0.0% | ClearTree base:  +5.7% | ClearTree K32 fd1.0:  +6.5% | ClearTree K16:  +6.9% | other statics (2, 16, 0.05) -12.2%, (4, 8, 0.8) -3.9%, (4, 16, 0.2) -3.5%, (4, 32, 0.4) -1.5%

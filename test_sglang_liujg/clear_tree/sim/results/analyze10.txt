@@ -1,0 +1,69 @@
+== W: high workload, b=8. Overall rate | full-batch rate | full-batch tokens/request/round, ms/round, layers/round | drain time share
+seed 7
+   static (2,16,0.05)                         386.5 ( +0.0%) | full   392.8 ( +0.0%) | 8.01 tok  163.1 ms 8.00 layers | drain 5% (drain rate 274)
+   static (2,32,0.05)                         376.5 ( -2.6%) | full   386.0 ( -1.7%) | 8.02 tok  166.3 ms 8.00 layers | drain 7% (drain rate 246)
+   static (4,16,0.05)                         357.3 ( -7.5%) | full   364.7 ( -7.2%) | 8.10 tok  177.6 ms 8.00 layers | drain 7% (drain rate 253)
+   static (4,32,0.05)                         371.8 ( -3.8%) | full   378.2 ( -3.7%) | 8.56 tok  181.1 ms 8.00 layers | drain 6% (drain rate 270)
+   ClearTree oracle W=2 K=16                  374.1 ( -3.2%) | full   393.8 ( +0.3%) | 8.20 tok  166.5 ms 8.33 layers | drain 10% (drain rate 194)
+   ClearTree oracle W=2 K=32                  367.9 ( -4.8%) | full   386.9 ( -1.5%) | 8.34 tok  172.4 ms 8.51 layers | drain 10% (drain rate 193)
+   ClearTree oracle W=4 K=16                  359.6 ( -6.9%) | full   369.7 ( -5.9%) | 7.96 tok  172.3 ms 7.79 layers | drain 7% (drain rate 232)
+   ClearTree oracle W=4 K=32                  367.4 ( -4.9%) | full   382.1 ( -2.7%) | 8.97 tok  187.8 ms 8.61 layers | drain 8% (drain rate 192)
+   ClearTree oracle W=2 K=16 known costs      373.2 ( -3.4%) | full   392.9 ( +0.0%) | 8.16 tok  166.2 ms 8.30 layers | drain 10% (drain rate 193)
+   batch W=2 K=16                             377.0 ( -2.5%) | full   391.5 ( -0.3%) | 7.84 tok  160.3 ms 7.79 layers | drain 8% (drain rate 214)
+   batch W=4 K=32                             367.8 ( -4.8%) | full   379.3 ( -3.4%) | 8.45 tok  178.1 ms 7.87 layers | drain 7% (drain rate 210)
+seed 8
+   static (2,16,0.05)                         369.2 ( +0.0%) | full   385.3 ( +0.0%) | 7.85 tok  163.0 ms 8.00 layers | drain 10% (drain rate 217)
+   static (2,32,0.05)                         366.2 ( -0.8%) | full   380.8 ( -1.2%) | 7.90 tok  166.0 ms 8.00 layers | drain 9% (drain rate 213)
+   static (4,16,0.05)                         346.7 ( -6.1%) | full   358.9 ( -6.9%) | 7.96 tok  177.4 ms 8.00 layers | drain 9% (drain rate 219)
+   static (4,32,0.05)                         365.2 ( -1.1%) | full   376.4 ( -2.3%) | 8.50 tok  180.7 ms 8.00 layers | drain 9% (drain rate 251)
+   ClearTree oracle W=2 K=16                  363.8 ( -1.5%) | full   383.7 ( -0.4%) | 7.95 tok  165.7 ms 8.30 layers | drain 10% (drain rate 189)
+   ClearTree oracle W=2 K=32                  367.7 ( -0.4%) | full   382.2 ( -0.8%) | 8.28 tok  173.3 ms 8.68 layers | drain 9% (drain rate 221)
+   ClearTree oracle W=4 K=16                  348.3 ( -5.6%) | full   361.7 ( -6.1%) | 7.81 tok  172.7 ms 7.89 layers | drain 9% (drain rate 212)
+   ClearTree oracle W=4 K=32                  359.8 ( -2.5%) | full   376.1 ( -2.4%) | 8.89 tok  189.1 ms 8.72 layers | drain 10% (drain rate 218)
+   ClearTree oracle W=2 K=16 known costs      366.5 ( -0.7%) | full   386.0 ( +0.2%) | 7.98 tok  165.3 ms 8.28 layers | drain 10% (drain rate 194)
+   batch W=2 K=16                             364.4 ( -1.3%) | full   382.3 ( -0.8%) | 7.69 tok  161.0 ms 7.85 layers | drain 10% (drain rate 199)
+   batch W=4 K=32                             362.1 ( -1.9%) | full   375.3 ( -2.6%) | 8.39 tok  178.8 ms 7.91 layers | drain 10% (drain rate 237)
+seed 9
+   static (2,16,0.05)                         383.2 ( +0.0%) | full   394.6 ( +0.0%) | 8.03 tok  162.8 ms 8.00 layers | drain 5% (drain rate 156)
+   static (2,32,0.05)                         376.4 ( -1.8%) | full   388.2 ( -1.6%) | 8.07 tok  166.2 ms 8.00 layers | drain 5% (drain rate 165)
+   static (4,16,0.05)                         357.1 ( -6.8%) | full   364.6 ( -7.6%) | 8.10 tok  177.8 ms 8.00 layers | drain 5% (drain rate 216)
+   static (4,32,0.05)                         377.2 ( -1.6%) | full   381.9 ( -3.2%) | 8.64 tok  180.9 ms 8.00 layers | drain 2% (drain rate 197)
+   ClearTree oracle W=2 K=16                  374.2 ( -2.3%) | full   393.7 ( -0.2%) | 8.07 tok  163.9 ms 8.05 layers | drain 7% (drain rate 121)
+   ClearTree oracle W=2 K=32                  365.2 ( -4.7%) | full   384.7 ( -2.5%) | 8.26 tok  171.7 ms 8.50 layers | drain 9% (drain rate 166)
+   ClearTree oracle W=4 K=16                  354.2 ( -7.6%) | full   369.6 ( -6.3%) | 7.85 tok  169.9 ms 7.59 layers | drain 6% (drain rate 112)
+   ClearTree oracle W=4 K=32                  365.0 ( -4.7%) | full   382.0 ( -3.2%) | 8.93 tok  187.1 ms 8.56 layers | drain 6% (drain rate 109)
+   ClearTree oracle W=2 K=16 known costs      371.6 ( -3.0%) | full   391.1 ( -0.9%) | 8.07 tok  165.1 ms 8.20 layers | drain 8% (drain rate 143)
+   batch W=2 K=16                             375.9 ( -1.9%) | full   393.5 ( -0.3%) | 7.87 tok  160.1 ms 7.74 layers | drain 7% (drain rate 157)
+   batch W=4 K=32                             370.4 ( -3.4%) | full   383.9 ( -2.7%) | 8.57 tok  178.6 ms 7.86 layers | drain 5% (drain rate 97)
+  mean over seeds vs static (2,16,0.05): overall / full batch / drain share
+   static (2,16,0.05)                        +0.0% /  +0.0% / 7%
+   static (2,32,0.05)                        -1.7% /  -1.5% / 7%
+   static (4,16,0.05)                        -6.8% /  -7.2% / 7%
+   static (4,32,0.05)                        -2.1% /  -3.1% / 6%
+   ClearTree oracle W=2 K=16                 -2.3% /  -0.1% / 9%
+   ClearTree oracle W=2 K=32                 -3.3% /  -1.6% / 9%
+   ClearTree oracle W=4 K=16                 -6.7% /  -6.1% / 7%
+   ClearTree oracle W=4 K=32                 -4.1% /  -2.8% / 8%
+   ClearTree oracle W=2 K=16 known costs     -2.4% /  -0.2% / 9%
+   batch W=2 K=16                            -1.9% /  -0.5% / 8%
+   batch W=4 K=32                            -3.4% /  -2.9% / 7%
+
+== S: seeds 8-10 (out of sample). % vs tuned static + switch (pure: per-workload best on seed 7; mixed/phased: round-8 best for the mix); [spec time share]
+mixed       b=1 n=3 tuned [8, 32, 0.4] [86%] | Target-only: -41.5% | global static+switch:  -6.0% [84%] | batch W=8 K=32:  +0.2% | batch W=8 K=32+switch:  -8.1% [74%] | ClearTree K16+switch:  +0.1% [91%]
+mixed       b=4 n=3 tuned [4, 16, 0.4] [91%] | Target-only: -20.7% | global static+switch:  +0.0% [91%] | batch W=4 K=16:  +3.7% | batch W=4 K=16+switch:  +3.3% [93%] | batch W=4 K=32:  +3.6% | batch W=4 K=32+switch:  +3.5% [93%] | ClearTree K16+switch:  +3.9% [94%]
+mixed       b=8 n=3 tuned [4, 16, 0.4] [41%] | Target-only:  -4.8% | global static+switch:  +0.0% [41%] | batch W=4 K=16:  +3.3% | batch W=4 K=16+switch:  +3.4% [51%] | batch W=4 K=32:  +2.0% | batch W=4 K=32+switch:  +2.5% [48%] | ClearTree K16+switch:  +1.8% [39%]
+phased      b=4 n=3 tuned [4, 16, 0.4] [60%] | Target-only: -21.7% | global static+switch:  +0.0% [60%] | batch W=4 K=16:  +5.6% | batch W=4 K=16+switch:  +5.0% [69%] | batch W=4 K=32:  +5.6% | batch W=4 K=32+switch:  +9.9% [75%] | ClearTree K16+switch:  +6.8% [71%]
+phased      b=8 n=3 tuned [4, 16, 0.4] [54%] | Target-only: -12.7% | global static+switch:  +0.0% [54%] | batch W=4 K=16:  -1.2% | batch W=4 K=16+switch:  +3.2% [53%] | batch W=4 K=32:  -2.0% | batch W=4 K=32+switch:  +0.1% [41%] | ClearTree K16+switch:  +5.0% [53%]
+pure   high b=1 n=3 tuned [4, 32, 0.4] [100%] | Target-only: -63.6% | global static+switch:  -2.7% [100%] | batch W=8 K=32:  -0.3% | batch W=8 K=32+switch:  -0.3% [100%] | ClearTree K16+switch:  -6.5% [100%]
+pure   high b=4 n=3 tuned [4, 32, 0.05] [100%] | Target-only: -52.8% | global static+switch:  -6.1% [100%] | batch W=4 K=16:  -4.7% | batch W=4 K=16+switch:  -4.7% [100%] | batch W=4 K=32:  -1.3% | batch W=4 K=32+switch:  -1.3% [100%] | ClearTree K16+switch: -10.7% [100%]
+pure   high b=8 n=3 tuned [2, 16, 0.05] [100%] | Target-only: -41.9% | global static+switch:  -7.7% [100%] | batch W=4 K=16:  -6.7% | batch W=4 K=16+switch:  -6.7% [100%] | batch W=4 K=32:  -3.0% | batch W=4 K=32+switch:  -3.0% [100%] | ClearTree K16+switch: -12.9% [100%]
+pure   low  b=1 n=3 tuned [8, 32, 0.4] [68%] | Target-only: -12.8% | global static+switch:  -1.4% [66%] | batch W=8 K=32:  -0.6% | batch W=8 K=32+switch:  -2.2% [60%] | ClearTree K16+switch:  +1.6% [73%]
+pure   low  b=4 n=3 tuned [4, 8, 0.8] [21%] | Target-only:  +3.1% | global static+switch:  -1.8% [25%] | batch W=4 K=16: -10.1% | batch W=4 K=16+switch:  -1.1% [29%] | batch W=4 K=32: -11.8% | batch W=4 K=32+switch:  -1.2% [20%] | ClearTree K16+switch:  -0.6% [33%]
+pure   low  b=8 n=3 tuned [4, 8, 0.8] [7%] | Target-only:  +2.2% | global static+switch:  -0.2% [7%] | batch W=4 K=16: -25.0% | batch W=4 K=16+switch:  -0.3% [7%] | batch W=4 K=32: -27.4% | batch W=4 K=32+switch:  -0.2% [7%] | ClearTree K16+switch:  +0.2% [7%]
+pure   mid  b=1 n=3 tuned [8, 32, 0.4] [100%] | Target-only: -47.0% | global static+switch:  -5.8% [100%] | batch W=8 K=32:  -0.4% | batch W=8 K=32+switch:  -0.4% [100%] | ClearTree K16+switch:  -3.1% [100%]
+pure   mid  b=4 n=3 tuned [4, 32, 0.2] [100%] | Target-only: -21.1% | global static+switch:  +0.1% [100%] | batch W=4 K=16:  +6.4% | batch W=4 K=16+switch:  +6.4% [100%] | batch W=4 K=32:  +7.5% | batch W=4 K=32+switch:  +7.5% [100%] | ClearTree K16+switch:  +6.0% [100%]
+pure   mid  b=8 n=3 tuned [4, 16, 0.4] [100%] | Target-only:  -3.5% | global static+switch:  +0.0% [100%] | batch W=4 K=16:  +7.2% | batch W=4 K=16+switch:  +7.2% [100%] | batch W=4 K=32:  +6.4% | batch W=4 K=32+switch:  +6.4% [100%] | ClearTree K16+switch:  +2.8% [64%]
+  group means (mean over scenarios of the seed mean; min in brackets):
+   pure: ClearTree K16+switch -2.58% (-12.9); Target-only -26.37% (-63.6); batch W=4 K=16 -5.46% (-25.0); batch W=4 K=16+switch +0.14% (-6.7); batch W=4 K=32 -4.92% (-27.4); batch W=4 K=32+switch +1.38% (-3.0); batch W=8 K=32 -0.43% (-0.6); batch W=8 K=32+switch -0.97% (-2.2); global static+switch -2.84% (-7.7)
+   mixed: ClearTree K16+switch +1.89% (+0.1); Target-only -22.34% (-41.5); batch W=4 K=16 +3.49% (+3.3); batch W=4 K=16+switch +3.37% (+3.3); batch W=4 K=32 +2.82% (+2.0); batch W=4 K=32+switch +3.00% (+2.5); batch W=8 K=32 +0.20% (+0.2); batch W=8 K=32+switch -8.07% (-8.1); global static+switch -2.01% (-6.0)
+   phased: ClearTree K16+switch +5.90% (+5.0); Target-only -17.19% (-21.7); batch W=4 K=16 +2.20% (-1.2); batch W=4 K=16+switch +4.12% (+3.2); batch W=4 K=32 +1.82% (-2.0); batch W=4 K=32+switch +5.00% (+0.1); global static+switch +0.00% (+0.0)

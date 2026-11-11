@@ -1,0 +1,22 @@
+acceptance a=2.5 k=2.0 s=(0.5,0.9) seeds=(7,): sim accept length (tokens per request per round), real N=8 values {'preflight': 3.81, 'tau0.8': 3.491}
+  N= 2 tau0.2:2.24 tau0.4:2.24 tau0.8:2.15
+  N= 4 tau0.2:2.92 tau0.4:2.88 tau0.8:2.62
+  N= 8 tau0.01:3.68 tau0.1:3.67 tau0.2:3.64 tau0.4:3.50 tau0.6:3.28 tau0.8:2.95 tau1.0:1.93
+  N=16 tau0.2:4.15 tau0.4:3.96 tau0.8:3.25
+Target-only step: a0=32.38 ms + a_b=0.503 ms per request (real {1: 32.53, 4: 34.99, 8: 36.14})
+
+== token-only: c0=39.092, c_b=0.000, v_tok=0.494, d0=5.852, d_req=0.000, d_tok=0.057
+   in-sample |err| mean 6.9%, max 26.9%; b=4 held out |err| mean 1.8%, max 4.2%
+   b=1: N2t0.2:37/37 N2t0.4:38/37 N2t0.8:39/36 N4t0.2:43/44 N4t0.4:45/45 N4t0.8:45/44 N8t0.01:43/47 N8t0.1:46/49 N8t0.2:48/50 N8t0.4:49/51 N8t0.6:49/51 N8t0.8:47/51 N8t1.0:36/36 N16t0.2:48/52 N16t0.4:49/55 N16t0.8:47/52
+   b=4: N8t0.01:124/124 N8t0.1:128/127 N8t0.2:133/131 N8t0.4:138/136 N8t0.6:139/140 N8t0.8:137/140 N8t1.0:113/116
+   b=8: N2t0.2:241/190 N2t0.4:242/194 N2t0.8:237/192 N4t0.2:241/201 N4t0.4:240/206 N4t0.8:237/209 N8t0.01:195/185 N8t0.1:201/190 N8t0.2:207/194 N8t0.4:212/203 N8t0.6:214/209 N8t0.8:209/212 N8t1.0:176/195 N16t0.2:169/174 N16t0.4:172/181 N16t0.8:164/182
+   b=1 N=8 tau=0.4 round 71.3 ms: Target/host const 39.1, per-request 0.0, verify tokens 4.4, Draft layers 22.0 + 0.0 (per request) + 1.7 (tokens); layers/round 3.76
+   b=8 N=8 tau=0.4 round 134.9 ms: Target/host const 39.1, per-request 0.0, verify tokens 35.6, Draft layers 41.2 + 0.0 (per request) + 15.0 (tokens); layers/round 7.05
+
+== full: c0=41.518, c_b=2.767, v_tok=0.027, d0=3.920, d_req=0.499, d_tok=0.095
+   in-sample |err| mean 1.8%, max 6.1%; b=4 held out |err| mean 1.9%, max 3.6%
+   b=1: N2t0.2:37/37 N2t0.4:38/37 N2t0.8:38/36 N4t0.2:45/44 N4t0.4:46/45 N4t0.8:45/44 N8t0.01:46/47 N8t0.1:49/49 N8t0.2:50/50 N8t0.4:51/51 N8t0.6:51/51 N8t0.8:48/51 N8t1.0:36/36 N16t0.2:52/52 N16t0.4:53/55 N16t0.8:50/52
+   b=4: N8t0.01:122/124 N8t0.1:129/127 N8t0.2:134/131 N8t0.4:140/136 N8t0.6:143/140 N8t0.8:140/140 N8t1.0:116/116
+   b=8: N2t0.2:189/190 N2t0.4:192/194 N2t0.8:193/192 N4t0.2:205/201 N4t0.4:209/206 N4t0.8:212/209 N8t0.01:175/185 N8t0.1:187/190 N8t0.2:196/194 N8t0.4:206/203 N8t0.6:211/209 N8t0.8:211/212 N8t1.0:186/195 N16t0.2:172/174 N16t0.4:184/181 N16t0.8:191/182
+   b=1 N=8 tau=0.4 round 68.0 ms: Target/host const 41.5, per-request 2.8, verify tokens 0.2, Draft layers 14.8 + 1.9 (per request) + 2.8 (tokens); layers/round 3.76
+   b=8 N=8 tau=0.4 round 138.8 ms: Target/host const 41.5, per-request 22.1, verify tokens 2.0, Draft layers 27.6 + 16.5 (per request) + 25.0 (tokens); layers/round 7.05

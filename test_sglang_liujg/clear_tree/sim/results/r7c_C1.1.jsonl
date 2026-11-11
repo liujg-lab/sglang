@@ -1,0 +1,5 @@
+{"fit": "results/fit7r_C1.json", "scen": "b=1 RTT=4", "seed": 8, "res": {"ClearTree core K=W=4": 43.18889804557098, "ClearTree core K=W=8": 48.24064362967263}, "sec": 14.5}
+{"fit": "results/fit7r_C1.json", "scen": "b=2 RTT=4", "seed": 8, "res": {"ClearTree core K=W=4": 77.90433337068625, "ClearTree core K=W=8": 84.15644960436072}, "sec": 11.4}
+{"fit": "results/fit7r_C1.json", "scen": "b=4 RTT=4", "seed": 8, "res": {"ClearTree core K=W=4": 135.3765383211594, "ClearTree core K=W=8": 140.47467776538466}, "sec": 19.2}
+{"fit": "results/fit7r_C1.json", "scen": "b=6 RTT=4", "seed": 8, "res": {"ClearTree core K=W=4": 175.03337329596312, "ClearTree core K=W=8": 173.96745553984994}, "sec": 26.8}
+{"fit": "results/fit7r_C1.json", "scen": "b=8 RTT=4", "seed": 8, "res": {"ClearTree core K=W=4": 219.87289619449643, "ClearTree core K=W=8": 218.82771698019457}, "sec": 35.8}

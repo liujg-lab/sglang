@@ -1,0 +1,3 @@
+{"kind": "high", "b": 8, "res": {"rate": 349.31, "tok_req_round": 8.538, "ms_round": 183.93, "layers_round": 8.216, "ahat": 10.0, "ghat": 5.0, "audit": {"stop_dG_mu": 1.0046, "stop_dA_mu": 1.0181, "grow_dA_mu": 0.9819, "all_dA_mu": 0.9825}}, "sec": 18.9}
+{"kind": "high", "b": 4, "res": {"rate": 235.33, "tok_req_round": 8.472, "ms_round": 139.24, "layers_round": 8.256, "ahat": 10.0, "ghat": 5.0, "audit": {"stop_dG_mu": 1.0077, "stop_dA_mu": 0.9048, "grow_dA_mu": 0.9729, "all_dA_mu": 0.9716}}, "sec": 9.6}
+{"kind": "high", "b": 1, "res": {"rate": 84.52, "tok_req_round": 8.79, "ms_round": 104.0, "layers_round": 7.968, "ahat": 10.0, "ghat": 4.999, "audit": {"stop_dG_mu": 1.0323, "stop_dA_mu": 0.5983, "grow_dA_mu": 0.9702, "all_dA_mu": 0.9648}}, "sec": 6.4}

@@ -276,6 +276,10 @@ sgl-kernel/csrc/**/*_musa/
 
 # liujg
 test_sglang_liujg/result/
+python/sglang/srt/speculative/clear_tree/scratchpad/
+test_sglang_liujg/clear_tree/sim/results/*.err
+!test_sglang_liujg/clear_tree/sim/results/*.jsonl
+!test_sglang_liujg/clear_tree/sim/results/*.out
 .cursor
 
 # sgl-kernel FetchContent local mirrors (do not commit)

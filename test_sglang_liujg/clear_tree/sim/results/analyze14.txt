@@ -1,0 +1,82 @@
+== % vs the best fixed (W, K) for the scenario (hindsight over the same seeds); mean over seeds 8-10
+unseen     flat    b=1 | best fixed 8,32    54.1 | table:  +0.0% | online K:  +0.0% | replay:  -3.1% | replay uses 4,32:48%,8,32:40%,2,16:12% | explore 2.5%
+unseen     flat    b=4 | best fixed 8,32   150.1 | table:  -0.1% | online K:  +0.3% | replay:  -0.3% | replay uses 4,32:83%,8,32:17% | explore 2.9%
+unseen     flat    b=8 | best fixed 4,32   232.1 | table:  -0.4% | online K:  +0.2% | replay:  -0.6% | replay uses 4,16:92%,4,32:6%,8,32:2% | explore 3.5%
+unseen     flatlow b=1 | best fixed 8,32    46.4 | table:  +0.0% | online K:  -0.1% | replay:  -2.6% | replay uses 4,32:60%,8,32:22%,2,16:15% | explore 3.3%
+unseen     flatlow b=4 | best fixed 4,32   129.9 | table:  -0.1% | online K:  -0.3% | replay:  -0.3% | replay uses 4,32:82%,8,32:18% | explore 3.0%
+unseen     flatlow b=8 | best fixed 4,16   216.0 | table:  -0.1% | online K:  -0.3% | replay:  +0.2% | replay uses 4,16:87%,4,32:8%,8,32:5% | explore 3.2%
+unseen     midhigh b=1 | best fixed 8,32    70.6 | table:  +0.0% | online K:  -0.1% | replay:  -4.2% | replay uses 4,32:56%,8,32:22%,2,16:22% | explore 3.0%
+unseen     midhigh b=4 | best fixed 4,32   198.6 | table:  +0.1% | online K:  +0.7% | replay:  +0.9% | replay uses 4,32:96%,8,32:4% | explore 3.4%
+unseen     midhigh b=8 | best fixed 4,32   304.5 | table:  -0.8% | online K:  -0.9% | replay:  -1.1% | replay uses 2,16:60%,4,16:35%,4,32:4% | explore 3.9%
+unseen     midlow  b=1 | best fixed 8,32    45.2 | table:  +0.0% | online K:  +0.0% | replay:  -2.4% | replay uses 8,32:65%,4,32:17%,2,16:10% | explore 1.4%
+unseen     midlow  b=4 | best fixed 4,16   127.8 | table:  -1.8% | online K:  -0.6% | replay:  -1.2% | replay uses 4,32:82%,8,32:18% | explore 3.0%
+unseen     midlow  b=8 | best fixed 4,16   217.6 | table:  +0.0% | online K:  -0.1% | replay:  +0.0% | replay uses 4,16:84%,4,32:11%,8,32:5% | explore 2.3%
+verify x10 high    b=1 | best fixed 4,16    78.2 | table:  -1.3% | online K:  -0.1% | replay:  -1.3% | replay uses 2,16:91%,8,32:9% | explore 4.3%
+verify x10 high    b=4 | best fixed 2,16   216.3 | table:  -6.0% | online K:  -2.7% | replay:  -1.6% | replay uses 2,16:78%,4,32:19%,8,32:3% | explore 4.1%
+verify x10 high    b=8 | best fixed 2,16   318.4 | table:  -0.3% | online K:  -0.3% | replay:  -0.8% | replay uses 2,16:87%,4,16:7%,4,32:4% | explore 4.5%
+verify x10 mid     b=1 | best fixed 8,32    52.2 | table:  +0.0% | online K:  +0.5% | replay:  -3.9% | replay uses 4,16:44%,2,16:30%,8,32:26% | explore 3.2%
+verify x10 mid     b=4 | best fixed 4,16   136.4 | table:  -8.8% | online K:  -1.7% | replay:  -1.4% | replay uses 4,16:55%,2,8:31%,4,32:10% | explore 3.5%
+verify x10 mid     b=8 | best fixed 8,16   216.9 | table:  -1.0% | online K:  +0.4% | replay:  -0.8% | replay uses 4,16:81%,4,32:8%,2,16:7% | explore 3.4%
+draft x0.5 high    b=1 | best fixed 8,32   111.3 | table:  +0.0% | online K:  -0.1% | replay:  -3.6% | replay uses 2,16:58%,4,32:16%,2,32:16% | explore 4.0%
+draft x0.5 high    b=4 | best fixed 4,32   340.8 | table:  -0.1% | online K:  -0.1% | replay:  -0.5% | replay uses 4,32:97%,8,32:3% | explore 2.8%
+draft x0.5 high    b=8 | best fixed 4,32   527.1 | table:  -0.7% | online K:  -0.1% | replay:  -1.0% | replay uses 2,16:87%,4,16:7%,4,32:4% | explore 4.3%
+draft x0.5 mid     b=1 | best fixed 8,32    71.1 | table:  +0.0% | online K:  +0.0% | replay:  -1.5% | replay uses 4,32:54%,8,32:46% | explore 2.0%
+draft x0.5 mid     b=4 | best fixed 8,32   206.6 | table:  -0.7% | online K:  -0.4% | replay:  -0.7% | replay uses 4,32:82%,8,32:18% | explore 2.7%
+draft x0.5 mid     b=8 | best fixed 4,32   321.3 | table:  -0.9% | online K:  +0.1% | replay:  -1.2% | replay uses 4,16:95%,4,32:3%,8,32:2% | explore 3.2%
+draft x2   high    b=1 | best fixed 4,32    56.5 | table:  -1.3% | online K:  -1.2% | replay:  -1.8% | replay uses 2,16:75%,4,32:14%,8,32:9% | explore 4.0%
+draft x2   high    b=4 | best fixed 2,16   161.3 | table:  -0.1% | online K:  -0.3% | replay:  +0.4% | replay uses 2,16:81%,4,32:17%,8,32:2% | explore 3.8%
+draft x2   high    b=8 | best fixed 2,16   246.7 | table:  -0.2% | online K:  -0.2% | replay:  -0.7% | replay uses 2,16:88%,4,16:7%,4,32:3% | explore 4.2%
+draft x2   mid     b=1 | best fixed 8,32    41.8 | table:  +0.0% | online K:  +0.4% | replay:  -3.1% | replay uses 8,32:41%,4,32:24%,2,16:23% | explore 2.3%
+draft x2   mid     b=4 | best fixed 4,16   116.6 | table:  -1.5% | online K:  -0.0% | replay:  -0.1% | replay uses 4,32:83%,8,32:17% | explore 2.7%
+draft x2   mid     b=8 | best fixed 4,16   215.5 | table:  -0.0% | online K:  -0.3% | replay:  -0.0% | replay uses 4,16:88%,4,32:7%,8,32:5% | explore 3.3%
+
+  group means (min) vs best fixed (W, K):
+   unseen    : table -0.26% (-1.8); online K -0.10% (-0.9); replay -1.23% (-4.2)
+   verify x10: table -2.89% (-8.8); online K -0.62% (-2.7); replay -1.63% (-3.9)
+   draft x0.5: table -0.39% (-0.9); online K -0.10% (-0.4); replay -1.42% (-3.6)
+   draft x2  : table -0.51% (-1.5); online K -0.28% (-1.2); replay -0.90% (-3.1)
+  all 30 scenarios: table -0.86%; online K -0.24%; replay -1.28%
+  vs table (percentage points): unseen: K +0.16, replay -0.97; verify x10: K +2.27, replay +1.26; draft x0.5: K +0.30, replay -1.03; draft x2: K +0.23, replay -0.39
+
+== Narrowing audit: accepted tokens of a real tree of the narrower width vs the wide tree cut down (same depth, same K)
+   unseen    : 5782 request-rounds, differ 5.9%, mean (real - cut) +0.005 tokens, mean |diff| 0.092, relative to real accepted +0.17%
+   verify x10: 1105 request-rounds, differ 5.6%, mean (real - cut) +0.022 tokens, mean |diff| 0.094, relative to real accepted +0.54%
+   draft x0.5: 2518 request-rounds, differ 6.6%, mean (real - cut) -0.006 tokens, mean |diff| 0.135, relative to real accepted -0.16%
+   draft x2  : 1052 request-rounds, differ 4.3%, mean (real - cut) +0.006 tokens, mean |diff| 0.061, relative to real accepted +0.16%
+
+== 14b: replay with measured Draft layer times, % vs best fixed (W, K); same scenarios
+   unseen     flat    b=1: replay (measured layers)  +0.0% | replay (learned)  -3.1% | online K  +0.0% | table  +0.0%
+   unseen     flat    b=4: replay (measured layers)  -0.3% | replay (learned)  -0.3% | online K  +0.3% | table  -0.1%
+   unseen     flat    b=8: replay (measured layers)  -0.6% | replay (learned)  -0.6% | online K  +0.2% | table  -0.4%
+   unseen     flatlow b=1: replay (measured layers)  +0.0% | replay (learned)  -2.6% | online K  -0.1% | table  +0.0%
+   unseen     flatlow b=4: replay (measured layers)  -0.3% | replay (learned)  -0.3% | online K  -0.3% | table  -0.1%
+   unseen     flatlow b=8: replay (measured layers)  +0.2% | replay (learned)  +0.2% | online K  -0.3% | table  -0.1%
+   unseen     midhigh b=1: replay (measured layers)  +0.0% | replay (learned)  -4.2% | online K  -0.1% | table  +0.0%
+   unseen     midhigh b=4: replay (measured layers)  +0.9% | replay (learned)  +0.9% | online K  +0.7% | table  +0.1%
+   unseen     midhigh b=8: replay (measured layers)  -1.1% | replay (learned)  -1.1% | online K  -0.9% | table  -0.8%
+   unseen     midlow  b=1: replay (measured layers)  +0.0% | replay (learned)  -2.4% | online K  +0.0% | table  +0.0%
+   unseen     midlow  b=4: replay (measured layers)  -1.2% | replay (learned)  -1.2% | online K  -0.6% | table  -1.8%
+   unseen     midlow  b=8: replay (measured layers)  +0.0% | replay (learned)  +0.0% | online K  -0.1% | table  +0.0%
+   verify x10 high    b=1: replay (measured layers)  -1.3% | replay (learned)  -1.3% | online K  -0.1% | table  -1.3%
+   verify x10 high    b=4: replay (measured layers)  -1.6% | replay (learned)  -1.6% | online K  -2.7% | table  -6.0%
+   verify x10 high    b=8: replay (measured layers)  -0.8% | replay (learned)  -0.8% | online K  -0.3% | table  -0.3%
+   verify x10 mid     b=1: replay (measured layers)  +0.0% | replay (learned)  -3.9% | online K  +0.5% | table  +0.0%
+   verify x10 mid     b=4: replay (measured layers)  -0.9% | replay (learned)  -1.4% | online K  -1.7% | table  -8.8%
+   verify x10 mid     b=8: replay (measured layers)  -0.2% | replay (learned)  -0.8% | online K  +0.4% | table  -1.0%
+   draft x0.5 high    b=1: replay (measured layers)  -0.1% | replay (learned)  -3.6% | online K  -0.1% | table  +0.0%
+   draft x0.5 high    b=4: replay (measured layers)  -0.5% | replay (learned)  -0.5% | online K  -0.1% | table  -0.1%
+   draft x0.5 high    b=8: replay (measured layers)  -1.0% | replay (learned)  -1.0% | online K  -0.1% | table  -0.7%
+   draft x0.5 mid     b=1: replay (measured layers)  +0.0% | replay (learned)  -1.5% | online K  +0.0% | table  +0.0%
+   draft x0.5 mid     b=4: replay (measured layers)  -0.8% | replay (learned)  -0.7% | online K  -0.4% | table  -0.7%
+   draft x0.5 mid     b=8: replay (measured layers)  -1.2% | replay (learned)  -1.2% | online K  +0.1% | table  -0.9%
+   draft x2   high    b=1: replay (measured layers)  -0.4% | replay (learned)  -1.8% | online K  -1.2% | table  -1.3%
+   draft x2   high    b=4: replay (measured layers)  -0.1% | replay (learned)  +0.4% | online K  -0.3% | table  -0.1%
+   draft x2   high    b=8: replay (measured layers)  -0.7% | replay (learned)  -0.7% | online K  -0.2% | table  -0.2%
+   draft x2   mid     b=1: replay (measured layers)  +0.0% | replay (learned)  -3.1% | online K  +0.4% | table  +0.0%
+   draft x2   mid     b=4: replay (measured layers)  -0.1% | replay (learned)  -0.1% | online K  -0.0% | table  -1.5%
+   draft x2   mid     b=8: replay (measured layers)  -0.0% | replay (learned)  -0.0% | online K  -0.3% | table  -0.0%
+   unseen    : replay (measured layers) mean -0.20% (min -1.2); learned -1.23%; online K -0.10%; table -0.26%
+   verify x10: replay (measured layers) mean -0.81% (min -1.6); learned -1.63%; online K -0.62%; table -2.89%
+   draft x0.5: replay (measured layers) mean -0.60% (min -1.2); learned -1.42%; online K -0.10%; table -0.39%
+   draft x2  : replay (measured layers) mean -0.21% (min -0.7); learned -0.90%; online K -0.28%; table -0.51%
+   all 30 scenarios: replay (measured layers) -0.41%

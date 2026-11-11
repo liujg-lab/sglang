@@ -1,0 +1,93 @@
+== S1 cross-K stopping. % vs v10 (mean over seeds 8-10). diag (v10 runs, per rule-driven stop):
+   cross(g) = a two-layer option with the g forecast is positive while no one-layer option is;
+   lag1(true) = the true next layer pays; cross(true) = only two true layers pay; value = sum of those
+   positive values (tokens, calibrated Draft mass) / committed tokens
+step       flat b=1 | v10   51.0 | opt2  +0.0% | true1  +0.6% | true2  +0.3% | stops 2471: cross(g)  0.1% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.00%, true 0.00% | two-layer-only decisions per round: opt2 0.1%, true2 0.7%
+step       flat b=4 | v10  141.6 | opt2  +0.4% | true1  +2.0% | true2  +1.3% | stops 1527: cross(g)  4.1% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.04%, true 0.00% | two-layer-only decisions per round: opt2 2.5%, true2 0.7%
+step       flat b=8 | v10  220.6 | opt2  -0.5% | true1  +2.4% | true2  +1.4% | stops 1056: cross(g) 12.1% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.12%, true 0.00% | two-layer-only decisions per round: opt2 8.9%, true2 0.4%
+step       high b=1 | v10   79.4 | opt2  -0.3% | true1  -1.4% | true2  -1.2% | stops  384: cross(g)  4.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.8% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.0%, true2 7.3%
+step       high b=4 | v10  235.5 | opt2  +0.2% | true1  -1.3% | true2  +0.1% | stops   88: cross(g) 12.5% (other K 100%), lag1(true)  0.0%, cross(true)  1.1% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.5%, true2 3.7%
+step       high b=8 | v10  358.1 | opt2  +0.4% | true1  +0.9% | true2  +0.6% | stops  240: cross(g)  8.3% (other K 100%), lag1(true)  0.0%, cross(true)  1.7% | value g 0.02%, true 0.00% | two-layer-only decisions per round: opt2 2.7%, true2 1.3%
+step       mid  b=1 | v10   54.0 | opt2  -0.2% | true1  +0.5% | true2  +0.1% | stops 2094: cross(g)  1.2% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 0.8%, true2 3.6%
+step       mid  b=4 | v10  150.2 | opt2  +0.2% | true1  +1.4% | true2  +2.2% | stops 1249: cross(g)  7.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.1% | value g 0.06%, true 0.00% | two-layer-only decisions per round: opt2 7.0%, true2 1.6%
+step       mid  b=8 | v10  229.7 | opt2  -0.5% | true1  +1.5% | true2  +1.9% | stops 1119: cross(g) 13.8% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.08%, true 0.00% | two-layer-only decisions per round: opt2 8.3%, true2 0.1%
+step large flat b=1 | v10   46.7 | opt2  -0.4% | true1  +0.6% | true2  +0.7% | stops 2539: cross(g) 12.0% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.23%, true 0.00% | two-layer-only decisions per round: opt2 10.5%, true2 4.1%
+step large flat b=4 | v10  139.1 | opt2  -0.0% | true1  +2.4% | true2  +2.4% | stops 1858: cross(g)  3.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.06%, true 0.00% | two-layer-only decisions per round: opt2 5.2%, true2 0.2%
+step large flat b=8 | v10  221.0 | opt2  -0.5% | true1  +1.6% | true2  +1.6% | stops 1243: cross(g)  1.3% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.02%, true 0.00% | two-layer-only decisions per round: opt2 2.1%, true2 0.0%
+step large high b=1 | v10   72.6 | opt2  +0.5% | true1  +2.2% | true2  +2.7% | stops  545: cross(g) 27.9% (other K 100%), lag1(true)  0.0%, cross(true)  8.3% | value g 0.20%, true 0.04% | two-layer-only decisions per round: opt2 10.5%, true2 4.5%
+step large high b=4 | v10  217.1 | opt2  -0.1% | true1  +0.9% | true2  +1.2% | stops  294: cross(g) 12.2% (other K 100%), lag1(true)  0.0%, cross(true)  3.7% | value g 0.07%, true 0.01% | two-layer-only decisions per round: opt2 4.7%, true2 1.9%
+step large high b=8 | v10  341.1 | opt2  -0.5% | true1  +4.2% | true2  +4.2% | stops  258: cross(g)  0.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.4% | value g 0.00%, true 0.00% | two-layer-only decisions per round: opt2 0.4%, true2 0.2%
+step large mid  b=1 | v10   49.4 | opt2  -0.1% | true1  +2.7% | true2  +2.1% | stops 2291: cross(g) 17.8% (other K 100%), lag1(true)  0.0%, cross(true)  0.3% | value g 0.34%, true 0.00% | two-layer-only decisions per round: opt2 16.9%, true2 6.0%
+step large mid  b=4 | v10  147.1 | opt2  -0.6% | true1  +2.2% | true2  +2.3% | stops 1577: cross(g)  5.6% (other K 100%), lag1(true)  0.0%, cross(true)  0.2% | value g 0.08%, true 0.00% | two-layer-only decisions per round: opt2 6.4%, true2 0.5%
+step large mid  b=8 | v10  226.6 | opt2  -0.1% | true1  +1.8% | true2  +2.1% | stops 1255: cross(g)  1.1% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.3%, true2 0.0%
+verify x10 flat b=1 | v10   49.5 | opt2  -0.1% | true1  +0.4% | true2  +0.4% | stops 2466: cross(g)  1.8% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.2%, true2 0.8%
+verify x10 flat b=4 | v10  128.7 | opt2  +0.2% | true1  +1.5% | true2  +1.4% | stops 1600: cross(g)  3.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.04%, true 0.00% | two-layer-only decisions per round: opt2 3.1%, true2 0.2%
+verify x10 flat b=8 | v10  216.8 | opt2  -0.1% | true1  -0.5% | true2  -0.9% | stops   83: cross(g) 12.0% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.10%, true 0.00% | two-layer-only decisions per round: opt2 6.0%, true2 0.4%
+verify x10 high b=1 | v10   78.4 | opt2  -0.3% | true1  -0.9% | true2  -0.7% | stops  373: cross(g)  5.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.5%, true2 3.3%
+verify x10 high b=4 | v10  210.8 | opt2  +0.3% | true1  -0.2% | true2  -0.2% | stops  184: cross(g)  8.2% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.01%, true 0.00% | two-layer-only decisions per round: opt2 1.8%, true2 2.2%
+verify x10 high b=8 | v10  314.8 | opt2  +0.6% | true1  +2.1% | true2  +2.0% | stops  169: cross(g)  1.8% (other K 100%), lag1(true)  0.0%, cross(true)  0.6% | value g 0.00%, true 0.00% | two-layer-only decisions per round: opt2 0.6%, true2 0.0%
+verify x10 mid  b=1 | v10   52.2 | opt2  +0.2% | true1  +1.2% | true2  +0.8% | stops 2113: cross(g)  4.4% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.03%, true 0.00% | two-layer-only decisions per round: opt2 3.1%, true2 1.5%
+verify x10 mid  b=4 | v10  137.7 | opt2  -0.5% | true1  +0.8% | true2  +0.8% | stops 1339: cross(g)  6.3% (other K 100%), lag1(true)  0.0%, cross(true)  0.1% | value g 0.05%, true 0.00% | two-layer-only decisions per round: opt2 4.6%, true2 1.0%
+verify x10 mid  b=8 | v10  217.3 | opt2  +0.0% | true1  +0.1% | true2  +0.2% | stops  148: cross(g) 14.2% (other K 100%), lag1(true)  0.0%, cross(true)  0.0% | value g 0.13%, true 0.00% | two-layer-only decisions per round: opt2 3.9%, true2 0.0%
+  group means (min, max):
+   step      : opt2 -0.03% (-0.5, +0.4); true1 +0.74% (-1.4, +2.4); true2 +0.76% (-1.2, +2.2); stops: cross(g) 7.1%, cross(true) 0.4%, lag1(true) 0.0%; value g 0.04%, true 0.00% of tokens
+   step large: opt2 -0.21% (-0.6, +0.5); true1 +2.04% (+0.6, +4.2); true2 +2.14% (+0.7, +4.2); stops: cross(g) 9.1%, cross(true) 1.4%, lag1(true) 0.0%; value g 0.11%, true 0.01% of tokens
+   verify x10: opt2 +0.04% (-0.5, +0.6); true1 +0.49% (-0.9, +2.1); true2 +0.42% (-0.9, +2.0); stops: cross(g) 6.4%, cross(true) 0.1%, lag1(true) 0.0%; value g 0.04%, true 0.00% of tokens
+
+== S2 cross-K marginal calibration. Rates: mean over seeds; vs r13 best fixed (W, K) where available
+   f(band) = sum actual band acceptance / sum c_i * band mass (same-tree replay, rounds after warm-up, pooled seeds);
+   replay columns on v10 runs: chosen K vs K re-chosen with hindsight f (same rounds, same trees), share of rounds changed;
+   best fixed K on the same trees; per-round oracle K (knows each round's actual tokens) as an upper bound
+low  verify x1    b=1 | v10   34.5 | +f_band  +0.8% | vs best fixed 8,32: v10  +0.1%, +f_band  +0.8% (r13: table +0.0%, online K +0.1%) | f8=1.08 f16=0.88 f32=0.79 | replay: re-chosen with f +0.00% (0% rounds), best fixed K=32 -0.04%, per-round oracle +0.65% | K use v10 8:1%,16:6%,32:93%; +f_band 8:1%,16:6%,32:93%
+low  verify x1    b=4 | v10  109.5 | +f_band  +0.9% | vs best fixed 2,16: v10  -2.0%, +f_band  -1.1% (r13: table -0.7%, online K -1.8%) | f8=1.04 f16=0.80 f32=0.79 | replay: re-chosen with f +0.01% (4% rounds), best fixed K=16 -0.19%, per-round oracle +0.76% | K use v10 8:3%,16:74%,32:23%; +f_band 8:3%,16:75%,32:22%
+low  verify x1    b=8 | v10  214.4 | +f_band  +0.0% | vs best fixed 4,32: v10  -0.2%, +f_band  -0.1% (r13: table -0.1%, online K +0.1%) | f8=1.05 f16=0.71 f32=1.07 | replay: re-chosen with f +0.02% (4% rounds), best fixed K=16 -0.16%, per-round oracle +0.67% | K use v10 8:12%,16:84%,32:4%; +f_band 8:11%,16:83%,32:7%
+mid  verify x1    b=1 | v10   57.0 | +f_band  -0.2% | vs best fixed 8,32: v10  +0.2%, +f_band  -0.1% (r13: table +0.0%, online K +0.1%) | f8=1.00 f16=1.02 f32=1.03 | replay: re-chosen with f +0.00% (0% rounds), best fixed K=32 -0.01%, per-round oracle +0.46% | K use v10 8:1%,16:1%,32:98%; +f_band 8:1%,16:1%,32:98%
+mid  verify x1    b=4 | v10  159.6 | +f_band  -0.5% | vs best fixed 4,32: v10  +0.6%, +f_band  +0.0% (r13: table +0.0%, online K +0.6%) | f8=0.99 f16=1.06 f32=1.11 | replay: re-chosen with f -0.02% (3% rounds), best fixed K=32 -0.37%, per-round oracle +0.81% | K use v10 8:0%,16:35%,32:65%; +f_band 8:0%,16:33%,32:67%
+mid  verify x1    b=8 | v10  246.4 | +f_band  -0.4% | vs best fixed 4,16: v10  +0.3%, +f_band  -0.1% (r13: table +0.1%, online K +0.3%) | f8=0.99 f16=1.07 f32=1.15 | replay: re-chosen with f +0.04% (6% rounds), best fixed K=32 -0.76%, per-round oracle +0.74% | K use v10 8:0%,16:67%,32:32%; +f_band 8:0%,16:57%,32:43%
+high verify x1    b=1 | v10   83.2 | +f_band  -0.2% | vs best fixed 4,32: v10  -0.8%, +f_band  -0.9% (r13: table -0.8%, online K -0.8%) | f8=0.98 f16=1.12 f32=1.15 | replay: re-chosen with f -0.01% (1% rounds), best fixed K=32 -0.01%, per-round oracle +0.37% | K use v10 8:2%,16:16%,32:82%; +f_band 8:2%,16:15%,32:83%
+high verify x1    b=4 | v10  246.6 | +f_band  -0.2% | vs best fixed 4,32: v10  -0.3%, +f_band  -0.5% (r13: table -0.1%, online K -0.0%) | f8=0.96 f16=1.14 f32=1.27 | replay: re-chosen with f +0.02% (2% rounds), best fixed K=32 -0.02%, per-round oracle +0.63% | K use v10 8:0%,16:8%,32:91%; +f_band 8:1%,16:4%,32:95%
+high verify x1    b=8 | v10  379.8 | +f_band  -0.5% | vs best fixed 2,16: v10  +0.8%, +f_band  +0.3% (r13: table -0.3%, online K +0.2%) | f8=0.97 f16=1.21 f32=1.24 | replay: re-chosen with f +0.00% (1% rounds), best fixed K=16 -0.24%, per-round oracle +0.17% | K use v10 8:2%,16:90%,32:8%; +f_band 8:1%,16:90%,32:9%
+low  verify x10   b=1 | v10   31.7 | +f_band  +2.4% | vs best fixed 8,16: v10  -3.3%, +f_band  -0.9% (r13: table -3.2%, online K -5.2%) | f8=1.07 f16=0.90 f32=0.72 | replay: re-chosen with f +0.06% (9% rounds), best fixed K=32 -1.37%, per-round oracle +5.15% | K use v10 8:1%,16:43%,32:56%; +f_band 8:2%,16:68%,32:30%
+low  verify x10   b=4 | v10  112.6 | +f_band  -0.1% | vs best fixed 8,16: v10  -0.0%, +f_band  -0.2% (r13: table -1.7%, online K -0.0%) | f8=1.02 f16=0.83 f32=0.87 | replay: re-chosen with f +0.04% (6% rounds), best fixed K=8 -0.92%, per-round oracle +3.05% | K use v10 8:44%,16:41%,32:15%; +f_band 8:62%,16:28%,32:10%
+low  verify x10   b=8 | v10  213.1 | +f_band  +0.0% | vs best fixed 8,16: v10  +0.3%, +f_band  +0.3% (r13: table -0.6%, online K -0.0%) | f8=1.02 f16=0.88 f32=0.92 | replay: re-chosen with f +0.17% (5% rounds), best fixed K=8 +0.26%, per-round oracle +1.33% | K use v10 8:68%,16:32%,32:1%; +f_band 8:70%,16:29%,32:2%
+mid  verify x10   b=1 | v10   52.2 | +f_band  -0.3% | vs best fixed 8,32: v10  +0.0%, +f_band  -0.3% (r13: table +0.0%, online K +0.5%) | f8=0.99 f16=1.03 f32=1.05 | replay: re-chosen with f -0.00% (1% rounds), best fixed K=32 -0.31%, per-round oracle +4.09% | K use v10 8:1%,16:16%,32:83%; +f_band 8:1%,16:12%,32:87%
+mid  verify x10   b=4 | v10  137.7 | +f_band  -0.2% | vs best fixed 4,16: v10  +1.0%, +f_band  +0.8% (r13: table -8.8%, online K -1.7%) | f8=0.99 f16=1.08 f32=1.07 | replay: re-chosen with f -0.03% (1% rounds), best fixed K=16 -0.33%, per-round oracle +2.15% | K use v10 8:19%,16:77%,32:5%; +f_band 8:20%,16:74%,32:6%
+mid  verify x10   b=8 | v10  217.3 | +f_band  +0.3% | vs best fixed 8,16: v10  +0.2%, +f_band  +0.5% (r13: table -1.0%, online K +0.4%) | f8=1.01 f16=1.00 f32=1.17 | replay: re-chosen with f +0.00% (5% rounds), best fixed K=16 -2.18%, per-round oracle +1.32% | K use v10 8:57%,16:42%,32:1%; +f_band 8:36%,16:61%,32:3%
+high verify x10   b=1 | v10   78.4 | +f_band  -0.2% | vs best fixed 4,16: v10  +0.2%, +f_band  +0.0% (r13: table -1.3%, online K -0.1%) | f8=0.97 f16=1.15 f32=1.04 | replay: re-chosen with f +0.00% (1% rounds), best fixed K=32 -1.36%, per-round oracle +2.30% | K use v10 8:3%,16:44%,32:53%; +f_band 8:3%,16:37%,32:60%
+high verify x10   b=4 | v10  210.8 | +f_band  -0.4% | vs best fixed 2,16: v10  -2.6%, +f_band  -3.0% (r13: table -6.0%, online K -2.7%) | f8=0.98 f16=1.14 f32=1.19 | replay: re-chosen with f -0.04% (2% rounds), best fixed K=16 -0.04%, per-round oracle +1.90% | K use v10 8:8%,16:87%,32:5%; +f_band 8:6%,16:85%,32:9%
+high verify x10   b=8 | v10  314.8 | +f_band  +0.5% | vs best fixed 2,16: v10  -1.1%, +f_band  -0.6% (r13: table -0.3%, online K -0.3%) | f8=0.98 f16=1.20 f32=1.37 | replay: re-chosen with f +0.25% (14% rounds), best fixed K=16 -0.61%, per-round oracle +0.90% | K use v10 8:34%,16:65%,32:2%; +f_band 8:22%,16:77%,32:2%
+  mean vs best fixed (W, K): v10 -0.37%, +f_band -0.28%; verify x10 only: v10 -0.59%, +f_band -0.36%
+  pooled f(band) = actual / predicted marginal (v10 runs):
+   band ..8: all 0.99; b1 1.01; b4 0.98; b8 0.98; d4-6 1.02; d<=3 1.03; d>=7 0.97; early 0.98; high 0.97; late 0.99; low 1.06; mid 0.99; x1 0.99; x10 0.99
+   band ..16: all 1.10; b1 1.03; b4 1.09; b8 1.15; d4-6 1.03; d<=3 0.93; d>=7 1.15; early 1.13; high 1.17; late 1.10; low 0.86; mid 1.06; x1 1.10; x10 1.12
+   band ..32: all 1.08; b1 0.97; b4 1.17; b8 1.19; d4-6 1.01; d<=3 0.76; d>=7 1.14; early 1.08; high 1.20; late 1.08; low 0.76; mid 1.08; x1 1.10; x10 1.05
+
+== S3 the unused K = 32 becomes cheaper (penalty 15 + 2 b ms removed from spec round 150 on). Rates mean over seeds
+cheap32  high b=1 | oracle table   82.4 | stale table -3.89% [b0 p0 t0] | v2 -3.89% [b0 p0 t0] | v2 + probe 1% -3.20% [b3 p42 t3 c32 -17] | v2 + probe 3% -2.69% [b3 p113 t3 c32 -17] | v2 + near-tie -3.72% [b0 p102 t0] | K=32 share: oracle 76%, stale 1%, probe3% 32%
+cheap32  high b=4 | oracle table  249.0 | stale table -3.18% [b0 p0 t0] | v2 -3.18% [b0 p0 t0] | v2 + probe 1% -3.40% [b0 p18 t0] | v2 + probe 3% -3.25% [b0 p53 t0] | v2 + near-tie -3.02% [b0 p7 t0] | K=32 share: oracle 74%, stale 1%, probe3% 2%
+cheap32  high b=8 | oracle table  386.3 | stale table -0.06% [b0 p0 t0] | v2 -0.06% [b0 p0 t0] | v2 + probe 1% -0.09% [b0 p18 t0] | v2 + probe 3% -0.41% [b0 p52 t0] | v2 + near-tie -0.07% [b0 p63 t0] | K=32 share: oracle 2%, stale 0%, probe3% 1%
+cheap32  mid  b=1 | oracle table   57.3 | stale table -5.61% [b0 p0 t0] | v2 -5.61% [b0 p0 t0] | v2 + probe 1% -2.45% [b3 p65 t3 c32 -17] | v2 + probe 3% -2.50% [b3 p180 t3 c32 -17] | v2 + near-tie -5.34% [b0 p123 t0] | K=32 share: oracle 92%, stale 1%, probe3% 58%
+cheap32  mid  b=4 | oracle table  161.2 | stale table -0.72% [b0 p0 t0] | v2 -0.72% [b0 p0 t0] | v2 + probe 1% -0.85% [b3 p39 t3 c32 -23] | v2 + probe 3% -1.03% [b3 p105 t3 c32 -23] | v2 + near-tie -0.88% [b0 p5 t0] | K=32 share: oracle 54%, stale 1%, probe3% 17%
+cheap32  mid  b=8 | oracle table  250.9 | stale table -0.10% [b0 p0 t0] | v2 -0.10% [b0 p0 t0] | v2 + probe 1% -0.39% [b3 p39 t3 c32 -30] | v2 + probe 3% -0.39% [b3 p106 t3 c32 -30] | v2 + near-tie -0.10% [b0 p0 t0] | K=32 share: oracle 26%, stale 0%, probe3% 15%
+nochange high b=1 | stale table   79.1 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.00% [b0 p42 t0] | v2 + probe 3% -0.13% [b0 p118 t0] | v2 + near-tie +0.30% [b0 p102 t0]
+nochange high b=4 | stale table  241.1 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.40% [b0 p18 t0] | v2 + probe 3% -0.16% [b0 p53 t0] | v2 + near-tie +0.16% [b0 p7 t0]
+nochange high b=8 | stale table  386.1 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.18% [b0 p18 t0] | v2 + probe 3% -0.38% [b0 p51 t0] | v2 + near-tie -0.01% [b0 p63 t0]
+nochange mid  b=1 | stale table   54.1 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.19% [b0 p72 t0] | v2 + probe 3% -0.66% [b0 p196 t0] | v2 + near-tie +0.13% [b0 p115 t0]
+nochange mid  b=4 | stale table  160.0 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.38% [b0 p42 t0] | v2 + probe 3% -0.70% [b0 p111 t0] | v2 + near-tie -0.15% [b0 p5 t0]
+nochange mid  b=8 | stale table  250.6 | v2 +0.00% [b0 p0 t0] | v2 + probe 1% -0.13% [b0 p41 t0] | v2 + probe 3% -0.39% [b0 p111 t0] | v2 + near-tie +0.00% [b0 p0 t0]
+  group means (min) vs the reference (cheap32: oracle table; nochange: stale table = right table):
+   cheap32 : stale table -2.26% (-5.61); v2 -2.26% (-5.61); v2 + probe 1% -1.73% (-3.40); v2 + probe 3% -1.71% (-3.25); v2 + near-tie -2.19% (-5.34)
+   nochange: v2 +0.00% (+0.00); v2 + probe 1% -0.21% (-0.40); v2 + probe 3% -0.40% (-0.70); v2 + near-tie +0.07% (-0.15)
+   recovered by v2 (cells where stale loses > 0.3%): 0% over 4 cells
+   recovered by v2 + probe 1% (cells where stale loses > 0.3%): 12% over 4 cells
+   recovered by v2 + probe 3% (cells where stale loses > 0.3%): 11% over 4 cells
+   recovered by v2 + near-tie (cells where stale loses > 0.3%): -2% over 4 cells
+
+== Round 16 B2 rerun with the n0 fix (drift v2 no longer overwrites the Theta prior weight); % vs the oracle table
+   high b=1 | stale -0.31% | v2 fixed -0.40% (old -0.44%) | bursts 3
+   high b=4 | stale -1.90% | v2 fixed -1.18% (old -1.18%) | bursts 3
+   high b=8 | stale -0.13% | v2 fixed -0.88% (old -0.84%) | bursts 3
+   mid  b=1 | stale +0.20% | v2 fixed -0.20% (old -0.20%) | bursts 3
+   mid  b=4 | stale -4.46% | v2 fixed -0.89% (old -0.60%) | bursts 3
+   mid  b=8 | stale -1.58% | v2 fixed -1.44% (old -1.05%) | bursts 2
+  mean: stale -1.36%, v2 fixed -0.83% (old -0.72%); recovered (stale loses > 0.5%) fixed 42% (old 53%); cells where stale loses <= 0.5%: v2 vs stale -0.09%, -0.75%, -0.40%

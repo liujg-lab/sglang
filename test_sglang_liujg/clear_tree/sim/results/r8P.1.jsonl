@@ -1,0 +1,4 @@
+{"part": "P", "kind": "mid", "b": 8, "res": {"ClearTree core W=4": 233.33809171404178, "ClearTree core W=8": 225.4348663773487}, "sec": 39.3}
+{"part": "P", "kind": "low", "b": 4, "res": {"ClearTree core W=4": 104.36555719021773, "ClearTree core W=8": 103.1311154566509}, "sec": 23.2}
+{"part": "P", "kind": "high", "b": 4, "res": {"ClearTree core W=4": 228.82803202540572, "ClearTree core W=8": 210.38624229421126}, "sec": 20.2}
+{"part": "P", "kind": "mid", "b": 1, "res": {"ClearTree core W=4": 53.73175801705288, "ClearTree core W=8": 56.13458441678514}, "sec": 16.5}
