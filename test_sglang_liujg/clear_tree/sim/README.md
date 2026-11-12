@@ -1,5 +1,7 @@
 # ClearTree 合成模拟器
 
+> **D64（2026-11-12）：** 每层候选人数改成 1 到 |𝒜| 全部枚举（`ext14.ALL_M = True`，默认）。第 28 轮及以前都用旧规则（只取 |𝒜| 和更小的图档）；要复现这些结果，运行前设 `ext14.ALL_M = False`。
+
 端到端的合成模拟，用来回答"ClearTree 的控制逻辑在原理上是否可行"：收益从哪里来、哪些模块有用、规划器要多快。**不是实测**，接受模型、快照分布和成本大多按方案自己的假设生成，结论只作为实测之前的先验。结果的汇总见 `python/sglang/srt/speculative/clear_tree/progress/results.md` 第 7 节。
 
 ## 模拟的世界
@@ -42,6 +44,19 @@
 | `diag15.py` | 第十五批探查：用配对回放比较逐层宽度表和固定宽度 |
 | `ext13.py`、`run16.py`、`analyze16.py` | 第十六批（审稿意见 15）：选 K 的三种方式（逐档早停、全档枚举、生长和验证同一口径），验证耗时按图档跳变的世界；运行中验证成本突变，两版漂移检测（`BatchAccount6`、`BatchAccount6L`）。`BatchAccount6L` 原来用 `self.n0` 存学基线的轮数，覆盖了 Θ 跨 b 先验的权重；第十七批改名为 `n_off`，B2 用 `r16B2fix` 重跑 |
 | `ext14.py`、`run17.py`、`analyze17.py` | 第十七批（审稿意见 16）：S1 跨 K 停止（两层乐观前瞻、真值一层和两层前瞻、跨 K 停止诊断）；S2 跨 K 的边际校准（同树回放的按档位段偏差、f_band）；S3 没在用的 K=32 变便宜（第二版漂移检测、随机交错短测量、低频探测、近似平局探测）（`BatchAccount7`、`BatchAccount7L`） |
+| `ext15.py`、`run18.py`、`analyze18.py` | 第十八批：在线更新层宽 W（`BatchAccount8`）。现行第十版规则加实测成本；查表、固定 W、第 14 轮回放控制器移植版、按实测成本给存下的树重新打分（只 1% 探索；部署启动当作事件；探索到最宽或宽一档；有无真实配对确认；探索记录单独保留），世界是表定错（行贵、行便宜）和运行中行成本变化；L、L2 是 10 倍长运行（`analyze18L.py`） |
+| `ext24.py`、`run30.py`、`analyze30.py` | 第三十批（conda，D64 规则，基线是第 29 轮的 G1）：成本事件按来源区分（`src`）、切窄后复核（`recheck`）、收紧下一层增益（`tight`），各自单独加在基线上（`BatchAccount17`）；新世界：每个验证 token 的成本 ×5（`add_vchg`）、K ≥ 16 时验证耗时有台阶（`add_step`）。只跑改动可能起作用的组，跳过的组构造上和基线相同。30b（E 部分，`r30e`）：K 检查每个 K 4 轮、容差用检查自身的方差（`chk_n=4`，D68 采用）；D 部分（`src_pre`、`chk_z`）只做了试跑，没有正式跑 |
+| `ext23.py`、`run29.py`、`analyze29.py` | 第二十九批（conda，D64 规则）：回放控制器的三个护栏（`BatchAccount16`：G1 成本事件冷却和探测轮上限、G3 探测轮不更新 Θ_b、G4 探测轮打散和开关空档后不探测），并补上验证耗时的漂移检测；新世界：D42 投机开关（Target-only 按比例缩放）、RTT 跳变和来回切换（`add_rtt`）；静态部分重跑时只比 v11 和 G1（`run29.py <proc> S`） |
+| `run28.py`、`analyze28.py` | 第二十八批（conda）：回放控制器加在线成本的两个修正：成本事件时清零累计量、低频持续计时探测（`ext22` 加了 `reset_on_event`、`cprobe_period`），在第 26 轮和第 27 轮 B 部分的 15 个世界上 |
+| `run27.py`、`analyze27.py` | 第二十七批（conda）：回放控制器加在线成本时推迟第一次判定（100 / 300 轮，清零或保留）；中接受率 b=8 运行中层成本 ×0.3 / ×3 / ×10，对比理想切换（`ext22` 加了 `first_delay`、`delay_reset`） |
+| `ext22.py`、`run26.py`、`analyze26.py` | 第二十六批（conda）：第十一版的回放控制器加 D61 的在线成本模型（`BatchAccount15`；回放耗时用"实测 − 模型 + 候选模型"），对比成本已知的回放控制器和平表；第 25 轮的 9 个世界加 3 个运行中成本变化的世界 |
+| `ext21.py`、`run25.py`、`analyze25.py` | 第二十五批（conda）：快速收敛版在线调 W（并集探测轮、粗筛、窄一档免费回放减偏差、宽一档探测、小 ε 置信序列，`BatchAccount14`）对比回放控制器；第 23 轮的世界加高接受率，短运行两个种子、长运行一个种子 |
+| `diag24.py`、`analyze24.py` | 第二十四批（conda）：诊断回放是否低估更窄的宽度。固定建树宽度，同一轮另外真长窄树（沿用宽树日程、按自己规则但限深、不限深），把回放偏差拆成截窄近似、退出/停止和深度截断；ext20 和 ext15 两种设定（`Diag22`、`Diag18`） |
+| `ext20.py`、`run23.py`、`analyze23.py` | 第二十三批（conda）：由成本模型推 W 的阈值（跨 b 共用的价值曲线 ΔA(h) + 模型成本差，`BatchAccount13`），对比按格校准、回放控制器、平表和固定 W；世界含接受率分阶段变化和 b 变化 |
+| `ext19.py`、`run22.py`、`analyze22.py` | 第二十二批（conda）：整 batch 统一分配验证预算（每个请求自己的 K_i，变长验证，按总 token 档计成本）对比每轮统一 K（`World22`、`BatchAccount12`） |
+| `ext18.py`、`run21.py`、`analyze21.py` | 第二十一批（conda）：成本模型加前缀长度项（层耗时 a(图档, W) + κ_W·Σℓ，验证耗时 a(b, K) + κ_t(K)·Σℓ），在线回归对比不管前缀的 EMA 和已知真实成本（`World21`、`BatchAccount11`） |
+| `ext17.py`、`run20.py`、`analyze20.py` | 第二十批（conda sglang 环境）：起点用平表，成本从零在线学（计时探测、EMA、层耗时偏离触发重测，`BatchAccount10`），和成本已知对比 |
+| `pairvar19.py`、`ext16.py`、`run19.py`、`analyze19.py` | 第十九批：W 比较的配对和不配对方差；事件触发的 W 校准方法在同一预算下的对比（`BatchAccount9`：固定 30 轮、IPW 加分组序贯、配对回放加置信序列、多臂竞赛） |
 | `diag4.py`、`diag4b.py` | 诊断：请求数 ×4 的长时间运行；起步方式和探测日志；不带开关逐轮记录，比较 20 轮和 200 轮窗口 |
 | `analyze4.py`、`analyze5.py`、`analyze6.py` | 汇总第四、五、六批，和第三批配对比较 |
 
@@ -85,7 +100,26 @@ for p in 0 1; do python3 run14.py $p > results/r14.$p.jsonl; python3 run14b.py $
 python3 diag15.py
 for p in 0 1; do python3 run16.py A $p > results/r16A.$p.jsonl; python3 run16.py B $p > results/r16B.$p.jsonl; python3 run16.py B2 $p > results/r16B2.$p.jsonl; done
 for p in 0 1; do python3 run17.py S2 $p > results/r17S2.$p.jsonl; python3 run16.py B2 $p > results/r16B2fix.$p.jsonl; python3 run17.py S1 $p > results/r17S1.$p.jsonl; python3 run17.py S3 $p > results/r17S3.$p.jsonl; done
-python3 analyze4.py; python3 analyze5.py; python3 analyze6.py; python3 analyze7.py; python3 analyze8.py; python3 analyze9.py; python3 analyze10.py; python3 analyze11.py; python3 analyze12.py; python3 analyze13.py; python3 analyze14.py; python3 analyze16.py; python3 analyze17.py   # 读 results/
+for p in 0 1; do python3 run18.py A $p > results/r18A.$p.jsonl; done
+for p in 0 1; do python3 run18.py O $p > results/r18O.$p.jsonl; python3 run18.py B $p > results/r18B.$p.jsonl; done   # O 读 r18A
+for p in 0 1; do python3 run18.py L $p > results/r18L.$p.jsonl; python3 run18.py L2 $p > results/r18L2.$p.jsonl; done   # 10 倍长运行
+(python3 pairvar19.py base mid 4; python3 pairvar19.py "tok x0.3" mid 4; python3 pairvar19.py base high 8) > results/pairvar19.txt
+for p in 0 1; do python3 run19.py $p > results/r19.$p.jsonl; done
+for p in 0 1; do python3 run19.py $p B > results/r19B.$p.jsonl; python3 run19.py $p L > results/r19L.$p.jsonl; done   # 19b 修正版，短运行和 10 倍长运行
+# 第二十批起在 conda 环境里跑：source <conda>/etc/profile.d/conda.sh && conda activate sglang
+for p in 0 1; do python run20.py $p > results/r20.$p.jsonl; done; python analyze20.py
+for p in 0 1; do python run21.py $p > results/r21.$p.jsonl; done; python analyze21.py
+for p in 0 1; do python run22.py $p > results/r22.$p.jsonl; done; python analyze22.py
+for p in 0 1; do python run23.py $p > results/r23.$p.jsonl; done; python analyze23.py
+for p in 0 1; do python diag24.py $p > results/r24.$p.jsonl; done; python analyze24.py
+for p in 0 1; do python run25.py $p > results/r25.$p.jsonl; done; python analyze25.py
+for p in 0 1; do python run26.py $p > results/r26.$p.jsonl; done; python analyze26.py
+for p in 0 1; do python run27.py $p > results/r27.$p.jsonl; done; python analyze27.py
+for p in 0 1; do python run28.py $p > results/r28.$p.jsonl; done; python analyze28.py   # 第 28 轮及以前要设 ext14.ALL_M = False 才能复现
+for p in 0 1; do python run29.py $p > results/r29.$p.jsonl; done                       # W、R 两部分（S 部分用下一行）
+for p in 0 1; do python run29.py $p S > results/r29s.$p.jsonl; done; python analyze29.py
+for p in 0 1; do for x in A B C E F; do python run30.py $p $x > results/r30${x,,}.$p.jsonl; done; done; python analyze30.py   # 要先有 r29、r29s；E 要先有 r30a
+python3 analyze4.py; python3 analyze5.py; python3 analyze6.py; python3 analyze7.py; python3 analyze8.py; python3 analyze9.py; python3 analyze10.py; python3 analyze11.py; python3 analyze12.py; python3 analyze13.py; python3 analyze14.py; python3 analyze16.py; python3 analyze17.py; python3 analyze18.py; python3 analyze18L.py; python3 analyze19.py   # 读 results/
 python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 ```
 
@@ -123,6 +157,21 @@ python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 | `d15_schedules.json` | 第十五批：各场景下每种宽度表和 K 的回放吞吐 |
 | `r16A.*.jsonl`、`r16B.*.jsonl`、`r16B2.*.jsonl`、`analyze16.txt` | 第十六批：三种选 K 方式；漂移检测两版（`r16B2` 带 n0 覆盖的 bug，以 `r16B2fix` 为准） |
 | `r17S1.*.jsonl`、`r17S2.*.jsonl`、`r17S3.*.jsonl`、`r16B2fix.*.jsonl`、`analyze17.txt` | 第十七批：跨 K 停止；跨 K 边际校准；没在用的 K 变便宜；第十六批 B2 的修正重跑 |
+| `r18A.*.jsonl`、`r18B.*.jsonl`、`r18O.*.jsonl`、`analyze18.txt` | 第十八批：在线更新 W 的各种做法（A：主对比；B：看过 A 之后加的启动事件和宽一档探索；O：成本变化世界的理想切换） |
+| `pairvar19.txt`、`r19.*.jsonl`、`analyze19.txt` | 第十九批：配对和不配对的每轮方差；四种 W 校准方法（参照用 `r18A` 的同场景结果） |
+| `r30a.*`、`r30b.*`、`r30c.*`、`r30e.*`、`r30f.*.jsonl`、`analyze30.txt` | 第三十批：src（A）、recheck（B）、tight（C）、src4（E，30b）、tight 长运行（F，30c） |
+| `r29.*.jsonl`、`r29s.*.jsonl`、`analyze29.txt` | 第二十九批：护栏、开关世界、RTT 世界（`r29`：W、R 部分，另有 2 组按原计划比 v11 和三个都开的 S；`r29s`：S 部分 v11 对 G1） |
+| `r28.*.jsonl`、`analyze28.txt` | 第二十八批：清零累计量和持续计时探测（conda 环境；参照取自 r25–r27） |
+| `r27.*.jsonl`、`analyze27.txt` | 第二十七批：推迟第一次判定；成本变化后最好的 W 也变（conda 环境；A 部分的参照取自 r25、r26） |
+| `r26.*.jsonl`、`analyze26.txt` | 第二十六批：回放控制器加在线成本模型（conda 环境；静态世界的参照取自 r25） |
+| `r25.*.jsonl`、`analyze25.txt` | 第二十五批：快速收敛版对比回放控制器（conda 环境） |
+| `r24.*.jsonl`、`analyze24.txt` | 第二十四批：回放对更窄宽度的偏差诊断（conda 环境） |
+| `r23.*.jsonl`、`analyze23.txt` | 第二十三批：由成本模型推 W 的阈值对比其他在线调 W 的做法（conda 环境） |
+| `r22.*.jsonl`、`analyze22.txt` | 第二十二批：整 batch 统一分配验证预算（conda 环境） |
+| `r21.*.jsonl`、`analyze21.txt` | 第二十一批：前缀感知的在线成本模型（conda 环境） |
+| `r20.*.jsonl`、`analyze20.txt` | 第二十批：平表起步，在线成本对比已知成本（conda 环境） |
+| `r19B.*.jsonl`、`r19L.*.jsonl` | 第十九批修正版（19b）：配对加置信序列推迟开窗、30 对、经验 Bernstein 或正态混合；短运行和 10 倍长运行（长运行参照 `r18L`） |
+| `r18L.*.jsonl`、`r18L2.*.jsonl`、`analyze18L.txt` | 第十八批长运行复核（10 倍请求，种子 8）：L 检验一次性探索的代价是否被摊薄；L2 是看过 L 之后加的"探索记录单独保留" |
 | `d8.4.jsonl`、`d8.8.jsonl`、`analyze8.txt` | 高接受率负载的诊断（每个请求每轮的提交数、轮时）；`analyze8.py` 的输出 |
 | `d4A.jsonl`、`d4B.jsonl`、`d4b.jsonl` | 诊断。`d4A`、`d4B` 的探测日志里速率单位是 token/ms，只保留 1 位小数（之后改成了 tok/s） |
 

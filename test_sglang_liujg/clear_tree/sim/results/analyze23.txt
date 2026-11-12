@@ -1,0 +1,16 @@
+== Round 23: W from the cost model vs other online W methods (known prefix-aware costs, flat start, seed 8).
+   % vs the best fixed W of the scenario; [W use %] switches / exploration rounds
+base   b=4 | best fixed W=4  146.5 (2:140.5 4:146.5 8:143.5) | flat +0.03% [4:98,8:2] 0/0 | derived -0.18% [4:86,8:14] 0/160 | derived2 -0.23% [4:89,8:11] 0/120 | cellcal +0.65% [4:95,8:5] 0/0 | replay14 +0.07% [4:92,8:8] 0/72
+base   b=8 | best fixed W=4  218.1 (2:214.2 4:218.1 8:200.8) | flat -0.00% [4:100,8:0] 0/0 | derived -1.96% [2:82,4:13,8:5] 1/160 | derived2 -1.29% [4:92,8:8] 0/120 | cellcal -0.35% [4:98,8:2] 0/0 | replay14 -0.90% [4:94,8:6] 0/79
+het    b=4 | best fixed W=2   98.6 (2:98.6 4:97.7 8:89.5) | flat -0.77% [4:99,8:1] 0/0 | derived -1.15% [2:82,4:12,8:5] 1/160 | derived2 -1.46% [4:92,8:8] 0/120 | cellcal -0.76% [4:98,8:2] 0/0 | replay14 -0.78% [4:94,8:6] 0/85
+het    b=8 | best fixed W=2  132.7 (2:132.7 4:130.4 8:114.3) | flat -1.65% [4:99,8:1] 0/0 | derived -1.19% [2:84,4:10,8:6] 1/180 | derived2 -3.14% [4:91,8:9] 0/129 | cellcal -0.22% [2:87,4:10,8:3] 1/0 | replay14 +0.09% [2:85,4:14,8:1] 1/107
+phased b=4 | best fixed W=2  102.2 (2:102.2 4:101.3 8:90.3) | flat -1.02% [4:99,8:1] 0/0 | derived +0.46% [2:72,4:23,8:5] 3/160 | derived2 -2.05% [4:91,8:9] 0/120 | cellcal -0.80% [2:6,4:88,8:5] 1/0 | replay14 -0.22% [2:37,4:58,8:4] 1/85
+phased b=8 | best fixed W=2  137.5 (2:137.5 4:133.6 8:114.6) | flat -2.82% [4:100,8:0] 0/0 | derived -0.76% [2:82,4:13,8:5] 1/160 | derived2 -4.18% [4:92,8:8] 0/120 | cellcal -1.60% [2:9,4:87,8:4] 1/0 | replay14 -0.45% [2:42,4:54,8:4] 1/100
+bvar   b=8 | best fixed W=2  105.6 (2:105.6 4:104.3 8:94.8) | flat -1.25% [4:100] 0/0 | derived -1.05% [2:45,4:45,8:10] 2/160 | derived2 -3.72% [4:85,8:15] 0/120 | cellcal -1.62% [2:13,4:75,8:11] 1/0 | replay14 -0.73% [2:22,4:73,8:5] 1/47
+
+  means over scenarios (min) vs the best fixed W:
+   flat     : -1.07% (-2.8)  |  base +0.01%; het -1.21%; phased -1.92%; bvar -1.25%
+   derived  : -0.83% (-2.0)  |  base -1.07%; het -1.17%; phased -0.15%; bvar -1.05%
+   derived2 : -2.29% (-4.2)  |  base -0.76%; het -2.30%; phased -3.11%; bvar -3.72%
+   cellcal  : -0.67% (-1.6)  |  base +0.15%; het -0.49%; phased -1.20%; bvar -1.62%
+   replay14 : -0.42% (-0.9)  |  base -0.41%; het -0.34%; phased -0.34%; bvar -0.73%

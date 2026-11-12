@@ -38,6 +38,11 @@ import ext10 as P
 import ext13 as D
 import feasibility as F
 
+# D64 (2026-11-12): candidate head counts per layer. True = every m = 1..n (net values can be negative once the
+# per-request prefix cost of D61 is in, so the best m can sit inside a graph tier). False = the old rule
+# {n} plus the smaller graph tiers, which rounds up to 28 used; set ext14.ALL_M = False to reproduce them.
+ALL_M = True
+
 
 def _dbin(d):
     return "d<=3" if d <= 3 else ("d4-6" if d <= 6 else "d>=7")
@@ -72,7 +77,11 @@ class BatchAccount7(D.BatchAccount6):
         return {K: N._mass(t, K) for K in self.k_options}
 
     def _mopts(self, n):
-        return sorted({n} | {x for x in self.buckets if x < n}) if n else []
+        if not n:
+            return []
+        if ALL_M:
+            return list(range(1, n + 1))
+        return sorted({n} | {x for x in self.buckets if x < n})
 
     @staticmethod
     def _grow(t, W, rng, params):

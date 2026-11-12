@@ -1,0 +1,89 @@
+== Round 19: W calibration methods, one budget (200 rounds per window). % vs the hindsight best fixed W;
+   cal = share of spec rounds inside windows; regret = mean loss of the chosen W in the main bucket's windows
+   (best fixed W rate vs the chosen W's fixed rate); outcomes: switch / keep / keep-uncertain counts
+base     mid  b=1 | best W=8   57.4 | table +0.0% | replay14 +0.0% | fixed30 +0.0% (cal 2%, regret 0.00) | ipw -0.4% (cal 16%, regret 0.00) | paired_cs -2.1% (cal 11%, regret 1.29) | sh -2.3% (cal 15%, regret 0.65) | paired_cs v2 eb +0.0% (cal 16%, regret 0.00) | paired_cs v2 nm +0.0% (cal 14%, regret 0.00)
+base     mid  b=4 | best W=4  161.1 | table +0.1% | replay14 -0.1% | fixed30 +0.1% (cal 5%, regret 0.00) | ipw +0.1% (cal 17%, regret 0.00) | paired_cs +0.2% (cal 15%, regret 0.00) | sh +0.1% (cal 18%, regret 0.04) | paired_cs v2 eb +0.0% (cal 14%, regret 0.00) | paired_cs v2 nm -0.2% (cal 9%, regret 0.00)
+base     mid  b=8 | best W=4  249.9 | table +0.0% | replay14 -0.1% | fixed30 +0.1% (cal 5%, regret 0.00) | ipw -0.2% (cal 17%, regret 0.00) | paired_cs +0.1% (cal 6%, regret 0.00) | sh -0.2% (cal 17%, regret 0.00) | paired_cs v2 eb -0.1% (cal 11%, regret 0.00) | paired_cs v2 nm +0.3% (cal 3%, regret 0.00)
+base     high b=1 | best W=4   83.5 | table -0.7% | replay14 -0.6% | fixed30 -1.2% (cal 4%, regret 1.11) | ipw -0.9% (cal 18%, regret 0.70) | paired_cs -1.2% (cal 2%, regret 1.29) | sh -2.5% (cal 18%, regret 2.80) | paired_cs v2 eb -0.2% (cal 13%, regret 0.47) | paired_cs v2 nm -0.5% (cal 11%, regret 0.35)
+base     high b=4 | best W=4  251.9 | table -0.0% | replay14 -0.9% | fixed30 -1.1% (cal 6%, regret 0.00) | ipw -1.3% (cal 29%, regret 0.00) | paired_cs -0.7% (cal 29%, regret 0.00) | sh -1.6% (cal 28%, regret 0.26) | paired_cs v2 eb -1.2% (cal 27%, regret 0.00) | paired_cs v2 nm -0.9% (cal 27%, regret 0.00)
+base     high b=8 | best W=2  386.8 | table -0.0% | replay14 -0.3% | fixed30 -1.2% (cal 8%, regret 0.00) | ipw -2.0% (cal 27%, regret 0.00) | paired_cs -1.0% (cal 11%, regret 0.00) | sh -1.3% (cal 29%, regret 0.00) | paired_cs v2 eb -1.8% (cal 16%, regret 0.00) | paired_cs v2 nm -0.7% (cal 6%, regret 0.00)
+tok x3   mid  b=1 | best W=4   52.5 | table -0.1% | replay14 -0.3% | fixed30 -0.0% (cal 2%, regret 0.04) | ipw +0.1% (cal 16%, regret 0.06) | paired_cs -0.1% (cal 8%, regret 0.03) | sh -2.2% (cal 14%, regret 1.21) | paired_cs v2 eb -0.1% (cal 16%, regret 0.06) | paired_cs v2 nm -0.0% (cal 14%, regret 0.05)
+tok x3   mid  b=4 | best W=4  140.8 | table +0.0% | replay14 -0.3% | fixed30 -0.5% (cal 5%, regret 0.00) | ipw -0.4% (cal 17%, regret 0.00) | paired_cs +0.1% (cal 14%, regret 0.00) | sh -0.4% (cal 17%, regret 0.05) | paired_cs v2 eb -0.6% (cal 14%, regret 0.00) | paired_cs v2 nm -0.1% (cal 14%, regret 0.00)
+tok x3   mid  b=8 | best W=4  218.3 | table -0.0% | replay14 +0.1% | fixed30 -0.3% (cal 45%, regret 0.08) | ipw -0.2% (cal 91%, regret nan) | paired_cs -0.5% (cal 92%, regret nan) | sh -0.1% (cal 89%, regret nan) | paired_cs v2 eb -0.4% (cal 30%, regret nan) | paired_cs v2 nm -0.2% (cal 25%, regret 0.23)
+tok x3   high b=1 | best W=4   78.6 | table -6.3% | replay14 -1.1% | fixed30 -1.1% (cal 4%, regret 3.46) | ipw -4.4% (cal 17%, regret 4.51) | paired_cs -0.5% (cal 3%, regret 0.30) | sh -0.6% (cal 18%, regret 0.61) | paired_cs v2 eb -1.0% (cal 9%, regret 0.00) | paired_cs v2 nm -0.8% (cal 3%, regret 0.00)
+tok x3   high b=4 | best W=2  225.3 | table -7.8% | replay14 -1.3% | fixed30 -2.1% (cal 6%, regret 0.00) | ipw -2.2% (cal 14%, regret 0.00) | paired_cs -1.7% (cal 8%, regret 0.00) | sh -2.4% (cal 27%, regret 0.00) | paired_cs v2 eb -3.5% (cal 14%, regret 0.00) | paired_cs v2 nm -2.1% (cal 5%, regret 0.00)
+tok x3   high b=8 | best W=2  329.8 | table -0.3% | replay14 -1.0% | fixed30 -2.6% (cal 7%, regret 0.00) | ipw -1.5% (cal 10%, regret 0.00) | paired_cs -1.2% (cal 5%, regret 0.00) | sh -3.2% (cal 28%, regret 0.00) | paired_cs v2 eb -7.8% (cal 8%, regret 0.00) | paired_cs v2 nm -1.6% (cal 4%, regret 0.00)
+tok x0.3 mid  b=1 | best W=8   59.4 | table +0.0% | replay14 +0.0% | fixed30 +0.0% (cal 2%, regret 0.00) | ipw -0.9% (cal 16%, regret 0.00) | paired_cs +0.0% (cal 11%, regret 0.00) | sh -2.7% (cal 16%, regret 2.80) | paired_cs v2 eb +0.0% (cal 15%, regret 0.00) | paired_cs v2 nm +0.0% (cal 11%, regret 0.00)
+tok x0.3 mid  b=4 | best W=8  178.5 | table -4.1% | replay14 -0.8% | fixed30 -2.7% (cal 5%, regret 2.81) | ipw -4.7% (cal 18%, regret 4.22) | paired_cs -1.3% (cal 14%, regret 1.41) | sh -2.1% (cal 19%, regret 1.41) | paired_cs v2 eb -2.4% (cal 14%, regret 2.81) | paired_cs v2 nm -1.5% (cal 10%, regret 1.41)
+tok x0.3 mid  b=8 | best W=8  279.8 | table -2.6% | replay14 -0.7% | fixed30 -1.5% (cal 5%, regret 1.74) | ipw -2.8% (cal 17%, regret 2.61) | paired_cs -0.6% (cal 13%, regret 0.87) | sh -1.2% (cal 18%, regret 0.87) | paired_cs v2 eb -2.0% (cal 14%, regret 2.61) | paired_cs v2 nm -1.4% (cal 14%, regret 1.74)
+tok x0.3 high b=1 | best W=8   86.9 | table +0.0% | replay14 +0.0% | fixed30 +0.0% (cal 4%, regret 0.00) | ipw -0.5% (cal 17%, regret 0.00) | paired_cs -2.3% (cal 13%, regret 3.16) | sh -2.1% (cal 19%, regret 2.11) | paired_cs v2 eb +0.0% (cal 16%, regret 0.00) | paired_cs v2 nm +0.0% (cal 15%, regret 0.00)
+tok x0.3 high b=4 | best W=4  270.7 | table -0.0% | replay14 -0.4% | fixed30 -0.3% (cal 6%, regret 0.00) | ipw -0.6% (cal 29%, regret 0.00) | paired_cs -0.3% (cal 12%, regret 0.00) | sh -2.1% (cal 29%, regret 2.00) | paired_cs v2 eb -0.4% (cal 22%, regret 0.00) | paired_cs v2 nm -0.2% (cal 10%, regret 0.00)
+tok x0.3 high b=8 | best W=4  421.7 | table -2.1% | replay14 -1.1% | fixed30 -1.7% (cal 8%, regret 1.66) | ipw -1.4% (cal 28%, regret 1.66) | paired_cs -1.7% (cal 28%, regret 1.66) | sh -0.2% (cal 31%, regret 0.00) | paired_cs v2 eb -2.6% (cal 26%, regret 2.49) | paired_cs v2 nm -1.6% (cal 24%, regret 1.66)
+change   mid  b=1 | best W=8   52.7 | table +0.0% | replay14 +0.0% | fixed30 +0.2% (cal 5%, regret 0.02) | ipw -0.3% (cal 21%, regret 0.06) | paired_cs +0.1% (cal 10%, regret 0.97) | sh +0.2% (cal 20%, regret 0.01) | paired_cs v2 eb +0.0% (cal 17%, regret 0.06) | paired_cs v2 nm -0.1% (cal 16%, regret 0.04)
+change   mid  b=4 | best W=4  142.8 | table +0.1% | replay14 -0.4% | fixed30 -0.4% (cal 7%, regret 0.00) | ipw -0.6% (cal 26%, regret 0.00) | paired_cs -0.1% (cal 25%, regret 0.00) | sh -0.2% (cal 27%, regret 0.00) | paired_cs v2 eb -0.6% (cal 20%, regret 0.00) | paired_cs v2 nm -0.1% (cal 20%, regret 0.00)
+change   mid  b=8 | best W=2  220.4 | table -0.5% | replay14 -0.2% | fixed30 -0.2% (cal 19%, regret 0.12) | ipw -0.8% (cal 88%, regret 0.23) | paired_cs +0.1% (cal 29%, regret 0.12) | sh -0.3% (cal 77%, regret 0.23) | paired_cs v2 eb -0.9% (cal 50%, regret 0.23) | paired_cs v2 nm -0.3% (cal 26%, regret 0.09)
+change   high b=1 | best W=4   79.1 | table -5.9% | replay14 -1.0% | fixed30 -0.8% (cal 7%, regret 2.71) | ipw -2.5% (cal 25%, regret 2.71) | paired_cs -1.3% (cal 16%, regret 1.06) | sh -0.6% (cal 27%, regret 0.30) | paired_cs v2 eb -1.7% (cal 15%, regret 0.30) | paired_cs v2 nm -1.0% (cal 8%, regret 0.18)
+change   high b=4 | best W=2  229.3 | table -6.1% | replay14 -1.2% | fixed30 -1.2% (cal 9%, regret 0.00) | ipw -3.7% (cal 38%, regret 2.59) | paired_cs -0.3% (cal 22%, regret 0.00) | sh -2.5% (cal 43%, regret 0.00) | paired_cs v2 eb -3.5% (cal 23%, regret 0.00) | paired_cs v2 nm -1.8% (cal 16%, regret 0.00)
+change   high b=8 | best W=2  339.9 | table -0.2% | replay14 -0.8% | fixed30 -2.5% (cal 11%, regret 0.00) | ipw -2.6% (cal 26%, regret 0.00) | paired_cs -1.1% (cal 12%, regret 0.00) | sh -4.0% (cal 43%, regret 0.00) | paired_cs v2 eb -4.1% (cal 17%, regret 0.00) | paired_cs v2 nm -2.0% (cal 9%, regret 0.00)
+
+  group means (min) vs the best fixed W:
+   base    : table -0.10% (-0.7); replay14 -0.32% (-0.9); fixed30 -0.53% (-1.2); ipw -0.79% (-2.0); paired_cs -0.77% (-2.1); sh -1.30% (-2.5); paired_cs v2 eb -0.55% (-1.8); paired_cs v2 nm -0.34% (-0.9)
+   tok x3  : table -2.40% (-7.8); replay14 -0.65% (-1.3); fixed30 -1.12% (-2.6); ipw -1.45% (-4.4); paired_cs -0.65% (-1.7); sh -1.49% (-3.2); paired_cs v2 eb -2.23% (-7.8); paired_cs v2 nm -0.80% (-2.1)
+   tok x0.3: table -1.46% (-4.1); replay14 -0.49% (-1.1); fixed30 -1.02% (-2.7); ipw -1.82% (-4.7); paired_cs -1.03% (-2.3); sh -1.74% (-2.7); paired_cs v2 eb -1.26% (-2.6); paired_cs v2 nm -0.80% (-1.6)
+   change  : table -2.12% (-6.1); replay14 -0.60% (-1.2); fixed30 -0.80% (-2.5); ipw -1.74% (-3.7); paired_cs -0.45% (-1.3); sh -1.23% (-4.0); paired_cs v2 eb -1.80% (-4.1); paired_cs v2 nm -0.90% (-2.0)
+
+  per method: calibration share of rounds, mean regret of the chosen W per window, outcomes
+   fixed30   base    : cal 5.0% | regret 0.28% over 24 windows | keep 22, switch 2
+   fixed30   tok x3  : cal 11.6% | regret 0.85% over 25 windows | keep 16, switch 9
+   fixed30   tok x0.3: cal 5.0% | regret 0.78% over 24 windows | keep 21, switch 3
+   fixed30   change  : cal 9.5% | regret 0.56% over 45 windows | keep 34, switch 11
+   ipw       base    : cal 20.6% | regret 0.10% over 21 windows | keep 1, keep-uncertain 20
+   ipw       tok x3  : cal 27.3% | regret 0.77% over 18 windows | keep 3, keep-uncertain 11, switch 4
+   ipw       tok x0.3: cal 20.9% | regret 1.21% over 21 windows | keep-uncertain 20, switch 1
+   ipw       change  : cal 37.3% | regret 0.87% over 19 windows | keep 3, keep-uncertain 11, switch 5
+   paired_cs base    : cal 12.3% | regret 0.64% over 24 windows | keep 7, keep-uncertain 9, switch 8
+   paired_cs tok x3  : cal 21.8% | regret 0.10% over 21 windows | keep 4, keep-uncertain 5, switch 12
+   paired_cs tok x0.3: cal 15.3% | regret 1.11% over 22 windows | keep 8, keep-uncertain 7, switch 7
+   paired_cs change  : cal 19.0% | regret 0.50% over 36 windows | keep 10, keep-uncertain 7, switch 19
+   sh        base    : cal 20.9% | regret 0.63% over 21 windows | keep 16, switch 5
+   sh        tok x3  : cal 32.1% | regret 0.51% over 18 windows | keep 6, switch 12
+   sh        tok x0.3: cal 21.8% | regret 1.71% over 21 windows | keep 8, switch 13
+   sh        change  : cal 39.8% | regret 0.07% over 18 windows | keep 7, switch 11
+   paired_cs v2 eb base    : cal 16.2% | regret 0.07% over 21 windows | keep 7, keep-uncertain 13, switch 1
+   paired_cs v2 eb tok x3  : cal 15.1% | regret 0.02% over 18 windows | keep 3, keep-uncertain 9, switch 6
+   paired_cs v2 eb tok x0.3: cal 17.8% | regret 1.13% over 21 windows | keep 5, keep-uncertain 15, switch 1
+   paired_cs v2 eb change  : cal 23.7% | regret 0.08% over 18 windows | keep 3, keep-uncertain 8, switch 7
+   paired_cs v2 nm base    : cal 11.8% | regret 0.06% over 22 windows | keep 10, keep-uncertain 10, switch 2
+   paired_cs v2 nm tok x3  : cal 10.8% | regret 0.03% over 19 windows | keep 3, keep-uncertain 8, switch 8
+   paired_cs v2 nm tok x0.3: cal 13.8% | regret 0.69% over 21 windows | keep 10, keep-uncertain 7, switch 4
+   paired_cs v2 nm change  : cal 15.9% | regret 0.05% over 30 windows | keep 11, keep-uncertain 7, switch 12
+
+  all 24 scenarios: table -1.52%; replay14 -0.52%; fixed30 -0.87%; ipw -1.45%; paired_cs -0.72%; sh -1.44%; paired_cs v2 eb -1.46%; paired_cs v2 nm -0.71%
+  cost where the table is right (base, cells where the table is within 1% of the best), vs table:
+   replay14 : mean -0.22 pt, worst -0.94 pt over 6 cells
+   fixed30  : mean -0.43 pt, worst -1.12 pt over 6 cells
+   ipw      : mean -0.69 pt, worst -1.96 pt over 6 cells
+   paired_cs: mean -0.67 pt, worst -2.10 pt over 6 cells
+   sh       : mean -1.20 pt, worst -2.31 pt over 6 cells
+   paired_cs v2 eb: mean -0.45 pt, worst -1.78 pt over 6 cells
+   paired_cs v2 nm: mean -0.24 pt, worst -0.90 pt over 6 cells
+  recovered share of the table's loss (cells where the table loses > 1%):
+   replay14 : 76% over 7 cells
+   fixed30  : 60% over 7 cells
+   ipw      : 30% over 7 cells
+   paired_cs: 73% over 7 cells
+   sh       : 72% over 7 cells
+   paired_cs v2 eb: 41% over 7 cells
+   paired_cs v2 nm: 64% over 7 cells
+
+== Round 19b long runs (30x requests, seed 8): % vs the table; tok x0.3 also vs the best fixed W
+base     high b=4 | replay14 -0.28% | paired_cs v2 eb -0.11% [cal 2.7%, sw 0] | paired_cs v2 nm +0.12% [cal 2.7%, sw 0]
+base     high b=8 | replay14 -0.20% | paired_cs v2 eb -0.21% [cal 2.1%, sw 0] | paired_cs v2 nm -0.14% [cal 0.5%, sw 0]
+base     mid  b=4 | replay14 -0.74% | paired_cs v2 eb -0.00% [cal 2.3%, sw 0] | paired_cs v2 nm -0.11% [cal 1.0%, sw 0]
+base     mid  b=8 | replay14 -0.17% | paired_cs v2 eb +0.03% [cal 1.3%, sw 0] | paired_cs v2 nm +0.11% [cal 0.3%, sw 0]
+tok x0.3 high b=4 | replay14 -0.09% (vs best -0.10%) | paired_cs v2 eb -0.19% (vs best -0.20%) [cal 1.8%, sw 0] | paired_cs v2 nm -0.11% (vs best -0.12%) [cal 1.0%, sw 0]
+tok x0.3 high b=8 | replay14 +2.46% (vs best -0.17%) | paired_cs v2 eb -0.10% (vs best -2.66%) [cal 2.5%, sw 0] | paired_cs v2 nm +2.51% (vs best -0.12%) [cal 2.0%, sw 1]
+tok x0.3 mid  b=4 | replay14 +3.98% (vs best -0.13%) | paired_cs v2 eb +4.04% (vs best -0.08%) [cal 2.0%, sw 1] | paired_cs v2 nm +4.04% (vs best -0.08%) [cal 1.9%, sw 1]
+tok x0.3 mid  b=8 | replay14 +2.69% (vs best +0.03%) | paired_cs v2 eb +0.13% (vs best -2.46%) [cal 1.5%, sw 0] | paired_cs v2 nm +0.13% (vs best -2.46%) [cal 1.5%, sw 0]
+   base     means: replay14 -0.35% vs table; paired_cs v2 eb -0.07% vs table; paired_cs v2 nm -0.01% vs table
+   tok x0.3 means: replay14 +2.26% vs table, -0.09% vs best; paired_cs v2 eb +0.97% vs table, -1.35% vs best; paired_cs v2 nm +1.64% vs table, -0.69% vs best

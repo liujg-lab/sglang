@@ -1,0 +1,51 @@
+== Round 18 part L: short (3x requests) vs long (30x), seed 8. % vs table; [share of rounds above the table W]; switches
+base     high b=4 | spec rounds short 733 long 7310
+   replay14                 | short -1.40% [4.1%] sw 0 | long -0.28% [4.4%] sw 0
+   rescore no-confirm       | short -0.91% [1.5%] sw 0 | long -0.03% [0.9%] sw 0
+   rescore step no-confirm  | short -1.44% [6.6%] sw 0 | long -0.08% [1.4%] sw 0
+   rescore step no-confirm keep-wide | short - | long -0.08% [1.4%] sw 0
+base     high b=8 | spec rounds short 804 long 7913
+   replay14                 | short -0.57% [8.3%] sw 0 | long -0.20% [5.0%] sw 0
+   rescore no-confirm       | short -0.08% [6.1%] sw 0 | long -0.20% [1.4%] sw 0
+   rescore step no-confirm  | short -0.79% [10.0%] sw 0 | long -0.11% [1.8%] sw 0
+   rescore step no-confirm keep-wide | short - | long -0.11% [1.8%] sw 0
+base     mid  b=4 | spec rounds short 1398 long 13521
+   replay14                 | short -0.50% [86.3%] sw 1 | long -0.74% [98.6%] sw 1
+   rescore no-confirm       | short -0.46% [3.2%] sw 0 | long -0.06% [1.1%] sw 0
+   rescore step no-confirm  | short -0.19% [7.0%] sw 0 | long -0.04% [1.5%] sw 0
+   rescore step no-confirm keep-wide | short - | long -0.04% [1.5%] sw 0
+base     mid  b=8 | spec rounds short 1455 long 14111
+   replay14                 | short -0.17% [4.4%] sw 0 | long -0.17% [4.8%] sw 0
+   rescore no-confirm       | short -0.06% [0.9%] sw 0 | long +0.01% [1.1%] sw 0
+   rescore step no-confirm  | short -0.08% [4.6%] sw 0 | long -0.05% [1.4%] sw 0
+   rescore step no-confirm keep-wide | short - | long -0.05% [1.4%] sw 0
+tok x0.3 high b=4 | spec rounds short 735 long 7270 | fixed 4: short +0.00%, long +0.01% vs table
+   replay14                 | short -0.22% [3.8%] sw 0 | long -0.09% [4.5%] sw 0
+   rescore no-confirm       | short +0.32% [1.5%] sw 0 | long -0.08% [0.8%] sw 0
+   rescore step no-confirm  | short -0.28% [6.7%] sw 0 | long -0.04% [1.4%] sw 0
+   rescore step no-confirm keep-wide | short - | long -0.04% [1.4%] sw 0
+tok x0.3 high b=8 | spec rounds short 799 long 7866 | fixed 4: short +2.77%, long +2.63% vs table
+   replay14                 | short +2.00% [73.3%] sw 1 | long +2.46% [97.3%] sw 1
+   rescore no-confirm       | short -0.02% [6.4%] sw 0 | long +0.01% [1.4%] sw 0
+   rescore step no-confirm  | short -0.14% [10.0%] sw 0 | long +0.05% [1.8%] sw 0
+   rescore step no-confirm keep-wide | short - | long +1.29% [46.7%] sw 1
+tok x0.3 mid  b=4 | spec rounds short 1371 long 13273 | fixed 8: short +4.43%, long +4.12% vs table
+   replay14                 | short +3.91% [86.1%] sw 1 | long +3.98% [98.6%] sw 1
+   rescore no-confirm       | short -0.23% [2.8%] sw 0 | long -0.16% [1.0%] sw 0
+   rescore step no-confirm  | short +0.75% [8.3%] sw 1 | long +0.12% [3.2%] sw 1
+   rescore step no-confirm keep-wide | short - | long +2.53% [59.4%] sw 2
+tok x0.3 mid  b=8 | spec rounds short 1414 long 13738 | fixed 8: short +2.38%, long +2.66% vs table
+   replay14                 | short +2.06% [83.2%] sw 1 | long +2.69% [98.4%] sw 1
+   rescore no-confirm       | short +0.21% [0.8%] sw 0 | long +0.12% [1.1%] sw 0
+   rescore step no-confirm  | short +2.38% [99.2%] sw 2 | long +2.71% [99.7%] sw 1
+   rescore step no-confirm keep-wide | short - | long +2.71% [99.7%] sw 1
+
+  means over the four scenarios of each world:
+   base     replay14                 short -0.66%; long -0.35%
+   base     rescore no-confirm       short -0.38%; long -0.07%
+   base     rescore step no-confirm  short -0.63%; long -0.07%
+   base     rescore step no-confirm keep-wide long -0.07%
+   tok x0.3 replay14                 short +1.94%; long +2.26%; short vs best -0.45%; long vs best -0.09%
+   tok x0.3 rescore no-confirm       short +0.07%; long -0.03%; short vs best -2.25%; long vs best -2.30%
+   tok x0.3 rescore step no-confirm  short +0.68%; long +0.71%; short vs best -1.66%; long vs best -1.59%
+   tok x0.3 rescore step no-confirm keep-wide long +1.62%; long vs best -0.71%

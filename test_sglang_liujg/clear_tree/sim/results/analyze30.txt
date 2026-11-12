@@ -1,0 +1,298 @@
+== Round 30 A (src): verify cost per token x5 at spec round 400 (vchg). src vs G1 (paired %)
+short s8 vchg high b=8 | src vs G1  +0.27% | G1 ev 1 K {'8': 140, '16': 657, '32': 43} sw [[67, 8, 4, 2]]
+     src ev 1 (l0/v1) checks 1 offsets 0 chk [[426, 427, 15.2, 17.5, False]] probes 54->49 K {'8': 120, '16': 673, '32': 41} sw [[67, 8, 4, 2]]
+short s9 vchg high b=8 | src vs G1  +0.28% | G1 ev 1 K {'8': 93, '16': 664, '32': 64} sw [[67, 8, 4, 2]]
+     src ev 1 (l0/v1) checks 1 offsets 0 chk [[773, 774, 10.7, 11.4, False]] probes 52->44 K {'8': 118, '16': 647, '32': 57} sw [[67, 8, 4, 2]]
+long     vchg high b=8 | src vs G1  +0.13% | G1 ev 1 K {'8': 638, '16': 2096, '32': 44} sw [[67, 8, 4, 2]]
+     src ev 1 (l0/v1) checks 1 offsets 0 chk [[426, 427, 15.2, 17.5, False]] probes 55->50 K {'8': 589, '16': 2134, '32': 40} sw [[67, 8, 4, 2]]
+short s8 vchg mid  b=4 | src vs G1  +0.00% | G1 ev 0 K {'8': 31, '16': 1117, '32': 285} sw []
+     src ev 0 (l0/v0) checks 0 offsets 0 chk [] probes 36->36 K {'8': 31, '16': 1117, '32': 285} sw []
+short s9 vchg mid  b=4 | src vs G1  +0.00% | G1 ev 0 K {'8': 47, '16': 1096, '32': 310} sw []
+     src ev 0 (l0/v0) checks 0 offsets 0 chk [] probes 36->36 K {'8': 47, '16': 1096, '32': 310} sw []
+long     vchg mid  b=4 | src vs G1  +0.00% | G1 ev 0 K {'8': 225, '16': 4013, '32': 433} sw []
+     src ev 0 (l0/v0) checks 0 offsets 0 chk [] probes 36->36 K {'8': 225, '16': 4013, '32': 433} sw []
+  mean all: +0.11% (+0.00, +0.28)
+  mean mid: +0.00% (+0.00, +0.00)
+  mean high: +0.22% (+0.13, +0.28)
+
+== Round 30 A (src): RTT worlds of round 29. % vs best fixed W; v11 novd / v11 / G1 from r29
+short s8 rtt alt  high b=8 | v11 novd -2.02% | v11 -2.48% | G1 -1.46% | src -1.37% | src: ev 0 checks 4 offsets 4 probes 54 (G1 54)
+short s9 rtt alt  high b=8 | v11 novd -1.71% | v11 -2.40% | G1 -1.19% | src -1.10% | src: ev 0 checks 4 offsets 4 probes 54 (G1 54)
+long     rtt alt  high b=8 | v11 novd -2.21% | v11 -3.04% | G1 -2.30% | src -1.35% | src: ev 3 checks 17 offsets 9 probes 133 (G1 111)
+short s8 rtt alt  mid  b=4 | v11 novd +0.33% | v11 -0.52% | G1 -0.45% | src -1.32% | src: ev 2 checks 6 offsets 2 probes 72 (G1 71)
+short s9 rtt alt  mid  b=4 | v11 novd -0.22% | v11 -2.46% | G1 -2.14% | src -1.03% | src: ev 2 checks 7 offsets 1 probes 72 (G1 73)
+long     rtt alt  mid  b=4 | v11 novd -1.71% | v11 -1.52% | G1 -1.49% | src -0.94% | src: ev 5 checks 30 offsets 3 probes 229 (G1 108)
+short s8 rtt jump high b=8 | v11 novd -1.40% | v11 -1.60% | G1 -1.60% | src -0.91% | src: ev 1 checks 1 offsets 0 probes 50 (G1 54)
+short s9 rtt jump high b=8 | v11 novd -1.25% | v11 -1.57% | G1 -1.57% | src -1.08% | src: ev 1 checks 1 offsets 0 probes 44 (G1 52)
+long     rtt jump high b=8 | v11 novd -0.90% | v11 -0.96% | G1 -0.96% | src -0.58% | src: ev 1 checks 1 offsets 0 probes 50 (G1 59)
+short s8 rtt jump mid  b=4 | v11 novd +1.23% | v11 +0.65% | G1 +0.65% | src +1.17% | src: ev 0 checks 1 offsets 1 probes 42 (G1 54)
+short s9 rtt jump mid  b=4 | v11 novd -0.62% | v11 -1.18% | G1 -1.18% | src -0.39% | src: ev 0 checks 1 offsets 1 probes 42 (G1 54)
+long     rtt jump mid  b=4 | v11 novd -0.04% | v11 -0.10% | G1 -0.10% | src +0.13% | src: ev 0 checks 1 offsets 1 probes 42 (G1 54)
+  means (min):
+   all          : v11 novd -0.88% (-2.2); v11 -1.43% (-3.0); G1 -1.15% (-2.3); src -0.73% (-1.4)
+   rtt jump     : v11 novd -0.50% (-1.4); v11 -0.79% (-1.6); G1 -0.79% (-1.6); src -0.28% (-1.1)
+   rtt alt      : v11 novd -1.26% (-2.2); v11 -2.07% (-3.0); G1 -1.51% (-2.3); src -1.18% (-1.4)
+   rtt jump mid : v11 novd +0.19% (-0.6); v11 -0.21% (-1.2); G1 -0.21% (-1.2); src +0.30% (-0.4)
+   rtt jump high: v11 novd -1.19% (-1.4); v11 -1.38% (-1.6); G1 -1.38% (-1.6); src -0.85% (-1.1)
+   rtt alt mid  : v11 novd -0.53% (-1.7); v11 -1.50% (-2.5); G1 -1.36% (-2.1); src -1.10% (-1.3)
+   rtt alt high : v11 novd -1.98% (-2.2); v11 -2.64% (-3.0); G1 -1.65% (-2.3); src -1.27% (-1.4)
+
+== Round 30 A (src): round-28 worlds with a drift trigger under G1, src vs G1 (paired %)
+short s8 het       het  b=4 | src vs G1  -0.44% | ev 1->1 (l0/v1) checks 1 offsets 0 probes 50->42 | sw G1 [[225, 4, 4, 2]] src [[239, 4, 4, 2]]
+long     het       het  b=4 | src vs G1  -0.06% | ev 1->1 (l0/v1) checks 1 offsets 0 probes 54->48 | sw G1 [[225, 4, 4, 2]] src [[239, 4, 4, 2]]
+short s9 phased    het  b=4 | src vs G1  -0.37% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 43->38 | sw G1 [[127, 4, 4, 2]] src [[127, 4, 4, 2], [273, 4, 2, 4], [1117, 4, 4, 2]]
+short s8 bvar      het  b=8 | src vs G1  +1.94% | ev 1->0 (l0/v0) checks 1 offsets 1 probes 54->42 | sw G1 [] src [[411, 8, 4, 2]]
+long     bvar      het  b=8 | src vs G1  +0.10% | ev 1->0 (l0/v0) checks 1 offsets 1 probes 54->42 | sw G1 [[1230, 8, 4, 2]] src [[1230, 8, 4, 2]]
+short s8 chg x3    mid  b=4 | src vs G1  +0.97% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->42 | sw G1 [] src []
+short s9 chg x3    mid  b=4 | src vs G1  -0.27% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->42 | sw G1 [] src [[655, 4, 4, 8], [695, 4, 8, 2], [835, 4, 2, 4]]
+long     chg x3    mid  b=4 | src vs G1  +0.36% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->31 | sw G1 [] src []
+short s8 chg x0.3  high b=8 | src vs G1  +0.05% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->44 | sw G1 [[67, 8, 4, 2]] src [[67, 8, 4, 2]]
+short s9 chg x0.3  high b=8 | src vs G1  -0.01% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 51->41 | sw G1 [[67, 8, 4, 2]] src [[67, 8, 4, 2]]
+long     chg x0.3  high b=8 | src vs G1  -0.32% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 58->43 | sw G1 [[67, 8, 4, 2]] src [[67, 8, 4, 2]]
+short s8 chg x0.3  mid  b=4 | src vs G1  +0.14% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->42 | sw G1 [] src []
+short s9 chg x0.3  mid  b=4 | src vs G1  -0.31% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->42 | sw G1 [[687, 4, 4, 8], [849, 4, 8, 4]] src [[455, 4, 4, 2], [675, 4, 2, 4]]
+long     chg x0.3  mid  b=4 | src vs G1  -0.04% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->42 | sw G1 [] src []
+short s8 chg8 x0.3 mid  b=8 | src vs G1  +0.21% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 55->50 | sw G1 [] src []
+short s9 chg8 x0.3 mid  b=8 | src vs G1  -0.05% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 62->55 | sw G1 [] src []
+long     chg8 x0.3 mid  b=8 | src vs G1  +0.28% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 61->44 | sw G1 [] src []
+short s8 chg8 x3   mid  b=8 | src vs G1  +0.03% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 54->44 | sw G1 [[467, 8, 4, 2]] src [[455, 8, 4, 2]]
+short s9 chg8 x3   mid  b=8 | src vs G1  +0.04% | ev 1->2 (l2/v0) checks 0 offsets 0 probes 66->54 | sw G1 [[467, 8, 4, 2]] src [[455, 8, 4, 2]]
+long     chg8 x3   mid  b=8 | src vs G1  +0.07% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 65->60 | sw G1 [[467, 8, 4, 2]] src [[455, 8, 4, 2]]
+short s8 chg8 x10  mid  b=8 | src vs G1  +0.86% | ev 2->1 (l1/v0) checks 0 offsets 0 probes 67->59 | sw G1 [[889, 8, 4, 2], [2806, 2, 4, 2]] src [[455, 8, 4, 2]]
+short s9 chg8 x10  mid  b=8 | src vs G1  +0.29% | ev 2->2 (l1/v1) checks 1 offsets 0 probes 84->72 | sw G1 [[467, 8, 4, 2]] src [[455, 8, 4, 2]]
+long     chg8 x10  mid  b=8 | src vs G1  +0.17% | ev 1->1 (l1/v0) checks 0 offsets 0 probes 72->60 | sw G1 [[889, 8, 4, 2], [10613, 2, 4, 2]] src [[455, 8, 4, 2]]
+  means (min, max):
+   all      : +0.16% (-0.44, +1.94) n=23
+   static   : +0.23% (-0.44, +1.94) n=5
+   chg (r26): +0.06% (-0.32, +0.97) n=9
+   chg8     : +0.21% (-0.05, +0.86) n=9
+   short    : +0.21% (-0.44, +1.94) n=15
+   long     : +0.07% (-0.32, +0.36) n=8
+   het      : -0.25% (-0.44, -0.06) n=2
+   phased   : -0.37% (-0.37, -0.37) n=1
+   bvar     : +1.02% (+0.10, +1.94) n=2
+   chg8 x3  : +0.05% (+0.03, +0.07) n=3
+   chg8 x10 : +0.44% (+0.17, +0.86) n=3
+   incl. identical runs (0): +0.081% over 45 runs (22 not run)
+
+== Round 30 B (recheck): round-28 worlds with a narrowing switch under G1, recheck vs G1 (paired %)
+short s8 het       het  b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[246, 4, 4, 2, 1.017, 0.0305, 0.0234, False]] | sw G1 [[225, 4, 4, 2]] recheck [[225, 4, 4, 2]]
+short s9 het       het  b=4 | recheck vs G1  +0.00% | rechecks 2 back 0 [[169, 4, 4, 2, 1.057, 0.0381, 0.0169, False], [407, 4, 4, 2, 0.999, 0.032, 0.0324, False]] | sw G1 [[147, 4, 4, 2], [267, 4, 2, 4]] recheck [[147, 4, 4, 2], [267, 4, 2, 4], [387, 4, 4, 2]]
+long     het       het  b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[246, 4, 4, 2, 1.017, 0.0305, 0.0234, False]] | sw G1 [[225, 4, 4, 2]] recheck [[225, 4, 4, 2]]
+short s8 het       het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[128, 8, 4, 2, 1.014, 0.0484, 0.0415, False]] | sw G1 [[107, 8, 4, 2]] recheck [[107, 8, 4, 2]]
+long     het       het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[128, 8, 4, 2, 1.014, 0.0484, 0.0415, False]] | sw G1 [[107, 8, 4, 2]] recheck [[107, 8, 4, 2]]
+short s8 phased    het  b=4 | recheck vs G1  +0.00% | rechecks 2 back 0 [[1053, 4, 4, 2, 0.981, 0.0308, 0.0381, False], [1555, 4, 4, 2, 1.008, 0.0386, 0.035, False]] | sw G1 [[1033, 4, 4, 2], [1455, 4, 2, 4]] recheck [[1033, 4, 4, 2], [1455, 4, 2, 4], [1535, 4, 4, 2]]
+short s9 phased    het  b=4 | recheck vs G1  +0.00% | rechecks 0 back 0 [] | sw G1 [[127, 4, 4, 2]] recheck [[127, 4, 4, 2]]
+long     phased    het  b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 4, 4, 2, 1.06, 0.0359, 0.0227, False]] | sw G1 [[67, 4, 4, 2]] recheck [[67, 4, 4, 2]]
+short s8 phased    het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[976, 8, 4, 2, 1.007, 0.0322, 0.0297, False]] | sw G1 [[953, 8, 4, 2]] recheck [[953, 8, 4, 2]]
+short s9 phased    het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[1014, 8, 4, 2, 0.994, 0.0309, 0.033, False]] | sw G1 [[993, 8, 4, 2]] recheck [[993, 8, 4, 2]]
+long     phased    het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[3229, 8, 4, 2, 1.002, 0.0308, 0.0301, False]] | sw G1 [[3207, 8, 4, 2]] recheck [[3207, 8, 4, 2]]
+short s9 bvar      het  b=8 | recheck vs G1  +0.00% | rechecks 2 back 0 [[290, 2, 8, 4, 0.995, 0.1245, 0.1273, False], [487, 8, 4, 2, 0.994, 0.0363, 0.0388, False]] | sw G1 [[227, 2, 4, 8], [267, 2, 8, 4]] recheck [[227, 2, 4, 8], [267, 2, 8, 4], [467, 8, 4, 2]]
+long     bvar      het  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[1250, 8, 4, 2, 1.013, 0.0566, 0.0507, False]] | sw G1 [[1230, 8, 4, 2]] recheck [[1230, 8, 4, 2]]
+short s8 high      high b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[169, 4, 4, 2, 1.002, 0.0309, 0.03, False]] | sw G1 [[147, 4, 4, 2]] recheck [[147, 4, 4, 2]]
+short s9 high      high b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 4, 4, 2, 1.009, 0.0319, 0.0269, False]] | sw G1 [[67, 4, 4, 2]] recheck [[67, 4, 4, 2]]
+long     high      high b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[169, 4, 4, 2, 1.002, 0.0309, 0.03, False]] | sw G1 [[147, 4, 4, 2]] recheck [[147, 4, 4, 2]]
+short s8 high      high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 0.994, 0.0702, 0.0736, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+short s9 high      high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 1.008, 0.0759, 0.0711, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+long     high      high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 0.994, 0.0702, 0.0736, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+short s8 chg x0.3  high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 0.994, 0.0702, 0.0736, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+short s9 chg x0.3  high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 1.008, 0.0759, 0.0711, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+long     chg x0.3  high b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[87, 8, 4, 2, 0.994, 0.0702, 0.0736, False]] | sw G1 [[67, 8, 4, 2]] recheck [[67, 8, 4, 2]]
+short s9 chg x0.3  mid  b=4 | recheck vs G1  +0.00% | rechecks 1 back 0 [[872, 4, 8, 4, 1.003, 0.0332, 0.0323, False]] | sw G1 [[687, 4, 4, 8], [849, 4, 8, 4]] recheck [[687, 4, 4, 8], [849, 4, 8, 4]]
+short s8 chg8 x3   mid  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[488, 8, 4, 2, 0.986, 0.0357, 0.0425, False]] | sw G1 [[467, 8, 4, 2]] recheck [[467, 8, 4, 2]]
+short s9 chg8 x3   mid  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[488, 8, 4, 2, 1.013, 0.0477, 0.0408, False]] | sw G1 [[467, 8, 4, 2]] recheck [[467, 8, 4, 2]]
+long     chg8 x3   mid  b=8 | recheck vs G1  +0.00% | rechecks 1 back 0 [[488, 8, 4, 2, 0.986, 0.0357, 0.0425, False]] | sw G1 [[467, 8, 4, 2]] recheck [[467, 8, 4, 2]]
+short s8 chg8 x10  mid  b=8 | recheck vs G1  +0.00% | rechecks 0 back 0 [] | sw G1 [[889, 8, 4, 2], [2806, 2, 4, 2]] recheck [[889, 8, 4, 2], [2806, 2, 4, 2]]
+short s9 chg8 x10  mid  b=8 | recheck vs G1  +0.00% | rechecks 0 back 0 [] | sw G1 [[467, 8, 4, 2]] recheck [[467, 8, 4, 2]]
+long     chg8 x10  mid  b=8 | recheck vs G1  +0.00% | rechecks 0 back 0 [] | sw G1 [[889, 8, 4, 2], [10613, 2, 4, 2]] recheck [[889, 8, 4, 2], [10613, 2, 4, 2]]
+  means (min, max):
+   all      : +0.00% (+0.00, +0.00) n=29
+   static   : +0.00% (+0.00, +0.00) n=19
+   chg (r26): +0.00% (+0.00, +0.00) n=4
+   chg8     : +0.00% (+0.00, +0.00) n=6
+   short    : +0.00% (+0.00, +0.00) n=19
+   long     : +0.00% (+0.00, +0.00) n=10
+   het      : +0.00% (+0.00, +0.00) n=5
+   phased   : +0.00% (+0.00, +0.00) n=6
+   high     : +0.00% (+0.00, +0.00) n=6
+   bvar     : +0.00% (+0.00, +0.00) n=2
+   chg8 x3  : +0.00% (+0.00, +0.00) n=3
+   chg8 x10 : +0.00% (+0.00, +0.00) n=3
+   incl. identical runs (0): +0.000% over 45 runs (16 not run)
+
+== Round 30 C (tight): verify step +12+1.5b ms for K >= 16 (step). tight vs G1 (paired %)
+short s8 step b=1 | tight vs G1  +1.72% | K G1 {'8': 2121, '16': 52, '32': 708} tight {'8': 2578, '16': 7, '32': 432} | W G1 {'2': 24, '4': 2659, '8': 198} tight {'2': 24, '4': 2783, '8': 210}
+short s9 step b=1 | tight vs G1  +2.21% | K G1 {'8': 2412, '16': 29, '32': 655} tight {'8': 2803, '16': 8, '32': 398} | W G1 {'2': 26, '4': 2724, '8': 346} tight {'2': 26, '4': 2963, '8': 220}
+long     step b=1 | tight vs G1  +1.69% | K G1 {'8': 7942, '16': 99, '32': 2103} tight {'8': 9127, '16': 8, '32': 1398} | W G1 {'2': 72, '4': 9485, '8': 587} tight {'2': 74, '4': 9851, '8': 608}
+short s8 step b=4 | tight vs G1  +1.59% | K G1 {'8': 1566, '16': 28, '32': 73} tight {'8': 1665, '16': 12, '32': 34} | W G1 {'2': 22, '4': 1524, '8': 121} tight {'2': 22, '4': 1569, '8': 120}
+short s9 step b=4 | tight vs G1  +1.53% | K G1 {'8': 1596, '16': 13, '32': 73} tight {'8': 1667, '16': 12, '32': 41} | W G1 {'2': 189, '4': 1378, '8': 115} tight {'2': 22, '4': 1572, '8': 126}
+long     step b=4 | tight vs G1  +1.66% | K G1 {'8': 5206, '16': 43, '32': 151} tight {'8': 5477, '16': 12, '32': 38} | W G1 {'2': 46, '4': 5065, '8': 289} tight {'2': 48, '4': 5185, '8': 294}
+  mean all: +1.73% (+1.53, +2.21)
+  mean 1: +1.87% (+1.69, +2.21)
+  mean 4: +1.59% (+1.53, +1.66)
+
+== Round 30 C (tight): round-28 worlds, tight vs G1 (paired %)
+short s8 base      mid  b=4 | tight vs G1  +0.05% |  | sw G1 [] tight []
+short s9 base      mid  b=4 | tight vs G1  +0.30% |  | sw G1 [] tight []
+short s8 base      mid  b=8 | tight vs G1  +0.79% |  | sw G1 [] tight []
+short s9 base      mid  b=8 | tight vs G1  +0.67% |  | sw G1 [] tight []
+short s8 het       het  b=4 | tight vs G1  -0.93% |  | sw G1 [[225, 4, 4, 2]] tight []
+short s9 het       het  b=4 | tight vs G1  -0.83% |  | sw G1 [[147, 4, 4, 2], [267, 4, 2, 4]] tight []
+short s8 het       het  b=8 | tight vs G1  +1.34% |  | sw G1 [[107, 8, 4, 2]] tight [[107, 8, 4, 2]]
+short s9 het       het  b=8 | tight vs G1  +1.43% |  | sw G1 [] tight []
+short s8 phased    het  b=4 | tight vs G1  +1.49% |  | sw G1 [[1033, 4, 4, 2], [1455, 4, 2, 4]] tight []
+short s9 phased    het  b=4 | tight vs G1  +0.07% |  | sw G1 [[127, 4, 4, 2]] tight [[127, 4, 4, 2]]
+short s8 phased    het  b=8 | tight vs G1  +1.54% |  | sw G1 [[953, 8, 4, 2]] tight [[991, 8, 4, 2]]
+short s9 phased    het  b=8 | tight vs G1  +0.21% |  | sw G1 [[993, 8, 4, 2]] tight [[1173, 8, 4, 2]]
+short s8 bvar      het  b=8 | tight vs G1  +2.36% |  | sw G1 [] tight [[427, 8, 4, 2]]
+short s9 bvar      het  b=8 | tight vs G1  +1.79% |  | sw G1 [[227, 2, 4, 8], [267, 2, 8, 4]] tight [[267, 2, 4, 2], [697, 4, 2, 4]]
+short s8 high      high b=4 | tight vs G1  +0.92% |  | sw G1 [[147, 4, 4, 2]] tight [[67, 4, 4, 2]]
+short s9 high      high b=4 | tight vs G1  -0.14% |  | sw G1 [[67, 4, 4, 2]] tight [[67, 4, 4, 2]]
+short s8 high      high b=8 | tight vs G1  -0.40% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s9 high      high b=8 | tight vs G1  -0.72% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s8 chg x3    mid  b=4 | tight vs G1  +0.69% |  | sw G1 [] tight []
+short s9 chg x3    mid  b=4 | tight vs G1  +0.12% |  | sw G1 [] tight []
+short s8 chg x0.3  high b=8 | tight vs G1  -0.46% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s9 chg x0.3  high b=8 | tight vs G1  -0.25% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s8 chg x0.3  mid  b=4 | tight vs G1  -0.35% |  | sw G1 [] tight [[667, 4, 4, 8], [1053, 4, 8, 4]]
+short s9 chg x0.3  mid  b=4 | tight vs G1  +0.46% |  | sw G1 [[687, 4, 4, 8], [849, 4, 8, 4]] tight []
+short s8 chg8 x0.3 mid  b=8 | tight vs G1  +0.62% |  | sw G1 [] tight []
+short s9 chg8 x0.3 mid  b=8 | tight vs G1  +0.26% |  | sw G1 [] tight []
+short s8 chg8 x3   mid  b=8 | tight vs G1  -0.02% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2]]
+short s9 chg8 x3   mid  b=8 | tight vs G1  +0.17% |  | sw G1 [[467, 8, 4, 2]] tight [[507, 8, 4, 2]]
+short s8 chg8 x10  mid  b=8 | tight vs G1  +0.18% |  | sw G1 [[889, 8, 4, 2], [2806, 2, 4, 2]] tight [[467, 8, 4, 2]]
+short s9 chg8 x10  mid  b=8 | tight vs G1  -1.52% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2], [2924, 1, 8, 4]]
+  means (min, max):
+   all      : +0.33% (-1.52, +2.36) n=30
+   static   : +0.55% (-0.93, +2.36) n=18
+   chg (r26): +0.03% (-0.46, +0.69) n=6
+   chg8     : -0.05% (-1.52, +0.62) n=6
+   short    : +0.33% (-1.52, +2.36) n=30
+   het      : +0.25% (-0.93, +1.43) n=4
+   phased   : +0.83% (+0.07, +1.54) n=4
+   high     : -0.09% (-0.72, +0.92) n=4
+   bvar     : +2.08% (+1.79, +2.36) n=2
+   chg8 x3  : +0.08% (-0.02, +0.17) n=2
+   chg8 x10 : -0.67% (-1.52, +0.18) n=2
+
+== Round 30b (src4: 4 rounds per K, tolerance from the check's pooled sd). paired % vs src (r30a) and vs G1
+short s8 R rtt alt   high b=8 | vs src  +0.21% vs G1  +0.31% | common/not src (4, 0) src4 (3, 0) | ev 0->0 probes 54->54
+short s9 R rtt alt   high b=8 | vs src  +0.04% vs G1  +0.14% | common/not src (4, 0) src4 (3, 0) | ev 0->0 probes 54->54
+long     R rtt alt   high b=8 | vs src  +0.57% vs G1  +1.55% | common/not src (9, 7) src4 (9, 0) | ev 3->0 probes 133->132
+short s8 R rtt alt   mid  b=4 | vs src  +1.59% vs G1  +0.70% | common/not src (2, 4) src4 (4, 0) | ev 2->0 probes 72->70
+short s9 R rtt alt   mid  b=4 | vs src  +0.49% vs G1  +1.63% | common/not src (1, 5) src4 (2, 1) | ev 2->1 probes 72->71
+long     R rtt alt   mid  b=4 | vs src  +0.51% vs G1  +1.07% | common/not src (3, 17) src4 (17, 0) | ev 5->0 probes 229->224
+short s8 R rtt jump  high b=8 | vs src  -0.12% vs G1  +0.58% | common/not src (0, 1) src4 (1, 0) | ev 1->0 probes 50->50
+short s9 R rtt jump  high b=8 | vs src  +0.12% vs G1  +0.62% | common/not src (0, 1) src4 (1, 0) | ev 1->0 probes 44->46
+long     R rtt jump  high b=8 | vs src  -0.13% vs G1  +0.25% | common/not src (0, 1) src4 (1, 0) | ev 1->0 probes 50->51
+short s8 R rtt jump  mid  b=4 | vs src  -0.30% vs G1  +0.21% | common/not src (1, 0) src4 (1, 0) | ev 0->0 probes 42->48
+short s9 R rtt jump  mid  b=4 | vs src  +0.39% vs G1  +1.19% | common/not src (1, 0) src4 (1, 0) | ev 0->0 probes 42->48
+long     R rtt jump  mid  b=4 | vs src  -0.16% vs G1  +0.07% | common/not src (1, 0) src4 (1, 0) | ev 0->0 probes 42->48
+short s8 S bvar      het  b=8 | vs src  -0.30% vs G1  +1.63% | common/not src (1, 0) src4 (1, 0) | ev 0->0 probes 42->48
+long     S bvar      het  b=8 | vs src  -0.02% vs G1  +0.08% | common/not src (1, 0) src4 (1, 0) | ev 0->0 probes 42->48
+short s9 S chg8 x10  mid  b=8 | vs src  -0.00% vs G1  +0.28% | common/not src (0, 1) src4 (0, 1) | ev 2->2 probes 72->78
+short s8 S het       het  b=4 | vs src  -0.28% vs G1  -0.72% | common/not src (0, 1) src4 (1, 0) | ev 1->0 probes 42->48
+long     S het       het  b=4 | vs src  -0.05% vs G1  -0.11% | common/not src (0, 1) src4 (1, 0) | ev 1->0 probes 48->48
+short s8 V vchg      high b=8 | vs src  -0.21% vs G1  +0.05% | common/not src (0, 1) src4 (0, 1) | ev 1->1 probes 49->54
+short s9 V vchg      high b=8 | vs src  +0.11% vs G1  +0.39% | common/not src (0, 1) src4 (0, 1) | ev 1->1 probes 44->51
+long     V vchg      high b=8 | vs src  -0.30% vs G1  -0.17% | common/not src (0, 1) src4 (0, 1) | ev 1->1 probes 50->62
+short s8 V vchg      mid  b=4 | vs src  +0.00% vs G1  +0.00% | common/not src (0, 0) src4 (0, 0) | ev 0->0 probes 36->36
+short s9 V vchg      mid  b=4 | vs src  +0.00% vs G1  +0.00% | common/not src (0, 0) src4 (0, 0) | ev 0->0 probes 36->36
+long     V vchg      mid  b=4 | vs src  +0.00% vs G1  +0.00% | common/not src (0, 0) src4 (0, 0) | ev 0->0 probes 36->36
+  means (min, max):
+   all      : vs src +0.09% (-0.30, +1.59); vs G1 +0.42% (-0.72, +1.63) n=23
+   rtt jump : vs src -0.04% (-0.30, +0.39); vs G1 +0.49% (+0.07, +1.19) n=6
+   rtt alt  : vs src +0.57% (+0.04, +1.59); vs G1 +0.90% (+0.14, +1.63) n=6
+   V        : vs src -0.07% (-0.30, +0.11); vs G1 +0.04% (-0.17, +0.39) n=6
+   S        : vs src -0.13% (-0.30, -0.00); vs G1 +0.23% (-0.72, +1.63) n=5
+   RTT worlds vs best fixed W: src -0.73% (min -1.37) n=12
+   RTT worlds vs best fixed W: src4 -0.47% (min -1.16) n=12
+== Round 30c (tight, long runs): round-28 worlds, tight vs G1 (paired %)
+long     base      mid  b=4 | tight vs G1  +0.33% |  | sw G1 [] tight []
+long     base      mid  b=8 | tight vs G1  +0.75% |  | sw G1 [] tight []
+long     het       het  b=4 | tight vs G1  +1.69% |  | sw G1 [[225, 4, 4, 2]] tight []
+long     het       het  b=8 | tight vs G1  +0.91% |  | sw G1 [[107, 8, 4, 2]] tight [[107, 8, 4, 2]]
+long     phased    het  b=4 | tight vs G1  +1.27% |  | sw G1 [[67, 4, 4, 2]] tight []
+long     phased    het  b=8 | tight vs G1  +0.24% |  | sw G1 [[3207, 8, 4, 2]] tight [[3831, 8, 4, 2]]
+long     bvar      het  b=8 | tight vs G1  +0.10% |  | sw G1 [[1230, 8, 4, 2]] tight [[1365, 8, 4, 2], [1505, 8, 2, 4]]
+long     high      high b=4 | tight vs G1  +0.07% |  | sw G1 [[147, 4, 4, 2]] tight [[67, 4, 4, 2]]
+long     high      high b=8 | tight vs G1  -0.67% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+long     chg x3    mid  b=4 | tight vs G1  +0.62% |  | sw G1 [] tight []
+long     chg x0.3  high b=8 | tight vs G1  -0.96% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+long     chg x0.3  mid  b=4 | tight vs G1  +0.18% |  | sw G1 [] tight [[667, 4, 4, 8], [1053, 4, 8, 4]]
+long     chg8 x0.3 mid  b=8 | tight vs G1  +0.64% |  | sw G1 [] tight []
+long     chg8 x3   mid  b=8 | tight vs G1  +0.12% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2]]
+long     chg8 x10  mid  b=8 | tight vs G1  +0.10% |  | sw G1 [[889, 8, 4, 2], [10613, 2, 4, 2]] tight [[467, 8, 4, 2]]
+  means (min, max):
+   all      : +0.36% (-0.96, +1.69) n=15
+   static   : +0.52% (-0.67, +1.69) n=9
+   chg (r26): -0.05% (-0.96, +0.62) n=3
+   chg8     : +0.29% (+0.10, +0.64) n=3
+   long     : +0.36% (-0.96, +1.69) n=15
+   het      : +1.30% (+0.91, +1.69) n=2
+   phased   : +0.75% (+0.24, +1.27) n=2
+   high     : -0.30% (-0.67, +0.07) n=2
+   bvar     : +0.10% (+0.10, +0.10) n=1
+   chg8 x3  : +0.12% (+0.12, +0.12) n=1
+   chg8 x10 : +0.10% (+0.10, +0.10) n=1
+
+== Round 30 C + 30c (tight, short and long): round-28 worlds, tight vs G1 (paired %)
+short s8 base      mid  b=4 | tight vs G1  +0.05% |  | sw G1 [] tight []
+short s9 base      mid  b=4 | tight vs G1  +0.30% |  | sw G1 [] tight []
+long     base      mid  b=4 | tight vs G1  +0.33% |  | sw G1 [] tight []
+short s8 base      mid  b=8 | tight vs G1  +0.79% |  | sw G1 [] tight []
+short s9 base      mid  b=8 | tight vs G1  +0.67% |  | sw G1 [] tight []
+long     base      mid  b=8 | tight vs G1  +0.75% |  | sw G1 [] tight []
+short s8 het       het  b=4 | tight vs G1  -0.93% |  | sw G1 [[225, 4, 4, 2]] tight []
+short s9 het       het  b=4 | tight vs G1  -0.83% |  | sw G1 [[147, 4, 4, 2], [267, 4, 2, 4]] tight []
+long     het       het  b=4 | tight vs G1  +1.69% |  | sw G1 [[225, 4, 4, 2]] tight []
+short s8 het       het  b=8 | tight vs G1  +1.34% |  | sw G1 [[107, 8, 4, 2]] tight [[107, 8, 4, 2]]
+short s9 het       het  b=8 | tight vs G1  +1.43% |  | sw G1 [] tight []
+long     het       het  b=8 | tight vs G1  +0.91% |  | sw G1 [[107, 8, 4, 2]] tight [[107, 8, 4, 2]]
+short s8 phased    het  b=4 | tight vs G1  +1.49% |  | sw G1 [[1033, 4, 4, 2], [1455, 4, 2, 4]] tight []
+short s9 phased    het  b=4 | tight vs G1  +0.07% |  | sw G1 [[127, 4, 4, 2]] tight [[127, 4, 4, 2]]
+long     phased    het  b=4 | tight vs G1  +1.27% |  | sw G1 [[67, 4, 4, 2]] tight []
+short s8 phased    het  b=8 | tight vs G1  +1.54% |  | sw G1 [[953, 8, 4, 2]] tight [[991, 8, 4, 2]]
+short s9 phased    het  b=8 | tight vs G1  +0.21% |  | sw G1 [[993, 8, 4, 2]] tight [[1173, 8, 4, 2]]
+long     phased    het  b=8 | tight vs G1  +0.24% |  | sw G1 [[3207, 8, 4, 2]] tight [[3831, 8, 4, 2]]
+short s8 bvar      het  b=8 | tight vs G1  +2.36% |  | sw G1 [] tight [[427, 8, 4, 2]]
+short s9 bvar      het  b=8 | tight vs G1  +1.79% |  | sw G1 [[227, 2, 4, 8], [267, 2, 8, 4]] tight [[267, 2, 4, 2], [697, 4, 2, 4]]
+long     bvar      het  b=8 | tight vs G1  +0.10% |  | sw G1 [[1230, 8, 4, 2]] tight [[1365, 8, 4, 2], [1505, 8, 2, 4]]
+short s8 high      high b=4 | tight vs G1  +0.92% |  | sw G1 [[147, 4, 4, 2]] tight [[67, 4, 4, 2]]
+short s9 high      high b=4 | tight vs G1  -0.14% |  | sw G1 [[67, 4, 4, 2]] tight [[67, 4, 4, 2]]
+long     high      high b=4 | tight vs G1  +0.07% |  | sw G1 [[147, 4, 4, 2]] tight [[67, 4, 4, 2]]
+short s8 high      high b=8 | tight vs G1  -0.40% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s9 high      high b=8 | tight vs G1  -0.72% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+long     high      high b=8 | tight vs G1  -0.67% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s8 chg x3    mid  b=4 | tight vs G1  +0.69% |  | sw G1 [] tight []
+short s9 chg x3    mid  b=4 | tight vs G1  +0.12% |  | sw G1 [] tight []
+long     chg x3    mid  b=4 | tight vs G1  +0.62% |  | sw G1 [] tight []
+short s8 chg x0.3  high b=8 | tight vs G1  -0.46% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s9 chg x0.3  high b=8 | tight vs G1  -0.25% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+long     chg x0.3  high b=8 | tight vs G1  -0.96% |  | sw G1 [[67, 8, 4, 2]] tight [[67, 8, 4, 2]]
+short s8 chg x0.3  mid  b=4 | tight vs G1  -0.35% |  | sw G1 [] tight [[667, 4, 4, 8], [1053, 4, 8, 4]]
+short s9 chg x0.3  mid  b=4 | tight vs G1  +0.46% |  | sw G1 [[687, 4, 4, 8], [849, 4, 8, 4]] tight []
+long     chg x0.3  mid  b=4 | tight vs G1  +0.18% |  | sw G1 [] tight [[667, 4, 4, 8], [1053, 4, 8, 4]]
+short s8 chg8 x0.3 mid  b=8 | tight vs G1  +0.62% |  | sw G1 [] tight []
+short s9 chg8 x0.3 mid  b=8 | tight vs G1  +0.26% |  | sw G1 [] tight []
+long     chg8 x0.3 mid  b=8 | tight vs G1  +0.64% |  | sw G1 [] tight []
+short s8 chg8 x3   mid  b=8 | tight vs G1  -0.02% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2]]
+short s9 chg8 x3   mid  b=8 | tight vs G1  +0.17% |  | sw G1 [[467, 8, 4, 2]] tight [[507, 8, 4, 2]]
+long     chg8 x3   mid  b=8 | tight vs G1  +0.12% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2]]
+short s8 chg8 x10  mid  b=8 | tight vs G1  +0.18% |  | sw G1 [[889, 8, 4, 2], [2806, 2, 4, 2]] tight [[467, 8, 4, 2]]
+short s9 chg8 x10  mid  b=8 | tight vs G1  -1.52% |  | sw G1 [[467, 8, 4, 2]] tight [[527, 8, 4, 2], [2924, 1, 8, 4]]
+long     chg8 x10  mid  b=8 | tight vs G1  +0.10% |  | sw G1 [[889, 8, 4, 2], [10613, 2, 4, 2]] tight [[467, 8, 4, 2]]
+  means (min, max):
+   all      : +0.34% (-1.52, +2.36) n=45
+   static   : +0.54% (-0.93, +2.36) n=27
+   chg (r26): +0.00% (-0.96, +0.69) n=9
+   chg8     : +0.06% (-1.52, +0.64) n=9
+   short    : +0.33% (-1.52, +2.36) n=30
+   long     : +0.36% (-0.96, +1.69) n=15
+   het      : +0.60% (-0.93, +1.69) n=6
+   phased   : +0.80% (+0.07, +1.54) n=6
+   high     : -0.16% (-0.72, +0.92) n=6
+   bvar     : +1.42% (+0.10, +2.36) n=3
+   chg8 x3  : +0.09% (-0.02, +0.17) n=3
+   chg8 x10 : -0.42% (-1.52, +0.18) n=3
+

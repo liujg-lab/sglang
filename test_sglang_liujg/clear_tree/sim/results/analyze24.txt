@@ -1,0 +1,75 @@
+== Round 24: is the paired replay biased against narrower W? (seed 8; one fixed built width per run)
+   replay est vs TRUE (own trees) in % of tokens/round; bias = est - TRUE; components of TRUE - est on the Wn side:
+   narrowing (ext12.narrowed vs a real Wn tree), exits/stop (own rule vs the built schedule), depth (no cap)
+ext20 high short b=8 | fixed rate 2:331.3 4:313.7 8:268.7 (best 2; 2 vs 4 +5.6%)
+   built 4, 2 vs 4: est  +5.47% (+-0.22) TRUE  +5.81% (+-0.24) bias -0.33 | deep-round est +5.61% | narrowing +0.07; exits/stop +0.17; depth +0.09 | deeper rounds 12%
+   built 8, 4 vs 8: est +13.79% (+-0.17) TRUE +15.03% (+-0.22) bias -1.24 | deep-round est +14.03% | narrowing -0.01; exits/stop +0.86; depth +0.38 | deeper rounds 23%
+   built 8, 2 vs 8: est +17.76% (+-0.29) TRUE +18.90% (+-0.33) bias -1.14 | deep-round est +17.86% | narrowing -0.12; exits/stop +0.92; depth +0.32 | deeper rounds 23%
+   built 8, 2 vs 4 (both replayed): est  +3.97% (+-0.22) TRUE  +3.87% (+-0.27) bias +0.10 | deep-round est +3.83% | per-round sd 6.2% | need 71 rounds
+   built 4: 2 vs 4 need 41 rounds;  k mismatch (replay K vs built K) 0/762, 0/760
+ext20 high short b=4 | fixed rate 2:222.8 4:221.2 8:198.4 (best 2; 2 vs 4 +0.7%)
+   built 4, 2 vs 4: est  +1.71% (+-0.33) TRUE  +1.61% (+-0.36) bias +0.10 | deep-round est +1.75% | narrowing -0.11; exits/stop +0.02; depth -0.02 | deeper rounds 5%
+   built 8, 4 vs 8: est  +9.83% (+-0.20) TRUE +10.69% (+-0.24) bias -0.86 | deep-round est +10.37% | narrowing +0.09; exits/stop +0.34; depth +0.43 | deeper rounds 21%
+   built 8, 2 vs 8: est +11.47% (+-0.35) TRUE +11.90% (+-0.38) bias -0.43 | deep-round est +11.81% | narrowing +0.02; exits/stop +0.14; depth +0.26 | deeper rounds 19%
+   built 8, 2 vs 4 (both replayed): est  +1.64% (+-0.30) TRUE  +1.20% (+-0.33) bias +0.44 | deep-round est +1.44% | per-round sd 8.1% | need 2056 rounds
+   built 4: 2 vs 4 need 2057 rounds;  k mismatch (replay K vs built K) 0/734, 0/732
+ext20 mid  short b=8 | fixed rate 2:214.2 4:218.1 8:200.8 (best 4; 2 vs 4 -1.8%)
+   built 4, 2 vs 4: est  +0.08% (+-0.21) TRUE  -0.63% (+-0.21) bias +0.72 | deep-round est -0.82% | narrowing +0.00; exits/stop -0.53; depth -0.19 | deeper rounds 16%
+   built 8, 4 vs 8: est  +8.02% (+-0.17) TRUE  +7.28% (+-0.21) bias +0.74 | deep-round est +6.83% | narrowing -0.05; exits/stop -0.31; depth -0.39 | deeper rounds 36%
+   built 8, 2 vs 8: est  +6.78% (+-0.25) TRUE  +6.03% (+-0.30) bias +0.75 | deep-round est +5.11% | narrowing -0.08; exits/stop -0.33; depth -0.34 | deeper rounds 35%
+   built 8, 2 vs 4 (both replayed): est  -1.24% (+-0.19) TRUE  -1.25% (+-0.22) bias +0.01 | deep-round est -1.72% | per-round sd 6.9% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/1481, 0/1373
+ext20 mid  short b=4 | fixed rate 2:140.5 4:146.5 8:143.5 (best 4; 2 vs 4 -4.1%)
+   built 4, 2 vs 4: est  -2.84% (+-0.33) TRUE  -3.66% (+-0.34) bias +0.82 | deep-round est -3.63% | narrowing +0.02; exits/stop -0.59; depth -0.25 | deeper rounds 10%
+   built 8, 4 vs 8: est  +4.20% (+-0.26) TRUE  +3.52% (+-0.29) bias +0.67 | deep-round est +3.26% | narrowing -0.04; exits/stop -0.28; depth -0.36 | deeper rounds 32%
+   built 8, 2 vs 8: est  +0.69% (+-0.36) TRUE  +0.21% (+-0.40) bias +0.48 | deep-round est -0.37% | narrowing +0.01; exits/stop -0.24; depth -0.25 | deeper rounds 21%
+   built 8, 2 vs 4 (both replayed): est  -3.50% (+-0.27) TRUE  -3.31% (+-0.33) bias -0.19 | deep-round est -3.63% | per-round sd 9.9% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/1429, 0/1301
+ext20 het  mixed b=8 | fixed rate 2:132.7 4:130.4 8:114.3 (best 2; 2 vs 4 +1.8%)
+   built 4, 2 vs 4: est  +2.97% (+-0.18) TRUE  +2.17% (+-0.20) bias +0.81 | deep-round est +1.56% | narrowing +0.06; exits/stop -0.55; depth -0.32 | deeper rounds 28%
+   built 8, 4 vs 8: est +11.35% (+-0.16) TRUE +10.60% (+-0.22) bias +0.74 | deep-round est +10.52% | narrowing +0.05; exits/stop -0.54; depth -0.25 | deeper rounds 48%
+   built 8, 2 vs 8: est +11.74% (+-0.22) TRUE +12.63% (+-0.30) bias -0.90 | deep-round est +10.05% | narrowing +0.01; exits/stop +0.91; depth -0.01 | deeper rounds 48%
+   built 8, 2 vs 4 (both replayed): est  +0.39% (+-0.16) TRUE  +2.03% (+-0.21) bias -1.64 | deep-round est -0.47% | per-round sd 6.8% | need inf rounds
+   built 4: 2 vs 4 need 203 rounds;  k mismatch (replay K vs built K) 0/1867, 0/1855
+ext20 het  mixed b=4 | fixed rate 2:98.6 4:97.7 8:89.5 (best 2; 2 vs 4 +0.8%)
+   built 4, 2 vs 4: est  +1.08% (+-0.27) TRUE  +0.09% (+-0.29) bias +0.99 | deep-round est -0.44% | narrowing -0.03; exits/stop -0.57; depth -0.39 | deeper rounds 16%
+   built 8, 4 vs 8: est  +9.29% (+-0.24) TRUE  +8.31% (+-0.28) bias +0.98 | deep-round est +8.06% | narrowing -0.07; exits/stop -0.60; depth -0.31 | deeper rounds 35%
+   built 8, 2 vs 8: est  +8.56% (+-0.34) TRUE  +8.55% (+-0.40) bias +0.01 | deep-round est +6.83% | narrowing +0.00; exits/stop +0.06; depth -0.07 | deeper rounds 31%
+   built 8, 2 vs 4 (both replayed): est  -0.73% (+-0.24) TRUE  +0.24% (+-0.30) bias -0.97 | deep-round est -1.22% | per-round sd 9.7% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/1637, 0/1558
+ext15 high base  b=8 | fixed rate 2:382.3 4:374.6 8:329.5 (best 2; 2 vs 4 +2.1%)
+   built 4, 2 vs 4: est  +2.83% (+-0.25) TRUE  +2.88% (+-0.26) bias -0.05 | cut-rule est +2.81% | narrowing -0.00; exits/stop +0.04; depth +0.00 | deeper rounds 3%
+   built 8, 4 vs 8: est +11.53% (+-0.16) TRUE +12.45% (+-0.20) bias -0.92 | cut-rule est +11.54% | narrowing +0.05; exits/stop +0.54; depth +0.32 | deeper rounds 18%
+   built 8, 2 vs 8: est +13.26% (+-0.28) TRUE +13.81% (+-0.31) bias -0.55 | cut-rule est +13.25% | narrowing +0.01; exits/stop +0.38; depth +0.15 | deeper rounds 17%
+   built 8, 2 vs 4 (both replayed): est  +1.73% (+-0.23) TRUE  +1.36% (+-0.26) bias +0.37 | cut-rule est +1.71% | per-round sd 6.3% | need 938 rounds
+   built 4: 2 vs 4 need 182 rounds;  k mismatch (replay K vs built K) 0/736, 0/739
+ext15 high base  b=4 | fixed rate 2:246.7 4:248.5 8:229.5 (best 4; 2 vs 4 -0.7%)
+   built 4, 2 vs 4: est  -0.57% (+-0.35) TRUE  -0.67% (+-0.37) bias +0.10 | cut-rule est -0.47% | narrowing -0.07; exits/stop -0.01; depth -0.04 | deeper rounds 3%
+   built 8, 4 vs 8: est  +7.71% (+-0.19) TRUE  +7.90% (+-0.22) bias -0.19 | cut-rule est +7.67% | narrowing -0.16; exits/stop +0.13; depth +0.21 | deeper rounds 17%
+   built 8, 2 vs 8: est  +6.98% (+-0.37) TRUE  +7.21% (+-0.39) bias -0.22 | cut-rule est +6.93% | narrowing -0.01; exits/stop +0.14; depth +0.10 | deeper rounds 14%
+   built 8, 2 vs 4 (both replayed): est  -0.73% (+-0.33) TRUE  -0.69% (+-0.35) bias -0.04 | cut-rule est -0.74% | per-round sd 9.0% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/728, 0/724
+ext15 mid  base  b=8 | fixed rate 2:241.2 4:251.4 8:240.0 (best 4; 2 vs 4 -4.1%)
+   built 4, 2 vs 4: est  -3.50% (+-0.22) TRUE  -2.92% (+-0.24) bias -0.57 | cut-rule est -2.29% | narrowing +0.07; exits/stop +0.69; depth -0.19 | deeper rounds 12%
+   built 8, 4 vs 8: est  +4.02% (+-0.18) TRUE  +3.81% (+-0.20) bias +0.21 | cut-rule est +4.58% | narrowing -0.09; exits/stop +0.06; depth -0.17 | deeper rounds 34%
+   built 8, 2 vs 8: est  +0.71% (+-0.26) TRUE  +1.02% (+-0.27) bias -0.31 | cut-rule est +1.53% | narrowing -0.02; exits/stop +0.57; depth -0.24 | deeper rounds 25%
+   built 8, 2 vs 4 (both replayed): est  -3.31% (+-0.21) TRUE  -2.79% (+-0.23) bias -0.52 | cut-rule est -3.05% | per-round sd 7.7% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/1438, 0/1328
+ext15 mid  base  b=4 | fixed rate 2:152.7 4:162.5 8:162.0 (best 4; 2 vs 4 -6.0%)
+   built 4, 2 vs 4: est  -6.42% (+-0.35) TRUE  -5.30% (+-0.35) bias -1.11 | cut-rule est -4.73% | narrowing +0.17; exits/stop +1.15; depth -0.20 | deeper rounds 7%
+   built 8, 4 vs 8: est  +0.77% (+-0.27) TRUE  +0.90% (+-0.30) bias -0.13 | cut-rule est +1.51% | narrowing -0.09; exits/stop +0.46; depth -0.25 | deeper rounds 32%
+   built 8, 2 vs 8: est  -5.23% (+-0.39) TRUE  -4.17% (+-0.40) bias -1.06 | cut-rule est -3.69% | narrowing +0.07; exits/stop +1.17; depth -0.18 | deeper rounds 17%
+   built 8, 2 vs 4 (both replayed): est  -6.00% (+-0.32) TRUE  -5.07% (+-0.34) bias -0.93 | cut-rule est -5.20% | per-round sd 11.7% | need inf rounds
+   built 4: 2 vs 4 need inf rounds;  k mismatch (replay K vs built K) 0/1389, 0/1297
+
+  2 vs 4 from W=8 trees (what a window built at 8 compares): est / TRUE / need / long-run rate 2 vs 4
+   ext20 high b=8: est +3.97%  TRUE +3.87%  bias +0.10  need 71  rate +5.6%
+   ext20 high b=4: est +1.64%  TRUE +1.20%  bias +0.44  need 2056  rate +0.7%
+   ext20 mid  b=8: est -1.24%  TRUE -1.25%  bias +0.01  need inf  rate -1.8%
+   ext20 mid  b=4: est -3.50%  TRUE -3.31%  bias -0.19  need inf  rate -4.1%
+   ext20 het  b=8: est +0.39%  TRUE +2.03%  bias -1.64  need inf  rate +1.8%
+   ext20 het  b=4: est -0.73%  TRUE +0.24%  bias -0.97  need inf  rate +0.8%
+   ext15 high b=8: est +1.73%  TRUE +1.36%  bias +0.37  need 938  rate +2.1%
+   ext15 high b=4: est -0.73%  TRUE -0.69%  bias -0.04  need inf  rate -0.7%
+   ext15 mid  b=8: est -3.31%  TRUE -2.79%  bias -0.52  need inf  rate -4.1%
+   ext15 mid  b=4: est -6.00%  TRUE -5.07%  bias -0.93  need inf  rate -6.0%

@@ -1,0 +1,31 @@
+== Round 20: flat starting table; costs known vs learned online (timing probes). Seed 8. % vs the best fixed W
+   (rerun here); [probe / calibration share of spec rounds; cost events; layer-cost error; verify K-diff error]
+base     mid  b=1 | best fixed W=8   59.1 | flat known +0.00% | flat online -0.28% [probe 0.7%, cal 0.0%, ev 0, lt 0.6%, vK 203%] | calib known +0.00% [probe 0.0%, cal 13.2%, ev 0, lt -, vK -] | calib online -0.28% [probe 0.7%, cal 12.9%, ev 0, lt 0.6%, vK 203%]
+base     mid  b=4 | best fixed W=4  162.5 | flat known +0.07% | flat online -0.37% [probe 2.6%, cal 0.0%, ev 0, lt 1.1%, vK 49%] | calib known -0.29% [probe 0.0%, cal 14.4%, ev 0, lt -, vK -] | calib online +0.04% [probe 2.6%, cal 14.4%, ev 0, lt 1.3%, vK 233%]
+base     mid  b=8 | best fixed W=4  251.4 | flat known -0.00% | flat online -0.78% [probe 2.9%, cal 0.0%, ev 0, lt 1.4%, vK 42%] | calib known -0.38% [probe 0.0%, cal 4.6%, ev 0, lt -, vK -] | calib online -0.62% [probe 2.8%, cal 4.3%, ev 0, lt 1.4%, vK 142%]
+base     high b=1 | best fixed W=4   82.4 | flat known -0.70% | flat online -0.81% [probe 1.2%, cal 0.0%, ev 0, lt 0.5%, vK 42%] | calib known -0.70% [probe 0.0%, cal 13.5%, ev 0, lt -, vK -] | calib online -0.81% [probe 1.2%, cal 15.7%, ev 0, lt 0.5%, vK 42%]
+base     high b=4 | best fixed W=4  248.5 | flat known -0.04% | flat online -0.47% [probe 3.2%, cal 0.0%, ev 0, lt 0.7%, vK 299%] | calib known -0.27% [probe 0.0%, cal 27.1%, ev 0, lt -, vK -] | calib online -0.32% [probe 3.0%, cal 27.1%, ev 0, lt 1.6%, vK 325%]
+base     high b=8 | best fixed W=2  382.3 | flat known -2.02% | flat online -2.29% [probe 5.0%, cal 0.0%, ev 0, lt 0.9%, vK 19%] | calib known -2.39% [probe 0.0%, cal 26.9%, ev 0, lt -, vK -] | calib online -2.87% [probe 5.1%, cal 26.7%, ev 0, lt 1.6%, vK 59%]
+tok x0.3 mid  b=1 | best fixed W=8   61.0 | flat known +0.00% | flat online +0.30% [probe 0.8%, cal 0.0%, ev 0, lt 1.4%, vK 205%] | calib known +0.00% [probe 0.0%, cal 9.4%, ev 0, lt -, vK -] | calib online +0.30% [probe 0.8%, cal 8.2%, ev 0, lt 1.4%, vK 205%]
+tok x0.3 mid  b=4 | best fixed W=8  180.1 | flat known -3.99% | flat online -5.14% [probe 2.6%, cal 0.0%, ev 0, lt 0.9%, vK 204%] | calib known -0.67% [probe 0.0%, cal 7.7%, ev 0, lt -, vK -] | calib online -0.66% [probe 2.8%, cal 9.6%, ev 0, lt 0.8%, vK 101%]
+tok x0.3 mid  b=8 | best fixed W=8  280.3 | flat known -2.84% | flat online -3.09% [probe 2.9%, cal 0.0%, ev 0, lt 1.4%, vK 93%] | calib known -2.15% [probe 0.0%, cal 14.3%, ev 0, lt -, vK -] | calib online -2.60% [probe 2.9%, cal 14.3%, ev 0, lt 1.4%, vK 104%]
+tok x0.3 high b=1 | best fixed W=8   86.0 | flat known +0.00% | flat online +0.01% [probe 1.2%, cal 0.0%, ev 0, lt 0.8%, vK 62%] | calib known +0.00% [probe 0.0%, cal 15.0%, ev 0, lt -, vK -] | calib online +0.01% [probe 1.2%, cal 14.9%, ev 0, lt 0.8%, vK 62%]
+tok x0.3 high b=4 | best fixed W=4  267.7 | flat known -0.07% | flat online +0.02% [probe 2.9%, cal 0.0%, ev 0, lt 1.7%, vK 59%] | calib known -0.20% [probe 0.0%, cal 8.4%, ev 0, lt -, vK -] | calib online -0.04% [probe 3.0%, cal 11.3%, ev 0, lt 1.4%, vK 493%]
+tok x0.3 high b=8 | best fixed W=4  422.6 | flat known -0.01% | flat online -0.62% [probe 5.0%, cal 0.0%, ev 0, lt 0.5%, vK 78%] | calib known -0.22% [probe 0.0%, cal 8.4%, ev 0, lt -, vK -] | calib online -0.85% [probe 5.0%, cal 4.9%, ev 0, lt 0.6%, vK 32%]
+change   mid  b=1 | best fixed W=8   54.1 | flat known +0.00% | flat online +0.26% [probe 1.5%, cal 0.0%, ev 1, lt 0.5%, vK 203%] | calib known +0.00% [probe 0.0%, cal 18.9%, ev 0, lt -, vK -] | calib online +0.26% [probe 1.5%, cal 19.0%, ev 1, lt 0.5%, vK 203%]
+change   mid  b=4 | best fixed W=4  143.7 | flat known -0.01% | flat online -0.21% [probe 3.7%, cal 0.0%, ev 1, lt 1.1%, vK 67%] | calib known -0.58% [probe 0.0%, cal 20.9%, ev 0, lt -, vK -] | calib online +0.07% [probe 3.7%, cal 19.2%, ev 1, lt 1.4%, vK 171%]
+change   mid  b=8 | best fixed W=2  222.3 | flat known -0.98% | flat online -1.34% [probe 11.0%, cal 0.0%, ev 1, lt 1.4%, vK 51%] | calib known -1.03% [probe 0.0%, cal 22.0%, ev 0, lt -, vK -] | calib online -1.36% [probe 12.9%, cal 25.6%, ev 1, lt 1.1%, vK 210%]
+change   high b=1 | best fixed W=4   78.0 | flat known -5.44% | flat online -5.42% [probe 2.4%, cal 0.0%, ev 1, lt 0.7%, vK 143%] | calib known -0.48% [probe 0.0%, cal 12.1%, ev 0, lt -, vK -] | calib online -0.63% [probe 2.4%, cal 9.5%, ev 1, lt 1.0%, vK 141%]
+change   high b=4 | best fixed W=2  225.8 | flat known -4.66% | flat online -5.38% [probe 5.8%, cal 0.0%, ev 1, lt 0.9%, vK 403%] | calib known -1.95% [probe 0.0%, cal 13.9%, ev 0, lt -, vK -] | calib online -2.31% [probe 5.4%, cal 13.2%, ev 1, lt 1.3%, vK 196%]
+change   high b=8 | best fixed W=2  337.6 | flat known -11.47% | flat online -11.34% [probe 7.0%, cal 0.0%, ev 1, lt 0.7%, vK 21%] | calib known -2.98% [probe 0.0%, cal 13.5%, ev 0, lt -, vK -] | calib online -3.79% [probe 6.6%, cal 13.0%, ev 1, lt 1.1%, vK 48%]
+
+  means (min) vs the best fixed W:
+   base    : flat known -0.45% (-2.0); flat online -0.83% (-2.3); calib known -0.67% (-2.4); calib online -0.81% (-2.9)
+   tok x0.3: flat known -1.15% (-4.0); flat online -1.42% (-5.1); calib known -0.54% (-2.2); calib online -0.64% (-2.6)
+   change  : flat known -3.76% (-11.5); flat online -3.91% (-11.3); calib known -1.17% (-3.0); calib online -1.29% (-3.8)
+   all     : flat known -1.79%; flat online -2.05%; calib known -0.79%; calib online -0.91%
+
+  paired gaps (same scenario):
+   base    : flat: online - known -0.38% (min -0.8, max -0.1); calib: online - known -0.14% (min -0.5, max +0.3); calib online - flat known -0.36% (min -0.9, max -0.0)
+   tok x0.3: flat: online - known -0.28% (min -1.2, max +0.3); calib: online - known -0.10% (min -0.6, max +0.3); calib online - flat known +0.54% (min -0.8, max +3.5)
+   change  : flat: online - known -0.15% (min -0.8, max +0.3); calib: online - known -0.13% (min -0.8, max +0.6); calib online - flat known +2.70% (min -0.4, max +8.7)

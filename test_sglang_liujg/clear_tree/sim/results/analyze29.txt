@@ -1,0 +1,180 @@
+== Round 29 W: speculation switch (D42), Target-only scaled so fixed W=4 wins ~12%. % vs best of Target-only and
+   fixed W + switch; [spec share]; switch log (ms, decision); timing-probe rounds
+short s8 b=4 | Target-only -12.1% | fixed 2 -4.8%[0.91] fixed 4 +0.0%[1.00] fixed 8 -2.7%[1.00]
+     v11   +0.10% [1.00] probes 36 gaps 0 sw 0 [] W-switch []
+     G3    -0.47% [1.00] probes 36 gaps 0 sw 0 [] W-switch []
+     G4    +0.17% [1.00] probes 26 gaps 0 sw 0 [] W-switch []
+     all   -0.05% [1.00] probes 28 gaps 0 sw 0 [] W-switch []
+short s9 b=4 | Target-only -12.2% | fixed 2 -5.1%[1.00] fixed 4 +0.0%[1.00] fixed 8 -3.6%[1.00]
+     v11   -0.56% [1.00] probes 36 gaps 0 sw 0 [] W-switch []
+     G3    -0.56% [1.00] probes 36 gaps 0 sw 0 [] W-switch []
+     G4    -0.94% [1.00] probes 30 gaps 0 sw 0 [] W-switch []
+     all   -0.65% [1.00] probes 27 gaps 0 sw 0 [] W-switch []
+long     b=4 | Target-only -13.9% | fixed 2 -4.3%[0.91] fixed 4 +0.0%[1.00] fixed 8 -3.5%[1.00]
+     v11   -0.67% [0.97] probes 36 gaps 0 sw 4 [[221762, 'exit'], [222740, 'spec'], [250199, 'exit'], [269784, 'spec']] W-switch []
+     G3    -0.14% [1.00] probes 36 gaps 0 sw 2 [[222167, 'exit'], [223128, 'spec']] W-switch []
+     G4    -0.27% [0.97] probes 27 gaps 1 sw 3 [[219768, 'exit'], [220563, 'ar'], [236720, 'spec']] W-switch []
+     all   -0.90% [0.97] probes 24 gaps 1 sw 4 [[221864, 'exit'], [222803, 'spec'], [252515, 'exit'], [271361, 'spec']] W-switch []
+short s8 b=8 | Target-only -10.7% | fixed 2 -2.1%[1.00] fixed 4 +0.0%[1.00] fixed 8 -8.4%[0.77]
+     v11   -0.88% [1.00] probes 43 gaps 0 sw 1 [[1421, 'spec']] W-switch []
+     G3    -1.08% [1.00] probes 50 gaps 0 sw 1 [[1421, 'spec']] W-switch []
+     G4    -1.06% [1.00] probes 31 gaps 0 sw 1 [[1421, 'spec']] W-switch []
+     all   -0.97% [1.00] probes 30 gaps 0 sw 1 [[1421, 'spec']] W-switch []
+short s9 b=8 | Target-only -11.8% | fixed 2 -1.8%[1.00] fixed 4 +0.0%[1.00] fixed 8 -8.2%[1.00]
+     v11   -0.77% [1.00] probes 39 gaps 0 sw 1 [[1407, 'spec']] W-switch []
+     G3    -0.63% [1.00] probes 40 gaps 0 sw 1 [[1407, 'spec']] W-switch []
+     G4    -0.60% [1.00] probes 29 gaps 0 sw 1 [[1407, 'spec']] W-switch []
+     all   -0.68% [1.00] probes 29 gaps 0 sw 1 [[1407, 'spec']] W-switch []
+long     b=8 | Target-only -11.7% | fixed 2 -1.1%[1.00] fixed 4 +0.0%[1.00] fixed 8 -8.9%[0.79]
+     v11   -0.64% [1.00] probes 41 gaps 0 sw 2 [[1421, 'spec'], [740469, 'spec']] W-switch []
+     G3    -0.48% [1.00] probes 39 gaps 0 sw 2 [[1421, 'spec'], [739800, 'spec']] W-switch []
+     G4    -0.58% [1.00] probes 32 gaps 0 sw 2 [[1421, 'spec'], [740351, 'spec']] W-switch []
+     all   -0.61% [1.00] probes 29 gaps 1 sw 2 [[1421, 'spec'], [740878, 'ar']] W-switch []
+  means (min):
+   all  : v11 -0.57% (-0.9); G3 -0.56% (-1.1); G4 -0.55% (-1.1); all -0.64% (-1.0)
+   b=4  : v11 -0.38% (-0.7); G3 -0.39% (-0.6); G4 -0.35% (-0.9); all -0.53% (-0.9)
+   b=8  : v11 -0.76% (-0.9); G3 -0.73% (-1.1); G4 -0.75% (-1.1); all -0.75% (-1.0)
+   short: v11 -0.53% (-0.9); G3 -0.68% (-1.1); G4 -0.61% (-1.1); all -0.59% (-1.0)
+   long : v11 -0.66% (-0.7); G3 -0.31% (-0.5); G4 -0.42% (-0.6); all -0.75% (-0.9)
+
+== Round 29 R: RTT jump 4->24 ms at spec round 400 / RTT alternating 4<->40 ms every 100 rounds from 400.
+   % vs best fixed W (known costs); events / suppressed / timing-probe rounds; W switches
+short s8 rtt alt  high b=8 best 2 | fixed 2 +0.0% fixed 4 -4.9% fixed 8 -17.8%
+     v11 novd  -2.02% ev 0 supp 0 probes 39 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     v11       -2.48% ev 4 supp 0 probes 108 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     G1        -1.46% ev 2 supp 13 probes 54 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+     G3        -2.85% ev 4 supp 0 probes 109 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     all       -2.38% ev 2 supp 15 probes 54 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+short s9 rtt alt  high b=8 best 2 | fixed 2 +0.0% fixed 4 -5.5% fixed 8 -17.9%
+     v11 novd  -1.71% ev 0 supp 0 probes 35 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     v11       -2.40% ev 4 supp 0 probes 107 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G1        -1.19% ev 2 supp 14 probes 54 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+     G3        -2.33% ev 4 supp 0 probes 108 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     all       -2.12% ev 2 supp 12 probes 54 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+long     rtt alt  high b=8 best 2 | fixed 2 +0.0% fixed 4 -5.4% fixed 8 -17.9%
+     v11 novd  -2.21% ev 0 supp 0 probes 39 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     v11       -3.04% ev 22 supp 0 probes 433 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G1        -2.30% ev 4 supp 65 probes 111 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G3        -2.79% ev 23 supp 0 probes 450 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     all       -2.36% ev 4 supp 83 probes 95 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+short s8 rtt alt  mid  b=4 best 4 | fixed 2 -5.4% fixed 4 +0.0% fixed 8 -1.9%
+     v11 novd  +0.33% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       -0.52% ev 10 supp 0 probes 216 sw 0 [] final {'4': 4, '1': 8}
+     G1        -0.45% ev 3 supp 39 probes 71 sw 0 [] final {'4': 4, '1': 8}
+     G3        -0.86% ev 10 supp 0 probes 216 sw 0 [] final {'4': 4, '1': 8}
+     all       -0.45% ev 3 supp 33 probes 65 sw 0 [] final {'4': 4, '1': 8}
+short s9 rtt alt  mid  b=4 best 4 | fixed 2 -6.5% fixed 4 +0.0% fixed 8 -2.2%
+     v11 novd  -0.22% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       -2.46% ev 10 supp 0 probes 212 sw 0 [] final {'4': 4, '1': 8}
+     G1        -2.14% ev 3 supp 35 probes 73 sw 0 [] final {'4': 4, '1': 8}
+     G3        -1.90% ev 11 supp 0 probes 218 sw 0 [] final {'4': 4, '1': 8}
+     all       -2.51% ev 3 supp 32 probes 73 sw 0 [] final {'4': 4, '1': 8}
+long     rtt alt  mid  b=4 best 4 | fixed 2 -5.0% fixed 4 +0.0% fixed 8 -2.0%
+     v11 novd  -1.71% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       -1.52% ev 41 supp 0 probes 774 sw 0 [] final {'4': 4, '1': 8}
+     G1        -1.49% ev 4 supp 163 probes 108 sw 0 [] final {'4': 4, '1': 8}
+     G3        -1.73% ev 42 supp 0 probes 792 sw 1 [[4173, 4, 4, 2]] final {'4': 2, '1': 8}
+     all       -1.87% ev 4 supp 160 probes 98 sw 0 [] final {'4': 4, '1': 8}
+short s8 rtt jump high b=8 best 2 | fixed 2 +0.0% fixed 4 -4.6% fixed 8 -17.5%
+     v11 novd  -1.40% ev 0 supp 0 probes 41 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     v11       -1.60% ev 1 supp 0 probes 54 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     G1        -1.60% ev 1 supp 0 probes 54 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     G3        -1.76% ev 1 supp 0 probes 55 sw 1 [[67, 8, 4, 2]] final {'8': 2, '4': 4}
+     all       -1.75% ev 1 supp 0 probes 43 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+short s9 rtt jump high b=8 best 2 | fixed 2 +0.0% fixed 4 -5.0% fixed 8 -17.8%
+     v11 novd  -1.25% ev 0 supp 0 probes 32 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     v11       -1.57% ev 1 supp 0 probes 52 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G1        -1.57% ev 1 supp 0 probes 52 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G3        -1.12% ev 1 supp 0 probes 50 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     all       -1.93% ev 1 supp 0 probes 41 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+long     rtt jump high b=8 best 2 | fixed 2 +0.0% fixed 4 -5.2% fixed 8 -17.8%
+     v11 novd  -0.90% ev 0 supp 0 probes 37 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     v11       -0.96% ev 1 supp 0 probes 59 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G1        -0.96% ev 1 supp 0 probes 59 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     G3        -0.90% ev 1 supp 0 probes 60 sw 1 [[67, 8, 4, 2]] final {'8': 2}
+     all       -0.84% ev 1 supp 0 probes 42 sw 1 [[118, 8, 4, 2]] final {'8': 2, '4': 4, '1': 8}
+short s8 rtt jump mid  b=4 best 4 | fixed 2 -4.7% fixed 4 +0.0% fixed 8 -0.5%
+     v11 novd  +1.23% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       +0.65% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G1        +0.65% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G3        +0.54% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     all       +0.61% ev 1 supp 0 probes 49 sw 0 [] final {'4': 4, '1': 8}
+short s9 rtt jump mid  b=4 best 4 | fixed 2 -6.2% fixed 4 +0.0% fixed 8 -1.1%
+     v11 novd  -0.62% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       -1.18% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G1        -1.18% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G3        -0.30% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     all       +0.38% ev 1 supp 0 probes 45 sw 0 [] final {'4': 4, '1': 8}
+long     rtt jump mid  b=4 best 4 | fixed 2 -5.3% fixed 4 +0.0% fixed 8 -2.2%
+     v11 novd  -0.04% ev 0 supp 0 probes 36 sw 0 [] final {'4': 4, '1': 8}
+     v11       -0.10% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G1        -0.10% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     G3        -0.07% ev 1 supp 0 probes 54 sw 0 [] final {'4': 4, '1': 8}
+     all       -0.01% ev 1 supp 0 probes 42 sw 0 [] final {'4': 4, '1': 8}
+  means (min):
+   all          : v11 novd -0.88% (-2.2); v11 -1.43% (-3.0); G1 -1.15% (-2.3); G3 -1.34% (-2.8); all -1.27% (-2.5)
+   rtt jump     : v11 novd -0.50% (-1.4); v11 -0.79% (-1.6); G1 -0.79% (-1.6); G3 -0.60% (-1.8); all -0.59% (-1.9)
+   rtt alt      : v11 novd -1.26% (-2.2); v11 -2.07% (-3.0); G1 -1.51% (-2.3); G3 -2.08% (-2.8); all -1.95% (-2.5)
+   rtt jump mid : v11 novd +0.19% (-0.6); v11 -0.21% (-1.2); G1 -0.21% (-1.2); G3 +0.06% (-0.3); all +0.33% (-0.0)
+   rtt jump high: v11 novd -1.19% (-1.4); v11 -1.38% (-1.6); G1 -1.38% (-1.6); G3 -1.26% (-1.8); all -1.51% (-1.9)
+   rtt alt mid  : v11 novd -0.53% (-1.7); v11 -1.50% (-2.5); G1 -1.36% (-2.1); G3 -1.50% (-1.9); all -1.61% (-2.5)
+   rtt alt high : v11 novd -1.98% (-2.2); v11 -2.64% (-3.0); G1 -1.65% (-2.3); G3 -2.66% (-2.8); all -2.29% (-2.4)
+   short        : v11 novd -0.71% (-2.0); v11 -1.45% (-2.5); G1 -1.12% (-2.1); G3 -1.32% (-2.8); all -1.27% (-2.5)
+   long         : v11 novd -1.22% (-2.2); v11 -1.41% (-3.0); G1 -1.21% (-2.3); G3 -1.37% (-2.8); all -1.27% (-2.4)
+
+(first launch, all vs v11) short s8 base mid b=4: -0.15%
+(first launch, all vs v11) short s8 het het b=4: -0.07%
+== Round 29 S: round 28 worlds, 'G1' vs 'v11' (paired %); events v11/G1; suppressed (G1); probes v11/G1; first W switch
+short s8 base      mid  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [] G1 []
+short s9 base      mid  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [] G1 []
+long     base      mid  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [] G1 []
+short s8 base      mid  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 43/43 | sw v11 [] G1 []
+short s9 base      mid  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 39/39 | sw v11 [] G1 []
+long     base      mid  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 41/41 | sw v11 [] G1 []
+short s8 het       het  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 50/50 | sw v11 [[225, 4, 4, 2]] G1 [[225, 4, 4, 2]]
+short s9 het       het  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 25/25 | sw v11 [[147, 4, 4, 2], [267, 4, 2, 4]] G1 [[147, 4, 4, 2], [267, 4, 2, 4]]
+long     het       het  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [[225, 4, 4, 2]] G1 [[225, 4, 4, 2]]
+short s8 het       het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 54/54 | sw v11 [[107, 8, 4, 2]] G1 [[107, 8, 4, 2]]
+short s9 het       het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 39/39 | sw v11 [] G1 []
+long     het       het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 54/54 | sw v11 [[107, 8, 4, 2]] G1 [[107, 8, 4, 2]]
+short s8 phased    het  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [[1033, 4, 4, 2], [1455, 4, 2, 4]] G1 [[1033, 4, 4, 2], [1455, 4, 2, 4]]
+short s9 phased    het  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 43/43 | sw v11 [[127, 4, 4, 2]] G1 [[127, 4, 4, 2]]
+long     phased    het  b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [[67, 4, 4, 2]] G1 [[67, 4, 4, 2]]
+short s8 phased    het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 45/45 | sw v11 [[953, 8, 4, 2]] G1 [[953, 8, 4, 2]]
+short s9 phased    het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 45/45 | sw v11 [[993, 8, 4, 2]] G1 [[993, 8, 4, 2]]
+long     phased    het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 49/49 | sw v11 [[3207, 8, 4, 2]] G1 [[3207, 8, 4, 2]]
+short s8 bvar      het  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+short s9 bvar      het  b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 36/36 | sw v11 [[227, 2, 4, 8], [267, 2, 8, 4]] G1 [[227, 2, 4, 8], [267, 2, 8, 4]]
+long     bvar      het  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [[1230, 8, 4, 2]] G1 [[1230, 8, 4, 2]]
+short s8 high      high b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 27/27 | sw v11 [[147, 4, 4, 2]] G1 [[147, 4, 4, 2]]
+short s9 high      high b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 20/20 | sw v11 [[67, 4, 4, 2]] G1 [[67, 4, 4, 2]]
+long     high      high b=4 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 28/28 | sw v11 [[147, 4, 4, 2]] G1 [[147, 4, 4, 2]]
+short s8 high      high b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 45/45 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+short s9 high      high b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 31/31 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+long     high      high b=8 | G1 vs v11  +0.00% | ev 0/0 supp 0 probes 39/39 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+short s8 chg x3    mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+short s9 chg x3    mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+long     chg x3    mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+short s8 chg x0.3  high b=8 | G1 vs v11  +0.01% | ev 1/1 supp 0 probes 56/54 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+short s9 chg x0.3  high b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 51/51 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+long     chg x0.3  high b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 58/58 | sw v11 [[67, 8, 4, 2]] G1 [[67, 8, 4, 2]]
+short s8 chg x0.3  mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+short s9 chg x0.3  mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [[687, 4, 4, 8], [849, 4, 8, 4]] G1 [[687, 4, 4, 8], [849, 4, 8, 4]]
+long     chg x0.3  mid  b=4 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [] G1 []
+short s8 chg8 x0.3 mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 55/55 | sw v11 [] G1 []
+short s9 chg8 x0.3 mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 62/62 | sw v11 [] G1 []
+long     chg8 x0.3 mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 61/61 | sw v11 [] G1 []
+short s8 chg8 x3   mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 54/54 | sw v11 [[467, 8, 4, 2]] G1 [[467, 8, 4, 2]]
+short s9 chg8 x3   mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 66/66 | sw v11 [[467, 8, 4, 2]] G1 [[467, 8, 4, 2]]
+long     chg8 x3   mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 65/65 | sw v11 [[467, 8, 4, 2]] G1 [[467, 8, 4, 2]]
+short s8 chg8 x10  mid  b=8 | G1 vs v11  +0.00% | ev 2/2 supp 0 probes 67/67 | sw v11 [[889, 8, 4, 2], [2806, 2, 4, 2]] G1 [[889, 8, 4, 2], [2806, 2, 4, 2]]
+short s9 chg8 x10  mid  b=8 | G1 vs v11  +0.00% | ev 2/2 supp 0 probes 84/84 | sw v11 [[467, 8, 4, 2]] G1 [[467, 8, 4, 2]]
+long     chg8 x10  mid  b=8 | G1 vs v11  +0.00% | ev 1/1 supp 0 probes 72/72 | sw v11 [[889, 8, 4, 2], [10613, 2, 4, 2]] G1 [[889, 8, 4, 2], [10613, 2, 4, 2]]
+  means (min, max) of G1 vs v11:
+   all      : +0.00% (+0.00, +0.01) n=45
+   static   : +0.00% (+0.00, +0.00) n=27
+   chg (r26): +0.00% (+0.00, +0.01) n=9
+   chg8     : +0.00% (+0.00, +0.00) n=9
+   short    : +0.00% (+0.00, +0.01) n=30
+   long     : +0.00% (+0.00, +0.00) n=15
+  static worlds with a verify-detector event under v11: 4 [('het', 'het', 4, 'short s8', [[42, 43, ['verify']]]), ('bvar', 'het', 8, 'short s8', [[115, 116, ['verify']]]), ('het', 'het', 4, 'long', [[42, 43, ['verify']]]), ('bvar', 'het', 8, 'long', [[115, 116, ['verify']]])]
