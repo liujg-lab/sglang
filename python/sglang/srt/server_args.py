@@ -555,6 +555,14 @@ class ServerArgs:
     opt_tree_addr: str = "127.0.0.1"
     opt_tree_port: str = "30029"
 
+    # CLEAR_TREE_REMOTE. Same fixed N and tau as OPT until the controller lands.
+    clear_tree_role: Optional[Literal["target", "draft"]] = None
+    clear_tree_width: Optional[int] = None
+    clear_tree_tau: float = 0.5
+    clear_tree_max_depth: Optional[int] = None
+    clear_tree_addr: str = "127.0.0.1"
+    clear_tree_port: str = "30039"
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -3290,6 +3298,15 @@ class ServerArgs:
 
         if self.speculative_algorithm == "OPT_TREE_REMOTE":
             self._handle_opt_tree_remote()
+        if self.speculative_algorithm == "CLEAR_TREE_REMOTE":
+            self._handle_clear_tree_remote()
+
+    def _handle_clear_tree_remote(self) -> None:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_args import (
+            apply_clear_tree_settings,
+        )
+
+        apply_clear_tree_settings(self, on_npu=self.device == "npu" or is_npu())
 
     def _handle_opt_tree_remote(self) -> None:
         from sglang.srt.speculative.opt_tree_remote.opt_tree_args import (
@@ -5165,6 +5182,7 @@ class ServerArgs:
                 "SPECTRE",
                 "STANDALONE_REMOTE",
                 "OPT_TREE_REMOTE",
+                "CLEAR_TREE_REMOTE",
             ],
             help="Speculative algorithm.",
         )
@@ -5578,6 +5596,59 @@ class ServerArgs:
             type=str,
             default=ServerArgs.opt_tree_port,
             help="TCP port for the OPT_TREE_REMOTE sync RPC.",
+        )
+
+        # CLEAR_TREE_REMOTE speculative decoding
+        parser.add_argument(
+            "--clear-tree-role",
+            type=str,
+            choices=["target", "draft"],
+            default=ServerArgs.clear_tree_role,
+            help=(
+                "Role of this process for CLEAR_TREE_REMOTE: 'target' verifies, "
+                "'draft' grows the tree. The copied shell still uses fixed N and tau."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-width",
+            type=int,
+            default=ServerArgs.clear_tree_width,
+            help=(
+                "ClearTree width N. Each layer keeps N nodes, and the verify set "
+                "is those N nodes. Omitted --speculative-num-draft-tokens is "
+                "set to N on Draft and N + 1 on Target."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-tau",
+            type=float,
+            default=ServerArgs.clear_tree_tau,
+            help=(
+                "ClearTree stops when the acceptance-mass gain is not greater "
+                "than this threshold."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-max-depth",
+            type=int,
+            default=ServerArgs.clear_tree_max_depth,
+            help=(
+                "ClearTree depth cap, including the seed layer. The longest "
+                "verified chain is max_depth - 1. Omitted --speculative-num-steps "
+                "is set to this depth; an explicit value must equal it."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-addr",
+            type=str,
+            default=ServerArgs.clear_tree_addr,
+            help="Draft RPC bind address, or the address the Target connects to.",
+        )
+        parser.add_argument(
+            "--clear-tree-port",
+            type=str,
+            default=ServerArgs.clear_tree_port,
+            help="TCP port for the CLEAR_TREE_REMOTE sync RPC.",
         )
 
         # Expert parallelism

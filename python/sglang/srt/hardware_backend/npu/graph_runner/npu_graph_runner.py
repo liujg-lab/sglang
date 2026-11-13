@@ -259,6 +259,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
                     or self.model_runner.spec_algorithm.is_opt_tree_remote()
+                    or self.model_runner.spec_algorithm.is_clear_tree_remote()
                     or _is_spectre(self)
                 )
                 else max_num_tokens
@@ -551,7 +552,13 @@ class NPUGraphRunner(CudaGraphRunner):
             callable(getattr(algo, "is_opt_tree_remote", None))
             and algo.is_opt_tree_remote()
         )
-        is_sr_target = remote_spec_role(args) == "target" and (is_sr or is_opt)
+        is_clear = (
+            callable(getattr(algo, "is_clear_tree_remote", None))
+            and algo.is_clear_tree_remote()
+        )
+        is_sr_target = remote_spec_role(args) == "target" and (
+            is_sr or is_opt or is_clear
+        )
         backend = getattr(runner, "attn_backend", None)
         target_fia = bool(
             backend is not None

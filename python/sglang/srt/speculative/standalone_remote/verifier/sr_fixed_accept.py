@@ -386,12 +386,26 @@ def _is_opt_tree_worker(worker) -> bool:
     return getattr(server_args, "speculative_algorithm", None) == "OPT_TREE_REMOTE"
 
 
+def _is_clear_tree_worker(worker) -> bool:
+    algo = getattr(worker, "speculative_algorithm", None)
+    if algo == "CLEAR_TREE_REMOTE":
+        return True
+    is_clear = getattr(algo, "is_clear_tree_remote", None)
+    if callable(is_clear) and is_clear():
+        return True
+    server_args = getattr(worker, "server_args", None)
+    return getattr(server_args, "speculative_algorithm", None) == "CLEAR_TREE_REMOTE"
+
+
 def static_disable_reason(worker) -> Optional[str]:
     """Reason to skip workspace construction. Does not import kernels."""
     # OPT verify layout is N + 1. Keep fixed-accept off until an NPU e2e run
     # confirms the tree path; only the Target verifier builds this workspace.
+    # The copied ClearTree shell uses that same layout.
     if _is_opt_tree_worker(worker):
         return "opt_tree"
+    if _is_clear_tree_worker(worker):
+        return "clear_tree"
     if bool(getattr(worker, "_hybrid_needs_hidden", False)):
         return "hybrid"
     try:

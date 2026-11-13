@@ -472,7 +472,7 @@ class AscendAttnBackend(AttentionBackend):
         algo = getattr(args, "speculative_algorithm", None)
         if self.verify_tree_topk <= 1:
             return
-        if algo == "OPT_TREE_REMOTE":
+        if algo == "OPT_TREE_REMOTE" or algo == "CLEAR_TREE_REMOTE":
             # Draft stays on the compact path. Entering the SR policy below
             # would rewrite it to shared prefix.
             if role != "target":
@@ -552,7 +552,7 @@ class AscendAttnBackend(AttentionBackend):
             verify_topk=self.verify_tree_topk,
         )
         if (
-            algo == "OPT_TREE_REMOTE"
+            (algo == "OPT_TREE_REMOTE" or algo == "CLEAR_TREE_REMOTE")
             and self.tree_attention_impl != IMPL_TREE_PAGED_FIA
         ):
             self.tree_attention_impl = initial_impl

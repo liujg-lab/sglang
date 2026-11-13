@@ -22,13 +22,16 @@ def remote_spec_role(server_args):
     """Role shared by remote speculative servers.
 
     ``STANDALONE_REMOTE`` stores it on ``standalone_remote_role``.
-    ``OPT_TREE_REMOTE`` stores it on ``opt_tree_role``. The SR field wins when
-    both are set. Neither algorithm is treated as the other.
+    ``OPT_TREE_REMOTE`` stores it on ``opt_tree_role``.
+    ``CLEAR_TREE_REMOTE`` stores it on ``clear_tree_role``. The first set
+    field wins, in that order. None of these algorithms is treated as another.
     """
     if server_args is None:
         return None
-    return getattr(server_args, "standalone_remote_role", None) or getattr(
-        server_args, "opt_tree_role", None
+    return (
+        getattr(server_args, "standalone_remote_role", None)
+        or getattr(server_args, "opt_tree_role", None)
+        or getattr(server_args, "clear_tree_role", None)
     )
 
 
@@ -48,6 +51,23 @@ def _opt_tree_captures_verify_cuda_graph(server_args) -> bool:
     return not is_npu()
 
 
+def _clear_tree_captures_verify_cuda_graph(server_args) -> bool:
+    """ClearTree Target captures verify graphs. Draft does so only off NPU.
+
+    Callers must already know the algorithm is CLEAR_TREE_REMOTE. The rule
+    matches OPT: Ascend verify capture is the Target FIA path, and Draft
+    keeps DECODE there.
+    """
+    role = getattr(server_args, "clear_tree_role", None)
+    if role == "target":
+        return True
+    if role != "draft":
+        return False
+    from sglang.srt.utils import is_npu
+
+    return not is_npu()
+
+
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
@@ -58,6 +78,7 @@ class SpeculativeAlgorithm(Enum):
     SPECTRE = auto()
     STANDALONE_REMOTE = auto()
     OPT_TREE_REMOTE = auto()
+    CLEAR_TREE_REMOTE = auto()
     NONE = auto()
 
     @classmethod
@@ -94,6 +115,9 @@ class SpeculativeAlgorithm(Enum):
     def is_opt_tree_remote(self) -> bool:
         return self == SpeculativeAlgorithm.OPT_TREE_REMOTE
 
+    def is_clear_tree_remote(self) -> bool:
+        return self == SpeculativeAlgorithm.CLEAR_TREE_REMOTE
+
     def skips_colocated_draft_worker(self, server_args) -> bool:
         """Draft role runs the target model itself and does not launch a colocated worker."""
         if self.is_spectre() and getattr(server_args, "spectre_role", None) == "draft":
@@ -106,6 +130,11 @@ class SpeculativeAlgorithm(Enum):
         if (
             self.is_opt_tree_remote()
             and getattr(server_args, "opt_tree_role", None) == "draft"
+        ):
+            return True
+        if (
+            self.is_clear_tree_remote()
+            and getattr(server_args, "clear_tree_role", None) == "draft"
         ):
             return True
         return False
@@ -133,6 +162,11 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "opt_tree_role", None) == "draft"
         ):
             return True
+        if (
+            self.is_clear_tree_remote()
+            and getattr(server_args, "clear_tree_role", None) == "draft"
+        ):
+            return True
         return False
 
     def uses_ordinary_decode_prepare(self, server_args) -> bool:
@@ -149,6 +183,11 @@ class SpeculativeAlgorithm(Enum):
             and getattr(server_args, "opt_tree_role", None) == "draft"
         ):
             return True
+        if (
+            self.is_clear_tree_remote()
+            and getattr(server_args, "clear_tree_role", None) == "draft"
+        ):
+            return True
         return False
 
     def guess_tokens_per_step(self, server_args) -> int:
@@ -161,12 +200,18 @@ class SpeculativeAlgorithm(Enum):
         """
         if self.is_opt_tree_remote():
             return int(getattr(server_args, "opt_tree_width", 0) or 0)
+        if self.is_clear_tree_remote():
+            return int(getattr(server_args, "clear_tree_width", 0) or 0)
         n = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
         return n - 1
 
     def reports_remote_spec_metrics(self) -> bool:
         """Zero-verify and fallback counts are part of the client totals."""
-        return self.is_standalone_remote() or self.is_opt_tree_remote()
+        return (
+            self.is_standalone_remote()
+            or self.is_opt_tree_remote()
+            or self.is_clear_tree_remote()
+        )
 
     def uses_spec_topk_cuda_graph_layout(self) -> bool:
         """Draft-tree CUDA graph pads tokens as ``bs * topk`` (EAGLE / STANDALONE / SR)."""
@@ -198,6 +243,10 @@ class SpeculativeAlgorithm(Enum):
             server_args
         ):
             return True
+        if self.is_clear_tree_remote() and _clear_tree_captures_verify_cuda_graph(
+            server_args
+        ):
+            return True
         return False
 
     def uses_dual_ntpb_cuda_graph(
@@ -221,6 +270,10 @@ class SpeculativeAlgorithm(Enum):
         ):
             return True
         if self.is_opt_tree_remote() and _opt_tree_captures_verify_cuda_graph(
+            server_args
+        ):
+            return True
+        if self.is_clear_tree_remote() and _clear_tree_captures_verify_cuda_graph(
             server_args
         ):
             return True
@@ -367,6 +420,22 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return OptTreeRemoteWorker
+        elif self.is_clear_tree_remote():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+            if getattr(server_args, "clear_tree_role", None) != "target":
+                raise ValueError(
+                    "CLEAR_TREE_REMOTE draft uses TpModelWorker. "
+                    "create_worker is only valid for --clear-tree-role target."
+                )
+
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_worker import (
+                ClearTreeRemoteWorker,
+            )
+
+            return ClearTreeRemoteWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

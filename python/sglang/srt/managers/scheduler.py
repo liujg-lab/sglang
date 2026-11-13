@@ -215,6 +215,9 @@ from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import
 from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
     SchedulerSpectreTargetMixin,
 )
+from sglang.srt.speculative.clear_tree_remote.clear_tree_scheduler import (
+    ClearTreeSchedulerMixin,
+)
 from sglang.srt.speculative.opt_tree_remote.opt_tree_scheduler import (
     OptTreeSchedulerMixin,
 )
@@ -306,6 +309,7 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerSpectreDraftMixin,
     SchedulerSpectreTargetMixin,
+    ClearTreeSchedulerMixin,
     OptTreeSchedulerMixin,
     SchedulerStandaloneRemoteDraftMixin,
     SchedulerStandaloneRemoteTargetMixin,
@@ -453,6 +457,7 @@ class Scheduler(
         self.init_spectre_communication()
         self.init_standalone_remote_communication()
         self.init_opt_tree_communication()
+        self.init_clear_tree_communication()
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -3825,6 +3830,16 @@ def dispatch_event_loop(scheduler: Scheduler):
             and server_args.opt_tree_role == "target"
         ):
             scheduler.event_loop_normal_opt_tree_target()
+        elif (
+            scheduler.spec_algorithm.is_clear_tree_remote()
+            and server_args.clear_tree_role == "draft"
+        ):
+            scheduler.event_loop_normal_clear_tree_draft()
+        elif (
+            scheduler.spec_algorithm.is_clear_tree_remote()
+            and server_args.clear_tree_role == "target"
+        ):
+            scheduler.event_loop_normal_clear_tree_target()
         elif server_args.spectre_role == "draft":
             scheduler.event_loop_normal_spectre_draft()
         elif (

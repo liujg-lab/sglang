@@ -32,6 +32,14 @@ def _is_opt_tree_remote(server_args) -> bool:
     return bool(is_opt()) if callable(is_opt) else False
 
 
+def _is_clear_tree_remote(server_args) -> bool:
+    algo = getattr(server_args, "speculative_algorithm", None)
+    if algo == "CLEAR_TREE_REMOTE":
+        return True
+    is_clear = getattr(algo, "is_clear_tree_remote", None)
+    return bool(is_clear()) if callable(is_clear) else False
+
+
 def local_spec_shape(server_args) -> Tuple[int, int, int]:
     """``(topk, num_steps, num_draft_tokens)`` from one process's server args.
 
@@ -39,12 +47,17 @@ def local_spec_shape(server_args) -> Tuple[int, int, int]:
     A missing draft width becomes ``steps + 1``.
 
     OPT Target stores verify length N + 1 and Draft stores layer width N.
-    The wire shape stays ``(opt_tree_width, opt_tree_max_depth, opt_tree_width)``
-    so the two roles do not reject each other.
+    The wire shape stays ``(width, max_depth, width)`` so the two roles do
+    not reject each other. CLEAR_TREE_REMOTE uses the same shape with its
+    own width and depth fields. Message fields are unchanged.
     """
     if server_args is not None and _is_opt_tree_remote(server_args):
         width = int(getattr(server_args, "opt_tree_width", 0) or 0)
         depth = int(getattr(server_args, "opt_tree_max_depth", 0) or 0)
+        return (width, depth, width)
+    if server_args is not None and _is_clear_tree_remote(server_args):
+        width = int(getattr(server_args, "clear_tree_width", 0) or 0)
+        depth = int(getattr(server_args, "clear_tree_max_depth", 0) or 0)
         return (width, depth, width)
     topk = max(1, int(getattr(server_args, "speculative_eagle_topk", 1) or 1))
     steps = max(1, int(getattr(server_args, "speculative_num_steps", 1) or 1))

@@ -521,6 +521,8 @@ def _dual_ntpb_log_tag(runner) -> str:
     algo = runner.model_runner.spec_algorithm
     if algo.is_opt_tree_remote():
         return "[OPT CudaGraph]"
+    if algo.is_clear_tree_remote():
+        return "[ClearTree CudaGraph]"
     return "[SR CudaGraph]"
 
 
@@ -746,22 +748,42 @@ class CudaGraphRunner:
             )
 
             return opt_draft_capture_extra_keys(self.model_runner.server_args, ntpb)
+        if algo.is_clear_tree_remote():
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                opt_draft_capture_extra_keys,
+            )
+
+            return opt_draft_capture_extra_keys(self.model_runner.server_args, ntpb)
         del ntpb
         return [None]
 
     def _replay_graph_extra(self, forward_batch: ForwardBatch):
         """Bonus verify replays the N+1 graph. Layer verify uses None."""
-        if not self.model_runner.spec_algorithm.is_opt_tree_remote():
-            return None
-        if getattr(self.model_runner.server_args, "opt_tree_role", None) != "draft":
-            return None
-        if not forward_batch.forward_mode.is_target_verify():
-            return None
-        from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
-            opt_bonus_graph_extra,
-        )
+        algo = self.model_runner.spec_algorithm
+        if algo.is_opt_tree_remote():
+            if getattr(self.model_runner.server_args, "opt_tree_role", None) != "draft":
+                return None
+            if not forward_batch.forward_mode.is_target_verify():
+                return None
+            from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                opt_bonus_graph_extra,
+            )
 
-        return opt_bonus_graph_extra(forward_batch.spec_info)
+            return opt_bonus_graph_extra(forward_batch.spec_info)
+        if algo.is_clear_tree_remote():
+            if (
+                getattr(self.model_runner.server_args, "clear_tree_role", None)
+                != "draft"
+            ):
+                return None
+            if not forward_batch.forward_mode.is_target_verify():
+                return None
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                opt_bonus_graph_extra,
+            )
+
+            return opt_bonus_graph_extra(forward_batch.spec_info)
+        return None
 
     def _graph_bs_supported(self, graph_key, extra, cuda_graph_bs: int) -> bool:
         """Bonus must hit its own key. A missing key stays eager."""
@@ -818,6 +840,7 @@ class CudaGraphRunner:
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
                     or self.model_runner.spec_algorithm.is_opt_tree_remote()
+                    or self.model_runner.spec_algorithm.is_clear_tree_remote()
                     or _is_spectre(self)
                 )
                 else max(forward_batch.global_num_tokens_cpu)
@@ -846,11 +869,20 @@ class CudaGraphRunner:
             )
             ntpb_captured = actual_ntpb in self.spectre_ntpb_options
             if not ntpb_captured and replay_extra is not None:
-                from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
-                    opt_draft_bonus_ntpb,
-                )
+                algo = self.model_runner.spec_algorithm
+                bonus_ntpb = None
+                if algo.is_opt_tree_remote():
+                    from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                        opt_draft_bonus_ntpb,
+                    )
 
-                bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
+                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
+                elif algo.is_clear_tree_remote():
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                        opt_draft_bonus_ntpb,
+                    )
+
+                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
                 ntpb_captured = (
                     bonus_ntpb is not None and int(actual_ntpb) == int(bonus_ntpb)
                 )
@@ -860,8 +892,9 @@ class CudaGraphRunner:
                 and forward_batch.forward_mode == expected_forward_mode
             )
 
+        algo = self.model_runner.spec_algorithm
         if (
-            self.model_runner.spec_algorithm.is_opt_tree_remote()
+            algo.is_opt_tree_remote()
             and getattr(self.model_runner.server_args, "opt_tree_role", None)
             == "draft"
             and forward_batch.forward_mode.is_target_verify()
@@ -871,6 +904,20 @@ class CudaGraphRunner:
             )
 
             # Layer width must equal the captured ntpb. ntpb=1 is DECODE.
+            if not opt_layer_verify_graph_matches(
+                forward_batch.spec_info, actual_ntpb
+            ):
+                is_bs_supported = False
+        elif (
+            algo.is_clear_tree_remote()
+            and getattr(self.model_runner.server_args, "clear_tree_role", None)
+            == "draft"
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                opt_layer_verify_graph_matches,
+            )
+
             if not opt_layer_verify_graph_matches(
                 forward_batch.spec_info, actual_ntpb
             ):
@@ -994,6 +1041,14 @@ class CudaGraphRunner:
                 bonus_ntpb = None
                 if is_dual and self.model_runner.spec_algorithm.is_opt_tree_remote():
                     from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
+                        opt_draft_bonus_ntpb,
+                    )
+
+                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
+                    if bonus_ntpb is not None and bonus_ntpb not in ntpb_list:
+                        ntpb_list.append(bonus_ntpb)
+                elif is_dual and self.model_runner.spec_algorithm.is_clear_tree_remote():
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
                         opt_draft_bonus_ntpb,
                     )
 
@@ -1398,6 +1453,7 @@ class CudaGraphRunner:
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_standalone_remote()
                     or self.model_runner.spec_algorithm.is_opt_tree_remote()
+                    or self.model_runner.spec_algorithm.is_clear_tree_remote()
                     or _is_spectre(self)
                 )
                 else max_num_tokens
@@ -1641,6 +1697,88 @@ class CudaGraphRunner:
                 is_bonus=is_bonus,
             )
             from sglang.srt.speculative.opt_tree_remote.opt_tree_attention import (
+                capture_attention,
+            )
+
+            capture_bs = num_tokens // query_width if query_width else 0
+            spec_info.target_verify_attention = capture_attention(
+                self.model_runner, query_width, capture_bs
+            )
+
+        elif (
+            self.model_runner.spec_algorithm.is_clear_tree_remote()
+            and getattr(self.model_runner.server_args, "clear_tree_role", None)
+            == "target"
+        ):
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            draft_token_num = (
+                ntpb_override
+                if ntpb_override is not None
+                else self.num_tokens_per_bs
+            )
+            if _uses_dual_ntpb(self) and draft_token_num == 1:
+                return None
+            width = int(self.model_runner.server_args.clear_tree_width)
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=self.buffers.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                retrive_cum_len=None,
+                spec_steps=int(self.model_runner.server_args.clear_tree_max_depth),
+                topk=width,
+                draft_token_num=width + 1,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+
+        elif (
+            self.model_runner.spec_algorithm.is_clear_tree_remote()
+            and getattr(self.model_runner.server_args, "clear_tree_role", None)
+            == "draft"
+        ):
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                OPT_BONUS_GRAPH_EXTRA,
+                OptLayerSpec,
+            )
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            draft_token_num = (
+                ntpb_override
+                if ntpb_override is not None
+                else self.num_tokens_per_bs
+            )
+            if _uses_dual_ntpb(self) and draft_token_num == 1:
+                return None
+            width = int(self.model_runner.server_args.clear_tree_width)
+            query_width = int(draft_token_num)
+            is_bonus = (
+                query_width == width + 1
+                and getattr(self, "_active_capture_extra", None)
+                == OPT_BONUS_GRAPH_EXTRA
+            )
+            if query_width != width and not is_bonus:
+                raise RuntimeError(
+                    f"CLEAR_TREE_REMOTE draft TARGET_VERIFY graph ntpb {query_width} "
+                    f"!= clear_tree_width {width}"
+                )
+            spec_info = OptLayerSpec(
+                custom_mask=self.buffers.custom_mask,
+                positions=self.buffers.positions[:num_tokens],
+                draft_token_num=query_width,
+                num_tokens_per_req=query_width,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                apply_prefix_custom_mask=True,
+                is_bonus=is_bonus,
+            )
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
                 capture_attention,
             )
 

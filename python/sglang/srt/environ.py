@@ -448,6 +448,8 @@ class Envs:
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
     # OPT_TREE_REMOTE draft only. Page size other than 1 never reads this as on.
     SGLANG_OPT_TREE_KV_REUSE = EnvBool(True)
+    # CLEAR_TREE_REMOTE draft only. Independent of the OPT flag.
+    SGLANG_CLEAR_TREE_KV_REUSE = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
