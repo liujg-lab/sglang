@@ -44,9 +44,34 @@ class BatchAccount16(E.BatchAccount15):
         """Predicted gain of the next layer for one request and K: the last increment (v11)."""
         return vn[K] - vp[K]
 
+    def _fband_obs(self, trees, cs, e_now):
+        """Band f from the same tree at every K (round 17). Applied to value on the next round, not to the tight gain."""
+        if getattr(self, "fband", None) != "online":
+            return
+        Ks = self.k_options
+        pb = {K: 0.0 for K in Ks}
+        ab = {K: 0.0 for K in Ks}
+        for i, t in enumerate(trees):
+            aK = {K: P.last_node(t, t.topk(K, False))[0] for K in Ks}
+            lo = None
+            for K in Ks:
+                pr = cs[i] * (e_now[i][K] - (e_now[i][lo] if lo else 0.0))
+                ac = aK[K] - (aK[lo] if lo else 0)
+                pb[K] += pr
+                ab[K] += ac
+                lo = K
+        for K in Ks:
+            self.fS[K][0] += pb[K]
+            self.fS[K][1] += ab[K]
+            self.f[K] = (self.fS[K][1] + self.f_prior) / (self.fS[K][0] + self.f_prior)
+
     def _probe_W(self, b, cls):
         s = self.ctx14.get(Q.bkey(b))
         return s["cur"] if s else V.flat_wk(b, cls)[0]
+
+    def _cap_ok(self):
+        """Timing-probe cap (D67): cumulative, probe rounds < max(pcap_base, pcap x rounds). Hook for round 31."""
+        return self.n_probe_rounds < max(self.pcap_base, self.pcap * self.rounds)
 
     # ---------------- drift detection and cost events ----------------
     def _drift(self, key, dev, trig, kind):
@@ -122,6 +147,7 @@ class BatchAccount16(E.BatchAccount15):
         suml_all = float(sum(ell))
         kforce, probe, tag = None, False, "normal"
         self._probe_now = False
+        self._tag, self._force_w, self._force_k = "normal", False, False
         bk = Q.bkey(b)
         pending = False
         if not warm and self.cost_mode != "known":
@@ -137,13 +163,17 @@ class BatchAccount16(E.BatchAccount15):
             if allow and self.spread:
                 allow = self.bk_cnt.get(bk, 0) - self.last_probe.get(bk, -10 ** 9) >= self.spread
             if allow and self.pcap:
-                allow = self.n_probe_rounds < max(self.pcap_base, self.pcap * self.rounds)
+                allow = self._cap_ok()
             if q and not allow:
                 self.n_probe_wait += 1
             if allow:
-                W, kforce = q.pop(0)
-                if W is None:                       # round 30: a probe that forces only K (W as the controller says)
+                spec_w, kforce = q.pop(0)
+                self._force_w, self._force_k = spec_w is not None, kforce is not None
+                self._tag = "probe"
+                if spec_w is None:                  # round 30: a probe that forces only K (W as the controller says)
                     W = self._probe_W(b, cls)
+                else:
+                    W = spec_w
                 probe = True
                 self.n_probe_rounds += 1
                 self.last_probe[bk] = self.bk_cnt.get(bk, 0)
@@ -155,10 +185,12 @@ class BatchAccount16(E.BatchAccount15):
         self._probe_now = probe
         if not probe:
             W, tag = self._choose(b, cls, warm, slots, ell, theta)
+            self._tag, self._force_w, self._force_k = tag, False, False
             if not warm and self.wmode == "replay14":
                 wc = self._cprobe(b)
                 if wc is not None:
                     W, tag = wc, "cprobe"
+                    self._tag, self._force_w, self._force_k = "cprobe", True, False
                     self.n_cprobe += 1
         if not warm:
             self.bk_cnt[bk] = self.bk_cnt.get(bk, 0) + 1
@@ -262,6 +294,10 @@ class BatchAccount16(E.BatchAccount15):
             self.req_a[r] = self.req_a.get(r, 0.0) + acc[i]
             self.req_e[r] = self.req_e.get(r, 0.0) + e
             self.c_a += acc[i]; self.c_e += e
+        self.sum_depth = getattr(self, "sum_depth", 0.0) + depth
+        self.n_depth = getattr(self, "n_depth", 0) + 1
+        if not warm:
+            self._fband_obs(trees, cs, e_now)
         if self.hold > 0:
             self.hold -= 1
         self.rounds += 1

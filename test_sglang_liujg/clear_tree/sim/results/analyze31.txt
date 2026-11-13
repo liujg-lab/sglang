@@ -1,0 +1,199 @@
+== Round 31 A: cooldown with two cost changes close together (mid, short prefixes, b = 8, short runs). % vs cur
+3chg x10  s8 rounds 2123
+    cur    +0.00% | events [(254, 'l'), (603, 'l'), (1210, 'l')] suppressed 63 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2), (2103, 4, 2)] | checks 2/3 probes 91
+    pend   +0.20% | events [(254, 'l'), (603, 'l'), (1203, 'l')] suppressed 62 pending fired 1 | switches [(741, 4, 2), (981, 2, 4), (1259, 4, 2), (2104, 4, 2)] | checks 1/1 probes 68
+    psrc   -0.07% | events [(254, 'l'), (603, 'l'), (1210, 'l'), (1268, 'v')] suppressed 62 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2), (2093, 4, 2)] | checks 0/1 probes 72
+    nocd  +13.37% | events [(254, 'l'), (603, 'l'), (614, 'l'), (703, 'l'), (2406, 'v')] suppressed 0 pending fired 0 | switches [(753, 4, 2)] | checks 0/1 probes 80
+3chg x10  s9 rounds 2116
+    cur    +0.00% | events [(255, 'l'), (603, 'l'), (1208, 'l')] suppressed 62 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2), (2090, 4, 2)] | checks 0/0 probes 72
+    pend   +0.38% | events [(255, 'l'), (603, 'l'), (1203, 'l')] suppressed 62 pending fired 1 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2)] | checks 0/1 probes 79
+    psrc   +0.00% | events [(255, 'l'), (603, 'l'), (1208, 'l')] suppressed 62 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2), (2090, 4, 2)] | checks 0/0 probes 72
+    nocd  +14.07% | events [(255, 'l'), (603, 'l'), (704, 'l')] suppressed 0 pending fired 0 | switches [(747, 4, 2), (2431, 4, 2)] | checks 1/1 probes 84
+3chg x10  s10 rounds 2184
+    cur    +0.00% | events [(255, 'l'), (604, 'l'), (1207, 'l')] suppressed 55 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2)] | checks 3/4 probes 110
+    pend   -0.06% | events [(255, 'l'), (604, 'l'), (1204, 'l')] suppressed 56 pending fired 1 | switches [(741, 4, 2), (981, 2, 4), (1307, 4, 2), (2185, 8, 2)] | checks 0/0 probes 72
+    psrc   +0.00% | events [(255, 'l'), (604, 'l'), (1207, 'l')] suppressed 55 pending fired 0 | switches [(741, 4, 2), (981, 2, 4), (1247, 4, 2)] | checks 3/4 probes 110
+    nocd  +13.25% | events [(255, 'l'), (604, 'l'), (704, 'l')] suppressed 0 pending fired 0 | switches [(747, 4, 2)] | checks 1/1 probes 84
+l+l x10   s8 rounds 2723
+    cur    +0.00% | events [(254, 'l'), (563, 'l')] suppressed 17 pending fired 0 | switches [(433, 4, 2)] | checks 1/1 probes 76
+    pend   -2.88% | events [(254, 'l'), (554, 'l'), (1154, 'l')] suppressed 19 pending fired 2 | switches [(433, 4, 2), (1399, 2, 4), (2617, 4, 2)] | checks 2/2 probes 96
+    psrc   +0.00% | events [(254, 'l'), (563, 'l')] suppressed 17 pending fired 0 | switches [(433, 4, 2)] | checks 1/1 probes 76
+    nocd   +4.68% | events [(254, 'l'), (403, 'l')] suppressed 0 pending fired 0 | switches [(439, 4, 2), (2804, 4, 2)] | checks 0/0 probes 65
+l+l x10   s9 rounds 2708
+    cur    +0.00% | events [(255, 'l'), (558, 'l')] suppressed 33 pending fired 0 | switches [(453, 4, 8), (493, 8, 2), (2675, 4, 2)] | checks 0/0 probes 66
+    pend   +0.16% | events [(255, 'l'), (555, 'l')] suppressed 33 pending fired 1 | switches [(453, 4, 8), (493, 8, 2)] | checks 0/1 probes 68
+    psrc   +0.00% | events [(255, 'l'), (558, 'l')] suppressed 33 pending fired 0 | switches [(453, 4, 8), (493, 8, 2), (2675, 4, 2)] | checks 0/0 probes 66
+    nocd   +8.93% | events [(255, 'l'), (403, 'l')] suppressed 0 pending fired 0 | switches [(439, 4, 2)] | checks 0/0 probes 66
+l+l x10   s10 rounds 2702
+    cur    +0.00% | events [(255, 'l'), (558, 'l')] suppressed 32 pending fired 0 | switches [(453, 4, 8), (493, 8, 2), (2666, 4, 2)] | checks 0/1 probes 72
+    pend   +0.02% | events [(255, 'l'), (555, 'l')] suppressed 32 pending fired 1 | switches [(453, 4, 8), (493, 8, 2)] | checks 0/0 probes 66
+    psrc   +0.00% | events [(255, 'l'), (558, 'l')] suppressed 32 pending fired 0 | switches [(453, 4, 8), (493, 8, 2), (2666, 4, 2)] | checks 0/1 probes 72
+    nocd   +8.49% | events [(255, 'l'), (402, 'l'), (2877, 'v')] suppressed 0 pending fired 0 | switches [(439, 4, 2)] | checks 1/3 probes 96
+v+l x10   s8 rounds 2621
+    cur    +0.00% | events [(278, 'v'), (580, 'l'), (1302, 'v')] suppressed 44 pending fired 0 | switches [(325, 4, 2), (525, 2, 4), (643, 4, 2), (2610, 4, 2)] | checks 0/3 probes 100
+    pend   +0.28% | events [(278, 'v'), (578, 'l'), (1178, 'v')] suppressed 44 pending fired 2 | switches [(325, 4, 2), (525, 2, 4), (643, 4, 2)] | checks 2/4 probes 106
+    psrc   +8.73% | events [(278, 'v'), (405, 'l')] suppressed 1 pending fired 0 | switches [(325, 4, 2), (2853, 4, 2)] | checks 0/2 probes 77
+    nocd   +8.59% | events [(278, 'v'), (405, 'l'), (427, 'v')] suppressed 0 pending fired 0 | switches [(325, 4, 2), (2851, 4, 2)] | checks 0/2 probes 81
+v+l x10   s9 rounds 2750
+    cur    +0.00% | events [(276, 'v'), (687, 'l')] suppressed 27 pending fired 0 | switches [(447, 4, 2), (685, 2, 4), (725, 4, 2)] | checks 2/5 probes 108
+    pend   +0.33% | events [(276, 'v'), (576, 'l'), (1176, 'v')] suppressed 28 pending fired 2 | switches [(447, 4, 2)] | checks 1/4 probes 107
+    psrc   +5.35% | events [(276, 'v'), (405, 'l'), (2884, 'v')] suppressed 1 pending fired 0 | switches [(505, 4, 2)] | checks 0/3 probes 104
+    nocd   +5.13% | events [(276, 'v'), (405, 'l'), (428, 'v'), (2875, 'v')] suppressed 0 pending fired 0 | switches [(505, 4, 2)] | checks 0/3 probes 110
+v+l x10   s10 rounds 2775
+    cur    +0.00% | events [(277, 'v'), (683, 'l'), (1302, 'v')] suppressed 29 pending fired 0 | switches [(447, 4, 2), (679, 2, 4), (725, 4, 2)] | checks 0/3 probes 108
+    pend   -0.16% | events [(277, 'v'), (577, 'l'), (577, 'v')] suppressed 29 pending fired 2 | switches [(447, 4, 2)] | checks 2/4 probes 114
+    psrc   +5.10% | events [(277, 'v'), (405, 'l')] suppressed 1 pending fired 0 | switches [(465, 4, 2), (2910, 8, 4)] | checks 0/3 probes 95
+    nocd   +4.67% | events [(277, 'v'), (405, 'l'), (428, 'v'), (2830, 'l')] suppressed 0 pending fired 0 | switches [(465, 4, 2)] | checks 0/2 probes 97
+v+l x3    s8 rounds 1840
+    cur    +0.00% | events [(278, 'v'), (578, 'l')] suppressed 37 pending fired 0 | switches [(325, 4, 2), (525, 2, 4)] | checks 0/1 probes 65
+    pend   +0.00% | events [(278, 'v'), (578, 'l')] suppressed 37 pending fired 0 | switches [(325, 4, 2), (525, 2, 4)] | checks 0/1 probes 65
+    psrc   +1.49% | events [(278, 'v'), (405, 'l')] suppressed 0 pending fired 0 | switches [(325, 4, 2)] | checks 0/1 probes 61
+    nocd   +1.49% | events [(278, 'v'), (405, 'l')] suppressed 0 pending fired 0 | switches [(325, 4, 2)] | checks 0/1 probes 61
+v+l x3    s9 rounds 1802
+    cur    +0.00% | events [(276, 'v'), (690, 'l')] suppressed 26 pending fired 0 | switches [(467, 4, 2), (687, 2, 4), (733, 4, 2)] | checks 0/1 probes 70
+    pend   +0.28% | events [(276, 'v'), (576, 'l')] suppressed 26 pending fired 1 | switches [(467, 4, 2)] | checks 0/1 probes 64
+    psrc   +1.37% | events [(276, 'v'), (406, 'l')] suppressed 0 pending fired 0 | switches [(473, 4, 2)] | checks 0/1 probes 66
+    nocd   +1.37% | events [(276, 'v'), (406, 'l')] suppressed 0 pending fired 0 | switches [(473, 4, 2)] | checks 0/1 probes 66
+v+l x3    s10 rounds 1876
+    cur    +0.00% | events [(277, 'v'), (663, 'l')] suppressed 27 pending fired 0 | switches [(467, 4, 2)] | checks 0/1 probes 76
+    pend   +0.47% | events [(277, 'v'), (577, 'l')] suppressed 27 pending fired 1 | switches [(467, 4, 2)] | checks 0/1 probes 71
+    psrc   +1.18% | events [(277, 'v'), (405, 'l')] suppressed 0 pending fired 0 | switches [(453, 4, 2)] | checks 0/1 probes 73
+    nocd   +1.18% | events [(277, 'v'), (405, 'l')] suppressed 0 pending fired 0 | switches [(453, 4, 2)] | checks 0/1 probes 73
+  means (min, max):
+   v+l x3         n=3: pend +0.25% (+0.00, +0.47); psrc +1.35% (+1.18, +1.49); nocd +1.35% (+1.18, +1.49)
+   v+l x10        n=3: pend +0.15% (-0.16, +0.33); psrc +6.40% (+5.10, +8.73); nocd +6.13% (+4.67, +8.59)
+   l+l x10        n=3: pend -0.90% (-2.88, +0.16); psrc +0.00% (+0.00, +0.00); nocd +7.37% (+4.68, +8.93)
+   3chg x10       n=3: pend +0.17% (-0.06, +0.38); psrc -0.02% (-0.07, +0.00); nocd +13.56% (+13.25, +14.07)
+   all            n=12: pend -0.08% (-2.88, +0.47); psrc +1.93% (-0.07, +8.73); nocd +7.10% (+1.18, +14.07)
+
+== Round 31 T: probe cap, rtt alt starting late on 20x runs. bucket vs cur (cumulative cap)
+high b=8 s8 rounds 5452 | bucket vs cur  -0.46% | probes 273 -> 172 | rounds a probe waited 0 -> 1065 | checks (common/all) 20/20 -> 12/13 | events 0 -> 0
+mid  b=4 s8 rounds 9247 | bucket vs cur  -0.02% | probes 417 -> 237 | rounds a probe waited 0 -> 2240 | checks (common/all) 33/33 -> 18/19 | events 0 -> 0
+mid  b=4 s9 rounds 9414 | bucket vs cur  -0.06% | probes 471 -> 244 | rounds a probe waited 917 -> 2682 | checks (common/all) 23/36 -> 13/19 | events 4 -> 1
+
+== Round 31 Z: width switches of cur on the 45 round-28 world runs: gain, SE, n, gain / SE
+   bvar      het  b=8 s8 x10 | round 1505 b 8 2->4 gain 4.3% SE 3.7% n 10 z 1.1
+   bvar      het  b=8 s9 x3 | round 267 b 2 4->2 gain 4.5% SE 1.9% n 240 z 2.4
+   bvar      het  b=8 s9 x3 | round 763 b 4 2->4 gain 3.8% SE 5.2% n 18 z 0.7
+   chg x0.3  mid  b=4 s9 x3 | round 695 b 4 2->4 gain 8.1% SE 4.2% n 11 z 1.9
+   chg x3    mid  b=4 s9 x3 | round 655 b 4 4->8 gain 3.7% SE 8.6% n 10 z 0.4
+   high      high b=4 s8 x3 | round 67 b 4 4->2 gain 3.8% SE 1.3% n 40 z 2.9
+   high      high b=4 s8 x10 | round 67 b 4 4->2 gain 3.8% SE 1.3% n 40 z 2.9
+   high      high b=4 s9 x3 | round 67 b 4 4->2 gain 3.1% SE 1.6% n 40 z 1.9
+   phased    het  b=4 s9 x3 | round 127 b 4 4->2 gain 4.3% SE 2.3% n 100 z 1.9
+   phased    het  b=4 s9 x3 | round 273 b 4 2->4 gain 14.6% SE 6.7% n 12 z 2.2
+   switches logged 31; gain/SE <= 2: 6, <= 3: 10; median SE 1.31%; runs with a switch 24
+   narrower: 26 switches, median n 42, median SE 1.31%, gain/SE <= 2: 2
+   wider: 5 switches, median n 11, median SE 5.23%, gain/SE <= 2: 4
+
+== Round 31 B: se2 (switch needs gain > 2 SE) vs cur, round-28 world runs where cur had a switch with gain <= 2 SE
+short s9  bvar      het  b=8 | se2 vs cur  -0.07% | blocked 3 | switches cur [(267, 4, 2, 2.4), (763, 2, 4, 0.7)] se2 [(267, 4, 2)]
+long10 s8 bvar      het  b=8 | se2 vs cur  +0.31% | blocked 2 | switches cur [(1365, 4, 2, 6.0), (1505, 2, 4, 1.1)] se2 [(1365, 4, 2)]
+short s9  chg x0.3  mid  b=4 | se2 vs cur  +0.00% | blocked 1 | switches cur [(495, 4, 2, 3.4), (695, 2, 4, 1.9)] se2 [(495, 4, 2), (715, 2, 4)]
+short s9  chg x3    mid  b=4 | se2 vs cur  -0.35% | blocked 1 | switches cur [(655, 4, 8, 0.4), (695, 8, 4, 3.7)] se2 []
+short s9  high      high b=4 | se2 vs cur  +0.23% | blocked 1 | switches cur [(67, 4, 2, 1.9)] se2 [(87, 4, 2)]
+short s9  phased    het  b=4 | se2 vs cur  -0.43% | blocked 1 | switches cur [(127, 4, 2, 1.9), (273, 2, 4, 2.2)] se2 [(147, 4, 2), (1809, 2, 4)]
+  mean -0.05% (-0.43, +0.31) n=6; incl. identical runs (0): -0.007% over 45 runs
+
+== Round 31 C: K-check offsets with a changing b (target concurrency 8 / 4 every 15 s). % vs cur
+balt cb       short s8 rounds 740
+    cur           +0.00% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 70 | events [] | switches []
+         checks [(507, 19.2, 6.5, True)]
+    boff          -0.11% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 70 | events [] | switches []
+    boff+int      -0.11% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 70 | events [] | switches []
+    cto           +0.16% | checks common/done/started 0/0/8 abandoned 8 held 0 | probes 54 waited 191 | events [] | switches []
+    boff+int+cto  +0.16% | checks common/done/started 0/0/4 abandoned 4 held 7 | probes 54 waited 112 | events [] | switches []
+balt cb       short s9 rounds 734
+    cur           +0.00% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 189 | events [] | switches []
+         checks [(423, 26.3, 3.3, True)]
+    boff          +0.08% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 190 | events [] | switches []
+    boff+int      +0.08% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 190 | events [] | switches []
+    cto           +0.00% | checks common/done/started 1/1/4 abandoned 3 held 0 | probes 54 waited 117 | events [] | switches []
+    boff+int+cto  +0.08% | checks common/done/started 1/1/3 abandoned 2 held 11 | probes 54 waited 44 | events [] | switches []
+balt cb       long10 s8 rounds 2151
+    cur           +0.00% | checks common/done/started 3/3/3 abandoned 0 held 0 | probes 72 waited 340 | events [] | switches []
+         checks [(507, 19.2, 6.5, True), (1228, 20.2, 17.7, True), (1468, -17.4, 0.9, True)]
+    boff          +0.02% | checks common/done/started 2/2/2 abandoned 0 held 0 | probes 60 waited 294 | events [] | switches []
+    boff+int      +0.02% | checks common/done/started 2/2/2 abandoned 0 held 0 | probes 60 waited 294 | events [] | switches []
+    cto           +0.51% | checks common/done/started 0/0/13 abandoned 13 held 0 | probes 54 waited 362 | events [] | switches []
+    boff+int+cto  +0.57% | checks common/done/started 0/0/6 abandoned 6 held 17 | probes 60 waited 188 | events [] | switches []
+balt rtt      short s8 rounds 800
+    cur           +0.00% | checks common/done/started 1/1/1 abandoned 0 held 0 | probes 48 waited 0 | events [] | switches []
+         checks [(561, 14.2, 3.3, True)]
+    boff          +0.03% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 89 | events [] | switches []
+    boff+int      +0.03% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 89 | events [] | switches []
+    cto           -0.48% | checks common/done/started 0/0/4 abandoned 4 held 0 | probes 54 waited 100 | events [] | switches []
+    boff+int+cto  -0.48% | checks common/done/started 0/0/4 abandoned 4 held 5 | probes 54 waited 102 | events [] | switches []
+balt rtt      short s9 rounds 812
+    cur           +0.00% | checks common/done/started 1/1/1 abandoned 0 held 0 | probes 48 waited 0 | events [] | switches []
+         checks [(425, 15.5, 1.5, True)]
+    boff          -0.01% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 210 | events [] | switches []
+    boff+int      -0.01% | checks common/done/started 1/1/2 abandoned 0 held 0 | probes 54 waited 210 | events [] | switches []
+    cto           +0.00% | checks common/done/started 1/1/1 abandoned 0 held 0 | probes 48 waited 0 | events [] | switches []
+    boff+int+cto  -0.01% | checks common/done/started 1/1/3 abandoned 2 held 2 | probes 54 waited 41 | events [] | switches []
+balt rtt      long10 s8 rounds 2460
+    cur           +0.00% | checks common/done/started 1/1/1 abandoned 0 held 0 | probes 48 waited 0 | events [] | switches []
+         checks [(561, 14.2, 3.3, True)]
+    boff          +0.06% | checks common/done/started 2/2/2 abandoned 0 held 0 | probes 60 waited 300 | events [] | switches []
+    boff+int      +0.06% | checks common/done/started 2/2/2 abandoned 0 held 0 | probes 60 waited 300 | events [] | switches []
+    cto           +0.19% | checks common/done/started 0/0/4 abandoned 4 held 0 | probes 54 waited 100 | events [] | switches []
+    boff+int+cto  +0.19% | checks common/done/started 0/0/4 abandoned 4 held 5 | probes 54 waited 102 | events [] | switches []
+rtt alt high  short s8 rounds 840
+    cur           +0.00% | checks common/done/started 1/2/3 abandoned 0 held 0 | probes 54 waited 217 | events [(423, 'v')] | switches [(67, 4, 2)]
+         checks [(423, 29.4, 12.0, False), (524, -28.4, 2.2, True)]
+    boff+int      -0.22% | checks common/done/started 1/2/3 abandoned 0 held 5 | probes 54 waited 123 | events [(423, 'v')] | switches [(67, 4, 2)]
+rtt alt high  short s9 rounds 823
+    cur           +0.00% | checks common/done/started 3/3/4 abandoned 0 held 0 | probes 54 waited 111 | events [] | switches [(67, 4, 2)]
+         checks [(425, 32.7, 3.0, True), (526, -33.8, 1.1, True), (626, 35.9, 6.6, True)]
+    boff+int      -0.49% | checks common/done/started 2/3/3 abandoned 0 held 8 | probes 54 waited 104 | events [(725, 'v')] | switches [(67, 4, 2)]
+rtt alt high  long10 s8 rounds 2870
+    cur           +0.00% | checks common/done/started 8/9/10 abandoned 0 held 0 | probes 144 waited 1817 | events [(423, 'v')] | switches [(67, 4, 2)]
+         checks [(423, 29.4, 12.0, False), (524, -28.4, 2.2, True), (1182, 9.3, 17.6, True), (1422, -16.8, 8.0, True), (1662, 12.7, 5.6, True), (1902, -3.0, 21.3, True), (2142, -4.1, 8.3, True), (2382, 5.2, 16.5, True)]
+    boff+int      +0.77% | checks common/done/started 3/5/5 abandoned 0 held 41 | probes 112 waited 641 | events [(423, 'v'), (2039, 'v')] | switches [(67, 4, 2)]
+rtt alt mid   short s8 rounds 1441
+    cur           +0.00% | checks common/done/started 4/4/4 abandoned 0 held 0 | probes 72 waited 609 | events [] | switches []
+         checks [(431, 31.8, 5.7, True), (529, -35.1, 3.6, True), (631, 36.6, 6.5, True), (1302, -17.7, 20.2, True)]
+    boff+int      -0.05% | checks common/done/started 4/4/4 abandoned 0 held 21 | probes 72 waited 209 | events [] | switches []
+rtt alt mid   short s9 rounds 1520
+    cur           +0.00% | checks common/done/started 0/3/4 abandoned 0 held 0 | probes 76 waited 872 | events [(428, 'v'), (1182, 'v')] | switches []
+         checks [(428, 30.6, 11.4, False), (524, -25.6, 13.6, False), (1182, -5.7, 27.7, False)]
+    boff+int      +2.49% | checks common/done/started 2/3/4 abandoned 0 held 7 | probes 73 waited 668 | events [(428, 'v')] | switches []
+rtt alt mid   long10 s8 rounds 4679
+    cur           +0.00% | checks common/done/started 17/17/18 abandoned 0 held 0 | probes 234 waited 3436 | events [] | switches []
+         checks [(431, 31.8, 5.7, True), (529, -35.1, 3.6, True), (631, 36.6, 6.5, True), (1302, -17.7, 20.2, True), (1542, 13.3, 14.6, True), (1782, -14.5, 2.3, True), (2022, 9.0, 19.6, True), (2262, -2.9, 6.2, True)]
+    boff+int      +0.04% | checks common/done/started 5/6/6 abandoned 0 held 161 | probes 114 waited 171 | events [(1931, 'v')] | switches []
+  means (min, max):
+   balt cb        n=3: boff -0.00% (-0.11, +0.08); boff+int -0.00% (-0.11, +0.08); cto +0.22% (+0.00, +0.51); boff+int+cto +0.27% (+0.08, +0.57)
+   balt rtt       n=3: boff +0.03% (-0.01, +0.06); boff+int +0.03% (-0.01, +0.06); cto -0.10% (-0.48, +0.19); boff+int+cto -0.10% (-0.48, +0.19)
+   all balt       n=6: boff +0.01% (-0.11, +0.08); boff+int +0.01% (-0.11, +0.08); cto +0.06% (-0.48, +0.51); boff+int+cto +0.08% (-0.48, +0.57)
+   rtt alt mid    n=0: boff+int +0.83% (-0.05, +2.49)
+   rtt alt high   n=0: boff+int +0.02% (-0.49, +0.77)
+   all rtt alt    n=0: boff+int +0.42% (-0.49, +2.49)
+
+== Round 31 D: timing spikes (1% stalled rounds, 0.5% single spikes). rob vs cur
+tail base     short s8  rounds 1492 | rob vs cur  +1.70% | events cur 3 [(110, 'l'), (432, 'l'), (1062, 'l')] rob [] | suppressed 20 -> 0 | checks 0/0 -> 0/0 | probes 54 -> 36 | skipped 158 rescreened 0 | switches cur [(173, 4, 2), (659, 2, 4)] rob [(227, 4, 8), (349, 8, 4)]
+tail base     short s9  rounds 1500 | rob vs cur  +0.85% | events cur 3 [(110, 'l'), (435, 'l'), (1062, 'l')] rob [] | suppressed 27 -> 0 | checks 0/0 -> 0/0 | probes 54 -> 36 | skipped 169 rescreened 0 | switches cur [(273, 4, 8), (313, 8, 2), (433, 2, 4), (479, 4, 2)] rob [(227, 4, 8), (267, 8, 4)]
+tail base     long10 s8 rounds 4740 | rob vs cur  +0.83% | events cur 5 [(110, 'l'), (432, 'l'), (1062, 'l'), (2313, 'l'), (4728, 'l')] rob [] | suppressed 65 -> 0 | checks 1/1 -> 0/0 | probes 77 -> 36 | skipped 472 rescreened 0 | switches cur [(173, 4, 2), (659, 2, 4), (2373, 4, 2), (2593, 2, 4)] rob [(227, 4, 8), (349, 8, 4)]
+tail chg8 x10 short s8  rounds 2892 | rob vs cur  +4.25% | events cur 4 [(113, 'l'), (415, 'l'), (1302, 'v'), (2860, 'l')] rob [(411, 'l')] | suppressed 30 -> 0 | checks 4/8 -> 0/0 | probes 145 -> 57 | skipped 152 rescreened 0 | switches cur [(153, 4, 2), (273, 2, 4), (483, 4, 2)] rob [(455, 4, 2)]
+tail chg8 x10 short s9  rounds 2975 | rob vs cur  +2.28% | events cur 4 [(111, 'l'), (412, 'l'), (1302, 'v'), (2802, 'v')] rob [(411, 'l')] | suppressed 22 -> 0 | checks 3/6 -> 2/2 | probes 149 -> 84 | skipped 182 rescreened 1 | switches cur [(153, 4, 2), (285, 2, 4), (405, 4, 8), (463, 8, 2)] rob [(467, 4, 2)]
+tail het      short s8  rounds 1787 | rob vs cur  +0.86% | events cur 3 [(137, 'l'), (536, 'l'), (1357, 'l')] rob [] | suppressed 25 -> 0 | checks 1/1 -> 0/0 | probes 66 -> 31 | skipped 181 rescreened 0 | switches cur [(213, 4, 2), (1483, 2, 4)] rob []
+tail het      short s9  rounds 1958 | rob vs cur  +3.17% | events cur 3 [(137, 'l'), (611, 'l'), (1244, 'l')] rob [] | suppressed 29 -> 0 | checks 0/0 -> 0/0 | probes 39 -> 26 | skipped 181 rescreened 0 | switches cur [(273, 4, 8), (373, 8, 2), (839, 2, 4), (1287, 4, 2)] rob []
+tail high     short s8  rounds 827 | rob vs cur  +2.30% | events cur 2 [(109, 'l'), (431, 'l')] rob [] | suppressed 19 -> 0 | checks 0/0 -> 0/0 | probes 48 -> 42 | skipped 160 rescreened 0 | switches cur [(67, 4, 2), (273, 2, 4), (479, 4, 2)] rob [(67, 4, 2)]
+tail high     short s9  rounds 822 | rob vs cur  +1.00% | events cur 2 [(109, 'l'), (431, 'l')] rob [] | suppressed 42 -> 0 | checks 0/0 -> 0/0 | probes 44 -> 32 | skipped 164 rescreened 0 | switches cur [(67, 4, 2), (293, 2, 4), (333, 4, 2)] rob [(67, 4, 2)]
+tail high     long10 s8 rounds 2682 | rob vs cur  +0.91% | events cur 4 [(109, 'l'), (431, 'l'), (1061, 'l'), (2280, 'l')] rob [] | suppressed 46 -> 0 | checks 0/0 -> 0/0 | probes 62 -> 38 | skipped 429 rescreened 0 | switches cur [(67, 4, 2), (273, 2, 4), (479, 4, 2)] rob [(67, 4, 2)]
+base          short s8  rounds 1453 | rob vs cur  +0.37% | events cur 0 [] rob [] | suppressed 0 -> 0 | checks 0/0 -> 0/0 | probes 36 -> 36 | skipped 8 rescreened 0 | switches cur [] rob []
+base          short s9  rounds 1453 | rob vs cur  +0.26% | events cur 0 [] rob [] | suppressed 0 -> 0 | checks 0/0 -> 0/0 | probes 36 -> 36 | skipped 18 rescreened 0 | switches cur [] rob []
+base          long10 s8 rounds 4671 | rob vs cur  +0.29% | events cur 0 [] rob [] | suppressed 0 -> 0 | checks 0/0 -> 0/0 | probes 36 -> 36 | skipped 8 rescreened 0 | switches cur [] rob []
+chg8 x10      short s8  rounds 2862 | rob vs cur  -1.26% | events cur 1 [(403, 'l')] rob [(411, 'l'), (2829, 'v')] | suppressed 0 -> 0 | checks 1/1 -> 1/2 | probes 68 -> 87 | skipped 72 rescreened 1 | switches cur [(455, 4, 2), (2830, 4, 2)] rob [(455, 4, 2)]
+chg8 x10      short s9  rounds 2883 | rob vs cur  +0.65% | events cur 2 [(403, 'l'), (2851, 'l')] rob [(411, 'l')] | suppressed 3 -> 0 | checks 0/1 -> 0/0 | probes 78 -> 60 | skipped 50 rescreened 0 | switches cur [(547, 4, 2)] rob [(455, 4, 2)]
+chg8 x10      long10 s8 rounds 10672 | rob vs cur  -0.37% | events cur 1 [(403, 'l')] rob [(411, 'l'), (10614, 'v')] | suppressed 0 -> 0 | checks 1/1 -> 0/1 | probes 72 -> 78 | skipped 76 rescreened 2 | switches cur [(455, 4, 2), (10640, 4, 2)] rob [(455, 4, 2)]
+  means (min, max):
+   tail base      n=3: rob +1.13% (+0.83, +1.70)
+   tail high      n=3: rob +1.40% (+0.91, +2.30)
+   tail het       n=2: rob +2.01% (+0.86, +3.17)
+   tail chg8 x10  n=2: rob +3.27% (+2.28, +4.25)
+   tail           n=10: rob +1.81% (+0.83, +4.25)
+   base           n=3: rob +0.31% (+0.26, +0.37)
+   chg8 x10       n=3: rob -0.33% (-1.26, +0.65)
+   no spikes      n=6: rob -0.01% (-1.26, +0.65)
+
