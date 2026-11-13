@@ -2,7 +2,7 @@
 
 > **D64（2026-11-12）：** 每层候选人数改成 1 到 |𝒜| 全部枚举（`ext14.ALL_M = True`，默认）。第 28 轮及以前都用旧规则（只取 |𝒜| 和更小的图档）；要复现这些结果，运行前设 `ext14.ALL_M = False`。
 
-端到端的合成模拟，用来回答"ClearTree 的控制逻辑在原理上是否可行"：收益从哪里来、哪些模块有用、规划器要多快。**不是实测**，接受模型、快照分布和成本大多按方案自己的假设生成，结论只作为实测之前的先验。结果的汇总见 `python/sglang/srt/speculative/clear_tree/progress/results.md` 第 7 节。
+端到端的合成模拟，用来回答"ClearTree 的控制逻辑在原理上是否可行"：收益从哪里来、哪些模块有用、规划器要多快。**不是实测**，接受模型、快照分布和成本大多按方案自己的假设生成，结论只作为实测之前的先验。结果的汇总见 `python/sglang/srt/speculative/clear_tree_remote/design/progress/results.md` 第 7 节。
 
 ## 模拟的世界
 

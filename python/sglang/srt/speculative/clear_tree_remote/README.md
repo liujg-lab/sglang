@@ -4,4 +4,4 @@
 
 启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30039`。Target 的 `--speculative-num-draft-tokens` 是 N+1，Draft 的是 N。
 
-当前建树、验证和调度规则见 [../opt_tree_remote/README.md](../opt_tree_remote/README.md)。要接入的控制器见 [../clear_tree/README.md](../clear_tree/README.md)。
+当前建树、验证和调度规则见 [../opt_tree_remote/README.md](../opt_tree_remote/README.md)。要接入的控制器见 [design/README.md](design/README.md)。

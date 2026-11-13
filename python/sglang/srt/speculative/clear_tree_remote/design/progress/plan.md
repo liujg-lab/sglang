@@ -149,7 +149,7 @@
 | `unverified` | 位置对齐，但 `finish_tree_version` 缺失或和 `cached_reply.tree_version` 不同；只能用来结算提交数 |
 | `ok` | 以上都不是 |
 
-- **钩子：** 校验结果交给一个空钩子 `on_sr_finish_tail(state, tail)`。SR 默认只计数；OPT 和 ClearTree 的插桩各自在 `opt_tree_remote/` 里覆盖它，算法逻辑不放进 SR 目录。
+- **钩子：** 校验结果交给一个空钩子 `on_sr_finish_tail(state, tail)`。SR 默认只计数。ClearTree 的插桩在 `clear_tree_remote/` 里覆盖它。OPT 自己的插桩留在 `opt_tree_remote/`。算法逻辑不放进 SR 目录。
 
 **消费方怎么用（不属于这次改动）：**
 - **标签：**
@@ -165,7 +165,7 @@
 - `standalone_remote/sr_protocol.py`：加三个字段。`to_dict`/`from_dict` 不用改，值为 None 时本来就不发。
 - `standalone_remote/verifier/sr_target_scheduler_mixin.py`：`_build_sr_request` 的 FINISH 分支。
 - `standalone_remote/drafter/sr_draft_scheduler_mixin.py`：在 `_sr_prepare_v2` 里加校验、去重和钩子。
-- `sr_commit.py` 的 `structural_error` 不改。`opt_tree_remote/` 也不用改，钩子留给插桩补丁去覆盖。
+- `sr_commit.py` 的 `structural_error` 不改。`opt_tree_remote/` 不改。ClearTree 的钩子覆盖写在 `clear_tree_remote/`。
 
 **测试（CPU，加在现有的测试文件里）：**
 - `test_standalone_remote.py`：带和不带新字段的往返编码；模拟旧 Draft（`from_dict` 只认旧字段集合）时 FINISH 照常处理。
@@ -184,7 +184,7 @@
 ## 4. 插桩字段
 
 **规则：**
-- 用 `SGLANG_OPT_TRACE=1` 打开，默认关闭；代码放在 `opt_tree_remote/`。Target 侧在 `OptTreeRemoteWorker` 里覆盖 `verify`，先调用父类再记日志，不改 SR 共享代码（唯一例外是 3.1 的 FINISH 尾部）。
+- 用 `SGLANG_OPT_TRACE=1` 打开，默认关闭；ClearTree 的代码放在 `clear_tree_remote/`。Target 侧在 `ClearTreeRemoteWorker` 里覆盖 `verify`，先调用父类再记日志，不改 SR 共享代码（唯一例外是 3.1 的 FINISH 尾部）。`opt_tree_remote/` 不改。
 - 轻量记录每轮都记，不额外同步；重量记录只在 `rpc_seq % SGLANG_OPT_TRACE_EVERY == 0` 的轮次记，两端用同一个条件。
 - 格式：`[OPT trace <类型>] {json}`。两端用 (rid, prefix_len) 对齐，rpc_seq 只作核对。
 
@@ -342,8 +342,8 @@
 | 跳过路径走图 | A 起 | 是（`sr_worker.py`） |
 | 自适应投机开关 | B 起 | 是（Target 端） |
 | 两端捕获多个 N/W 档 | B 起 | 是（`spec_info.py`、graph runner） |
-| 层宽和验证数解耦、每层规则、ρ̂、c_i、Θ_b、层成本、终止语义、插桩 | C | 否（`opt_tree_remote/`） |
-| Target 验证长度 K+1（一到两个长度）、补齐 | C | 推导验证长度的逻辑是共享代码；补齐在 `opt_tree_remote/` |
+| 层宽和验证数解耦、每层规则、ρ̂、c_i、Θ_b、层成本、终止语义、插桩 | C | 否（`clear_tree_remote/`） |
+| Target 验证长度 K+1（一到两个长度）、补齐 | C | 推导验证长度的逻辑是共享代码；补齐在 `clear_tree_remote/` |
 | 第九版模块（GLMM、快照库、子集 DP、K_g/K_v、C++ 规划器） | D | C++ 规划器是新的编译依赖，需要确认 |
 
 决定以后：数值和规则写进 `validate/DECISION.md`，在 [decisions.md](decisions.md) 追加一条，并更新 [../README.md](../README.md) 的"实现范围"和"已知风险"。

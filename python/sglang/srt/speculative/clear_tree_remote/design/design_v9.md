@@ -1,6 +1,6 @@
 # ClearTree 第九版设计（已被第十版取代）
 
-**状态：** 2026-11-10 被第十版取代，当前方案见 [README.md](README.md) 的"算法（第十版，当前方案）"。本文件原样保留第九版，用作对照、消融和第二步模块的来源（第十版第七小节）。第十版用到的理论结果是引理 0、2、3 和定理 2（本文件第四节）。
+**状态：** 2026-11-10 被第十版取代，当前方案见 [README.md](README.md)。本文件原样保留第九版，用作对照、消融和第二步模块的来源（第十版第七小节）。第十版用到的理论结果是引理 0、2、3 和定理 2（本文件第四节）。实施位置以现行 README 和 D74 为准。
 
 本文件里的"实现范围""第一版""范围 C"等说法都是第九版当时的计划，已被第十版和 [progress/plan.md](progress/plan.md) 第 9 节取代；进展和数字以 [progress/](progress/README.md) 为准。实验通用约定见 [README.md](README.md) 的"实验约定"。
 
@@ -428,7 +428,7 @@ K_v = argmax_K [ Σ_i Â_i^K(实际的树) − Θ*·T_wait(b, K) ]
 
 ## 十、数值证据
 
-**理论检验**（合成，脚本见[理论检验脚本](../../../../../test_sglang_liujg/clear_tree/theory/README.md)）：
+**理论检验**（合成，脚本见[理论检验脚本](../../../../../../test_sglang_liujg/clear_tree/theory/README.md)）：
 
 | 实验 | 结果 |
 |---|---|
@@ -443,7 +443,7 @@ K_v = argmax_K [ Σ_i Â_i^K(实际的树) − Θ*·T_wait(b, K) ]
 | 顺序 C 池 | z=2 反复检查时，V=0 也有 28.2% 提前停止；Pocock 边界 4.9% |
 | 跨轮状态 | 逐轮规则比 Oracle 慢 1.2–1.5%；考虑状态动态但不知道未来的 rollout 慢 1.0–1.3% |
 
-**端到端合成模拟**（脚本和结果见[合成模拟器](../../../../../test_sglang_liujg/clear_tree/sim/README.md)，汇总见 [progress/results.md](progress/results.md) 第 7 节；参数按实测校准为 b=1 时每轮约 3.5 个 token、RTT 4 ms 时投机和 Target-only 在 b≈7–8 打平）：
+**端到端合成模拟**（脚本和结果见[合成模拟器](../../../../../../test_sglang_liujg/clear_tree/sim/README.md)，汇总见 [progress/results.md](progress/results.md) 第 7 节；参数按实测校准为 b=1 时每轮约 3.5 个 token、RTT 4 ms 时投机和 Target-only 在 b≈7–8 打平）：
 
 | 问题 | 结果 |
 |---|---|

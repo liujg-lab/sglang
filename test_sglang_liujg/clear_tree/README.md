@@ -1,6 +1,6 @@
 # ClearTree 实验材料
 
-ClearTree 的设计文档在 `python/sglang/srt/speculative/clear_tree/README.md`，进展、结果和计划在同目录的 `progress/` 下。这里放实验用的脚本：
+ClearTree 的设计文档在 `python/sglang/srt/speculative/clear_tree_remote/design/README.md`，进展、结果和计划在同目录的 `progress/` 下。这里放实验用的脚本：
 
 | 目录 | 内容 |
 |---|---|

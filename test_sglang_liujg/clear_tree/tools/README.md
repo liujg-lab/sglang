@@ -1,6 +1,6 @@
 # ClearTree 验证工具
 
-`python/sglang/srt/speculative/clear_tree/progress/plan.md` 里前置测量和各阶段实验用到的客户端和分析脚本。只用 Python 标准库和 `requests`，不需要 root。
+`python/sglang/srt/speculative/clear_tree_remote/design/progress/plan.md` 里前置测量和各阶段实验用到的客户端和分析脚本。只用 Python 标准库和 `requests`，不需要 root。
 
 **状态：** 只在本地的模拟 HTTP 服务器上自测过，没有在真实的 SGLang 服务上跑过。第一次使用前，先用一条请求核对 `/generate` 的返回字段（`output_ids`、`meta_info.output_top_logprobs`、`completion_tokens` 等）和 Target 日志里 `Decode batch` 行的格式，不符时改对应的解析函数。
 

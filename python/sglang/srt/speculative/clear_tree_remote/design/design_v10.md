@@ -1,6 +1,6 @@
 # ClearTree 第十版设计（已被第十一版取代）
 
-**状态：** 2026-11-12 被第十一版取代（D62：W 改由回放控制器按 b 档在线调，起点用平表），当前方案见 [README.md](README.md)。本文件是第十版当时的 README，原样保留，用作对照；文中的"本文件""当前方案"都指第十版。进展和数字以 [progress/](progress/README.md) 为准。
+**状态：** 2026-11-12 被第十一版取代（D62：W 改由回放控制器按 b 档在线调，起点用平表），当前方案见 [README.md](README.md)。本文件是第十版当时的 README，原样保留，用作对照；文中的"本文件""当前方案"都指第十版。进展和数字以 [progress/](progress/README.md) 为准。实施位置以现行 README 和 D74 为准。
 
 ClearTree 是跨机树投机解码的控制算法，计划作为默认关闭的策略放进 `OPT_TREE_REMOTE`。名字取自经济学的"出清价格"：用实测吞吐当价格（1 ms 值多少个 token），让 batch 里每个请求长多深、什么时候退出，以及要不要投机，都在同一个价位上权衡收益和成本。第十版里，每层多宽（W）按并发和接受率查一张按实测成本定的小表，验证几个节点（K）每轮在线选。
 
@@ -26,13 +26,13 @@ ClearTree 是跨机树投机解码的控制算法，计划作为默认关闭的�
 | [progress/results.md](progress/results.md) | 已有测试结果；第 7 节是合成模拟 |
 | [progress/decisions.md](progress/decisions.md) | 带日期的决定记录 |
 | [progress/plan.md](progress/plan.md) | 验证路线（阶段 0–5）、插桩字段、审计表、决定实现范围的规则 |
-| [理论检验脚本](../../../../../test_sglang_liujg/clear_tree/theory/README.md) | 引理、命题和设计选择的数值检验，论文附录的可复现材料 |
-| [合成模拟器](../../../../../test_sglang_liujg/clear_tree/sim/README.md) | 端到端模拟、模块消融、规划器计时、按 T0 实测重新标定（第 7–11 轮） |
-| [验证工具](../../../../../test_sglang_liujg/clear_tree/tools/README.md) | 在线实验用的代理、客户端、分析脚本和自测脚本 |
+| [理论检验脚本](../../../../../../test_sglang_liujg/clear_tree/theory/README.md) | 引理、命题和设计选择的数值检验，论文附录的可复现材料 |
+| [合成模拟器](../../../../../../test_sglang_liujg/clear_tree/sim/README.md) | 端到端模拟、模块消融、规划器计时、按 T0 实测重新标定（第 7–11 轮） |
+| [验证工具](../../../../../../test_sglang_liujg/clear_tree/tools/README.md) | 在线实验用的代理、客户端、分析脚本和自测脚本 |
 
 ## 和 TollTree、OPT 的关系
 
-- **OPT_TREE_REMOTE** 是现有的服务路径：宽度 N、阈值 τ 固定，见 [../opt_tree_remote/README.md](../opt_tree_remote/README.md)。ClearTree 不新建 `--speculative-algorithm`，不改 SR 的消息格式，在 OPT 上加一个默认关闭的策略。
+- **OPT_TREE_REMOTE** 是现有的服务路径：宽度 N、阈值 τ 固定，见 [../../opt_tree_remote/README.md](../../opt_tree_remote/README.md)。ClearTree 不新建 `--speculative-algorithm`，不改 SR 的消息格式，在 OPT 上加一个默认关闭的策略。
 - **TollTree**（`TOLL_TREE_REMOTE`）在 2026-11-07 停止，见 `toll-tree-remote` 分支上的 `toll_tree_remote/README.md`（本分支不含 TollTree 代码）。ClearTree 保留了它的价格思想（λ 即 Θ*、Dinkelbach、请求单独退出、层费分摊），但不再逐层变宽，也不做新协议。第十版的每层规则和 TollTree 的闭式门槛很接近，区别在于退出按图档、价格按 b 分开，以及层宽和验证数由实测成本定。
 
 | 方面 | TollTree | ClearTree 第九版 | ClearTree 第十版（当前） |
@@ -533,7 +533,7 @@ T_K = (t_send − t_stop) + (t_recv − t_send)
 - **按请求的配对只到第一次分叉为止：** 换配置后文本会走岔，分叉之后的部分只进总体统计。
 - **每格都带无损护栏：** 按差距分档统计翻转率，和 Target-only 跨形状基线比较。
 - **数据集：** 合成填充前缀的接受长度比自然提示高约 2 倍（6.8 对 3.8），不能拿来下性能结论。4096 的格子要用互不相同的前缀，不能只重复 8 条。
-- **网络延迟：** 用用户态 TCP 延迟代理（[验证工具](../../../../../test_sglang_liujg/clear_tree/tools/README.md)的 `delay_proxy.py`）加在 Target 和 Draft 之间，不需要 sudo；论文里另用 `tc netem` 或真实链路复核一两个点。每组第一格用 `opt_step_rtt_us` 确认延迟确实增加。
+- **网络延迟：** 用用户态 TCP 延迟代理（[验证工具](../../../../../../test_sglang_liujg/clear_tree/tools/README.md)的 `delay_proxy.py`）加在 Target 和 Draft 之间，不需要 sudo；论文里另用 `tc netem` 或真实链路复核一两个点。每组第一格用 `opt_step_rtt_us` 确认延迟确实增加。
 - **训练集和测试集的切分：** 按请求切分（检验新请求的冷启动）和按时间切分（检验已知请求的后验更新），两种都做；不能随机拆分层快照。
 - **bootstrap：** 按请求和 session 聚类、按时间块、两者交叉，三种都做；成本模型和 ΔT_K 以时间块 bootstrap 为准。
 - **吞吐口径：** 算法质量用 Θ_正常比较；系统收益的结论用 Θ_生产（包括探索、强制探测、规划等全部实际开销）。

@@ -1,6 +1,6 @@
 # ClearTree 理论检验脚本
 
-这些脚本是 ClearTree 设计文档（`python/sglang/srt/speculative/clear_tree/README.md`）里引理、命题和设计选择的数值检验，作为论文附录的可复现材料。全部是纯 Python 标准库，不依赖 SGLang、GPU 或模型权重。
+这些脚本是 ClearTree 设计文档（`python/sglang/srt/speculative/clear_tree_remote/design/README.md`）里引理、命题和设计选择的数值检验，作为论文附录的可复现材料。全部是纯 Python 标准库，不依赖 SGLang、GPU 或模型权重。
 
 **注意：** 都是合成实验，只说明机制和量级。生成器、噪声模型和参数都是人为设定的，结论能否在真实系统上成立，要看 `progress/plan.md` 里的 E1–E3。
 

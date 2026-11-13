@@ -1,6 +1,6 @@
 """Real T0 throughput (tok/s) used to recalibrate the simulator (round 7).
 
-Source: clear_tree/progress/results.md section 2, natural short prompts, lookahead off, KV reuse off,
+Source: clear_tree_remote/design/progress/results.md section 2, natural short prompts, lookahead off, KV reuse off,
 temperature 0, max_new_tokens 256, Target tp=2 on NPU, Draft on one GPU, RTT 3-5 ms. One run per cell
 except where results.md says otherwise. The N=8 cells of the N x tau table are the same runs as the
 tau sweep, so they appear once here.
