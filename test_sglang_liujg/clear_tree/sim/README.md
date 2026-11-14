@@ -60,6 +60,16 @@
 | `diag4.py`、`diag4b.py` | 诊断：请求数 ×4 的长时间运行；起步方式和探测日志；不带开关逐轮记录，比较 20 轮和 200 轮窗口 |
 | `analyze4.py`、`analyze5.py`、`analyze6.py` | 汇总第四、五、六批，和第三批配对比较 |
 
+| `ext25.py`、`run31.py`、`analyze31.py` | 第三十一批（conda）：冷却遇上连续成本变化（`pend`、`psrc`、`nocd`）、探测上限令牌桶、换 W 加标准误（`se_z`）、K 检查与 b 变化（`boff`、`chk_to`）、计时毛刺（`rob`）（`BatchAccount18`） |
+| `ext26.py`、`run32.py`、`analyze32.py` | 第三十二批（conda）：去掉冷却、事件令牌桶、没在用的 K 的持续探测、v12 组合（`BatchAccount19`） |
+| `run33.py` | 第三十三批（conda）：毛刺防护的连续计数只覆盖正在用的宽度上的普通轮（`rob_scope`） |
+| `run34.py` | 第三十四批（conda）：在 `scope`（没有冷却、`rob`、`rob_scope`）上重测标准误门槛（`se2`）和共同偏移按 b 档记（`boff`） |
+| `run35.py` | 第三十五批（conda）：高接受率 b=8 上换回宽松上界（`loose`）和在线 f_band（`fband`） |
+| `ext27.py`、`run36.py`、`analyze36.py` | 第三十六批（conda `sglang`）：配对增益 CUSUM（`cusum`）、最近 200 对的 3% 规则（`win200`）、无偏影子树（`oracle`）、固定 W 参照（`BatchAccount20`） |
+| `ext28.py`、`run37.py`、`analyze37.py` | 第三十七批（conda `sglang`）：切宽最少对数（`wide_need`）、最近 200 对、探索比例、K 选用快照、回放和影子树对照（`BatchAccount21`） |
+| `ext29.py`、`run38.py`、`analyze38.py` | 第三十八批（conda `sglang`）：验证回归去掉负斜率（`vnn`）、三个斜率的岭项（`vprior`）、探索轮回放日志（`explog`）（`BatchAccount22`） |
+| `ext30.py`、`run39.py`、`analyze39.py` | 第三十九批（conda `sglang`）：最近 200 对、窗口路径上的 2 倍标准误、n0=6 的斜率先验，加探索衰减（`BatchAccount23`） |
+
 跨轮的 rollout 基线在 `../theory/cross_round_rollout.py`。
 
 ## 运行
@@ -119,6 +129,29 @@ for p in 0 1; do python run28.py $p > results/r28.$p.jsonl; done; python analyze
 for p in 0 1; do python run29.py $p > results/r29.$p.jsonl; done                       # W、R 两部分（S 部分用下一行）
 for p in 0 1; do python run29.py $p S > results/r29s.$p.jsonl; done; python analyze29.py
 for p in 0 1; do for x in A B C E F; do python run30.py $p $x > results/r30${x,,}.$p.jsonl; done; done; python analyze30.py   # 要先有 r29、r29s；E 要先有 r30a
+for p in 0 1; do for x in A T Z B C D; do python run31.py $p $x > results/r31${x,,}.$p.jsonl; done; done; python analyze31.py
+for p in 0 1; do for x in P S K V X Y Y2 V2; do python run32.py $p $x > results/r32${x,,}.$p.jsonl; done; done; python analyze32.py
+for p in 0 1; do python run33.py $p > results/r33a.$p.jsonl; python run33.py $p b > results/r33b.$p.jsonl; done
+for p in 0 1; do python run34.py $p s > results/r34s.$p.jsonl; python run34.py $p b > results/r34b.$p.jsonl; done
+for p in 0 1; do python run35.py $p > results/r35.$p.jsonl; done
+for p in 0 1; do python run36.py $p pilot r36 > results/r36p.$p.jsonl; done; python analyze36.py pilot r36   # 第一次运行，CUSUM 和 win200 无效（D77）
+for p in 0 1; do python run36.py $p eval r36 > results/r36e.$p.jsonl; python run36.py $p fixed r36 > results/r36f.$p.jsonl; python run36.py $p guard r36 > results/r36g.$p.jsonl; done; python analyze36.py all r36
+for p in 0 1; do python run36.py $p seed10 r36 > results/r36s.$p.jsonl; done; python analyze36.py seed10 r36   # 第一次运行；CUSUM 和 win200 在成本事件后没有清状态，无效（D77）
+for p in 0 1; do python run36.py $p pilot > results/r36bp.$p.jsonl; done; python analyze36.py pilot   # 修复后重跑，默认标签 r36b
+for p in 0 1; do python run36.py $p eval > results/r36be.$p.jsonl; python run36.py $p guard > results/r36bg.$p.jsonl; done
+for p in 0 1; do python run36.py $p seed10 > results/r36bs.$p.jsonl; done   # 只在 7.39 的无结论区间补跑
+for p in 0 1; do python run37.py $p k > results/r37k.$p.jsonl; python run37.py $p bias > results/r37b.$p.jsonl; python run37.py $p x > results/r37x.$p.jsonl; done
+for p in 0 1; do python run37.py $p eval > results/r37e.$p.jsonl; done
+for p in 0 1; do python run37.py $p seed13 > results/r37s.$p.jsonl; done   # 只在 7.40 的无结论区间补跑。本次前 6 组已在文件里，其余 9 组用同一条 emit 续写
+python analyze37.py k; python analyze37.py bias; python analyze37.py x; python analyze37.py eval; python analyze37.py seed13
+for p in 0 1; do python run38.py $p p > results/r38p.$p.jsonl; done   # 种子 7 选 n0，写入 results/r38_param.json 之后不改
+for p in 0 1; do python run38.py $p b > results/r38b.$p.jsonl; python run38.py $p w > results/r38w.$p.jsonl; python run38.py $p g > results/r38g.$p.jsonl; done
+for p in 0 1; do python run38.py $p eval > results/r38e.$p.jsonl; done
+for p in 0 1; do python run38.py $p seed16 > results/r38s.$p.jsonl; done   # 只在 7.41 的无结论区间补跑
+python analyze38.py p; python analyze38.py b; python analyze38.py w; python analyze38.py g; python analyze38.py eval; python analyze38.py seed16
+for p in 0 1; do python run39.py $p eval > results/r39e.$p.jsonl; done
+for p in 0 1; do python run39.py $p seed20 > results/r39s.$p.jsonl; done   # 只在 7.42 的无结论区间补跑
+python analyze39.py eval; python analyze39.py seed20
 python3 analyze4.py; python3 analyze5.py; python3 analyze6.py; python3 analyze7.py; python3 analyze8.py; python3 analyze9.py; python3 analyze10.py; python3 analyze11.py; python3 analyze12.py; python3 analyze13.py; python3 analyze14.py; python3 analyze16.py; python3 analyze17.py; python3 analyze18.py; python3 analyze18L.py; python3 analyze19.py   # 读 results/
 python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 ```
@@ -160,6 +193,17 @@ python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 | `r18A.*.jsonl`、`r18B.*.jsonl`、`r18O.*.jsonl`、`analyze18.txt` | 第十八批：在线更新 W 的各种做法（A：主对比；B：看过 A 之后加的启动事件和宽一档探索；O：成本变化世界的理想切换） |
 | `pairvar19.txt`、`r19.*.jsonl`、`analyze19.txt` | 第十九批：配对和不配对的每轮方差；四种 W 校准方法（参照用 `r18A` 的同场景结果） |
 | `r30a.*`、`r30b.*`、`r30c.*`、`r30e.*`、`r30f.*.jsonl`、`analyze30.txt` | 第三十批：src（A）、recheck（B）、tight（C）、src4（E，30b）、tight 长运行（F，30c） |
+| `r31*.jsonl`、`analyze31.txt` | 第三十一批：冷却、探测上限、标准误门槛、K 检查、计时毛刺 |
+| `r32*.jsonl`、`analyze32.txt` | 第三十二批：去掉冷却、事件令牌桶、v12 组合和消融 |
+| `r33a.*.jsonl`、`r33b.*.jsonl` | 第三十三批：`rob_scope`；RTT 和种子 10 的补跑 |
+| `r34s.*.jsonl`、`r34b.*.jsonl` | 第三十四批：`scope` 对 `se2`（45 组）；`scope` 对 `boff`（balt） |
+| `r35.*.jsonl` | 第三十五批：`scope`、`loose`、`fband`（高接受率 b=8，6 组） |
+| `r36p.*.jsonl`、`r36e.*.jsonl`、`r36g.*.jsonl`、`r36s.*.jsonl` | 第三十六批第一次运行。CUSUM 和 win200 在成本事件后没有清状态，这四份里的这两个臂无效（D77）。`r36e` 里的 `oracle` 有效 |
+| `r36f.*.jsonl` | 第三十六批：已知成本的固定 W=2、4、8，有效 |
+| `r36bp.*.jsonl`、`r36be.*.jsonl`、`r36bs.*.jsonl`、`r36bg.*.jsonl`、`r36b_param.json` | 第三十六批修复后重跑。CUSUM 和 win200 在成本事件后清状态。60 组 CUSUM +0.298%，无结论（D78） |
+| `r37k.*.jsonl`、`r37b.*.jsonl`、`r37x.*.jsonl`、`r37e.*.jsonl`、`r37s.*.jsonl` | 第三十七批。K=32 的来源、回放偏差、关掉探索和持续探测；种子 11–13 上的窗口和切宽 30 对。60 组窗口 +0.230%，无结论；切宽 30 对不采纳（D79）。没有守卫 |
+| `r38p.*.jsonl`、`r38_param.json`、`r38b.*.jsonl`、`r38w.*.jsonl`、`r38g.*.jsonl`、`r38e.*.jsonl`、`r38s.*.jsonl` | 第三十八批。n0=6。`vnn` 60 组 +0.056%，不采纳；`vprior` 60 组 +0.112%，无结论（D80）。没有守卫 |
+| `r39e.*.jsonl`、`r39s.*.jsonl` | 第三十九批。`b3` 75 组 +0.339%，`b4` 75 组 +0.405%，无结论（D81）。没有守卫 |
 | `r29.*.jsonl`、`r29s.*.jsonl`、`analyze29.txt` | 第二十九批：护栏、开关世界、RTT 世界（`r29`：W、R 部分，另有 2 组按原计划比 v11 和三个都开的 S；`r29s`：S 部分 v11 对 G1） |
 | `r28.*.jsonl`、`analyze28.txt` | 第二十八批：清零累计量和持续计时探测（conda 环境；参照取自 r25–r27） |
 | `r27.*.jsonl`、`analyze27.txt` | 第二十七批：推迟第一次判定；成本变化后最好的 W 也变（conda 环境；A 部分的参照取自 r25、r26） |
