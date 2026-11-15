@@ -46,7 +46,7 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-width.")
     if server_args.clear_tree_max_depth is None:
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-max-depth.")
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         DRAFT_CAPACITY,
         TARGET_CAPACITY,
     )
@@ -79,6 +79,7 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
         tau=float(server_args.clear_tree_tau),
         max_depth=int(server_args.clear_tree_max_depth),
     )
+    server_args.remote_spec_shape = (width, depth, width)
     page = int(server_args.page_size or 1)
     if on_npu:
         expected_page, where = 128, "NPU"

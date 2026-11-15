@@ -255,11 +255,7 @@ class NPUGraphRunner(CudaGraphRunner):
             max_batch_size = (
                 max_num_tokens / actual_ntpb
                 if (
-                    self.model_runner.spec_algorithm.is_eagle()
-                    or self.model_runner.spec_algorithm.is_standalone()
-                    or self.model_runner.spec_algorithm.is_standalone_remote()
-                    or self.model_runner.spec_algorithm.is_opt_tree_remote()
-                    or self.model_runner.spec_algorithm.is_clear_tree_remote()
+                    self.model_runner.spec_algorithm.pads_mlp_gather_by_ntpb()
                     or _is_spectre(self)
                 )
                 else max_num_tokens
@@ -544,21 +540,11 @@ class NPUGraphRunner(CudaGraphRunner):
         runner = self.model_runner
         args = getattr(runner, "server_args", None)
         algo = getattr(runner, "spec_algorithm", None)
-        is_sr = (
-            callable(getattr(algo, "is_standalone_remote", None))
-            and algo.is_standalone_remote()
+        reports_remote = (
+            callable(getattr(algo, "reports_remote_spec_metrics", None))
+            and algo.reports_remote_spec_metrics()
         )
-        is_opt = (
-            callable(getattr(algo, "is_opt_tree_remote", None))
-            and algo.is_opt_tree_remote()
-        )
-        is_clear = (
-            callable(getattr(algo, "is_clear_tree_remote", None))
-            and algo.is_clear_tree_remote()
-        )
-        is_sr_target = remote_spec_role(args) == "target" and (
-            is_sr or is_opt or is_clear
-        )
+        is_sr_target = remote_spec_role(args) == "target" and reports_remote
         backend = getattr(runner, "attn_backend", None)
         target_fia = bool(
             backend is not None

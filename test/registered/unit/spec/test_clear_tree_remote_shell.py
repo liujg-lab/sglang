@@ -121,14 +121,24 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         with self.assertRaises(ValueError):
             apply_clear_tree_settings(draft, on_npu=False)
 
-    def test_wire_shape_uses_clear_fields(self):
+    def test_wire_shape_uses_remote_spec_shape(self):
         clear = _args(
-            speculative_num_draft_tokens=99,
-            speculative_num_steps=2,
+            speculative_eagle_topk=3,
             opt_tree_width=7,
             opt_tree_max_depth=3,
         )
+        apply_clear_tree_settings(clear, on_npu=False)
+        clear.speculative_num_draft_tokens = 99
+        clear.speculative_num_steps = 2
+        self.assertEqual(clear.remote_spec_shape, (4, 8, 4))
         self.assertEqual(local_spec_shape(clear), (4, 8, 4))
+
+        bare = _args(
+            speculative_num_draft_tokens=99,
+            speculative_num_steps=2,
+            speculative_eagle_topk=3,
+        )
+        self.assertEqual(local_spec_shape(bare), (3, 2, 99))
 
         opt = _args(
             speculative_algorithm="OPT_TREE_REMOTE",
@@ -139,10 +149,56 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         )
         self.assertEqual(local_spec_shape(opt), (7, 3, 7))
 
+        import sglang.srt.speculative.standalone_remote.sr_protocol as proto
+        from pathlib import Path
+
+        source = Path(proto.__file__).read_text(encoding="utf-8").lower()
+        self.assertNotIn("clear_tree", source)
+
+    def test_non_clear_send_uses_super(self):
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/clear_tree_remote/clear_tree_scheduler.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        mixin = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ClearTreeSchedulerMixin"
+        )
+        send = next(
+            node
+            for node in mixin.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_sr_send"
+        )
+        gate = next(node for node in send.body if isinstance(node, ast.If))
+        self.assertEqual(gate.test.func.attr, "_clear_step_rtt_enabled")
+        self.assertIn("_clear_send", ast.dump(ast.Module(body=gate.body, type_ignores=[])))
+        self.assertNotIn(
+            "_clear_send", ast.dump(ast.Module(body=gate.orelse, type_ignores=[]))
+        )
+        orelse = ast.dump(ast.Module(body=gate.orelse, type_ignores=[]))
+        self.assertIn("_sr_send", orelse)
+        self.assertIn("super", orelse)
+        enabled = next(
+            node
+            for node in mixin.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_clear_step_rtt_enabled"
+        )
+        enabled_src = ast.get_source_segment(source, enabled)
+        self.assertIn("is_clear_tree_remote", enabled_src)
+
     def test_fixed_accept_stays_off(self):
-        clear = SimpleNamespace(speculative_algorithm="CLEAR_TREE_REMOTE")
+        clear = SimpleNamespace(fixed_accept_skip="clear_tree")
+        named = SimpleNamespace(speculative_algorithm="CLEAR_TREE_REMOTE")
         opt = SimpleNamespace(speculative_algorithm="OPT_TREE_REMOTE")
         self.assertEqual(static_disable_reason(clear), "clear_tree")
+        self.assertIsNone(getattr(named, "fixed_accept_skip", None))
+        self.assertNotEqual(static_disable_reason(named), "clear_tree")
         self.assertEqual(static_disable_reason(opt), "opt_tree")
 
 

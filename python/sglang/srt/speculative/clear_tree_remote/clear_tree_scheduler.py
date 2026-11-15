@@ -872,7 +872,7 @@ class ClearTreeSchedulerMixin:
             tokens, parents, cols = windows[0]
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             remember_choice(self, len(tokens), plan.width)
-            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
                 hold_replay,
             )
 

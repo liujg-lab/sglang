@@ -391,7 +391,7 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
 
     add_draft_prefill(scheduler, time.perf_counter() - prefill_started)
     scheduler._sr_replay_grammars(reqs)
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         settle_replay,
     )
 
@@ -1120,7 +1120,7 @@ def opt_draft_bonus_ntpbs(server_args) -> list:
     """Bonus graphs for the flat widths. Each is one wider than its layer."""
     if getattr(server_args, "clear_tree_role", None) != "draft":
         return []
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         bonus_ntpbs,
     )
 
@@ -4007,7 +4007,7 @@ def grow_batch(scheduler, reqs):
 
         if windows:
             remember_choice(scheduler, len(windows[0][0]), plan.width)
-            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
                 hold_replay,
             )
 

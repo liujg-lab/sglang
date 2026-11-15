@@ -52,7 +52,10 @@ from sglang.srt.speculative.standalone_remote.drafter.sr_tree_paged_layout impor
     resolve_ascend_use_fia,
     resolve_eager_page_buckets,
 )
-from sglang.srt.speculative.spec_info import remote_spec_role
+from sglang.srt.speculative.spec_info import (
+    keeps_compact_remote_tree_attention,
+    remote_spec_role,
+)
 from sglang.srt.speculative.standalone_remote.sr_tail_attention import (
     SRTailAttentionMetadata,
     build_tail_attention_metadata,
@@ -472,7 +475,7 @@ class AscendAttnBackend(AttentionBackend):
         algo = getattr(args, "speculative_algorithm", None)
         if self.verify_tree_topk <= 1:
             return
-        if algo == "OPT_TREE_REMOTE" or algo == "CLEAR_TREE_REMOTE":
+        if keeps_compact_remote_tree_attention(args):
             # Draft stays on the compact path. Entering the SR policy below
             # would rewrite it to shared prefix.
             if role != "target":
@@ -552,7 +555,7 @@ class AscendAttnBackend(AttentionBackend):
             verify_topk=self.verify_tree_topk,
         )
         if (
-            (algo == "OPT_TREE_REMOTE" or algo == "CLEAR_TREE_REMOTE")
+            keeps_compact_remote_tree_attention(args)
             and self.tree_attention_impl != IMPL_TREE_PAGED_FIA
         ):
             self.tree_attention_impl = initial_impl

@@ -213,6 +213,34 @@ class SpeculativeAlgorithm(Enum):
             or self.is_clear_tree_remote()
         )
 
+    def pads_mlp_gather_by_ntpb(self) -> bool:
+        """Gathered token counts become a batch size by dividing by ntpb."""
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or self.is_standalone_remote()
+            or self.is_opt_tree_remote()
+            or self.is_clear_tree_remote()
+        )
+
+    def keeps_compact_remote_tree_attention(self) -> bool:
+        """Draft stays compact. Target restores that choice unless paged FIA wins."""
+        return self.is_opt_tree_remote() or self.is_clear_tree_remote()
+
+    def graph_capture_delegate(self):
+        """CUDA-graph capture that lives in an algorithm package.
+
+        OPT capture stays in the shared runner. ClearTree answers here so
+        the runner does not import that package.
+        """
+        if not self.is_clear_tree_remote():
+            return None
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
+            ClearTreeGraphCapture,
+        )
+
+        return ClearTreeGraphCapture
+
     def uses_spec_topk_cuda_graph_layout(self) -> bool:
         """Draft-tree CUDA graph pads tokens as ``bs * topk`` (EAGLE / STANDALONE / SR)."""
         return self.is_eagle() or self.is_standalone() or self.is_standalone_remote()
@@ -284,12 +312,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[List[int]]:
         if not self.uses_dual_ntpb_cuda_graph(server_args, is_draft_worker):
             return None
-        if self.is_clear_tree_remote():
-            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
-                capture_ntpb,
-            )
-
-            return capture_ntpb(getattr(server_args, "clear_tree_role", None))
+        delegate = self.graph_capture_delegate()
+        if delegate is not None:
+            return delegate.dual_ntpb_options(server_args)
         ntpb = self.target_verify_cuda_graph_num_tokens_per_bs(
             server_args, is_draft_worker
         )
@@ -444,6 +469,23 @@ class SpeculativeAlgorithm(Enum):
             return ClearTreeRemoteWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+def keeps_compact_remote_tree_attention(server_args) -> bool:
+    """True when this server uses the remote-tree compact attention rule.
+
+    ``speculative_algorithm`` may still be the startup string. OPT and
+    ClearTree drafts never enter the shared-prefix policy. Their targets
+    restore the initial implementation unless paged FIA was selected.
+    """
+    algo = getattr(server_args, "speculative_algorithm", None)
+    if isinstance(algo, str):
+        try:
+            algo = SpeculativeAlgorithm.from_string(algo)
+        except ValueError:
+            return False
+    keeps = getattr(algo, "keeps_compact_remote_tree_attention", None)
+    return bool(keeps()) if callable(keeps) else False
 
 
 def resolve_cuda_graph_capture_hidden_mode(current, spec_info):

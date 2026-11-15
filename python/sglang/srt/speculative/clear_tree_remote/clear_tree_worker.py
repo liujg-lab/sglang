@@ -28,6 +28,31 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_worker import (
 
 
 class ClearTreeRemoteWorker(StandaloneRemoteWorker):
+    def __init__(
+        self,
+        server_args,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank,
+        moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
+        nccl_port: int,
+        target_worker,
+    ):
+        self.fixed_accept_skip = "clear_tree"
+        super().__init__(
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
+        )
+
     def construct_draft_input(
         self,
         batch: ScheduleBatch,
@@ -35,8 +60,10 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         spec_steps: Optional[int] = None,
     ) -> EagleVerifyInput:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
-            TARGET_CAPACITY,
             VERIFY_KS,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            TARGET_CAPACITY,
         )
 
         max_depth = int(self.server_args.clear_tree_max_depth)
