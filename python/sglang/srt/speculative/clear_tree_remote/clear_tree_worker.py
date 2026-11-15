@@ -1,10 +1,9 @@
 """Target verifier for CLEAR_TREE_REMOTE.
 
-Draft tokens stay a width-N list. The verify forward also contains the
-committed tail at slot 0, so ``draft_token_num`` is N + 1. ``draft_token``
-is 1-D with that many entries per request: ``prepare_for_verify`` allocates
-``len(input_ids)`` KV slots. Parents use -1 for that root. The mask comes
-from ``build_tree_from_parents``.
+The draft list is this round's K, one of 8, 16, or 32. The verify forward
+also contains the committed tail at slot 0, so ``draft_token_num`` is K + 1.
+``draft_token`` is 1-D with that many entries per request. A parent of -2 is
+an unlinked pad. The mask comes from ``build_tree_from_parents``.
 """
 
 from __future__ import annotations
@@ -35,20 +34,23 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         draft_num_tokens: Optional[int] = None,
         spec_steps: Optional[int] = None,
     ) -> EagleVerifyInput:
-        width = int(self.server_args.clear_tree_width)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            TARGET_CAPACITY,
+            VERIFY_KS,
+        )
+
         max_depth = int(self.server_args.clear_tree_max_depth)
-        num_verify = width + 1
-        draft_tokens = int(self.server_args.speculative_num_draft_tokens)
-        if num_verify != draft_tokens:
+        capacity = int(self.server_args.speculative_num_draft_tokens)
+        if capacity != TARGET_CAPACITY:
             raise RuntimeError(
-                f"OPT verify length {num_verify} != speculative_num_draft_tokens "
-                f"{draft_tokens}"
+                f"CLEAR_TREE_REMOTE verify capacity {capacity} != {TARGET_CAPACITY}"
             )
+        tree_topk = max(int(self.server_args.speculative_eagle_topk or 2), 2)
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
-                max(width, 1),
+                tree_topk,
                 max_depth,
-                num_verify,
+                VERIFY_KS[0] + 1,
                 device=batch.device,
             )
 
@@ -65,9 +67,8 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         batch.seq_lens_sum = int(cpu_lens[:bs].sum())
 
         roots: List[int] = []
-        token_rows: List[List[int]] = []
-        parent_rows: List[List[int]] = []
-        no_draft: List[bool] = []
+        raw_tokens: List[List[int]] = []
+        raw_parents: List[List[int]] = []
         for req in list(batch.reqs)[:bs]:
             if len(req.output_ids) > 0:
                 roots.append(int(req.output_ids[-1]))
@@ -78,14 +79,27 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             parents = dtl.get("parent_list")
             if parents is None:
                 parents = [-1] * len(tokens)
-            parents = [int(p) for p in parents]
-            missing = len(tokens) != width or len(parents) != width
+            raw_tokens.append(tokens)
+            raw_parents.append([int(p) for p in parents])
+        present = [len(row) for row in raw_tokens if len(row) in VERIFY_KS]
+        verify_k = max(present) if present else VERIFY_KS[0]
+        if verify_k + 1 > capacity:
+            raise RuntimeError(
+                f"CLEAR_TREE_REMOTE verify length {verify_k + 1} exceeds "
+                f"capacity {capacity}"
+            )
+        token_rows: List[List[int]] = []
+        parent_rows: List[List[int]] = []
+        no_draft: List[bool] = []
+        for tokens, parents in zip(raw_tokens, raw_parents):
+            missing = len(tokens) != verify_k or len(parents) != verify_k
             no_draft.append(missing)
             if missing:
-                tokens = (tokens + [0] * width)[:width]
-                parents = (parents + [-1] * width)[:width]
+                tokens = (tokens + [0] * verify_k)[:verify_k]
+                parents = (parents + [-2] * verify_k)[:verify_k]
             token_rows.append(tokens)
             parent_rows.append(parents)
+        num_verify = verify_k + 1
 
         parent_index = torch.tensor(parent_rows, dtype=torch.long)
         layout = build_tree_from_parents(parent_index, cpu_lens[:bs].long())
@@ -119,7 +133,7 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             retrive_next_sibling=layout.retrive_next_sibling.to(device=device),
             retrive_cum_len=None,
             spec_steps=max_depth,
-            topk=max(width, 1),
+            topk=tree_topk,
             draft_token_num=num_verify,
             capture_hidden_mode=self._target_capture_hidden_mode(batch),
             seq_lens_sum=batch.seq_lens_sum,
@@ -219,6 +233,14 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                         "k": int(k),
                         "ran_graph": bool(ran_graph),
                     },
+                )
+            if metrics is not None and device_us is not None:
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                    push_verify_sample,
+                )
+
+                push_verify_sample(
+                    metrics, int(size), int(k), bucket, int(device_us), ran_graph
                 )
             target_verify_record(
                 rank=int(getattr(self, "tp_rank", 0) or 0),

@@ -9,9 +9,42 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
+    build_tree_from_parents,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+    RoundPlan,
+    accept_ratio,
+    flat_width,
+    ingest_verify_samples,
+    make_round,
+    observe_accept,
+    observe_price,
+    observe_verify,
+    predict_verify_ms,
+    reset_policy,
+    theta,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+    ClearAction,
+    ClearBatchRequest,
+    ClearDraftRequest,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_transport import (
+    _pack_request,
+    _unpack_request,
+)
+from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    SRAction,
+    SRBatchRequest,
+)
 from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     VERIFY_MIN_SAMPLES,
     ClearLedger,
+    push_verify_sample,
+    take_verify_samples,
     ForgettingRegressor,
     consume_verify_device,
     emit_verify_device,
@@ -71,6 +104,24 @@ class ClearTreeLedgerTest(CustomTestCase):
         self.assertTrue(record["draft_floor"])
         self.assertFalse(record["excluded"])
         self.assertEqual(ledger.verify_samples, 0)
+
+    def test_price_uses_open_to_recv_minus_prefill(self):
+        reset_policy()
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [10], 1, 10.0)
+        ledger.add_draft_prefill(0.02)
+        ledger.mark_stop(10.10)
+        ledger.mark_send(10.12)
+        ledger.mark_post(10.13)
+        _step(ledger, ["a"], [14], 2, 10.40)
+        self.assertAlmostEqual(theta(1), 4.0 / 380.0)
+
+        ledger.mark_stop(10.50)
+        ledger.mark_send(10.55)
+        ledger.mark_post(10.56)
+        ledger.note_idle()
+        _step(ledger, ["a"], [40], 3, 11.40)
+        self.assertAlmostEqual(theta(1), 4.0 / 380.0)
 
     def test_wait_is_not_an_empty_server(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -395,6 +446,195 @@ class ClearTreeLedgerTest(CustomTestCase):
         self.assertEqual(kind, "t_verify_device")
         self.assertIn('"device_us":39000', payload)
         self.assertIn('"verify_fit":true', payload)
+
+
+class TestFlatWidthOnlineK(CustomTestCase):
+    def setUp(self):
+        reset_policy()
+
+    def test_flat_width(self):
+        self.assertEqual(flat_width(1), 8)
+        self.assertEqual(flat_width(2), 4)
+        self.assertEqual(flat_width(8), 4)
+
+    def test_equal_verify_time_keeps_the_largest_k(self):
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        for k in (8, 16, 32):
+            observe_verify(1, k, 256, 10.0)
+        for _ in range(3):
+            observe_verify(1, 8, 256, 10.0)
+        plan = _value_plan()
+        plan.begin_layer([state])
+        self.assertEqual(plan.verify_k(state), 32)
+
+    def test_slower_long_graph_can_pick_a_shorter_k(self):
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        observe_verify(1, 8, 256, 10.0)
+        observe_verify(1, 16, 256, 40.0)
+        observe_verify(1, 32, 256, 50.0)
+        for _ in range(3):
+            observe_verify(1, 8, 256, 10.0)
+        plan = _value_plan()
+        plan.begin_layer([state])
+        self.assertEqual(plan.verify_k(state), 8)
+
+    def test_short_sample_and_probe_stay_on_tau(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        locked = [make_round(sched, [req]).locked_k for _ in range(6)]
+        self.assertEqual(locked, [8, 8, 16, 16, 32, 32])
+        warmed = make_round(sched, [req])
+        self.assertTrue(warmed.use_tau)
+        self.assertEqual(warmed.locked_k, 32)
+
+    def test_ready_sample_leaves_tau(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        for _ in range(10):
+            make_round(sched, [req])
+        for k, ms in ((8, 10.0), (16, 10.0), (32, 10.0)):
+            observe_verify(1, k, 256, ms)
+        for _ in range(3):
+            observe_verify(1, 8, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(sched, [req])
+        self.assertFalse(plan.use_tau)
+        self.assertIsNone(plan.locked_k)
+        self.assertEqual(plan.width, 8)
+
+    def test_accept_ratio_shrinks_toward_the_pool(self):
+        self.assertEqual(accept_ratio("a"), 1.0)
+        observe_accept("a", 1.0, 4.0)
+        self.assertAlmostEqual(accept_ratio("a"), 1.75 / 7.0)
+
+    def test_pad_parent_is_not_linked(self):
+        layout = build_tree_from_parents(
+            torch.tensor([[-1, -2]]),
+            torch.tensor([3]),
+        )
+        self.assertEqual(int(layout.retrive_next_token[0, 0]), 1)
+        self.assertEqual(int(layout.retrive_next_sibling[0, 1]), -1)
+        self.assertEqual(int(layout.retrive_next_token[0, 2]), -1)
+
+    def test_verify_samples_round_trip_and_stay_off_sr(self):
+        req = ClearDraftRequest(rid="a", step_id=1, base_committed_len=4)
+        batch = ClearBatchRequest(
+            session_id="s",
+            rpc_seq=3,
+            action=ClearAction.STEP,
+            reqs=[req],
+            verify_samples=[[1, 8, 256, 33000], [1, 16, 256, 40000]],
+        )
+        decoded, _mm = _unpack_request(_pack_request(batch))
+        self.assertEqual(
+            decoded.verify_samples, [[1, 8, 256, 33000], [1, 16, 256, 40000]]
+        )
+        self.assertEqual(decoded.reqs[0].rid, "a")
+        empty = ClearBatchRequest(session_id="s", rpc_seq=1, action=ClearAction.STEP)
+        self.assertNotIn("verify_samples", empty.to_dict())
+        shared = dict(batch.to_dict())
+        sr = SRBatchRequest.from_dict(shared)
+        self.assertFalse(hasattr(sr, "verify_samples"))
+        opt = SRBatchRequest(session_id="s", rpc_seq=1, action=SRAction.STEP)
+        self.assertNotIn("verify_samples", opt.to_dict())
+        self.assertEqual(
+            set(opt.to_dict()),
+            {"session_id", "rpc_seq", "action", "reqs", "protocol_version"},
+        )
+
+    def test_spike_does_not_make_the_short_graph_look_slower(self):
+        observe_verify(1, 8, 256, 10.0)
+        observe_verify(1, 8, 256, 40.0)
+        for _ in range(4):
+            observe_verify(1, 32, 256, 12.0)
+        self.assertAlmostEqual(predict_verify_ms(1, 8, 256), 10.0)
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        plan = _value_plan()
+        plan.begin_layer([state])
+        self.assertEqual(plan.verify_k(state), 8)
+
+    def test_probe_skips_k_that_does_not_fit(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 4070, output_ids=[])
+        saved = os.environ.get("SGLANG_CLEAR_NPU_KV_BUCKETS")
+        os.environ["SGLANG_CLEAR_NPU_KV_BUCKETS"] = "256,512,1024,2048,4096"
+        try:
+            locked = [make_round(sched, [req]).locked_k for _ in range(6)]
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_NPU_KV_BUCKETS", None)
+            else:
+                os.environ["SGLANG_CLEAR_NPU_KV_BUCKETS"] = saved
+        self.assertEqual(locked, [8, 8, 16, 16, 16, 16])
+        self.assertNotIn(32, locked)
+
+    def test_ingested_sample_is_visible_before_the_round_plan(self):
+        ingest_verify_samples(
+            [[1, 8, 256, 10000], [1, 16, 256, 10000], [1, 32, 256, 10000]]
+            + [[1, 8, 256, 10000]] * 3
+        )
+        self.assertEqual(predict_verify_ms(1, 8, 256), 10.0)
+
+    def test_lock_k_does_not_consume_probes(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        os.environ["SGLANG_CLEAR_LOCK_K"] = "32"
+        try:
+            plan = make_round(sched, [req])
+            self.assertTrue(plan.use_tau)
+            self.assertEqual(plan.locked_k, 32)
+        finally:
+            os.environ.pop("SGLANG_CLEAR_LOCK_K", None)
+        nxt = make_round(sched, [req])
+        self.assertEqual(nxt.locked_k, 8)
+
+    def test_verify_sample_queue_is_sent_once(self):
+        metrics = SimpleNamespace(tp_rank=0)
+        push_verify_sample(metrics, 1, 8, 256, 1000, True)
+        push_verify_sample(metrics, 1, 16, 256, 2000, True)
+        push_verify_sample(metrics, 1, 4, 256, 3000, True)
+        push_verify_sample(metrics, 1, 8, None, 1000, True)
+        push_verify_sample(metrics, 1, 8, 256, 1000, False)
+        self.assertEqual(
+            take_verify_samples(metrics),
+            [[1, 8, 256, 1000], [1, 16, 256, 2000]],
+        )
+        self.assertEqual(take_verify_samples(metrics), [])
+        for index in range(10):
+            push_verify_sample(metrics, 1, 8, 256, 1000 + index, True)
+        queued = take_verify_samples(metrics)
+        self.assertEqual(len(queued), 8)
+        self.assertEqual(queued[0][3], 1002)
+
+
+def _score_state(scores):
+    weight = torch.zeros(1, 8)
+    weight[0, : len(scores)] = torch.tensor(scores, dtype=torch.float32)
+    return SimpleNamespace(
+        depth=1,
+        weight=weight,
+        rid="r",
+        prefix=4,
+        config=SimpleNamespace(max_depth=8, tau=0.4, width=8),
+    )
+
+
+def _value_plan():
+    return RoundPlan(
+        width=8,
+        k=8,
+        use_tau=False,
+        locked_k=None,
+        theta_value=1.0,
+        layer_ms=0.0,
+        max_ell=10,
+        batch=1,
+        buckets=(256, 512, 1024, 2048, 4096),
+    )
 
 
 if __name__ == "__main__":

@@ -39,25 +39,31 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     release_uncommitted,
 )
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
-from sglang.srt.speculative.standalone_remote.sr_commit import (
-    SR_PROTOCOL_VERSION,
-    supported_protocol,
+from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+    CLEAR_PROTOCOL_VERSION,
+    ClearAction,
+    ClearBatchReply,
+    ClearBatchRequest,
+    ClearDraftRequest,
+    ClearReplyStatus,
+    action_value,
+    as_clear_action,
+    clear_batch_reply,
+    protocol_mismatch_reply,
+    supported_clear_protocol,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_transport import (
+    ClearDraftServer,
+    ClearTargetClient,
 )
 from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
-    SRBatchReply,
-    SRBatchRequest,
-    SRDraftRequest,
-    SRReplyStatus,
+    local_spec_shape,
 )
 from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
     get_sr_round_metrics,
     idle_sr_round_metrics,
-)
-from sglang.srt.speculative.standalone_remote.sr_transport import (
-    SRDraftServer,
-    SRTargetClient,
 )
 from sglang.srt.utils import DynamicGradMode
 
@@ -70,11 +76,11 @@ def make_clear_tree_transport(server_args):
     addr = server_args.clear_tree_addr or "127.0.0.1"
     port = str(server_args.clear_tree_port or "30039")
     if role == "draft":
-        return SRDraftServer(addr, port)
+        return ClearDraftServer(addr, port)
     timeout_ms = int(
         getattr(server_args, "standalone_remote_rpc_timeout_ms", 5000) or 5000
     )
-    return SRTargetClient(addr, port, timeout_ms=timeout_ms)
+    return ClearTargetClient(addr, port, timeout_ms=timeout_ms)
 
 
 def run_opt_draft_round(metrics, measure, work) -> None:
@@ -93,6 +99,15 @@ def run_opt_draft_round(metrics, measure, work) -> None:
 def _tree_dump_enabled() -> bool:
     value = os.environ.get("SGLANG_CLEAR_TREE_DUMP", "")
     return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+class _ReplyBatch:
+    """Attribute carrier for replies that the shared helpers still build."""
+
+    def __init__(self, session_id, rpc_seq, reqs):
+        self.session_id = session_id
+        self.rpc_seq = rpc_seq
+        self.reqs = reqs
 
 
 def dump_tree_reply(reply) -> None:
@@ -148,8 +163,11 @@ class ClearTreeSchedulerMixin:
         FINISH, and ABORT leave a previous STEP stamp alone. A failed STEP
         clears it.
         """
-        inflight = super()._sr_send(action, reqs, include_full_context)
-        if not self._clear_step_rtt_enabled() or action != SRAction.STEP:
+        if self._clear_step_rtt_enabled():
+            inflight = self._clear_send(action, reqs, include_full_context)
+        else:
+            inflight = super()._sr_send(action, reqs, include_full_context)
+        if not self._clear_step_rtt_enabled() or action_value(action) != "step":
             return inflight
         ok = (
             inflight is not None
@@ -167,7 +185,10 @@ class ClearTreeSchedulerMixin:
     def _sr_recv(self, inflight):
         sent = getattr(self, "_clear_step_sent_at", None)
         expected = getattr(self, "_clear_step_inflight_id", None)
-        result = super()._sr_recv(inflight)
+        if self._clear_step_rtt_enabled():
+            result = self._clear_recv(inflight)
+        else:
+            result = super()._sr_recv(inflight)
         if sent is None or id(inflight) != expected or not self._clear_step_rtt_enabled():
             return result
         self._clear_step_sent_at = None
@@ -177,6 +198,277 @@ class ClearTreeSchedulerMixin:
             counts["opt_step_rtt_us"] += int((time.perf_counter() - sent) * 1e6)
             counts["opt_step_rtt_samples"] += 1
         return result
+
+    def _sr_recv_packet(self):
+        algo = getattr(self, "spec_algorithm", None)
+        if algo is None or not algo.is_clear_tree_remote():
+            return super()._sr_recv_packet()
+        from sglang.srt.speculative.standalone_remote.sr_align import broadcast_sr_obj
+
+        packet = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if self.sr_server is not None:
+                packet = self.sr_server.recv_batch(timeout_ms=50)
+                if packet is not None and self.tp_size == 1:
+                    return packet
+                if packet is not None:
+                    batch, mm = packet
+                    packet = (
+                        batch.to_dict(),
+                        {rid: payload.to_pickleable() for rid, payload in mm.items()},
+                    )
+        if self.tp_size > 1:
+            packet = broadcast_sr_obj(
+                packet,
+                self.tp_size,
+                self.tp_rank,
+                self.tp_group,
+                self.tp_cpu_group,
+            )
+        if packet is None:
+            return None
+        batch_d, mm_d = packet
+        batch = ClearBatchRequest.from_dict(batch_d)
+        mm = {
+            rid: SRMMPayload.from_pickleable(item) for rid, item in (mm_d or {}).items()
+        }
+        return batch, mm
+
+    def _clear_spec_shape_rejected(self, batch) -> bool:
+        if batch.action not in (ClearAction.PREFILL, ClearAction.STEP):
+            return False
+        if batch.spec_shape is None:
+            return True
+        return tuple(batch.spec_shape) != local_spec_shape(self.server_args)
+
+    def _build_clear_request(self, req, action, include_full_context):
+        from sglang.srt.speculative.standalone_remote.sr_commit import note_commit_send
+        from sglang.srt.speculative.standalone_remote.sr_protocol import (
+            is_health_check_req,
+        )
+        from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+            _mm_features_alive,
+        )
+
+        self._sr_ensure_cursor(req)
+        metrics = get_sr_round_metrics(self, "Target")
+        clear_action = as_clear_action(action)
+        num_draft = (
+            int(self.server_args.speculative_num_draft_tokens or 0)
+            or int(self.server_args.speculative_num_steps or 0) + 1
+        )
+        if clear_action in (ClearAction.FINISH, ClearAction.ABORT):
+            return (
+                ClearDraftRequest(
+                    rid=req.rid,
+                    step_id=self._sr_step_id(req),
+                    base_committed_len=self._sr_base_committed_len(req),
+                    num_draft_tokens=0,
+                ),
+                None,
+            )
+        snapshot = (
+            include_full_context
+            or bool(req.sr_force_snapshot)
+            or req.sr_ack_commit_version is None
+        )
+        version = int(req.sr_next_commit_version)
+        req.sr_next_commit_version = version + 1
+        sent_len = len(req.output_ids or [])
+        req.sr_sent_commit_version = version
+        mm_items = getattr(getattr(req, "multimodal_inputs", None), "mm_items", None)
+        requires_mm = isinstance(mm_items, list) and len(mm_items) > 0
+        if snapshot:
+            committed = list(req.output_ids or [])
+            mm_payload = None
+            has_mm = False
+            if requires_mm and _mm_features_alive(req):
+                has_mm = True
+                mm_payload = SRMMPayload.from_req(req)
+            note_commit_send(metrics, "snapshot", len(committed))
+            req.sr_accepted_tree_candidate_indices = None
+            return (
+                ClearDraftRequest(
+                    rid=req.rid,
+                    step_id=self._sr_step_id(req),
+                    base_committed_len=self._sr_base_committed_len(req),
+                    committed_ids=committed,
+                    num_draft_tokens=num_draft,
+                    padded_input_ids=list(req.origin_input_ids),
+                    sampling_params=req.sampling_params,
+                    has_mm=has_mm,
+                    commit_mode="snapshot",
+                    commit_version=version,
+                    requires_mm=requires_mm,
+                ),
+                mm_payload,
+            )
+        acked = int(req.sr_ack_output_len or 0)
+        delta_ids = list((req.output_ids or [])[acked:sent_len])
+        tree_version, tree_base, path = self._sr_candidate_path(req, delta_ids)
+        req.sr_accepted_tree_candidate_indices = None
+        note_commit_send(metrics, "delta", len(delta_ids))
+        return (
+            ClearDraftRequest(
+                rid=req.rid,
+                step_id=self._sr_step_id(req),
+                base_committed_len=self._sr_base_committed_len(req),
+                num_draft_tokens=num_draft,
+                commit_mode="delta",
+                commit_version=version,
+                base_commit_version=req.sr_ack_commit_version,
+                base_output_len=acked,
+                delta_ids=delta_ids,
+                requires_mm=requires_mm,
+                commit_tree_version=tree_version,
+                commit_tree_base_committed_len=tree_base,
+                commit_candidate_indices=path,
+            ),
+            None,
+        )
+
+    def _clear_send(self, action, reqs, include_full_context):
+        from sglang.srt.speculative.standalone_remote.sr_protocol import (
+            is_health_check_req,
+        )
+        from sglang.srt.speculative.standalone_remote.verifier.sr_target_scheduler_mixin import (
+            SRInflight,
+            SRPendingEntry,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            take_verify_samples,
+        )
+
+        clear_action = as_clear_action(action)
+        if not reqs:
+            return None
+        if self.sr_speculation_stopped and clear_action in (
+            ClearAction.PREFILL,
+            ClearAction.STEP,
+        ):
+            return None
+        self._sr_sync_connection()
+        pending = {}
+        draft_reqs = []
+        mm_by_rid = {}
+        for req in reqs:
+            if is_health_check_req(req):
+                continue
+            dreq, mm = self._build_clear_request(req, clear_action, include_full_context)
+            draft_reqs.append(dreq)
+            pending[req.rid] = SRPendingEntry(
+                step_id=dreq.step_id,
+                base_committed_len=dreq.base_committed_len,
+                commit_version=dreq.commit_version,
+                sent_output_len=dreq.base_committed_len
+                - len(req.origin_input_ids or []),
+            )
+            if mm is not None:
+                mm_by_rid[req.rid] = mm
+        if not draft_reqs:
+            return None
+        self.sr_rpc_seq += 1
+        rpc_seq = self.sr_rpc_seq
+        samples = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            samples = take_verify_samples(get_sr_round_metrics(self, "Target")) or None
+        batch = ClearBatchRequest(
+            session_id=self.sr_session_id,
+            rpc_seq=rpc_seq,
+            action=clear_action,
+            reqs=draft_reqs,
+            protocol_version=CLEAR_PROTOCOL_VERSION,
+            spec_shape=local_spec_shape(getattr(self, "server_args", None)),
+            verify_samples=samples,
+        )
+        send_ok = True
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if self.sr_client is None:
+                logger.warning("[CLEAR] Target has no ZMQ client")
+                send_ok = False
+            else:
+                try:
+                    self.sr_client.send_batch(batch, mm_by_rid or None)
+                except Exception as exc:
+                    logger.warning("[CLEAR] Target RPC send failed: %s", exc)
+                    send_ok = False
+        if self.tp_size > 1:
+            send_ok = self._sr_broadcast_obj(send_ok)
+        return SRInflight(
+            session_id=self.sr_session_id,
+            rpc_seq=rpc_seq,
+            pending=pending,
+            wait_reply=clear_action not in (ClearAction.FINISH, ClearAction.ABORT),
+            send_ok=send_ok,
+        )
+
+    def _clear_recv(self, inflight):
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRReplyStatus
+
+        if inflight is None:
+            return {}, {}
+        reply = None
+        if inflight.wait_reply and inflight.send_ok:
+            if self.tp_size == 1 or self.tp_rank == 0:
+                if self.sr_client is not None:
+                    try:
+                        reply = self.sr_client.recv_batch(
+                            inflight.session_id, inflight.rpc_seq
+                        )
+                    except Exception as exc:
+                        logger.warning("[CLEAR] Target RPC recv failed: %s", exc)
+                        reply = None
+        if self.tp_size > 1:
+            payload = reply.to_dict() if reply is not None else None
+            payload = self._sr_broadcast_obj(payload)
+            reply = ClearBatchReply.from_dict(payload) if payload is not None else None
+        result = {}
+        got_packet = reply is not None
+        pending = inflight.pending
+        if reply is None:
+            self._sr_observe_rpc(inflight, got_packet=False)
+            return result, pending
+        if reply.session_id != self.sr_session_id or reply.rpc_seq != inflight.rpc_seq:
+            self._sr_note_stale(
+                "session" if reply.session_id != self.sr_session_id else "rpc_seq"
+            )
+            self._sr_observe_rpc(inflight, got_packet=True)
+            return result, pending
+        shape_mismatch = [
+            item for item in reply.reqs if item.reason == "spec_shape_mismatch"
+        ]
+        protocol_mismatch = any(item.reason == "protocol_mismatch" for item in reply.reqs)
+        if (
+            not supported_clear_protocol(reply.protocol_version)
+            or protocol_mismatch
+            or shape_mismatch
+        ):
+            if shape_mismatch:
+                logger.warning(
+                    "[CLEAR] spec_shape_mismatch target=%s draft=%s",
+                    local_spec_shape(getattr(self, "server_args", None)),
+                    shape_mismatch[0].spec_shape,
+                )
+                self._sr_stop_speculation("spec_shape_mismatch")
+            else:
+                self._sr_stop_speculation(
+                    "protocol_mismatch" if protocol_mismatch else "protocol_version"
+                )
+            self._sr_observe_rpc(inflight, got_packet=True)
+            return result, pending
+        for item in reply.reqs:
+            value = item.status.value if isinstance(item.status, ClearReplyStatus) else item.status
+            item.status = SRReplyStatus(value)
+            pending_entry = pending.get(item.rid)
+            if pending_entry is None:
+                continue
+            ok, reason = item.matches(pending_entry)
+            if not ok:
+                self._sr_note_stale(reason or "step")
+                continue
+            result[item.rid] = item
+        self._sr_observe_rpc(inflight, got_packet=got_packet)
+        return result, pending
 
     @property
     def is_remote_spec_draft(self) -> bool:
@@ -274,7 +566,7 @@ class ClearTreeSchedulerMixin:
         )
         if self.tp_size == 1 or self.tp_rank == 0:
             client = make_clear_tree_transport(self.server_args)
-            assert isinstance(client, SRTargetClient)
+            assert isinstance(client, ClearTargetClient)
             client.drop_callback = self._sr_note_stale
             self.sr_client = client
         if self.tp_rank == 0:
@@ -307,7 +599,7 @@ class ClearTreeSchedulerMixin:
         self.sr_server = None
         if self.tp_size == 1 or self.tp_rank == 0:
             server = make_clear_tree_transport(self.server_args)
-            assert isinstance(server, SRDraftServer)
+            assert isinstance(server, ClearDraftServer)
             self.sr_server = server
         self.draft_paused_reqs = []
         self.sr_tree_drafter = None
@@ -466,8 +758,14 @@ class ClearTreeSchedulerMixin:
         try:
             consume_clear_tree_lease(self, req)
             self._clear_release_uncommitted(req)
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                attach_round,
+                remember_choice,
+            )
+
+            plan = attach_round(self, [req])
             config = ClearTreeConfig(
-                width=int(self.server_args.clear_tree_width),
+                width=int(plan.width),
                 tau=float(self.server_args.clear_tree_tau),
                 max_depth=int(self.server_args.clear_tree_max_depth),
             )
@@ -573,6 +871,7 @@ class ClearTreeSchedulerMixin:
                 raise RuntimeError("OPT layer forward failed")
             tokens, parents, cols = windows[0]
             metrics.add_host("opt_grow", time.perf_counter() - t1)
+            remember_choice(self, len(tokens), plan.width)
             metrics.counts["opt_layer_forwards"] += layers
             if lookahead_launched is not None:
                 metrics.counts["opt_layer_forwards_critical"] += critical_layer_forwards(
@@ -636,7 +935,7 @@ class ClearTreeSchedulerMixin:
             finally:
                 metrics.add_host("opt_finish", time.perf_counter() - finish_start)
 
-    def _clear_handle_batch_impl(self, batch: SRBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
+    def _clear_handle_batch_impl(self, batch: ClearBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
         metrics = get_sr_round_metrics(self, "Draft")
         prepare_start = time.perf_counter()
         last_session = self.sr_state.session_id
@@ -644,8 +943,9 @@ class ClearTreeSchedulerMixin:
             self._sr_wipe_all()
         self.sr_state.session_id = batch.session_id
         self._sr_cleanup_stale_drafts(keep_rids={d.rid for d in batch.reqs})
+        sr_action = SRAction(batch.action.value)
         if (
-            batch.action not in (SRAction.FINISH, SRAction.ABORT)
+            batch.action not in (ClearAction.FINISH, ClearAction.ABORT)
             and self._sr_draft_busy()
         ):
             logger.info(
@@ -653,23 +953,29 @@ class ClearTreeSchedulerMixin:
                 batch.rpc_seq,
                 len(batch.reqs),
             )
-            return SRBatchReply(
+            return ClearBatchReply(
                 session_id=batch.session_id,
                 rpc_seq=batch.rpc_seq,
-                protocol_version=SR_PROTOCOL_VERSION,
+                protocol_version=CLEAR_PROTOCOL_VERSION,
                 reqs=[
-                    self._sr_empty_reply(d, status=SRReplyStatus.REJECT)
+                    ClearDraftReply(
+                        rid=d.rid,
+                        step_id=d.step_id,
+                        base_committed_len=d.base_committed_len,
+                        draft_tokens=[],
+                        status=ClearReplyStatus.REJECT,
+                    )
                     for d in batch.reqs
                 ],
             )
         n = len(batch.reqs)
         replies: List[Optional[object]] = [None] * n
         gpu_pairs = []
-        vision_jobs = [] if batch.action == SRAction.PREFILL else None
+        vision_jobs = [] if batch.action == ClearAction.PREFILL else None
         for i, dreq in enumerate(batch.reqs):
             reply, req = self._sr_prepare_v2(
                 dreq,
-                batch.action,
+                sr_action,
                 batch.session_id,
                 mm_by_rid.get(dreq.rid),
                 vision_jobs,
@@ -684,24 +990,25 @@ class ClearTreeSchedulerMixin:
             self._sr_flush_vision_jobs(vision_jobs)
         if gpu_pairs:
             windows = produce_opt_windows(
-                self, batch.action, [(dreq, req) for _, dreq, req in gpu_pairs]
+                self, sr_action, [(dreq, req) for _, dreq, req in gpu_pairs]
             )
             for (i, dreq, req), window in zip(gpu_pairs, windows):
                 pending_wire = getattr(req, "sr_pending_wire_request", None)
-                wire = pending_wire if isinstance(pending_wire, SRDraftRequest) else dreq
+                wire = pending_wire if getattr(pending_wire, "rid", None) else dreq
                 reply = self._sr_stamp_window(wire, window, batch.session_id)
-                if batch.action == SRAction.PREFILL:
+                if batch.action == ClearAction.PREFILL:
                     reply = self._sr_annotate_prompt_compaction(req, reply)
                 replies[i] = self._sr_finalize_v2_commit(wire, req, reply)
         self._sr_note_handled(batch)
-        return SRBatchReply(
-            session_id=batch.session_id,
-            rpc_seq=batch.rpc_seq,
-            protocol_version=SR_PROTOCOL_VERSION,
-            reqs=[
-                r if r is not None else self._sr_empty_reply(d)
-                for r, d in zip(replies, batch.reqs)
-            ],
+        return clear_batch_reply(
+            _ReplyBatch(
+                batch.session_id,
+                batch.rpc_seq,
+                [
+                    item if item is not None else self._sr_empty_reply(req)
+                    for item, req in zip(replies, batch.reqs)
+                ],
+            )
         )
 
     @DynamicGradMode()
@@ -781,7 +1088,7 @@ class ClearTreeSchedulerMixin:
                         )
                 else:
                     metrics = get_sr_round_metrics(self, "Draft")
-                    measure = batch.action == SRAction.STEP
+                    measure = batch.action == ClearAction.STEP
                     last_session = self.sr_state.session_id
                     if last_session is not None and batch.session_id > last_session:
                         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
@@ -801,27 +1108,37 @@ class ClearTreeSchedulerMixin:
                                 note_packet,
                             )
 
+                            if self.tp_rank == 0:
+                                from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                                    ingest_verify_samples,
+                                )
+
+                                ingest_verify_samples(
+                                    getattr(batch, "verify_samples", None)
+                                )
                             note_packet(self, batch)
                             try:
                                 round_start = time.perf_counter()
-                                if not supported_protocol(batch.protocol_version):
-                                    reply = self._sr_protocol_mismatch_reply(batch)
+                                if not supported_clear_protocol(batch.protocol_version):
+                                    reply = protocol_mismatch_reply(batch)
                                     self._sr_note_handled(batch)
-                                elif self._sr_spec_shape_rejected(batch):
-                                    reply = self._sr_spec_shape_mismatch_reply(batch)
+                                elif self._clear_spec_shape_rejected(batch):
+                                    reply = clear_batch_reply(
+                                        self._sr_spec_shape_mismatch_reply(batch)
+                                    )
                                     self._sr_note_handled(batch)
                                 else:
                                     reply = self._clear_handle_batch_impl(batch, mm)
                                 if (
                                     (self.tp_size == 1 or self.tp_rank == 0)
                                     and self.sr_server is not None
-                                    and batch.action not in (SRAction.FINISH, SRAction.ABORT)
+                                    and batch.action not in (ClearAction.FINISH, ClearAction.ABORT)
                                 ):
-                                    if batch.action == SRAction.STEP:
+                                    if batch.action == ClearAction.STEP:
                                         dump_tree_reply(reply)
                                     with metrics.phase("reply_send"):
                                         self.sr_server.send_batch(reply)
-                                if batch.action == SRAction.STEP:
+                                if batch.action == ClearAction.STEP:
                                     mark_send(self)
                                 if measure and getattr(metrics, "active", False):
                                     # Reply path is done, whether or not this rank sent.
@@ -863,7 +1180,7 @@ class ClearTreeSchedulerMixin:
                                     defer_drain=defer_drain,
                                     jobs=jobs,
                                 )
-                                if batch.action == SRAction.STEP:
+                                if batch.action == ClearAction.STEP:
                                     mark_post(self)
 
                         run_opt_draft_round(metrics, measure, _work)

@@ -52,6 +52,9 @@ def _validate_parents(row: Sequence[int]) -> List[int]:
     """Return hops from the root for each draft node. Root hop count is 0."""
     hops: List[int] = []
     for i, parent in enumerate(row):
+        if parent == -2:
+            hops.append(0)
+            continue
         if parent != -1 and not (0 <= parent < i):
             raise ValueError(
                 f"parents[{i}]={parent} must be -1 or an earlier draft index"
@@ -83,7 +86,13 @@ def opt_parent_slots(
             slots.append([-1] * (len(row) + 1))
             continue
         slots.append(
-            [-1] + [0 if int(parent) < 0 else int(parent) + 1 for parent in row]
+            [-1]
+            + [
+                -1
+                if int(parent) == -2
+                else (0 if int(parent) < 0 else int(parent) + 1)
+                for parent in row
+            ]
         )
     return slots
 
@@ -178,9 +187,18 @@ def build_tree_from_parents(
         seq_len = seqs[b]
         hops = hops_batch[b]
         row_parents = [int(x) for x in parents[b].tolist()]
-        verify_parent = [-1] + [0 if p < 0 else p + 1 for p in row_parents]
+        verify_parent = [-1]
+        for parent in row_parents:
+            if int(parent) == -2:
+                verify_parent.append(-1)
+            elif int(parent) < 0:
+                verify_parent.append(0)
+            else:
+                verify_parent.append(int(parent) + 1)
         children: List[List[int]] = [[] for _ in range(num_verify)]
         for draft_i, parent in enumerate(row_parents):
+            if int(parent) == -2:
+                continue
             verify_i = draft_i + 1
             parent_verify = 0 if parent < 0 else parent + 1
             children[parent_verify].append(verify_i)

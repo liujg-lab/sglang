@@ -673,7 +673,7 @@ def _finish_layer_timing(scheduler, timing) -> None:
         pairs.append((timing.ev0, timing.ev1, timing.ledger_meta))
 
 
-def _queue_ledger_layer(scheduler, timing, runners, layer: int) -> None:
+def _queue_ledger_layer(scheduler, timing, runners, layer: int, width: int) -> None:
     """One layer sub-batch for the shadow ledger. No extra device sync."""
     if timing is None:
         return
@@ -681,7 +681,6 @@ def _queue_ledger_layer(scheduler, timing, runners, layer: int) -> None:
         queue_layer_sample,
     )
 
-    width = int(scheduler.server_args.clear_tree_width)
     timing.ledger_meta = queue_layer_sample(
         scheduler,
         layer=int(layer),
@@ -689,6 +688,14 @@ def _queue_ledger_layer(scheduler, timing, runners, layer: int) -> None:
         host_us=getattr(timing, "host_us", None),
         width=width,
     )
+
+
+def _round_width(scheduler) -> int:
+    """Layer width for this round. The flat table wins once a plan exists."""
+    plan = getattr(scheduler, "_clear_round_plan", None)
+    if plan is not None:
+        return int(plan.width)
+    return int(scheduler.server_args.clear_tree_width)
 
 
 def critical_layer_forwards(launched: int) -> int:
@@ -897,6 +904,7 @@ def _commit_prob_rows(
         key = "opt_seed_d2h_wait_us" if seed else "opt_layer_d2h_wait_us"
         metrics.counts[key] += int((time.perf_counter() - t0) * 1e6)
     written = []
+    touched = []
     for row, index in enumerate(indices):
         state = states[index]
         if state.finished:
@@ -907,6 +915,11 @@ def _commit_prob_rows(
             expand_from_topk(state, scores[row][:, :width], ids[row][:, :width])
         if topk_out is not None:
             topk_out[index].append(ids[row])
+        touched.append(state)
+    decider = getattr(touched[0], "decider", None) if touched else None
+    if decider is not None:
+        decider.begin_layer(touched)
+    for state in touched:
         written.append(step_after_layer(state))
     return written
 
@@ -953,6 +966,19 @@ def grow_active_layers(
     """
     tails = list(tail_logits)
     states = [ClearTreeState.create(config) for _ in tails]
+    plan = getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
+    rids = list(getattr(scheduler, "_clear_round_rids", None) or []) if scheduler is not None else []
+    prefixes = (
+        list(getattr(scheduler, "_clear_round_prefixes", None) or [])
+        if scheduler is not None
+        else []
+    )
+    for index, state in enumerate(states):
+        state.decider = plan
+        if index < len(rids):
+            state.rid = rids[index]
+        if index < len(prefixes):
+            state.prefix = prefixes[index]
     if states_out is not None:
         states_out.extend(states)
     steps = [None] * len(tails)
@@ -1051,18 +1077,26 @@ def opt_bonus_graph_extra(spec_info):
     return None
 
 
-def opt_draft_bonus_ntpb(server_args):
-    """Query width of the single bonus graph, or None when this role has none.
-
-    The bonus forward carries the root guess plus one guess per verify node,
-    so its width is ``clear_tree_width + 1``. Layer graphs stay at ``N``.
-    """
+def opt_draft_bonus_ntpbs(server_args) -> list:
+    """Bonus graphs for the flat widths. Each is one wider than its layer."""
     if getattr(server_args, "clear_tree_role", None) != "draft":
+        return []
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        bonus_ntpbs,
+    )
+
+    return list(bonus_ntpbs())
+
+
+def opt_draft_bonus_ntpb(server_args):
+    """Widest bonus graph, or None when this role has none.
+
+    Layer graphs stay at 4 and 8. The bonus graphs are 5 and 9.
+    """
+    widths = opt_draft_bonus_ntpbs(server_args)
+    if not widths:
         return None
-    width = int(getattr(server_args, "clear_tree_width", 0) or 0)
-    if width <= 1:
-        return None
-    return width + 1
+    return int(widths[-1])
 
 
 def opt_draft_capture_extra_keys(server_args, ntpb) -> list:
@@ -1074,8 +1108,7 @@ def opt_draft_capture_extra_keys(server_args, ntpb) -> list:
     """
     if getattr(server_args, "clear_tree_role", None) != "draft":
         return [None]
-    bonus = opt_draft_bonus_ntpb(server_args)
-    if bonus is not None and ntpb is not None and int(ntpb) == int(bonus):
+    if ntpb is not None and int(ntpb) in opt_draft_bonus_ntpbs(server_args):
         return [OPT_BONUS_GRAPH_EXTRA]
     return [None]
 
@@ -1186,10 +1219,9 @@ class OptLayerForward:
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(list(tokens), dtype=torch.long)
         n = int(tokens.shape[0])
-        width = int(self.scheduler.server_args.clear_tree_width)
-        if n != width:
+        if n not in (4, 8):
             raise RuntimeError(
-                f"OPT layer has {n} tokens but attention was built for {width}"
+                f"OPT layer has {n} tokens but the captured layer graphs are 4 and 8"
             )
         depth = int(step.positions.reshape(-1)[0].item())
         ancestor = step.ancestor_mask
@@ -1218,7 +1250,7 @@ class OptLayerForward:
         )
         _mark_layer_launch(timing)
         logits = self._run(batch)
-        _queue_ledger_layer(self.scheduler, timing, [self], depth)
+        _queue_ledger_layer(self.scheduler, timing, [self], depth, n)
         _finish_layer_timing(self.scheduler, timing)
         logits = _row_logits(logits, n, tail=False)
         self.cached_len += n
@@ -1236,10 +1268,9 @@ class OptLayerForward:
         if not torch.is_tensor(tokens):
             raise RuntimeError("lookahead tokens must already be a tensor")
         n = int(tokens.shape[0])
-        width = int(self.scheduler.server_args.clear_tree_width)
-        if n != width:
+        if n not in (4, 8):
             raise RuntimeError(
-                f"OPT layer has {n} tokens but attention was built for {width}"
+                f"OPT layer has {n} tokens but the captured layer graphs are 4 and 8"
             )
         depth = int(depth)
         ancestor = anc_dev
@@ -1298,7 +1329,7 @@ class OptLayerForward:
         logits = self._run_lookahead(batch)
         if self._lookahead_launch_event is not None:
             self._lookahead_launch_event.record()
-        _queue_ledger_layer(self.scheduler, timing, [self], depth)
+        _queue_ledger_layer(self.scheduler, timing, [self], depth, n)
         _finish_layer_timing(self.scheduler, timing)
         logits = _row_logits(logits, n, tail=False)
         self._last_logits = logits
@@ -1865,7 +1896,7 @@ def _forward_verify_fitting(scheduler, runners, steps, consume=None):
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
     page = int(getattr(scheduler.tree_cache, "page_size", 1) or 1)
-    width = int(scheduler.server_args.clear_tree_width)
+    width = _round_width(scheduler)
     pending = list(zip(runners, steps))
     rows = []
     forwards = 0
@@ -1896,7 +1927,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
     if not runners:
         raise RuntimeError("OPT verify batch is empty")
     timing = _begin_layer_timing(scheduler)
-    width = int(scheduler.server_args.clear_tree_width)
+    width = _round_width(scheduler)
     device = scheduler.req_to_token_pool.device
     depth = _shared_depth(steps)
     token_rows = []
@@ -1906,9 +1937,9 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(list(tokens), dtype=torch.long)
         n = int(tokens.shape[0])
-        if n != width:
+        if n != width or n not in (4, 8):
             raise RuntimeError(
-                f"OPT layer has {n} tokens but attention was built for {width}"
+                f"OPT layer has {n} tokens but this round's graph width is {width}"
             )
         ancestor = step.ancestor_mask
         anc_shape = None if ancestor is None else tuple(ancestor.shape)
@@ -1964,7 +1995,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
-    _queue_ledger_layer(scheduler, timing, runners, depth)
+    _queue_ledger_layer(scheduler, timing, runners, depth, width)
     _finish_layer_timing(scheduler, timing)
     for runner in runners:
         runner.cached_len += width
@@ -2255,7 +2286,12 @@ def _append_layer_bonus_ids(runners, rows) -> None:
     for runner, row in zip(runners, rows):
         if runner is None or not torch.is_tensor(row):
             continue
-        width = int(runner.scheduler.server_args.clear_tree_width)
+        plan = getattr(runner.scheduler, "_clear_round_plan", None)
+        width = (
+            int(plan.width)
+            if plan is not None
+            else int(runner.scheduler.server_args.clear_tree_width)
+        )
         ids = getattr(runner, "bonus_ids", None)
         if ids is None:
             runner.bonus_ids = []
@@ -2862,7 +2898,8 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
         release_opt_bonus_guesses,
     )
 
-    width = int(scheduler.server_args.speculative_num_draft_tokens) + 1
+    plan = getattr(scheduler, "_clear_round_plan", None)
+    width = int(plan.width) + 1 if plan is not None else 9
     tree_end = int(runner.cached_len)
     prefix = int(runner.prefix_len)
     launched: List[_BonusLaunch] = []
@@ -3109,7 +3146,7 @@ def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
     ``n + 1`` while those slots are still mapped. ``ingest_slots`` is the
     span ingest still has to allocate. Admission runs before that alloc.
     """
-    n = int(scheduler.server_args.clear_tree_width)
+    n = 8
     depth = int(scheduler.server_args.clear_tree_max_depth)
     return int(ingest_slots) + (depth - 1) * n + (n + 1)
 
@@ -3329,7 +3366,7 @@ def prepare_lookahead_runtime(scheduler, runner):
     this request does not already have a batch.
     """
     batch = _lookahead_batch(scheduler, runner.req)
-    width = int(scheduler.server_args.clear_tree_width)
+    width = _round_width(scheduler)
     device = scheduler.req_to_token_pool.device
     shared = _lookahead_width_cache(scheduler, width, device)
     runner._la_batch = batch
@@ -3433,7 +3470,7 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     and ``can_run``. Later layers still report a graph miss through
     ``opt_lookahead_eager_layers``.
     """
-    n = int(scheduler.server_args.clear_tree_width)
+    n = _round_width(scheduler)
     if _lookahead_would_evict(scheduler, _lookahead_ingest_slots(runner)):
         raise LookaheadFallback("kv evict")
     cached = _load_layer_admit(scheduler, runner.req)
@@ -3492,6 +3529,13 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
     """
     batch, slots, bonus = runtime
     state = ClearTreeState.create(config)
+    state.decider = getattr(scheduler, "_clear_round_plan", None)
+    rids = list(getattr(scheduler, "_clear_round_rids", None) or [])
+    prefixes = list(getattr(scheduler, "_clear_round_prefixes", None) or [])
+    if rids:
+        state.rid = rids[0]
+    if prefixes:
+        state.prefix = prefixes[0]
     n = int(config.width)
     turn = 0
     layers = 0
@@ -3861,8 +3905,14 @@ def grow_batch(scheduler, reqs):
             consume_clear_tree_lease(scheduler, req)
         for req in reqs:
             scheduler._clear_release_uncommitted(req)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            attach_round,
+            remember_choice,
+        )
+
+        plan = attach_round(scheduler, reqs)
         config = ClearTreeConfig(
-            width=int(scheduler.server_args.clear_tree_width),
+            width=int(plan.width),
             tau=float(scheduler.server_args.clear_tree_tau),
             max_depth=int(scheduler.server_args.clear_tree_max_depth),
         )
@@ -3916,6 +3966,8 @@ def grow_batch(scheduler, reqs):
             mark_stop,
         )
 
+        if windows:
+            remember_choice(scheduler, len(windows[0][0]), plan.width)
         mark_stop(scheduler)
         return windows
     finally:

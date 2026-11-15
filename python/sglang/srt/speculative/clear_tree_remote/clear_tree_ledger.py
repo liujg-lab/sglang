@@ -67,6 +67,30 @@ def smallest_bucket(needed: int, buckets: Sequence[int]) -> Optional[int]:
     return None
 
 
+def predict_layer_ms(scheduler, width: int, active: int, sum_ell: int) -> Optional[float]:
+    """Draft layer fit for this width, or None until that width has enough samples."""
+    ledger = bind_ledger(scheduler)
+    if ledger is None:
+        return None
+    features = [1.0, float(graph_bucket(active)), float(sum_ell)]
+    preferred = None
+    fallback = None
+    for key, model in ledger.layer_models.items():
+        if int(key[0]) != int(width) or model.n < LAYER_MIN_SAMPLES:
+            continue
+        pred = model.predict(features)
+        if pred is None:
+            continue
+        if len(key) > 1 and str(key[1]) == "graph":
+            preferred = float(pred)
+            break
+        if fallback is None:
+            fallback = float(pred)
+    if preferred is not None:
+        return preferred
+    return fallback
+
+
 def _action_name(action) -> str:
     value = getattr(action, "value", action)
     return str(value)
@@ -144,6 +168,7 @@ class _Round:
         "idle_before",
         "gap_actions",
         "idle_after_post",
+        "t_open",
         "t_stop",
         "t_send",
         "t_post",
@@ -160,6 +185,7 @@ class _Round:
         prefix_lens: Sequence[int],
         width: int,
         idle_before: bool,
+        opened_at: float,
     ) -> None:
         self.session_id = session_id
         self.rpc_seq = int(rpc_seq)
@@ -171,6 +197,7 @@ class _Round:
         self.idle_before = bool(idle_before)
         self.gap_actions: List[str] = []
         self.idle_after_post = False
+        self.t_open = float(opened_at)
         self.t_stop: Optional[float] = None
         self.t_send: Optional[float] = None
         self.t_post: Optional[float] = None
@@ -217,7 +244,7 @@ class ClearLedger:
         closed = None
         if self.open is not None and self.open.t_send is not None:
             if name == "step":
-                closed = self._close(stamp, name, rids)
+                closed = self._close(stamp, name, rids, prefix_lens)
             elif name in _GAP_ACTIONS:
                 self.open.gap_actions.append(name)
                 self._apply_gap(name, rids)
@@ -239,6 +266,7 @@ class ClearLedger:
                 prefix_lens,
                 int(width),
                 idle_before,
+                stamp,
             )
         return closed
 
@@ -285,7 +313,13 @@ class ClearLedger:
         self.open.layers.append(sample)
         return sample
 
-    def _close(self, t_recv: float, next_action: str, next_rids: Sequence[str]) -> dict:
+    def _close(
+        self,
+        t_recv: float,
+        next_action: str,
+        next_rids: Sequence[str],
+        next_prefixes: Sequence[int] = (),
+    ) -> dict:
         rnd = self.open
         self.open = None
         assert rnd is not None
@@ -377,7 +411,49 @@ class ClearLedger:
         _emit("d_round", record)
         for sample in rnd.layers:
             self._finish_layer(rnd, sample, excluded)
+        self._note_price(rnd, t_recv, excluded, over_bucket, next_rids, next_prefixes)
         return record
+
+    def _note_price(
+        self,
+        rnd: _Round,
+        t_recv: float,
+        excluded: bool,
+        over_bucket: bool,
+        next_rids: Sequence[str],
+        next_prefixes: Sequence[int],
+    ) -> None:
+        """Clean decode rounds set the token price. Prefill, idle, and eager do not.
+
+        The denominator is the critical path from this STEP's arrival to the
+        next packet, minus the draft prefill already stored on the round.
+        """
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            observe_price,
+            settle_verified,
+        )
+
+        settle_verified(next_rids, next_prefixes)
+        if (
+            excluded
+            or over_bucket
+            or rnd.idle_after_post
+            or rnd.t_open is None
+            or rnd.t_stop is None
+        ):
+            return
+        prefill_s = float(rnd.draft_prefill_us) / 1e6
+        ms = (float(t_recv) - float(rnd.t_open) - prefill_s) * 1000.0
+        if ms <= 0:
+            return
+        new_prefix = {
+            str(rid): int(prefix) for rid, prefix in zip(next_rids, next_prefixes)
+        }
+        tokens = 0
+        for rid, old in zip(rnd.rids, rnd.prefix_lens):
+            if str(rid) in new_prefix:
+                tokens += max(0, new_prefix[str(rid)] - int(old))
+        observe_price(rnd.b, tokens, ms)
 
     def _verify(self) -> ForgettingRegressor:
         if self.verify_model is None:
@@ -658,6 +734,11 @@ def _fit_target_device(
     if len(features) != model.n_features:
         return None, None, False
     measured = float(device_us) / 1000.0
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        observe_verify,
+    )
+
+    observe_verify(int(batch_size), int(k), int(kv_bucket), measured)
     pred = None
     residual = None
     if model.n >= VERIFY_MIN_SAMPLES:
@@ -741,9 +822,53 @@ def read_verify_host_us(metrics) -> Optional[int]:
     return int(round(float(host["verify_forward"]) * 1e6))
 
 
+VERIFY_SAMPLE_LIMIT = 8
+
+
+def push_verify_sample(metrics, batch, k, bucket, device_us, ran_graph) -> None:
+    """Keep one finished graph sample for the next ClearTree request."""
+    if metrics is None or int(getattr(metrics, "tp_rank", 0) or 0) != 0:
+        return
+    if not ran_graph or bucket is None or device_us is None:
+        return
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import VERIFY_KS
+
+    if int(k) not in VERIFY_KS:
+        return
+    queue = getattr(metrics, "_clear_verify_samples", None)
+    if queue is None:
+        queue = []
+        metrics._clear_verify_samples = queue
+    queue.append([int(batch), int(k), int(bucket), int(device_us)])
+    del queue[:-VERIFY_SAMPLE_LIMIT]
+
+
+def take_verify_samples(metrics) -> list:
+    """Return the queued samples and leave the queue empty."""
+    if metrics is None:
+        return []
+    queue = list(getattr(metrics, "_clear_verify_samples", None) or [])
+    metrics._clear_verify_samples = []
+    return queue
+
+
 def install_clear_device_emit(metrics) -> None:
-    if getattr(metrics, "_clear_device_emit", None) is None:
-        metrics._clear_device_emit = emit_verify_device
+    if getattr(metrics, "_clear_device_emit", None) is not None:
+        return
+
+    def _emit(meta, duration_ms):
+        emit_verify_device(meta, duration_ms)
+        device_us = int(round(float(duration_ms) * 1000.0))
+        push_verify_sample(
+            metrics,
+            meta.get("b") or 0,
+            meta.get("k") or 0,
+            meta.get("kv_bucket"),
+            device_us,
+            bool(meta.get("ran_graph")),
+        )
+
+    metrics._clear_device_emit = _emit
 
 
 def next_verify_id(metrics) -> int:

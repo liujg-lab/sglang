@@ -647,6 +647,18 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        # ClearTree draft bonus 9 is one wider than the layer graph. Batch 1
+        # otherwise sizes the buffers at 8 and skips that capture.
+        if (
+            self.model_runner.spec_algorithm.is_clear_tree_remote()
+            and getattr(self.model_runner.server_args, "clear_tree_role", None)
+            == "draft"
+        ):
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                BONUS_NTPBS,
+            )
+
+            self.max_num_token = max(self.max_num_token, max(BONUS_NTPBS))
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -879,13 +891,16 @@ class CudaGraphRunner:
                     bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
                 elif algo.is_clear_tree_remote():
                     from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
-                        opt_draft_bonus_ntpb,
+                        opt_draft_bonus_ntpbs,
                     )
 
-                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
-                ntpb_captured = (
-                    bonus_ntpb is not None and int(actual_ntpb) == int(bonus_ntpb)
-                )
+                    bonus_ntpb = opt_draft_bonus_ntpbs(self.model_runner.server_args)
+                if isinstance(bonus_ntpb, (list, tuple)):
+                    ntpb_captured = int(actual_ntpb) in {int(item) for item in bonus_ntpb}
+                else:
+                    ntpb_captured = (
+                        bonus_ntpb is not None and int(actual_ntpb) == int(bonus_ntpb)
+                    )
             is_bs_supported = (
                 is_bs_supported
                 and ntpb_captured
@@ -1039,6 +1054,7 @@ class CudaGraphRunner:
                     or [self.num_tokens_per_bs]
                 )
                 bonus_ntpb = None
+                bonus_only_bs1 = set()
                 if is_dual and self.model_runner.spec_algorithm.is_opt_tree_remote():
                     from sglang.srt.speculative.opt_tree_remote.opt_tree_forward import (
                         opt_draft_bonus_ntpb,
@@ -1047,22 +1063,20 @@ class CudaGraphRunner:
                     bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
                     if bonus_ntpb is not None and bonus_ntpb not in ntpb_list:
                         ntpb_list.append(bonus_ntpb)
+                        bonus_only_bs1.add(int(bonus_ntpb))
                 elif is_dual and self.model_runner.spec_algorithm.is_clear_tree_remote():
                     from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
-                        opt_draft_bonus_ntpb,
+                        opt_draft_bonus_ntpbs,
                     )
 
-                    bonus_ntpb = opt_draft_bonus_ntpb(self.model_runner.server_args)
-                    if bonus_ntpb is not None and bonus_ntpb not in ntpb_list:
-                        ntpb_list.append(bonus_ntpb)
+                    for bonus_ntpb in opt_draft_bonus_ntpbs(self.model_runner.server_args):
+                        if bonus_ntpb not in ntpb_list:
+                            ntpb_list.append(bonus_ntpb)
+                        bonus_only_bs1.add(int(bonus_ntpb))
                 for ntpb in ntpb_list:
-                    # The bonus graph is one request of N+1 queries. Larger
-                    # batch sizes would exceed the width-N input buffers.
-                    if (
-                        bonus_ntpb is not None
-                        and int(ntpb) == int(bonus_ntpb)
-                        and int(bs) != 1
-                    ):
+                    # Bonus graphs are one request wide. Larger batches would
+                    # exceed the layer-width input buffers.
+                    if int(ntpb) in bonus_only_bs1 and int(bs) != 1:
                         continue
                     if int(bs) * int(ntpb) > int(self.max_num_token):
                         continue
@@ -1721,7 +1735,6 @@ class CudaGraphRunner:
             )
             if _uses_dual_ntpb(self) and draft_token_num == 1:
                 return None
-            width = int(self.model_runner.server_args.clear_tree_width)
             spec_info = EagleVerifyInput(
                 draft_token=None,
                 custom_mask=self.buffers.custom_mask,
@@ -1731,8 +1744,11 @@ class CudaGraphRunner:
                 retrive_next_sibling=None,
                 retrive_cum_len=None,
                 spec_steps=int(self.model_runner.server_args.clear_tree_max_depth),
-                topk=width,
-                draft_token_num=width + 1,
+                topk=max(
+                    int(self.model_runner.server_args.speculative_eagle_topk or 2),
+                    2,
+                ),
+                draft_token_num=int(draft_token_num),
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
@@ -1757,17 +1773,21 @@ class CudaGraphRunner:
             )
             if _uses_dual_ntpb(self) and draft_token_num == 1:
                 return None
-            width = int(self.model_runner.server_args.clear_tree_width)
             query_width = int(draft_token_num)
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                BONUS_NTPBS,
+                LAYER_WIDTHS,
+            )
+
             is_bonus = (
-                query_width == width + 1
+                query_width in BONUS_NTPBS
                 and getattr(self, "_active_capture_extra", None)
                 == OPT_BONUS_GRAPH_EXTRA
             )
-            if query_width != width and not is_bonus:
+            if query_width not in LAYER_WIDTHS and not is_bonus:
                 raise RuntimeError(
                     f"CLEAR_TREE_REMOTE draft TARGET_VERIFY graph ntpb {query_width} "
-                    f"!= clear_tree_width {width}"
+                    f"is not a layer width {LAYER_WIDTHS} or a bonus width {BONUS_NTPBS}"
                 )
             spec_info = OptLayerSpec(
                 custom_mask=self.buffers.custom_mask,

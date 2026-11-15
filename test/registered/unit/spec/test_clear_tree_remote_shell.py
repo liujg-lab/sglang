@@ -86,14 +86,35 @@ class ClearTreeRemoteShellTest(CustomTestCase):
     def test_omitted_draft_tokens_follow_role(self):
         target = _args(clear_tree_role="target")
         apply_clear_tree_settings(target, on_npu=False)
-        self.assertEqual(target.speculative_num_draft_tokens, 5)
+        self.assertEqual(target.speculative_num_draft_tokens, 33)
         self.assertEqual(target.speculative_num_steps, 8)
         self.assertTrue(target.disable_overlap_schedule)
         self.assertFalse(target.enable_mixed_chunk)
 
         draft = _args(clear_tree_role="draft")
         apply_clear_tree_settings(draft, on_npu=False)
-        self.assertEqual(draft.speculative_num_draft_tokens, 4)
+        self.assertEqual(draft.speculative_num_draft_tokens, 8)
+
+    def test_capture_widths_follow_role(self):
+        target = _args(clear_tree_role="target", speculative_num_draft_tokens=33)
+        draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=8)
+        opt = _args(
+            speculative_algorithm="OPT_TREE_REMOTE",
+            opt_tree_role="target",
+            speculative_num_draft_tokens=17,
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(target),
+            [33, 17, 9, 1],
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(draft),
+            [8, 4, 1],
+        )
+        self.assertEqual(
+            SpeculativeAlgorithm.OPT_TREE_REMOTE.dual_ntpb_cuda_graph_options(opt),
+            [17, 1],
+        )
 
     def test_explicit_draft_tokens_must_match(self):
         draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=5)

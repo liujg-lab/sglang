@@ -284,6 +284,12 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[List[int]]:
         if not self.uses_dual_ntpb_cuda_graph(server_args, is_draft_worker):
             return None
+        if self.is_clear_tree_remote():
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                capture_ntpb,
+            )
+
+            return capture_ntpb(getattr(server_args, "clear_tree_role", None))
         ntpb = self.target_verify_cuda_graph_num_tokens_per_bs(
             server_args, is_draft_worker
         )

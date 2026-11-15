@@ -4,7 +4,7 @@ Layer selection matches ``opt_classic_qwen3/tree.py`` ``Tree.update``. The stop
 check does not. The reference adds layer k + 1 before judging E on layers
 1..k, then drops that extra layer. This implementation judges as soon as layer
 k exists, so the draft forward that only built the dropped layer is skipped.
-The verify set is the same N nodes.
+The verify set is the chosen K, padded with parent -2 when the tree is shorter.
 
 - each layer keeps N nodes (parent path probability times that parent's top-N
   child probabilities, then a global top-N);
@@ -470,9 +470,9 @@ def _close_under_ancestors(
 
 
 def _ranked_verify_indices(
-    scores: torch.Tensor, layer_count: int, width: int
+    scores: torch.Tensor, layer_count: int, width: int, keep: int
 ) -> torch.Tensor:
-    """Top-N flat indices ordered by score desc, depth asc, column asc."""
+    """Top-``keep`` flat indices ordered by score desc, depth asc, column asc."""
     total = int(layer_count) * int(width)
     idx = torch.arange(total, device=scores.device)
     rows = torch.div(idx, width, rounding_mode="floor")
@@ -480,14 +480,16 @@ def _ranked_verify_indices(
     order = torch.argsort(cols, stable=True)
     order = order[torch.argsort(rows[order], stable=True)]
     order = order[torch.argsort(scores[order], descending=True, stable=True)]
-    return order[:width]
+    return order[: min(int(keep), total)]
 
 
-def finish(state: ClearTreeState) -> OptVerifySet:
-    """Keep the top-N nodes of every layer added so far.
+def finish(state: ClearTreeState, keep: Optional[int] = None) -> OptVerifySet:
+    """Keep the top-``keep`` nodes of every layer added so far.
 
-    Shallower nodes win ties, so the selected prefix already contains every
-    ancestor. Closure is checked and does not add or remove nodes.
+    ``keep`` defaults to the layer width. Shallower nodes win ties, so the
+    selected prefix already contains every ancestor. Closure is checked and
+    does not add or remove nodes. A short tree is padded to ``keep`` with
+    parent ``-2``; those rows are not linked into the accept chain.
     """
     if state.finished:
         raise RuntimeError("tree is already finished")
@@ -495,8 +497,11 @@ def finish(state: ClearTreeState) -> OptVerifySet:
         raise RuntimeError("finish needs a seeded tree")
     n = state.config.width
     layer_count = state.depth
+    limit = n if keep is None else int(keep)
+    if limit < 1:
+        raise ValueError(f"verify keep must be >= 1, got {limit}")
     flat = state.weight[:layer_count].reshape(-1)
-    selected = _ranked_verify_indices(flat, layer_count, n)
+    selected = _ranked_verify_indices(flat, layer_count, n, limit)
     closed = _close_under_ancestors(
         selected, state.parents[:layer_count], layer_count, n
     )
@@ -531,8 +536,15 @@ def finish(state: ClearTreeState) -> OptVerifySet:
                     f"missing ancestor {parent_key} for node {(row, col)}"
                 )
             parents_out.append(index_of[parent_key])
+    while len(tokens) < limit:
+        tokens.append(0)
+        depths.append(0)
+        cols.append(0)
+        parents_out.append(-2)
     parent_tensor = torch.tensor(parents_out, dtype=torch.long)
     for i, parent in enumerate(parents_out):
+        if parent == -2:
+            continue
         if parent != -1 and parent >= i:
             raise RuntimeError(f"parent index {parent} at {i} is not before the node")
     depth_tensor = torch.tensor(depths, dtype=torch.long)
@@ -552,7 +564,9 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
     A non-final step asks for a draft forward of the layer just added. A final
     step verifies that layer and does not forward it, and does not build a mask.
     """
-    if depth_rule(state):
+    decider = getattr(state, "decider", None)
+    grow = decider.should_grow(state) if decider is not None else depth_rule(state)
+    if grow:
         state.prev_e = acceptance_mass(state)
         return ClearTreeStep(
             is_final=False,
@@ -560,7 +574,11 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
             positions=_layer_positions(state),
             ancestor_mask=state.anc_mask,
         )
-    verify = finish(state)
+    keep = None
+    if decider is not None:
+        keep = int(decider.verify_k(state))
+        decider.note(state)
+    verify = finish(state, keep)
     return ClearTreeStep(
         is_final=True,
         tokens=verify.tokens,
