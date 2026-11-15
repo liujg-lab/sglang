@@ -14,17 +14,27 @@ import torch
 from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
     build_tree_from_parents,
 )
+from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
+    ClearTreeConfig,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+    grow_active_layers,
+)
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     RoundPlan,
     accept_ratio,
     flat_width,
     ingest_verify_samples,
+    compare_price,
+    layer_should_continue,
     make_round,
     observe_accept,
     observe_price,
     observe_verify,
     predict_verify_ms,
+    request_terms,
     reset_policy,
+    select_continuing,
     theta,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
@@ -49,6 +59,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     consume_verify_device,
     emit_verify_device,
     graph_bucket,
+    note_target_prefill,
     read_verify_host_us,
     reset_target_verify_model,
     smallest_bucket,
@@ -113,15 +124,20 @@ class ClearTreeLedgerTest(CustomTestCase):
         ledger.mark_stop(10.10)
         ledger.mark_send(10.12)
         ledger.mark_post(10.13)
-        _step(ledger, ["a"], [14], 2, 10.40)
+        closed = _step(ledger, ["a"], [14], 2, 10.40)
+        self.assertTrue(closed["price_kept"])
+        self.assertEqual(closed["price_tokens"], 4)
+        self.assertAlmostEqual(closed["price_ms"], 380.0)
         self.assertAlmostEqual(theta(1), 4.0 / 380.0)
 
         ledger.mark_stop(10.50)
         ledger.mark_send(10.55)
         ledger.mark_post(10.56)
         ledger.note_idle()
-        _step(ledger, ["a"], [40], 3, 11.40)
-        self.assertAlmostEqual(theta(1), 4.0 / 380.0)
+        later = _step(ledger, ["a"], [40], 3, 11.40)
+        self.assertTrue(later["price_kept"])
+        self.assertFalse(later["excluded"])
+        self.assertAlmostEqual(theta(1), 15.0 / 690.0)
 
     def test_wait_is_not_an_empty_server(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -144,9 +160,15 @@ class ClearTreeLedgerTest(CustomTestCase):
         fresh.mark_send(1.1)
         fresh.mark_post(1.2)
         fresh.note_idle()
+        before = theta(1)
         idle = _step(fresh, ["a"], [4], 2, 1.4)
         self.assertIn("idle_start", idle["exclude_reason"])
         self.assertEqual(fresh.verify_samples, 0)
+        self.assertFalse(idle["price_kept"])
+        self.assertEqual(idle["price_tokens"], 0)
+        self.assertAlmostEqual(idle["price_ms"], 400.0)
+        self.assertEqual(idle["gap_rpc"], [])
+        self.assertEqual(theta(1), before)
 
         prefill = ClearLedger(active_rids=["a"])
         _step(prefill, ["a"], [4], 1, 1.0)
@@ -158,6 +180,11 @@ class ClearTreeLedgerTest(CustomTestCase):
         held = _step(prefill, ["a"], [4], 3, 1.5)
         self.assertIn("prefill", held["exclude_reason"])
         self.assertEqual(prefill.verify_samples, 0)
+        self.assertFalse(held["price_kept"])
+        self.assertEqual(held["price_tokens"], 0)
+        self.assertAlmostEqual(held["price_ms"], 500.0)
+        self.assertEqual(held["gap_rpc"], [2])
+        self.assertEqual(theta(1), before)
 
         grown = ClearLedger(active_rids=["a"])
         _step(grown, ["a"], [4], 1, 1.0)
@@ -168,6 +195,25 @@ class ClearTreeLedgerTest(CustomTestCase):
         added = _step(grown, ["a", "b"], [4, 8], 2, 1.5)
         self.assertIn("new_rid", added["exclude_reason"])
         self.assertEqual(grown.verify_samples, 0)
+        self.assertFalse(added["price_kept"])
+        self.assertEqual(added["price_tokens"], 0)
+        self.assertAlmostEqual(added["price_ms"], 500.0)
+        self.assertEqual(added["gap_rpc"], [])
+        self.assertEqual(theta(1), before)
+
+    def test_target_prefill_log_stays_off_the_step(self):
+        record = note_target_prefill("sess", 7, ["a"], 10000)
+        self.assertEqual(
+            record,
+            {
+                "action": "prefill",
+                "session_id": "sess",
+                "rpc_seq": 7,
+                "rids": ["a"],
+                "wall_us": 10000,
+            },
+        )
+        self.assertIsNone(note_target_prefill("sess", 8, ["a"], 10000, 1))
 
     def test_bonus_hit_skips_layer_regression(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -452,10 +498,268 @@ class TestFlatWidthOnlineK(CustomTestCase):
     def setUp(self):
         reset_policy()
 
+    def test_price_ema_floor_leaves_the_cumulative_ratio(self):
+        for _ in range(20):
+            observe_price(1, 10.0, 10.0)
+        self.assertAlmostEqual(theta(1), 1.0)
+        observe_price(1, 0.0, 10.0)
+        self.assertAlmostEqual(theta(1), 0.95)
+        self.assertNotAlmostEqual(theta(1), 200.0 / 210.0)
+
+    def test_unseen_batch_uses_the_other_batch_prior(self):
+        observe_price(1, 10.0, 10.0)
+        self.assertAlmostEqual(theta(2), 2.0 ** 0.8)
+        sched = SimpleNamespace(_clear_ledger=False)
+        reqs = [
+            SimpleNamespace(rid="a", origin_input_ids=[1], output_ids=[]),
+            SimpleNamespace(rid="b", origin_input_ids=[1], output_ids=[]),
+        ]
+        plan = make_round(sched, reqs)
+        self.assertAlmostEqual(plan.theta_value, 2.0 ** 0.8)
+        observe_price(4, 20.0, 40.0)
+        self.assertAlmostEqual(theta(2), 2.0 ** -0.5)
+
+    def test_subtracting_prefill_differs_from_dropping_the_round(self):
+        report = compare_price(
+            [
+                {
+                    "b": 1,
+                    "price_tokens": 10,
+                    "price_ms": 10.0,
+                    "price_kept": True,
+                    "exclude_reason": [],
+                    "gap_rpc": [],
+                },
+                {
+                    "b": 1,
+                    "price_tokens": 2,
+                    "price_ms": 20.0,
+                    "price_kept": False,
+                    "exclude_reason": ["prefill"],
+                    "gap_rpc": [7],
+                },
+                {
+                    "b": 1,
+                    "price_tokens": 100,
+                    "price_ms": 10.0,
+                    "price_kept": False,
+                    "exclude_reason": ["finish"],
+                    "gap_rpc": [8],
+                },
+                {
+                    "b": 1,
+                    "price_tokens": 4,
+                    "price_ms": 10.0,
+                    "price_kept": False,
+                    "exclude_reason": ["idle_start"],
+                    "gap_rpc": [],
+                },
+            ],
+            [{"rpc_seq": 7, "wall_us": 10000, "action": "prefill"}],
+        )
+        self.assertAlmostEqual(report[1]["discard"], 1.0)
+        self.assertAlmostEqual(report[1]["deduct"], 16.0 / 30.0)
+        self.assertAlmostEqual(report[1]["relative"], 14.0 / 30.0)
+
     def test_flat_width(self):
         self.assertEqual(flat_width(1), 8)
         self.assertEqual(flat_width(2), 4)
         self.assertEqual(flat_width(8), 4)
+
+    def test_layer_forward_drops_one_request(self):
+        width = 4
+        vocab = 8
+        config = ClearTreeConfig(width=width, tau=0.4, max_depth=8)
+        cached = [0, 0]
+        calls = []
+
+        class _DropSecond:
+            def begin_layer(self, states):
+                self.peers = list(states)
+
+            def should_grow(self, state):
+                if int(state.depth) >= int(state.config.max_depth) - 1:
+                    return False
+                if int(state.depth) <= 1:
+                    return True
+                if int(state.depth) >= 3:
+                    return False
+                return state is self.peers[0]
+
+            def verify_k(self, state):
+                return width
+
+            def note(self, state):
+                return None
+
+        def forward_active(steps, indices):
+            calls.append(list(indices))
+            for index in indices:
+                cached[index] += width
+            rows = torch.full((len(indices), width, vocab), -8.0)
+            for rank in range(min(width + 1, vocab)):
+                rows[:, :, rank] = float(6 - rank)
+            return rows
+
+        tail = torch.full((vocab,), -8.0)
+        for rank in range(min(width + 1, vocab)):
+            tail[rank] = float(6 - rank)
+        scheduler = SimpleNamespace(
+            _clear_round_plan=_DropSecond(),
+            _clear_round_rids=["a", "b"],
+            _clear_round_prefixes=[4, 9],
+        )
+        windows = grow_active_layers(
+            config, [tail.clone(), tail.clone()], forward_active, scheduler
+        )
+        self.assertEqual(calls[0], [0, 1])
+        self.assertEqual(calls[1], [0])
+        stopped = cached[1]
+        self.assertEqual(stopped, width)
+        self.assertGreater(cached[0], stopped)
+        self.assertEqual(len(windows), 2)
+        self.assertTrue(windows[0][0])
+        self.assertTrue(windows[1][0])
+
+    def test_only_the_positive_net_request_continues(self):
+        good = _rows_state([[0.5, 0, 0, 0, 0, 0, 0, 0]], "good", 1)
+        poor = _rows_state([[0.05, 0, 0, 0, 0, 0, 0, 0]], "poor", 100)
+        kept = select_continuing(
+            [good, poor],
+            [good, poor],
+            theta=1.0,
+            verify_times={8: 1.0, 16: 1.0, 32: 1.0},
+            layer_cost=lambda active, _ell: 0.05 if int(active) == 1 else 0.5,
+            kappa=0.1,
+        )
+        self.assertEqual([item.rid for item in kept], ["good"])
+
+    def test_a_step_in_layer_cost_can_keep_fewer_requests(self):
+        first = _rows_state([[0.5, 0, 0, 0, 0, 0, 0, 0]], "first", 4)
+        second = _rows_state([[0.4, 0, 0, 0, 0, 0, 0, 0]], "second", 4)
+        times = {8: 1.0, 16: 1.0, 32: 1.0}
+        flat = select_continuing(
+            [first, second],
+            [first, second],
+            theta=1.0,
+            verify_times=times,
+            layer_cost=lambda _active, _ell: 0.01,
+            kappa=0.0,
+        )
+        stepped = select_continuing(
+            [first, second],
+            [first, second],
+            theta=1.0,
+            verify_times=times,
+            layer_cost=lambda active, _ell: 0.01 if int(active) == 1 else 10.0,
+            kappa=0.0,
+        )
+        self.assertEqual({item.rid for item in flat}, {"first", "second"})
+        self.assertEqual([item.rid for item in stepped], ["first"])
+
+    def test_a_stopped_request_still_changes_later_j(self):
+        live = _rows_state(
+            [
+                [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+                [0.6, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            "live",
+            4,
+        )
+        stopped = _rows_state([[0.125] * 8] * 4, "stopped", 4)
+        times = {8: 0.0, 16: 3.0, 32: 3.0}
+        alone = select_continuing(
+            [live],
+            [live],
+            theta=1.0,
+            verify_times=times,
+            layer_cost=lambda _active, _ell: 0.3,
+            kappa=0.0,
+        )
+        joint = select_continuing(
+            [stopped, live],
+            [live],
+            theta=1.0,
+            verify_times=times,
+            layer_cost=lambda _active, _ell: 0.3,
+            kappa=0.0,
+        )
+        self.assertEqual(alone, [])
+        self.assertEqual([item.rid for item in joint], ["live"])
+        mass, _gain = request_terms(stopped, 32)
+        self.assertGreater(mass, request_terms(stopped, 8)[0])
+
+    def test_deferred_windows_share_one_k(self):
+        width = 4
+        vocab = 8
+        config = ClearTreeConfig(width=width, tau=0.4, max_depth=8)
+        plan = RoundPlan(
+            width=width,
+            k=8,
+            use_tau=False,
+            locked_k=None,
+            theta_value=1.0,
+            layer_ms=1.0,
+            max_ell=10,
+            batch=2,
+            buckets=(256,),
+        )
+
+        def choose(eligible):
+            if not eligible or int(eligible[0].depth) >= 3:
+                return []
+            if int(eligible[0].depth) <= 1:
+                return list(eligible)
+            return [eligible[0]]
+
+        plan._choose_keep = choose
+        plan._select = lambda states: 8
+
+        def forward_active(steps, indices):
+            rows = torch.full((len(indices), width, vocab), -8.0)
+            for rank in range(min(width + 1, vocab)):
+                rows[:, :, rank] = float(6 - rank)
+            return rows
+
+        tail = torch.full((vocab,), -8.0)
+        for rank in range(min(width + 1, vocab)):
+            tail[rank] = float(6 - rank)
+        scheduler = SimpleNamespace(
+            _clear_round_plan=plan,
+            _clear_round_rids=["a", "b"],
+            _clear_round_prefixes=[4, 9],
+        )
+        windows = grow_active_layers(
+            config, [tail.clone(), tail.clone()], forward_active, scheduler
+        )
+        self.assertEqual(plan._frozen_k, 8)
+        self.assertEqual(len(windows[0][0]), 8)
+        self.assertEqual(len(windows[1][0]), 8)
+        self.assertEqual(len(windows[0][1]), 8)
+        self.assertEqual(len(windows[1][1]), 8)
+
+    def test_single_request_matches_the_whole_batch(self):
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        for k in (8, 16, 32):
+            observe_verify(1, k, 256, 10.0)
+        for _ in range(3):
+            observe_verify(1, 8, 256, 10.0)
+        for layer_ms in (0.0, 1000.0):
+            plan = _value_plan()
+            plan.layer_ms = layer_ms
+            plan.bind_states([state])
+            plan.begin_layer([state])
+            current = plan._values([state], include_gain=False)
+            nxt = plan._values([state], include_gain=True)
+            old = layer_should_continue(
+                max(current.values()),
+                max(nxt.values()) - float(plan.theta_value) * float(layer_ms),
+            )
+            self.assertEqual(plan.should_grow(state), old)
+            plan._at = None
+            plan._layer_cost = lambda _active, _ell: float(layer_ms)
+            plan._kappa = lambda: 0.0
+            self.assertEqual(plan.should_grow(state), old)
 
     def test_equal_verify_time_keeps_the_largest_k(self):
         state = _score_state([0.4, 0.2, 0.1, 0.05])
@@ -486,6 +790,64 @@ class TestFlatWidthOnlineK(CustomTestCase):
         warmed = make_round(sched, [req])
         self.assertTrue(warmed.use_tau)
         self.assertEqual(warmed.locked_k, 32)
+
+    def test_new_batch_restarts_probes_at_k8(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        one = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        two = [
+            one,
+            SimpleNamespace(rid="b", origin_input_ids=[1] * 10, output_ids=[]),
+        ]
+        locked = [make_round(sched, [one]).locked_k for _ in range(6)]
+        self.assertEqual(locked, [8, 8, 16, 16, 32, 32])
+        again = make_round(sched, two)
+        self.assertTrue(again.use_tau)
+        self.assertEqual(again.locked_k, 8)
+
+    def test_missing_tier_stays_on_tau_until_every_k_is_timed(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        reqs = [
+            SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[]),
+            SimpleNamespace(rid="b", origin_input_ids=[1] * 10, output_ids=[]),
+        ]
+        for k in (16, 32):
+            observe_verify(2, k, 256, 10.0)
+        for _ in range(4):
+            observe_verify(2, 16, 256, 10.0)
+        observe_price(2, 2.0, 1.0)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            for _ in range(10):
+                make_round(sched, reqs)
+            held = make_round(sched, reqs)
+        self.assertTrue(held.use_tau)
+        self.assertEqual(held.locked_k, 32)
+        observe_verify(2, 8, 256, 10.0)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            left = make_round(sched, reqs)
+        self.assertFalse(left.use_tau)
+        self.assertIsNone(left.locked_k)
+
+    def test_flat_mass_selects_k8_when_it_is_not_slower(self):
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        observe_verify(2, 8, 256, 10.0)
+        observe_verify(2, 16, 256, 12.0)
+        observe_verify(2, 32, 256, 14.0)
+        for _ in range(3):
+            observe_verify(2, 8, 256, 10.0)
+        plan = _value_plan()
+        plan.batch = 2
+        plan.begin_layer([state])
+        values = plan._values([state], include_gain=False)
+        self.assertEqual(set(values), {8, 16, 32})
+        self.assertGreater(values[8], values[16])
+        self.assertGreater(values[8], values[32])
+        self.assertEqual(plan.verify_k(state), 8)
 
     def test_ready_sample_leaves_tau(self):
         sched = SimpleNamespace(_clear_ledger=False)
@@ -609,6 +971,17 @@ class TestFlatWidthOnlineK(CustomTestCase):
         queued = take_verify_samples(metrics)
         self.assertEqual(len(queued), 8)
         self.assertEqual(queued[0][3], 1002)
+
+
+def _rows_state(rows, rid, prefix):
+    weight = torch.tensor(rows, dtype=torch.float32)
+    return SimpleNamespace(
+        depth=int(weight.shape[0]),
+        weight=weight,
+        rid=rid,
+        prefix=int(prefix),
+        config=SimpleNamespace(max_depth=8, tau=0.4, width=int(weight.shape[1])),
+    )
 
 
 def _score_state(scores):

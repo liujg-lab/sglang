@@ -574,6 +574,12 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
             positions=_layer_positions(state),
             ancestor_mask=state.anc_mask,
         )
+    if decider is not None and getattr(decider, "defer_finish", False):
+        return ClearTreeStep(
+            is_final=True,
+            tokens=state.tokens[state.depth - 1].clone(),
+            positions=_layer_positions(state),
+        )
     keep = None
     if decider is not None:
         keep = int(decider.verify_k(state))

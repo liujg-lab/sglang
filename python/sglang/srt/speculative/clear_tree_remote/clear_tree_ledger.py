@@ -67,28 +67,49 @@ def smallest_bucket(needed: int, buckets: Sequence[int]) -> Optional[int]:
     return None
 
 
-def predict_layer_ms(scheduler, width: int, active: int, sum_ell: int) -> Optional[float]:
-    """Draft layer fit for this width, or None until that width has enough samples."""
+def _layer_model(scheduler, width: int):
+    """Fitted layer model for this width. A graph-path fit wins over eager."""
     ledger = bind_ledger(scheduler)
     if ledger is None:
         return None
-    features = [1.0, float(graph_bucket(active)), float(sum_ell)]
     preferred = None
     fallback = None
     for key, model in ledger.layer_models.items():
         if int(key[0]) != int(width) or model.n < LAYER_MIN_SAMPLES:
             continue
-        pred = model.predict(features)
-        if pred is None:
+        if model.coefficients() is None:
             continue
         if len(key) > 1 and str(key[1]) == "graph":
-            preferred = float(pred)
+            preferred = model
             break
         if fallback is None:
-            fallback = float(pred)
+            fallback = model
     if preferred is not None:
         return preferred
     return fallback
+
+
+def predict_layer_ms(scheduler, width: int, active: int, sum_ell: int) -> Optional[float]:
+    """Draft layer fit for this width, or None until that width has enough samples."""
+    model = _layer_model(scheduler, width)
+    if model is None:
+        return None
+    features = [1.0, float(graph_bucket(active)), float(sum_ell)]
+    pred = model.predict(features)
+    if pred is None:
+        return None
+    return float(pred)
+
+
+def layer_sum_ell_slope(scheduler, width: int) -> Optional[float]:
+    """Coefficient of prefix length in the layer fit. None until that fit exists."""
+    model = _layer_model(scheduler, width)
+    if model is None:
+        return None
+    beta = model.coefficients()
+    if beta is None or len(beta) < 3:
+        return None
+    return float(beta[2])
 
 
 def _action_name(action) -> str:
@@ -144,13 +165,17 @@ class ForgettingRegressor:
                 self.xtx[i][j] += float(features[i]) * float(features[j])
         self.n += 1
 
-    def predict(self, features: Sequence[float]) -> Optional[float]:
+    def coefficients(self) -> Optional[List[float]]:
+        """Solved weights. The intercept is first. None until the fit is usable."""
         if self.n < self.min_samples:
             return None
         system = [row[:] for row in self.xtx]
         for index in range(1, self.n_features):
             system[index][index] += RIDGE
-        beta = _solve(system, self.xty)
+        return _solve(system, self.xty)
+
+    def predict(self, features: Sequence[float]) -> Optional[float]:
+        beta = self.coefficients()
         if beta is None:
             return None
         return sum(weight * float(value) for weight, value in zip(beta, features))
@@ -167,6 +192,7 @@ class _Round:
         "prefix_lens",
         "idle_before",
         "gap_actions",
+        "gap_rpcs",
         "idle_after_post",
         "t_open",
         "t_stop",
@@ -196,6 +222,7 @@ class _Round:
         self.w = int(width)
         self.idle_before = bool(idle_before)
         self.gap_actions: List[str] = []
+        self.gap_rpcs: List[int] = []
         self.idle_after_post = False
         self.t_open = float(opened_at)
         self.t_stop: Optional[float] = None
@@ -204,6 +231,24 @@ class _Round:
         self.draft_prefill_us = 0
         self.bonus_hit_rids: List[str] = []
         self.layers: List[dict] = []
+
+
+def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
+    """Tokens and milliseconds from open to the next STEP, minus draft prefill."""
+    if rnd.t_stop is None:
+        return None, None
+    prefill_s = float(rnd.draft_prefill_us) / 1e6
+    ms = (float(t_recv) - float(rnd.t_open) - prefill_s) * 1000.0
+    if ms <= 0:
+        return None, None
+    new_prefix = {
+        str(rid): int(prefix) for rid, prefix in zip(next_rids, next_prefixes)
+    }
+    tokens = 0
+    for rid, old in zip(rnd.rids, rnd.prefix_lens):
+        if str(rid) in new_prefix:
+            tokens += max(0, new_prefix[str(rid)] - int(old))
+    return tokens, ms
 
 
 class ClearLedger:
@@ -247,6 +292,7 @@ class ClearLedger:
                 closed = self._close(stamp, name, rids, prefix_lens)
             elif name in _GAP_ACTIONS:
                 self.open.gap_actions.append(name)
+                self.open.gap_rpcs.append(int(rpc_seq))
                 self._apply_gap(name, rids)
                 return None
             else:
@@ -382,6 +428,15 @@ class ClearLedger:
                 if fit_verify:
                     model.update(features, t_k_us / 1000.0)
                     self.verify_samples += 1
+        price_tokens, price_ms = _round_price(
+            rnd, t_recv, next_rids, next_prefixes
+        )
+        price_kept = (
+            price_tokens is not None
+            and price_ms is not None
+            and not excluded
+            and not over_bucket
+        )
         record = {
             "rpc_seq": rnd.rpc_seq,
             "session_id": rnd.session_id,
@@ -400,6 +455,10 @@ class ClearLedger:
             "draft_floor": draft_floor,
             "excluded": excluded,
             "exclude_reason": reasons,
+            "gap_rpc": list(rnd.gap_rpcs),
+            "price_tokens": price_tokens,
+            "price_ms": price_ms,
+            "price_kept": price_kept,
             "draft_prefill_us": rnd.draft_prefill_us,
             "bonus_hit_rids": list(rnd.bonus_hit_rids),
             "kv_bucket": bucket,
@@ -411,22 +470,22 @@ class ClearLedger:
         _emit("d_round", record)
         for sample in rnd.layers:
             self._finish_layer(rnd, sample, excluded)
-        self._note_price(rnd, t_recv, excluded, over_bucket, next_rids, next_prefixes)
+        self._note_price(rnd, next_rids, next_prefixes, price_tokens, price_ms, price_kept)
         return record
 
     def _note_price(
         self,
         rnd: _Round,
-        t_recv: float,
-        excluded: bool,
-        over_bucket: bool,
         next_rids: Sequence[str],
         next_prefixes: Sequence[int],
+        price_tokens: Optional[float],
+        price_ms: Optional[float],
+        price_kept: bool,
     ) -> None:
-        """Clean decode rounds set the token price. Prefill, idle, and eager do not.
+        """Kept rounds update Θ_b. A mixed round is logged and left out.
 
-        The denominator is the critical path from this STEP's arrival to the
-        next packet, minus the draft prefill already stored on the round.
+        An empty poll after the reply is only the draft-floor flag. It still
+        counts as pure decode. Eager rounds past the last KV bucket stay out.
         """
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
             observe_price,
@@ -434,26 +493,9 @@ class ClearLedger:
         )
 
         settle_verified(next_rids, next_prefixes)
-        if (
-            excluded
-            or over_bucket
-            or rnd.idle_after_post
-            or rnd.t_open is None
-            or rnd.t_stop is None
-        ):
+        if not price_kept or price_tokens is None or price_ms is None:
             return
-        prefill_s = float(rnd.draft_prefill_us) / 1e6
-        ms = (float(t_recv) - float(rnd.t_open) - prefill_s) * 1000.0
-        if ms <= 0:
-            return
-        new_prefix = {
-            str(rid): int(prefix) for rid, prefix in zip(next_rids, next_prefixes)
-        }
-        tokens = 0
-        for rid, old in zip(rnd.rids, rnd.prefix_lens):
-            if str(rid) in new_prefix:
-                tokens += max(0, new_prefix[str(rid)] - int(old))
-        observe_price(rnd.b, tokens, ms)
+        observe_price(rnd.b, price_tokens, price_ms)
 
     def _verify(self) -> ForgettingRegressor:
         if self.verify_model is None:
@@ -564,6 +606,27 @@ def _quiet(scheduler, fn) -> None:
         fn(ledger)
     except Exception:
         logger.warning("[CLEAR ledger] update failed", exc_info=True)
+
+
+def note_target_prefill(
+    session_id, rpc_seq, rids, wall_us, tp_rank=0
+) -> Optional[dict]:
+    """Target PREFILL wall time. Only rank 0 logs it; the STEP message is unchanged."""
+    if int(tp_rank) != 0 or not ledger_enabled():
+        return None
+    try:
+        record = {
+            "action": "prefill",
+            "session_id": str(session_id),
+            "rpc_seq": int(rpc_seq),
+            "rids": [str(rid) for rid in list(rids or [])],
+            "wall_us": int(wall_us),
+        }
+        _emit("t_gap", record)
+        return record
+    except Exception:
+        logger.warning("[CLEAR ledger] target prefill log failed", exc_info=True)
+        return None
 
 
 def note_packet(scheduler, batch) -> None:

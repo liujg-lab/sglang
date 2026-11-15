@@ -1032,6 +1032,7 @@ class ClearTreeSchedulerMixin:
                     live = [
                         r for r in self._sr_select_reqs(batch) if not r.finished()
                     ]
+                    gap_started = time.perf_counter()
                     inflight = (
                         self._sr_send(
                             SRAction.PREFILL, live, include_full_context=True
@@ -1045,14 +1046,32 @@ class ClearTreeSchedulerMixin:
                         self.process_batch_result(batch, result)
                     finally:
                         if inflight is not None:
-                            replies, pending = self._sr_recv(inflight)
-                            still = [r for r in live if not r.finished()]
-                            self._sr_apply_commit_acks(still, replies, pending)
-                            self._sr_note_draft_prompt_lens(still, replies)
-                            self._sr_maybe_align_chain_replies(
-                                still, replies, prefill=True
-                            )
-                            self._sr_attach_replies(still, replies)
+                            try:
+                                replies, pending = self._sr_recv(inflight)
+                                still = [r for r in live if not r.finished()]
+                                self._sr_apply_commit_acks(still, replies, pending)
+                                self._sr_note_draft_prompt_lens(still, replies)
+                                self._sr_maybe_align_chain_replies(
+                                    still, replies, prefill=True
+                                )
+                                self._sr_attach_replies(still, replies)
+                            finally:
+                                from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                                    note_target_prefill,
+                                )
+
+                                note_target_prefill(
+                                    getattr(inflight, "session_id", ""),
+                                    getattr(inflight, "rpc_seq", 0),
+                                    [getattr(req, "rid", "") for req in live],
+                                    int(
+                                        round(
+                                            (time.perf_counter() - gap_started)
+                                            * 1e6
+                                        )
+                                    ),
+                                    self.tp_rank,
+                                )
                 elif skip_reason := self._sr_skip_draft_rpc(batch):
                     get_sr_round_metrics(self, "Target").note_skip(
                         skip_reason, batch.batch_size()

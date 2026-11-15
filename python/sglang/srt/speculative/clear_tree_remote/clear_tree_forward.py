@@ -943,6 +943,26 @@ def _reraise_device_context(scheduler, exc) -> None:
     raise
 
 
+def _cut_deferred(plan, states, pending, results) -> None:
+    """Cut every stopped tree to the one K chosen after growth has stopped."""
+    if not pending:
+        return
+    if plan is None or not hasattr(plan, "freeze_k"):
+        raise RuntimeError("deferred finish without a round plan")
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import finish
+
+    keep = int(plan.freeze_k(states))
+    for index in list(pending):
+        verify = finish(states[index], keep)
+        plan.note(states[index])
+        results[index] = (
+            [int(token) for token in verify.tokens.tolist()],
+            [int(parent) for parent in verify.parents.tolist()],
+            [int(col) for col in verify.cols.tolist()],
+        )
+        pending.remove(index)
+
+
 def grow_active_layers(
     config: ClearTreeConfig,
     tail_logits,
@@ -979,10 +999,13 @@ def grow_active_layers(
             state.rid = rids[index]
         if index < len(prefixes):
             state.prefix = prefixes[index]
+    if plan is not None and hasattr(plan, "bind_states"):
+        plan.bind_states(states)
     if states_out is not None:
         states_out.extend(states)
     steps = [None] * len(tails)
     results = [None] * len(tails)
+    pending: List[int] = []
     active: List[int] = []
     metrics = _draft_metrics(scheduler)
     if tails:
@@ -997,7 +1020,10 @@ def grow_active_layers(
         for i, step in enumerate(seeded):
             steps[i] = step
             if step.is_final:
-                results[i] = _verify_window(step)
+                if step.verify is None:
+                    pending.append(i)
+                else:
+                    results[i] = _verify_window(step)
             else:
                 active.append(i)
     guard = 0
@@ -1016,6 +1042,10 @@ def grow_active_layers(
             logger.warning(
                 "[OPT] layer forward failed, keeping finished trees: %s", exc
             )
+            try:
+                _cut_deferred(plan, states, pending, results)
+            except Exception as cut_exc:
+                logger.warning("[OPT] deferred window cut failed: %s", cut_exc)
             return results
         rows = _as_layer_rows(logits, len(active), config.width)
         nxt: List[int] = []
@@ -1027,10 +1057,14 @@ def grow_active_layers(
         ):
             steps[i] = step
             if step.is_final:
-                results[i] = _verify_window(step)
+                if step.verify is None:
+                    pending.append(i)
+                else:
+                    results[i] = _verify_window(step)
             else:
                 nxt.append(i)
         active = nxt
+    _cut_deferred(plan, states, pending, results)
     if any(item is None for item in results):
         raise RuntimeError("OPT batch finished with a missing verify set")
     return results

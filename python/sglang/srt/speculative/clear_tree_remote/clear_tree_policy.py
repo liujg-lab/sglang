@@ -6,11 +6,15 @@ tree is padded only inside the graph of the K that was chosen.
 
 Warmup, probe rounds, and rounds whose verify or layer sample is still short
 keep the tau stop. A probe round also locks K. Other rounds stop by comparing
-the value of one more layer with the value of verifying now.
+one J across verify counts: keep the prefix of requests whose next layer is
+worth more than verifying now. Every request in the round, including one that
+already stopped growing, stays in that J. Verify time stays on the full batch.
+The layer cost is only the requests that would be forwarded.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Dict, Optional, Sequence
 
@@ -22,10 +26,14 @@ BONUS_NTPBS = (5, 9)
 WARMUP_ROUNDS = 10
 PROBE_PER_K = 2
 CALIBRATE_LAMBDA = 3.0
+PRICE_EMA_FLOOR = 0.05
+PRICE_PRIOR_N0 = 10.0
+PRICE_PRIOR_EXP = 0.8
 PAD_PARENT = -2
 
 _clock: Dict[tuple, list] = {}
 _clock_count: Dict[int, int] = {}
+_price_n: Dict[int, int] = {}
 _price_tok: Dict[int, float] = {}
 _price_ms: Dict[int, float] = {}
 _sum_a: Dict[str, float] = {}
@@ -33,7 +41,7 @@ _sum_e: Dict[str, float] = {}
 _total_a = 0.0
 _total_e = 0.0
 _pending: Dict[str, dict] = {}
-_probes: Dict[int, Dict[int, int]] = {}
+_probes: Dict[tuple, Dict[int, int]] = {}
 _rounds = 0
 
 
@@ -42,6 +50,7 @@ def reset_policy() -> None:
     global _total_a, _total_e, _rounds
     _clock.clear()
     _clock_count.clear()
+    _price_n.clear()
     _price_tok.clear()
     _price_ms.clear()
     _sum_a.clear()
@@ -82,6 +91,79 @@ def select_k(values: Dict[int, float]) -> int:
 def layer_should_continue(stop_value: float, next_value: float) -> bool:
     """True when one more layer is worth more than verifying now."""
     return float(next_value) > float(stop_value)
+
+
+def request_terms(state, k: int) -> tuple:
+    """Path mass inside K, and how much of the newest layer still clears it."""
+    return _prefix_mass(_path_scores(state), int(k)), _marginal_gain(state, int(k))
+
+
+def select_continuing(
+    all_states,
+    eligible,
+    *,
+    theta: float,
+    verify_times: Dict[int, float],
+    layer_cost,
+    kappa: Optional[float],
+) -> Optional[list]:
+    """Requests to forward, or None when no candidate has a layer cost.
+
+    ``J`` uses every tree in the round. ``T`` is the caller's verify time for
+    the full batch. The layer cost is charged only for the ``m`` requests that
+    would continue. An empty list means stop. Ties keep the larger K, then
+    the larger group.
+    """
+    states = list(all_states)
+    growing = list(eligible)
+    if not growing:
+        return []
+    price = float(theta)
+    slope = 0.0 if kappa is None else float(kappa)
+    joint = {}
+    gains = {}
+    for k, spent in verify_times.items():
+        if spent is None or int(k) not in VERIFY_KS:
+            continue
+        benefit = 0.0
+        per_state = {}
+        for state in states:
+            ratio = accept_ratio(str(getattr(state, "rid", "")))
+            mass, gain = request_terms(state, int(k))
+            benefit += ratio * mass
+            per_state[id(state)] = ratio * gain
+        joint[int(k)] = benefit - price * float(spent)
+        gains[int(k)] = per_state
+    if not joint:
+        return None
+    stop_value = max(joint.values())
+    best = None
+    any_cost = False
+    for k, base in joint.items():
+        ranked = []
+        for state in growing:
+            gain = float(gains[k].get(id(state), 0.0))
+            ell = int(getattr(state, "prefix", 0) or 0)
+            ranked.append((gain - price * slope * ell, gain, ell, state))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        running_gain = 0.0
+        running_ell = 0
+        for m, (_net, gain, ell, _state) in enumerate(ranked, start=1):
+            running_gain += gain
+            running_ell += ell
+            cost = layer_cost(m, running_ell)
+            if cost is None:
+                continue
+            any_cost = True
+            value = base + running_gain - price * float(cost)
+            choice = (value, int(k), int(m))
+            if best is None or choice > best[0]:
+                best = (choice, [item[3] for item in ranked[:m]])
+    if not any_cost or best is None:
+        return None
+    if best[0][0] > stop_value:
+        return list(best[1])
+    return []
 
 
 def ingest_verify_samples(samples) -> None:
@@ -160,22 +242,157 @@ def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[flo
     return sum(kept) / float(len(kept))
 
 
-def observe_price(batch: int, tokens: float, ms: float) -> None:
-    """Tokens per millisecond on one clean decode round."""
+def _observe_price_into(counts, tokens_ema, ms_ema, batch, tokens, ms) -> bool:
+    """One EMA step. The first sample uses step 1; later steps stay at least 0.05."""
     if ms is None or float(ms) <= 0 or tokens is None or float(tokens) < 0:
-        return
+        return False
     key = int(batch)
-    _price_tok[key] = _price_tok.get(key, 0.0) + float(tokens)
-    _price_ms[key] = _price_ms.get(key, 0.0) + float(ms)
+    if key < 1:
+        return False
+    count = int(counts.get(key, 0)) + 1
+    step = max(PRICE_EMA_FLOOR, 1.0 / float(count))
+    counts[key] = count
+    tokens_ema[key] = (1.0 - step) * float(tokens_ema.get(key, 0.0)) + step * float(
+        tokens
+    )
+    ms_ema[key] = (1.0 - step) * float(ms_ema.get(key, 0.0)) + step * float(ms)
+    return True
+
+
+def _raw_theta(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
+    key = int(batch)
+    spent = float(ms_ema.get(key, 0.0))
+    if int(counts.get(key, 0)) <= 0 or spent <= 0:
+        return None
+    return float(tokens_ema[key]) / spent
+
+
+def _price_prior(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
+    """log Θ = α + β·log b from the other batch sizes. One neighbor scales by b^0.8."""
+    if int(batch) < 1:
+        return None
+    usable = []
+    for key in counts:
+        if int(key) == int(batch):
+            continue
+        raw = _raw_theta(counts, tokens_ema, ms_ema, int(key))
+        if raw is None or raw <= 0:
+            continue
+        usable.append((int(key), float(raw)))
+    if not usable:
+        return None
+    if len(usable) == 1:
+        other_b, other_theta = usable[0]
+        return other_theta * (float(batch) / float(other_b)) ** PRICE_PRIOR_EXP
+    xs = [math.log(float(other_b)) for other_b, _theta in usable]
+    ys = [math.log(other_theta) for _other_b, other_theta in usable]
+    mean_x = sum(xs) / float(len(xs))
+    mean_y = sum(ys) / float(len(ys))
+    var_x = sum((item - mean_x) ** 2 for item in xs)
+    if var_x <= 0:
+        return None
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = cov / var_x
+    intercept = mean_y - slope * mean_x
+    return math.exp(intercept + slope * math.log(float(batch)))
+
+
+def _theta_from(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
+    raw = _raw_theta(counts, tokens_ema, ms_ema, batch)
+    prior = _price_prior(counts, tokens_ema, ms_ema, batch)
+    if raw is None and prior is None:
+        return None
+    if raw is None:
+        return prior
+    if prior is None:
+        return raw
+    count = float(counts.get(int(batch), 0))
+    weight = count / (count + PRICE_PRIOR_N0)
+    return weight * raw + (1.0 - weight) * prior
+
+
+def observe_price(batch: int, tokens: float, ms: float) -> None:
+    """One clean decode round updates this batch size's token and time EMAs."""
+    _observe_price_into(_price_n, _price_tok, _price_ms, batch, tokens, ms)
 
 
 def theta(batch: int) -> Optional[float]:
-    """Measured tokens per millisecond at this batch size."""
-    key = int(batch)
-    spent = _price_ms.get(key, 0.0)
-    if spent <= 0:
-        return None
-    return _price_tok.get(key, 0.0) / spent
+    """Pure-decode tokens per millisecond, blended with the other-batch prior."""
+    return _theta_from(_price_n, _price_tok, _price_ms, int(batch))
+
+
+def compare_price(rounds, gaps) -> Dict[int, dict]:
+    """Replay both price estimates. This does not change the SR protocol.
+
+    Dropping a round uses only ``price_kept`` samples. Subtracting the period
+    adds PREFILL and new-request rounds after removing the matched Target
+    PREFILL, and adds a round that only followed idle. FINISH and ABORT stay
+    out of both. Alignment is ``rpc_seq``, not the wall clock.
+    """
+    gap_wall = {}
+    for gap in list(gaps or []):
+        if not isinstance(gap, dict):
+            continue
+        seq = gap.get("rpc_seq")
+        wall = gap.get("wall_us")
+        if seq is None or wall is None:
+            continue
+        gap_wall[int(seq)] = gap_wall.get(int(seq), 0) + int(wall)
+    dropped_n: Dict[int, int] = {}
+    dropped_tok: Dict[int, float] = {}
+    dropped_ms: Dict[int, float] = {}
+    deducted_n: Dict[int, int] = {}
+    deducted_tok: Dict[int, float] = {}
+    deducted_ms: Dict[int, float] = {}
+    seen = set()
+    for record in list(rounds or []):
+        if not isinstance(record, dict):
+            continue
+        tokens = record.get("price_tokens")
+        spent = record.get("price_ms")
+        if tokens is None or spent is None:
+            continue
+        batch = int(record.get("b", 0) or 0)
+        if batch < 1:
+            continue
+        seen.add(batch)
+        reasons = {str(item) for item in (record.get("exclude_reason") or [])}
+        if record.get("price_kept"):
+            _observe_price_into(dropped_n, dropped_tok, dropped_ms, batch, tokens, spent)
+            _observe_price_into(
+                deducted_n, deducted_tok, deducted_ms, batch, tokens, spent
+            )
+            continue
+        if reasons.intersection(("finish", "abort")):
+            continue
+        if "prefill" in reasons or "new_rid" in reasons:
+            matched = 0
+            for seq in list(record.get("gap_rpc") or []):
+                matched += int(gap_wall.get(int(seq), 0))
+            adjusted = float(spent) - matched / 1000.0
+            if adjusted <= 0:
+                continue
+            _observe_price_into(
+                deducted_n, deducted_tok, deducted_ms, batch, tokens, adjusted
+            )
+            continue
+        if "idle_start" in reasons:
+            _observe_price_into(
+                deducted_n, deducted_tok, deducted_ms, batch, tokens, spent
+            )
+    report = {}
+    for batch in sorted(seen):
+        discard = _theta_from(dropped_n, dropped_tok, dropped_ms, batch)
+        deduct = _theta_from(deducted_n, deducted_tok, deducted_ms, batch)
+        relative = None
+        if discard not in (None, 0.0) and deduct is not None:
+            relative = abs(float(discard) - float(deduct)) / abs(float(discard))
+        report[int(batch)] = {
+            "discard": discard,
+            "deduct": deduct,
+            "relative": relative,
+        }
+    return report
 
 
 def observe_accept(rid: str, accepted: float, expected: float) -> None:
@@ -216,18 +433,25 @@ def settle_verified(rids: Sequence[str], prefixes: Sequence[int]) -> None:
         observe_accept(rid, found[rid] - int(item["prefix"]), float(item["e"]))
 
 
-def _take_probe(bucket: Optional[int], max_ell: int, buckets: Sequence[int]) -> Optional[int]:
-    """Lock the next K that still fits this prefix. An eager K keeps its quota."""
+def _take_probe(
+    bucket: Optional[int], max_ell: int, buckets: Sequence[int], batch: int
+) -> Optional[int]:
+    """Lock the next K that still fits this prefix.
+
+    Each batch size keeps its own quota inside a KV bucket, so a new
+    concurrency starts again at K = 8.
+    """
     if bucket is None:
         return None
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         smallest_bucket,
     )
 
-    row = _probes.get(int(bucket))
+    key = (int(bucket), int(batch))
+    row = _probes.get(key)
     if row is None:
         row = {int(k): PROBE_PER_K for k in VERIFY_KS}
-        _probes[int(bucket)] = row
+        _probes[key] = row
     for k in VERIFY_KS:
         if smallest_bucket(int(max_ell) + int(k) + 1, buckets) is None:
             continue
@@ -265,6 +489,7 @@ class RoundPlan:
         max_ell: int,
         batch: int,
         buckets: Sequence[int],
+        scheduler=None,
     ) -> None:
         self.width = int(width)
         self.k = int(k)
@@ -275,15 +500,37 @@ class RoundPlan:
         self.max_ell = int(max_ell)
         self.batch = int(batch)
         self.buckets = tuple(buckets)
+        self._scheduler = scheduler
         self._peers = []
+        self._all = []
         self._at = None
-        self._grow = False
+        self._keep_ids = set()
+        self._frozen_k = None
+
+    @property
+    def defer_finish(self) -> bool:
+        """Cut every window after the round, so one K is used for all of them.
+
+        A single request is cut where it stops. Lookahead only grows one tree,
+        and that path reads the window immediately.
+        """
+        return (
+            self.batch > 1
+            and not self.use_tau
+            and self.locked_k is None
+            and self.theta_value is not None
+            and self.layer_ms is not None
+        )
+
+    def bind_states(self, states) -> None:
+        """Every tree in the round, including one that later stops growing."""
+        self._all = list(states)
 
     def begin_layer(self, states) -> None:
         """The layer was just written. Judge these trees together."""
         self._peers = list(states)
         self._at = None
-        self._grow = False
+        self._keep_ids = set()
 
     def should_grow(self, state) -> bool:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import depth_rule
@@ -293,16 +540,30 @@ class RoundPlan:
         if self.use_tau or self.theta_value is None or self.layer_ms is None:
             return depth_rule(state)
         if self._at != int(state.depth):
-            self._grow = self._continue(self._peers or [state])
+            peers = list(self._peers or [state])
+            eligible = [
+                item
+                for item in peers
+                if int(item.depth) < int(item.config.max_depth) - 1
+            ]
+            self._keep_ids = {id(item) for item in self._choose_keep(eligible)}
             self._at = int(state.depth)
-        return bool(self._grow)
+        return id(state) in self._keep_ids
 
     def verify_k(self, state) -> int:
+        if self._frozen_k is not None:
+            return int(self._frozen_k)
         if self.locked_k is not None:
             return int(self.locked_k)
         if self.use_tau:
             return int(self.k)
-        return self._select(self._peers or [state])
+        return self._select(self._all or self._peers or [state])
+
+    def freeze_k(self, states) -> int:
+        """One verify count for every tree, chosen after growth has stopped."""
+        chosen = self._select(list(states))
+        self._frozen_k = int(chosen)
+        return int(self._frozen_k)
 
     def note(self, state) -> None:
         rid = getattr(state, "rid", None)
@@ -311,6 +572,46 @@ class RoundPlan:
             return
         scores = _path_scores(state)
         note_verified(str(rid), int(prefix), _prefix_mass(scores, self.verify_k(state)))
+
+    def _choose_keep(self, eligible) -> list:
+        times = {}
+        for k in VERIFY_KS:
+            spent = self._time(k)
+            if spent is not None:
+                times[int(k)] = float(spent)
+        kept = select_continuing(
+            self._all or eligible,
+            eligible,
+            theta=float(self.theta_value),
+            verify_times=times,
+            layer_cost=self._layer_cost,
+            kappa=self._kappa(),
+        )
+        if kept is None:
+            if self._continue(eligible):
+                return list(eligible)
+            return []
+        return list(kept)
+
+    def _layer_cost(self, active: int, sum_ell: int) -> Optional[float]:
+        if self._scheduler is None:
+            return None
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            predict_layer_ms,
+        )
+
+        return predict_layer_ms(
+            self._scheduler, self.width, int(active), int(sum_ell)
+        )
+
+    def _kappa(self) -> Optional[float]:
+        if self._scheduler is None:
+            return None
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            layer_sum_ell_slope,
+        )
+
+        return layer_sum_ell_slope(self._scheduler, self.width)
 
     def _time(self, k: int) -> Optional[float]:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
@@ -377,14 +678,18 @@ def make_round(scheduler, reqs) -> RoundPlan:
     probe = (
         None
         if locked_env is not None
-        else _take_probe(regime, max_ell, buckets)
+        else _take_probe(regime, max_ell, buckets, batch)
     )
     price = theta(batch)
     width = flat_width(batch)
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(prefixes))
-    ready = any(
-        verify_ready(k) and _time_for(batch, max_ell, k, buckets) is not None
+    usable = [
+        int(k)
         for k in VERIFY_KS
+        if smallest_bucket(int(max_ell) + int(k) + 1, buckets) is not None
+    ]
+    ready = bool(usable) and all(
+        _time_for(batch, max_ell, k, buckets) is not None for k in usable
     )
     use_tau = (
         locked_env is not None
@@ -413,6 +718,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
         max_ell=max_ell,
         batch=batch,
         buckets=buckets,
+        scheduler=scheduler,
     )
 
 

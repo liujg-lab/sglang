@@ -8,7 +8,7 @@
 
 ## 旁路账本
 
-`SGLANG_CLEAR_LEDGER=1` 时，Draft 记录时间账本和每次层前向，并拟合层耗时。默认关闭。只在 tp rank 0 输出。层拟合够样本后，停层比较“再长一层的 J”和“现在停下的 J”；验证样本够了以后，K 取 `J_K` 最大的已捕获档。样本不够时仍用 τ。Target 把已经完成的 `device_us` 放进下一轮 ClearTree 请求的 `verify_samples`。这条字段不属于 STANDALONE_REMOTE。`SGLANG_CLEAR_LOCK_K=32` 把验证数锁在 32，停层仍用 τ，并且不消耗探测。
+`SGLANG_CLEAR_LEDGER=1` 时，Draft 记录时间账本和每次层前向，并拟合层耗时。默认关闭。只在 tp rank 0 输出。层拟合够样本后，停层用同一个 `J_K`：人数从 1 枚举到还能再长的请求数，只保留继续价值更大的那一组。同一口径的合成收益主要出现在 T 按档跳变时。验证样本够了以后，K 取 `J_K` 最大的已捕获档。样本不够时仍用 τ。Target 把已经完成的 `device_us` 放进下一轮 ClearTree 请求的 `verify_samples`。这条字段不属于 STANDALONE_REMOTE。`SGLANG_CLEAR_LOCK_K=32` 把验证数锁在 32，停层仍用 τ，并且不消耗探测。
 
 - `SGLANG_CLEAR_TARGET_BACKEND=cuda`（默认）时，Draft 用 `T_K` 拟合验证耗时。`npu` 时 Draft 仍记录 `T_K`，但不拿它更新验证模型；Target 用 `device_us` 和 NPU 特征拟合。
 - `SGLANG_CLEAR_NPU_KV_BUCKETS`：Draft 计算 KV 桶用的列表，逗号分隔。默认 `256,512,1024,2048,4096`。
