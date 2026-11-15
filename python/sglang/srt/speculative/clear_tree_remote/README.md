@@ -1,6 +1,6 @@
 # CLEAR_TREE_REMOTE
 
-`CLEAR_TREE_REMOTE` 是从 `OPT_TREE_REMOTE` 复制出来的独立算法。回放控制器没有接入。层宽 W 用平表：一批一个请求时为 8，其余为 4。验证数 K 在 8、16、32 里选；前 10 轮、探测轮和样本不够的轮仍用 τ。旁路账本默认关闭，见下一节。
+`CLEAR_TREE_REMOTE` 是从 `OPT_TREE_REMOTE` 复制出来的独立算法。回放控制器在算，服务 W 仍是平表：一批一个请求时为 8，其余为 4。某一对宽度的实测偏差进了 3% 才换。验证数 K 在 8、16、32 里选；前 10 轮、探测轮和样本不够的轮仍用 τ。旁路账本默认关闭，见下一节。
 
 启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30039`。`--speculative-num-draft-tokens` 是图和缓冲容量：Target 为 33，Draft 为 8。握手仍用 `--clear-tree-width`。Target 按 9、17、33 各捕获一张验证图，回放按本轮 K+1 选图。Draft 层图是 4 和 8，bonus 是 5 和 9。
 
@@ -14,4 +14,4 @@
 - `SGLANG_CLEAR_NPU_KV_BUCKETS`：Draft 计算 KV 桶用的列表，逗号分隔。默认 `256,512,1024,2048,4096`。
 - Target 的 `t_verify` 用 `SGLANG_NPU_TREE_GRAPH_KV_BUCKETS`（未设置时用同一组默认桶）和 `select_tree_kv_bucket`。超出最大桶记为 eager。事件未完成时，下一次 poll 补记 `[CLEAR ledger t_verify_device]` 并更新同一条回归。
 
-日志是一行一个 JSON：`[CLEAR ledger d_round]`、`[CLEAR ledger d_layer]`、`[CLEAR ledger t_verify]`、`[CLEAR ledger t_verify_device]`。验证回归按本轮 K 分开。完成的 `device_us` 随下一轮请求回到 Draft。
+日志是一行一个 JSON：`[CLEAR ledger d_round]`、`[CLEAR ledger d_layer]`、`[CLEAR ledger d_replay]`、`[CLEAR ledger t_verify]`、`[CLEAR ledger t_verify_device]`。验证回归按本轮 K 分开。完成的 `device_us` 随下一轮请求回到 Draft。账本开着时，预热、探测和锁 K 之外，b>1 每 20 轮有 1 轮建 W=8，b=1 每 20 轮有 1 轮建 W=4，用来量 8 和 4 的回放偏差。账本关着时不离开平表。W=2 只出现在回放里。

@@ -630,6 +630,11 @@ def note_target_prefill(
 
 
 def note_packet(scheduler, batch) -> None:
+    serial = int(getattr(scheduler, "_clear_build_serial", 0) or 0) + 1
+    scheduler._clear_build_serial = serial
+    scheduler._clear_build_token = serial
+    closed = {}
+
     def _run(ledger: ClearLedger) -> None:
         reqs = list(getattr(batch, "reqs", None) or [])
         rids = [str(getattr(req, "rid", "")) for req in reqs]
@@ -641,7 +646,7 @@ def note_packet(scheduler, batch) -> None:
             else:
                 prefix.append(int(getattr(req, "base_committed_len", 0) or 0))
         width = int(scheduler.server_args.clear_tree_width)
-        ledger.on_packet(
+        record = ledger.on_packet(
             batch.action,
             rids,
             str(getattr(batch, "session_id", "")),
@@ -649,8 +654,12 @@ def note_packet(scheduler, batch) -> None:
             prefix,
             width,
         )
+        if isinstance(record, dict):
+            closed["record"] = record
 
     _quiet(scheduler, _run)
+    if "record" in closed:
+        scheduler._clear_replay_closed = closed["record"]
 
 
 def note_idle(scheduler) -> None:

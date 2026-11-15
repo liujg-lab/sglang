@@ -391,6 +391,11 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
 
     add_draft_prefill(scheduler, time.perf_counter() - prefill_started)
     scheduler._sr_replay_grammars(reqs)
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        settle_replay,
+    )
+
+    settle_replay(scheduler, reqs)
     if len(reqs) <= 1:
         return [scheduler._clear_expand_one(req) for req in reqs]
     from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
@@ -4002,6 +4007,11 @@ def grow_batch(scheduler, reqs):
 
         if windows:
             remember_choice(scheduler, len(windows[0][0]), plan.width)
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                hold_replay,
+            )
+
+            hold_replay(scheduler, reqs, states, plan)
         mark_stop(scheduler)
         return windows
     finally:

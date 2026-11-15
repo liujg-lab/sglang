@@ -872,6 +872,11 @@ class ClearTreeSchedulerMixin:
             tokens, parents, cols = windows[0]
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             remember_choice(self, len(tokens), plan.width)
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                hold_replay,
+            )
+
+            hold_replay(self, [req], tree_states, plan)
             metrics.counts["opt_layer_forwards"] += layers
             if lookahead_launched is not None:
                 metrics.counts["opt_layer_forwards_critical"] += critical_layer_forwards(

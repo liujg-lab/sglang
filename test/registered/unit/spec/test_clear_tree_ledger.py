@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
     build_tree_from_parents,
 )
@@ -23,19 +24,26 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     RoundPlan,
     accept_ratio,
+    choose_build_width,
     flat_width,
     ingest_verify_samples,
     compare_price,
     layer_should_continue,
+    hold_replay,
     make_round,
+    matched_depth,
     observe_accept,
     observe_price,
+    observe_replay,
     observe_verify,
+    persistent_width,
     predict_verify_ms,
     request_terms,
     reset_policy,
     select_continuing,
+    settle_replay,
     theta,
+    truncate_columns,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
     ClearAction,
@@ -953,6 +961,221 @@ class TestFlatWidthOnlineK(CustomTestCase):
             os.environ.pop("SGLANG_CLEAR_LOCK_K", None)
         nxt = make_round(sched, [req])
         self.assertEqual(nxt.locked_k, 8)
+
+    def test_truncate_drops_the_weaker_branch(self):
+        layers = [
+            [
+                {"token": 1, "parent": 0, "score": 0.9},
+                {"token": 2, "parent": 1, "score": 0.1},
+            ],
+            [
+                {"token": 3, "parent": 0, "score": 0.4},
+                {"token": 4, "parent": 1, "score": 0.8},
+            ],
+        ]
+        kept = truncate_columns(layers, 1)
+        self.assertEqual(matched_depth(layers, kept, [1, 3]), 2)
+        self.assertEqual(matched_depth(layers, kept, [2, 4]), 0)
+
+    def test_batch_one_measures_four_and_never_builds_wider(self):
+        chosen = [
+            choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
+        ]
+        self.assertEqual(chosen[-1], (4, "measure"))
+        self.assertTrue(all(width <= 8 for width, _kind in chosen))
+        self.assertTrue(all(width != 2 for width, _kind in chosen))
+        self.assertTrue(all(kind != "explore" for _width, kind in chosen))
+
+    def test_wider_batch_explores_only_while_the_ledger_is_on(self):
+        self.assertEqual(
+            choose_build_width(2, ledger_on=False, eligible=True), (4, "ordinary")
+        )
+        cold = [
+            choose_build_width(2, ledger_on=True, eligible=False) for _ in range(20)
+        ]
+        self.assertTrue(all(item == (4, "ordinary") for item in cold))
+        hot = [
+            choose_build_width(2, ledger_on=True, eligible=True) for _ in range(20)
+        ]
+        self.assertEqual(hot[-1], (8, "explore"))
+        self.assertEqual(hot[0], (4, "ordinary"))
+
+    def test_warmup_round_does_not_enter_the_replay_sum(self):
+        skipped = observe_replay(
+            1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}, counted=False
+        )
+        self.assertEqual(skipped["rounds"], 0)
+        counted = observe_replay(1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)})
+        self.assertEqual(counted["rounds"], 1)
+
+    def test_large_replay_bias_does_not_change_width(self):
+        for _ in range(30):
+            observe_replay(1, 4, "measure", 10.0, 10.0)
+        last = None
+        for _ in range(40):
+            last = observe_replay(
+                1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
+            )
+        self.assertGreater(last["gain"], 0.03)
+        self.assertFalse(last["gate"])
+        self.assertFalse(last["applied"])
+        self.assertEqual(last["would_w"], 4)
+        self.assertLess(last["rounds"], 200)
+        self.assertNotIn("se", last)
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        self.assertEqual(make_round(sched, [req]).width, 8)
+
+    def test_bias_inside_three_percent_switches_the_next_round(self):
+        for _ in range(30):
+            observe_replay(1, 4, "measure", 14.0, 10.0)
+        last = None
+        for _ in range(40):
+            last = observe_replay(
+                1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
+            )
+        self.assertTrue(last["gate"])
+        self.assertTrue(last["applied"])
+        self.assertEqual(last["would_w"], 4)
+        self.assertLess(last["rounds"], 200)
+        self.assertNotIn("se", last)
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        self.assertEqual(make_round(sched, [req]).width, 4)
+
+    def test_width_two_never_becomes_the_served_width(self):
+        for _ in range(30):
+            observe_replay(1, 4, "measure", 11.0, 10.0)
+        last = None
+        for _ in range(40):
+            last = observe_replay(
+                1,
+                8,
+                "ordinary",
+                10.0,
+                10.0,
+                {4: (11.0, 10.0), 2: (40.0, 10.0)},
+            )
+        self.assertTrue(last["gate"])
+        self.assertEqual(last["would_w"], 2)
+        self.assertFalse(last["applied"])
+        self.assertEqual(persistent_width(1), 8)
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        self.assertEqual(make_round(sched, [req]).width, 8)
+
+    def test_settle_counts_only_the_kept_branch(self):
+        for k in (8, 16, 32):
+            for _ in range(6):
+                observe_verify(1, k, 256, 5.0)
+        scores = [0.9, 0.8, 0.7, 0.6, 0.01, 0.01, 0.01, 0.01]
+        state = SimpleNamespace(
+            depth=1,
+            tokens=torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
+            parents=torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]]),
+            weight=torch.tensor([scores]),
+            prefix=4,
+            rid="a",
+        )
+        plan = _value_plan()
+        plan.replay_kind = "ordinary"
+        plan.replay_eligible = True
+        sched = SimpleNamespace(_clear_ledger=False, tp_rank=0, tp_size=1)
+        req = SimpleNamespace(rid="a", output_ids=[11])
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            hold_replay(sched, [req], [state], plan)
+        req.output_ids = [11, 8]
+        sched._clear_replay_closed = {
+            "excluded": False,
+            "price_kept": True,
+            "price_ms": 12.0,
+        }
+        missed = settle_replay(sched, [req])
+        self.assertEqual(missed["candidates"]["4"]["tokens"], 1.0)
+        req.output_ids = [11]
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            hold_replay(sched, [req], [state], plan)
+        req.output_ids = [11, 1, 5]
+        sched._clear_replay_closed = {
+            "excluded": False,
+            "price_kept": True,
+            "price_ms": 12.0,
+        }
+        hit = settle_replay(sched, [req])
+        self.assertEqual(hit["candidates"]["4"]["tokens"], 2.0)
+        self.assertIsNotNone(hit["candidates"]["4"]["ms"])
+        req.output_ids = [11]
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            hold_replay(sched, [req], [state], plan)
+        sched._clear_replay_closed = {
+            "excluded": True,
+            "price_kept": False,
+            "price_ms": 12.0,
+        }
+        self.assertIsNone(settle_replay(sched, [req]))
+
+    def test_rewritten_zero_temperature_explores_the_twentieth_round(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        params = SamplingParams(temperature=0)
+        reqs = [
+            SimpleNamespace(
+                rid=rid,
+                origin_input_ids=[1] * 10,
+                output_ids=[],
+                sampling_params=params,
+            )
+            for rid in ("a", "b")
+        ]
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ):
+            eligible = []
+            for _ in range(80):
+                plan = make_round(sched, reqs)
+                if plan.replay_eligible:
+                    eligible.append((plan.width, plan.replay_kind))
+                if len(eligible) == 20:
+                    break
+        self.assertEqual(eligible, [(4, "ordinary")] * 19 + [(8, "explore")])
+
+        reset_policy()
+        warm = SimpleNamespace(
+            rid="a",
+            origin_input_ids=[1] * 10,
+            output_ids=[],
+            sampling_params=SamplingParams(temperature=0.7),
+        )
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ):
+            widths = [make_round(sched, [warm]).width for _ in range(40)]
+        self.assertTrue(all(width == 8 for width in widths))
+
+    def test_nonzero_temperature_stays_on_the_flat_width(self):
+        sched = SimpleNamespace(_clear_ledger=False)
+        req = SimpleNamespace(
+            rid="a",
+            origin_input_ids=[1] * 10,
+            output_ids=[],
+            sampling_params=SimpleNamespace(temperature=0.7),
+        )
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ):
+            widths = [make_round(sched, [req]).width for _ in range(40)]
+        self.assertTrue(all(width == 8 for width in widths))
 
     def test_verify_sample_queue_is_sent_once(self):
         metrics = SimpleNamespace(tp_rank=0)
