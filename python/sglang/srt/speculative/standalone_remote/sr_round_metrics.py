@@ -278,6 +278,13 @@ class SRRoundMetrics:
         self.device_ms = Counter()
         self.device_samples = Counter()
         self.pending = deque()
+        # Ledger-only verify_forward events. Empty unless CLEAR_TREE sets the flag.
+        # poll() queries these and never synchronizes.
+        self._clear_ledger_device = False
+        self._clear_device_open = []
+        self._clear_device_pending = deque()
+        self._clear_device_emit = None
+        self._clear_verify_seq = 0
         self.active = False
         self._graph_host_samples = []
         self._window_start = None
@@ -320,6 +327,60 @@ class SRRoundMetrics:
                 continue
             self.device_ms[name] += duration
             self.device_samples[name] += 1
+        self._poll_clear_device()
+
+    def _poll_clear_device(self) -> None:
+        """Finish ledger verify events that the device has already completed."""
+        pending = self._clear_device_pending
+        emit = self._clear_device_emit
+        for _ in range(len(pending)):
+            start, end, meta = pending.popleft()
+            try:
+                ready = end.query()
+            except Exception as exc:
+                self._timing_failure("query", exc)
+                continue
+            if not ready:
+                pending.append((start, end, meta))
+                continue
+            try:
+                duration = start.elapsed_time(end)
+            except Exception as exc:
+                self._timing_failure("elapsed", exc)
+                continue
+            if emit is None:
+                continue
+            try:
+                emit(meta, duration)
+            except Exception:
+                logger.warning("[CLEAR ledger] device emit failed", exc_info=True)
+
+    def _begin_device_pair(self, stream):
+        factory = getattr(self.device_module, "Event", None)
+        if self.tp_rank != 0 or factory is None:
+            return None
+        try:
+            start, end = factory(enable_timing=True), factory(enable_timing=True)
+            if stream is None:
+                start.record()
+            else:
+                start.record(stream)
+        except Exception as exc:
+            self._timing_failure("start", exc)
+            return None
+        return (start, end)
+
+    def _finish_device_pair(self, pair, stream) -> bool:
+        _start, end = pair
+        try:
+            if stream is None:
+                end.record()
+            else:
+                end.record(stream)
+        except Exception as exc:
+            self._timing_failure("end", exc)
+            return False
+        return True
 
     @contextmanager
     def round(self):
@@ -361,23 +422,22 @@ class SRRoundMetrics:
             return
         start_time = time.perf_counter()
         event_pair = None
-        factory = getattr(self.device_module, "Event", None)
-        if (
-            device
-            and self.tp_rank == 0
-            and factory is not None
-            and self.rounds == DEVICE_SAMPLE_ROUND
-            and len(self.pending) < 16
-        ):
-            try:
-                start, end = factory(enable_timing=True), factory(enable_timing=True)
-                if stream is None:
-                    start.record()
-                else:
-                    start.record(stream)
-                event_pair = (start, end)
-            except Exception as exc:
-                self._timing_failure("start", exc)
+        ledger_pair = None
+        module = self.device_module
+        factory = getattr(module, "Event", None) if module is not None else None
+        if device and self.tp_rank == 0 and factory is not None:
+            if self.rounds == DEVICE_SAMPLE_ROUND and len(self.pending) < 16:
+                event_pair = self._begin_device_pair(stream)
+            # One pair per verify when the ClearTree ledger is on. The 1/32
+            # window sample above is unchanged. The queue bound skips a sample
+            # instead of synchronizing.
+            if (
+                name == "verify_forward"
+                and self._clear_ledger_device
+                and len(self._clear_device_pending) < 16
+                and not self._clear_device_open
+            ):
+                ledger_pair = self._begin_device_pair(stream)
         completed = False
         try:
             yield
@@ -386,17 +446,12 @@ class SRRoundMetrics:
             self.add_host(name, time.perf_counter() - start_time)
             # Do not submit instrumentation after a failed device operation or
             # replace its original exception with a timing-event error.
-            if event_pair is not None and completed:
-                start, end = event_pair
-                try:
-                    if stream is None:
-                        end.record()
-                    else:
-                        end.record(stream)
-                except Exception as exc:
-                    self._timing_failure("end", exc)
-                else:
-                    self.pending.append((name, start, end))
+            if completed and event_pair is not None:
+                if self._finish_device_pair(event_pair, stream):
+                    self.pending.append((name, event_pair[0], event_pair[1]))
+            if completed and ledger_pair is not None:
+                if self._finish_device_pair(ledger_pair, stream):
+                    self._clear_device_open.append(ledger_pair)
 
     def note_skip(self, reason, n_reqs):
         """Count one unmetered AR batch. Does not open a host-timed round."""

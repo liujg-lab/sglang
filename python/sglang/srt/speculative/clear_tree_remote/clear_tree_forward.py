@@ -18,6 +18,7 @@ import copy
 import logging
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -382,7 +383,13 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
         return [([], None, None)] * len(pairs)
     if action != SRAction.STEP:
         return [([], None, None)] * len(pairs)
+    prefill_started = time.perf_counter()
     materialize_missing_prefix(scheduler, reqs, capture_tail_logits=True)
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        add_draft_prefill,
+    )
+
+    add_draft_prefill(scheduler, time.perf_counter() - prefill_started)
     scheduler._sr_replay_grammars(reqs)
     if len(reqs) <= 1:
         return [scheduler._clear_expand_one(req) for req in reqs]
@@ -527,9 +534,20 @@ class _LayerTiming:
     and are reference only.
     """
 
-    __slots__ = ("metrics", "t0", "t_launch", "ev0", "ev1", "opened", "host_closed")
+    __slots__ = (
+        "metrics",
+        "t0",
+        "t_launch",
+        "ev0",
+        "ev1",
+        "opened",
+        "host_closed",
+        "host_us",
+        "ledger_meta",
+        "ledger_only",
+    )
 
-    def __init__(self, metrics, t0, ev0, ev1):
+    def __init__(self, metrics, t0, ev0, ev1, ledger_only=False):
         self.metrics = metrics
         self.t0 = t0
         self.t_launch = None
@@ -537,6 +555,9 @@ class _LayerTiming:
         self.ev1 = ev1
         self.opened = False
         self.host_closed = False
+        self.host_us = None
+        self.ledger_meta = None
+        self.ledger_only = bool(ledger_only)
 
 
 def _draft_metrics(scheduler):
@@ -553,18 +574,40 @@ def _draft_metrics(scheduler):
     return metrics
 
 
+class _SilentLayerCounts:
+    """Drop host-counter writes when the ledger times a layer outside a metrics window."""
+
+    def __init__(self) -> None:
+        self.counts = defaultdict(int)
+
+
 def _begin_layer_timing(scheduler):
-    """Start the host clock. Event creation failure drops this sample only."""
+    """Start the host clock. Event creation failure drops this sample only.
+
+    An active round-metrics window keeps the existing counters. With the
+    ledger on and that window off, events stay on a side list so the counters
+    do not move.
+    """
     metrics = _draft_metrics(scheduler)
+    ledger_only = False
     if metrics is None:
-        return None
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            ledger_enabled,
+        )
+
+        if not ledger_enabled():
+            return None
+        metrics = _SilentLayerCounts()
+        ledger_only = True
     try:
         factory = torch.get_device_module(scheduler.device).Event
         ev0 = factory(enable_timing=True)
         ev1 = factory(enable_timing=True)
     except Exception:
         return None
-    return _LayerTiming(metrics, time.perf_counter(), ev0, ev1)
+    return _LayerTiming(
+        metrics, time.perf_counter(), ev0, ev1, ledger_only=ledger_only
+    )
 
 
 def _close_layer_host(timing) -> None:
@@ -572,7 +615,8 @@ def _close_layer_host(timing) -> None:
     if timing is None or timing.host_closed:
         return
     now = time.perf_counter()
-    timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+    timing.host_us = int((now - timing.t0) * 1e6)
+    timing.metrics.counts["opt_layer_host_us"] += timing.host_us
     timing.host_closed = True
 
 
@@ -586,7 +630,8 @@ def _mark_layer_launch(timing) -> None:
         return
     now = time.perf_counter()
     if not timing.host_closed:
-        timing.metrics.counts["opt_layer_host_us"] += int((now - timing.t0) * 1e6)
+        timing.host_us = int((now - timing.t0) * 1e6)
+        timing.metrics.counts["opt_layer_host_us"] += timing.host_us
         timing.host_closed = True
     timing.t_launch = now
     try:
@@ -614,11 +659,36 @@ def _finish_layer_timing(scheduler, timing) -> None:
         timing.ev1.record()
     except Exception:
         return
-    events = getattr(scheduler, "_opt_layer_events", None)
-    if events is None:
-        events = []
-        scheduler._opt_layer_events = events
-    events.append((timing.ev0, timing.ev1))
+    if not timing.ledger_only:
+        events = getattr(scheduler, "_opt_layer_events", None)
+        if events is None:
+            events = []
+            scheduler._opt_layer_events = events
+        events.append((timing.ev0, timing.ev1))
+    if timing.ledger_meta is not None:
+        pairs = getattr(scheduler, "_clear_layer_pairs", None)
+        if not isinstance(pairs, list):
+            pairs = []
+            scheduler._clear_layer_pairs = pairs
+        pairs.append((timing.ev0, timing.ev1, timing.ledger_meta))
+
+
+def _queue_ledger_layer(scheduler, timing, runners, layer: int) -> None:
+    """One layer sub-batch for the shadow ledger. No extra device sync."""
+    if timing is None:
+        return
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        queue_layer_sample,
+    )
+
+    width = int(scheduler.server_args.clear_tree_width)
+    timing.ledger_meta = queue_layer_sample(
+        scheduler,
+        layer=int(layer),
+        runners=runners,
+        host_us=getattr(timing, "host_us", None),
+        width=width,
+    )
 
 
 def critical_layer_forwards(launched: int) -> int:
@@ -731,10 +801,12 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
     events = list(getattr(scheduler, "_opt_layer_events", None) or [])
     ingest = getattr(scheduler, "_opt_ingest_events", None)
     select = getattr(scheduler, "_opt_select_events", None)
+    ledger_pairs = list(getattr(scheduler, "_clear_layer_pairs", None) or [])
     scheduler._opt_layer_events = []
     scheduler._opt_ingest_events = []
     scheduler._opt_ingest_open = None
     scheduler._opt_select_events = []
+    scheduler._clear_layer_pairs = []
     pairs = [
         pair
         for pair in (ingest if isinstance(ingest, list) else [])
@@ -745,7 +817,7 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
         for pair in (select if isinstance(select, list) else [])
         if isinstance(pair, tuple) and len(pair) == 2
     ]
-    if not events and not pairs and not select_pairs:
+    if not events and not pairs and not select_pairs and not ledger_pairs:
         return
     if metrics is None or getattr(scheduler, "_sr_device_poisoned", False):
         return
@@ -767,6 +839,20 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
             if is_device_context_error(exc):
                 raise
             metrics.counts["device_timing_dropped_opt_layer"] += 1
+    if ledger_pairs:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            remember_layer_gpu,
+        )
+
+        for ev0, ev1, sample in ledger_pairs:
+            gpu_us = None
+            try:
+                gpu_us = int(ev0.elapsed_time(ev1) * 1000)
+            except Exception as exc:
+                if is_device_context_error(exc):
+                    raise
+                metrics.counts["device_timing_dropped_opt_layer"] += 1
+            remember_layer_gpu(sample, gpu_us)
     for start, end in pairs:
         try:
             metrics.counts["opt_ingest_gpu_us"] += int(
@@ -1132,6 +1218,7 @@ class OptLayerForward:
         )
         _mark_layer_launch(timing)
         logits = self._run(batch)
+        _queue_ledger_layer(self.scheduler, timing, [self], depth)
         _finish_layer_timing(self.scheduler, timing)
         logits = _row_logits(logits, n, tail=False)
         self.cached_len += n
@@ -1211,6 +1298,7 @@ class OptLayerForward:
         logits = self._run_lookahead(batch)
         if self._lookahead_launch_event is not None:
             self._lookahead_launch_event.record()
+        _queue_ledger_layer(self.scheduler, timing, [self], depth)
         _finish_layer_timing(self.scheduler, timing)
         logits = _row_logits(logits, n, tail=False)
         self._last_logits = logits
@@ -1375,6 +1463,11 @@ class OptLayerForward:
             return self._run(batch)
         forward_batch = _refresh_lookahead_forward(template, batch, delta)
         out = self.scheduler.model_worker.model_runner.forward(forward_batch)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            remember_layer_path,
+        )
+
+        remember_layer_path(self.scheduler, out)
         if not bool(getattr(out, "can_run_graph", True)):
             _opt_draft_count(self.scheduler, "opt_lookahead_eager_layers")
         logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
@@ -1439,6 +1532,11 @@ def _row_logits(logits: torch.Tensor, n: int, *, tail: bool) -> torch.Tensor:
 def _run_batch(scheduler, batch) -> torch.Tensor:
     scheduler.cur_batch = batch
     result = scheduler.run_batch(batch)
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        remember_layer_path,
+    )
+
+    remember_layer_path(scheduler, result)
     logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
     if logits is None:
         raise RuntimeError("OPT draft forward returned no logits")
@@ -1866,6 +1964,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
+    _queue_ledger_layer(scheduler, timing, runners, depth)
     _finish_layer_timing(scheduler, timing)
     for runner in runners:
         runner.cached_len += width
@@ -2019,6 +2118,11 @@ def ingest_tail_logits(scheduler, runners, phases=None) -> List[torch.Tensor]:
         if cached_row is not None:
             logits[id(runner)] = cached_row
             _opt_draft_count(scheduler, "opt_ingest_zero_fwd")
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                note_bonus_hit,
+            )
+
+            note_bonus_hit(scheduler, runner.req)
             continue
         mode = plan_opt_tail(runner.req, limit, page)
         if mode == "reprefill":
@@ -3524,6 +3628,8 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
 def forward_deferred_final_layers(scheduler, jobs) -> None:
     """Forward each deferred last layer, then publish or roll it back.
 
+    Layers forwarded in this function are marked post-reply for the ledger.
+
     Bonus guesses are written while the tree columns are still mapped.
     Publish clears those columns, so the guess forward cannot follow it.
     A lookahead job already queued that last layer. It only installs the
@@ -3533,6 +3639,11 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
     still counts once. A group split by the KV budget counts once per
     sub-batch. A failed group adds nothing.
     """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        set_post_reply,
+    )
+
+    set_post_reply(scheduler, True)
     try:
         for job in jobs:
             try:
@@ -3584,6 +3695,7 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
                 logger.warning("[OPT] bonus attach failed: %s", exc)
                 _opt_draft_count(scheduler, "opt_bonus_attach_failed")
     finally:
+        set_post_reply(scheduler, False)
         for job in jobs:
             try:
                 _publish_or_rollback(
@@ -3800,6 +3912,11 @@ def grow_batch(scheduler, reqs):
         metrics.counts["opt_layer_forwards"] += layers
         metrics.counts["opt_rounds"] += 1
         expanded = True
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            mark_stop,
+        )
+
+        mark_stop(scheduler)
         return windows
     finally:
         drain_opt_layer_gpu_us(scheduler, metrics)

@@ -9,9 +9,12 @@ from ``build_tree_from_parents``.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -147,3 +150,105 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             no_draft,
             device,
         )
+
+    def verify(self, batch, spec_info):
+        """Parent verify, then a local cost line. The reply bytes are unchanged."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            ledger_enabled,
+        )
+
+        enabled = ledger_enabled()
+        seq_lens = None
+        metrics = getattr(batch, "sr_round_metrics", None) if enabled else None
+        if enabled:
+            try:
+                seq_lens = _seq_lens_before_verify(batch)
+            except Exception:
+                seq_lens = []
+        if metrics is not None:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                install_clear_device_emit,
+            )
+
+            install_clear_device_emit(metrics)
+            metrics._clear_ledger_device = True
+        ok = False
+        try:
+            result = super().verify(batch, spec_info)
+            ok = True
+        finally:
+            if metrics is not None:
+                metrics._clear_ledger_device = False
+                if not ok:
+                    metrics._clear_device_open.clear()
+        if not enabled:
+            return result
+        try:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                consume_verify_device,
+                next_verify_id,
+                read_verify_host_us,
+                runtime_kv_buckets,
+                target_verify_record,
+            )
+            from sglang.srt.speculative.tree_attn_fallback import (
+                select_tree_kv_bucket,
+            )
+
+            k = max(int(getattr(spec_info, "draft_token_num", 1) or 1) - 1, 0)
+            ran_graph = bool(result[3]) if len(result) > 3 else False
+            buckets = runtime_kv_buckets()
+            max_ell = max(seq_lens) if seq_lens else 0
+            bucket = select_tree_kv_bucket(max_ell + k + 1, buckets)
+            size_fn = getattr(batch, "batch_size", None)
+            size = size_fn() if callable(size_fn) else len(seq_lens or [])
+            host_us = None if metrics is None else read_verify_host_us(metrics)
+            verify_id = None if metrics is None else next_verify_id(metrics)
+            inflight = getattr(batch, "sr_step_inflight", None)
+            rpc_seq = getattr(inflight, "rpc_seq", None) if inflight is not None else None
+            device_us = None
+            if metrics is not None:
+                device_us = consume_verify_device(
+                    metrics,
+                    {
+                        "verify_id": verify_id,
+                        "rpc_seq": None if rpc_seq is None else int(rpc_seq),
+                        "sum_ell": sum(seq_lens or []),
+                        "kv_bucket": None if bucket is None else int(bucket),
+                        "b": int(size),
+                        "k": int(k),
+                        "ran_graph": bool(ran_graph),
+                    },
+                )
+            target_verify_record(
+                rank=int(getattr(self, "tp_rank", 0) or 0),
+                batch_size=int(size),
+                k=k,
+                seq_lens=seq_lens or [],
+                ran_graph=ran_graph,
+                kv_bucket=bucket,
+                verify_host_us=host_us,
+                device_us=device_us,
+                verify_id=verify_id,
+                rpc_seq=None if rpc_seq is None else int(rpc_seq),
+            )
+        except Exception:
+            logger.warning("[CLEAR ledger] target verify log failed", exc_info=True)
+        return result
+
+
+def _seq_lens_before_verify(batch) -> List[int]:
+    cpu = getattr(batch, "seq_lens_cpu", None)
+    if cpu is not None:
+        try:
+            return [int(length) for length in list(cpu)[: batch.batch_size()]]
+        except Exception:
+            pass
+    lens = getattr(batch, "seq_lens", None)
+    if lens is None:
+        return []
+    if hasattr(lens, "detach"):
+        values = lens.detach().cpu().tolist()
+    else:
+        values = list(lens)
+    return [int(length) for length in values]

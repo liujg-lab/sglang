@@ -7,7 +7,9 @@ does not use the EAGLE top-k drafter. Each kept layer is one masked forward.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from contextlib import nullcontext
@@ -86,6 +88,33 @@ def run_opt_draft_round(metrics, measure, work) -> None:
     """
     with metrics.round() if measure else nullcontext():
         work(metrics.counts)
+
+
+def _tree_dump_enabled() -> bool:
+    value = os.environ.get("SGLANG_CLEAR_TREE_DUMP", "")
+    return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+def dump_tree_reply(reply) -> None:
+    """Log an already-built STEP tree. The reply bytes stay unchanged."""
+    if not _tree_dump_enabled():
+        return
+    try:
+        rpc_seq = int(getattr(reply, "rpc_seq", 0) or 0)
+        for item in list(getattr(reply, "reqs", None) or []):
+            tokens = getattr(item, "draft_tokens", None) or []
+            parents = getattr(item, "parent_list", None)
+            record = {
+                "rpc_seq": rpc_seq,
+                "step_id": int(getattr(item, "step_id", 0) or 0),
+                "draft_tokens": [int(token) for token in tokens],
+                "parent_list": (
+                    None if parents is None else [int(parent) for parent in parents]
+                ),
+            }
+            logger.info("[CLEAR tree] %s", json.dumps(record, separators=(",", ":")))
+    except Exception:
+        logger.warning("[CLEAR tree] dump failed", exc_info=True)
 
 
 def drain_deferred_layer_events(scheduler, metrics, *, defer_drain, jobs) -> None:
@@ -552,6 +581,11 @@ class ClearTreeSchedulerMixin:
             metrics.counts["opt_rounds"] += 1
             window = (tokens, parents, cols)
             expanded = True
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                mark_stop,
+            )
+
+            mark_stop(self)
             return tokens, parents, cols
         except Exception as exc:
             _reraise_device_context(self, exc)
@@ -761,6 +795,13 @@ class ClearTreeSchedulerMixin:
                             nonlocal timing
                             # Sync stays outside round(), after active is cleared.
                             timing = bool(getattr(metrics, "active", False))
+                            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                                mark_post,
+                                mark_send,
+                                note_packet,
+                            )
+
+                            note_packet(self, batch)
                             try:
                                 round_start = time.perf_counter()
                                 if not supported_protocol(batch.protocol_version):
@@ -776,8 +817,12 @@ class ClearTreeSchedulerMixin:
                                     and self.sr_server is not None
                                     and batch.action not in (SRAction.FINISH, SRAction.ABORT)
                                 ):
+                                    if batch.action == SRAction.STEP:
+                                        dump_tree_reply(reply)
                                     with metrics.phase("reply_send"):
                                         self.sr_server.send_batch(reply)
+                                if batch.action == SRAction.STEP:
+                                    mark_send(self)
                                 if measure and getattr(metrics, "active", False):
                                     # Reply path is done, whether or not this rank sent.
                                     # A failed send skips this stamp.
@@ -818,6 +863,8 @@ class ClearTreeSchedulerMixin:
                                     defer_drain=defer_drain,
                                     jobs=jobs,
                                 )
+                                if batch.action == SRAction.STEP:
+                                    mark_post(self)
 
                         run_opt_draft_round(metrics, measure, _work)
                     finally:
@@ -830,4 +877,9 @@ class ClearTreeSchedulerMixin:
             self._sr_cleanup_stale_drafts()
             self._sr_poll_deferred_finishes()
             self._sr_run_http_batch()
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                note_idle,
+            )
+
+            note_idle(self)
             idle_sr_round_metrics(self)
