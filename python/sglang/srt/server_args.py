@@ -558,6 +558,8 @@ class ServerArgs:
     # CLEAR_TREE_REMOTE. Same fixed N and tau as OPT until the controller lands.
     clear_tree_role: Optional[Literal["target", "draft"]] = None
     clear_tree_width: Optional[int] = None
+    clear_tree_widths: Optional[List[int]] = None
+    clear_tree_ks: Optional[List[int]] = None
     clear_tree_tau: float = 0.5
     clear_tree_max_depth: Optional[int] = None
     clear_tree_addr: str = "127.0.0.1"
@@ -5614,9 +5616,30 @@ class ServerArgs:
             type=int,
             default=ServerArgs.clear_tree_width,
             help=(
-                "ClearTree width N. Each layer keeps N nodes, and the verify set "
-                "is those N nodes. Omitted --speculative-num-draft-tokens is "
-                "set to N on Draft and N + 1 on Target."
+                "ClearTree handshake width. It is not the online width candidate "
+                "list. Omitted --speculative-num-draft-tokens follows the widest "
+                "configured candidate, not this value."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-widths",
+            type=int,
+            nargs="+",
+            default=ServerArgs.clear_tree_widths,
+            help=(
+                "ClearTree draft width candidates. Omitted means 2 4 8 16 32 64. "
+                "Startup captures a layer graph for each, a bonus graph at W+1, "
+                "and the decode graph of 1."
+            ),
+        )
+        parser.add_argument(
+            "--clear-tree-ks",
+            type=int,
+            nargs="+",
+            default=ServerArgs.clear_tree_ks,
+            help=(
+                "ClearTree verify-count candidates. Omitted means 2 4 8 16 32 64. "
+                "Startup captures a verify graph at each K+1 and the decode graph of 1."
             ),
         )
         parser.add_argument(

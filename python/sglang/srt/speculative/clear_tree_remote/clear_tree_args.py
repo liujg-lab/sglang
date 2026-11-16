@@ -17,10 +17,12 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
     """Check ClearTree flags and turn off overlap, mixed chunk, and co-located draft.
 
     ``--clear-tree-width`` stays the wire width shared by the two roles.
+    ``--clear-tree-widths`` and ``--clear-tree-ks`` are the candidate tiers.
+    Omitted lists are 2, 4, 8, 16, 32, 64.
     ``--speculative-num-draft-tokens`` is buffer capacity, not the per-round
-    length: Target holds the longest verify graph (33) and Draft holds the
-    widest layer (8). An omitted value is filled with that capacity; an
-    explicit value must already equal it.
+    length: Target holds the longest verify graph (max K + 1) and Draft holds
+    the widest layer (max W). An omitted value is filled with that capacity;
+    an explicit value must already equal it.
     ``--clear-tree-max-depth`` includes the seed layer. When
     ``--speculative-num-steps`` is omitted it is set to that depth; an explicit
     value must already equal it.
@@ -54,15 +56,20 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-width.")
     if server_args.clear_tree_max_depth is None:
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-max-depth.")
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
-        DRAFT_CAPACITY,
-        TARGET_CAPACITY,
-    )
+    from sglang.srt.speculative.clear_tree_remote import clear_tree_width as width_mod
 
+    installed_widths, installed_ks = width_mod.install_candidates(
+        getattr(server_args, "clear_tree_widths", None),
+        getattr(server_args, "clear_tree_ks", None),
+    )
+    server_args.clear_tree_widths = installed_widths
+    server_args.clear_tree_ks = installed_ks
     width = int(server_args.clear_tree_width)
     depth = int(server_args.clear_tree_max_depth)
     role = server_args.clear_tree_role
-    expected_draft_tokens = TARGET_CAPACITY if role == "target" else DRAFT_CAPACITY
+    expected_draft_tokens = (
+        width_mod.TARGET_CAPACITY if role == "target" else width_mod.DRAFT_CAPACITY
+    )
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = expected_draft_tokens
     elif int(server_args.speculative_num_draft_tokens) != expected_draft_tokens:

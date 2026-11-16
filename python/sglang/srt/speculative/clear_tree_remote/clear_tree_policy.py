@@ -1,10 +1,13 @@
 """Flat layer width and online verify count for one ClearTree round.
 
 W starts from a fixed table: batch size 1 uses 8, every other batch uses 4.
-A shadow replay may replace that width only after the measured 8-versus-4
-bias is inside 3 percent. K is chosen among 8, 16, and 32. Target graphs
-are captured at K + 1, so a short tree is padded only inside the graph of
-the K that was chosen.
+Every 20th eligible round builds only the next wider candidate. A shadow
+replay may replace the served width when that candidate's gain clears 3
+percent and the measured bias of the width pair is inside 3 percent. A
+narrower replacement is only the next smaller candidate. K is chosen among
+the configured verify counts.
+The default is 2, 4, 8, 16, 32, and 64. Target graphs are captured at K + 1,
+so a short tree is padded only inside the graph of the K that was chosen.
 
 Warmup, probe rounds, and rounds whose verify or layer sample is still short
 keep the tau stop. A probe round also locks K. Other rounds stop by comparing
@@ -29,14 +32,13 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     DRAFT_CAPACITY,
     LAYER_WIDTHS,
     TARGET_CAPACITY,
+    VERIFY_KS,
     batch_bucket,
     bonus_ntpbs,
     capture_ntpb,
     flat_width,
     persistent_width,
 )
-
-VERIFY_KS = (8, 16, 32)
 WARMUP_ROUNDS = 10
 PROBE_PER_K = 2
 PROBE_MAX_SENDS = 6
@@ -603,7 +605,7 @@ def _take_probe(max_ell: int, buckets: Sequence[int], batch: int) -> Optional[in
 
 
 def fitting_ks(max_ell: int, buckets: Sequence[int]) -> list:
-    """Captured K whose KV bucket exists. An empty result still keeps K = 8."""
+    """Captured K whose KV bucket exists. An empty result keeps the smallest K."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         smallest_bucket,
     )

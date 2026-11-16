@@ -1,8 +1,8 @@
 """Shadow replay for a ClearTree round.
 
-The served width changes only after the measured bias is inside 3 percent.
-This module may call the price policy and the ledger. The ledger does not
-import it.
+The served width changes when a candidate's gain clears 3 percent and that
+width pair's measured bias is inside 3 percent. This module may call the
+price policy and the ledger. The ledger does not import it.
 """
 
 from __future__ import annotations
@@ -34,14 +34,14 @@ _eligible_n: Dict[int, int] = {}
 _replay_n: Dict[int, int] = {}
 _replay_arms: Dict[int, Dict[int, Dict[str, float]]] = {}
 _would_w: Dict[int, int] = {}
-_bias_n8: Dict[int, int] = {}
-_bias_n4: Dict[int, int] = {}
-_bias_tok8: Dict[int, float] = {}
-_bias_ms8: Dict[int, float] = {}
-_bias_replay_tok: Dict[int, float] = {}
-_bias_replay_ms: Dict[int, float] = {}
-_bias_tok4: Dict[int, float] = {}
-_bias_ms4: Dict[int, float] = {}
+_real_n: Dict[tuple, int] = {}
+_real_tok: Dict[tuple, float] = {}
+_real_ms: Dict[tuple, float] = {}
+_pair_n: Dict[tuple, int] = {}
+_pair_replay_tok: Dict[tuple, float] = {}
+_pair_replay_ms: Dict[tuple, float] = {}
+_pair_wide_tok: Dict[tuple, float] = {}
+_pair_wide_ms: Dict[tuple, float] = {}
 
 
 def reset_replay_state() -> None:
@@ -49,22 +49,36 @@ def reset_replay_state() -> None:
     _replay_n.clear()
     _replay_arms.clear()
     _would_w.clear()
-    _bias_n8.clear()
-    _bias_n4.clear()
-    _bias_tok8.clear()
-    _bias_ms8.clear()
-    _bias_replay_tok.clear()
-    _bias_replay_ms.clear()
-    _bias_tok4.clear()
-    _bias_ms4.clear()
+    _real_n.clear()
+    _real_tok.clear()
+    _real_ms.clear()
+    _pair_n.clear()
+    _pair_replay_tok.clear()
+    _pair_replay_ms.clear()
+    _pair_wide_tok.clear()
+    _pair_wide_ms.clear()
+
+
+def _next_wider(width: int) -> Optional[int]:
+    wider = [int(item) for item in CANDIDATE_WIDTHS if int(item) > int(width)]
+    if not wider:
+        return None
+    return min(wider)
+
+
+def _next_narrower(width: int) -> Optional[int]:
+    narrower = [int(item) for item in CANDIDATE_WIDTHS if int(item) < int(width)]
+    if not narrower:
+        return None
+    return max(narrower)
 
 
 def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> tuple:
-    """Flat or switched width, plus one temporary departure when the ledger is on.
+    """Flat or switched width, plus one wider build when the ledger is on.
 
-    Width 4 spends every 20th eligible round at 8. Width 8 spends that round
-    at 4. The departure does not depend on the batch bucket. It does not
-    happen while the ledger is off, or on a warmup, probe, or locked round.
+    Every 20th eligible round builds the next larger candidate. The widest
+    candidate stays on that round. The departure does not happen while the
+    ledger is off, or on a warmup, probe, or locked round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
@@ -73,11 +87,10 @@ def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> t
     _eligible_n[bucket] = int(_eligible_n.get(bucket, 0)) + 1
     if _eligible_n[bucket] % REPLAY_EVERY != 0:
         return base, "ordinary"
-    if base == 4:
-        return 8, "explore"
-    if base == 8:
-        return 4, "measure"
-    return base, "ordinary"
+    nxt = _next_wider(base)
+    if nxt is None:
+        return base, "ordinary"
+    return nxt, "explore"
 
 def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: bool):
     """One width per packet. A fallback expand must not take a second departure."""
@@ -344,59 +357,85 @@ def _clear_arms(bucket: int) -> None:
     _replay_arms.pop(int(bucket), None)
     _replay_n[int(bucket)] = 0
 
-def replay_bias(bucket: int) -> Optional[float]:
-    """Window gap between replayed width-4 throughput and real width-4 throughput.
+def _real_key(bucket: int, width: int) -> tuple:
+    return (int(bucket), int(width))
 
-    Both are divided by the real width-8 throughput of the same bucket. None
-    until each side has 30 rounds.
+def _pair_key(bucket: int, wide: int, narrow: int) -> tuple:
+    return (int(bucket), int(wide), int(narrow))
+
+def _ordered_pair(left: int, right: int) -> tuple:
+    if int(left) >= int(right):
+        return int(left), int(right)
+    return int(right), int(left)
+
+def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
+    """Gap between truncated throughput and real narrow throughput.
+
+    Both are divided by the real wide throughput of rounds that replayed this
+    pair. None until each side has 30 rounds.
     """
-    key = int(bucket)
-    if int(_bias_n8.get(key, 0)) < BIAS_MIN_ROUNDS:
+    real = _real_key(bucket, narrow)
+    pair = _pair_key(bucket, wide, narrow)
+    if int(_real_n.get(real, 0)) < BIAS_MIN_ROUNDS:
         return None
-    if int(_bias_n4.get(key, 0)) < BIAS_MIN_ROUNDS:
+    if int(_pair_n.get(pair, 0)) < BIAS_MIN_ROUNDS:
         return None
-    ms8 = float(_bias_ms8.get(key, 0.0))
-    replay_ms = float(_bias_replay_ms.get(key, 0.0))
-    ms4 = float(_bias_ms4.get(key, 0.0))
-    if ms8 <= 0.0 or replay_ms <= 0.0 or ms4 <= 0.0:
+    wide_ms = float(_pair_wide_ms.get(pair, 0.0))
+    replay_ms = float(_pair_replay_ms.get(pair, 0.0))
+    narrow_ms = float(_real_ms.get(real, 0.0))
+    if wide_ms <= 0.0 or replay_ms <= 0.0 or narrow_ms <= 0.0:
         return None
-    base = float(_bias_tok8.get(key, 0.0)) / ms8
+    base = float(_pair_wide_tok.get(pair, 0.0)) / wide_ms
     if base <= 0.0:
         return None
-    replay_ratio = (float(_bias_replay_tok.get(key, 0.0)) / replay_ms) / base - 1.0
-    real_ratio = (float(_bias_tok4.get(key, 0.0)) / ms4) / base - 1.0
+    replay_ratio = (float(_pair_replay_tok.get(pair, 0.0)) / replay_ms) / base - 1.0
+    real_ratio = (float(_real_tok.get(real, 0.0)) / narrow_ms) / base - 1.0
     return float(replay_ratio - real_ratio)
 
-def bias_gate_open(bucket: int) -> bool:
-    """True when the 8-versus-4 gap is known and inside the 3 percent limit."""
-    gap = replay_bias(bucket)
+def bias_gate_open(bucket: int, wide: int, narrow: int) -> bool:
+    """True when this pair's gap is known and inside the 3 percent limit."""
+    gap = replay_bias(bucket, wide, narrow)
     return gap is not None and abs(float(gap)) <= BIAS_LIMIT
+
+def _bias_report(bucket: int, served: int, would: int) -> tuple:
+    """Bias and gate for the served width against ``would``."""
+    if int(served) == int(would):
+        return None, False
+    wide, narrow = _ordered_pair(served, would)
+    gap = replay_bias(bucket, wide, narrow)
+    open_gate = gap is not None and abs(float(gap)) <= BIAS_LIMIT
+    return gap, open_gate
 
 def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> None:
     if float(actual_ms) <= 0.0:
         return
-    key = int(bucket)
-    if int(built) == 8 and 4 in replayed and replayed[4][1] is not None:
-        _bias_n8[key] = int(_bias_n8.get(key, 0)) + 1
-        _bias_tok8[key] = float(_bias_tok8.get(key, 0.0)) + float(actual_tokens)
-        _bias_ms8[key] = float(_bias_ms8.get(key, 0.0)) + float(actual_ms)
-        _bias_replay_tok[key] = float(_bias_replay_tok.get(key, 0.0)) + float(replayed[4][0])
-        _bias_replay_ms[key] = float(_bias_replay_ms.get(key, 0.0)) + float(replayed[4][1])
-    elif int(built) == 4:
-        _bias_n4[key] = int(_bias_n4.get(key, 0)) + 1
-        _bias_tok4[key] = float(_bias_tok4.get(key, 0.0)) + float(actual_tokens)
-        _bias_ms4[key] = float(_bias_ms4.get(key, 0.0)) + float(actual_ms)
+    real = _real_key(bucket, built)
+    _real_n[real] = int(_real_n.get(real, 0)) + 1
+    _real_tok[real] = float(_real_tok.get(real, 0.0)) + float(actual_tokens)
+    _real_ms[real] = float(_real_ms.get(real, 0.0)) + float(actual_ms)
+    for width, pair in replayed.items():
+        if int(width) >= int(built) or pair[1] is None:
+            continue
+        key = _pair_key(bucket, built, width)
+        _pair_n[key] = int(_pair_n.get(key, 0)) + 1
+        _pair_replay_tok[key] = float(_pair_replay_tok.get(key, 0.0)) + float(pair[0])
+        _pair_replay_ms[key] = float(_pair_replay_ms.get(key, 0.0)) + float(pair[1])
+        _pair_wide_tok[key] = float(_pair_wide_tok.get(key, 0.0)) + float(actual_tokens)
+        _pair_wide_ms[key] = float(_pair_wide_ms.get(key, 0.0)) + float(actual_ms)
 
 def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
-    """Best servable width under the 20-round, 3 percent, 30/10 rule.
+    """Best width under the 20-round, 3 percent, 30/10 rule.
 
-    Width 2 can win the shadow comparison and is written to ``would_w``. It
-    cannot block a switch among 4 and 8, and it is never served.
+    A narrower candidate needs 30 rounds and a wider one needs 10. ``would_w``
+    is the largest gain even when that pair's gate is closed. The served width
+    moves only to a candidate whose own gate is open. A narrower move is only
+    the next smaller candidate.
     """
     best = int(current)
     best_gain = 0.0
     shadow = int(current)
     shadow_gain = 0.0
+    adjacent = _next_narrower(current)
     for cand in CANDIDATE_WIDTHS:
         if int(cand) == int(current):
             continue
@@ -414,24 +453,23 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
         if gain > shadow_gain and gain > REPLAY_GAIN:
             shadow = int(cand)
             shadow_gain = float(gain)
-        if int(cand) not in (4, 8):
+        if int(cand) < int(current) and int(cand) != adjacent:
             continue
-        if gain > best_gain and gain > REPLAY_GAIN:
+        wide, narrow = _ordered_pair(current, cand)
+        if (
+            gain > best_gain
+            and gain > REPLAY_GAIN
+            and bias_gate_open(bucket, wide, narrow)
+        ):
             best = int(cand)
             best_gain = float(gain)
     _would_w[int(bucket)] = int(shadow)
     applied = False
-    if (
-        allow_apply
-        and best != int(current)
-        and best in (4, 8)
-        and int(current) in (4, 8)
-        and bias_gate_open(bucket)
-    ):
+    if allow_apply and best != int(current):
         assign_persistent_width(int(bucket), int(best))
         _clear_arms(bucket)
         applied = True
-    return best, best_gain, applied
+    return best, shadow_gain, applied
 
 def observe_replay(
     batch: int,
@@ -447,12 +485,14 @@ def observe_replay(
     """Accumulate one labeled round and return the shadow decision.
 
     ``counted`` is false for warmup, probe, and locked rounds. A measure round
-    updates only the width-4 side of the bias. Width 2 can win the shadow
-    comparison and still cannot change the served width.
+    updates bias only. ``would_w`` can name a candidate whose gate is closed.
+    The logged bias and gate are the pair of the width served at the start of
+    this round and ``would_w``.
     """
     pairs = {} if replayed is None else {int(key): value for key, value in replayed.items()}
     bucket = batch_bucket(batch)
-    current = persistent_width(batch)
+    served = persistent_width(batch)
+    current = served
     if counted:
         _note_bias(bucket, int(built), actual_tokens, actual_ms, pairs)
     gain = 0.0
@@ -485,8 +525,9 @@ def observe_replay(
         judged_rounds = int(_replay_n[bucket])
         if judged_rounds % REPLAY_EVERY == 0:
             _best, gain, applied = _judge(bucket, current, allow_apply=apply)
-            current = persistent_width(batch)
     rounds = judged_rounds
+    would = int(_would_w.get(bucket, served))
+    bias, gate = _bias_report(bucket, served, would)
     record = {
         "bucket": int(bucket),
         "b": int(batch),
@@ -495,9 +536,9 @@ def observe_replay(
         "candidates": _candidate_log(int(built), actual_tokens, actual_ms, pairs),
         "rounds": rounds,
         "gain": float(gain),
-        "would_w": int(_would_w.get(bucket, current)),
-        "bias": replay_bias(bucket),
-        "gate": bias_gate_open(bucket),
+        "would_w": would,
+        "bias": bias,
+        "gate": gate,
         "applied": bool(applied),
     }
     return record

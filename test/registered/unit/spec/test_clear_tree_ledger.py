@@ -123,6 +123,16 @@ def _step(ledger, rids, prefix, rpc, now, width=8):
     return ledger.on_packet("step", rids, "sess", rpc, prefix, width, now=now)
 
 
+def _pin_verify_ks(test, ks=(8, 16, 32)):
+    """Keep one probe scenario on the previous verify tiers, then restore."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        install_candidates,
+    )
+
+    install_candidates(None, ks)
+    test.addCleanup(lambda: install_candidates(None, None))
+
+
 class ClearTreeLedgerTest(CustomTestCase):
     def setUp(self):
         self._saved = {name: os.environ.get(name) for name in _LEDGER_ENV}
@@ -816,6 +826,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.verify_k(state), 8)
 
     def test_short_sample_and_probe_stay_on_tau(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
@@ -826,6 +837,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(warmed.locked_k, 32)
 
     def test_new_batch_restarts_probes_at_k8(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         one = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
@@ -840,6 +852,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(again.locked_k, 8)
 
     def test_missing_tier_stays_on_tau_until_every_k_is_timed(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         reqs = [
@@ -892,7 +905,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         for _ in range(10):
             make_round(sched, [req])
-        for k in (8, 16, 32):
+        for k in (2, 4, 8, 16, 32, 64):
             observe_verify(1, k, 256, 10.0)
             observe_verify(1, k, 256, 10.0)
         for _ in range(3):
@@ -959,6 +972,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.verify_k(state), 8)
 
     def test_probe_skips_k_that_does_not_fit(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 4070, output_ids=[])
@@ -982,6 +996,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(predict_verify_ms(1, 8, 256), 10.0)
 
     def test_lock_k_does_not_consume_probes(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
@@ -1010,21 +1025,26 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(matched_depth(layers, kept, [1, 3]), 2)
         self.assertEqual(matched_depth(layers, kept, [2, 4]), 0)
 
-    def test_batch_one_measures_four_then_builds_eight(self):
+    def test_batch_one_explores_the_next_wider_width(self):
         reset_policy()
         chosen = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertEqual(chosen[-1], (4, "measure"))
-        self.assertTrue(all(width <= 8 for width, _kind in chosen))
-        self.assertTrue(all(width != 2 for width, _kind in chosen))
-        self.assertTrue(all(kind != "explore" for _width, kind in chosen))
+        self.assertEqual(chosen[-1], (16, "explore"))
+        self.assertTrue(all(item == (8, "ordinary") for item in chosen[:-1]))
         assign_persistent_width(1, 4)
         later = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
         self.assertEqual(later[-1], (8, "explore"))
         self.assertTrue(all(item == (4, "ordinary") for item in later[:-1]))
+
+    def test_widest_width_does_not_leave(self):
+        assign_persistent_width(1, 64)
+        chosen = [
+            choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
+        ]
+        self.assertTrue(all(item == (64, "ordinary") for item in chosen))
 
     def test_wider_batch_explores_only_while_the_ledger_is_on(self):
         self.assertEqual(
@@ -1083,6 +1103,67 @@ class TestFlatWidthOnlineK(CustomTestCase):
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         self.assertEqual(make_round(sched, [req]).width, 4)
 
+    def test_open_pair_bias_serves_the_next_wider_width(self):
+        reset_policy()
+        for _ in range(30):
+            observe_replay(1, 8, "ordinary", 10.0, 10.0)
+        closed = None
+        for _ in range(10):
+            closed = observe_replay(
+                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
+            )
+        self.assertEqual(closed["would_w"], 16)
+        self.assertFalse(closed["gate"])
+        self.assertFalse(closed["applied"])
+        self.assertEqual(persistent_width(1), 8)
+        last = None
+        for _ in range(20):
+            last = observe_replay(
+                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
+            )
+        self.assertTrue(last["gate"])
+        self.assertTrue(last["applied"])
+        self.assertEqual(last["would_w"], 16)
+        self.assertEqual(persistent_width(1), 16)
+
+    def test_narrow_move_stops_at_the_adjacent_width(self):
+        reset_policy()
+        for _ in range(30):
+            observe_replay(1, 4, "measure", 11.0, 10.0)
+        for _ in range(30):
+            observe_replay(1, 2, "measure", 14.0, 10.0)
+        last = None
+        for _ in range(40):
+            last = observe_replay(
+                1,
+                8,
+                "ordinary",
+                10.0,
+                10.0,
+                {4: (11.0, 10.0), 2: (14.0, 10.0)},
+            )
+        self.assertEqual(last["would_w"], 2)
+        self.assertTrue(last["applied"])
+        self.assertEqual(persistent_width(1), 4)
+
+    def test_far_narrow_gate_does_not_skip_the_adjacent_width(self):
+        reset_policy()
+        for _ in range(30):
+            observe_replay(1, 2, "measure", 14.0, 10.0)
+        last = None
+        for _ in range(40):
+            last = observe_replay(
+                1,
+                8,
+                "ordinary",
+                10.0,
+                10.0,
+                {4: (11.0, 10.0), 2: (14.0, 10.0)},
+            )
+        self.assertEqual(last["would_w"], 2)
+        self.assertFalse(last["applied"])
+        self.assertEqual(persistent_width(1), 8)
+
     def test_width_two_never_becomes_the_served_width(self):
         reset_policy()
         for _ in range(30):
@@ -1097,7 +1178,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 10.0,
                 {4: (10.2, 10.0), 2: (40.0, 10.0)},
             )
-        self.assertTrue(last["gate"])
+        self.assertFalse(last["gate"])
         self.assertEqual(last["would_w"], 2)
         self.assertFalse(last["applied"])
         self.assertEqual(persistent_width(1), 8)
@@ -1222,7 +1303,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         metrics = SimpleNamespace(tp_rank=0)
         push_verify_sample(metrics, 1, 8, 256, 1000, True)
         push_verify_sample(metrics, 1, 16, 256, 2000, True)
-        push_verify_sample(metrics, 1, 4, 256, 3000, True)
+        push_verify_sample(metrics, 1, 3, 256, 3000, True)
         push_verify_sample(metrics, 1, 8, None, 1000, True)
         push_verify_sample(metrics, 1, 8, 256, 1000, False)
         self.assertEqual(
@@ -1328,6 +1409,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(persistent_width(2), 8)
 
     def test_probe_uses_the_sample_bucket_and_can_retry(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace()
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 240, output_ids=[])
@@ -1349,6 +1431,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = saved
 
     def test_probe_cap_leaves_the_cell_on_tau(self):
+        _pin_verify_ks(self)
         reset_policy()
         sched = SimpleNamespace()
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
@@ -1381,7 +1464,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         plan = install_fallback_plan(sched, reqs)
         self.assertTrue(plan.fallback)
         self.assertTrue(plan.use_tau)
-        self.assertEqual(plan.locked_k, 32)
+        self.assertEqual(plan.locked_k, 64)
         self.assertFalse(plan.replay_eligible)
         self.assertEqual(policy._rounds, 0)
         self.assertEqual(policy._probe_sent, {})
@@ -1453,7 +1536,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
             plan = make_round(sched, [req])
             self.assertTrue(plan.use_tau)
-            self.assertEqual(plan.locked_k, 32)
+            self.assertEqual(plan.locked_k, 64)
             self.assertEqual(policy._probe_sent, {})
         finally:
             os.environ["SGLANG_CLEAR_LEDGER"] = "1"
@@ -1477,7 +1560,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ):
             plan = make_round(SimpleNamespace(), [req])
         self.assertTrue(plan.use_tau)
-        self.assertEqual(plan.locked_k, 32)
+        self.assertEqual(plan.locked_k, 64)
         self.assertFalse(plan.replay_eligible)
 
     def test_verify_window_keeps_the_latest_sixteen(self):
@@ -1529,7 +1612,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             clear_tree_width=4,
             clear_tree_tau=0.4,
             clear_tree_max_depth=8,
-            speculative_num_draft_tokens=8,
+            speculative_num_draft_tokens=None,
             speculative_num_steps=8,
             speculative_verify_mode=None,
             speculative_eagle_topk=None,

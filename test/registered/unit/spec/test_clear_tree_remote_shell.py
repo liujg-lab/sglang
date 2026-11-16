@@ -86,18 +86,26 @@ class ClearTreeRemoteShellTest(CustomTestCase):
     def test_omitted_draft_tokens_follow_role(self):
         target = _args(clear_tree_role="target")
         apply_clear_tree_settings(target, on_npu=False)
-        self.assertEqual(target.speculative_num_draft_tokens, 33)
+        self.assertEqual(target.speculative_num_draft_tokens, 65)
+        self.assertEqual(target.clear_tree_widths, [2, 4, 8, 16, 32, 64])
+        self.assertEqual(target.clear_tree_ks, [2, 4, 8, 16, 32, 64])
         self.assertEqual(target.speculative_num_steps, 8)
         self.assertTrue(target.disable_overlap_schedule)
         self.assertFalse(target.enable_mixed_chunk)
 
         draft = _args(clear_tree_role="draft")
         apply_clear_tree_settings(draft, on_npu=False)
-        self.assertEqual(draft.speculative_num_draft_tokens, 8)
+        self.assertEqual(draft.speculative_num_draft_tokens, 64)
 
     def test_capture_widths_follow_role(self):
-        target = _args(clear_tree_role="target", speculative_num_draft_tokens=33)
-        draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=8)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            bonus_ntpbs,
+            install_candidates,
+        )
+
+        install_candidates(None, None)
+        target = _args(clear_tree_role="target", speculative_num_draft_tokens=65)
+        draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=64)
         opt = _args(
             speculative_algorithm="OPT_TREE_REMOTE",
             opt_tree_role="target",
@@ -105,16 +113,59 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         )
         self.assertEqual(
             SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(target),
-            [33, 17, 9, 1],
+            [65, 33, 17, 9, 5, 3, 1],
         )
         self.assertEqual(
             SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(draft),
-            [8, 4, 1],
+            [64, 32, 16, 8, 4, 2, 1],
         )
+        self.assertEqual(bonus_ntpbs(), (65, 33, 17, 9, 5, 3))
         self.assertEqual(
             SpeculativeAlgorithm.OPT_TREE_REMOTE.dual_ntpb_cuda_graph_options(opt),
             [17, 1],
         )
+
+    def test_custom_candidates_set_capacity_and_capture(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            bonus_ntpbs,
+            install_candidates,
+        )
+
+        target = _args(
+            clear_tree_role="target",
+            clear_tree_widths=[8, 4, 4],
+            clear_tree_ks=[16, 8],
+        )
+        draft = _args(
+            clear_tree_role="draft",
+            clear_tree_widths=[8, 4],
+            clear_tree_ks=[16, 8],
+        )
+        try:
+            apply_clear_tree_settings(target, on_npu=False)
+            self.assertEqual(target.clear_tree_widths, [4, 8])
+            self.assertEqual(target.clear_tree_ks, [8, 16])
+            self.assertEqual(target.speculative_num_draft_tokens, 17)
+            self.assertEqual(
+                SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                    target
+                ),
+                [17, 9, 1],
+            )
+            apply_clear_tree_settings(draft, on_npu=False)
+            self.assertEqual(draft.speculative_num_draft_tokens, 8)
+            self.assertEqual(
+                SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                    draft
+                ),
+                [8, 4, 1],
+            )
+            self.assertEqual(bonus_ntpbs(), (9, 5))
+            rejected = _args(clear_tree_role="draft", clear_tree_widths=[1, 4])
+            with self.assertRaises(ValueError):
+                apply_clear_tree_settings(rejected, on_npu=False)
+        finally:
+            install_candidates(None, None)
 
     def test_explicit_draft_tokens_must_match(self):
         draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=5)
