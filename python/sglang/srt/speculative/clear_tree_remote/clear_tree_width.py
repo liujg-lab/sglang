@@ -1,7 +1,7 @@
 """Flat layer width and tau verify count for one ClearTree round.
 
 Batch size 1 starts at width 8 and verify count 16. Every other batch starts
-at width 4 and verify count 8. A gated replay stores a width replacement
+at width 4 and verify count 8. A replay switch stores a width replacement
 here. This module does not import the ledger.
 """
 
@@ -122,8 +122,24 @@ def batch_bucket(batch_size: int) -> int:
     return 5
 
 def persistent_width(batch_size: int) -> int:
-    """Width served after a gated switch, or the flat table before one."""
+    """Width served after a replay switch, or the flat table before one."""
     bucket = batch_bucket(batch_size)
     if bucket in _persistent_w:
         return int(_persistent_w[bucket])
     return flat_width(batch_size)
+
+
+def _next_wider(width: int) -> Optional[int]:
+    """Next configured candidate above ``width``, or None at the widest."""
+    wider = [int(item) for item in CANDIDATE_WIDTHS if int(item) > int(width)]
+    if not wider:
+        return None
+    return min(wider)
+
+
+def _next_narrower(width: int) -> Optional[int]:
+    """Next configured candidate below ``width``, or None at the narrowest."""
+    narrower = [int(item) for item in CANDIDATE_WIDTHS if int(item) < int(width)]
+    if not narrower:
+        return None
+    return max(narrower)

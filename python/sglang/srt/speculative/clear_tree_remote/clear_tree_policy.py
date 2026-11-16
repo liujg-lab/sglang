@@ -1,25 +1,31 @@
 """Flat layer width and online verify count for one ClearTree round.
 
 W and the tau verify count start from a fixed table. Batch size 1 uses width
-8 and K 16. Every other batch uses width 4 and K 8. Every 20th eligible round
-builds only the next wider candidate. A shadow replay may replace the served
-width when that candidate's gain clears 3 percent and the measured bias of
-the width pair is inside 3 percent. A narrower replacement is only the next
-smaller candidate. Online K stays inside the tiers that can hold the tree.
-The default candidates are 2, 4, 8, 16, 32, and 64. Target graphs are captured
-at K + 1, so a short tree is padded only inside the graph of the K that was
-chosen.
+8 and K 16. Every other batch uses width 4 and K 8. Eligible rounds first
+spend two builds on the next narrower width when that width has not run for
+300 rounds. Every 20th eligible round that is not one of those builds the
+next wider candidate. A shadow replay may replace the served width when that
+candidate's gain clears 3 percent. A narrower replacement is only the next
+smaller candidate and needs 30 paired rounds. A wider one needs 10. Measured
+bias is logged and does not gate the switch. Online K stays inside the tiers
+that can hold the tree. The default candidates are 2, 4, 8, 16, 32, and 64.
+Target graphs are captured at K + 1, so a short tree is padded only inside
+the graph of the K that was chosen.
 
-Warmup, probe rounds, rounds past the probe cap, and rounds whose verify or
-layer sample is still short keep the tau stop and the flat K. A probe round
-locks the probed K. Past ``max(54, 5% of rounds)`` probes, that round does
-not probe and stays on tau. Other rounds stop by comparing one J across
-verify counts at or below the covering tier: keep the prefix of requests
-whose next layer is worth more than verifying now. The final K is also at or
-below the tier that covers the nodes actually built. Every request in the
-round, including one that already stopped growing, stays in that J. Verify
-time stays on the full batch. The layer cost is only the requests that would
-be forwarded.
+Warmup, K-probe rounds, and rounds whose verify or layer sample is still
+short keep the tau stop and the flat K. A K-probe round locks the probed K.
+Probes reach the covering tier of the next wider width, or the served width
+when it is already the widest. Past ``max(54, 5% of rounds)`` probes, that
+round does not take another probe. A cell that still lacks samples stays on
+tau because it is not ready. A cell that already has samples keeps the value
+rule. Ordinary rounds ready and choose K only inside the covering tier of the
+width built for that round, which for an ordinary round is the served width.
+Other rounds stop by comparing one J across verify counts at or below that
+tier: keep the prefix of requests whose next layer is worth more than
+verifying now. The final K is also at or below the tier that covers the nodes
+actually built. Every request in the round, including one that already
+stopped growing, stays in that J. Verify time stays on the full batch. The
+layer cost is only the requests that would be forwarded.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     batch_bucket,
     bonus_ntpbs,
     capture_ntpb,
+    _next_wider,
     flat_k,
     flat_width,
     persistent_width,
@@ -933,15 +940,21 @@ def make_round(scheduler, reqs) -> RoundPlan:
     locked_env = locked_k_from_env()
     fitting = fitting_ks(max_ell, buckets)
     max_depth = _round_max_depth(scheduler)
-    # A probe round is not eligible, so its tree stays on the served width.
-    probe_cover = _cover_for(persistent_width(batch), max_depth, fitting)
+    # A K-probe round is not eligible, so its tree stays on the served width.
+    # The probe reaches one width wider, so a later exploration round can
+    # find samples for that tree's covering tier.
+    served = persistent_width(batch)
+    wider = _next_wider(served)
+    probe_width = served if wider is None else int(wider)
+    probe_cover = _cover_for(probe_width, max_depth, fitting)
     probe = None
-    probe_capped = False
-    if locked_env is None and ledger_on and greedy:
-        if _probe_rounds >= _probe_limit():
-            probe_capped = True
-        else:
-            probe = _take_probe(max_ell, buckets, batch, probe_cover)
+    if (
+        locked_env is None
+        and ledger_on
+        and greedy
+        and _probe_rounds < _probe_limit()
+    ):
+        probe = _take_probe(max_ell, buckets, batch, probe_cover)
     price = theta(batch)
     eligible = (
         _rounds > WARMUP_ROUNDS
@@ -972,7 +985,6 @@ def make_round(scheduler, reqs) -> RoundPlan:
         or not greedy
         or _rounds <= WARMUP_ROUNDS
         or probe is not None
-        or probe_capped
         or price is None
         or layer_ms is None
         or not ready
@@ -1000,7 +1012,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
     )
     plan.cover_k = int(cover)
     plan.replay_kind = kind
-    plan.replay_eligible = bool(eligible and not use_tau)
+    plan.replay_eligible = bool(eligible and not use_tau and kind != "probe_w")
     plan.fallback = False
     return plan
 
@@ -1154,7 +1166,6 @@ def _requests_greedy(reqs) -> bool:
 
 _REPLAY_EXPORTS = frozenset(
     {
-        "bias_gate_open",
         "candidate_stop_depth",
         "choose_build_width",
         "hold_replay",

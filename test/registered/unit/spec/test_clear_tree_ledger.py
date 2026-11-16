@@ -921,13 +921,18 @@ class TestFlatWidthOnlineK(CustomTestCase):
             observe_verify(1, 8, 256, 10.0)
         observe_price(1, 2.0, 1.0)
         with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
             return_value=1.0,
         ):
             plan = make_round(sched, [req])
         self.assertFalse(plan.use_tau)
         self.assertIsNone(plan.locked_k)
-        self.assertEqual(plan.width, 8)
+        self.assertEqual(plan.width, 4)
+        self.assertEqual(plan.replay_kind, "probe_w")
+        self.assertFalse(plan.replay_eligible)
 
     def test_accept_ratio_shrinks_toward_the_pool(self):
         self.assertEqual(accept_ratio("a"), 1.0)
@@ -1039,21 +1044,24 @@ class TestFlatWidthOnlineK(CustomTestCase):
         chosen = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
+        self.assertEqual(chosen[:2], [(4, "probe_w"), (4, "probe_w")])
+        self.assertTrue(all(item == (8, "ordinary") for item in chosen[2:-1]))
         self.assertEqual(chosen[-1], (16, "explore"))
-        self.assertTrue(all(item == (8, "ordinary") for item in chosen[:-1]))
         assign_persistent_width(1, 4)
         later = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
+        self.assertEqual(later[:2], [(2, "probe_w"), (2, "probe_w")])
+        self.assertTrue(all(item == (4, "ordinary") for item in later[2:-1]))
         self.assertEqual(later[-1], (8, "explore"))
-        self.assertTrue(all(item == (4, "ordinary") for item in later[:-1]))
 
     def test_widest_width_does_not_leave(self):
         assign_persistent_width(1, 64)
         chosen = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertTrue(all(item == (64, "ordinary") for item in chosen))
+        self.assertEqual(chosen[:2], [(32, "probe_w"), (32, "probe_w")])
+        self.assertTrue(all(item == (64, "ordinary") for item in chosen[2:]))
 
     def test_wider_batch_explores_only_while_the_ledger_is_on(self):
         self.assertEqual(
@@ -1066,8 +1074,9 @@ class TestFlatWidthOnlineK(CustomTestCase):
         hot = [
             choose_build_width(2, ledger_on=True, eligible=True) for _ in range(20)
         ]
+        self.assertEqual(hot[:2], [(2, "probe_w"), (2, "probe_w")])
+        self.assertTrue(all(item == (4, "ordinary") for item in hot[2:-1]))
         self.assertEqual(hot[-1], (8, "explore"))
-        self.assertEqual(hot[0], (4, "ordinary"))
 
     def test_warmup_round_does_not_enter_the_replay_sum(self):
         skipped = observe_replay(
@@ -1086,14 +1095,15 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
             )
         self.assertGreater(last["gain"], 0.03)
-        self.assertFalse(last["gate"])
-        self.assertFalse(last["applied"])
+        self.assertNotIn("gate", last)
+        self.assertGreater(abs(last["bias"]), 0.03)
+        self.assertTrue(last["applied"])
         self.assertEqual(last["would_w"], 4)
         self.assertLess(last["rounds"], 200)
         self.assertNotIn("se", last)
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
-        self.assertEqual(make_round(sched, [req]).width, 8)
+        self.assertEqual(make_round(sched, [req]).width, 4)
 
     def test_bias_inside_three_percent_switches_the_next_round(self):
         for _ in range(30):
@@ -1103,7 +1113,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
             last = observe_replay(
                 1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
             )
-        self.assertTrue(last["gate"])
+        self.assertNotIn("gate", last)
+        self.assertAlmostEqual(last["bias"], 0.0)
         self.assertTrue(last["applied"])
         self.assertEqual(last["would_w"], 4)
         self.assertLess(last["rounds"], 200)
@@ -1122,17 +1133,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
             )
         self.assertEqual(closed["would_w"], 16)
-        self.assertFalse(closed["gate"])
-        self.assertFalse(closed["applied"])
-        self.assertEqual(persistent_width(1), 8)
-        last = None
-        for _ in range(20):
-            last = observe_replay(
-                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
-            )
-        self.assertTrue(last["gate"])
-        self.assertTrue(last["applied"])
-        self.assertEqual(last["would_w"], 16)
+        self.assertNotIn("gate", closed)
+        self.assertTrue(closed["applied"])
         self.assertEqual(persistent_width(1), 16)
 
     def test_narrow_move_stops_at_the_adjacent_width(self):
@@ -1170,8 +1172,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 {4: (11.0, 10.0), 2: (14.0, 10.0)},
             )
         self.assertEqual(last["would_w"], 2)
-        self.assertFalse(last["applied"])
-        self.assertEqual(persistent_width(1), 8)
+        self.assertTrue(last["applied"])
+        self.assertEqual(persistent_width(1), 4)
 
     def test_width_two_never_becomes_the_served_width(self):
         reset_policy()
@@ -1187,7 +1189,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 10.0,
                 {4: (10.2, 10.0), 2: (40.0, 10.0)},
             )
-        self.assertFalse(last["gate"])
         self.assertEqual(last["would_w"], 2)
         self.assertFalse(last["applied"])
         self.assertEqual(persistent_width(1), 8)
@@ -1196,7 +1197,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(make_round(sched, [req]).width, 8)
 
     def test_settle_counts_only_the_kept_branch(self):
-        for k in (8, 16, 32):
+        for k in (2, 4, 8, 16, 32):
             for _ in range(6):
                 observe_verify(1, k, 256, 5.0)
         scores = [0.9, 0.8, 0.7, 0.6, 0.01, 0.01, 0.01, 0.01]
@@ -1281,11 +1282,19 @@ class TestFlatWidthOnlineK(CustomTestCase):
             eligible = []
             for _ in range(80):
                 plan = make_round(sched, reqs)
-                if plan.replay_eligible:
-                    eligible.append((plan.width, plan.replay_kind))
+                if policy._rounds <= policy.WARMUP_ROUNDS:
+                    continue
+                eligible.append(
+                    (plan.width, plan.replay_kind, plan.replay_eligible)
+                )
                 if len(eligible) == 20:
                     break
-        self.assertEqual(eligible, [(4, "ordinary")] * 19 + [(8, "explore")])
+        self.assertEqual(
+            eligible,
+            [(2, "probe_w", False)] * 2
+            + [(4, "ordinary", True)] * 17
+            + [(8, "explore", True)],
+        )
 
         reset_policy()
         warm = SimpleNamespace(
@@ -1414,24 +1423,21 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_width_two_does_not_block_a_servable_switch(self):
         reset_policy()
-        for _ in range(30):
-            observe_replay(
+        last = None
+        for n in range(1, 41):
+            last = observe_replay(
                 2,
                 8,
                 "explore",
                 10.6,
                 10.0,
                 {4: (10.0, 10.0), 2: (11.0, 10.0)},
+                apply=n > 20,
             )
-        for _ in range(30):
-            observe_replay(2, 4, "measure", 10.0, 10.0)
-        last = None
-        for _ in range(10):
-            last = observe_replay(2, 4, "ordinary", 10.0, 10.0, {2: (11.0, None)})
         self.assertEqual(last["rounds"], 40)
         self.assertEqual(last["would_w"], 2)
         self.assertTrue(last["applied"])
-        self.assertEqual(persistent_width(2), 8)
+        self.assertEqual(persistent_width(2), 2)
 
     def test_probe_uses_the_sample_bucket_and_can_retry(self):
         _pin_verify_ks(self)
@@ -1705,7 +1711,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertTrue(plan.use_tau)
         self.assertFalse(plan.replay_eligible)
         self.assertEqual(plan.locked_k, 16)
-        self.assertEqual(plan.width, 8)
+        self.assertEqual(plan.width, 4)
+        self.assertEqual(plan.replay_kind, "probe_w")
 
     def test_foreign_verify_bucket_warns_once(self):
         reset_policy()
@@ -1732,13 +1739,38 @@ class TestFlatWidthOnlineK(CustomTestCase):
         observe_price(1, 2.0, 1.0)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
             return_value=1.0,
         ):
             plan = make_round(SimpleNamespace(), [req])
-        self.assertTrue(plan.use_tau)
-        self.assertEqual(plan.locked_k, 16)
+        self.assertFalse(plan.use_tau)
+        self.assertIsNone(plan.locked_k)
+        self.assertEqual(plan.replay_kind, "probe_w")
         self.assertFalse(plan.replay_eligible)
+        self.assertEqual(policy._probe_rounds, 54)
+        self.assertEqual(policy._probe_sent, {})
+
+        reset_policy()
+        policy._probe_rounds = 54
+        policy._rounds = 20
+        for k in (2, 4, 8, 16, 32):
+            observe_verify(1, k, 256, 10.0)
+            observe_verify(1, k, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            short = make_round(SimpleNamespace(), [req])
+        self.assertTrue(short.use_tau)
+        self.assertEqual(short.locked_k, 16)
+        self.assertFalse(short.replay_eligible)
         self.assertEqual(policy._probe_rounds, 54)
         self.assertEqual(policy._probe_sent, {})
 
@@ -1754,6 +1786,97 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 make_round(sched, [req])
         gap = [line for line in logs.output if "verify_samples" in line]
         self.assertEqual(len(gap), 1)
+
+    def test_replay_k_stays_inside_retained_nodes(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+            _replayed_counts,
+            _select_replay_k,
+        )
+
+        self.assertEqual(
+            _select_replay_k([[0.4, 0.3]], [1.0], 1.0, {32: 1.0}, 32, cap=2),
+            2,
+        )
+        layers = [
+            [
+                {"token": 0, "parent": -1, "score": 0.4},
+                {"token": 1, "parent": -1, "score": 0.3},
+                {"token": 2, "parent": -1, "score": 0.2},
+                {"token": 3, "parent": -1, "score": 0.1},
+            ]
+        ]
+        hold = {
+            "width": 4,
+            "theta": 1.0,
+            "verify_ms": {
+                2: 100.0,
+                4: 1.0,
+                8: 1.0,
+                16: 1.0,
+                32: 1.0,
+                64: 1.0,
+            },
+            "layers": [],
+            "k": 2,
+            "measured_ms": 50.0,
+            "trees": {
+                "a": {"layers": layers, "ratio": 1.0, "prefix": 1},
+            },
+        }
+        replayed = _replayed_counts(hold, {"a": [0]})
+        self.assertEqual(replayed[2][1], 50.0)
+
+    def test_finished_tree_does_not_keep_the_batch_growing(self):
+        def nodes(scores):
+            return [
+                [
+                    {"token": index, "parent": -1, "score": score}
+                    for index, score in enumerate(scores)
+                ]
+            ]
+
+        def tree(scores):
+            layers = nodes(scores)
+            return {
+                "layers": layers,
+                "kept": truncate_columns(layers, 2),
+                "ratio": 1.0,
+                "prefix": 1,
+            }
+
+        short = tree([0.2, 0.1])
+        short["layers"] = short["layers"] + [
+            [
+                {"token": 10, "parent": 0, "score": 9.0},
+                {"token": 11, "parent": 1, "score": 9.0},
+            ]
+        ]
+        short["kept"] = truncate_columns(short["layers"], 2)
+        long_layers = nodes([0.2, 0.1])
+        for depth in range(3):
+            long_layers.append(
+                [
+                    {"token": 20 + depth, "parent": 0, "score": 0.0},
+                    {"token": 30 + depth, "parent": 1, "score": 0.0},
+                ]
+            )
+        long = {
+            "layers": long_layers,
+            "kept": truncate_columns(long_layers, 2),
+            "ratio": 1.0,
+            "prefix": 1,
+        }
+        rows = [{"pred": {2: 5.0}} for _ in range(4)]
+        self.assertEqual(
+            batch_stop_depth(
+                [short, long],
+                theta=1.0,
+                verify_ms={64: 1.0},
+                layer_rows=rows,
+                width=2,
+            ),
+            2,
+        )
 
 
 def _rows_state(rows, rid, prefix):

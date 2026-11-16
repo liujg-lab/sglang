@@ -1,8 +1,11 @@
 """Shadow replay for a ClearTree round.
 
-The served width changes when a candidate's gain clears 3 percent and that
-width pair's measured bias is inside 3 percent. This module may call the
-price policy and the ledger. The ledger does not import it.
+The served width changes when a candidate's gain clears 3 percent. A narrower
+move is the next smaller width after 30 paired rounds. A wider move needs 10.
+Measured bias is logged and does not decide the switch. Two rounds in every
+300 eligible rounds that miss the next narrower width build that width so its
+layer cost can be fit. This module may call the price policy and the ledger.
+The ledger does not import it.
 """
 
 from __future__ import annotations
@@ -12,12 +15,15 @@ from typing import Dict, Optional, Sequence
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     VERIFY_KS,
     _prefix_mass,
+    _tier_for_nodes,
     accept_ratio,
     keep_by_net_benefit,
     select_k,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     CANDIDATE_WIDTHS,
+    _next_narrower,
+    _next_wider,
     assign_persistent_width,
     batch_bucket,
     persistent_width,
@@ -28,7 +34,8 @@ REPLAY_GAIN = 0.03
 NARROW_MIN_ROUNDS = 30
 WIDE_MIN_ROUNDS = 10
 BIAS_MIN_ROUNDS = 30
-BIAS_LIMIT = 0.03
+PROBE_W_IDLE = 300
+PROBE_W_RUNS = 2
 
 _eligible_n: Dict[int, int] = {}
 _replay_n: Dict[int, int] = {}
@@ -42,6 +49,8 @@ _pair_replay_tok: Dict[tuple, float] = {}
 _pair_replay_ms: Dict[tuple, float] = {}
 _pair_wide_tok: Dict[tuple, float] = {}
 _pair_wide_ms: Dict[tuple, float] = {}
+_narrow_idle: Dict[tuple, int] = {}
+_probe_w_left: Dict[tuple, int] = {}
 
 
 def reset_replay_state() -> None:
@@ -57,40 +66,52 @@ def reset_replay_state() -> None:
     _pair_replay_ms.clear()
     _pair_wide_tok.clear()
     _pair_wide_ms.clear()
+    _narrow_idle.clear()
+    _probe_w_left.clear()
 
 
-def _next_wider(width: int) -> Optional[int]:
-    wider = [int(item) for item in CANDIDATE_WIDTHS if int(item) > int(width)]
-    if not wider:
-        return None
-    return min(wider)
-
-
-def _next_narrower(width: int) -> Optional[int]:
-    narrower = [int(item) for item in CANDIDATE_WIDTHS if int(item) < int(width)]
-    if not narrower:
-        return None
-    return max(narrower)
+def _mark_width_ran(bucket: int, width: int) -> None:
+    """This width was built, so its narrow-timing counter starts over."""
+    key = (int(bucket), int(width))
+    _narrow_idle[key] = 0
+    _probe_w_left[key] = 0
 
 
 def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> tuple:
-    """Flat or switched width, plus one wider build when the ledger is on.
+    """Flat or switched width, plus a narrow timing probe and a wider build.
 
-    Every 20th eligible round builds the next larger candidate. The widest
-    candidate stays on that round. The departure does not happen while the
-    ledger is off, or on a warmup, probe, or locked round.
+    The next narrower width is built for two rounds when it has gone 300
+    eligible rounds without a real build. The counter starts at 300, so the
+    first eligible round is a probe. Those rounds are ``probe_w`` and take
+    the slot ahead of exploration. Every 20th remaining eligible round builds
+    the next larger candidate. The widest candidate stays on that round. The
+    departure does not happen while the ledger is off, or on a warmup,
+    K-probe, or locked round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
         return base, "ordinary"
     bucket = batch_bucket(batch_size)
     _eligible_n[bucket] = int(_eligible_n.get(bucket, 0)) + 1
-    if _eligible_n[bucket] % REPLAY_EVERY != 0:
-        return base, "ordinary"
-    nxt = _next_wider(base)
-    if nxt is None:
-        return base, "ordinary"
-    return nxt, "explore"
+    narrow = _next_narrower(base)
+    if narrow is not None:
+        key = (int(bucket), int(narrow))
+        left = int(_probe_w_left.get(key, 0))
+        idle = int(_narrow_idle.get(key, PROBE_W_IDLE))
+        if left > 0 or idle >= PROBE_W_IDLE:
+            if left <= 0:
+                left = PROBE_W_RUNS
+            _probe_w_left[key] = left - 1
+            _narrow_idle[key] = 0
+            return int(narrow), "probe_w"
+        _narrow_idle[key] = idle + 1
+    if _eligible_n[bucket] % REPLAY_EVERY == 0:
+        nxt = _next_wider(base)
+        if nxt is not None:
+            _mark_width_ran(bucket, nxt)
+            return int(nxt), "explore"
+    _mark_width_ran(bucket, base)
+    return base, "ordinary"
 
 def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: bool):
     """One width per packet. A fallback expand must not take a second departure."""
@@ -252,7 +273,8 @@ def batch_stop_depth(trees, *, theta, verify_ms, layer_rows, width: int) -> int:
 
     ``trees`` carry ``layers``, ``kept``, ``ratio``, and ``prefix``. A missing
     layer cost keeps the built depth. The comparison is the shared net-benefit
-    rule, so one request does not pay the whole batch's layer cost alone.
+    rule, so one request does not pay the whole batch's layer cost alone. A
+    tree whose own build depth is already at or behind ``stop`` is not growing.
     """
     if not trees or theta is None:
         return max((len(tree["layers"]) for tree in trees), default=0)
@@ -290,7 +312,7 @@ def batch_stop_depth(trees, *, theta, verify_ms, layer_rows, width: int) -> int:
                     "ell": int(tree.get("prefix", 0) or 0),
                     "c": float(tree["ratio"]),
                     "item": tree,
-                    "growing": True,
+                    "growing": len(tree["layers"]) > int(stop),
                 }
             )
         if not requests:
@@ -324,19 +346,38 @@ def _schedule_ms(layer_rows, width: int, n_layers: int, verify_ms, k: int):
         total += float(pred)
     return total
 
-def _select_replay_k(score_rows, ratios, theta, verify_ms, default_k: int) -> int:
+def _retained_nodes(tree, stop: int) -> int:
+    """Kept nodes at or above the root and before ``stop``."""
+    kept = tree.get("kept") or []
+    end = min(int(stop), len(kept))
+    return sum(len(kept[depth]) for depth in range(max(end, 0)))
+
+
+def _clamp_replay_k(k: int, cap: Optional[int]) -> int:
+    chosen = int(k)
+    if cap is None:
+        return chosen
+    return min(chosen, int(cap))
+
+
+def _select_replay_k(
+    score_rows, ratios, theta, verify_ms, default_k: int, cap: Optional[int] = None
+) -> int:
+    """Value-rule K at or below ``cap``. ``cap`` is the retained-node tier."""
     if theta is None:
-        return int(default_k)
+        return _clamp_replay_k(default_k, cap)
     values = {}
     for k, spent in verify_ms.items():
         if spent is None:
+            continue
+        if cap is not None and int(k) > int(cap):
             continue
         benefit = 0.0
         for scores, ratio in zip(score_rows, ratios):
             benefit += float(ratio) * _prefix_mass(scores, int(k))
         values[int(k)] = benefit - float(theta) * float(spent)
     if not values:
-        return int(default_k)
+        return _clamp_replay_k(default_k, cap)
     return select_k(values)
 
 def _blank_arm() -> Dict[str, float]:
@@ -392,19 +433,12 @@ def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
     real_ratio = (float(_real_tok.get(real, 0.0)) / narrow_ms) / base - 1.0
     return float(replay_ratio - real_ratio)
 
-def bias_gate_open(bucket: int, wide: int, narrow: int) -> bool:
-    """True when this pair's gap is known and inside the 3 percent limit."""
-    gap = replay_bias(bucket, wide, narrow)
-    return gap is not None and abs(float(gap)) <= BIAS_LIMIT
-
-def _bias_report(bucket: int, served: int, would: int) -> tuple:
-    """Bias and gate for the served width against ``would``."""
+def _bias_report(bucket: int, served: int, would: int) -> Optional[float]:
+    """Bias of the served width against ``would``. Diagnostic only."""
     if int(served) == int(would):
-        return None, False
+        return None
     wide, narrow = _ordered_pair(served, would)
-    gap = replay_bias(bucket, wide, narrow)
-    open_gate = gap is not None and abs(float(gap)) <= BIAS_LIMIT
-    return gap, open_gate
+    return replay_bias(bucket, wide, narrow)
 
 def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> None:
     if float(actual_ms) <= 0.0:
@@ -427,9 +461,9 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
     """Best width under the 20-round, 3 percent, 30/10 rule.
 
     A narrower candidate needs 30 rounds and a wider one needs 10. ``would_w``
-    is the largest gain even when that pair's gate is closed. The served width
-    moves only to a candidate whose own gate is open. A narrower move is only
-    the next smaller candidate.
+    is the largest gain, including a width that is not the adjacent narrower
+    step. The served width moves only to that adjacent narrower candidate or
+    to a wider one.
     """
     best = int(current)
     best_gain = 0.0
@@ -455,12 +489,7 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
             shadow_gain = float(gain)
         if int(cand) < int(current) and int(cand) != adjacent:
             continue
-        wide, narrow = _ordered_pair(current, cand)
-        if (
-            gain > best_gain
-            and gain > REPLAY_GAIN
-            and bias_gate_open(bucket, wide, narrow)
-        ):
+        if gain > best_gain and gain > REPLAY_GAIN:
             best = int(cand)
             best_gain = float(gain)
     _would_w[int(bucket)] = int(shadow)
@@ -484,10 +513,10 @@ def observe_replay(
 ) -> dict:
     """Accumulate one labeled round and return the shadow decision.
 
-    ``counted`` is false for warmup, probe, and locked rounds. A measure round
-    updates bias only. ``would_w`` can name a candidate whose gate is closed.
-    The logged bias and gate are the pair of the width served at the start of
-    this round and ``would_w``.
+    ``counted`` is false for warmup, K-probe, and locked rounds. A measure
+    round updates bias only. ``would_w`` can name a candidate that is not the
+    adjacent narrower step. The logged bias is the pair of the width served
+    at the start of this round and ``would_w``.
     """
     pairs = {} if replayed is None else {int(key): value for key, value in replayed.items()}
     bucket = batch_bucket(batch)
@@ -527,7 +556,7 @@ def observe_replay(
             _best, gain, applied = _judge(bucket, current, allow_apply=apply)
     rounds = judged_rounds
     would = int(_would_w.get(bucket, served))
-    bias, gate = _bias_report(bucket, served, would)
+    bias = _bias_report(bucket, served, would)
     record = {
         "bucket": int(bucket),
         "b": int(batch),
@@ -538,7 +567,6 @@ def observe_replay(
         "gain": float(gain),
         "would_w": would,
         "bias": bias,
-        "gate": gate,
         "applied": bool(applied),
     }
     return record
@@ -699,11 +727,16 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
         )
         scores = []
         ratios = []
+        retained = 0
         for tree in prepared:
             end = min(int(stop), len(tree["layers"]))
             scores.append(_kept_scores(tree["layers"], tree["kept"], end))
             ratios.append(float(tree["ratio"]))
-        k_prime = _select_replay_k(scores, ratios, theta, verify_ms, int(hold["k"]))
+            retained = max(retained, _retained_nodes(tree, stop))
+        cap = None if retained <= 0 else _tier_for_nodes(retained, VERIFY_KS)
+        k_prime = _select_replay_k(
+            scores, ratios, theta, verify_ms, int(hold["k"]), cap
+        )
         accepts = [
             replay_accept_k(
                 tree["layers"],
