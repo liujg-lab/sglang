@@ -100,8 +100,9 @@ def opt_parent_slots(
 def align_draft_row(tokens, parents, verify_k: int):
     """Pad a shorter captured K with parent -2. Other short rows stay no-draft.
 
-    A row whose length is 8, 16, or 32 and is below this batch's K keeps its
-    real prefix. Anything else that is not already ``verify_k`` long is dropped.
+    A row whose length is a configured verify count and is below this batch's
+    K keeps its real prefix. Anything else that is not already ``verify_k``
+    long is dropped.
     """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import VERIFY_KS
 

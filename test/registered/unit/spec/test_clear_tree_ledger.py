@@ -805,7 +805,16 @@ class TestFlatWidthOnlineK(CustomTestCase):
             self.assertEqual(plan.should_grow(state), old)
 
     def test_equal_verify_time_keeps_the_largest_k(self):
-        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        reset_policy()
+        weight = torch.zeros(4, 8)
+        weight[0, :4] = torch.tensor([0.4, 0.2, 0.1, 0.05])
+        state = SimpleNamespace(
+            depth=4,
+            weight=weight,
+            rid="r",
+            prefix=4,
+            config=SimpleNamespace(max_depth=8, tau=0.4, width=8),
+        )
         for k in (8, 16, 32):
             observe_verify(1, k, 256, 10.0)
         for _ in range(3):
@@ -831,10 +840,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         locked = [make_round(sched, [req]).locked_k for _ in range(6)]
-        self.assertEqual(locked, [8, 16, 32, 32, 32, 32])
+        self.assertEqual(locked, [8, 16, 32, 16, 16, 16])
         warmed = make_round(sched, [req])
         self.assertTrue(warmed.use_tau)
-        self.assertEqual(warmed.locked_k, 32)
+        self.assertEqual(warmed.locked_k, 16)
 
     def test_new_batch_restarts_probes_at_k8(self):
         _pin_verify_ks(self)
@@ -846,7 +855,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             SimpleNamespace(rid="b", origin_input_ids=[1] * 10, output_ids=[]),
         ]
         locked = [make_round(sched, [one]).locked_k for _ in range(6)]
-        self.assertEqual(locked, [8, 16, 32, 32, 32, 32])
+        self.assertEqual(locked, [8, 16, 32, 16, 16, 16])
         again = make_round(sched, two)
         self.assertTrue(again.use_tau)
         self.assertEqual(again.locked_k, 8)
@@ -872,7 +881,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
                 make_round(sched, reqs)
             held = make_round(sched, reqs)
         self.assertTrue(held.use_tau)
-        self.assertEqual(held.locked_k, 32)
+        self.assertEqual(held.locked_k, 8)
         observe_verify(2, 8, 256, 10.0)
         observe_verify(2, 8, 256, 10.0)
         with patch(
@@ -1246,6 +1255,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertIsNone(settle_replay(sched, [req]))
 
     def test_rewritten_zero_temperature_explores_the_twentieth_round(self):
+        reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         params = SamplingParams(temperature=0)
         reqs = [
@@ -1257,9 +1267,16 @@ class TestFlatWidthOnlineK(CustomTestCase):
             )
             for rid in ("a", "b")
         ]
+        for k in (2, 4, 8, 16, 32, 64):
+            observe_verify(2, k, 256, 5.0)
+            observe_verify(2, k, 256, 5.0)
+        observe_price(2, 2.0, 1.0)
         with patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
             return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
         ):
             eligible = []
             for _ in range(80):
@@ -1350,7 +1367,15 @@ class TestFlatWidthOnlineK(CustomTestCase):
         note_packet(sched, packet(1006, None, 2))
         closed = sched._clear_replay_closed
         self.assertEqual(closed["price_tokens"], 3)
-        self.assertEqual(sched._clear_target_prefix["a"], 1006)
+        self.assertEqual(sched._clear_target_prefix, {"a": 1006})
+        other = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="b", base_committed_len=4, committed_ids=None)],
+            action="step",
+            session_id="s",
+            rpc_seq=3,
+        )
+        note_packet(sched, other)
+        self.assertEqual(sched._clear_target_prefix, {"b": 4})
 
     def test_target_prefix_sizes_the_verify_bucket(self):
         reset_policy()
@@ -1445,7 +1470,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertTrue(any("stopped after" in line for line in logs.output))
         held = make_round(sched, [req])
         self.assertTrue(held.use_tau)
-        self.assertEqual(held.locked_k, 32)
+        self.assertEqual(held.locked_k, 16)
 
     def test_failed_send_puts_verify_samples_back(self):
         metrics = SimpleNamespace(_clear_verify_samples=[[1, 8, 256, 1000]])
@@ -1464,7 +1489,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         plan = install_fallback_plan(sched, reqs)
         self.assertTrue(plan.fallback)
         self.assertTrue(plan.use_tau)
-        self.assertEqual(plan.locked_k, 64)
+        self.assertEqual(plan.locked_k, 8)
         self.assertFalse(plan.replay_eligible)
         self.assertEqual(policy._rounds, 0)
         self.assertEqual(policy._probe_sent, {})
@@ -1536,7 +1561,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
             plan = make_round(sched, [req])
             self.assertTrue(plan.use_tau)
-            self.assertEqual(plan.locked_k, 64)
+            self.assertEqual(plan.locked_k, 16)
             self.assertEqual(policy._probe_sent, {})
         finally:
             os.environ["SGLANG_CLEAR_LEDGER"] = "1"
@@ -1560,7 +1585,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ):
             plan = make_round(SimpleNamespace(), [req])
         self.assertTrue(plan.use_tau)
-        self.assertEqual(plan.locked_k, 64)
+        self.assertEqual(plan.locked_k, 16)
         self.assertFalse(plan.replay_eligible)
 
     def test_verify_window_keeps_the_latest_sixteen(self):
@@ -1626,6 +1651,96 @@ class TestFlatWidthOnlineK(CustomTestCase):
             apply_clear_tree_settings(args, on_npu=False)
         args.tp_size = 1
         apply_clear_tree_settings(args, on_npu=False)
+
+    def test_layer_width_follows_the_candidate_list(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+            layer_width_supported,
+        )
+
+        self.assertTrue(layer_width_supported(16))
+        self.assertFalse(layer_width_supported(7))
+        install_candidates([4, 8], [8, 16])
+        self.addCleanup(lambda: install_candidates(None, None))
+        self.assertTrue(layer_width_supported(4))
+        self.assertFalse(layer_width_supported(16))
+
+    def test_frozen_rows_skip_unforwarded_requests_and_missing_widths(self):
+        deep = SimpleNamespace(depth=3, prefix=10)
+        shallow = SimpleNamespace(depth=2, prefix=4)
+
+        def predict(_scheduler, width, _active, _sum_ell):
+            if int(width) != 8:
+                return None
+            return 7.0
+
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            side_effect=predict,
+        ):
+            rows = _freeze_layer_rows(SimpleNamespace(), [deep, shallow])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["active"], 2)
+        self.assertEqual(rows[0]["sum_ell"], 14)
+        self.assertEqual(rows[1]["active"], 1)
+        self.assertEqual(rows[1]["sum_ell"], 10)
+        self.assertEqual(rows[0]["pred"][8], 7.0)
+        self.assertIsNone(rows[0]["pred"][4])
+        self.assertIn(16, rows[0]["pred"])
+        self.assertIsNone(rows[0]["pred"][16])
+
+    def test_tau_round_stays_out_of_replay(self):
+        reset_policy()
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        for k in (2, 4, 8, 16, 32, 64):
+            observe_verify(1, k, 256, 10.0)
+            observe_verify(1, k, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        policy._rounds = 11
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=None,
+        ):
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertTrue(plan.use_tau)
+        self.assertFalse(plan.replay_eligible)
+        self.assertEqual(plan.locked_k, 16)
+        self.assertEqual(plan.width, 8)
+
+    def test_foreign_verify_bucket_warns_once(self):
+        reset_policy()
+        with self.assertLogs(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_policy",
+            level="WARNING",
+        ) as logs:
+            ingest_verify_samples(
+                [[1, 8, 99999, 10000], [1, 8, 99999, 11000]]
+            )
+            ingest_verify_samples([[1, 8, 256, 10000]])
+        foreign = [line for line in logs.output if "99999" in line]
+        self.assertEqual(len(foreign), 1)
+        self.assertEqual(len(policy._clock[(1, 8, 99999)]), 2)
+        self.assertEqual(len(policy._clock[(1, 8, 256)]), 1)
+
+    def test_probe_round_cap_stays_on_the_flat_k(self):
+        reset_policy()
+        policy._probe_rounds = 54
+        policy._rounds = 20
+        for k in (2, 4, 8, 16, 32, 64):
+            observe_verify(1, k, 256, 10.0)
+            observe_verify(1, k, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertTrue(plan.use_tau)
+        self.assertEqual(plan.locked_k, 16)
+        self.assertFalse(plan.replay_eligible)
+        self.assertEqual(policy._probe_rounds, 54)
+        self.assertEqual(policy._probe_sent, {})
 
     def test_sample_gap_warns_once(self):
         reset_policy()

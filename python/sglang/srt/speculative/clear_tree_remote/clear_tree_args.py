@@ -64,6 +64,14 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
     )
     server_args.clear_tree_widths = installed_widths
     server_args.clear_tree_ks = installed_ks
+    missing_widths = [item for item in (4, 8) if item not in installed_widths]
+    missing_ks = [item for item in (8, 16) if item not in installed_ks]
+    if missing_widths or missing_ks:
+        raise ValueError(
+            "CLEAR_TREE_REMOTE flat table needs widths 4 and 8 and verify "
+            f"counts 8 and 16; missing widths {missing_widths or 'none'} "
+            f"and verify counts {missing_ks or 'none'}."
+        )
     width = int(server_args.clear_tree_width)
     depth = int(server_args.clear_tree_max_depth)
     role = server_args.clear_tree_role

@@ -708,6 +708,21 @@ def _round_width(scheduler) -> int:
     return int(scheduler.server_args.clear_tree_width)
 
 
+def _require_layer_width(n: int) -> None:
+    """Reject a layer whose token count has no captured graph."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        LAYER_WIDTHS,
+        layer_width_supported,
+    )
+
+    if layer_width_supported(n):
+        return
+    raise RuntimeError(
+        f"OPT layer has {n} tokens but the captured layer graphs are "
+        f"{list(LAYER_WIDTHS)}"
+    )
+
+
 def critical_layer_forwards(launched: int) -> int:
     """Layers on the pre-reply path. The early final launch is excluded."""
     return max(int(launched) - 1, 0)
@@ -1135,7 +1150,7 @@ def opt_draft_bonus_ntpbs(server_args) -> list:
 def opt_draft_bonus_ntpb(server_args):
     """Widest bonus graph, or None when this role has none.
 
-    Layer graphs stay at 4 and 8. The bonus graphs are 5 and 9.
+    Each bonus graph is one wider than a layer width.
     """
     widths = opt_draft_bonus_ntpbs(server_args)
     if not widths:
@@ -1263,10 +1278,7 @@ class OptLayerForward:
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(list(tokens), dtype=torch.long)
         n = int(tokens.shape[0])
-        if n not in (4, 8):
-            raise RuntimeError(
-                f"OPT layer has {n} tokens but the captured layer graphs are 4 and 8"
-            )
+        _require_layer_width(n)
         depth = int(step.positions.reshape(-1)[0].item())
         ancestor = step.ancestor_mask
         if int(ancestor.shape[0]) != n or int(ancestor.shape[1]) != depth * n:
@@ -1312,10 +1324,7 @@ class OptLayerForward:
         if not torch.is_tensor(tokens):
             raise RuntimeError("lookahead tokens must already be a tensor")
         n = int(tokens.shape[0])
-        if n not in (4, 8):
-            raise RuntimeError(
-                f"OPT layer has {n} tokens but the captured layer graphs are 4 and 8"
-            )
+        _require_layer_width(n)
         depth = int(depth)
         ancestor = anc_dev
         if int(ancestor.shape[0]) != n or int(ancestor.shape[1]) != depth * n:
@@ -1981,9 +1990,15 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(list(tokens), dtype=torch.long)
         n = int(tokens.shape[0])
-        if n != width or n not in (4, 8):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            LAYER_WIDTHS,
+            layer_width_supported,
+        )
+
+        if n != width or not layer_width_supported(n):
             raise RuntimeError(
-                f"OPT layer has {n} tokens but this round's graph width is {width}"
+                f"OPT layer has {n} tokens but this round's graph width is {width} "
+                f"and the captured layer graphs are {list(LAYER_WIDTHS)}"
             )
         ancestor = step.ancestor_mask
         anc_shape = None if ancestor is None else tuple(ancestor.shape)
@@ -3190,7 +3205,7 @@ def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
     ``n + 1`` while those slots are still mapped. ``ingest_slots`` is the
     span ingest still has to allocate. Admission runs before that alloc.
     """
-    n = 8
+    n = _round_width(scheduler)
     depth = int(scheduler.server_args.clear_tree_max_depth)
     return int(ingest_slots) + (depth - 1) * n + (n + 1)
 

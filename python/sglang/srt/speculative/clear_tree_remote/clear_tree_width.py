@@ -1,7 +1,8 @@
-"""Flat layer width for one ClearTree round.
+"""Flat layer width and tau verify count for one ClearTree round.
 
-Batch size 1 starts at 8. Every other batch starts at 4. A gated replay
-stores a replacement here. This module does not import the ledger.
+Batch size 1 starts at width 8 and verify count 16. Every other batch starts
+at width 4 and verify count 8. A gated replay stores a width replacement
+here. This module does not import the ledger.
 """
 
 from __future__ import annotations
@@ -34,6 +35,20 @@ def assign_persistent_width(bucket: int, width: int) -> None:
 def flat_width(batch_size: int) -> int:
     """Layer width. One request uses 8; every larger batch uses 4."""
     return 8 if int(batch_size) == 1 else 4
+
+
+def flat_k(batch_size: int) -> int:
+    """Verify count on tau. One request uses 16; every larger batch uses 8."""
+    return 16 if int(batch_size) == 1 else 8
+
+
+def layer_width_supported(n: int) -> bool:
+    """True when ``n`` is a configured draft layer graph width."""
+    try:
+        width = int(n)
+    except (TypeError, ValueError):
+        return False
+    return width in LAYER_WIDTHS
 
 
 def _normalize_tiers(values: Sequence[int], *, name: str) -> list:

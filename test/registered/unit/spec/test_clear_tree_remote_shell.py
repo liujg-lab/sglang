@@ -167,6 +167,22 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         finally:
             install_candidates(None, None)
 
+    def test_flat_table_tiers_are_required(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        draft = _args(
+            clear_tree_role="draft",
+            clear_tree_widths=[16, 32],
+            clear_tree_ks=[32, 64],
+        )
+        try:
+            with self.assertRaises(ValueError):
+                apply_clear_tree_settings(draft, on_npu=False)
+        finally:
+            install_candidates(None, None)
+
     def test_explicit_draft_tokens_must_match(self):
         draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=5)
         with self.assertRaises(ValueError):

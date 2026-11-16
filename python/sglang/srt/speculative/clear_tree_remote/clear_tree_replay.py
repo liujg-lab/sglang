@@ -585,17 +585,23 @@ def _freeze_layer_rows(scheduler, states) -> list:
     rows = []
     # The last written layer is verified and not forwarded.
     for layer in range(max(int(depth) - 1, 0)):
+        # Row i is the forward of layer i. A tree whose last written layer is
+        # i was verified there and did not forward it.
         active_states = [
-            state for state in states if int(getattr(state, "depth", 0) or 0) > layer
+            state
+            for state in states
+            if int(getattr(state, "depth", 0) or 0) > layer + 1
         ]
         pred = {}
         active = len(active_states)
         sum_ell = sum(int(getattr(state, "prefix", 0) or 0) for state in active_states)
-        for width in (4, 8):
+        for width in CANDIDATE_WIDTHS:
             try:
-                pred[width] = predict_layer_ms(scheduler, width, active, sum_ell)
+                pred[int(width)] = predict_layer_ms(
+                    scheduler, int(width), active, sum_ell
+                )
             except Exception:
-                pred[width] = None
+                pred[int(width)] = None
         rows.append({"active": active, "sum_ell": sum_ell, "pred": pred})
     return rows
 

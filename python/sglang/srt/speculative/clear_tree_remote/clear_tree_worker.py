@@ -1,6 +1,6 @@
 """Target verifier for CLEAR_TREE_REMOTE.
 
-The draft list is this round's K, one of 8, 16, or 32. The verify forward
+The draft list is this round's K, one of the configured verify counts. The verify forward
 also contains the committed tail at slot 0, so ``draft_token_num`` is K + 1.
 ``draft_token`` is 1-D with that many entries per request. A parent of -2 is
 an unlinked pad. The mask comes from ``build_tree_from_parents``.

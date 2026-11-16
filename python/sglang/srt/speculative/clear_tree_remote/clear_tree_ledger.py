@@ -6,7 +6,7 @@ samples Target sends back, not the regression logged here.
 
 ``SGLANG_CLEAR_LEDGER=1`` on both roles turns the online K and W controllers
 on. Default is off. Only tp rank 0 logs and fits. With the switch off, every
-round stays on tau and the largest verify tier.
+round stays on tau and the flat verify count: 16 for one request, 8 otherwise.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ FORGET = 0.999
 RIDGE = 1e-6
 LAYER_MIN_SAMPLES = 4
 VERIFY_MIN_SAMPLES = 6
-_CUDA_K = (8, 16, 32)
 _DEFAULT_BUCKETS = (256, 512, 1024, 2048, 4096)
 _GAP_ACTIONS = ("prefill", "finish", "abort")
 
@@ -506,7 +505,7 @@ class ClearLedger:
     def _verify(self) -> ForgettingRegressor:
         if self.verify_model is None:
             if self.backend == "npu":
-                width = 1 + len(_CUDA_K) + max(len(self.buckets) - 1, 0) + 2
+                width = _verify_feature_width(self.buckets)
             else:
                 width = 4
             self.verify_model = ForgettingRegressor(width, VERIFY_MIN_SAMPLES)
@@ -564,14 +563,23 @@ def _cuda_features(batch: int, sum_ell: int, k: int) -> List[float]:
     return [1.0, float(batch), float(sum_ell), float(k + 1) * float(sum_ell)]
 
 
+def _verify_feature_width(buckets: Sequence[int]) -> int:
+    """NPU verify features: intercept, one K bit, bucket bits, then two batch terms."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import VERIFY_KS
+
+    return 1 + len(VERIFY_KS) + max(len(buckets) - 1, 0) + 2
+
+
 def _npu_features(
     batch: int, k: int, bucket: Optional[int], buckets: Sequence[int]
 ) -> Optional[List[float]]:
     if bucket is None:
         return None
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import VERIFY_KS
+
     features = [1.0]
-    for known in _CUDA_K:
-        features.append(1.0 if int(k) == known else 0.0)
+    for known in VERIFY_KS:
+        features.append(1.0 if int(k) == int(known) else 0.0)
     rest = [int(item) for item in buckets][1:]
     for item in rest:
         features.append(1.0 if int(bucket) == item else 0.0)
@@ -645,7 +653,7 @@ def note_packet(scheduler, batch) -> None:
     # Snapshot packets also carry output-only ``committed_ids``. The prefix
     # used for theta and c_i is always the Target base length.
     prefix = [int(getattr(req, "base_committed_len", 0) or 0) for req in reqs]
-    stored = dict(getattr(scheduler, "_clear_target_prefix", None) or {})
+    stored = {}
     for rid, length in zip(rids, prefix):
         if rid:
             stored[rid] = int(length)
@@ -786,8 +794,9 @@ def _target_verify_regressor() -> ForgettingRegressor:
     global _target_verify_model
     if _target_verify_model is None:
         buckets = runtime_kv_buckets()
-        width = 1 + len(_CUDA_K) + max(len(buckets) - 1, 0) + 2
-        _target_verify_model = ForgettingRegressor(width, VERIFY_MIN_SAMPLES)
+        _target_verify_model = ForgettingRegressor(
+            _verify_feature_width(buckets), VERIFY_MIN_SAMPLES
+        )
     return _target_verify_model
 
 
