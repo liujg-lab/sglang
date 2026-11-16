@@ -1,0 +1,17 @@
+{
+  "run_id": "2026-11-16-a",
+  "experiment": "e2e",
+  "voided": false,
+  "void_reason": "",
+  "target_git": "1518066e75fd8227c52b1b80e1d9b46821915810",
+  "draft_git": "2402baff8441353bd360eb9e24827188b6a41254",
+  "target_dirty": true,
+  "draft_dirty": true,
+  "ledger": "on then off",
+  "target_backend": "npu",
+  "kv_buckets": "256,512,1024,2048,4096",
+  "clear_tree_widths": "2 4 8 16 32 64",
+  "clear_tree_ks": "2 4 8 16 32 64",
+  "temperature": 0,
+  "notes": "One pair, ledger on first on the already running process, then ledger off after a restart. Not A B A B. text_only first 100, concurrency 4, max_new_tokens 1024. Target clear_tree_remote is untracked on that checkout."
+}
