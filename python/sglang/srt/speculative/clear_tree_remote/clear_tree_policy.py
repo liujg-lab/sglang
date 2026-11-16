@@ -2,9 +2,10 @@
 
 W and the tau verify count start from a fixed table. Batch size 1 uses width
 8 and K 16. Every other batch uses width 4 and K 8. Eligible rounds first
-spend two builds on the next narrower width when that width has not run for
-300 rounds. Every 20th eligible round that is not one of those builds the
-next wider candidate. A shadow replay may replace the served width when that
+build the next narrower width when that width has not run for 300 rounds.
+That burst lasts until the width has four layer samples, at most four
+rounds, and two rounds once the fit exists. Every 20th eligible round that
+is not one of those builds the next wider candidate. A shadow replay may replace the served width when that
 candidate's gain clears 3 percent. A narrower replacement is only the next
 smaller candidate and needs 30 paired rounds. A wider one needs 10. Measured
 bias is logged and does not gate the switch. Online K stays inside the tiers
@@ -85,6 +86,33 @@ _saw_verify_samples = False
 _rounds_without_samples = 0
 _sample_gap_warned = False
 _bucket_warned = False
+
+
+def on_external_event(scheduler) -> None:
+    """Target session advanced. Clear fits and replay totals. Keep W and theta.
+
+    The open ledger round is dropped so the packet that observes the new
+    session cannot write the straddling round into the cleared models.
+    Settled accept totals stay. Pending ones do not.
+    """
+    global _probe_rounds
+    _clock.clear()
+    _clock_count.clear()
+    _probe_sent.clear()
+    _probe_inflight.clear()
+    _probe_warned.clear()
+    _probe_rounds = 0
+    _pending.clear()
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+        reset_replay_state,
+    )
+
+    reset_replay_state()
+    ledger = getattr(scheduler, "_clear_ledger", None)
+    if ledger:
+        ledger.drop_fitted()
+    scheduler._clear_replay_hold = None
+    scheduler._clear_replay_closed = None
 
 
 def reset_policy() -> None:
@@ -509,9 +537,38 @@ def accept_ratio(rid: str) -> float:
     return (taken + CALIBRATE_LAMBDA * pooled) / (mass + CALIBRATE_LAMBDA)
 
 
-def note_verified(rid: str, prefix: int, expected: float) -> None:
-    """Remember this round until the next packet reports how many tokens committed."""
-    _pending[str(rid)] = {"prefix": int(prefix), "e": float(expected)}
+def note_verified(
+    rid: str,
+    prefix: int,
+    expected: float,
+    depth: Optional[int] = None,
+) -> None:
+    """Remember this round until the next packet reports how many tokens committed.
+
+    ``depth`` is the written tree. Without it, a later prefix jump is not a
+    target gap.
+    """
+    item = {"prefix": int(prefix), "e": float(expected)}
+    if depth is not None:
+        item["depth"] = int(depth)
+    _pending[str(rid)] = item
+
+
+def target_gap_open(rids: Sequence[str], prefixes: Sequence[int]) -> bool:
+    """True when one noted request grew by more than its tree depth plus one."""
+    found = {str(rid): int(prefix) for rid, prefix in zip(rids, prefixes)}
+    for rid, item in _pending.items():
+        if rid not in found or "depth" not in item:
+            continue
+        growth = int(found[rid]) - int(item["prefix"])
+        if growth > int(item["depth"]) + 1:
+            return True
+    return False
+
+
+def discard_pending() -> None:
+    """Drop unsettled accept rows without writing them into c_i."""
+    _pending.clear()
 
 
 def settle_verified(rids: Sequence[str], prefixes: Sequence[int]) -> None:
@@ -794,7 +851,12 @@ class RoundPlan:
         else:
             return
         scores = _path_scores(state)
-        note_verified(key, prefix, _prefix_mass(scores, self.verify_k(state)))
+        note_verified(
+            key,
+            prefix,
+            _prefix_mass(scores, self.verify_k(state)),
+            int(state.depth),
+        )
 
     def _choose_keep(self, eligible) -> list:
         times = {}

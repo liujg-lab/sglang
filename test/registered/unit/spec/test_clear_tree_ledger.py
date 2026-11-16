@@ -37,6 +37,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     make_round,
     matched_depth,
     note_verified,
+    on_external_event,
     observe_accept,
     observe_price,
     observe_replay,
@@ -82,8 +83,11 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRBatchRequest,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+    LAYER_MIN_SAMPLES,
+    LAYER_RIDGE,
     VERIFY_MIN_SAMPLES,
     ClearLedger,
+    predict_layer_ms,
     note_packet,
     push_verify_sample,
     restore_verify_samples,
@@ -1044,15 +1048,15 @@ class TestFlatWidthOnlineK(CustomTestCase):
         chosen = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertEqual(chosen[:2], [(4, "probe_w"), (4, "probe_w")])
-        self.assertTrue(all(item == (8, "ordinary") for item in chosen[2:-1]))
+        self.assertEqual(chosen[:4], [(4, "probe_w")] * 4)
+        self.assertTrue(all(item == (8, "ordinary") for item in chosen[4:-1]))
         self.assertEqual(chosen[-1], (16, "explore"))
         assign_persistent_width(1, 4)
         later = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertEqual(later[:2], [(2, "probe_w"), (2, "probe_w")])
-        self.assertTrue(all(item == (4, "ordinary") for item in later[2:-1]))
+        self.assertEqual(later[:4], [(2, "probe_w")] * 4)
+        self.assertTrue(all(item == (4, "ordinary") for item in later[4:-1]))
         self.assertEqual(later[-1], (8, "explore"))
 
     def test_widest_width_does_not_leave(self):
@@ -1060,8 +1064,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         chosen = [
             choose_build_width(1, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertEqual(chosen[:2], [(32, "probe_w"), (32, "probe_w")])
-        self.assertTrue(all(item == (64, "ordinary") for item in chosen[2:]))
+        self.assertEqual(chosen[:4], [(32, "probe_w")] * 4)
+        self.assertTrue(all(item == (64, "ordinary") for item in chosen[4:]))
 
     def test_wider_batch_explores_only_while_the_ledger_is_on(self):
         self.assertEqual(
@@ -1074,8 +1078,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         hot = [
             choose_build_width(2, ledger_on=True, eligible=True) for _ in range(20)
         ]
-        self.assertEqual(hot[:2], [(2, "probe_w"), (2, "probe_w")])
-        self.assertTrue(all(item == (4, "ordinary") for item in hot[2:-1]))
+        self.assertEqual(hot[:4], [(2, "probe_w")] * 4)
+        self.assertTrue(all(item == (4, "ordinary") for item in hot[4:-1]))
         self.assertEqual(hot[-1], (8, "explore"))
 
     def test_warmup_round_does_not_enter_the_replay_sum(self):
@@ -1291,8 +1295,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
                     break
         self.assertEqual(
             eligible,
-            [(2, "probe_w", False)] * 2
-            + [(4, "ordinary", True)] * 17
+            [(2, "probe_w", False)] * 4
+            + [(4, "ordinary", True)] * 15
             + [(8, "explore", True)],
         )
 
@@ -1877,6 +1881,164 @@ class TestFlatWidthOnlineK(CustomTestCase):
             ),
             2,
         )
+
+    def test_layer_prefix_ridge_stays_inside_the_seen_span(self):
+        model = ForgettingRegressor(
+            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+        )
+        for prefix, cost in (
+            (900.0, 5.8),
+            (900.0, 6.2),
+            (903.0, 5.7),
+            (903.0, 6.3),
+        ):
+            model.update([1.0, 1.0, prefix], cost)
+        self.assertLess(abs(model.coefficients()[2]), 1e-3)
+        ledger = ClearLedger()
+        ledger.layer_models[(4, "graph")] = model
+        sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
+        near = predict_layer_ms(sched, 4, 1, 1000)
+        self.assertIsNotNone(near)
+        self.assertGreater(near, 0.0)
+        self.assertLess(abs(near - 6.0), 1.0)
+        self.assertIsNone(predict_layer_ms(sched, 4, 1, 2500))
+
+        negative = ForgettingRegressor(
+            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+        )
+        for prefix in (900.0, 900.0, 903.0, 903.0):
+            negative.update([1.0, 1.0, prefix], -1.0)
+        ledger.layer_models[(8, "graph")] = negative
+        self.assertIsNone(predict_layer_ms(sched, 8, 1, 901))
+
+    def test_probe_w_stops_once_four_layer_samples_exist(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+            PROBE_W_IDLE,
+            _narrow_idle,
+        )
+
+        reset_policy()
+        ledger = ClearLedger()
+        sched = SimpleNamespace(_clear_ledger=ledger)
+        self.assertEqual(
+            choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched),
+            (4, "probe_w"),
+        )
+        filled = ForgettingRegressor(
+            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+        )
+        filled.n = LAYER_MIN_SAMPLES
+        ledger.layer_models[(4, "graph")] = filled
+        self.assertEqual(
+            choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched),
+            (8, "ordinary"),
+        )
+        _narrow_idle[(1, 4)] = PROBE_W_IDLE
+        again = [
+            choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched)
+            for _ in range(3)
+        ]
+        self.assertEqual(
+            again, [(4, "probe_w"), (4, "probe_w"), (8, "ordinary")]
+        )
+
+    def test_external_event_clears_fits_and_keeps_width_and_theta(self):
+        reset_policy()
+        assign_persistent_width(1, 16)
+        observe_price(1, 4.0, 2.0)
+        note_verified("kept", 10, 2.0)
+        settle_verified(["kept"], [13])
+        kept = accept_ratio("kept")
+        note_verified("pending", 10, 1.0, 3)
+        observe_verify(1, 8, 256, 10.0)
+        observe_replay(1, 16, "ordinary", 10.0, 10.0, {8: (12.0, 9.0)})
+        ledger = ClearLedger()
+        fitted = ForgettingRegressor(
+            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+        )
+        fitted.n = 4
+        ledger.layer_models[(8, "graph")] = fitted
+        ledger.verify_model = ForgettingRegressor(4, 6)
+        ledger.verify_samples = 3
+        ledger.open = object()
+        sched = SimpleNamespace(
+            _clear_ledger=ledger,
+            _clear_replay_hold={"tree": 1},
+            _clear_replay_closed={"excluded": False},
+        )
+        price = theta(1)
+        on_external_event(sched)
+        self.assertEqual(persistent_width(1), 16)
+        self.assertAlmostEqual(theta(1), price)
+        self.assertAlmostEqual(accept_ratio("kept"), kept)
+        self.assertEqual(policy._pending, {})
+        self.assertEqual(policy._clock, {})
+        self.assertEqual(policy._probe_sent, {})
+        self.assertEqual(policy._probe_rounds, 0)
+        self.assertEqual(ledger.layer_models, {})
+        self.assertIsNone(ledger.verify_model)
+        self.assertEqual(ledger.verify_samples, 0)
+        self.assertIsNone(ledger.open)
+        self.assertIsNone(sched._clear_replay_hold)
+        self.assertIsNone(sched._clear_replay_closed)
+        fresh = observe_replay(1, 16, "ordinary", 10.0, 10.0, {8: (12.0, 9.0)})
+        self.assertEqual(fresh["rounds"], 1)
+
+    def test_target_gap_skips_price_accept_and_layer_fit(self):
+        reset_policy()
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [100], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        ledger.mark_post(1.2)
+        ledger.note_idle()
+        ledger.queue_layer(
+            {
+                "layer": 0,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 100,
+                "host_us": 1000,
+                "gpu_us": 4000,
+                "path": "graph",
+                "post_reply": False,
+            }
+        )
+        note_verified("a", 100, 1.5, 3)
+        before = theta(1)
+        jumped = _step(ledger, ["a"], [110], 2, 1.5)
+        self.assertIn("target_gap", jumped["exclude_reason"])
+        self.assertTrue(jumped["excluded"])
+        self.assertFalse(jumped["price_kept"])
+        self.assertEqual(theta(1), before)
+        self.assertEqual(ledger.layer_models[(8, "graph")].n, 0)
+        self.assertNotIn("a", policy._sum_a)
+        self.assertEqual(policy._pending, {})
+
+        ledger.mark_stop(2.0)
+        ledger.mark_send(2.1)
+        ledger.mark_post(2.2)
+        ledger.note_idle()
+        note_verified("a", 110, 1.5, 3)
+        kept = _step(ledger, ["a"], [114], 4, 2.5)
+        self.assertNotIn("target_gap", kept["exclude_reason"])
+        self.assertTrue(kept["price_kept"])
+        self.assertAlmostEqual(policy._sum_a["a"], 3.0)
+
+    def test_prefix_jump_without_depth_is_kept(self):
+        reset_policy()
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [100], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        ledger.mark_post(1.2)
+        ledger.note_idle()
+        note_verified("a", 100, 1.5)
+        record = _step(ledger, ["a"], [200], 2, 1.5)
+        self.assertNotIn("target_gap", record["exclude_reason"])
+        self.assertTrue(record["price_kept"])
+        self.assertAlmostEqual(policy._sum_a["a"], 99.0)
 
 
 def _rows_state(rows, rid, prefix):

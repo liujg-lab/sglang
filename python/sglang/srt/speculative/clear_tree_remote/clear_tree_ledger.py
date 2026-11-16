@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 FORGET = 0.999
 RIDGE = 1e-6
 LAYER_MIN_SAMPLES = 4
+LAYER_SPAN_PAD = 128.0
+# Intercept, graph bucket, prefix sum. The prefix prior is one token's
+# 2 µs scaled by 128, so a flat prefix cannot set the slope.
+LAYER_RIDGE = (0.0, RIDGE, LAYER_SPAN_PAD ** 2)
+_PREFIX_FEATURE = 2
 VERIFY_MIN_SAMPLES = 6
 _DEFAULT_BUCKETS = (256, 512, 1024, 2048, 4096)
 _GAP_ACTIONS = ("prefill", "finish", "abort")
@@ -67,17 +72,18 @@ def smallest_bucket(needed: int, buckets: Sequence[int]) -> Optional[int]:
     return None
 
 
-def _layer_model(scheduler, width: int):
-    """Fitted layer model for this width. A graph-path fit wins over eager."""
-    ledger = bind_ledger(scheduler)
-    if ledger is None:
-        return None
+def _scan_layer_models(models, width: int, *, ready: bool):
+    """Graph-path fit for this width, else the first other path.
+
+    ``ready`` keeps only a fit that can already be solved. The sample count
+    used to decide a narrow probe still sees a short graph fit.
+    """
     preferred = None
     fallback = None
-    for key, model in ledger.layer_models.items():
-        if int(key[0]) != int(width) or model.n < LAYER_MIN_SAMPLES:
+    for key, model in models.items():
+        if int(key[0]) != int(width):
             continue
-        if model.coefficients() is None:
+        if ready and (model.n < LAYER_MIN_SAMPLES or model.coefficients() is None):
             continue
         if len(key) > 1 and str(key[1]) == "graph":
             preferred = model
@@ -89,14 +95,46 @@ def _layer_model(scheduler, width: int):
     return fallback
 
 
+def _layer_model(scheduler, width: int):
+    """Fitted layer model for this width. A graph-path fit wins over eager."""
+    ledger = bind_ledger(scheduler)
+    if ledger is None:
+        return None
+    return _scan_layer_models(ledger.layer_models, width, ready=True)
+
+
+def layer_sample_count(scheduler, width: int) -> int:
+    """Samples in the model ``predict_layer_ms`` will use, even below four.
+
+    A missing ledger counts as zero. This does not create one.
+    """
+    existing = None if scheduler is None else getattr(scheduler, "_clear_ledger", None)
+    if not existing:
+        return 0
+    model = _scan_layer_models(existing.layer_models, width, ready=False)
+    if model is None:
+        return 0
+    return int(model.n)
+
+
+def _layer_features(active: int, sum_ell: int) -> List[float]:
+    return [1.0, float(graph_bucket(active)), float(sum_ell)]
+
+
 def predict_layer_ms(scheduler, width: int, active: int, sum_ell: int) -> Optional[float]:
-    """Draft layer fit for this width, or None until that width has enough samples."""
+    """Draft layer fit, or None when the prefix is outside the seen span.
+
+    A non-positive prediction is also None. The served width then stays on
+    the flat K, and a replay candidate with this result does not pair.
+    """
     model = _layer_model(scheduler, width)
     if model is None:
         return None
-    features = [1.0, float(graph_bucket(active)), float(sum_ell)]
+    features = _layer_features(active, sum_ell)
+    if not model.span_allows(features):
+        return None
     pred = model.predict(features)
-    if pred is None:
+    if pred is None or float(pred) <= 0.0:
         return None
     return float(pred)
 
@@ -141,11 +179,26 @@ def _solve(matrix: List[List[float]], rhs: List[float]) -> Optional[List[float]]
 
 
 class ForgettingRegressor:
-    """One forgetting least-squares fit. Slopes have a tiny zero prior; the intercept does not."""
+    """One forgetting least-squares fit.
 
-    def __init__(self, n_features: int, min_samples: int) -> None:
+    Without ``ridge``, slopes have a tiny zero prior and the intercept does
+    not. A ridge sequence is added on those diagonals, including a zero
+    intercept entry. ``span_feature`` records the min and max of that input.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        min_samples: int,
+        ridge: Optional[Sequence[float]] = None,
+        span_feature: Optional[int] = None,
+    ) -> None:
         self.n_features = int(n_features)
         self.min_samples = int(min_samples)
+        self.ridge = None if ridge is None else tuple(float(value) for value in ridge)
+        self.span_feature = None if span_feature is None else int(span_feature)
+        self.span_min: Optional[float] = None
+        self.span_max: Optional[float] = None
         self.n = 0
         self.xtx = [
             [0.0] * self.n_features for _ in range(self.n_features)
@@ -164,21 +217,60 @@ class ForgettingRegressor:
             for j in range(width):
                 self.xtx[i][j] += float(features[i]) * float(features[j])
         self.n += 1
+        if self.span_feature is None:
+            return
+        value = float(features[self.span_feature])
+        if self.span_min is None or self.span_max is None:
+            self.span_min = value
+            self.span_max = value
+            return
+        self.span_min = min(self.span_min, value)
+        self.span_max = max(self.span_max, value)
 
     def coefficients(self) -> Optional[List[float]]:
         """Solved weights. The intercept is first. None until the fit is usable."""
         if self.n < self.min_samples:
             return None
         system = [row[:] for row in self.xtx]
-        for index in range(1, self.n_features):
-            system[index][index] += RIDGE
+        if self.ridge is None:
+            for index in range(1, self.n_features):
+                system[index][index] += RIDGE
+        else:
+            for index, value in enumerate(self.ridge):
+                if index >= self.n_features:
+                    break
+                system[index][index] += float(value)
         return _solve(system, self.xty)
+
+    def span_allows(self, features: Sequence[float]) -> bool:
+        """False when ``span_feature`` is past the seen range by the margin.
+
+        The margin is the larger of 128 and the span of samples already seen.
+        A regressor that does not track a feature always allows the query.
+        """
+        if self.span_feature is None or self.span_min is None or self.span_max is None:
+            return True
+        value = float(features[self.span_feature])
+        span = float(self.span_max) - float(self.span_min)
+        margin = max(LAYER_SPAN_PAD, span)
+        low = float(self.span_min) - margin
+        high = float(self.span_max) + margin
+        return low <= value <= high
 
     def predict(self, features: Sequence[float]) -> Optional[float]:
         beta = self.coefficients()
         if beta is None:
             return None
         return sum(weight * float(value) for weight, value in zip(beta, features))
+
+
+def _new_layer_model() -> ForgettingRegressor:
+    return ForgettingRegressor(
+        3,
+        LAYER_MIN_SAMPLES,
+        ridge=LAYER_RIDGE,
+        span_feature=_PREFIX_FEATURE,
+    )
 
 
 class _Round:
@@ -267,6 +359,13 @@ class ClearLedger:
         self.open: Optional[_Round] = None
         self.layer_models: Dict[tuple, ForgettingRegressor] = {}
         self.verify_model: Optional[ForgettingRegressor] = None
+        self.verify_samples = 0
+
+    def drop_fitted(self) -> None:
+        """Drop the open round and both regressions. Theta lives outside."""
+        self.open = None
+        self.layer_models.clear()
+        self.verify_model = None
         self.verify_samples = 0
 
     def on_packet(
@@ -384,6 +483,8 @@ class ClearLedger:
             reasons.append("new_rid")
         if rnd.idle_before:
             reasons.append("idle_start")
+        if _target_gap(next_rids, next_prefixes):
+            reasons.append("target_gap")
         draft_floor = (
             next_action == "step"
             and rnd.t_post is not None
@@ -475,7 +576,15 @@ class ClearLedger:
         _emit("d_round", record)
         for sample in rnd.layers:
             self._finish_layer(rnd, sample, excluded)
-        self._note_price(rnd, next_rids, next_prefixes, price_tokens, price_ms, price_kept)
+        self._note_price(
+            rnd,
+            next_rids,
+            next_prefixes,
+            price_tokens,
+            price_ms,
+            price_kept,
+            skip_accept="target_gap" in reasons,
+        )
         return record
 
     def _note_price(
@@ -486,18 +595,24 @@ class ClearLedger:
         price_tokens: Optional[float],
         price_ms: Optional[float],
         price_kept: bool,
+        skip_accept: bool = False,
     ) -> None:
         """Kept rounds update Θ_b. A mixed round is logged and left out.
 
         An empty poll after the reply is only the draft-floor flag. It still
         counts as pure decode. Eager rounds past the last KV bucket stay out.
+        A target gap drops the pending accept count without writing c_i.
         """
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            discard_pending,
             observe_price,
             settle_verified,
         )
 
-        settle_verified(next_rids, next_prefixes)
+        if skip_accept:
+            discard_pending()
+        else:
+            settle_verified(next_rids, next_prefixes)
         if not price_kept or price_tokens is None or price_ms is None:
             return
         observe_price(rnd.b, price_tokens, price_ms)
@@ -531,7 +646,7 @@ class ClearLedger:
             key = (int(sample["w"]), str(sample["path"]))
             model = self.layer_models.get(key)
             if model is None:
-                model = ForgettingRegressor(3, LAYER_MIN_SAMPLES)
+                model = _new_layer_model()
                 self.layer_models[key] = model
             if model.n >= LAYER_MIN_SAMPLES:
                 pred = model.predict(features)
@@ -557,6 +672,15 @@ class ClearLedger:
             "fit": fitted,
         }
         _emit("d_layer", sample_log)
+
+
+def _target_gap(next_rids: Sequence[str], next_prefixes: Sequence[int]) -> bool:
+    """True when a noted request grew by more than its tree depth plus one."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        target_gap_open,
+    )
+
+    return target_gap_open(next_rids, next_prefixes)
 
 
 def _cuda_features(batch: int, sum_ell: int, k: int) -> List[float]:

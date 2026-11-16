@@ -1123,11 +1123,15 @@ class ClearTreeSchedulerMixin:
                     measure = batch.action == ClearAction.STEP
                     last_session = self.sr_state.session_id
                     if last_session is not None and batch.session_id > last_session:
+                        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                            on_external_event,
+                        )
                         from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
                             flush_sr_round_metrics,
                         )
 
                         flush_sr_round_metrics(self, "session_reset")
+                        on_external_event(self)
                     timing = False
                     try:
                         def _work(counts):

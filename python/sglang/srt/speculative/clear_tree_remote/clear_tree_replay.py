@@ -2,9 +2,10 @@
 
 The served width changes when a candidate's gain clears 3 percent. A narrower
 move is the next smaller width after 30 paired rounds. A wider move needs 10.
-Measured bias is logged and does not decide the switch. Two rounds in every
-300 eligible rounds that miss the next narrower width build that width so its
-layer cost can be fit. This module may call the price policy and the ledger.
+Measured bias is logged and does not decide the switch. When the next
+narrower width has missed 300 eligible rounds, it is built until its layer
+fit has four samples, at most four rounds, and for two rounds after that.
+This module may call the price policy and the ledger.
 The ledger does not import it.
 """
 
@@ -36,6 +37,7 @@ WIDE_MIN_ROUNDS = 10
 BIAS_MIN_ROUNDS = 30
 PROBE_W_IDLE = 300
 PROBE_W_RUNS = 2
+PROBE_W_FILL = 4
 
 _eligible_n: Dict[int, int] = {}
 _replay_n: Dict[int, int] = {}
@@ -51,6 +53,7 @@ _pair_wide_tok: Dict[tuple, float] = {}
 _pair_wide_ms: Dict[tuple, float] = {}
 _narrow_idle: Dict[tuple, int] = {}
 _probe_w_left: Dict[tuple, int] = {}
+_probe_w_fill: Dict[tuple, bool] = {}
 
 
 def reset_replay_state() -> None:
@@ -68,6 +71,7 @@ def reset_replay_state() -> None:
     _pair_wide_ms.clear()
     _narrow_idle.clear()
     _probe_w_left.clear()
+    _probe_w_fill.clear()
 
 
 def _mark_width_ran(bucket: int, width: int) -> None:
@@ -77,16 +81,35 @@ def _mark_width_ran(bucket: int, width: int) -> None:
     _probe_w_left[key] = 0
 
 
-def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> tuple:
+def _layer_samples(scheduler, width: int) -> int:
+    """Layer samples already stored for ``width``. No ledger counts as zero."""
+    if scheduler is None:
+        return 0
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        layer_sample_count,
+    )
+
+    return int(layer_sample_count(scheduler, width))
+
+
+def choose_build_width(
+    batch_size: int,
+    *,
+    ledger_on: bool,
+    eligible: bool,
+    scheduler=None,
+) -> tuple:
     """Flat or switched width, plus a narrow timing probe and a wider build.
 
-    The next narrower width is built for two rounds when it has gone 300
-    eligible rounds without a real build. The counter starts at 300, so the
-    first eligible round is a probe. Those rounds are ``probe_w`` and take
-    the slot ahead of exploration. Every 20th remaining eligible round builds
-    the next larger candidate. The widest candidate stays on that round. The
-    departure does not happen while the ledger is off, or on a warmup,
-    K-probe, or locked round.
+    The next narrower width is built when it has gone 300 eligible rounds
+    without a real build. The first bursts for that width run until its layer
+    fit has four samples, and never more than four rounds. Later bursts are
+    two rounds. The counter starts at 300, so the first eligible round is a
+    probe. Those rounds are ``probe_w`` and take the slot ahead of
+    exploration. Every 20th remaining eligible round builds the next larger
+    candidate. The widest candidate stays on that round. The departure does
+    not happen while the ledger is off, or on a warmup, K-probe, or locked
+    round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
@@ -95,12 +118,27 @@ def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> t
     _eligible_n[bucket] = int(_eligible_n.get(bucket, 0)) + 1
     narrow = _next_narrower(base)
     if narrow is not None:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            LAYER_MIN_SAMPLES,
+        )
+
         key = (int(bucket), int(narrow))
         left = int(_probe_w_left.get(key, 0))
         idle = int(_narrow_idle.get(key, PROBE_W_IDLE))
+        samples = _layer_samples(scheduler, narrow)
+        if (
+            left > 0
+            and _probe_w_fill.get(key, False)
+            and samples >= LAYER_MIN_SAMPLES
+        ):
+            _probe_w_left[key] = 0
+            _probe_w_fill[key] = False
+            left = 0
         if left > 0 or idle >= PROBE_W_IDLE:
             if left <= 0:
-                left = PROBE_W_RUNS
+                filling = samples < LAYER_MIN_SAMPLES
+                left = PROBE_W_FILL if filling else PROBE_W_RUNS
+                _probe_w_fill[key] = filling
             _probe_w_left[key] = left - 1
             _narrow_idle[key] = 0
             return int(narrow), "probe_w"
@@ -119,7 +157,12 @@ def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: boo
     cached = None if scheduler is None else getattr(scheduler, "_clear_build_cache", None)
     if token is not None and isinstance(cached, tuple) and cached[0] == token:
         return cached[1]
-    chosen = choose_build_width(batch, ledger_on=ledger_on, eligible=eligible)
+    chosen = choose_build_width(
+        batch,
+        ledger_on=ledger_on,
+        eligible=eligible,
+        scheduler=scheduler,
+    )
     if token is not None and scheduler is not None:
         scheduler._clear_build_cache = (token, chosen)
     return chosen
