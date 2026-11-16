@@ -1,12 +1,13 @@
 """Shadow cost ledger for CLEAR_TREE_REMOTE.
 
 Records the time ledger and layer forwards, and fits layer and verify cost.
-Draft uses the layer fit when it stops a tree. Verify decisions use the
-samples Target sends back, not the regression logged here.
+Draft uses the layer fit when it stops a tree. Online K reads ``T_K`` written
+at round close, not the device samples Target sends back.
 
-``SGLANG_CLEAR_LEDGER=1`` on both roles turns the online K and W controllers
-on. Default is off. Only tp rank 0 logs and fits. With the switch off, every
-round stays on tau and the flat verify count: 16 for one request, 8 otherwise.
+``SGLANG_CLEAR_LEDGER=1`` on the Draft turns the online K and W controllers
+on. The Target ledger only logs that process. Default is off. Only tp rank 0
+logs and fits. With the switch off, every round stays on tau and the flat
+verify count: 16 for one request, 8 otherwise.
 """
 
 from __future__ import annotations
@@ -204,6 +205,8 @@ class ForgettingRegressor:
             [0.0] * self.n_features for _ in range(self.n_features)
         ]
         self.xty = [0.0] * self.n_features
+        self._coef: Optional[List[float]] = None
+        self._coef_n = -1
 
     def update(self, features: Sequence[float], target: float) -> None:
         forget = FORGET
@@ -217,6 +220,7 @@ class ForgettingRegressor:
             for j in range(width):
                 self.xtx[i][j] += float(features[i]) * float(features[j])
         self.n += 1
+        self._coef = None
         if self.span_feature is None:
             return
         value = float(features[self.span_feature])
@@ -231,6 +235,8 @@ class ForgettingRegressor:
         """Solved weights. The intercept is first. None until the fit is usable."""
         if self.n < self.min_samples:
             return None
+        if self._coef is not None and self._coef_n == self.n:
+            return self._coef
         system = [row[:] for row in self.xtx]
         if self.ridge is None:
             for index in range(1, self.n_features):
@@ -240,7 +246,9 @@ class ForgettingRegressor:
                 if index >= self.n_features:
                     break
                 system[index][index] += float(value)
-        return _solve(system, self.xty)
+        self._coef = _solve(system, self.xty)
+        self._coef_n = self.n
+        return self._coef
 
     def span_allows(self, features: Sequence[float]) -> bool:
         """False when ``span_feature`` is past the seen range by the margin.
@@ -293,6 +301,7 @@ class _Round:
         "draft_prefill_us",
         "bonus_hit_rids",
         "layers",
+        "fallback",
     )
 
     def __init__(
@@ -323,6 +332,7 @@ class _Round:
         self.draft_prefill_us = 0
         self.bonus_hit_rids: List[str] = []
         self.layers: List[dict] = []
+        self.fallback = False
 
 
 def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
@@ -433,7 +443,8 @@ class ClearLedger:
             self.open.idle_after_post = True
 
     def mark_stop(self, now: Optional[float] = None) -> None:
-        if self.open is None:
+        """The first stop in a round wins. Later cuts stay inside ``T_K``."""
+        if self.open is None or self.open.t_stop is not None:
             return
         self.open.t_stop = time.perf_counter() if now is None else float(now)
 
@@ -485,6 +496,8 @@ class ClearLedger:
             reasons.append("idle_start")
         if _target_gap(next_rids, next_prefixes):
             reasons.append("target_gap")
+        if rnd.fallback:
+            reasons.append("fallback")
         draft_floor = (
             next_action == "step"
             and rnd.t_post is not None
@@ -508,7 +521,7 @@ class ClearLedger:
         over_bucket = False
         features = None
         if t_k_us is not None and self.backend == "npu":
-            # T_K stays in the log. The NPU label is Target device_us.
+            # The shadow model stays empty on NPU. K selection uses T_K below.
             needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + rnd.k + 1
             bucket = smallest_bucket(needed, self.buckets)
             over_bucket = bucket is None
@@ -534,6 +547,8 @@ class ClearLedger:
                 if fit_verify:
                     model.update(features, t_k_us / 1000.0)
                     self.verify_samples += 1
+        self._observe_round_verify(rnd, t_k_us, excluded)
+        seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(
             rnd, t_recv, next_rids, next_prefixes
         )
@@ -572,6 +587,9 @@ class ClearLedger:
             "verify_pred_ms": verify_pred,
             "verify_residual": verify_residual,
             "verify_fit": fit_verify,
+            "seed_ms": seed_ms,
+            "layer_wall_ms": layer_wall_ms,
+            "gain_ratio": _gain_ratio(),
         }
         _emit("d_round", record)
         for sample in rnd.layers:
@@ -583,9 +601,66 @@ class ClearLedger:
             price_tokens,
             price_ms,
             price_kept,
-            skip_accept="target_gap" in reasons,
+            skip_accept="target_gap" in reasons or "fallback" in reasons,
         )
         return record
+
+    def _observe_round_verify(
+        self, rnd: _Round, t_k_us: Optional[int], excluded: bool
+    ) -> None:
+        """Write Draft ``T_K`` into the table that chooses K.
+
+        A draft-floor round is not excluded: that wait is on the critical
+        path and still depends on K. An over-bucket prefix yields no bucket
+        and ``observe_verify`` drops it.
+        """
+        if excluded or t_k_us is None:
+            return
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            observe_verify,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            VERIFY_KS,
+        )
+
+        if int(rnd.k) not in VERIFY_KS:
+            return
+        needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
+        observe_verify(
+            rnd.b,
+            int(rnd.k),
+            smallest_bucket(needed, runtime_kv_buckets()),
+            float(t_k_us) / 1000.0,
+        )
+
+    def _assign_layer_walls(self, rnd: _Round) -> tuple:
+        """Wall time between forwards. The last pre-reply sample ends at stop.
+
+        A sample with no timestamp keeps ``wall_us`` unset and the regression
+        falls back to ``host_us + gpu_us``. A missing neighbour is not skipped
+        over. Post-reply samples stay out of this chain.
+        """
+        pre = [sample for sample in rnd.layers if not sample.get("post_reply")]
+        for index, sample in enumerate(pre):
+            t0 = sample.get("t0")
+            if index + 1 < len(pre):
+                boundary = pre[index + 1].get("t0")
+            else:
+                boundary = rnd.t_stop
+            if t0 is not None and boundary is not None and float(boundary) >= float(t0):
+                sample["wall_us"] = int(round((float(boundary) - float(t0)) * 1e6))
+            else:
+                sample["wall_us"] = None
+        seed_ms = None
+        if pre and pre[0].get("t0") is not None:
+            seed_ms = (float(pre[0]["t0"]) - float(rnd.t_open)) * 1000.0
+        walls = [
+            int(sample["wall_us"])
+            for sample in pre
+            if sample.get("wall_us") is not None
+        ]
+        layer_wall_ms = (sum(walls) / 1000.0) if walls else 0.0
+        return seed_ms, layer_wall_ms
 
     def _note_price(
         self,
@@ -601,7 +676,8 @@ class ClearLedger:
 
         An empty poll after the reply is only the draft-floor flag. It still
         counts as pure decode. Eager rounds past the last KV bucket stay out.
-        A target gap drops the pending accept count without writing c_i.
+        A target gap or a fallback round drops the pending accept count
+        without writing c_i.
         """
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
             discard_pending,
@@ -629,20 +705,25 @@ class ClearLedger:
     def _finish_layer(self, rnd: _Round, sample: dict, excluded: bool) -> None:
         host = sample.get("host_us")
         gpu = sample.get("gpu_us")
+        wall = sample.get("wall_us")
+        post_reply = bool(sample.get("post_reply"))
         pred = None
         residual = None
         fitted = False
         features = None
         measured = None
-        if host is not None and gpu is not None:
+        if wall is not None:
+            measured = int(wall) / 1000.0
+        elif host is not None and gpu is not None:
             measured = (int(host) + int(gpu)) / 1000.0
+        if measured is not None:
             features = [
                 1.0,
                 float(sample["graph_bucket"]),
                 float(sample["sum_ell"]),
             ]
         model = None
-        if features is not None:
+        if features is not None and not post_reply:
             key = (int(sample["w"]), str(sample["path"]))
             model = self.layer_models.get(key)
             if model is None:
@@ -665,8 +746,9 @@ class ClearLedger:
             "sum_ell": sample["sum_ell"],
             "host_us": host,
             "gpu_us": gpu,
+            "wall_us": None if wall is None else int(wall),
             "path": sample["path"],
-            "post_reply": bool(sample["post_reply"]),
+            "post_reply": post_reply,
             "pred_ms": pred,
             "residual": residual,
             "fit": fitted,
@@ -681,6 +763,15 @@ def _target_gap(next_rids: Sequence[str], next_prefixes: Sequence[int]) -> bool:
     )
 
     return target_gap_open(next_rids, next_prefixes)
+
+
+def _gain_ratio() -> float:
+    """Current next-layer calibration. One when the Draft has no observations."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        gain_ratio,
+    )
+
+    return float(gain_ratio())
 
 
 def _cuda_features(batch: int, sum_ell: int, k: int) -> List[float]:
@@ -810,6 +901,16 @@ def mark_stop(scheduler) -> None:
     _quiet(scheduler, lambda ledger: ledger.mark_stop())
 
 
+def mark_round_fallback(scheduler) -> None:
+    """The open round rebuilt one request at a time and stays out of the fits."""
+
+    def _run(ledger: ClearLedger) -> None:
+        if ledger.open is not None:
+            ledger.open.fallback = True
+
+    _quiet(scheduler, _run)
+
+
 def mark_send(scheduler) -> None:
     _quiet(scheduler, lambda ledger: ledger.mark_send())
 
@@ -853,8 +954,12 @@ def queue_layer_sample(
     runners,
     host_us: Optional[int],
     width: int,
+    t0: Optional[float] = None,
 ) -> Optional[dict]:
-    """Attach one sub-batch to the open round. GPU time is filled later."""
+    """Attach one sub-batch to the open round. GPU time is filled later.
+
+    ``t0`` is the host clock taken when this layer forward began.
+    """
     if not ledger_enabled():
         return None
     try:
@@ -874,6 +979,7 @@ def queue_layer_sample(
             "gpu_us": None,
             "path": path,
             "post_reply": bool(getattr(scheduler, "_clear_layer_post_reply", False)),
+            "t0": None if t0 is None else float(t0),
         }
         return ledger.queue_layer(sample)
     except Exception:

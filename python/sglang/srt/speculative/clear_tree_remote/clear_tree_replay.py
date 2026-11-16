@@ -18,6 +18,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     _prefix_mass,
     _tier_for_nodes,
     accept_ratio,
+    gain_ratio,
     keep_by_net_benefit,
     select_k,
 )
@@ -311,7 +312,9 @@ def replay_accept_k(layers, kept, tokens, stop: int, k_prime: int) -> int:
     return matched
 
 
-def batch_stop_depth(trees, *, theta, verify_ms, layer_rows, width: int) -> int:
+def batch_stop_depth(
+    trees, *, theta, verify_ms, layer_rows, width: int, gain_ratio: float = 1.0
+) -> int:
     """One kept depth for the batch. The gain uses the latest written layer.
 
     ``trees`` carry ``layers``, ``kept``, ``ratio``, and ``prefix``. A missing
@@ -345,11 +348,12 @@ def batch_stop_depth(trees, *, theta, verify_ms, layer_rows, width: int) -> int:
                 float(tree["layers"][end - 1][col]["score"])
                 for col in tree["kept"][end - 1]
             ]
+            scale = float(gain_ratio)
             requests.append(
                 {
                     "e": {int(k): _prefix_mass(scores, int(k)) for k in VERIFY_KS},
                     "g": {
-                        int(k): _list_marginal(scores, latest, int(k))
+                        int(k): _list_marginal(scores, latest, int(k)) * scale
                         for k in VERIFY_KS
                     },
                     "ell": int(tree.get("prefix", 0) or 0),
@@ -726,8 +730,10 @@ def hold_replay(scheduler, reqs, states, plan) -> None:
                 "verify_ms": verify,
                 "k": k_actual,
                 "layers": _freeze_layer_rows(scheduler, usable),
+                "gain_ratio": float(gain_ratio()),
             }
         existing["trees"].update(trees)
+        existing["gain_ratio"] = float(gain_ratio())
         scheduler._clear_replay_hold = existing
     except Exception:
         import logging
@@ -767,6 +773,7 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
             verify_ms=verify_ms,
             layer_rows=layer_rows,
             width=int(width),
+            gain_ratio=float(hold.get("gain_ratio", 1.0) or 1.0),
         )
         scores = []
         ratios = []

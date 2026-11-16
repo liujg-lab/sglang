@@ -29,6 +29,9 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     attach_round,
     choose_build_width,
     flat_width,
+    _marginal_gain,
+    _raw_marginal,
+    gain_ratio,
     ingest_verify_samples,
     install_fallback_plan,
     compare_price,
@@ -45,6 +48,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     persistent_width,
     predict_verify_ms,
     request_terms,
+    reset_gain_calibration,
     reset_policy,
     select_continuing,
     settle_replay,
@@ -92,6 +96,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     push_verify_sample,
     restore_verify_samples,
     take_verify_samples,
+    FORGET,
     ForgettingRegressor,
     consume_verify_device,
     emit_verify_device,
@@ -99,6 +104,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     note_target_prefill,
     read_verify_host_us,
     reset_target_verify_model,
+    runtime_kv_buckets,
     smallest_bucket,
     target_verify_record,
     target_verify_samples,
@@ -142,6 +148,8 @@ class ClearTreeLedgerTest(CustomTestCase):
         self._saved = {name: os.environ.get(name) for name in _LEDGER_ENV}
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
         reset_target_verify_model()
+        reset_policy()
+        reset_gain_calibration()
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -1007,11 +1015,18 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertNotIn(32, locked)
 
     def test_ingested_sample_is_visible_before_the_round_plan(self):
+        for _ in range(4):
+            observe_verify(1, 8, 256, 10.0)
+        observe_verify(1, 16, 256, 10.0)
+        observe_verify(1, 32, 256, 10.0)
+        self.assertEqual(predict_verify_ms(1, 8, 256), 10.0)
+        before = {key: list(rows) for key, rows in policy._clock.items()}
         ingest_verify_samples(
             [[1, 8, 256, 10000], [1, 16, 256, 10000], [1, 32, 256, 10000]]
-            + [[1, 8, 256, 10000]] * 3
         )
-        self.assertEqual(predict_verify_ms(1, 8, 256), 10.0)
+        self.assertEqual(
+            {key: list(rows) for key, rows in policy._clock.items()}, before
+        )
 
     def test_lock_k_does_not_consume_probes(self):
         _pin_verify_ks(self)
@@ -1730,8 +1745,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             ingest_verify_samples([[1, 8, 256, 10000]])
         foreign = [line for line in logs.output if "99999" in line]
         self.assertEqual(len(foreign), 1)
-        self.assertEqual(len(policy._clock[(1, 8, 99999)]), 2)
-        self.assertEqual(len(policy._clock[(1, 8, 256)]), 1)
+        self.assertEqual(policy._clock, {})
 
     def test_probe_round_cap_stays_on_the_flat_k(self):
         reset_policy()
@@ -1777,19 +1791,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertFalse(short.replay_eligible)
         self.assertEqual(policy._probe_rounds, 54)
         self.assertEqual(policy._probe_sent, {})
-
-    def test_sample_gap_warns_once(self):
-        reset_policy()
-        sched = SimpleNamespace()
-        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
-        with self.assertLogs(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_policy",
-            level="WARNING",
-        ) as logs:
-            for _ in range(50):
-                make_round(sched, [req])
-        gap = [line for line in logs.output if "verify_samples" in line]
-        self.assertEqual(len(gap), 1)
 
     def test_replay_k_stays_inside_retained_nodes(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -2039,6 +2040,190 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertNotIn("target_gap", record["exclude_reason"])
         self.assertTrue(record["price_kept"])
         self.assertAlmostEqual(policy._sum_a["a"], 99.0)
+
+    def test_close_writes_draft_t_k_into_the_verify_table(self):
+        ledger = ClearLedger(active_rids=["a", "b", "c", "d"])
+        _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 1, 0.0)
+        ledger.open.k = 16
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.02)
+        ledger.mark_post(1.03)
+        ledger.note_idle()
+        record = _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 2, 1.08)
+        bucket = smallest_bucket(100 + 16 + 1, runtime_kv_buckets())
+        self.assertEqual(record["t_k_us"], 80000)
+        self.assertFalse(record["excluded"])
+        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
+
+        idle = ClearLedger(active_rids=[])
+        _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 3, 2.0)
+        idle.open.k = 16
+        idle.mark_stop(2.0)
+        idle.mark_send(2.0)
+        idle.mark_post(2.01)
+        idle.note_idle()
+        skipped = _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 4, 2.08)
+        self.assertIn("idle_start", skipped["exclude_reason"])
+        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
+
+    def test_layer_wall_uses_the_gap_between_forwards(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [16], 1, 0.0)
+        samples = []
+        for t0, layer in ((0.0, 0), (0.012, 1), (0.025, 2)):
+            sample = {
+                "layer": layer,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 16,
+                "host_us": 1,
+                "gpu_us": 1,
+                "path": "graph",
+                "post_reply": False,
+                "t0": t0,
+            }
+            ledger.queue_layer(sample)
+            samples.append(sample)
+        ledger.mark_stop(0.040)
+        ledger.mark_send(0.040)
+        ledger.mark_post(0.041)
+        ledger.note_idle()
+        record = _step(ledger, ["a"], [16], 2, 0.050)
+        self.assertEqual([item["wall_us"] for item in samples], [12000, 13000, 15000])
+        model = ledger.layer_models[(8, "graph")]
+        self.assertEqual(model.n, 3)
+        expected = ((12.0 * FORGET + 13.0) * FORGET) + 15.0
+        self.assertAlmostEqual(model.xty[0], expected)
+        self.assertEqual(record["seed_ms"], 0.0)
+        self.assertAlmostEqual(record["layer_wall_ms"], 40.0)
+
+    def test_post_reply_layer_does_not_fit(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [16], 1, 0.0)
+        ledger.queue_layer(
+            {
+                "layer": 0,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 16,
+                "host_us": 1000,
+                "gpu_us": 1000,
+                "path": "graph",
+                "post_reply": False,
+            }
+        )
+        ledger.queue_layer(
+            {
+                "layer": 1,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 16,
+                "host_us": 9000,
+                "gpu_us": 9000,
+                "path": "graph",
+                "post_reply": True,
+                "t0": 1.0,
+            }
+        )
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        ledger.mark_post(1.2)
+        ledger.note_idle()
+        _step(ledger, ["a"], [16], 2, 1.4)
+        self.assertEqual(ledger.layer_models[(8, "graph")].n, 1)
+
+    def test_mark_stop_keeps_the_first_time(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 0.0)
+        ledger.mark_stop(1.5)
+        ledger.mark_stop(9.0)
+        self.assertEqual(ledger.open.t_stop, 1.5)
+
+    def test_fallback_round_stays_out_of_the_fits(self):
+        saved = os.environ.get("SGLANG_CLEAR_LEDGER")
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+
+        def _restore_ledger_flag():
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+            else:
+                os.environ["SGLANG_CLEAR_LEDGER"] = saved
+
+        self.addCleanup(_restore_ledger_flag)
+        ledger = ClearLedger(active_rids=["a"])
+        sched = SimpleNamespace(
+            _clear_ledger=ledger,
+            _clear_build_token=1,
+            _clear_target_prefix={},
+        )
+        _step(ledger, ["a"], [32], 1, 1.0)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 4, output_ids=[])
+        install_fallback_plan(sched, [req])
+        self.assertTrue(ledger.open.fallback)
+        ledger.open.k = 16
+        ledger.queue_layer(
+            {
+                "layer": 0,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 32,
+                "host_us": 1000,
+                "gpu_us": 1000,
+                "path": "graph",
+                "post_reply": False,
+            }
+        )
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.0)
+        ledger.mark_post(1.01)
+        ledger.note_idle()
+        note_verified("a", 32, 5.0, 2)
+        record = _step(ledger, ["a"], [34], 2, 1.08)
+        self.assertIn("fallback", record["exclude_reason"])
+        self.assertFalse(record["price_kept"])
+        self.assertEqual(policy._clock, {})
+        self.assertEqual(ledger.layer_models[(8, "graph")].n, 0)
+        self.assertNotIn("a", policy._sum_a)
+        self.assertEqual(policy._pending, {})
+
+    def test_stop_rule_keeps_the_same_request_and_refits(self):
+        good = _rows_state([[0.5, 0, 0, 0, 0, 0, 0, 0]], "good", 1)
+        poor = _rows_state([[0.05, 0, 0, 0, 0, 0, 0, 0]], "poor", 100)
+        kept = select_continuing(
+            [good, poor],
+            [good, poor],
+            theta=1.0,
+            verify_times={8: 1.0, 16: 1.0, 32: 1.0},
+            layer_cost=lambda active, _ell: 0.05 if int(active) == 1 else 0.5,
+            kappa=0.1,
+        )
+        self.assertEqual([item.rid for item in kept], ["good"])
+        reg = ForgettingRegressor(2, 1)
+        reg.update([1.0, 0.0], 1.0)
+        first = list(reg.coefficients())
+        self.assertEqual(reg.coefficients(), first)
+        reg.update([1.0, 1.0], 3.0)
+        self.assertNotEqual(reg.coefficients(), first)
+
+    def test_gain_ratio_shrinks_the_upper_bound(self):
+        self.assertEqual(gain_ratio(), 1.0)
+        policy._gain_pred = 10.0
+        policy._gain_actual = 6.0
+        self.assertAlmostEqual(gain_ratio(), (6.0 + 3.0) / (10.0 + 3.0))
+        state = _rows_state([[0.4, 0.2, 0.1, 0.0]], "r", 4)
+        raw = _raw_marginal(state, 2)
+        self.assertAlmostEqual(_marginal_gain(state, 2), raw * gain_ratio())
+        policy._gain_pred = 10.0
+        policy._gain_actual = 20.0
+        self.assertEqual(gain_ratio(), 1.0)
+        on_external_event(SimpleNamespace())
+        self.assertEqual(policy._gain_pred, 10.0)
+        self.assertEqual(policy._gain_actual, 20.0)
+        self.assertEqual(gain_ratio(), 1.0)
 
 
 def _rows_state(rows, rid, prefix):

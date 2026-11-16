@@ -60,7 +60,6 @@ PROBE_INFLIGHT_ROUNDS = 8
 PROBE_ROUND_FLOOR = 54
 PROBE_ROUND_FRACTION = 0.05
 VERIFY_WINDOW = 16
-SAMPLE_GAP_ROUNDS = 50
 CALIBRATE_LAMBDA = 3.0
 PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
@@ -82,10 +81,9 @@ _probe_inflight: Dict[tuple, int] = {}
 _probe_warned: set = set()
 _rounds = 0
 _probe_rounds = 0
-_saw_verify_samples = False
-_rounds_without_samples = 0
-_sample_gap_warned = False
 _bucket_warned = False
+_gain_pred = 0.0
+_gain_actual = 0.0
 
 
 def on_external_event(scheduler) -> None:
@@ -115,10 +113,16 @@ def on_external_event(scheduler) -> None:
     scheduler._clear_replay_closed = None
 
 
+def reset_gain_calibration() -> None:
+    """Drop the next-layer gain ratio. An external event does not call this."""
+    global _gain_pred, _gain_actual
+    _gain_pred = 0.0
+    _gain_actual = 0.0
+
+
 def reset_policy() -> None:
     """Drop prices, accept ratios, probe counts, verify samples, and replay."""
     global _total_a, _total_e, _rounds, _probe_rounds
-    global _saw_verify_samples, _rounds_without_samples, _sample_gap_warned
     global _bucket_warned
     _clock.clear()
     _clock_count.clear()
@@ -131,10 +135,8 @@ def reset_policy() -> None:
     _probe_sent.clear()
     _probe_inflight.clear()
     _probe_warned.clear()
-    _saw_verify_samples = False
-    _rounds_without_samples = 0
-    _sample_gap_warned = False
     _bucket_warned = False
+    reset_gain_calibration()
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         reset_replay_state,
     )
@@ -242,16 +244,40 @@ def select_continuing(
     layer_cost,
     kappa: Optional[float],
 ) -> Optional[list]:
-    """Requests to forward, or None when no candidate has a layer cost."""
+    """Requests to forward, or None when no candidate has a layer cost.
+
+    Each request is sorted once. Path mass at a tier is a prefix of that
+    order. Tiers with no verify time are left out.
+    """
     growing_ids = {id(state) for state in eligible}
+    timed = []
+    for key, spent in verify_times.items():
+        if spent is None or int(key) not in VERIFY_KS:
+            continue
+        timed.append(int(key))
+    ratio = gain_ratio()
     requests = []
     for state in list(all_states):
+        scores = _path_scores(state)
+        ordered = sorted(scores, reverse=True)
+        prefix = []
+        running = 0.0
+        for value in ordered:
+            running += float(value)
+            prefix.append(running)
+        latest = _latest_scores(state)
         mass = {}
         gain = {}
-        for k in VERIFY_KS:
-            path, marginal = request_terms(state, int(k))
-            mass[int(k)] = path
-            gain[int(k)] = marginal
+        count = len(ordered)
+        for k in timed:
+            if count == 0:
+                mass[k] = 0.0
+                gain[k] = 0.0
+                continue
+            mass[k] = prefix[min(k, count) - 1]
+            theta_k = ordered[k - 1] if count >= k else 0.0
+            raw = sum(max(0.0, score - theta_k) for score in latest)
+            gain[k] = raw * ratio
         requests.append(
             {
                 "e": mass,
@@ -272,9 +298,11 @@ def select_continuing(
 
 
 def ingest_verify_samples(samples) -> None:
-    """Record samples carried on one ClearTree request. ``device_us`` is microseconds."""
-    global _saw_verify_samples
-    got = False
+    """Parse samples carried on one ClearTree request.
+
+    ``device_us`` is microseconds and is only logged. The verify table is
+    filled from the Draft ledger's ``T_K``.
+    """
     for sample in list(samples or []):
         if not isinstance(sample, (list, tuple)) or len(sample) != 4:
             continue
@@ -282,10 +310,13 @@ def ingest_verify_samples(samples) -> None:
         _warn_foreign_bucket(int(bucket))
         if device_us is None:
             continue
-        observe_verify(int(batch), int(k), int(bucket), float(device_us) / 1000.0)
-        got = True
-    if got:
-        _saw_verify_samples = True
+        logger.debug(
+            "[CLEAR] verify_samples device_us b=%s k=%s bucket=%s device_us=%s",
+            int(batch),
+            int(k),
+            int(bucket),
+            int(device_us),
+        )
 
 
 def locked_k_from_env() -> Optional[int]:
@@ -590,29 +621,6 @@ def forget_request(rid: str) -> None:
     _pending.pop(key, None)
 
 
-def _note_sample_gap() -> None:
-    """Warn once when the Draft ledger goes 50 rounds without verify samples."""
-    global _saw_verify_samples, _rounds_without_samples, _sample_gap_warned
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        ledger_enabled,
-    )
-
-    if not ledger_enabled():
-        return
-    if _saw_verify_samples:
-        _saw_verify_samples = False
-        _rounds_without_samples = 0
-        _sample_gap_warned = False
-        return
-    _rounds_without_samples += 1
-    if _rounds_without_samples >= SAMPLE_GAP_ROUNDS and not _sample_gap_warned:
-        _sample_gap_warned = True
-        logger.warning(
-            "[CLEAR] Draft ledger has seen no verify_samples for %s rounds",
-            SAMPLE_GAP_ROUNDS,
-        )
-
-
 def _warn_foreign_bucket(bucket: int) -> None:
     """One warning when a sample bucket is missing from the Draft list."""
     global _bucket_warned
@@ -777,6 +785,7 @@ class RoundPlan:
         self._all = []
         self._at = None
         self._keep_ids = set()
+        self._raw_gain: Dict[int, float] = {}
         self._frozen_k = None
 
     @property
@@ -803,6 +812,25 @@ class RoundPlan:
         self._peers = list(states)
         self._at = None
         self._keep_ids = set()
+        self._note_layer_gain(states)
+
+    def _note_layer_gain(self, states) -> None:
+        """Compare the previous flat-K upper bound with this layer's mass.
+
+        The stored prediction is the raw upper bound, before the ratio.
+        Depth 1 only stores that bound for the next layer.
+        """
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            FORGET,
+        )
+
+        k = int(flat_k(self.batch))
+        for state in list(states or []):
+            depth = int(getattr(state, "depth", 0) or 0)
+            key = id(state)
+            if depth >= 2 and key in self._raw_gain:
+                _observe_gain(self._raw_gain[key], _quality_increment(state, k), FORGET)
+            self._raw_gain[key] = _raw_marginal(state, k)
 
     def should_grow(self, state) -> bool:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import depth_rule
@@ -996,7 +1024,6 @@ def make_round(scheduler, reqs) -> RoundPlan:
     max_ell = max(prefixes) if prefixes else 0
     buckets = runtime_kv_buckets()
     _rounds += 1
-    _note_sample_gap()
     greedy = _requests_greedy(reqs)
     ledger_on = ledger_enabled()
     locked_env = locked_k_from_env()
@@ -1132,6 +1159,7 @@ def install_fallback_plan(scheduler, reqs) -> RoundPlan:
     scheduler._clear_plan_fallback = True
     scheduler._clear_fallback_plan = (token, plan)
     _bind_round(scheduler, plan, reqs)
+    _mark_fallback(scheduler)
     return plan
 
 
@@ -1142,6 +1170,7 @@ def attach_round(scheduler, reqs) -> RoundPlan:
     fallback: tau, K locked to the packet's flat tier, and no extra round or probe.
     """
     token = getattr(scheduler, "_clear_build_token", None)
+    fallback = False
     if getattr(scheduler, "_clear_plan_fallback", False):
         cached = getattr(scheduler, "_clear_fallback_plan", None)
         if isinstance(cached, tuple) and cached[0] == token:
@@ -1149,16 +1178,20 @@ def attach_round(scheduler, reqs) -> RoundPlan:
         else:
             plan = make_fallback_round(scheduler, reqs)
             scheduler._clear_fallback_plan = (token, plan)
+        fallback = True
     else:
         cached = getattr(scheduler, "_clear_primary_plan", None)
         if isinstance(cached, tuple) and cached[0] == token:
             plan = make_fallback_round(scheduler, reqs)
             scheduler._clear_plan_fallback = True
             scheduler._clear_fallback_plan = (token, plan)
+            fallback = True
         else:
             plan = make_round(scheduler, reqs)
             scheduler._clear_primary_plan = (token, plan)
     _bind_round(scheduler, plan, reqs)
+    if fallback:
+        _mark_fallback(scheduler)
     return plan
 
 
@@ -1194,15 +1227,62 @@ def _prefix_mass(scores: Sequence[float], k: int) -> float:
     return float(sum(ordered[: int(k)]))
 
 
-def _marginal_gain(state, k: int) -> float:
-    """How much of the newest layer still clears the current K-th score."""
+def _latest_scores(state) -> list:
+    depth = int(getattr(state, "depth", 0) or 0)
+    weight = getattr(state, "weight", None)
+    if depth < 1 or weight is None:
+        return []
+    return [float(value) for value in weight[depth - 1].tolist()]
+
+
+def _raw_marginal(state, k: int) -> float:
+    """Upper bound on the newest layer, before the gain ratio."""
     scores = _path_scores(state)
-    if not scores or int(state.depth) < 1:
+    if not scores or int(getattr(state, "depth", 0) or 0) < 1:
         return 0.0
     ordered = sorted(scores, reverse=True)
     theta_k = ordered[int(k) - 1] if len(ordered) >= int(k) else 0.0
-    latest = [float(value) for value in state.weight[int(state.depth) - 1].tolist()]
-    return float(sum(max(0.0, score - theta_k) for score in latest))
+    return float(sum(max(0.0, score - theta_k) for score in _latest_scores(state)))
+
+
+def _quality_increment(state, k: int) -> float:
+    """Top-K mass this layer added, at one flat verify count."""
+    scores = _path_scores(state)
+    latest = _latest_scores(state)
+    if not scores or not latest:
+        return 0.0
+    previous = scores[:-len(latest)] if len(latest) <= len(scores) else []
+    return _prefix_mass(scores, k) - _prefix_mass(previous, k)
+
+
+def _observe_gain(predicted: float, actual: float, forget: float) -> None:
+    global _gain_pred, _gain_actual
+    _gain_pred = _gain_pred * float(forget) + float(predicted)
+    _gain_actual = _gain_actual * float(forget) + float(actual)
+
+
+def gain_ratio() -> float:
+    """How much of the upper bound the next layer has actually kept.
+
+    No observations leave the bound unchanged. The ratio never exceeds 1.
+    """
+    if _gain_pred == 0.0 and _gain_actual == 0.0:
+        return 1.0
+    raw = (_gain_actual + CALIBRATE_LAMBDA) / (_gain_pred + CALIBRATE_LAMBDA)
+    return min(1.0, float(raw))
+
+
+def _marginal_gain(state, k: int) -> float:
+    """How much of the newest layer still clears the current K-th score."""
+    return _raw_marginal(state, k) * gain_ratio()
+
+
+def _mark_fallback(scheduler) -> None:
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        mark_round_fallback,
+    )
+
+    mark_round_fallback(scheduler)
 
 
 def _requests_greedy(reqs) -> bool:

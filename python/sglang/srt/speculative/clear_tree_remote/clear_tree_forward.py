@@ -697,6 +697,7 @@ def _queue_ledger_layer(scheduler, timing, runners, layer: int, width: int) -> N
         runners=runners,
         host_us=getattr(timing, "host_us", None),
         width=width,
+        t0=getattr(timing, "t0", None),
     )
 
 
@@ -1089,6 +1090,12 @@ def grow_active_layers(
             else:
                 nxt.append(i)
         active = nxt
+    if scheduler is not None:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            mark_stop,
+        )
+
+        mark_stop(scheduler)
     _cut_deferred(plan, states, pending, results)
     if any(item is None for item in results):
         raise RuntimeError("OPT batch finished with a missing verify set")
