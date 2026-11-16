@@ -280,6 +280,8 @@ python/sglang/srt/speculative/clear_tree/scratchpad/
 test_sglang_liujg/clear_tree/sim/results/*.err
 !test_sglang_liujg/clear_tree/sim/results/*.jsonl
 !test_sglang_liujg/clear_tree/sim/results/*.out
+# Measured-run logs. The template note under validate/_template/raw/ stays tracked.
+test_sglang_liujg/clear_tree/validate/*/*/raw/
 .cursor
 
 # sgl-kernel FetchContent local mirrors (do not commit)
