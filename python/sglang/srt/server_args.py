@@ -561,7 +561,7 @@ class ServerArgs:
     clear_tree_tau: float = 0.5
     clear_tree_max_depth: Optional[int] = None
     clear_tree_addr: str = "127.0.0.1"
-    clear_tree_port: str = "30039"
+    clear_tree_port: str = "30019"
 
     # Expert parallelism
     ep_size: int = 1

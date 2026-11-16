@@ -13,7 +13,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     VERIFY_KS,
     _prefix_mass,
     accept_ratio,
-    layer_should_continue,
+    keep_by_net_benefit,
     select_k,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
@@ -62,10 +62,9 @@ def reset_replay_state() -> None:
 def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> tuple:
     """Flat or switched width, plus one temporary departure when the ledger is on.
 
-    A batch larger than one spends every 20th eligible round at width 8.
-    A single request, already at 8, spends that round at width 4 instead.
-    Neither departure happens while the ledger is off, or on a warmup, probe,
-    or locked round.
+    Width 4 spends every 20th eligible round at 8. Width 8 spends that round
+    at 4. The departure does not depend on the batch bucket. It does not
+    happen while the ledger is off, or on a warmup, probe, or locked round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
@@ -74,10 +73,10 @@ def choose_build_width(batch_size: int, *, ledger_on: bool, eligible: bool) -> t
     _eligible_n[bucket] = int(_eligible_n.get(bucket, 0)) + 1
     if _eligible_n[bucket] % REPLAY_EVERY != 0:
         return base, "ordinary"
-    if bucket == 1 and base == 8:
-        return 4, "measure"
-    if bucket != 1 and base == 4:
+    if base == 4:
         return 8, "explore"
+    if base == 8:
+        return 4, "measure"
     return base, "ordinary"
 
 def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: bool):
@@ -166,43 +165,139 @@ def candidate_stop_depth(
     layer_costs: Sequence[Optional[float]],
     ratio: float,
 ) -> int:
-    """Built depth, or up to two layers earlier when the truncated J says stop."""
-    depth = len(layers)
-    if depth < 2 or theta is None:
+    """Built depth, or up to two layers earlier when the batch J says stop.
+
+    ``layer_costs[i]`` is the forward of written layer ``i``. The gain is the
+    latest written layer, not the next layer's real nodes.
+    """
+    rows = [
+        {"pred": {0: None if cost is None else float(cost)}}
+        for cost in list(layer_costs or [])
+    ]
+    return batch_stop_depth(
+        [
+            {
+                "layers": layers,
+                "kept": kept,
+                "ratio": float(ratio),
+                "prefix": 0,
+            }
+        ],
+        theta=theta,
+        verify_ms=verify_ms,
+        layer_rows=rows,
+        width=0,
+    )
+
+def _top_kept_nodes(layers, kept, end: int, limit: int) -> set:
+    """Top ``limit`` kept nodes: score desc, depth asc, column asc."""
+    nodes = []
+    for depth in range(min(int(end), len(kept))):
+        for col in kept[depth]:
+            nodes.append(
+                (
+                    float(layers[depth][col]["score"]),
+                    int(depth),
+                    int(col),
+                )
+            )
+    nodes.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return {(depth, col) for _score, depth, col in nodes[: max(int(limit), 0)]}
+
+
+def replay_accept_k(layers, kept, tokens, stop: int, k_prime: int) -> int:
+    """Accepted drafts on the top ``k_prime`` nodes, plus one bonus when present."""
+    chosen = _top_kept_nodes(layers, kept, stop, k_prime)
+    parent = None
+    matched = 0
+    sequence = [int(token) for token in tokens]
+    depth_limit = min(len(layers), max(int(stop), 0))
+    for depth in range(depth_limit):
+        if matched >= len(sequence):
+            break
+        found = None
+        for col in kept[depth]:
+            if (depth, int(col)) not in chosen:
+                continue
+            node = layers[depth][col]
+            if depth > 0 and int(node["parent"]) != parent:
+                continue
+            if int(node["token"]) == sequence[matched]:
+                found = int(col)
+                break
+        if found is None:
+            break
+        parent = found
+        matched += 1
+    if len(sequence) > matched:
+        return matched + 1
+    return matched
+
+
+def batch_stop_depth(trees, *, theta, verify_ms, layer_rows, width: int) -> int:
+    """One kept depth for the batch. The gain uses the latest written layer.
+
+    ``trees`` carry ``layers``, ``kept``, ``ratio``, and ``prefix``. A missing
+    layer cost keeps the built depth. The comparison is the shared net-benefit
+    rule, so one request does not pay the whole batch's layer cost alone.
+    """
+    if not trees or theta is None:
+        return max((len(tree["layers"]) for tree in trees), default=0)
+    depth = max(len(tree["layers"]) for tree in trees)
+    if depth < 2:
         return depth
     earliest = max(1, depth - 2)
+    times = {
+        int(k): float(spent)
+        for k, spent in (verify_ms or {}).items()
+        if spent is not None
+    }
     for stop in range(earliest, depth):
-        cost = layer_costs[stop] if stop < len(layer_costs) else None
-        if cost is None:
+        row = layer_rows[stop - 1] if 0 <= stop - 1 < len(layer_rows) else None
+        pred = None if row is None else row.get("pred", {}).get(int(width))
+        if pred is None:
             return depth
-        if not _truncated_worth(
-            layers, kept, stop, float(theta), verify_ms, float(cost), float(ratio)
-        ):
+        requests = []
+        for tree in trees:
+            end = min(int(stop), len(tree["layers"]))
+            if end < 1:
+                continue
+            scores = _kept_scores(tree["layers"], tree["kept"], end)
+            latest = [
+                float(tree["layers"][end - 1][col]["score"])
+                for col in tree["kept"][end - 1]
+            ]
+            requests.append(
+                {
+                    "e": {int(k): _prefix_mass(scores, int(k)) for k in VERIFY_KS},
+                    "g": {
+                        int(k): _list_marginal(scores, latest, int(k))
+                        for k in VERIFY_KS
+                    },
+                    "ell": int(tree.get("prefix", 0) or 0),
+                    "c": float(tree["ratio"]),
+                    "item": tree,
+                    "growing": True,
+                }
+            )
+        if not requests:
+            return depth
+
+        def layer_cost(_count, _ell, _pred=float(pred)):
+            return _pred
+
+        kept_items = keep_by_net_benefit(
+            requests,
+            theta=float(theta),
+            verify_times=times,
+            layer_cost=layer_cost,
+            kappa=0.0,
+        )
+        if kept_items is None:
+            return depth
+        if not kept_items:
             return stop
     return depth
-
-def _truncated_worth(layers, kept, stop, theta, verify_ms, layer_cost, ratio) -> bool:
-    """True when one more truncated layer is worth more than verifying now."""
-    current = {}
-    nxt = {}
-    scores = _kept_scores(layers, kept, stop)
-    latest = [
-        float(layers[stop][col]["score"])
-        for col in kept[stop]
-    ] if stop < len(kept) else []
-    for k, spent in verify_ms.items():
-        if spent is None:
-            continue
-        mass = _prefix_mass(scores, int(k))
-        current[int(k)] = float(ratio) * mass - float(theta) * float(spent)
-        nxt[int(k)] = (
-            float(ratio) * (mass + _list_marginal(scores, latest, int(k)))
-            - float(theta) * float(spent)
-        )
-    if not current or not nxt:
-        return True
-    next_value = max(nxt.values()) - float(theta) * float(layer_cost)
-    return layer_should_continue(max(current.values()), next_value)
 
 def _schedule_ms(layer_rows, width: int, n_layers: int, verify_ms, k: int):
     spent = None if verify_ms is None else verify_ms.get(int(k))
@@ -293,9 +388,15 @@ def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> N
         _bias_ms4[key] = float(_bias_ms4.get(key, 0.0)) + float(actual_ms)
 
 def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
-    """Best candidate under the 20-round, 3 percent, 30/10 rule. Width 2 stays a shadow."""
+    """Best servable width under the 20-round, 3 percent, 30/10 rule.
+
+    Width 2 can win the shadow comparison and is written to ``would_w``. It
+    cannot block a switch among 4 and 8, and it is never served.
+    """
     best = int(current)
     best_gain = 0.0
+    shadow = int(current)
+    shadow_gain = 0.0
     for cand in CANDIDATE_WIDTHS:
         if int(cand) == int(current):
             continue
@@ -310,9 +411,15 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
         ):
             continue
         gain = (arm["tok"] / arm["ms"]) / (arm["cur_tok"] / arm["cur_ms"]) - 1.0
+        if gain > shadow_gain and gain > REPLAY_GAIN:
+            shadow = int(cand)
+            shadow_gain = float(gain)
+        if int(cand) not in (4, 8):
+            continue
         if gain > best_gain and gain > REPLAY_GAIN:
             best = int(cand)
             best_gain = float(gain)
+    _would_w[int(bucket)] = int(shadow)
     applied = False
     if (
         allow_apply
@@ -322,11 +429,8 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
         and bias_gate_open(bucket)
     ):
         assign_persistent_width(int(bucket), int(best))
-        _would_w[int(bucket)] = int(best)
         _clear_arms(bucket)
         applied = True
-    else:
-        _would_w[int(bucket)] = int(best)
     return best, best_gain, applied
 
 def observe_replay(
@@ -368,7 +472,6 @@ def observe_replay(
                     arms[int(width)] = (float(pair[0]), float(pair[1]))
         if int(current) in arms and float(arms[int(current)][1]) > 0.0:
             cur_tok, cur_ms = arms[int(current)]
-            paired = False
             for width, pair in arms.items():
                 if int(width) == int(current) or float(pair[1]) <= 0.0:
                     continue
@@ -378,13 +481,11 @@ def observe_replay(
                 arm["cur_tok"] += float(cur_tok)
                 arm["cur_ms"] += float(cur_ms)
                 arm["n"] += 1.0
-                paired = True
-            if paired:
-                _replay_n[bucket] = int(_replay_n.get(bucket, 0)) + 1
-                judged_rounds = int(_replay_n[bucket])
-                if judged_rounds % REPLAY_EVERY == 0:
-                    _best, gain, applied = _judge(bucket, current, allow_apply=apply)
-                    current = persistent_width(batch)
+        _replay_n[bucket] = int(_replay_n.get(bucket, 0)) + 1
+        judged_rounds = int(_replay_n[bucket])
+        if judged_rounds % REPLAY_EVERY == 0:
+            _best, gain, applied = _judge(bucket, current, allow_apply=apply)
+            current = persistent_width(batch)
     rounds = judged_rounds
     record = {
         "bucket": int(bucket),
@@ -441,7 +542,8 @@ def _freeze_layer_rows(scheduler, states) -> list:
 
     depth = max((int(getattr(state, "depth", 0) or 0) for state in states), default=0)
     rows = []
-    for layer in range(depth):
+    # The last written layer is verified and not forwarded.
+    for layer in range(max(int(depth) - 1, 0)):
         active_states = [
             state for state in states if int(getattr(state, "depth", 0) or 0) > layer
         ]
@@ -526,35 +628,52 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
     for width in CANDIDATE_WIDTHS:
         if int(width) >= built:
             continue
-        accepts = []
-        scores = []
-        ratios = []
-        stops = []
+        prepared = []
         for rid, tree in trees.items():
             tokens = tokens_by_rid.get(rid)
             if tokens is None:
                 return {}
             layers = tree["layers"]
-            kept = truncate_columns(layers, width)
-            costs = [
-                row.get("pred", {}).get(int(width)) for row in layer_rows
-            ]
-            stop = candidate_stop_depth(
-                layers,
-                kept,
-                theta=theta,
-                verify_ms=verify_ms,
-                layer_costs=costs,
-                ratio=float(tree["ratio"]),
+            prepared.append(
+                {
+                    "layers": layers,
+                    "kept": truncate_columns(layers, width),
+                    "tokens": tokens,
+                    "ratio": float(tree["ratio"]),
+                    "prefix": int(tree.get("prefix", 0) or 0),
+                }
             )
-            accepts.append(replay_accept(layers, width, tokens, stop=stop))
-            scores.append(_kept_scores(layers, kept, stop))
+        stop = batch_stop_depth(
+            prepared,
+            theta=theta,
+            verify_ms=verify_ms,
+            layer_rows=layer_rows,
+            width=int(width),
+        )
+        scores = []
+        ratios = []
+        for tree in prepared:
+            end = min(int(stop), len(tree["layers"]))
+            scores.append(_kept_scores(tree["layers"], tree["kept"], end))
             ratios.append(float(tree["ratio"]))
-            stops.append(int(stop))
         k_prime = _select_replay_k(scores, ratios, theta, verify_ms, int(hold["k"]))
+        accepts = [
+            replay_accept_k(
+                tree["layers"],
+                tree["kept"],
+                tree["tokens"],
+                min(int(stop), len(tree["layers"])),
+                k_prime,
+            )
+            for tree in prepared
+        ]
         model_actual = _schedule_ms(layer_rows, built, len(layer_rows), verify_ms, int(hold["k"]))
         model_cand = _schedule_ms(
-            layer_rows, int(width), max(stops) if stops else 0, verify_ms, k_prime
+            layer_rows,
+            int(width),
+            max(int(stop) - 1, 0),
+            verify_ms,
+            k_prime,
         )
         measured = hold.get("measured_ms")
         if measured is None or model_actual is None or model_cand is None:

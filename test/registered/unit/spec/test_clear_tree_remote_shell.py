@@ -33,7 +33,7 @@ def _args(**overrides):
         clear_tree_tau=0.5,
         clear_tree_max_depth=8,
         clear_tree_addr="127.0.0.1",
-        clear_tree_port="30039",
+        clear_tree_port="30019",
         opt_tree_role=None,
         opt_tree_width=None,
         opt_tree_max_depth=None,

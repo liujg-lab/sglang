@@ -412,6 +412,11 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
         batch_failed = True
     if batch_failed or any(window is None for window in windows):
         get_sr_round_metrics(scheduler, "Draft").counts["opt_batch_fallbacks"] += 1
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            install_fallback_plan,
+        )
+
+        install_fallback_plan(scheduler, reqs)
     for i, window in enumerate(windows):
         if window is None:
             windows[i] = scheduler._clear_expand_one(reqs[i])

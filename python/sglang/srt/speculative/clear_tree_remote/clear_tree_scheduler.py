@@ -74,7 +74,7 @@ def make_clear_tree_transport(server_args):
     """Bind or connect the OPT RPC socket. Addresses come from ``--clear-tree-*``."""
     role = server_args.clear_tree_role
     addr = server_args.clear_tree_addr or "127.0.0.1"
-    port = str(server_args.clear_tree_port or "30039")
+    port = str(server_args.clear_tree_port or "30019")
     if role == "draft":
         return ClearDraftServer(addr, port)
     timeout_ms = int(
@@ -336,7 +336,11 @@ class ClearTreeSchedulerMixin:
             SRPendingEntry,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            restore_verify_samples,
             take_verify_samples,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
         )
 
         clear_action = as_clear_action(action)
@@ -370,8 +374,10 @@ class ClearTreeSchedulerMixin:
         self.sr_rpc_seq += 1
         rpc_seq = self.sr_rpc_seq
         samples = None
+        sample_metrics = None
         if self.tp_size == 1 or self.tp_rank == 0:
-            samples = take_verify_samples(get_sr_round_metrics(self, "Target")) or None
+            sample_metrics = get_sr_round_metrics(self, "Target")
+            samples = take_verify_samples(sample_metrics) or None
         batch = ClearBatchRequest(
             session_id=self.sr_session_id,
             rpc_seq=rpc_seq,
@@ -394,6 +400,8 @@ class ClearTreeSchedulerMixin:
                     send_ok = False
         if self.tp_size > 1:
             send_ok = self._sr_broadcast_obj(send_ok)
+        if not send_ok and samples:
+            restore_verify_samples(sample_metrics, samples)
         return SRInflight(
             session_id=self.sr_session_id,
             rpc_seq=rpc_seq,

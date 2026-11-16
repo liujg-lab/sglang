@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
+    align_draft_row,
     build_tree_from_parents,
     clear_opt_no_draft_links,
     pack_verify_draft_token,
@@ -119,11 +120,8 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         parent_rows: List[List[int]] = []
         no_draft: List[bool] = []
         for tokens, parents in zip(raw_tokens, raw_parents):
-            missing = len(tokens) != verify_k or len(parents) != verify_k
+            tokens, parents, missing = align_draft_row(tokens, parents, verify_k)
             no_draft.append(missing)
-            if missing:
-                tokens = (tokens + [0] * verify_k)[:verify_k]
-                parents = (parents + [-2] * verify_k)[:verify_k]
             token_rows.append(tokens)
             parent_rows.append(parents)
         num_verify = verify_k + 1

@@ -97,6 +97,26 @@ def opt_parent_slots(
     return slots
 
 
+def align_draft_row(tokens, parents, verify_k: int):
+    """Pad a shorter captured K with parent -2. Other short rows stay no-draft.
+
+    A row whose length is 8, 16, or 32 and is below this batch's K keeps its
+    real prefix. Anything else that is not already ``verify_k`` long is dropped.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import VERIFY_KS
+
+    length = len(tokens)
+    limit = int(verify_k)
+    if length in VERIFY_KS and length < limit and len(parents) == length:
+        pad = limit - length
+        return list(tokens) + [0] * pad, list(parents) + [-2] * pad, False
+    missing = length != limit or len(parents) != limit
+    if missing:
+        tokens = (list(tokens) + [0] * limit)[:limit]
+        parents = (list(parents) + [-2] * limit)[:limit]
+    return list(tokens), list(parents), missing
+
+
 def clear_opt_no_draft_links(
     retrive_next_token: torch.Tensor,
     retrive_next_sibling: torch.Tensor,

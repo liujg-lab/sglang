@@ -36,6 +36,14 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
     if server_args.clear_tree_role not in ("target", "draft"):
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-role {target|draft}.")
     if (
+        server_args.clear_tree_role == "draft"
+        and int(getattr(server_args, "tp_size", 1) or 1) > 1
+    ):
+        raise ValueError(
+            "CLEAR_TREE_REMOTE draft does not support tp_size > 1; "
+            "the verify ledger is rank 0 only."
+        )
+    if (
         server_args.speculative_verify_mode == "rpd"
         and server_args.clear_tree_role != "target"
     ):

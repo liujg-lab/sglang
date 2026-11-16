@@ -1,11 +1,12 @@
 """Shadow cost ledger for CLEAR_TREE_REMOTE.
 
-Records the time ledger and layer forwards, and fits layer and verify cost
-in the background. Predictions are logged only. Tree width, tau, and the
-reply bytes stay on the existing fixed-N path.
+Records the time ledger and layer forwards, and fits layer and verify cost.
+Draft uses the layer fit when it stops a tree. Verify decisions use the
+samples Target sends back, not the regression logged here.
 
-``SGLANG_CLEAR_LEDGER=1`` turns it on. Default is off. Only tp rank 0 logs
-and fits.
+``SGLANG_CLEAR_LEDGER=1`` on both roles turns the online K and W controllers
+on. Default is off. Only tp rank 0 logs and fits. With the switch off, every
+round stays on tau and the largest verify tier.
 """
 
 from __future__ import annotations
@@ -320,8 +321,13 @@ class ClearLedger:
         if name == "prefill":
             self.active_rids.update(str(rid) for rid in rids)
         elif name in ("finish", "abort"):
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                forget_request,
+            )
+
             for rid in rids:
                 self.active_rids.discard(str(rid))
+                forget_request(str(rid))
 
     def note_idle(self) -> None:
         """The recv loop found no packet. This is a wait, not an empty server."""
@@ -633,18 +639,20 @@ def note_packet(scheduler, batch) -> None:
     serial = int(getattr(scheduler, "_clear_build_serial", 0) or 0) + 1
     scheduler._clear_build_serial = serial
     scheduler._clear_build_token = serial
+    scheduler._clear_plan_fallback = False
+    reqs = list(getattr(batch, "reqs", None) or [])
+    rids = [str(getattr(req, "rid", "")) for req in reqs]
+    # Snapshot packets also carry output-only ``committed_ids``. The prefix
+    # used for theta and c_i is always the Target base length.
+    prefix = [int(getattr(req, "base_committed_len", 0) or 0) for req in reqs]
+    stored = dict(getattr(scheduler, "_clear_target_prefix", None) or {})
+    for rid, length in zip(rids, prefix):
+        if rid:
+            stored[rid] = int(length)
+    scheduler._clear_target_prefix = stored
     closed = {}
 
     def _run(ledger: ClearLedger) -> None:
-        reqs = list(getattr(batch, "reqs", None) or [])
-        rids = [str(getattr(req, "rid", "")) for req in reqs]
-        prefix = []
-        for req in reqs:
-            ids = getattr(req, "committed_ids", None)
-            if ids is not None:
-                prefix.append(len(ids))
-            else:
-                prefix.append(int(getattr(req, "base_committed_len", 0) or 0))
         width = int(scheduler.server_args.clear_tree_width)
         record = ledger.on_packet(
             batch.action,
@@ -922,6 +930,14 @@ def take_verify_samples(metrics) -> list:
     queue = list(getattr(metrics, "_clear_verify_samples", None) or [])
     metrics._clear_verify_samples = []
     return queue
+
+
+def restore_verify_samples(metrics, samples) -> None:
+    """Put samples back after a send that did not leave this process."""
+    if metrics is None or not samples:
+        return
+    queued = list(getattr(metrics, "_clear_verify_samples", None) or [])
+    metrics._clear_verify_samples = list(samples) + queued
 
 
 def install_clear_device_emit(metrics) -> None:

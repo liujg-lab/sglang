@@ -16,9 +16,12 @@ The layer cost is only the requests that would be forwarded.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import Dict, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     BONUS_NTPBS,
@@ -36,6 +39,10 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
 VERIFY_KS = (8, 16, 32)
 WARMUP_ROUNDS = 10
 PROBE_PER_K = 2
+PROBE_MAX_SENDS = 6
+PROBE_INFLIGHT_ROUNDS = 8
+VERIFY_WINDOW = 16
+SAMPLE_GAP_ROUNDS = 50
 CALIBRATE_LAMBDA = 3.0
 PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
@@ -52,13 +59,21 @@ _sum_e: Dict[str, float] = {}
 _total_a = 0.0
 _total_e = 0.0
 _pending: Dict[str, dict] = {}
-_probes: Dict[tuple, Dict[int, int]] = {}
+_probe_sent: Dict[tuple, int] = {}
+_probe_inflight: Dict[tuple, int] = {}
+_probe_warned: set = set()
 _rounds = 0
+_saw_verify_samples = False
+_rounds_without_samples = 0
+_sample_gap_warned = False
+_bucket_warned = False
 
 
 def reset_policy() -> None:
     """Drop prices, accept ratios, probe counts, verify samples, and replay."""
     global _total_a, _total_e, _rounds
+    global _saw_verify_samples, _rounds_without_samples, _sample_gap_warned
+    global _bucket_warned
     _clock.clear()
     _clock_count.clear()
     _price_n.clear()
@@ -67,7 +82,13 @@ def reset_policy() -> None:
     _sum_a.clear()
     _sum_e.clear()
     _pending.clear()
-    _probes.clear()
+    _probe_sent.clear()
+    _probe_inflight.clear()
+    _probe_warned.clear()
+    _saw_verify_samples = False
+    _rounds_without_samples = 0
+    _sample_gap_warned = False
+    _bucket_warned = False
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         reset_replay_state,
     )
@@ -99,9 +120,8 @@ def request_terms(state, k: int) -> tuple:
     return _prefix_mass(_path_scores(state), int(k)), _marginal_gain(state, int(k))
 
 
-def select_continuing(
-    all_states,
-    eligible,
+def keep_by_net_benefit(
+    requests,
     *,
     theta: float,
     verify_times: Dict[int, float],
@@ -110,13 +130,13 @@ def select_continuing(
 ) -> Optional[list]:
     """Requests to forward, or None when no candidate has a layer cost.
 
-    ``J`` uses every tree in the round. ``T`` is the caller's verify time for
-    the full batch. The layer cost is charged only for the ``m`` requests that
-    would continue. An empty list means stop. Ties keep the larger K, then
-    the larger group.
+    Each request maps ``e`` and ``g`` from K to path mass and marginal gain,
+    plus ``ell``, ``c``, ``item``, and ``growing``. ``J`` uses every request.
+    The layer cost is charged only for the ``m`` requests that would continue.
+    An empty list means stop. Ties keep the larger K, then the larger group.
     """
-    states = list(all_states)
-    growing = list(eligible)
+    rows = list(requests)
+    growing = [row for row in rows if row.get("growing", True)]
     if not growing:
         return []
     price = float(theta)
@@ -127,14 +147,13 @@ def select_continuing(
         if spent is None or int(k) not in VERIFY_KS:
             continue
         benefit = 0.0
-        per_state = {}
-        for state in states:
-            ratio = accept_ratio(str(getattr(state, "rid", "")))
-            mass, gain = request_terms(state, int(k))
-            benefit += ratio * mass
-            per_state[id(state)] = ratio * gain
+        per_row = {}
+        for row in rows:
+            ratio = float(row["c"])
+            benefit += ratio * float(row["e"].get(int(k), 0.0))
+            per_row[id(row)] = ratio * float(row["g"].get(int(k), 0.0))
         joint[int(k)] = benefit - price * float(spent)
-        gains[int(k)] = per_state
+        gains[int(k)] = per_row
     if not joint:
         return None
     stop_value = max(joint.values())
@@ -142,14 +161,14 @@ def select_continuing(
     any_cost = False
     for k, base in joint.items():
         ranked = []
-        for state in growing:
-            gain = float(gains[k].get(id(state), 0.0))
-            ell = int(getattr(state, "prefix", 0) or 0)
-            ranked.append((gain - price * slope * ell, gain, ell, state))
+        for row in growing:
+            gain = float(gains[k].get(id(row), 0.0))
+            ell = int(row["ell"])
+            ranked.append((gain - price * slope * ell, gain, ell, row["item"]))
         ranked.sort(key=lambda item: item[0], reverse=True)
         running_gain = 0.0
         running_ell = 0
-        for m, (_net, gain, ell, _state) in enumerate(ranked, start=1):
+        for m, (_net, gain, ell, _item) in enumerate(ranked, start=1):
             running_gain += gain
             running_ell += ell
             cost = layer_cost(m, running_ell)
@@ -167,8 +186,48 @@ def select_continuing(
     return []
 
 
+def select_continuing(
+    all_states,
+    eligible,
+    *,
+    theta: float,
+    verify_times: Dict[int, float],
+    layer_cost,
+    kappa: Optional[float],
+) -> Optional[list]:
+    """Requests to forward, or None when no candidate has a layer cost."""
+    growing_ids = {id(state) for state in eligible}
+    requests = []
+    for state in list(all_states):
+        mass = {}
+        gain = {}
+        for k in VERIFY_KS:
+            path, marginal = request_terms(state, int(k))
+            mass[int(k)] = path
+            gain[int(k)] = marginal
+        requests.append(
+            {
+                "e": mass,
+                "g": gain,
+                "ell": int(getattr(state, "prefix", 0) or 0),
+                "c": accept_ratio(str(getattr(state, "rid", ""))),
+                "item": state,
+                "growing": id(state) in growing_ids,
+            }
+        )
+    return keep_by_net_benefit(
+        requests,
+        theta=theta,
+        verify_times=verify_times,
+        layer_cost=layer_cost,
+        kappa=kappa,
+    )
+
+
 def ingest_verify_samples(samples) -> None:
     """Record samples carried on one ClearTree request. ``device_us`` is microseconds."""
+    global _saw_verify_samples
+    got = False
     for sample in list(samples or []):
         if not isinstance(sample, (list, tuple)) or len(sample) != 4:
             continue
@@ -176,6 +235,9 @@ def ingest_verify_samples(samples) -> None:
         if device_us is None:
             continue
         observe_verify(int(batch), int(k), int(bucket), float(device_us) / 1000.0)
+        got = True
+    if got:
+        _saw_verify_samples = True
 
 
 def locked_k_from_env() -> Optional[int]:
@@ -187,12 +249,20 @@ def locked_k_from_env() -> Optional[int]:
 
 
 def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None:
-    """One clean graph verify. Eager and over-bucket rows are not recorded."""
+    """One clean graph verify. Eager and over-bucket rows are not recorded.
+
+    Each cell keeps the latest ``VERIFY_WINDOW`` samples. A sample that
+    arrives also retires the in-flight probe for that cell.
+    """
     if int(k) not in VERIFY_KS or bucket is None or ms is None:
         return
     key = (int(batch), int(k), int(bucket))
-    _clock.setdefault(key, []).append(float(ms))
+    rows = _clock.setdefault(key, [])
+    rows.append(float(ms))
+    if len(rows) > VERIFY_WINDOW:
+        del rows[:-VERIFY_WINDOW]
     _clock_count[int(k)] = _clock_count.get(int(k), 0) + 1
+    _probe_inflight.pop(key, None)
 
 
 def verify_ready(k: int) -> bool:
@@ -431,34 +501,104 @@ def settle_verified(rids: Sequence[str], prefixes: Sequence[int]) -> None:
         item = _pending.pop(rid)
         if rid not in found:
             continue
-        observe_accept(rid, found[rid] - int(item["prefix"]), float(item["e"]))
+        delta = int(found[rid]) - int(item["prefix"])
+        observe_accept(rid, max(delta - 1, 0), float(item["e"]))
 
 
-def _take_probe(
-    bucket: Optional[int], max_ell: int, buckets: Sequence[int], batch: int
-) -> Optional[int]:
-    """Lock the next K that still fits this prefix.
+def forget_request(rid: str) -> None:
+    """Drop one request's accept totals. The pooled shrink target stays."""
+    key = str(rid)
+    _sum_a.pop(key, None)
+    _sum_e.pop(key, None)
+    _pending.pop(key, None)
 
-    Each batch size keeps its own quota inside a KV bucket, so a new
-    concurrency starts again at K = 8.
+
+def _note_sample_gap() -> None:
+    """Warn once when the Draft ledger goes 50 rounds without verify samples."""
+    global _saw_verify_samples, _rounds_without_samples, _sample_gap_warned
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        ledger_enabled,
+    )
+
+    if not ledger_enabled():
+        return
+    if _saw_verify_samples:
+        _saw_verify_samples = False
+        _rounds_without_samples = 0
+        _sample_gap_warned = False
+        return
+    _rounds_without_samples += 1
+    if _rounds_without_samples >= SAMPLE_GAP_ROUNDS and not _sample_gap_warned:
+        _sample_gap_warned = True
+        logger.warning(
+            "[CLEAR] Draft ledger has seen no verify_samples for %s rounds",
+            SAMPLE_GAP_ROUNDS,
+        )
+
+
+def _warn_bucket_lists() -> None:
+    """One warning when Draft and Target KV bucket lists are both set and differ."""
+    global _bucket_warned
+    if _bucket_warned:
+        return
+    raw_draft = os.environ.get("SGLANG_CLEAR_NPU_KV_BUCKETS", "").strip()
+    raw_target = os.environ.get("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS", "").strip()
+    if not raw_draft or not raw_target:
+        return
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        configured_buckets,
+        runtime_kv_buckets,
+    )
+
+    if tuple(configured_buckets()) == tuple(runtime_kv_buckets()):
+        return
+    _bucket_warned = True
+    logger.warning(
+        "[CLEAR] SGLANG_CLEAR_NPU_KV_BUCKETS and "
+        "SGLANG_NPU_TREE_GRAPH_KV_BUCKETS differ; verify samples use the Target list"
+    )
+
+
+def _take_probe(max_ell: int, buckets: Sequence[int], batch: int) -> Optional[int]:
+    """Send the next K whose own bucket still needs arrived samples.
+
+    The cell is ``(b, K, S(max_ell + K + 1))``. A send stays in flight for
+    ``PROBE_INFLIGHT_ROUNDS`` rounds. After ``PROBE_MAX_SENDS`` the cell is
+    left on tau. Arrivals are not a quota that is spent at send time.
     """
-    if bucket is None:
-        return None
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         smallest_bucket,
     )
 
-    key = (int(bucket), int(batch))
-    row = _probes.get(key)
-    if row is None:
-        row = {int(k): PROBE_PER_K for k in VERIFY_KS}
-        _probes[key] = row
     for k in VERIFY_KS:
-        if smallest_bucket(int(max_ell) + int(k) + 1, buckets) is None:
+        bucket = smallest_bucket(int(max_ell) + int(k) + 1, buckets)
+        if bucket is None:
             continue
-        if row[k] > 0:
-            row[k] -= 1
-            return int(k)
+        key = (int(batch), int(k), int(bucket))
+        if len(_clock.get(key, ())) >= PROBE_PER_K:
+            _probe_inflight.pop(key, None)
+            continue
+        sent = int(_probe_sent.get(key, 0))
+        if sent >= PROBE_MAX_SENDS:
+            if key not in _probe_warned:
+                _probe_warned.add(key)
+                logger.warning(
+                    "[CLEAR] verify probe for b=%s K=%s bucket=%s stopped after %s sends",
+                    int(batch),
+                    int(k),
+                    int(bucket),
+                    PROBE_MAX_SENDS,
+                )
+            continue
+        inflight = _probe_inflight.get(key)
+        if (
+            inflight is not None
+            and int(_rounds) - int(inflight) < PROBE_INFLIGHT_ROUNDS
+        ):
+            continue
+        _probe_sent[key] = sent + 1
+        _probe_inflight[key] = int(_rounds)
+        return int(k)
     return None
 
 
@@ -539,7 +679,8 @@ class RoundPlan:
         if int(state.depth) >= int(state.config.max_depth) - 1:
             return False
         if self.use_tau or self.theta_value is None or self.layer_ms is None:
-            return depth_rule(state)
+            keep = int(self.k) if self.use_tau else None
+            return depth_rule(state, keep)
         if self._at != int(state.depth):
             peers = list(self._peers or [state])
             eligible = [
@@ -568,11 +709,18 @@ class RoundPlan:
 
     def note(self, state) -> None:
         rid = getattr(state, "rid", None)
-        prefix = getattr(state, "prefix", None)
-        if rid is None or prefix is None:
+        if rid is None:
+            return
+        stored = getattr(self._scheduler, "_clear_target_prefix", None) or {}
+        key = str(rid)
+        if key in stored:
+            prefix = int(stored[key])
+        elif getattr(state, "prefix", None) is not None:
+            prefix = int(state.prefix)
+        else:
             return
         scores = _path_scores(state)
-        note_verified(str(rid), int(prefix), _prefix_mass(scores, self.verify_k(state)))
+        note_verified(key, prefix, _prefix_mass(scores, self.verify_k(state)))
 
     def _choose_keep(self, eligible) -> list:
         times = {}
@@ -656,40 +804,56 @@ class RoundPlan:
         return values
 
 
+def _draft_prefix(req) -> int:
+    """Draft KV length. Layer cost uses this, not the Target prefix."""
+    return len(getattr(req, "origin_input_ids", None) or []) + len(
+        getattr(req, "output_ids", None) or []
+    )
+
+
+def _plan_prefix(scheduler, req, draft_len: int) -> int:
+    """Target committed length when this packet stored one, else the Draft length."""
+    stored = getattr(scheduler, "_clear_target_prefix", None) or {}
+    rid = str(getattr(req, "rid", ""))
+    if rid in stored:
+        return int(stored[rid])
+    return int(draft_len)
+
+
 def make_round(scheduler, reqs) -> RoundPlan:
     """Choose W and the warmup, probe, or value rule for these requests."""
     global _rounds
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        configured_buckets,
+        ledger_enabled,
         predict_layer_ms,
+        runtime_kv_buckets,
         smallest_bucket,
     )
 
-    batch = max(len(list(reqs)), 1)
+    reqs = list(reqs)
+    batch = max(len(reqs), 1)
+    drafts = [_draft_prefix(req) for req in reqs]
     prefixes = [
-        len(getattr(req, "origin_input_ids", None) or [])
-        + len(getattr(req, "output_ids", None) or [])
-        for req in reqs
+        _plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)
     ]
     max_ell = max(prefixes) if prefixes else 0
-    buckets = configured_buckets()
+    buckets = runtime_kv_buckets()
+    _warn_bucket_lists()
     _rounds += 1
-    regime = smallest_bucket(max_ell + 1, buckets)
+    _note_sample_gap()
+    greedy = _requests_greedy(reqs)
+    ledger_on = ledger_enabled()
     locked_env = locked_k_from_env()
-    probe = (
-        None
-        if locked_env is not None
-        else _take_probe(regime, max_ell, buckets, batch)
-    )
+    probe = None
+    if locked_env is None and ledger_on and greedy:
+        probe = _take_probe(max_ell, buckets, batch)
     price = theta(batch)
     eligible = (
         _rounds > WARMUP_ROUNDS
         and probe is None
         and locked_env is None
-        and _requests_greedy(reqs)
-    )
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        ledger_enabled,
+        and greedy
+        and ledger_on
     )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         _cached_build_width,
@@ -698,10 +862,10 @@ def make_round(scheduler, reqs) -> RoundPlan:
     width, kind = _cached_build_width(
         scheduler,
         batch,
-        ledger_on=ledger_enabled(),
+        ledger_on=ledger_on,
         eligible=eligible,
     )
-    layer_ms = predict_layer_ms(scheduler, width, batch, sum(prefixes))
+    layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     usable = [
         int(k)
         for k in VERIFY_KS
@@ -712,6 +876,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     )
     use_tau = (
         locked_env is not None
+        or not ledger_on
+        or not greedy
         or _rounds <= WARMUP_ROUNDS
         or probe is not None
         or price is None
@@ -741,19 +907,87 @@ def make_round(scheduler, reqs) -> RoundPlan:
     )
     plan.replay_kind = kind
     plan.replay_eligible = eligible
+    plan.fallback = False
+    return plan
+
+
+def make_fallback_round(scheduler, reqs) -> RoundPlan:
+    """Tau and the largest fitting K. Does not count a round or take a probe."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        runtime_kv_buckets,
+    )
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        persistent_width,
+    )
+
+    reqs = list(reqs)
+    batch = max(len(reqs), 1)
+    drafts = [_draft_prefix(req) for req in reqs]
+    prefixes = [
+        _plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)
+    ]
+    max_ell = max(prefixes) if prefixes else 0
+    buckets = runtime_kv_buckets()
+    chosen = max(fitting_ks(max_ell, buckets))
+    plan = RoundPlan(
+        width=persistent_width(batch),
+        k=chosen,
+        use_tau=True,
+        locked_k=chosen,
+        theta_value=theta(batch),
+        layer_ms=None,
+        max_ell=max_ell,
+        batch=batch,
+        buckets=buckets,
+        scheduler=scheduler,
+    )
+    plan.replay_kind = "ordinary"
+    plan.replay_eligible = False
+    plan.fallback = True
+    return plan
+
+
+def _bind_round(scheduler, plan, reqs) -> None:
+    """Publish the plan. Prefixes stored here stay on the Draft length."""
+    scheduler._clear_round_plan = plan
+    scheduler._clear_round_rids = [getattr(req, "rid", "") for req in reqs]
+    scheduler._clear_round_prefixes = [_draft_prefix(req) for req in reqs]
+
+
+def install_fallback_plan(scheduler, reqs) -> RoundPlan:
+    """One degraded plan for every per-request rebuild of this packet."""
+    token = getattr(scheduler, "_clear_build_token", None)
+    plan = make_fallback_round(scheduler, reqs)
+    scheduler._clear_plan_fallback = True
+    scheduler._clear_fallback_plan = (token, plan)
+    _bind_round(scheduler, plan, reqs)
     return plan
 
 
 def attach_round(scheduler, reqs) -> RoundPlan:
-    """Store the round plan where the grow loop can see it."""
-    plan = make_round(scheduler, reqs)
-    scheduler._clear_round_plan = plan
-    scheduler._clear_round_rids = [getattr(req, "rid", "") for req in reqs]
-    scheduler._clear_round_prefixes = [
-        len(getattr(req, "origin_input_ids", None) or [])
-        + len(getattr(req, "output_ids", None) or [])
-        for req in reqs
-    ]
+    """Store the round plan where the grow loop can see it.
+
+    The second attach for one ``_clear_build_token`` is the batch-build
+    fallback: tau, K locked to the largest tier, and no extra round or probe.
+    """
+    token = getattr(scheduler, "_clear_build_token", None)
+    if getattr(scheduler, "_clear_plan_fallback", False):
+        cached = getattr(scheduler, "_clear_fallback_plan", None)
+        if isinstance(cached, tuple) and cached[0] == token:
+            plan = cached[1]
+        else:
+            plan = make_fallback_round(scheduler, reqs)
+            scheduler._clear_fallback_plan = (token, plan)
+    else:
+        cached = getattr(scheduler, "_clear_primary_plan", None)
+        if isinstance(cached, tuple) and cached[0] == token:
+            plan = make_fallback_round(scheduler, reqs)
+            scheduler._clear_plan_fallback = True
+            scheduler._clear_fallback_plan = (token, plan)
+        else:
+            plan = make_round(scheduler, reqs)
+            scheduler._clear_primary_plan = (token, plan)
+    _bind_round(scheduler, plan, reqs)
     return plan
 
 

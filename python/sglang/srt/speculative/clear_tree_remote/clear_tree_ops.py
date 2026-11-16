@@ -382,24 +382,27 @@ def host_topk_rows(
     return _host_scores_and_ids(scores, ids)
 
 
-def acceptance_mass(state: ClearTreeState) -> torch.Tensor:
-    """E on ``weight[:depth]``, every layer added so far."""
+def acceptance_mass(state: ClearTreeState, keep: Optional[int] = None) -> torch.Tensor:
+    """E on ``weight[:depth]``. ``keep`` is the verify count; width is the default."""
     if state.depth < 1:
         raise RuntimeError("acceptance mass needs a seeded tree")
     flat = state.weight[: state.depth].reshape(-1)
-    return torch.topk(flat, k=state.config.width, dim=-1).values.sum()
+    limit = int(state.config.width if keep is None else keep)
+    k = min(max(limit, 1), int(flat.numel()))
+    return torch.topk(flat, k=k, dim=-1).values.sum()
 
 
-def depth_rule(state: ClearTreeState) -> bool:
+def depth_rule(state: ClearTreeState, keep: Optional[int] = None) -> bool:
     """True when the latest layer should be forwarded and expanded again.
 
     The comparison stays in fp32. This does not write ``prev_e``.
     ``depth < max_depth - 1`` is the reference ``depth < max_depth`` check
-    after the extra layer, without building that layer.
+    after the extra layer, without building that layer. Tau rounds pass the
+    locked verify count as ``keep`` so the mass matches that K.
     """
     if state.prev_e is None:
         raise RuntimeError("prev_e is missing")
-    e = acceptance_mass(state)
+    e = acceptance_mass(state, keep)
     grow = (e - state.prev_e) > state.config.tau
     return bool(grow.item()) and state.depth < state.config.max_depth - 1
 
@@ -567,7 +570,10 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
     decider = getattr(state, "decider", None)
     grow = decider.should_grow(state) if decider is not None else depth_rule(state)
     if grow:
-        state.prev_e = acceptance_mass(state)
+        keep = None
+        if decider is not None and getattr(decider, "use_tau", False):
+            keep = int(decider.k)
+        state.prev_e = acceptance_mass(state, keep)
         return ClearTreeStep(
             is_final=False,
             tokens=state.tokens[state.depth - 1].clone(),
