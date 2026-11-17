@@ -1,0 +1,17 @@
+{
+  "run_id": "2026-11-17-a",
+  "experiment": "e2e",
+  "voided": false,
+  "void_reason": "",
+  "target_git": "1518066e75fd8227c52b1b80e1d9b46821915810",
+  "draft_git": "bf6fb6d22da73becb48272ed95caa13cbb3f0cea",
+  "target_dirty": true,
+  "draft_dirty": true,
+  "ledger": "on c1, on c4, then off c1 and off c4",
+  "target_backend": "npu",
+  "kv_buckets": "256,512,1024,2048,4096",
+  "clear_tree_widths": "2 4 8 16 32 64",
+  "clear_tree_ks": "2 4 8 16 32 64",
+  "temperature": 0,
+  "notes": "Cold start for each ledger-on concurrency. Ledger-off is one cold start with concurrency 1 then 4. cuda graph batch sizes 1 2 4 on both roles. text_only first 100, max_new_tokens 1024. Not A B A B. Draft patch is the clear_tree_remote and ledger test diff. Target clear_tree_remote is the synced package."
+}

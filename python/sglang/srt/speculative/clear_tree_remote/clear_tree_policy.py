@@ -4,23 +4,27 @@ W and the tau verify count start from a fixed table. Batch size 1 uses width
 8 and K 16. Every other batch uses width 4 and K 8. Eligible rounds first
 build the next narrower width when that width has not run for 300 rounds.
 That burst lasts until the width has four layer samples, at most four
-rounds, and two rounds once the fit exists. Every 20th eligible round that
-is not one of those builds the next wider candidate. A shadow replay may replace the served width when that
-candidate's gain clears 3 percent. A narrower replacement is only the next
-smaller candidate and needs 30 paired rounds. A wider one needs 10. Measured
-bias is logged and does not gate the switch. Online K stays inside the tiers
-that can hold the tree. The default candidates are 2, 4, 8, 16, 32, and 64.
-Target graphs are captured at K + 1, so a short tree is padded only inside
-the graph of the K that was chosen.
+rounds, and two rounds once the fit exists. A narrow width that already has
+four samples but cannot price this round's prefix sum is built for one
+round after 20 eligible rounds. Every 20th eligible round that is not one
+of those builds the next wider candidate. A shadow replay may replace the
+served width when that candidate's gain clears 3 percent. Either replacement
+needs 30 paired rounds, and a narrower one is only the next smaller
+candidate. Measured bias is logged and does not gate the switch. Online K
+stays inside the tiers that can hold the tree and that already have a
+sample. The default candidates are 2, 4, 8, 16, 32, and 64. Target graphs
+are captured at K + 1, so a short tree is padded only inside the graph of
+the K that was chosen.
 
-Warmup, K-probe rounds, and rounds whose verify or layer sample is still
-short keep the tau stop and the flat K. A K-probe round locks the probed K.
-Probes reach the covering tier of the next wider width, or the served width
-when it is already the widest. Past ``max(54, 5% of rounds)`` probes, that
-round does not take another probe. A cell that still lacks samples stays on
-tau because it is not ready. A cell that already has samples keeps the value
-rule. Ordinary rounds ready and choose K only inside the covering tier of the
-width built for that round, which for an ordinary round is the served width.
+K-probe rounds, and rounds whose flat tier or layer sample is still short,
+keep the tau stop and the flat K. A K-probe round locks the probed K.
+Probes start only after that flat tier has a sample, skip the tier, and
+take the nearest other tier first. Each of those tiers is probed until it
+has two samples. The flat tier above the cover is replaced by the largest
+tier inside it. Past ``max(2 * K tiers, rounds / 20)`` probes, the round
+keeps choosing among tiers that already have a sample. A cell whose flat
+tier still lacks a sample stays on tau and does not probe. Ordinary rounds
+choose K only inside the covering tier of the width built for that round.
 Other rounds stop by comparing one J across verify counts at or below that
 tier: keep the prefix of requests whose next layer is worth more than
 verifying now. The final K is also at or below the tier that covers the nodes
@@ -53,21 +57,14 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     flat_width,
     persistent_width,
 )
-WARMUP_ROUNDS = 10
-PROBE_PER_K = 2
-PROBE_MAX_SENDS = 6
-PROBE_INFLIGHT_ROUNDS = 8
-PROBE_ROUND_FLOOR = 54
-PROBE_ROUND_FRACTION = 0.05
+EXPLORE_EVERY = 20
+PROBE_RUNS = 2
 VERIFY_WINDOW = 16
 CALIBRATE_LAMBDA = 3.0
 PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
-PRICE_PRIOR_EXP = 0.8
-PAD_PARENT = -2
 
 _clock: Dict[tuple, list] = {}
-_clock_count: Dict[int, int] = {}
 _price_n: Dict[int, int] = {}
 _price_tok: Dict[int, float] = {}
 _price_ms: Dict[int, float] = {}
@@ -76,9 +73,6 @@ _sum_e: Dict[str, float] = {}
 _total_a = 0.0
 _total_e = 0.0
 _pending: Dict[str, dict] = {}
-_probe_sent: Dict[tuple, int] = {}
-_probe_inflight: Dict[tuple, int] = {}
-_probe_warned: set = set()
 _rounds = 0
 _probe_rounds = 0
 _bucket_warned = False
@@ -95,10 +89,6 @@ def on_external_event(scheduler) -> None:
     """
     global _probe_rounds
     _clock.clear()
-    _clock_count.clear()
-    _probe_sent.clear()
-    _probe_inflight.clear()
-    _probe_warned.clear()
     _probe_rounds = 0
     _pending.clear()
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -125,16 +115,12 @@ def reset_policy() -> None:
     global _total_a, _total_e, _rounds, _probe_rounds
     global _bucket_warned
     _clock.clear()
-    _clock_count.clear()
     _price_n.clear()
     _price_tok.clear()
     _price_ms.clear()
     _sum_a.clear()
     _sum_e.clear()
     _pending.clear()
-    _probe_sent.clear()
-    _probe_inflight.clear()
-    _probe_warned.clear()
     _bucket_warned = False
     reset_gain_calibration()
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -330,8 +316,8 @@ def locked_k_from_env() -> Optional[int]:
 def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None:
     """One clean graph verify. Eager and over-bucket rows are not recorded.
 
-    Each cell keeps the latest ``VERIFY_WINDOW`` samples. A sample that
-    arrives also retires the in-flight probe for that cell.
+    Each cell keeps the latest ``VERIFY_WINDOW`` samples. One sample is enough
+    to use that cell.
     """
     if int(k) not in VERIFY_KS or bucket is None or ms is None:
         return
@@ -340,19 +326,6 @@ def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None
     rows.append(float(ms))
     if len(rows) > VERIFY_WINDOW:
         del rows[:-VERIFY_WINDOW]
-    _clock_count[int(k)] = _clock_count.get(int(k), 0) + 1
-    _probe_inflight.pop(key, None)
-
-
-def verify_ready(k: int) -> bool:
-    """A tier is usable once it has been seen and the table has a full sample."""
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        VERIFY_MIN_SAMPLES,
-    )
-
-    if _clock_count.get(int(k), 0) < 1:
-        return False
-    return sum(_clock_count.values()) >= VERIFY_MIN_SAMPLES
 
 
 def _median(values: Sequence[float]) -> float:
@@ -382,8 +355,11 @@ def _steady_verify_samples(rows: Sequence[float]) -> list:
 
 
 def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:
-    """Device time for this batch, K, and KV bucket, after one high spike is dropped."""
-    if bucket is None or not verify_ready(k):
+    """Device time for this cell, after one high spike is dropped.
+
+    A tier is usable only when its own ``(batch, K, bucket)`` cell has a sample.
+    """
+    if bucket is None:
         return None
     rows = _clock.get((int(batch), int(k), int(bucket)))
     if not rows:
@@ -418,7 +394,7 @@ def _raw_theta(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
 
 
 def _price_prior(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
-    """log Θ = α + β·log b from the other batch sizes. One neighbor scales by b^0.8."""
+    """log Θ = α + β·log b from the other batch sizes. One neighbor scales by b/b′."""
     if int(batch) < 1:
         return None
     usable = []
@@ -433,7 +409,7 @@ def _price_prior(counts, tokens_ema, ms_ema, batch: int) -> Optional[float]:
         return None
     if len(usable) == 1:
         other_b, other_theta = usable[0]
-        return other_theta * (float(batch) / float(other_b)) ** PRICE_PRIOR_EXP
+        return other_theta * (float(batch) / float(other_b))
     xs = [math.log(float(other_b)) for other_b, _theta in usable]
     ys = [math.log(other_theta) for _other_b, other_theta in usable]
     mean_x = sum(xs) / float(len(xs))
@@ -685,56 +661,64 @@ def _flat_locked_k(batch: int, max_ell: int, buckets: Sequence[int]) -> int:
     return max(fitting)
 
 
+def _covered_flat_k(
+    batch: int, max_ell: int, buckets: Sequence[int], cover: int
+) -> int:
+    """Flat K inside ``cover``, else the largest fitting tier at or below it."""
+    preferred = _flat_locked_k(batch, max_ell, buckets)
+    fitting = [int(k) for k in fitting_ks(max_ell, buckets) if int(k) <= int(cover)]
+    if int(preferred) in fitting:
+        return int(preferred)
+    if fitting:
+        return max(fitting)
+    return int(preferred)
+
+
 def _probe_limit() -> int:
-    """Probe rounds allowed so far: at least 54, otherwise 5 percent."""
-    return max(PROBE_ROUND_FLOOR, int(PROBE_ROUND_FRACTION * _rounds))
+    """Probe rounds allowed so far: two per K tier, else one in EXPLORE_EVERY."""
+    return max(PROBE_RUNS * len(VERIFY_KS), _rounds // EXPLORE_EVERY)
+
+
+def _probe_rank(flat: int, k: int) -> tuple:
+    """Log2 distance from the flat tier. A tie keeps the smaller K."""
+    if int(flat) <= 0 or int(k) <= 0:
+        return (0, int(k))
+    return (abs(math.log2(float(k)) - math.log2(float(flat))), int(k))
 
 
 def _take_probe(
-    max_ell: int, buckets: Sequence[int], batch: int, cover: int
+    max_ell: int,
+    buckets: Sequence[int],
+    batch: int,
+    cover: int,
+    flat: int,
 ) -> Optional[int]:
-    """Send the next K whose own bucket still needs arrived samples.
+    """Send the nearest K whose own cell still has fewer than two samples.
 
-    The cell is ``(b, K, S(max_ell + K + 1))``. A send stays in flight for
-    ``PROBE_INFLIGHT_ROUNDS`` rounds. After ``PROBE_MAX_SENDS`` the cell is
-    left on tau. Tiers above ``cover`` are not probed. Arrivals are not a
-    quota that is spent at send time.
+    The flat tier is not probed. Tiers above ``cover`` are not probed. A
+    round that was excluded writes no sample, so the same cell is eligible
+    again on the next round.
     """
     global _probe_rounds
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         smallest_bucket,
     )
 
-    for k in VERIFY_KS:
-        if int(k) > int(cover):
-            continue
+    ranked = sorted(
+        (
+            int(k)
+            for k in VERIFY_KS
+            if int(k) <= int(cover) and int(k) != int(flat)
+        ),
+        key=lambda k: _probe_rank(flat, k),
+    )
+    for k in ranked:
         bucket = smallest_bucket(int(max_ell) + int(k) + 1, buckets)
         if bucket is None:
             continue
         key = (int(batch), int(k), int(bucket))
-        if len(_clock.get(key, ())) >= PROBE_PER_K:
-            _probe_inflight.pop(key, None)
+        if len(_clock.get(key, ())) >= PROBE_RUNS:
             continue
-        sent = int(_probe_sent.get(key, 0))
-        if sent >= PROBE_MAX_SENDS:
-            if key not in _probe_warned:
-                _probe_warned.add(key)
-                logger.warning(
-                    "[CLEAR] verify probe for b=%s K=%s bucket=%s stopped after %s sends",
-                    int(batch),
-                    int(k),
-                    int(bucket),
-                    PROBE_MAX_SENDS,
-                )
-            continue
-        inflight = _probe_inflight.get(key)
-        if (
-            inflight is not None
-            and int(_rounds) - int(inflight) < PROBE_INFLIGHT_ROUNDS
-        ):
-            continue
-        _probe_sent[key] = sent + 1
-        _probe_inflight[key] = int(_rounds)
         _probe_rounds += 1
         return int(k)
     return None
@@ -1007,7 +991,7 @@ def _plan_prefix(scheduler, req, draft_len: int) -> int:
 
 
 def make_round(scheduler, reqs) -> RoundPlan:
-    """Choose W and the warmup, probe, or value rule for these requests."""
+    """Choose W and the probe or value rule for these requests."""
     global _rounds
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         ledger_enabled,
@@ -1031,23 +1015,28 @@ def make_round(scheduler, reqs) -> RoundPlan:
     max_depth = _round_max_depth(scheduler)
     # A K-probe round is not eligible, so its tree stays on the served width.
     # The probe reaches one width wider, so a later exploration round can
-    # find samples for that tree's covering tier.
+    # find samples for that tree's covering tier. Probing waits until the
+    # served width's flat tier has its own sample.
     served = persistent_width(batch)
     wider = _next_wider(served)
     probe_width = served if wider is None else int(wider)
     probe_cover = _cover_for(probe_width, max_depth, fitting)
+    served_flat = _covered_flat_k(
+        batch, max_ell, buckets, _cover_for(served, max_depth, fitting)
+    )
+    flat_ready = _time_for(batch, max_ell, served_flat, buckets) is not None
     probe = None
     if (
         locked_env is None
         and ledger_on
         and greedy
+        and flat_ready
         and _probe_rounds < _probe_limit()
     ):
-        probe = _take_probe(max_ell, buckets, batch, probe_cover)
+        probe = _take_probe(max_ell, buckets, batch, probe_cover, served_flat)
     price = theta(batch)
     eligible = (
-        _rounds > WARMUP_ROUNDS
-        and probe is None
+        probe is None
         and locked_env is None
         and greedy
         and ledger_on
@@ -1061,18 +1050,16 @@ def make_round(scheduler, reqs) -> RoundPlan:
         batch,
         ledger_on=ledger_on,
         eligible=eligible,
+        sum_ell=sum(drafts),
     )
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     cover = _cover_for(width, max_depth, fitting)
-    usable = [int(k) for k in fitting if int(k) <= int(cover)]
-    ready = bool(usable) and all(
-        _time_for(batch, max_ell, k, buckets) is not None for k in usable
-    )
+    flat_tier = _covered_flat_k(batch, max_ell, buckets, cover)
+    ready = _time_for(batch, max_ell, flat_tier, buckets) is not None
     use_tau = (
         locked_env is not None
         or not ledger_on
         or not greedy
-        or _rounds <= WARMUP_ROUNDS
         or probe is not None
         or price is None
         or layer_ms is None
@@ -1085,7 +1072,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
         chosen = int(probe)
         locked = chosen
     else:
-        chosen = _flat_locked_k(batch, max_ell, buckets)
+        chosen = int(flat_tier)
         locked = chosen if use_tau else None
     plan = RoundPlan(
         width=width,
@@ -1100,6 +1087,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
         scheduler=scheduler,
     )
     plan.cover_k = int(cover)
+    plan.flat_k = int(flat_tier)
     plan.replay_kind = kind
     plan.replay_eligible = bool(eligible and not use_tau and kind != "probe_w")
     plan.fallback = False
@@ -1139,6 +1127,7 @@ def make_fallback_round(scheduler, reqs) -> RoundPlan:
     plan.cover_k = _cover_for(
         plan.width, _round_max_depth(scheduler), fitting_ks(max_ell, buckets)
     )
+    plan.flat_k = _covered_flat_k(batch, max_ell, buckets, plan.cover_k)
     plan.replay_kind = "ordinary"
     plan.replay_eligible = False
     plan.fallback = True

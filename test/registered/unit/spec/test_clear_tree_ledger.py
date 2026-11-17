@@ -563,14 +563,14 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_unseen_batch_uses_the_other_batch_prior(self):
         observe_price(1, 10.0, 10.0)
-        self.assertAlmostEqual(theta(2), 2.0 ** 0.8)
+        self.assertAlmostEqual(theta(2), 2.0)
         sched = SimpleNamespace(_clear_ledger=False)
         reqs = [
             SimpleNamespace(rid="a", origin_input_ids=[1], output_ids=[]),
             SimpleNamespace(rid="b", origin_input_ids=[1], output_ids=[]),
         ]
         plan = make_round(sched, reqs)
-        self.assertAlmostEqual(plan.theta_value, 2.0 ** 0.8)
+        self.assertAlmostEqual(plan.theta_value, 2.0)
         observe_price(4, 20.0, 40.0)
         self.assertAlmostEqual(theta(2), 2.0 ** -0.5)
 
@@ -852,10 +852,11 @@ class TestFlatWidthOnlineK(CustomTestCase):
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         locked = [make_round(sched, [req]).locked_k for _ in range(6)]
-        self.assertEqual(locked, [8, 16, 32, 16, 16, 16])
+        self.assertEqual(locked, [16, 16, 16, 16, 16, 16])
         warmed = make_round(sched, [req])
         self.assertTrue(warmed.use_tau)
         self.assertEqual(warmed.locked_k, 16)
+        self.assertEqual(policy._probe_rounds, 0)
 
     def test_new_batch_restarts_probes_at_k8(self):
         _pin_verify_ks(self)
@@ -867,14 +868,17 @@ class TestFlatWidthOnlineK(CustomTestCase):
             SimpleNamespace(rid="b", origin_input_ids=[1] * 10, output_ids=[]),
         ]
         locked = [make_round(sched, [one]).locked_k for _ in range(6)]
-        self.assertEqual(locked, [8, 16, 32, 16, 16, 16])
+        self.assertEqual(locked, [16, 16, 16, 16, 16, 16])
         again = make_round(sched, two)
         self.assertTrue(again.use_tau)
         self.assertEqual(again.locked_k, 8)
+        self.assertEqual(policy._probe_rounds, 0)
 
     def test_missing_tier_stays_on_tau_until_every_k_is_timed(self):
         _pin_verify_ks(self)
         reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
         sched = SimpleNamespace(_clear_ledger=False)
         reqs = [
             SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[]),
@@ -894,8 +898,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
             held = make_round(sched, reqs)
         self.assertTrue(held.use_tau)
         self.assertEqual(held.locked_k, 8)
+        self.assertEqual(policy._probe_rounds, 0)
         observe_verify(2, 8, 256, 10.0)
         observe_verify(2, 8, 256, 10.0)
+        observe_verify(2, 32, 256, 10.0)
         with patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
             return_value=1.0,
@@ -924,8 +930,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
         reset_policy()
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
-        for _ in range(10):
-            make_round(sched, [req])
         for k in (2, 4, 8, 16, 32, 64):
             observe_verify(1, k, 256, 10.0)
             observe_verify(1, k, 256, 10.0)
@@ -1000,19 +1004,26 @@ class TestFlatWidthOnlineK(CustomTestCase):
     def test_probe_skips_k_that_does_not_fit(self):
         _pin_verify_ks(self)
         reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
         sched = SimpleNamespace(_clear_ledger=False)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 4070, output_ids=[])
         saved = os.environ.get("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS")
         os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = "256,512,1024,2048,4096"
         try:
-            locked = [make_round(sched, [req]).locked_k for _ in range(6)]
+            observe_verify(1, 16, 4096, 10.0)
+            probed = [make_round(sched, [req]).locked_k for _ in range(2)]
+            observe_verify(1, 8, 4096, 10.0)
+            observe_verify(1, 8, 4096, 10.0)
+            rested = [make_round(sched, [req]).locked_k for _ in range(2)]
         finally:
             if saved is None:
                 os.environ.pop("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS", None)
             else:
                 os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = saved
-        self.assertEqual(locked, [8, 16, 16, 16, 16, 16])
-        self.assertNotIn(32, locked)
+        self.assertEqual(probed, [8, 8])
+        self.assertEqual(rested, [16, 16])
+        self.assertNotIn(32, probed + rested)
 
     def test_ingested_sample_is_visible_before_the_round_plan(self):
         for _ in range(4):
@@ -1040,8 +1051,9 @@ class TestFlatWidthOnlineK(CustomTestCase):
             self.assertEqual(plan.locked_k, 32)
         finally:
             os.environ.pop("SGLANG_CLEAR_LOCK_K", None)
-        nxt = make_round(sched, [req])
-        self.assertEqual(nxt.locked_k, 8)
+            nxt = make_round(sched, [req])
+        self.assertEqual(nxt.locked_k, 16)
+        self.assertEqual(policy._probe_rounds, 0)
 
     def test_truncate_drops_the_weaker_branch(self):
         layers = [
@@ -1148,6 +1160,12 @@ class TestFlatWidthOnlineK(CustomTestCase):
             observe_replay(1, 8, "ordinary", 10.0, 10.0)
         closed = None
         for _ in range(10):
+            closed = observe_replay(
+                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
+            )
+        self.assertFalse(closed["applied"])
+        self.assertEqual(persistent_width(1), 8)
+        for _ in range(20):
             closed = observe_replay(
                 1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
             )
@@ -1301,8 +1319,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
             eligible = []
             for _ in range(80):
                 plan = make_round(sched, reqs)
-                if policy._rounds <= policy.WARMUP_ROUNDS:
-                    continue
                 eligible.append(
                     (plan.width, plan.replay_kind, plan.replay_eligible)
                 )
@@ -1370,6 +1386,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_snapshot_prefix_does_not_add_the_prompt(self):
         reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
         sched = SimpleNamespace(
             server_args=SimpleNamespace(clear_tree_width=8),
             tp_rank=0,
@@ -1461,41 +1479,98 @@ class TestFlatWidthOnlineK(CustomTestCase):
     def test_probe_uses_the_sample_bucket_and_can_retry(self):
         _pin_verify_ks(self)
         reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
         sched = SimpleNamespace()
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 240, output_ids=[])
         saved = os.environ.get("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS")
         os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = "256,512,1024,2048,4096"
         try:
-            make_round(sched, [req])
-            self.assertEqual(policy._probe_sent[(1, 8, 256)], 1)
-            self.assertNotIn((1, 8, 512), policy._probe_sent)
-            for _ in range(7):
-                make_round(sched, [req])
-            self.assertEqual(policy._probe_sent[(1, 8, 256)], 1)
-            make_round(sched, [req])
-            self.assertEqual(policy._probe_sent[(1, 8, 256)], 2)
+            observe_verify(1, 16, 512, 10.0)
+            self.assertEqual(make_round(sched, [req]).locked_k, 8)
+            self.assertEqual(make_round(sched, [req]).locked_k, 8)
+            observe_verify(1, 8, 512, 10.0)
+            self.assertEqual(make_round(sched, [req]).locked_k, 8)
+            observe_verify(1, 8, 256, 10.0)
+            observe_verify(1, 8, 256, 10.0)
+            self.assertEqual(make_round(sched, [req]).locked_k, 32)
         finally:
             if saved is None:
                 os.environ.pop("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS", None)
             else:
                 os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = saved
 
-    def test_probe_cap_leaves_the_cell_on_tau(self):
-        _pin_verify_ks(self)
+    def test_probe_limit_follows_rounds_and_tier_count(self):
         reset_policy()
-        sched = SimpleNamespace()
+        policy._rounds = 100
+        self.assertEqual(policy._probe_limit(), 12)
+        policy._rounds = 1000
+        self.assertEqual(policy._probe_limit(), 50)
+
+    def test_flat_sample_alone_leaves_tau_when_probes_are_spent(self):
+        reset_policy()
+        policy._probe_rounds = 12
+        observe_verify(1, 16, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
-        with self.assertLogs(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_policy",
-            level="WARNING",
-        ) as logs:
-            for _ in range(60):
-                make_round(sched, [req])
-        self.assertEqual(policy._probe_sent[(1, 8, 256)], 6)
-        self.assertTrue(any("stopped after" in line for line in logs.output))
-        held = make_round(sched, [req])
-        self.assertTrue(held.use_tau)
-        self.assertEqual(held.locked_k, 16)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertFalse(plan.use_tau)
+        self.assertIsNone(plan.locked_k)
+        self.assertEqual(policy._probe_rounds, 12)
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        plan.begin_layer([state])
+        self.assertEqual(plan.verify_k(state), 16)
+
+    def test_nonflat_samples_stay_on_tau_and_do_not_probe(self):
+        reset_policy()
+        for k in (8, 32):
+            observe_verify(1, k, 256, 10.0)
+            observe_verify(1, k, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertTrue(plan.use_tau)
+        self.assertEqual(plan.locked_k, 16)
+        self.assertEqual(policy._probe_rounds, 0)
+
+    def test_batch_one_probes_the_nearest_tier_first(self):
+        reset_policy()
+        saved = os.environ.get("SGLANG_CLEAR_LEDGER")
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        try:
+            sched = SimpleNamespace()
+            req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+            observe_verify(1, 16, 256, 10.0)
+            order = []
+            for expected in (8, 32, 4, 64, 2):
+                for _ in range(policy.PROBE_RUNS):
+                    plan = make_round(sched, [req])
+                    self.assertTrue(plan.use_tau)
+                    self.assertEqual(plan.locked_k, expected)
+                    observe_verify(1, expected, 256, 10.0)
+                order.append(expected)
+            self.assertEqual(order, [8, 32, 4, 64, 2])
+            done = make_round(sched, [req])
+            self.assertEqual(done.locked_k, 16)
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+            else:
+                os.environ["SGLANG_CLEAR_LEDGER"] = saved
 
     def test_failed_send_puts_verify_samples_back(self):
         metrics = SimpleNamespace(_clear_verify_samples=[[1, 8, 256, 1000]])
@@ -1517,7 +1592,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.locked_k, 8)
         self.assertFalse(plan.replay_eligible)
         self.assertEqual(policy._rounds, 0)
-        self.assertEqual(policy._probe_sent, {})
+        self.assertEqual(policy._probe_rounds, 0)
         again = attach_round(sched, [reqs[0]])
         self.assertTrue(again.fallback)
         self.assertEqual(policy._rounds, 0)
@@ -1580,6 +1655,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_ledger_off_does_not_probe(self):
         reset_policy()
+        saved = os.environ.get("SGLANG_CLEAR_LEDGER")
         os.environ["SGLANG_CLEAR_LEDGER"] = "0"
         try:
             sched = SimpleNamespace()
@@ -1587,9 +1663,12 @@ class TestFlatWidthOnlineK(CustomTestCase):
             plan = make_round(sched, [req])
             self.assertTrue(plan.use_tau)
             self.assertEqual(plan.locked_k, 16)
-            self.assertEqual(policy._probe_sent, {})
+            self.assertEqual(policy._probe_rounds, 0)
         finally:
-            os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+            else:
+                os.environ["SGLANG_CLEAR_LEDGER"] = saved
 
     def test_nonzero_temperature_locks_the_largest_k(self):
         reset_policy()
@@ -1716,6 +1795,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_tau_round_stays_out_of_replay(self):
         reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         for k in (2, 4, 8, 16, 32, 64):
             observe_verify(1, k, 256, 10.0)
@@ -1769,7 +1850,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.replay_kind, "probe_w")
         self.assertFalse(plan.replay_eligible)
         self.assertEqual(policy._probe_rounds, 54)
-        self.assertEqual(policy._probe_sent, {})
 
         reset_policy()
         policy._probe_rounds = 54
@@ -1786,11 +1866,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
             return_value=1.0,
         ):
             short = make_round(SimpleNamespace(), [req])
-        self.assertTrue(short.use_tau)
-        self.assertEqual(short.locked_k, 16)
+        self.assertFalse(short.use_tau)
+        self.assertIsNone(short.locked_k)
         self.assertFalse(short.replay_eligible)
         self.assertEqual(policy._probe_rounds, 54)
-        self.assertEqual(policy._probe_sent, {})
 
     def test_replay_k_stays_inside_retained_nodes(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -1799,7 +1878,21 @@ class TestFlatWidthOnlineK(CustomTestCase):
         )
 
         self.assertEqual(
-            _select_replay_k([[0.4, 0.3]], [1.0], 1.0, {32: 1.0}, 32, cap=2),
+            _select_replay_k(
+                [[0.4, 0.3]], [1.0], 1.0, {32: 1.0}, 32, cap=2, flat_k_value=16
+            ),
+            16,
+        )
+        self.assertEqual(
+            _select_replay_k(
+                [[0.4, 0.3]],
+                [1.0],
+                1.0,
+                {2: 1.0, 32: 5.0},
+                32,
+                cap=2,
+                flat_k_value=16,
+            ),
             2,
         )
         layers = [
@@ -1943,6 +2036,60 @@ class TestFlatWidthOnlineK(CustomTestCase):
             again, [(4, "probe_w"), (4, "probe_w"), (8, "ordinary")]
         )
 
+    def test_narrow_width_probes_early_when_the_prefix_is_unpriced(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+            _narrow_idle,
+        )
+
+        def prepared(idle):
+            reset_policy()
+            ledger = ClearLedger()
+            filled = ForgettingRegressor(
+                3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+            )
+            filled.n = LAYER_MIN_SAMPLES
+            ledger.layer_models[(4, "graph")] = filled
+            _narrow_idle[(1, 4)] = idle
+            return SimpleNamespace(_clear_ledger=ledger)
+
+        due = prepared(policy.EXPLORE_EVERY)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=None,
+        ):
+            self.assertEqual(
+                choose_build_width(
+                    1, ledger_on=True, eligible=True, scheduler=due, sum_ell=5000
+                ),
+                (4, "probe_w"),
+            )
+        early = prepared(policy.EXPLORE_EVERY - 1)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=None,
+        ):
+            self.assertEqual(
+                choose_build_width(
+                    1, ledger_on=True, eligible=True, scheduler=early, sum_ell=5000
+                ),
+                (8, "ordinary"),
+            )
+        covered = prepared(policy.EXPLORE_EVERY)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            self.assertEqual(
+                choose_build_width(
+                    1,
+                    ledger_on=True,
+                    eligible=True,
+                    scheduler=covered,
+                    sum_ell=5000,
+                ),
+                (8, "ordinary"),
+            )
+
     def test_external_event_clears_fits_and_keeps_width_and_theta(self):
         reset_policy()
         assign_persistent_width(1, 16)
@@ -1974,7 +2121,6 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertAlmostEqual(accept_ratio("kept"), kept)
         self.assertEqual(policy._pending, {})
         self.assertEqual(policy._clock, {})
-        self.assertEqual(policy._probe_sent, {})
         self.assertEqual(policy._probe_rounds, 0)
         self.assertEqual(ledger.layer_models, {})
         self.assertIsNone(ledger.verify_model)

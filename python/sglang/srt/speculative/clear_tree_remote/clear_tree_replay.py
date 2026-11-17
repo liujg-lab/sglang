@@ -1,12 +1,13 @@
 """Shadow replay for a ClearTree round.
 
-The served width changes when a candidate's gain clears 3 percent. A narrower
-move is the next smaller width after 30 paired rounds. A wider move needs 10.
-Measured bias is logged and does not decide the switch. When the next
-narrower width has missed 300 eligible rounds, it is built until its layer
-fit has four samples, at most four rounds, and for two rounds after that.
-This module may call the price policy and the ledger.
-The ledger does not import it.
+The served width changes when a candidate's gain clears 3 percent. A move to
+either neighbor needs 30 paired rounds, and a narrower move is only the next
+smaller width. Measured bias is logged and does not decide the switch. When
+the next narrower width has missed 300 eligible rounds, it is built until its
+layer fit has four samples, at most four rounds, and for two rounds after
+that. If that width already has four samples but cannot price this round's
+prefix sum, it is built for one round after 20 eligible rounds. This module
+may call the price policy and the ledger. The ledger does not import it.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from __future__ import annotations
 from typing import Dict, Optional, Sequence
 
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+    EXPLORE_EVERY,
+    PROBE_RUNS,
     VERIFY_KS,
     _prefix_mass,
     _tier_for_nodes,
@@ -28,17 +31,13 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     _next_wider,
     assign_persistent_width,
     batch_bucket,
+    flat_k,
     persistent_width,
 )
 
-REPLAY_EVERY = 20
 REPLAY_GAIN = 0.03
-NARROW_MIN_ROUNDS = 30
-WIDE_MIN_ROUNDS = 10
-BIAS_MIN_ROUNDS = 30
+MIN_PAIRS = 30
 PROBE_W_IDLE = 300
-PROBE_W_RUNS = 2
-PROBE_W_FILL = 4
 
 _eligible_n: Dict[int, int] = {}
 _replay_n: Dict[int, int] = {}
@@ -93,24 +92,39 @@ def _layer_samples(scheduler, width: int) -> int:
     return int(layer_sample_count(scheduler, width))
 
 
+def _narrow_unpriced(scheduler, width: int, batch: int, sum_ell: int) -> bool:
+    """True when this width cannot price the round's prefix sum."""
+    if scheduler is None:
+        return False
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        predict_layer_ms,
+    )
+
+    return (
+        predict_layer_ms(scheduler, int(width), int(batch), int(sum_ell)) is None
+    )
+
+
 def choose_build_width(
     batch_size: int,
     *,
     ledger_on: bool,
     eligible: bool,
     scheduler=None,
+    sum_ell: int = 0,
 ) -> tuple:
     """Flat or switched width, plus a narrow timing probe and a wider build.
 
     The next narrower width is built when it has gone 300 eligible rounds
     without a real build. The first bursts for that width run until its layer
     fit has four samples, and never more than four rounds. Later bursts are
-    two rounds. The counter starts at 300, so the first eligible round is a
+    two rounds. A width that already has four samples, cannot price this
+    round's prefix sum, and has waited 20 eligible rounds is built for one
+    round. The counter starts at 300, so the first eligible round is a
     probe. Those rounds are ``probe_w`` and take the slot ahead of
     exploration. Every 20th remaining eligible round builds the next larger
     candidate. The widest candidate stays on that round. The departure does
-    not happen while the ledger is off, or on a warmup, K-probe, or locked
-    round.
+    not happen while the ledger is off, or on a K-probe or locked round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
@@ -135,16 +149,26 @@ def choose_build_width(
             _probe_w_left[key] = 0
             _probe_w_fill[key] = False
             left = 0
-        if left > 0 or idle >= PROBE_W_IDLE:
+        early = (
+            left <= 0
+            and samples >= LAYER_MIN_SAMPLES
+            and EXPLORE_EVERY <= idle < PROBE_W_IDLE
+            and _narrow_unpriced(scheduler, narrow, batch_size, sum_ell)
+        )
+        if left > 0 or idle >= PROBE_W_IDLE or early:
             if left <= 0:
-                filling = samples < LAYER_MIN_SAMPLES
-                left = PROBE_W_FILL if filling else PROBE_W_RUNS
-                _probe_w_fill[key] = filling
+                if early:
+                    left = 1
+                    _probe_w_fill[key] = False
+                else:
+                    filling = samples < LAYER_MIN_SAMPLES
+                    left = LAYER_MIN_SAMPLES if filling else PROBE_RUNS
+                    _probe_w_fill[key] = filling
             _probe_w_left[key] = left - 1
             _narrow_idle[key] = 0
             return int(narrow), "probe_w"
         _narrow_idle[key] = idle + 1
-    if _eligible_n[bucket] % REPLAY_EVERY == 0:
+    if _eligible_n[bucket] % EXPLORE_EVERY == 0:
         nxt = _next_wider(base)
         if nxt is not None:
             _mark_width_ran(bucket, nxt)
@@ -152,7 +176,9 @@ def choose_build_width(
     _mark_width_ran(bucket, base)
     return base, "ordinary"
 
-def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: bool):
+def _cached_build_width(
+    scheduler, batch: int, *, ledger_on: bool, eligible: bool, sum_ell: int = 0
+):
     """One width per packet. A fallback expand must not take a second departure."""
     token = None if scheduler is None else getattr(scheduler, "_clear_build_token", None)
     cached = None if scheduler is None else getattr(scheduler, "_clear_build_cache", None)
@@ -163,6 +189,7 @@ def _cached_build_width(scheduler, batch: int, *, ledger_on: bool, eligible: boo
         ledger_on=ledger_on,
         eligible=eligible,
         scheduler=scheduler,
+        sum_ell=sum_ell,
     )
     if token is not None and scheduler is not None:
         scheduler._clear_build_cache = (token, chosen)
@@ -408,10 +435,22 @@ def _clamp_replay_k(k: int, cap: Optional[int]) -> int:
 
 
 def _select_replay_k(
-    score_rows, ratios, theta, verify_ms, default_k: int, cap: Optional[int] = None
+    score_rows,
+    ratios,
+    theta,
+    verify_ms,
+    default_k: int,
+    cap: Optional[int] = None,
+    flat_k_value: Optional[int] = None,
 ) -> int:
-    """Value-rule K at or below ``cap``. ``cap`` is the retained-node tier."""
+    """Value-rule K at or below ``cap``. No priced tier inside ``cap`` uses the flat K.
+
+    ``cap`` is the retained-node tier. ``flat_k_value`` is this round's flat
+    tier and is not clamped to ``cap``.
+    """
     if theta is None:
+        if flat_k_value is not None:
+            return int(flat_k_value)
         return _clamp_replay_k(default_k, cap)
     values = {}
     for k, spent in verify_ms.items():
@@ -424,6 +463,8 @@ def _select_replay_k(
             benefit += float(ratio) * _prefix_mass(scores, int(k))
         values[int(k)] = benefit - float(theta) * float(spent)
     if not values:
+        if flat_k_value is not None:
+            return int(flat_k_value)
         return _clamp_replay_k(default_k, cap)
     return select_k(values)
 
@@ -460,13 +501,13 @@ def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
     """Gap between truncated throughput and real narrow throughput.
 
     Both are divided by the real wide throughput of rounds that replayed this
-    pair. None until each side has 30 rounds.
+    pair. None until each side has ``MIN_PAIRS`` rounds.
     """
     real = _real_key(bucket, narrow)
     pair = _pair_key(bucket, wide, narrow)
-    if int(_real_n.get(real, 0)) < BIAS_MIN_ROUNDS:
+    if int(_real_n.get(real, 0)) < MIN_PAIRS:
         return None
-    if int(_pair_n.get(pair, 0)) < BIAS_MIN_ROUNDS:
+    if int(_pair_n.get(pair, 0)) < MIN_PAIRS:
         return None
     wide_ms = float(_pair_wide_ms.get(pair, 0.0))
     replay_ms = float(_pair_replay_ms.get(pair, 0.0))
@@ -505,12 +546,12 @@ def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> N
         _pair_wide_ms[key] = float(_pair_wide_ms.get(key, 0.0)) + float(actual_ms)
 
 def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
-    """Best width under the 20-round, 3 percent, 30/10 rule.
+    """Best width under the 20-round, 3 percent, 30-pair rule.
 
-    A narrower candidate needs 30 rounds and a wider one needs 10. ``would_w``
-    is the largest gain, including a width that is not the adjacent narrower
-    step. The served width moves only to that adjacent narrower candidate or
-    to a wider one.
+    Both a narrower and a wider candidate need 30 rounds. ``would_w`` is the
+    largest gain, including a width that is not the adjacent narrower step.
+    The served width moves only to that adjacent narrower candidate or to a
+    wider one.
     """
     best = int(current)
     best_gain = 0.0
@@ -521,7 +562,7 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
         if int(cand) == int(current):
             continue
         arm = _arm(bucket, cand)
-        needed = NARROW_MIN_ROUNDS if int(cand) < int(current) else WIDE_MIN_ROUNDS
+        needed = MIN_PAIRS
         if (
             arm["n"] < needed
             or arm["ms"] <= 0.0
@@ -560,7 +601,7 @@ def observe_replay(
 ) -> dict:
     """Accumulate one labeled round and return the shadow decision.
 
-    ``counted`` is false for warmup, K-probe, and locked rounds. A measure
+    ``counted`` is false for K-probe and locked rounds. A measure
     round updates bias only. ``would_w`` can name a candidate that is not the
     adjacent narrower step. The logged bias is the pair of the width served
     at the start of this round and ``would_w``.
@@ -599,7 +640,7 @@ def observe_replay(
                 arm["n"] += 1.0
         _replay_n[bucket] = int(_replay_n.get(bucket, 0)) + 1
         judged_rounds = int(_replay_n[bucket])
-        if judged_rounds % REPLAY_EVERY == 0:
+        if judged_rounds % EXPLORE_EVERY == 0:
             _best, gain, applied = _judge(bucket, current, allow_apply=apply)
     rounds = judged_rounds
     would = int(_would_w.get(bucket, served))
@@ -729,6 +770,7 @@ def hold_replay(scheduler, reqs, states, plan) -> None:
                 "theta": plan.theta_value,
                 "verify_ms": verify,
                 "k": k_actual,
+                "flat_k": int(getattr(plan, "flat_k", flat_k(int(plan.batch)))),
                 "layers": _freeze_layer_rows(scheduler, usable),
                 "gain_ratio": float(gain_ratio()),
             }
@@ -784,8 +826,17 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
             ratios.append(float(tree["ratio"]))
             retained = max(retained, _retained_nodes(tree, stop))
         cap = None if retained <= 0 else _tier_for_nodes(retained, VERIFY_KS)
+        stored_flat = hold.get("flat_k")
+        if stored_flat is None:
+            stored_flat = flat_k(int(hold.get("batch", 1)))
         k_prime = _select_replay_k(
-            scores, ratios, theta, verify_ms, int(hold["k"]), cap
+            scores,
+            ratios,
+            theta,
+            verify_ms,
+            int(hold["k"]),
+            cap,
+            flat_k_value=int(stored_flat),
         )
         accepts = [
             replay_accept_k(
