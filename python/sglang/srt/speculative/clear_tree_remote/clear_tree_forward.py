@@ -27,6 +27,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
     ClearTreeConfig,
+    bonus_prediction_enabled,
     opt_draft_lookahead_enabled,
     opt_probe_layer_wait_enabled,
 )
@@ -1144,8 +1145,11 @@ def opt_bonus_graph_extra(spec_info):
 
 
 def opt_draft_bonus_ntpbs(server_args) -> list:
-    """Bonus graphs for the flat widths. Each is one wider than its layer."""
-    if getattr(server_args, "clear_tree_role", None) != "draft":
+    """Opt-in Draft bonus graphs, each one wider than its layer."""
+    if (
+        getattr(server_args, "clear_tree_role", None) != "draft"
+        or not bonus_prediction_enabled()
+    ):
         return []
     from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         bonus_ntpbs,
@@ -2348,7 +2352,9 @@ def _host_bonus_ids(row: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _append_layer_bonus_ids(runners, rows) -> None:
-    """Store one host ``[N, N + 1]`` id tensor per request in this sub-batch."""
+    """Store bonus ids only when speculative bonus precomputation is enabled."""
+    if not bonus_prediction_enabled():
+        return
     for runner, row in zip(runners, rows):
         if runner is None or not torch.is_tensor(row):
             continue
@@ -2993,11 +2999,13 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
 def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree) -> None:
     """Predict bonus tokens while the tree KV is still mapped.
 
-    Page size other than 1 never writes these slots. Logits are dropped either
-    way so a deferred runner does not keep the whole vocabulary.
+    Disabled by default. Page size other than 1 never writes these slots.
+    Stored ids are dropped even when prediction is disabled or skipped.
     """
     runner = job.runner
     try:
+        if not bonus_prediction_enabled():
+            return
         if runner is None or _opt_page_size(scheduler) != 1:
             _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
@@ -3098,7 +3106,11 @@ class _PinnedLayer:
         self.scores = torch.empty(n, dtype=torch.float32, **pin)
         self.tokens = torch.empty(n, dtype=torch.long, **pin)
         self.parents = torch.empty(n, dtype=torch.long, **pin)
-        self.ids = torch.empty(n, n + 1, dtype=torch.long, **pin)
+        self.ids = (
+            torch.empty(n, n + 1, dtype=torch.long, **pin)
+            if bonus_prediction_enabled()
+            else None
+        )
         self.event = torch.cuda.Event()
         self.kind = "seed"
         self.ready = False
@@ -3108,9 +3120,10 @@ class _PinnedLayer:
         flat_ids = ids.reshape(-1)
         self.scores.copy_(scores.reshape(-1)[:n].float(), non_blocking=True)
         self.tokens.copy_(flat_ids[:n].to(dtype=torch.long), non_blocking=True)
-        self.ids[0, : int(flat_ids.numel())].copy_(
-            flat_ids.to(dtype=torch.long), non_blocking=True
-        )
+        if self.ids is not None:
+            self.ids[0, : int(flat_ids.numel())].copy_(
+                flat_ids.to(dtype=torch.long), non_blocking=True
+            )
         self.kind = "seed"
         self.event.record()
         self.ready = True
@@ -3125,7 +3138,8 @@ class _PinnedLayer:
         self.scores.copy_(top_scores.reshape(-1).float(), non_blocking=True)
         self.tokens.copy_(tokens.reshape(-1).to(dtype=torch.long), non_blocking=True)
         self.parents.copy_(parents.reshape(-1).to(dtype=torch.long), non_blocking=True)
-        self.ids.copy_(vocab_ids.to(dtype=torch.long), non_blocking=True)
+        if self.ids is not None:
+            self.ids.copy_(vocab_ids.to(dtype=torch.long), non_blocking=True)
         self.kind = "expand"
         self.event.record()
         self.ready = True
@@ -3139,7 +3153,7 @@ class _PinnedLayer:
             self.scores.clone(),
             self.tokens.clone(),
             self.parents.clone(),
-            self.ids.clone(),
+            self.ids.clone() if self.ids is not None else None,
             self.kind,
         )
 
@@ -3204,17 +3218,17 @@ def lookahead_supported(scheduler) -> bool:
 
 
 def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
-    """Slots held together: ingest, every forwarded layer, and one bonus group.
+    """Slots held together: ingest, every layer, and an optional bonus group.
 
     ``depth_rule`` stops once ``depth`` reaches ``max_depth - 1``. Lookahead
     forwards that last layer before the host decides to stop, so the tree
-    takes ``(max_depth - 1) * n`` slots. The bonus forward then allocates
-    ``n + 1`` while those slots are still mapped. ``ingest_slots`` is the
-    span ingest still has to allocate. Admission runs before that alloc.
+    takes ``(max_depth - 1) * n`` slots. When prediction is enabled, its bonus
+    group allocates another ``n + 1``. Admission precedes ingest allocation.
     """
     n = _round_width(scheduler)
     depth = int(scheduler.server_args.clear_tree_max_depth)
-    return int(ingest_slots) + (depth - 1) * n + (n + 1)
+    bonus_slots = n + 1 if bonus_prediction_enabled() else 0
+    return int(ingest_slots) + (depth - 1) * n + bonus_slots
 
 
 def _lookahead_ingest_slots(runner) -> int:
@@ -3379,7 +3393,7 @@ def _lookahead_width_cache(scheduler, width: int, device):
         return hit
     hit = {
         "slots": (_PinnedLayer(width), _PinnedLayer(width)),
-        "bonus": _PinnedBonus(width),
+        "bonus": _PinnedBonus(width) if bonus_prediction_enabled() else None,
         "positions": torch.empty(width, dtype=torch.long, device=device),
         "dummy_tokens": torch.zeros(width, dtype=torch.long, device=device),
         "launch_event": torch.cuda.Event(),
@@ -3443,6 +3457,7 @@ def prepare_lookahead_runtime(scheduler, runner):
     runner._la_positions = shared["positions"]
     runner._la_dummy_tokens = shared["dummy_tokens"]
     runner._lookahead_tail = None
+    runner._lookahead_bonus = None
     runner._lookahead_launch_event = shared["launch_event"]
     runner._lookahead_queued = False
     runner.lookahead_inflight = False
@@ -3484,6 +3499,8 @@ def _reset_lookahead_runner(scheduler, runner) -> None:
     _clear_req_to_token_span(scheduler, runner.req, keep, end)
     runner.lookahead_inflight = False
     runner._lookahead_queued = False
+    runner._lookahead_bonus = None
+    _drop_stored_logits(runner)
     runner._last_logits = None
     runner._la_forward_template = None
     runner._la_mrope_delta = None
@@ -3594,6 +3611,7 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
     second top-k. A graph miss or an eviction falls back to the caller.
     """
     batch, slots, bonus = runtime
+    predict_bonus = bonus_prediction_enabled()
     state = ClearTreeState.create(config)
     state.decider = getattr(scheduler, "_clear_round_plan", None)
     rids = list(getattr(scheduler, "_clear_round_rids", None) or [])
@@ -3626,18 +3644,21 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
             cpu_scores, cpu_tokens, _cpu_parents, cpu_ids, kind = slot.clone_cpu()
             if kind == "seed":
                 mirror_layer(state, cpu_scores, cpu_tokens, None, seed=True)
-                runner.bonus_ids.append(cpu_ids[0, : n + 1].contiguous())
+                if predict_bonus:
+                    runner.bonus_ids.append(cpu_ids[0, : n + 1].contiguous())
             else:
                 mirror_layer(
                     state, cpu_scores, cpu_tokens, _cpu_parents, seed=False
                 )
-                runner.bonus_ids.append(cpu_ids.contiguous())
+                if predict_bonus:
+                    runner.bonus_ids.append(cpu_ids.contiguous())
             step = step_after_layer(state)
             if step.is_final:
-                bonus_scores, bonus_ids = _vocab_topk(runner._last_logits, n + 1)
-                del bonus_scores
-                bonus.copy(bonus_ids)
-                runner._lookahead_bonus = bonus
+                if predict_bonus:
+                    bonus_scores, bonus_ids = _vocab_topk(runner._last_logits, n + 1)
+                    del bonus_scores
+                    bonus.copy(bonus_ids)
+                    runner._lookahead_bonus = bonus
                 runner.lookahead_inflight = True
                 return [_verify_window(step)], state, layers
             select = _begin_select_timing(scheduler)
@@ -3717,11 +3738,29 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
     try:
         if bonus is not None:
             runner.bonus_ids.append(bonus.clone_cpu())
+        else:
+            # With prediction off there is no bonus D2H event to wait on.
+            # Settle the queued final layer before publishing its KV slots.
+            try:
+                _await_lookahead_event(
+                    scheduler, getattr(runner, "_lookahead_launch_event", None)
+                )
+            except Exception:
+                if getattr(scheduler, "_sr_device_poisoned", False):
+                    raise
+                try:
+                    torch.get_device_module(scheduler.device).synchronize()
+                except Exception:
+                    # Completion is unknown. Neither publish nor recycle these
+                    # slots; let the existing poisoned-device cleanup own them.
+                    scheduler._sr_device_poisoned = True
+                    scheduler._sr_clear_stamps_after_poison()
+                    raise
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
         bonus_failed = True
         logger.warning(
-            "[OPT] lookahead bonus ids failed for %s: %s",
+            "[OPT] lookahead settle failed for %s: %s",
             getattr(getattr(runner, "req", None), "rid", None),
             exc,
         )
@@ -3740,10 +3779,10 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
 
     Layers forwarded in this function are marked post-reply for the ledger.
 
-    Bonus guesses are written while the tree columns are still mapped.
+    When enabled, bonus guesses are written while the tree is still mapped.
     Publish clears those columns, so the guess forward cannot follow it.
-    A lookahead job already queued that last layer. It only installs the
-    top-k ids, unless the request can no longer keep the slots. Each
+    A lookahead job already queued that last layer. It waits for completion
+    (and installs bonus ids when enabled), unless it must drop the slots. Each
     finished ``_forward_verify_batch`` increments
     ``opt_layer_forwards_deferred``. A depth group that fits in one forward
     still counts once. A group split by the KV budget counts once per
@@ -4013,7 +4052,7 @@ def grow_batch(scheduler, reqs):
             return rows
 
         t1 = time.perf_counter()
-        topk_out = [[] for _ in runners]
+        topk_out = [[] for _ in runners] if bonus_prediction_enabled() else None
         windows = grow_active_layers(
             config,
             tail_logits,
@@ -4022,8 +4061,8 @@ def grow_batch(scheduler, reqs):
             states_out=states,
             topk_out=topk_out,
         )
-        for runner, ids in zip(runners, topk_out):
-            runner.bonus_ids = ids
+        for index, runner in enumerate(runners):
+            runner.bonus_ids = topk_out[index] if topk_out is not None else []
         metrics.add_host("opt_grow", time.perf_counter() - t1)
         metrics.counts["opt_layer_forwards"] += layers
         metrics.counts["opt_rounds"] += 1

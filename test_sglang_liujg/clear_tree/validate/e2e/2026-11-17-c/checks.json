@@ -1,0 +1,3765 @@
+{
+  "schema_version": 2,
+  "raw_directory": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw",
+  "global": {
+    "expected_trials": {
+      "status": "pass",
+      "detail": {
+        "missing": [],
+        "expected": [
+          "c1-A1",
+          "c1-A2",
+          "c1-B1",
+          "c1-B2",
+          "c4-A1",
+          "c4-A2",
+          "c4-B1",
+          "c4-B2",
+          "c4-AA1",
+          "c4-AA2"
+        ]
+      }
+    },
+    "unique_trial_names": {
+      "status": "pass",
+      "detail": []
+    },
+    "root_metadata_parse": {
+      "status": "pass",
+      "detail": []
+    },
+    "AA_calibration": {
+      "status": "pass",
+      "detail": "requires healthy, output-matched AA with explicit same bonus configuration"
+    },
+    "AB_comparisons": {
+      "status": "fail",
+      "detail": {
+        "scope": "output/config equivalence and performance eligibility; NOT device/runtime error classification",
+        "pairs": [
+          {
+            "trials": [
+              "c1-A1",
+              "c1-B1"
+            ],
+            "output_status": "fail",
+            "different_requests": 85,
+            "configuration_status": "pass"
+          },
+          {
+            "trials": [
+              "c1-A2",
+              "c1-B2"
+            ],
+            "output_status": "fail",
+            "different_requests": 85,
+            "configuration_status": "pass"
+          },
+          {
+            "trials": [
+              "c4-A1",
+              "c4-B1"
+            ],
+            "output_status": "fail",
+            "different_requests": 86,
+            "configuration_status": "pass"
+          },
+          {
+            "trials": [
+              "c4-A2",
+              "c4-B2"
+            ],
+            "output_status": "fail",
+            "different_requests": 86,
+            "configuration_status": "pass"
+          }
+        ]
+      }
+    }
+  },
+  "trials": {
+    "c1-A1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            1138.6640998171642
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            1138.664
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.run.json",
+              "bytes": 2620,
+              "sha256": "2b3eb229f1c596b0ff17b8f528cd1f32a0d2a82c2fd51a69fcbe41d0cfc0ac7e"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.jsonl",
+              "bytes": 3690707,
+              "sha256": "5b4ca801ecd49c0378f6675f3fef90d3b7ab3f19fa37129431dce36952ea27a7"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.csv",
+              "bytes": 1012,
+              "sha256": "78f11b11a7f489110758851ad126b448bb3c21881da7f7242ba08c3ecff216f4"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 513,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 513,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/client.20261117T095748.938335Z-603c9f0f.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 16169,
+          "hits": 8045,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 1,
+          "CSV": 1.0
+        }
+      }
+    },
+    "c1-A2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            1133.6503175115213
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            1133.65
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.run.json",
+              "bytes": 2617,
+              "sha256": "24b13234894703b1282a3665ba68d1042164e0e6b850ecdd8dbfd1ebf977be6e"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.jsonl",
+              "bytes": 3691187,
+              "sha256": "e31ee6741cdfa53a09078688da6fab27d6faa322933c5f0935d4f30d94c808a6"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.csv",
+              "bytes": 1012,
+              "sha256": "ec4b5f3d469966feb671a15e478f5e7606bda31b92b881c543fdc615bd7fd853"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 512,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 512,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/client.20261117T111748.611696Z-f8716cfa.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-A2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 16169,
+          "hits": 8045,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 1,
+          "CSV": 1.0
+        }
+      }
+    },
+    "c1-B1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            1192.7852366389707
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            1192.785
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.run.json",
+              "bytes": 2621,
+              "sha256": "3fb4e1e0119785f5cc408fb4c7332f04af2e8725b937733e67860d5765bcfb13"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.jsonl",
+              "bytes": 3673670,
+              "sha256": "af8d2bc0cf94c71f768c6dd30eb05734b82be2375329b63d4b8b0096976eb1cb"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.csv",
+              "bytes": 1012,
+              "sha256": "9f65ce211e745f1a6ce70042d09a682c89ddfcd4cc175eb57d5890f2482f6f3f"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 509,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 509,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/client.20261117T103607.631903Z-5d65c29b.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": false,
+          "attempts": 0,
+          "hits": 0,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 1,
+          "CSV": 1.0
+        }
+      }
+    },
+    "c1-B2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            1196.2434115484357
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            1196.243
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.run.json",
+              "bytes": 2620,
+              "sha256": "6945b487f6c75893b8013df823bd51f5d26d8582ee8fde369bef383594bbeab8"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.jsonl",
+              "bytes": 3674026,
+              "sha256": "5103e4c296d2ecd5cbb3f243b2ad25e6ee2d8ab35f6969b2c03e34f1f245fe02"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.csv",
+              "bytes": 1012,
+              "sha256": "de9d9f2ddeac6d847112e2ebb9c3d0da63c254d1bbb95e8a8cc4c6e605c7fadc"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 508,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 508,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/client.20261117T115607.721022Z-0b9d2715.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c1-B2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": false,
+          "attempts": 0,
+          "hits": 0,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 1,
+          "CSV": 1.0
+        }
+      }
+    },
+    "c4-A1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            521.6079785237089
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            521.608
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.run.json",
+              "bytes": 2623,
+              "sha256": "8bb97d2834b7be721f4ae469005813617342a31152b1c88d3ce231dde5c468ef"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.jsonl",
+              "bytes": 3871189,
+              "sha256": "5e28a26e70ec26deeaa04d2c95e2aa906862180d5ed79efb1938d23a808447a4"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.csv",
+              "bytes": 1015,
+              "sha256": "692db4c39c675d96a896ad1eb5dba7b61e0edb68d75a5582924fe4b64cfc0ac2"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/client.20261117T123718.102661Z-3b240481.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 18140,
+          "hits": 9111,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    },
+    "c4-A2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            516.2638794332743
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            516.264
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.run.json",
+              "bytes": 2621,
+              "sha256": "ec510a2fdad819c71401c6591548781d132a3d41ce2880cddd032cf33e6d8e5a"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.jsonl",
+              "bytes": 3871030,
+              "sha256": "ade7b2239823a2d406b0972da0775f966ab3f39a9aa9bd0661f20ff728901a54"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.csv",
+              "bytes": 1015,
+              "sha256": "96f395ac52580079c9fafe3cba562d01ee719688405e5a0e5f131d0ca8a4e16b"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/client.20261117T133244.246895Z-1555eb3f.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-A2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 18140,
+          "hits": 9111,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    },
+    "c4-AA1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            540.1715207071975
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            540.172
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.run.json",
+              "bytes": 2623,
+              "sha256": "ad9778a1187536fd99d09dffd6e1c7896fd55d2be9781511667ae9039f61da01"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.jsonl",
+              "bytes": 3869016,
+              "sha256": "66b67dfb6176231de3169e828a60a4cb1a3b7a5924f0050872506fc720bb0e42"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.csv",
+              "bytes": 1015,
+              "sha256": "74d9ea4ed7b3dac8ebe8456c4ff44d3fe0ffe62a2a1309168797633106706283"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/client.20261117T142809.724627Z-3e44513c.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 18140,
+          "hits": 9111,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    },
+    "c4-AA2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            548.2880911352113
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            548.288
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.run.json",
+              "bytes": 2621,
+              "sha256": "adf7ade1dfe6384448705192f119088647446e9788d98cdbd8245ee0c79f14ad"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.jsonl",
+              "bytes": 3868644,
+              "sha256": "8a18490081e3b97445c4e0b75bd7a3dbd180af0c4d99702ee00327087243cbf8"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.csv",
+              "bytes": 1015,
+              "sha256": "7ed817690ade365c68f60cdffc0207fb9c901204ed3b30c5bb7171f37d837b97"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 159,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/client.20261117T145623.437115Z-93fb7f21.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-AA2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": true,
+          "attempts": 18140,
+          "hits": 9111,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    },
+    "c4-B1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            482.9357891846449
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            482.936
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.run.json",
+              "bytes": 2618,
+              "sha256": "1ec06ea783dcc700d809aa5342852a33efcdc2a24023eeb8e17f11314fae4eef"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.jsonl",
+              "bytes": 3861396,
+              "sha256": "f9b38c94196c7b57ebec75912b420a14fcf371484e188f7c0020ca8964df094c"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.csv",
+              "bytes": 1015,
+              "sha256": "78041a3c4d7f911981c41190815bd098fcb0edea01b8098ddc759edd495c5532"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/client.20261117T130516.767557Z-4960a6d5.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": false,
+          "attempts": 0,
+          "hits": 0,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    },
+    "c4-B2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": "requires JSONL, manifest, single-row CSV and client log summary"
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest total_tokens/output_tok_s (reconstructed exact client wall)",
+            482.14315273147076
+          ],
+          [
+            "client.log summary wall (rounded to 0.001s)",
+            482.143
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": {
+          "errors": 0
+        }
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL must retain global_index 0..n-1 in request order; never completion-order sort"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired_accepted_and_draft": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.run.json",
+              "bytes": 2617,
+              "sha256": "bce05592e98df7176472669a8ed84f7c681be0026df16db4d9a91b76b8a60650"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.jsonl",
+              "bytes": 3861960,
+              "sha256": "1b9b41fc21e573d6066675862628ff46a8097684602e6b44582e426fb9f69b81"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.csv",
+              "bytes": 1015,
+              "sha256": "4b63752100366930274e52d57a9441711fbf3b60c6ea272c1ce548551baaec78"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": {
+          "matched_lines": 0,
+          "scope": "entire supplied target/draft/client logs"
+        }
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/client.20261117T140042.552204Z-b0991e4a.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-17-c/raw/c4-B2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "allowed": [
+            1,
+            2,
+            4
+          ],
+          "scope": "observed capture bs only, not ntpb/query/KV widths; absent capture evidence is missing"
+        }
+      },
+      "bonus_activity_consistency": {
+        "status": "pass",
+        "detail": {
+          "configured_bonus": false,
+          "attempts": 0,
+          "hits": 0,
+          "boundary": "off must not attempt/hit; enabled with zero attempts may be ineligible, not proof of execution"
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "directory": 4,
+          "CSV": 4.0
+        }
+      }
+    }
+  },
+  "runtime_status": "pass",
+  "output_equivalence_status": "fail",
+  "status": "fail"
+}

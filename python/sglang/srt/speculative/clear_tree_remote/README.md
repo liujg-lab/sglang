@@ -2,9 +2,15 @@
 
 `CLEAR_TREE_REMOTE` 是从 `OPT_TREE_REMOTE` 复制出来的独立算法。服务 W 和 τ 上的 K 都从平表起步：一批一个请求时 W 为 8、K 为 16，其余 W 为 4、K 为 8。在线 K 和在线 W 由 Draft 的 `SGLANG_CLEAR_LEDGER=1` 打开。验证数 K 默认在 2、4、8、16、32、64 里选，可用 `--clear-tree-ks` 改。探测轮、平表档还没有样本的轮、层样本不够的轮、非贪心轮，以及批建树失败后的回退轮，都用 τ，并且 K 锁在平表。这一档的 KV 桶装不下时退到装得下的最大档；平表档超过本轮覆盖上界时，改用上界以内最大的一档。回退轮不加轮次、不取探测、不进回放统计，b 取整个包的请求数。τ 轮的停层按本轮锁定的 K 算质量，不是按层宽。相邻窄档和宽档配对都满 30 轮，并且增益超过 3%，才换服务 W。偏差只记在日志里。账本默认关闭；关着时不取探测，每一轮都是平表的 W 和 K，停层用 τ，质量按这个 K 算。
 
-启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30019`。`--clear-tree-widths` 未指定时是 2 4 8 16 32 64，`--clear-tree-ks` 未指定时是同一组数。平表要求宽度里有 4 和 8、验证数里有 8 和 16，缺了拒绝启动。`--speculative-num-draft-tokens` 是图和缓冲容量：Target 为最大 K 加 1，默认 65；Draft 为最大 W，默认 64。Draft 的 bonus 缓冲是最大 W 加 1，默认 65。省略该参数时按这个容量填上；显式传入的值必须等于它。握手仍用 `--clear-tree-width`，它不是候选列表。未设置 `--max-running-requests` 时改为 48。CUDA 和 NPU 图按该进程的 batch 列表捕获，这个列表不是算法常量。启动捕获每一个候选。Target 验证图默认是 65、33、17、9、5、3，另加 decode 的 1，回放按本轮 K+1 选图。Draft 层图默认是 64、32、16、8、4、2，bonus 默认是 65、33、17、9、5、3，另加 decode 的 1。bonus 仍只在 batch 1 捕获。
+启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30019`。`--clear-tree-widths` 未指定时是 2 4 8 16 32 64，`--clear-tree-ks` 未指定时是同一组数。平表要求宽度里有 4 和 8、验证数里有 8 和 16，缺了拒绝启动。`--speculative-num-draft-tokens` 是图和缓冲容量：Target 为最大 K 加 1，默认 65；Draft 为最大 W，默认 64。Draft 的 bonus 缓冲是最大 W 加 1，默认 65。省略该参数时按这个容量填上；显式传入的值必须等于它。握手仍用 `--clear-tree-width`，它不是候选列表。未设置 `--max-running-requests` 时改为 48。CUDA 和 NPU 图按该进程的 batch 列表捕获，这个列表不是算法常量。启动捕获每一个候选。Target 验证图默认是 65、33、17、9、5、3，另加 decode 的 1，回放按本轮 K+1 选图。Draft 层图默认是 64、32、16、8、4、2，另加 decode 的 1。Draft bonus 预测默认关闭，不捕获 bonus 专用图；显式开启时，bonus 图按候选宽度加 1 捕获，默认是 65、33、17、9、5、3，仍只在 batch 1 捕获。
 
 在线 K、在线 W、账本和回放以本文件和本目录代码为准。[design/README.md](design/README.md) 是设计，不判断正在跑的服务。从 OPT 复制来的建树和验证细节见 [../opt_tree_remote/README.md](../opt_tree_remote/README.md)。
+
+## Draft 回包后的 KV 补算与 bonus 预测
+
+Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION` 默认关闭（未设置或设为 `0`）。page size 为 1、`SGLANG_CLEAR_TREE_KV_REUSE` 开启且请求可复用时，回包后仍按各请求的停止深度分组补算最后一层 KV，再发布树 KV lease；下一轮照常复用已接受路径的 KV。关闭时不保存 bonus 候选、不做最后层 bonus 专用 top-k/拷贝，也不做猜测 token 的额外前向。Target 验证后实际提交的 bonus token 不受影响，在下一轮由正常 ingest 路径处理。
+
+在 Draft 启动前设置 `SGLANG_CLEAR_BONUS_PREDICTION=1` 可恢复原来的预计算：在根和每个进入验证的节点处各猜一个未包含在验证子节点中的 token，以 W+1 个为一组、逐请求前向，提前写入其 KV 和后续 logits；命中且成为新提交尾部时可跳过该请求下一轮的 ingest 前向。此开关只控制 ClearTree Draft，独立于树 KV 复用，不修改 Target 的 K+1 验证图、协议、在线 K 或账本时间定义。按启动配置使用，修改开关后需重启 Draft，不支持运行中热切换。page size 非 1 的现有限制不变。
 
 ## 账本
 

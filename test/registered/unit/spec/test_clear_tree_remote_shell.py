@@ -4,7 +4,11 @@ The shell is a renamed copy of fixed-width OPT. It must not be recognized as
 OPT or STANDALONE_REMOTE, and OPT must not pick up ClearTree fields.
 """
 
+import ast
+import os
 import unittest
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -595,6 +599,692 @@ class ClearTreeDraftTransportTest(CustomTestCase):
         self.assertEqual(result, (batch, mm))
         self.assertIs(result[1], mm)
         self.assertTrue(server.last_recv_queued)
+
+
+@contextmanager
+def _bonus_prediction(value):
+    # Restore the caller's environment, including an originally absent flag.
+    with patch.dict(os.environ):
+        os.environ.pop("SGLANG_CLEAR_BONUS_PREDICTION", None)
+        if value is not None:
+            os.environ["SGLANG_CLEAR_BONUS_PREDICTION"] = value
+        yield
+
+
+class ClearTreeBonusPredictionTest(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_config,
+            clear_tree_forward,
+            clear_tree_lease,
+        )
+
+        self.torch = torch
+        self.config = clear_tree_config
+        self.forward = clear_tree_forward
+        self.lease = clear_tree_lease
+
+    def _host(self, *, finished=False):
+        torch = self.torch
+        pool = torch.full((1, 16), -1, dtype=torch.int32)
+        freed = []
+
+        def free(slots):
+            freed.extend(int(slot) for slot in slots.tolist())
+
+        def rollback(req, keep):
+            end = int(req.kv_allocated_len)
+            free(pool[0, keep:end][pool[0, keep:end] >= 0])
+            pool[0, keep:end] = -1
+            req.kv_allocated_len = req.kv_committed_len = keep
+
+        host = SimpleNamespace(
+            server_args=_args(clear_tree_role="draft", clear_tree_width=2),
+            tree_cache=SimpleNamespace(page_size=1),
+            req_to_token_pool=SimpleNamespace(req_to_token=pool, device=pool.device),
+            token_to_kv_pool_allocator=SimpleNamespace(free=free),
+            _sr_device_poisoned=False,
+            _sr_is_finished=lambda _req: finished,
+            _sr_pause_req=Mock(),
+            _clear_rollback=Mock(side_effect=rollback),
+            last_batch="stale",
+            cur_batch="stale",
+        )
+        return host, pool, freed
+
+    def _req(self, allocated=5):
+        return SimpleNamespace(
+            rid="r",
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[],
+            kv_committed_len=3,
+            kv_allocated_len=allocated,
+            clear_tree_lease=None,
+        )
+
+    def _state(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import (
+            ClearTreeState,
+            expand_from_topk,
+            seed_from_topk,
+        )
+
+        torch = self.torch
+        state = ClearTreeState.create(
+            self.config.ClearTreeConfig(width=2, tau=-1.0, max_depth=4)
+        )
+        seed_from_topk(state, torch.tensor([0.6, 0.4]), torch.tensor([20, 30]))
+        expand_from_topk(
+            state,
+            torch.tensor([[0.5, 0.2], [0.4, 0.1]]),
+            torch.tensor([[21, 31], [22, 32]]),
+        )
+        state.finished = True
+        return state
+
+    def _job(self, host, *, complete=False):
+        req = self._req(allocated=7 if complete else 5)
+        runner = SimpleNamespace(
+            scheduler=host,
+            req=req,
+            prefix_len=3,
+            cached_len=req.kv_allocated_len,
+            layer_slots=[self.torch.tensor([100, 101])],
+            bonus_ids=[self.torch.tensor([1, 2, 3])],
+        )
+        if complete:
+            runner.layer_slots.append(self.torch.tensor([200, 201]))
+        return SimpleNamespace(
+            req=req,
+            runner=runner,
+            keep=3,
+            window=([20, 21], [-1, 0], [0, 0]),
+            state=self._state(),
+        )
+
+    def test_bonus_prediction_flag_defaults_off_and_accepts_explicit_values(self):
+        for value, expected in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                self.assertIs(self.config.bonus_prediction_enabled(), expected)
+
+    def test_disabled_attach_drops_ids_without_selection_or_forward(self):
+        for value in (None, "0"):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, _pool, _freed = self._host()
+                job = self._job(host)
+                with patch.object(
+                    self.forward, "select_bonus_candidates"
+                ) as select, patch.object(
+                    self.forward, "_forward_bonus_candidates"
+                ) as predict:
+                    self.forward.maybe_attach_bonus_guesses(host, job)
+                select.assert_not_called()
+                predict.assert_not_called()
+                self.assertEqual(job.runner.bonus_ids, [])
+                self.assertIsNone(getattr(job.req, "opt_bonus_guesses", None))
+
+    def test_disabled_append_does_not_run_dedicated_topk(self):
+        torch = self.torch
+        for value, expected_calls in ((None, 0), ("0", 0), ("1", 1)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, _pool, _freed = self._host()
+                runner = SimpleNamespace(scheduler=host, bonus_ids=[])
+                with patch.object(torch, "topk", wraps=torch.topk) as topk:
+                    self.forward._append_layer_bonus_ids(
+                        [runner], [torch.tensor([[0.1, 0.9, 0.3, 0.2]])]
+                    )
+                self.assertEqual(topk.call_count, expected_calls)
+                self.assertEqual(len(runner.bonus_ids), expected_calls)
+                if expected_calls:
+                    self.assertEqual(runner.bonus_ids[0].tolist(), [[1, 2, 3]])
+
+    def test_deferred_final_layer_publishes_lease_and_leaves_only_real_bonus(self):
+        torch = self.torch
+        for value in (None, "0"):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, pool, freed = self._host()
+                job = self._job(host)
+
+                def fitting(_host, runners, steps, *, consume):
+                    runner = runners[0]
+                    self.assertEqual(steps[0].positions.tolist(), [2, 2])
+                    runner.layer_slots.append(torch.tensor([200, 201]))
+                    runner.cached_len += 2
+                    runner.req.kv_allocated_len = runner.cached_len
+                    consume(runners, [torch.zeros(2, 4)])
+                    return [], 1
+
+                with patch.object(
+                    self.forward, "_forward_verify_fitting", side_effect=fitting
+                ) as fit, patch.object(
+                    self.forward, "_forward_bonus_candidates"
+                ) as predict, patch.object(
+                    self.forward, "_host_bonus_ids"
+                ) as topk:
+                    self.forward.forward_deferred_final_layers(host, [job])
+                fit.assert_called_once()
+                predict.assert_not_called()
+                topk.assert_not_called()
+                self.assertEqual(job.runner.bonus_ids, [])
+                self.assertEqual(
+                    job.req.clear_tree_lease.layer_slots, ((100, 101), (200, 201))
+                )
+                self.assertEqual(job.req.kv_allocated_len, 3)
+                self.assertEqual(pool[0, 3:7].tolist(), [-1] * 4)
+                self.assertIsNone(host.last_batch)
+                self.assertIsNone(host.cur_batch)
+                host._sr_pause_req.assert_called_once_with(job.req)
+                job.req.output_ids = [20, 21, 99]
+                job.req.sr_align_result = SimpleNamespace(
+                    kind="append_n", old_local_len=3
+                )
+                self.lease.consume_clear_tree_lease(host, job.req)
+                self.assertEqual(pool[0, 3:5].tolist(), [100, 200])
+                self.assertEqual(job.req.kv_committed_len, 5)
+                self.assertEqual(
+                    len(job.req.origin_input_ids)
+                    + len(job.req.output_ids)
+                    - job.req.kv_committed_len,
+                    1,
+                )
+                self.assertCountEqual(freed, [101, 201])
+
+    def test_deferred_final_layers_group_by_depth(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        for depths, expected in (((2, 2), [["a", "b"]]), ((1, 2), [["a"], ["b"]])):
+            with self.subTest(depths=depths), _bonus_prediction(None):
+                host, _pool, _freed = self._host()
+                jobs = [self._job(host), self._job(host)]
+                for job, rid, depth in zip(jobs, ("a", "b"), depths):
+                    job.req.rid = rid
+                    job.state.depth = depth
+                groups = []
+
+                def fitting(_host, runners, _steps, **_kwargs):
+                    groups.append([runner.req.rid for runner in runners])
+                    return [], 1
+
+                with patch.object(
+                    self.forward, "_forward_verify_fitting", side_effect=fitting
+                ), patch.object(self.forward, "_publish_or_rollback"):
+                    self.forward.forward_deferred_final_layers(host, jobs)
+                self.assertEqual(groups, expected)
+                self.assertEqual(
+                    get_sr_round_metrics(host, "Draft").counts[
+                        "opt_layer_forwards_deferred"
+                    ],
+                    len(expected),
+                )
+
+    def test_deferred_failure_drops_partial_layer_and_finished_releases_tree(self):
+        torch = self.torch
+        for finished in (False, True):
+            with self.subTest(finished=finished), _bonus_prediction(None):
+                host, pool, freed = self._host(finished=finished)
+                job = self._job(host)
+                pool[0, 3:5] = torch.tensor([100, 101])
+
+                def fail(_host, runners, _steps, **_kwargs):
+                    runner = runners[0]
+                    runner.layer_slots.append(torch.tensor([200, 201]))
+                    runner.req.kv_allocated_len = 7
+                    pool[0, 5:7] = torch.tensor([200, 201])
+                    raise RuntimeError("last layer failed")
+
+                with patch.object(
+                    self.forward, "_forward_verify_fitting", side_effect=fail
+                ) as fit:
+                    self.forward.forward_deferred_final_layers(host, [job])
+                self.assertEqual(fit.call_count, 0 if finished else 1)
+                self.assertEqual(job.runner.bonus_ids, [])
+                self.assertEqual(pool[0, 5:7].tolist(), [-1, -1])
+                if finished:
+                    self.assertIsNone(job.req.clear_tree_lease)
+                    self.assertCountEqual(freed, [100, 101])
+                    self.assertEqual(job.req.kv_allocated_len, 3)
+                    host._sr_pause_req.assert_not_called()
+                else:
+                    self.assertEqual(
+                        job.req.clear_tree_lease.layer_slots, ((100, 101),)
+                    )
+                    self.assertCountEqual(freed, [200, 201])
+                    self.assertEqual(job.req.kv_committed_len, 3)
+
+    def test_enabled_prediction_precedes_publish_and_always_clears_ids(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), _bonus_prediction("1"):
+                host, pool, _freed = self._host()
+                job = self._job(host, complete=True)
+                job.runner._lookahead_satisfied = True
+                job.runner._alloc_layer_slots = Mock()
+                pool[0, 3:7] = self.torch.tensor([100, 101, 200, 201])
+                events = []
+                plans = [object()]
+                publish = self.forward._publish_or_rollback
+
+                def predict(_host, runner, selected):
+                    self.assertIs(selected, plans)
+                    self.assertIsNone(job.req.clear_tree_lease)
+                    self.assertEqual(pool[0, 3:7].tolist(), [100, 101, 200, 201])
+                    self.assertTrue(runner.bonus_ids)
+                    events.append("predict")
+                    if fail:
+                        raise RuntimeError("bonus failed")
+
+                def published(*args):
+                    self.assertEqual(job.runner.bonus_ids, [])
+                    events.append("publish")
+                    return publish(*args)
+
+                with patch.object(
+                    self.forward, "select_bonus_candidates", return_value=plans
+                ), patch.object(
+                    self.forward, "_forward_bonus_candidates", side_effect=predict
+                ), patch.object(
+                    self.forward, "_publish_or_rollback", side_effect=published
+                ), patch.object(
+                    self.forward, "_forward_verify_fitting"
+                ) as fit:
+                    self.forward.forward_deferred_final_layers(host, [job])
+                self.assertEqual(events, ["predict", "publish"])
+                self.assertIsNotNone(job.req.clear_tree_lease)
+                fit.assert_not_called()
+
+    def test_enabled_bonus_hit_and_miss_free_unused_guesses(self):
+        torch = self.torch
+        for hit in (False, True):
+            with self.subTest(hit=hit), _bonus_prediction("1"):
+                host, pool, freed = self._host()
+                req = self._req(allocated=3)
+                req.output_ids = [20, 30 if hit else 99]
+                req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+                req.clear_tree_lease = self.lease.ClearTreeKVLease(
+                    keep=3,
+                    layer_slots=((100, 101),),
+                    tokens=(20,),
+                    parents=(-1,),
+                    cols=(0,),
+                    depths=(0,),
+                )
+                seed = torch.tensor([1.0, 2.0, 3.0])
+                req.opt_bonus_guesses = [
+                    self.lease.OptBonusGuess(parent=0, token=30, slot=200, logits=seed),
+                    self.lease.OptBonusGuess(
+                        parent=-1, token=8, slot=201, logits=torch.zeros(3)
+                    ),
+                ]
+                self.lease.consume_clear_tree_lease(host, req)
+                self.assertEqual(req.kv_committed_len, 5 if hit else 4)
+                self.assertEqual(pool[0, 3].item(), 100)
+                self.assertIsNone(req.opt_bonus_guesses)
+                self.assertCountEqual(freed, [101, 201] if hit else [101, 200, 201])
+                if hit:
+                    self.assertEqual(pool[0, 4].item(), 200)
+                    self.assertTrue(
+                        torch.equal(self.forward.take_cached_tail_logits(req, 5), seed)
+                    )
+                else:
+                    self.assertIsNone(getattr(req, "opt_prefill_tail_logits", None))
+                self.lease.release_opt_bonus_guesses(host, req)
+                self.assertEqual(len(freed), 2 if hit else 3)
+
+    def test_lookahead_runtime_bonus_buffer_is_opt_in(self):
+        torch = self.torch
+        for value, enabled in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, _pool, _freed = self._host()
+                runner = SimpleNamespace(req=self._req())
+                batch = SimpleNamespace(
+                    seq_lens=object(),
+                    seq_lens_cpu=object(),
+                    orig_seq_lens=object(),
+                    req_pool_indices=object(),
+                )
+                with patch.object(
+                    self.forward, "_lookahead_batch", return_value=batch
+                ), patch.object(
+                    self.forward, "_round_width", return_value=2
+                ), patch.object(
+                    self.forward, "_PinnedLayer"
+                ), patch.object(
+                    self.forward, "_PinnedBonus"
+                ) as bonus, patch.object(
+                    torch.cuda, "Event"
+                ):
+                    runtime = self.forward.prepare_lookahead_runtime(host, runner)
+                self.assertIs(runtime[0], batch)
+                self.assertEqual(bonus.call_count, int(enabled))
+                self.assertIs(runtime[2], bonus.return_value if enabled else None)
+                self.assertEqual(runner.bonus_ids, [])
+
+    def test_lookahead_disabled_skips_final_bonus_topk(self):
+        torch = self.torch
+        # A one-layer tree still launches its final layer, but must not score
+        # that layer solely to predict bonus ids when prediction is disabled.
+        config = self.config.ClearTreeConfig(width=2, tau=-1.0, max_depth=2)
+        for value, enabled in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, _pool, _freed = self._host()
+                runner = SimpleNamespace(
+                    bonus_ids=[], _last_logits=torch.zeros(2, 4), launch_layer=Mock()
+                )
+                slot = Mock()
+                slot.clone_cpu.return_value = (
+                    torch.tensor([0.6, 0.4]),
+                    torch.tensor([20, 30]),
+                    torch.zeros(2, dtype=torch.long),
+                    torch.tensor([[20, 30, 40], [0, 0, 0]]),
+                    "seed",
+                )
+                bonus = Mock() if enabled else None
+                with patch.object(
+                    self.forward, "_vocab_topk", wraps=self.forward._vocab_topk
+                ) as topk:
+                    windows, state, layers = self.forward.grow_lookahead(
+                        host,
+                        runner,
+                        config,
+                        torch.zeros(4),
+                        (object(), (slot, slot), bonus),
+                    )
+                self.assertEqual(topk.call_count, 2 if enabled else 1)
+                self.assertEqual(layers, 1)
+                self.assertEqual(state.depth, 1)
+                self.assertTrue(windows)
+                runner.launch_layer.assert_called_once()
+                self.assertTrue(runner.lookahead_inflight)
+                self.assertEqual(len(runner.bonus_ids), int(enabled))
+                self.assertIs(getattr(runner, "_lookahead_bonus", None), bonus)
+                if enabled:
+                    bonus.copy.assert_called_once()
+
+    def test_lookahead_without_bonus_waits_before_publish_and_never_reforwards(self):
+        with _bonus_prediction(None):
+            host, _pool, _freed = self._host()
+            job = self._job(host, complete=True)
+            runner = job.runner
+            runner.lookahead_inflight = True
+            runner._lookahead_bonus = None
+            runner._lookahead_satisfied = False
+            events = []
+
+            def wait():
+                self.assertTrue(runner.lookahead_inflight)
+                self.assertFalse(runner._lookahead_satisfied)
+                self.assertIsNone(job.req.clear_tree_lease)
+                events.append("launch_wait")
+
+            runner._lookahead_launch_event = SimpleNamespace(
+                synchronize=Mock(side_effect=wait)
+            )
+            publish = self.forward._publish_or_rollback
+
+            def published(*args):
+                self.assertFalse(runner.lookahead_inflight)
+                self.assertTrue(runner._lookahead_satisfied)
+                events.append("publish")
+                return publish(*args)
+
+            with patch.object(
+                self.forward, "_forward_verify_fitting"
+            ) as fit, patch.object(
+                self.forward, "_forward_bonus_candidates"
+            ) as predict, patch.object(
+                self.forward, "_publish_or_rollback", side_effect=published
+            ):
+                self.forward.forward_deferred_final_layers(host, [job])
+                self.forward._settle_lookahead_job(host, job)
+            self.assertEqual(events, ["launch_wait", "publish"])
+            runner._lookahead_launch_event.synchronize.assert_called_once()
+            fit.assert_not_called()
+            predict.assert_not_called()
+            self.assertEqual(
+                job.req.clear_tree_lease.layer_slots, ((100, 101), (200, 201))
+            )
+            self.assertEqual(runner.bonus_ids, [])
+
+    def test_lookahead_disabled_omits_candidate_copies_and_bonus_kv_budget(self):
+        torch = self.torch
+        for value, enabled in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                host, _pool, _freed = self._host()
+                host.server_args.clear_tree_max_depth = 4
+                self.assertEqual(
+                    self.forward._lookahead_kv_need(host, 1),
+                    7 + (3 if enabled else 0),
+                )
+
+                def cpu_empty(*args, **kwargs):
+                    kwargs.pop("pin_memory", None)
+                    return torch.zeros(*args, **kwargs)
+
+                with patch.object(torch, "empty", side_effect=cpu_empty), patch.object(
+                    torch.cuda, "Event"
+                ):
+                    slot = self.forward._PinnedLayer(2)
+                self.assertEqual(slot.ids is not None, enabled)
+                slot.copy_seed(torch.ones(3), torch.arange(3))
+                self.assertEqual(slot.clone_cpu()[3] is not None, enabled)
+                slot.copy_expand(
+                    torch.ones(2),
+                    torch.arange(2),
+                    torch.zeros(2, dtype=torch.long),
+                    torch.zeros(2, 3, dtype=torch.long),
+                )
+                self.assertEqual(slot.clone_cpu()[3] is not None, enabled)
+                self.assertEqual(slot.event.synchronize.call_count, 2)
+
+    def test_lookahead_failed_wait_requires_completion_before_lease_publish(self):
+        for sync_fails in (False, True):
+            with self.subTest(sync_fails=sync_fails), _bonus_prediction(None):
+                host, _pool, freed = self._host()
+                host.device = "cpu"
+                host._sr_clear_stamps_after_poison = Mock()
+                job = self._job(host, complete=True)
+                runner = job.runner
+                runner.lookahead_inflight = True
+                runner._lookahead_bonus = None
+                runner._lookahead_launch_event = SimpleNamespace(
+                    synchronize=Mock(side_effect=RuntimeError("event failed"))
+                )
+                sync = Mock(
+                    side_effect=RuntimeError("sync failed") if sync_fails else None
+                )
+                with patch.object(
+                    self.torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(synchronize=sync),
+                ), patch.object(self.forward, "_forward_verify_fitting") as fit:
+                    self.forward.forward_deferred_final_layers(host, [job])
+                sync.assert_called_once()
+                fit.assert_not_called()
+                self.assertFalse(runner.lookahead_inflight)
+                self.assertTrue(runner._lookahead_satisfied)
+                self.assertEqual(host._sr_device_poisoned, sync_fails)
+                self.assertEqual(
+                    bool(getattr(runner, "lookahead_dropped", False)), sync_fails
+                )
+                self.assertEqual(
+                    host._sr_clear_stamps_after_poison.call_count, int(sync_fails)
+                )
+                if sync_fails:
+                    self.assertIsNone(job.req.clear_tree_lease)
+                    host._clear_rollback.assert_not_called()
+                    self.assertEqual(freed, [])
+                else:
+                    self.assertIsNotNone(job.req.clear_tree_lease)
+
+    def test_bonus_capture_graphs_are_opt_in_without_changing_layer_or_target(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
+            ClearTreeGraphCapture,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        install_candidates(None, None)
+        self.addCleanup(install_candidates, None, None)
+        draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=64)
+        target = _args(clear_tree_role="target", speculative_num_draft_tokens=65)
+        for value, enabled in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(value=value), _bonus_prediction(value):
+                expected = [65, 33, 17, 9, 5, 3] if enabled else []
+                self.assertEqual(self.forward.opt_draft_bonus_ntpbs(draft), expected)
+                self.assertEqual(
+                    ClearTreeGraphCapture.bonus_ntpbs_for_capture(draft), expected
+                )
+                self.assertEqual(self.forward.opt_draft_bonus_ntpbs(target), [])
+                self.assertEqual(
+                    self.forward.opt_draft_capture_extra_keys(draft, 3),
+                    [0] if enabled else [None],
+                )
+                for width in (1, 2, 4, 8, 16, 32, 64):
+                    self.assertEqual(
+                        self.forward.opt_draft_capture_extra_keys(draft, width), [None]
+                    )
+                self.assertEqual(
+                    self.forward.opt_draft_capture_extra_keys(target, 65), [None]
+                )
+                self.assertEqual(
+                    SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                        draft
+                    ),
+                    [64, 32, 16, 8, 4, 2, 1],
+                )
+                self.assertEqual(
+                    SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                        target
+                    ),
+                    [65, 33, 17, 9, 5, 3, 1],
+                )
+
+    def test_single_and_batch_growth_only_collect_ids_when_enabled(self):
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_policy as policy
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_replay as replay
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        # Importing the scheduler pulls GPU/model dependencies (and dill) into
+        # CPU CI. Execute only this unchanged method from its parsed source;
+        # all forward, config, and lease logic uses the real ClearTree modules.
+        path = Path(self.forward.__file__).with_name("clear_tree_scheduler.py")
+        mixin = next(
+            node
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "ClearTreeSchedulerMixin"
+        )
+        method = next(
+            node
+            for node in mixin.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_clear_expand_one"
+        )
+        for value, enabled in ((None, False), ("0", False), ("1", True)):
+            for batch in (False, True):
+                with self.subTest(value=value, batch=batch), _bonus_prediction(
+                    value
+                ), ExitStack() as stack:
+                    host, _pool, _freed = self._host()
+                    reqs = [self._req(allocated=3) for _ in range(2 if batch else 1)]
+                    for index, req in enumerate(reqs):
+                        req.rid = str(index)
+                    host._sr_resume_req = Mock()
+                    host._sr_isolate_need = Mock()
+                    host._clear_release_uncommitted = Mock()
+                    runners = []
+
+                    def make_runner(_host, req, keep):
+                        runner = SimpleNamespace(
+                            req=req, prefix_len=keep, bonus_ids=[], forward_layer=Mock()
+                        )
+                        runners.append(runner)
+                        return runner
+
+                    def grow(_config, _tails, _forward, _host, *, states_out, topk_out):
+                        self.assertEqual(
+                            topk_out, [[] for _ in reqs] if enabled else None
+                        )
+                        states_out.extend([self._state() for _ in reqs])
+                        if enabled:
+                            for rows in topk_out:
+                                rows.append(self.torch.tensor([1, 2, 3]))
+                        return [([20, 21], [-1, 0], [0, 0]) for _ in reqs]
+
+                    def finish(_host, _req, runner, *_args):
+                        self.assertEqual(len(runner.bonus_ids), int(enabled))
+                        return None
+
+                    stack.enter_context(
+                        patch.object(
+                            policy,
+                            "attach_round",
+                            return_value=SimpleNamespace(width=2),
+                        )
+                    )
+                    stack.enter_context(patch.object(policy, "remember_choice"))
+                    stack.enter_context(patch.object(replay, "queue_hold_replay"))
+                    stack.enter_context(
+                        patch.object(
+                            self.forward, "OptLayerForward", side_effect=make_runner
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            self.forward,
+                            "ingest_tail_logits",
+                            return_value=[self.torch.zeros(4) for _ in reqs],
+                        )
+                    )
+                    grow_mock = stack.enter_context(
+                        patch.object(
+                            self.forward, "grow_active_layers", side_effect=grow
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            self.forward, "finish_opt_expand_req", side_effect=finish
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            self.forward, "commit_deferred_expands", return_value=None
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(self.forward, "drain_opt_layer_gpu_us")
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            self.forward, "lookahead_supported", return_value=False
+                        )
+                    )
+                    if batch:
+                        result = self.forward.grow_batch(host, reqs)
+                        self.assertEqual(len(result), 2)
+                    else:
+                        namespace = dict(
+                            vars(self.forward),
+                            get_sr_round_metrics=get_sr_round_metrics,
+                        )
+                        exec(
+                            compile(
+                                ast.Module(body=[method], type_ignores=[]),
+                                str(path),
+                                "exec",
+                            ),
+                            namespace,
+                        )
+                        result = namespace[method.name](host, reqs[0])
+                        self.assertEqual(result[0], [20, 21])
+                    grow_mock.assert_called_once()
+                    self.assertEqual(len(runners), len(reqs))
 
 
 if __name__ == "__main__":

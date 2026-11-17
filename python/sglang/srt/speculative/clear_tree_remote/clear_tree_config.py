@@ -49,6 +49,11 @@ def _env_flag(name: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
+def bonus_prediction_enabled() -> bool:
+    """Draft bonus KV/seed-logits precomputation. Default off; set at startup."""
+    return _env_flag("SGLANG_CLEAR_BONUS_PREDICTION")
+
+
 def opt_draft_lookahead_enabled() -> bool:
     """Draft layer lookahead. Default off.
 

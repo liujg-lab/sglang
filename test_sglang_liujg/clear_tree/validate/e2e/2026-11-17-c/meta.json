@@ -1,0 +1,95 @@
+{
+  "run_id": "2026-11-17-c",
+  "experiment": "flat-table-bonus-ab",
+  "completed": true,
+  "voided": false,
+  "ledger": false,
+  "conditions": {
+    "A": {
+      "bonus_prediction": true
+    },
+    "B": {
+      "bonus_prediction": false
+    }
+  },
+  "concurrency": [
+    1,
+    4
+  ],
+  "sequence_per_concurrency": [
+    "A1",
+    "B1",
+    "A2",
+    "B2"
+  ],
+  "calibration": [
+    "c4-AA1",
+    "c4-AA2"
+  ],
+  "temperature": 0,
+  "max_items": 100,
+  "max_new_tokens": 1024,
+  "request_rate": "inf",
+  "smoke": {
+    "max_items": 4,
+    "max_new_tokens": 128,
+    "concurrency": 4
+  },
+  "warmup": "one first-item request, discarded; flush cache afterwards",
+  "cold_start": "both processes restarted per trial",
+  "cuda_graph_bs": [
+    1,
+    2,
+    4
+  ],
+  "clear_tree_widths": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "clear_tree_ks": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "max_depth": 8,
+  "max_running_requests": 4,
+  "target_capacity": 65,
+  "draft_capacity": 64,
+  "tree_kv_reuse": true,
+  "lookahead": false,
+  "dataset": {
+    "path": "/mnt/user/liujg/Downloads/text_only.jsonl",
+    "sha256": "8cf47bd9104c062c0ae2729f582044c97b407847a092fc2f3fa343280b4eec22",
+    "bytes": 65983375
+  },
+  "cpu_checks": {
+    "shell_tests": 34,
+    "ledger_tests": 112,
+    "passed": true
+  },
+  "package_provenance": "raw/preflight.json",
+  "noise_threshold": "max(1%, relative difference of independent same-session c4 A/A calibration)",
+  "validation_boundary": "No ledger T_K or draft_floor measurements; no online policy claims; periodic counters are lease reuse evidence, not strict per-round success proof.",
+  "services_stopped": true,
+  "tunnels_preserved": true,
+  "completed_utc": "2026-11-17T15:11:47.489072+00:00",
+  "runtime_status": "pass",
+  "output_equivalence_status": "fail",
+  "formal_requests": 1000,
+  "smoke_requests": 8,
+  "performance_status": "descriptive_only_output_equivalence_failed",
+  "AA_output_tok_s": [
+    123.04425067242238,
+    121.22276787443357
+  ],
+  "AA_relative_noise": 0.014803477513452417,
+  "AA_drift_caveat": "late A/A is slower than earlier c4 A1/A2; pairwise AA difference does not bound full-session drift",
+  "output_divergence_investigation": "first token divergence archived; root cause unresolved, no equivalence claim"
+}

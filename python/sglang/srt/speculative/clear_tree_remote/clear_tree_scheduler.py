@@ -19,7 +19,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.clear_tree_remote.clear_tree_config import ClearTreeConfig
+from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
+    ClearTreeConfig,
+    bonus_prediction_enabled,
+)
 from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     LookaheadFallback,
     OptLayerForward,
@@ -847,7 +850,7 @@ class ClearTreeSchedulerMixin:
                 return runner.forward_layer(step)
 
             t1 = time.perf_counter()
-            topk_out = [[]]
+            topk_out = [[]] if bonus_prediction_enabled() else None
             windows = None
             seed_logits = tail_logits
             lookahead_launched = None
@@ -878,7 +881,7 @@ class ClearTreeSchedulerMixin:
                     states_out=tree_states,
                     topk_out=topk_out,
                 )
-                runner.bonus_ids = topk_out[0]
+                runner.bonus_ids = topk_out[0] if topk_out is not None else []
             if not windows or windows[0] is None:
                 raise RuntimeError("OPT layer forward failed")
             tokens, parents, cols = windows[0]
