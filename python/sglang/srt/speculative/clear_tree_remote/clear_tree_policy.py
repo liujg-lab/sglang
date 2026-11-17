@@ -42,6 +42,7 @@ from typing import Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import policy_timed
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     BONUS_NTPBS,
     CANDIDATE_WIDTHS,
@@ -57,6 +58,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     flat_width,
     persistent_width,
 )
+
 EXPLORE_EVERY = 20
 PROBE_RUNS = 2
 VERIFY_WINDOW = 16
@@ -101,6 +103,8 @@ def on_external_event(scheduler) -> None:
         ledger.drop_fitted()
     scheduler._clear_replay_hold = None
     scheduler._clear_replay_closed = None
+    scheduler._clear_replay_pending = None
+    scheduler._clear_replay_to_hold = []
 
 
 def reset_gain_calibration() -> None:
@@ -484,7 +488,9 @@ def compare_price(rounds, gaps) -> Dict[int, dict]:
         seen.add(batch)
         reasons = {str(item) for item in (record.get("exclude_reason") or [])}
         if record.get("price_kept"):
-            _observe_price_into(dropped_n, dropped_tok, dropped_ms, batch, tokens, spent)
+            _observe_price_into(
+                dropped_n, dropped_tok, dropped_ms, batch, tokens, spent
+            )
             _observe_price_into(
                 deducted_n, deducted_tok, deducted_ms, batch, tokens, spent
             )
@@ -705,11 +711,7 @@ def _take_probe(
     )
 
     ranked = sorted(
-        (
-            int(k)
-            for k in VERIFY_KS
-            if int(k) <= int(cover) and int(k) != int(flat)
-        ),
+        (int(k) for k in VERIFY_KS if int(k) <= int(cover) and int(k) != int(flat)),
         key=lambda k: _probe_rank(flat, k),
     )
     for k in ranked:
@@ -791,6 +793,7 @@ class RoundPlan:
         """Every tree in the round, including one that later stops growing."""
         self._all = list(states)
 
+    @policy_timed
     def begin_layer(self, states) -> None:
         """The layer was just written. Judge these trees together."""
         self._peers = list(states)
@@ -816,6 +819,7 @@ class RoundPlan:
                 _observe_gain(self._raw_gain[key], _quality_increment(state, k), FORGET)
             self._raw_gain[key] = _raw_marginal(state, k)
 
+    @policy_timed
     def should_grow(self, state) -> bool:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import depth_rule
 
@@ -835,6 +839,7 @@ class RoundPlan:
             self._at = int(state.depth)
         return id(state) in self._keep_ids
 
+    @policy_timed
     def verify_k(self, state) -> int:
         if self._frozen_k is not None:
             return int(self._frozen_k)
@@ -844,6 +849,7 @@ class RoundPlan:
             return int(self.k)
         return self._select(self._all or self._peers or [state])
 
+    @policy_timed
     def freeze_k(self, states) -> int:
         """One verify count for every tree, chosen after growth has stopped."""
         chosen = self._select(list(states))
@@ -899,9 +905,7 @@ class RoundPlan:
             predict_layer_ms,
         )
 
-        return predict_layer_ms(
-            self._scheduler, self.width, int(active), int(sum_ell)
-        )
+        return predict_layer_ms(self._scheduler, self.width, int(active), int(sum_ell))
 
     def _kappa(self) -> Optional[float]:
         if self._scheduler is None:
@@ -1002,9 +1006,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
     reqs = list(reqs)
     batch = max(len(reqs), 1)
     drafts = [_draft_prefix(req) for req in reqs]
-    prefixes = [
-        _plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)
-    ]
+    prefixes = [_plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)]
     max_ell = max(prefixes) if prefixes else 0
     buckets = runtime_kv_buckets()
     _rounds += 1
@@ -1014,13 +1016,10 @@ def make_round(scheduler, reqs) -> RoundPlan:
     fitting = fitting_ks(max_ell, buckets)
     max_depth = _round_max_depth(scheduler)
     # A K-probe round is not eligible, so its tree stays on the served width.
-    # The probe reaches one width wider, so a later exploration round can
-    # find samples for that tree's covering tier. Probing waits until the
-    # served width's flat tier has its own sample.
+    # Only the served width's covering tier bounds K probes. Exploration
+    # needs the flat tier's sample, not samples for every wider tier.
     served = persistent_width(batch)
-    wider = _next_wider(served)
-    probe_width = served if wider is None else int(wider)
-    probe_cover = _cover_for(probe_width, max_depth, fitting)
+    probe_cover = _cover_for(served, max_depth, fitting)
     served_flat = _covered_flat_k(
         batch, max_ell, buckets, _cover_for(served, max_depth, fitting)
     )
@@ -1035,12 +1034,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
     ):
         probe = _take_probe(max_ell, buckets, batch, probe_cover, served_flat)
     price = theta(batch)
-    eligible = (
-        probe is None
-        and locked_env is None
-        and greedy
-        and ledger_on
-    )
+    eligible = probe is None and locked_env is None and greedy and ledger_on
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         _cached_build_width,
     )
@@ -1106,9 +1100,7 @@ def make_fallback_round(scheduler, reqs) -> RoundPlan:
     reqs = list(reqs)
     batch = max(len(reqs), 1)
     drafts = [_draft_prefix(req) for req in reqs]
-    prefixes = [
-        _plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)
-    ]
+    prefixes = [_plan_prefix(scheduler, req, draft) for req, draft in zip(reqs, drafts)]
     max_ell = max(prefixes) if prefixes else 0
     buckets = runtime_kv_buckets()
     chosen = _flat_locked_k(batch, max_ell, buckets)
@@ -1141,6 +1133,7 @@ def _bind_round(scheduler, plan, reqs) -> None:
     scheduler._clear_round_prefixes = [_draft_prefix(req) for req in reqs]
 
 
+@policy_timed
 def install_fallback_plan(scheduler, reqs) -> RoundPlan:
     """One degraded plan for every per-request rebuild of this packet."""
     token = getattr(scheduler, "_clear_build_token", None)
@@ -1152,6 +1145,7 @@ def install_fallback_plan(scheduler, reqs) -> RoundPlan:
     return plan
 
 
+@policy_timed
 def attach_round(scheduler, reqs) -> RoundPlan:
     """Store the round plan where the grow loop can see it.
 
@@ -1240,7 +1234,7 @@ def _quality_increment(state, k: int) -> float:
     latest = _latest_scores(state)
     if not scores or not latest:
         return 0.0
-    previous = scores[:-len(latest)] if len(latest) <= len(scores) else []
+    previous = scores[: -len(latest)] if len(latest) <= len(scores) else []
     return _prefix_mass(scores, k) - _prefix_mass(previous, k)
 
 

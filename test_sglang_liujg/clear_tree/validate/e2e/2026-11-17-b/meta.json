@@ -1,0 +1,57 @@
+{
+  "run_id": "2026-11-17-b",
+  "experiment": "e2e-c123",
+  "voided": false,
+  "target_git": "1518066e75fd8227c52b1b80e1d9b46821915810",
+  "draft_git": "0da712cc79e768ce97ee33ff4169abe9c90628a9",
+  "target_dirty": true,
+  "draft_dirty": true,
+  "ledger": true,
+  "target_backend": "npu",
+  "kv_buckets": [
+    256,
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "clear_tree_widths": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "clear_tree_ks": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "temperature": 0,
+  "max_new_tokens": 1024,
+  "max_items": 100,
+  "concurrency": [
+    1,
+    4
+  ],
+  "cuda_graph_bs": [
+    1,
+    2,
+    4
+  ],
+  "max_running_requests": 4,
+  "dataset": {
+    "sha256": "8cf47bd9104c062c0ae2729f582044c97b407847a092fc2f3fa343280b4eec22",
+    "bytes": 65983375
+  },
+  "comparison": "historical 2026-11-17-a; not A/B or A/A",
+  "completed": true,
+  "services_stopped": true,
+  "tunnels_preserved": true,
+  "historical_full_logs_provenance": "d_round and d_replay exactly match 2026-11-17-a raw ledger",
+  "validation_boundary": "no concurrent A/A or A/B; no persistent width switches; terminal round remains open without a following STEP"
+}

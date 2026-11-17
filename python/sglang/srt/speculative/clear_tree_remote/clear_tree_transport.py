@@ -352,6 +352,7 @@ class ClearDraftServer(_CommEndpoint):
         sock.bind(self._url)
         self._socket = sock
         self._last_identity = None
+        self.last_recv_queued = False
         logger.info("[CLEAR] Draft ROUTER bound on %s", self._url)
 
     def close(self) -> None:
@@ -383,13 +384,19 @@ class ClearDraftServer(_CommEndpoint):
     ) -> Optional[Tuple[ClearBatchRequest, Dict[str, Any]]]:
         import zmq
 
+        self.last_recv_queued = False
         self._finish_comm("abandoned")
+        queued = False
         try:
-            if timeout_ms is None:
-                self._socket.setsockopt(zmq.RCVTIMEO, -1)
-            else:
-                self._socket.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_ms)))
-            frames = self._socket.recv_multipart(copy=False)
+            try:
+                frames = self._socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
+                queued = True
+            except zmq.Again:
+                if timeout_ms is None:
+                    self._socket.setsockopt(zmq.RCVTIMEO, -1)
+                else:
+                    self._socket.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_ms)))
+                frames = self._socket.recv_multipart(copy=False)
             received = time.perf_counter_ns()
         except zmq.Again:
             return None
@@ -420,6 +427,7 @@ class ClearDraftServer(_CommEndpoint):
         )
         if batch.action in (ClearAction.FINISH, ClearAction.ABORT):
             self._finish_comm("receive_only")
+        self.last_recv_queued = queued
         return batch, mm
 
     def send_batch(self, batch: ClearBatchReply, identity: Optional[Any] = None) -> None:

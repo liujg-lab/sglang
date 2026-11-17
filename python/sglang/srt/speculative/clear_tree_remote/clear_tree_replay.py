@@ -12,7 +12,10 @@ may call the price policy and the ledger. The ledger does not import it.
 
 from __future__ import annotations
 
+import time
 from typing import Dict, Optional, Sequence
+
+from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import policy_timed
 
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     EXPLORE_EVERY,
@@ -100,9 +103,7 @@ def _narrow_unpriced(scheduler, width: int, batch: int, sum_ell: int) -> bool:
         predict_layer_ms,
     )
 
-    return (
-        predict_layer_ms(scheduler, int(width), int(batch), int(sum_ell)) is None
-    )
+    return predict_layer_ms(scheduler, int(width), int(batch), int(sum_ell)) is None
 
 
 def choose_build_width(
@@ -141,11 +142,7 @@ def choose_build_width(
         left = int(_probe_w_left.get(key, 0))
         idle = int(_narrow_idle.get(key, PROBE_W_IDLE))
         samples = _layer_samples(scheduler, narrow)
-        if (
-            left > 0
-            and _probe_w_fill.get(key, False)
-            and samples >= LAYER_MIN_SAMPLES
-        ):
+        if left > 0 and _probe_w_fill.get(key, False) and samples >= LAYER_MIN_SAMPLES:
             _probe_w_left[key] = 0
             _probe_w_fill[key] = False
             left = 0
@@ -176,12 +173,17 @@ def choose_build_width(
     _mark_width_ran(bucket, base)
     return base, "ordinary"
 
+
 def _cached_build_width(
     scheduler, batch: int, *, ledger_on: bool, eligible: bool, sum_ell: int = 0
 ):
     """One width per packet. A fallback expand must not take a second departure."""
-    token = None if scheduler is None else getattr(scheduler, "_clear_build_token", None)
-    cached = None if scheduler is None else getattr(scheduler, "_clear_build_cache", None)
+    token = (
+        None if scheduler is None else getattr(scheduler, "_clear_build_token", None)
+    )
+    cached = (
+        None if scheduler is None else getattr(scheduler, "_clear_build_cache", None)
+    )
     if token is not None and isinstance(cached, tuple) and cached[0] == token:
         return cached[1]
     chosen = choose_build_width(
@@ -194,6 +196,7 @@ def _cached_build_width(
     if token is not None and scheduler is not None:
         scheduler._clear_build_cache = (token, chosen)
     return chosen
+
 
 def truncate_columns(layers, width: int) -> list:
     """Per layer, the columns kept when the tree is cut down to ``width``.
@@ -215,6 +218,7 @@ def truncate_columns(layers, width: int) -> list:
         previous = set(chosen)
         kept.append(chosen)
     return kept
+
 
 def matched_depth(layers, kept, tokens) -> int:
     """How many committed tokens walk the kept columns, from the root."""
@@ -238,6 +242,7 @@ def matched_depth(layers, kept, tokens) -> int:
         matched += 1
     return matched
 
+
 def replay_accept(layers, width: int, tokens, stop: Optional[int] = None) -> int:
     """Accepted draft tokens on the truncated tree, plus one bonus when present."""
     kept = truncate_columns(layers, width)
@@ -247,6 +252,7 @@ def replay_accept(layers, width: int, tokens, stop: Optional[int] = None) -> int
         return matched + 1
     return matched
 
+
 def _kept_scores(layers, kept, end: int) -> list:
     scores = []
     for depth in range(min(int(end), len(kept))):
@@ -254,12 +260,14 @@ def _kept_scores(layers, kept, end: int) -> list:
             scores.append(float(layers[depth][col]["score"]))
     return scores
 
+
 def _list_marginal(scores, latest, k: int) -> float:
     if not latest:
         return 0.0
     ordered = sorted((float(value) for value in scores), reverse=True)
     theta_k = ordered[int(k) - 1] if len(ordered) >= int(k) else 0.0
     return float(sum(max(0.0, float(score) - theta_k) for score in latest))
+
 
 def candidate_stop_depth(
     layers,
@@ -293,6 +301,7 @@ def candidate_stop_depth(
         layer_rows=rows,
         width=0,
     )
+
 
 def _top_kept_nodes(layers, kept, end: int, limit: int) -> set:
     """Top ``limit`` kept nodes: score desc, depth asc, column asc."""
@@ -408,6 +417,7 @@ def batch_stop_depth(
             return stop
     return depth
 
+
 def _schedule_ms(layer_rows, width: int, n_layers: int, verify_ms, k: int):
     spent = None if verify_ms is None else verify_ms.get(int(k))
     if spent is None:
@@ -419,6 +429,7 @@ def _schedule_ms(layer_rows, width: int, n_layers: int, verify_ms, k: int):
             return None
         total += float(pred)
     return total
+
 
 def _retained_nodes(tree, stop: int) -> int:
     """Kept nodes at or above the root and before ``stop``."""
@@ -468,8 +479,10 @@ def _select_replay_k(
         return _clamp_replay_k(default_k, cap)
     return select_k(values)
 
+
 def _blank_arm() -> Dict[str, float]:
     return {"tok": 0.0, "ms": 0.0, "cur_tok": 0.0, "cur_ms": 0.0, "n": 0.0}
+
 
 def _arm(bucket: int, width: int) -> Dict[str, float]:
     row = _replay_arms.get(bucket)
@@ -482,20 +495,25 @@ def _arm(bucket: int, width: int) -> Dict[str, float]:
         row[int(width)] = found
     return found
 
+
 def _clear_arms(bucket: int) -> None:
     _replay_arms.pop(int(bucket), None)
     _replay_n[int(bucket)] = 0
 
+
 def _real_key(bucket: int, width: int) -> tuple:
     return (int(bucket), int(width))
 
+
 def _pair_key(bucket: int, wide: int, narrow: int) -> tuple:
     return (int(bucket), int(wide), int(narrow))
+
 
 def _ordered_pair(left: int, right: int) -> tuple:
     if int(left) >= int(right):
         return int(left), int(right)
     return int(right), int(left)
+
 
 def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
     """Gap between truncated throughput and real narrow throughput.
@@ -521,12 +539,14 @@ def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
     real_ratio = (float(_real_tok.get(real, 0.0)) / narrow_ms) / base - 1.0
     return float(replay_ratio - real_ratio)
 
+
 def _bias_report(bucket: int, served: int, would: int) -> Optional[float]:
     """Bias of the served width against ``would``. Diagnostic only."""
     if int(served) == int(would):
         return None
     wide, narrow = _ordered_pair(served, would)
     return replay_bias(bucket, wide, narrow)
+
 
 def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> None:
     if float(actual_ms) <= 0.0:
@@ -544,6 +564,7 @@ def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> N
         _pair_replay_ms[key] = float(_pair_replay_ms.get(key, 0.0)) + float(pair[1])
         _pair_wide_tok[key] = float(_pair_wide_tok.get(key, 0.0)) + float(actual_tokens)
         _pair_wide_ms[key] = float(_pair_wide_ms.get(key, 0.0)) + float(actual_ms)
+
 
 def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
     """Best width under the 20-round, 3 percent, 30-pair rule.
@@ -588,6 +609,7 @@ def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
         applied = True
     return best, shadow_gain, applied
 
+
 def observe_replay(
     batch: int,
     built: int,
@@ -606,7 +628,9 @@ def observe_replay(
     adjacent narrower step. The logged bias is the pair of the width served
     at the start of this round and ``would_w``.
     """
-    pairs = {} if replayed is None else {int(key): value for key, value in replayed.items()}
+    pairs = (
+        {} if replayed is None else {int(key): value for key, value in replayed.items()}
+    )
     bucket = batch_bucket(batch)
     served = persistent_width(batch)
     current = served
@@ -659,16 +683,16 @@ def observe_replay(
     }
     return record
 
+
 def _candidate_log(built, actual_tokens, actual_ms, replayed) -> dict:
-    logged = {
-        str(int(built)): {"tokens": float(actual_tokens), "ms": float(actual_ms)}
-    }
+    logged = {str(int(built)): {"tokens": float(actual_tokens), "ms": float(actual_ms)}}
     for width, pair in replayed.items():
         logged[str(int(width))] = {
             "tokens": float(pair[0]),
             "ms": None if pair[1] is None else float(pair[1]),
         }
     return logged
+
 
 def _layers_of(state) -> list:
     depth = int(getattr(state, "depth", 0) or 0)
@@ -691,6 +715,7 @@ def _layers_of(state) -> list:
             ]
         )
     return layers
+
 
 def _freeze_layer_rows(scheduler, states) -> list:
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
@@ -721,9 +746,40 @@ def _freeze_layer_rows(scheduler, states) -> list:
         rows.append({"active": active, "sum_ell": sum_ell, "pred": pred})
     return rows
 
-def hold_replay(scheduler, reqs, states, plan) -> None:
-    """Keep this round's trees until the next STEP brings their committed text."""
+
+def queue_hold_replay(scheduler, reqs, states, plan) -> None:
+    """Register references only; freeze tensors and prices after the reply.
+
+    Capture the served width now: settling the previous round in post-reply
+    may switch it before this round's trees are held.
+    """
+    queued = getattr(scheduler, "_clear_replay_to_hold", None)
+    if queued is None:
+        queued = []
+        scheduler._clear_replay_to_hold = queued
+    queued.append(
+        (
+            list(reqs),
+            list(states),
+            plan,
+            getattr(scheduler, "_clear_build_token", None),
+            int(persistent_width(int(plan.batch))),
+            getattr(scheduler, "_clear_replay_packet", None),
+        )
+    )
+
+
+def hold_replay(
+    scheduler, reqs, states, plan, *, token=None, served=None, packet=None
+) -> None:
+    """Freeze this round's trees until the next STEP brings committed text."""
     try:
+        if token is None:
+            token = getattr(scheduler, "_clear_build_token", None)
+        if served is None:
+            served = persistent_width(int(plan.batch))
+        if packet is None:
+            packet = getattr(scheduler, "_clear_replay_packet", None)
         trees = {}
         usable = []
         for req, state in zip(reqs, states):
@@ -731,7 +787,7 @@ def hold_replay(scheduler, reqs, states, plan) -> None:
             if not layers:
                 continue
             rid = str(getattr(req, "rid", "") or getattr(state, "rid", ""))
-            output = list(getattr(req, "output_ids", None) or [])
+            output = getattr(req, "output_ids", None) or []
             trees[rid] = {
                 "layers": layers,
                 "output_len": len(output),
@@ -753,15 +809,17 @@ def hold_replay(scheduler, reqs, states, plan) -> None:
             k_actual = int(plan.locked_k)
         else:
             k_actual = int(plan.verify_k(usable[0]))
-        token = getattr(scheduler, "_clear_build_token", None)
         existing = getattr(scheduler, "_clear_replay_hold", None)
         if (
             existing is None
             or existing.get("token") != token
+            or existing.get("packet") != packet
             or len(list(reqs)) > 1
         ):
             existing = {
                 "token": token,
+                "packet": packet,
+                "served": int(served),
                 "trees": {},
                 "width": int(plan.width),
                 "kind": str(getattr(plan, "replay_kind", "ordinary")),
@@ -783,6 +841,7 @@ def hold_replay(scheduler, reqs, states, plan) -> None:
         logging.getLogger(__name__).warning(
             "[CLEAR ledger] replay hold failed", exc_info=True
         )
+
 
 def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
     built = int(hold["width"])
@@ -848,7 +907,9 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
             )
             for tree in prepared
         ]
-        model_actual = _schedule_ms(layer_rows, built, len(layer_rows), verify_ms, int(hold["k"]))
+        model_actual = _schedule_ms(
+            layer_rows, built, len(layer_rows), verify_ms, int(hold["k"])
+        )
         model_cand = _schedule_ms(
             layer_rows,
             int(width),
@@ -867,16 +928,29 @@ def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
             out[int(width)] = (float(sum(accepts)), counterfactual)
     return out
 
+
+@policy_timed
 def settle_replay(scheduler, reqs) -> Optional[dict]:
-    """Replay the previous tree with this STEP's committed tokens."""
+    """Consume the previous hold and copy committed tails; defer replay work."""
     hold = getattr(scheduler, "_clear_replay_hold", None)
     closed = getattr(scheduler, "_clear_replay_closed", None)
     scheduler._clear_replay_hold = None
     scheduler._clear_replay_closed = None
+    scheduler._clear_replay_pending = None
     if not isinstance(hold, dict) or not isinstance(closed, dict):
         return None
     try:
+        packet = hold.get("packet")
+        if packet is None or packet != (
+            str(closed.get("session_id", "")),
+            closed.get("rpc_seq"),
+        ):
+            return None
         if not hold.get("eligible"):
+            return None
+        # Exploration deliberately builds wider than served. Only a persistent
+        # switch since the build makes this a cross-switch transition round.
+        if int(hold["served"]) != persistent_width(int(hold["batch"])):
             return None
         if closed.get("excluded") or not closed.get("price_kept"):
             return None
@@ -890,9 +964,9 @@ def settle_replay(scheduler, reqs) -> Optional[dict]:
             req = by_rid.get(rid)
             if req is None:
                 return None
-            output = [int(token) for token in list(getattr(req, "output_ids", None) or [])]
+            output = getattr(req, "output_ids", None) or []
             old = int(tree["output_len"])
-            if old > len(output):
+            if old < 0 or old > len(output):
                 return None
             fresh = output[old:]
             tokens_by_rid[rid] = fresh
@@ -900,20 +974,15 @@ def settle_replay(scheduler, reqs) -> Optional[dict]:
         if not tokens_by_rid:
             return None
         hold["measured_ms"] = float(measured)
-        replayed = _replayed_counts(hold, tokens_by_rid)
-        size = int(getattr(scheduler, "tp_size", 1) or 1)
-        record = observe_replay(
-            int(hold["batch"]),
-            int(hold["width"]),
-            str(hold["kind"]),
-            float(actual),
-            float(measured),
-            replayed,
-            counted=True,
-            apply=size <= 1,
-        )
-        _emit_replay(scheduler, record)
-        return record
+        pending = {
+            "token": getattr(scheduler, "_clear_build_token", None),
+            "packet": getattr(scheduler, "_clear_replay_packet", None),
+            "hold": hold,
+            "tokens": tokens_by_rid,
+            "actual": actual,
+        }
+        scheduler._clear_replay_pending = pending
+        return pending
     except Exception:
         import logging
 
@@ -922,16 +991,81 @@ def settle_replay(scheduler, reqs) -> Optional[dict]:
         )
         return None
 
-def _emit_replay(scheduler, record: dict) -> None:
+
+def run_post_reply(scheduler) -> None:
+    """Settle the previous round, hold this build, then flush Draft logs once."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        _emit,
-        ledger_enabled,
+        add_post_ms,
+        flush_draft_logs,
     )
 
-    if not ledger_enabled():
+    started = time.perf_counter()
+    token = getattr(scheduler, "_clear_build_token", None)
+    packet = getattr(scheduler, "_clear_replay_packet", None)
+    post_key = (token, packet)
+    if getattr(scheduler, "_clear_replay_post_done", None) == post_key:
         return
-    rank = 0 if scheduler is None else int(getattr(scheduler, "tp_rank", 0) or 0)
-    if rank != 0:
-        return
-    _emit("d_replay", record)
+    scheduler._clear_replay_post_done = post_key
+    previous_post = getattr(scheduler, "_clear_in_post_reply", False)
+    scheduler._clear_in_post_reply = True
+    try:
+        pending = getattr(scheduler, "_clear_replay_pending", None)
+        queued = getattr(scheduler, "_clear_replay_to_hold", None) or []
+        scheduler._clear_replay_pending = None
+        scheduler._clear_replay_to_hold = None
+        # A STEP that returned early must not leave an old hold looking like
+        # the reply just sent. Non-STEP packets never enter this function.
+        scheduler._clear_replay_hold = None
+        scheduler._clear_replay_closed = None
+        try:
+            if (
+                isinstance(pending, dict)
+                and pending.get("token") == token
+                and pending.get("packet") == packet
+            ):
+                hold = pending["hold"]
+                if int(hold["served"]) == persistent_width(int(hold["batch"])):
+                    replayed = _replayed_counts(hold, pending["tokens"])
+                    record = observe_replay(
+                        int(hold["batch"]),
+                        int(hold["width"]),
+                        str(hold["kind"]),
+                        float(pending["actual"]),
+                        float(hold["measured_ms"]),
+                        replayed,
+                        counted=True,
+                        apply=int(getattr(scheduler, "tp_size", 1) or 1) <= 1,
+                    )
+                    _emit_replay(scheduler, record)
+        except Exception:
+            import logging
 
+            logging.getLogger(__name__).warning(
+                "[CLEAR ledger] replay post failed", exc_info=True
+            )
+        # A failed batch build may already have registered its primary trees.
+        # Fallback rounds are excluded, so do not retain any of those trees.
+        if not getattr(scheduler, "_clear_plan_fallback", False):
+            for reqs, states, plan, build_token, served, build_packet in queued:
+                if build_token == token and build_packet == packet:
+                    hold_replay(
+                        scheduler,
+                        reqs,
+                        states,
+                        plan,
+                        token=build_token,
+                        served=served,
+                        packet=build_packet,
+                    )
+        flush_draft_logs(scheduler)
+    finally:
+        scheduler._clear_in_post_reply = previous_post
+        add_post_ms(scheduler, (time.perf_counter() - started) * 1000.0)
+
+
+def _emit_replay(scheduler, record: dict) -> None:
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        queue_draft_log,
+    )
+
+    queue_draft_log(scheduler, "d_replay", record)

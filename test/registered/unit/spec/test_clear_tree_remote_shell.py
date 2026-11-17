@@ -6,9 +6,18 @@ OPT or STANDALONE_REMOTE, and OPT must not pick up ClearTree fields.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import ANY, Mock, call, patch
 
+import zmq
+
+from sglang.srt.speculative.clear_tree_remote import clear_tree_transport as transport
 from sglang.srt.speculative.clear_tree_remote.clear_tree_args import (
     apply_clear_tree_settings,
+)
+from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+    ClearAction,
+    ClearBatchRequest,
+    ClearDraftRequest,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm, remote_spec_role
 from sglang.srt.speculative.standalone_remote.sr_protocol import local_spec_shape
@@ -243,7 +252,9 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         )
         gate = next(node for node in send.body if isinstance(node, ast.If))
         self.assertEqual(gate.test.func.attr, "_clear_step_rtt_enabled")
-        self.assertIn("_clear_send", ast.dump(ast.Module(body=gate.body, type_ignores=[])))
+        self.assertIn(
+            "_clear_send", ast.dump(ast.Module(body=gate.body, type_ignores=[]))
+        )
         self.assertNotIn(
             "_clear_send", ast.dump(ast.Module(body=gate.orelse, type_ignores=[]))
         )
@@ -259,6 +270,181 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         enabled_src = ast.get_source_segment(source, enabled)
         self.assertIn("is_clear_tree_remote", enabled_src)
 
+    def test_draft_loop_post_runs_only_after_valid_reply_and_drain(self):
+        import ast
+        from collections import defaultdict
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_ledger as ledger
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_replay as replay
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+            supported_clear_protocol,
+        )
+
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/clear_tree_remote/clear_tree_scheduler.py"
+        ).read_text()
+        mixin = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "ClearTreeSchedulerMixin"
+        )
+        method = next(
+            node
+            for node in mixin.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "event_loop_normal_clear_tree_draft"
+        )
+        method.decorator_list = []
+        for status, send_error, identity, handler_error, reason in (
+            ("ok", False, b"peer", False, None),
+            ("empty", False, b"peer", False, None),
+            ("empty", False, b"peer", False, "commit_incomplete"),
+            ("reject", False, b"peer", False, None),
+            ("ok", True, b"peer", False, None),
+            ("ok", False, None, False, None),
+            ("ok", False, b"peer", True, None),
+        ):
+            with self.subTest(
+                status=status,
+                send_error=send_error,
+                identity=identity,
+                handler_error=handler_error,
+            ):
+                events = []
+                batch = SimpleNamespace(
+                    action=ClearAction.STEP,
+                    session_id="sess",
+                    rpc_seq=1,
+                    protocol_version=1,
+                    reqs=[SimpleNamespace(rid="r")],
+                )
+                reply = SimpleNamespace(
+                    session_id="sess",
+                    rpc_seq=1,
+                    protocol_version=1,
+                    reqs=[SimpleNamespace(status=status, reason=reason)],
+                )
+
+                def send(_reply):
+                    events.append("send")
+                    if send_error:
+                        raise RuntimeError("send failed")
+
+                def handle(*_args):
+                    if handler_error:
+                        raise RuntimeError("handler failed")
+                    return reply
+
+                metrics = SimpleNamespace(
+                    active=False, phase=lambda _name: nullcontext()
+                )
+                scheduler = SimpleNamespace(
+                    tp_rank=0,
+                    tp_size=1,
+                    _opt_deferred=[],
+                    sr_state=SimpleNamespace(session_id="sess"),
+                    sr_server=SimpleNamespace(send_batch=send, _last_identity=identity),
+                    _init_clear_tree_draft=lambda: None,
+                    recv_requests=Mock(side_effect=[[], StopIteration()]),
+                    process_input_requests=lambda _reqs: None,
+                    _sr_recv_packet=lambda: (batch, {}),
+                    _sr_batch_is_stale=lambda _batch: False,
+                    _clear_spec_shape_rejected=lambda _batch: False,
+                    _clear_handle_batch_impl=handle,
+                    _sr_resume_http_reqs=lambda: None,
+                    _sr_poll_deferred_finishes=lambda: None,
+                )
+                namespace = {
+                    "time": __import__("time"),
+                    "sys": __import__("sys"),
+                    "ClearAction": ClearAction,
+                    "get_sr_round_metrics": lambda *_args: metrics,
+                    "supported_clear_protocol": supported_clear_protocol,
+                    "run_opt_draft_round": lambda _m, _measure, work: work(
+                        defaultdict(int)
+                    ),
+                    "dump_tree_reply": lambda _reply: None,
+                    "drain_deferred_layer_events": lambda *_a, **_kw: events.append(
+                        "drain"
+                    ),
+                }
+                exec(
+                    compile(
+                        ast.Module(body=[method], type_ignores=[]),
+                        "<draft-loop>",
+                        "exec",
+                    ),
+                    namespace,
+                )
+                with patch.object(ledger, "note_packet"), patch.object(
+                    ledger, "mark_send"
+                ), patch.object(
+                    ledger, "mark_post", side_effect=lambda *_a: events.append("mark")
+                ), patch.object(
+                    replay,
+                    "run_post_reply",
+                    side_effect=lambda *_a: events.append("post"),
+                ):
+                    expected = (
+                        RuntimeError if send_error or handler_error else StopIteration
+                    )
+                    with self.assertRaises(expected):
+                        namespace[method.name](scheduler)
+                self.assertIn("drain", events)
+                should_post = (
+                    status in {"ok", "empty"}
+                    and reason != "commit_incomplete"
+                    and not send_error
+                    and identity is not None
+                    and not handler_error
+                )
+                self.assertEqual("post" in events, should_post)
+                if should_post:
+                    self.assertEqual(events, ["send", "drain", "post", "mark"])
+
+    def test_recv_packet_passes_local_queue_flag_before_tp1_return(self):
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/speculative/clear_tree_remote/clear_tree_scheduler.py"
+        ).read_text()
+        mixin = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "ClearTreeSchedulerMixin"
+        )
+        method = next(
+            node
+            for node in mixin.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_sr_recv_packet"
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[method], type_ignores=[]), "<recv-packet>", "exec"
+            ),
+            namespace,
+        )
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                packet = (object(), {})
+                scheduler = SimpleNamespace(
+                    spec_algorithm=SimpleNamespace(is_clear_tree_remote=lambda: True),
+                    tp_size=1,
+                    tp_rank=0,
+                    sr_server=SimpleNamespace(
+                        recv_batch=Mock(return_value=packet), last_recv_queued=queued
+                    ),
+                )
+                self.assertIs(namespace[method.name](scheduler), packet)
+                self.assertEqual(scheduler._clear_recv_queued, queued)
+                scheduler.sr_server.recv_batch.assert_called_once_with(timeout_ms=50)
+
     def test_fixed_accept_stays_off(self):
         clear = SimpleNamespace(fixed_accept_skip="clear_tree")
         named = SimpleNamespace(speculative_algorithm="CLEAR_TREE_REMOTE")
@@ -267,6 +453,148 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         self.assertIsNone(getattr(named, "fixed_accept_skip", None))
         self.assertNotEqual(static_disable_reason(named), "clear_tree")
         self.assertEqual(static_disable_reason(opt), "opt_tree")
+
+
+class _DraftSocket:
+    def __init__(self, *responses):
+        self.recv_multipart = Mock(side_effect=responses)
+        self.setsockopt = Mock()
+
+
+class ClearTreeDraftTransportTest(CustomTestCase):
+    def _server(self, *responses):
+        # Exercise recv_batch without binding a real ROUTER or opening a context.
+        server = transport.ClearDraftServer.__new__(transport.ClearDraftServer)
+        server._socket = _DraftSocket(*responses)
+        server._comm_pending = None
+        server.comm_metrics = Mock()
+        server._last_identity = None
+        server.last_recv_queued = False
+        return server
+
+    def _frames(self):
+        batch = ClearBatchRequest(
+            session_id="session",
+            rpc_seq=3,
+            action=ClearAction.STEP,
+            reqs=[ClearDraftRequest(rid="r", committed_ids=[1, 2])],
+        )
+        return batch, [b"target", *transport._pack_request(batch)]
+
+    def test_immediate_request_is_queued(self):
+        batch, frames = self._frames()
+        server = self._server(frames)
+
+        result = server.recv_batch(timeout_ms=17)
+
+        self.assertEqual(result, (batch, {}))
+        self.assertTrue(server.last_recv_queued)
+        server._socket.recv_multipart.assert_called_once_with(
+            flags=zmq.NOBLOCK, copy=False
+        )
+        server._socket.setsockopt.assert_not_called()
+        self.assertEqual(server._last_identity, b"target")
+        self.assertEqual(server._comm_pending.key, ("session", 3))
+
+    def test_again_then_request_is_not_queued(self):
+        batch, frames = self._frames()
+        for timeout, expected_timeout in ((None, -1), (17, 17), (0, 1)):
+            with self.subTest(timeout=timeout):
+                server = self._server(zmq.Again(), frames)
+                server.last_recv_queued = True
+
+                self.assertEqual(server.recv_batch(timeout), (batch, {}))
+
+                self.assertFalse(server.last_recv_queued)
+                self.assertEqual(
+                    server._socket.recv_multipart.call_args_list,
+                    [
+                        call(flags=zmq.NOBLOCK, copy=False),
+                        call(copy=False),
+                    ],
+                )
+                server._socket.setsockopt.assert_called_once_with(
+                    zmq.RCVTIMEO, expected_timeout
+                )
+
+    def test_full_timeout_clears_previous_queued_result(self):
+        _, frames = self._frames()
+        server = self._server(frames, zmq.Again(), zmq.Again())
+        self.assertIsNotNone(server.recv_batch(17))
+        self.assertTrue(server.last_recv_queued)
+
+        self.assertIsNone(server.recv_batch(17))
+
+        self.assertFalse(server.last_recv_queued)
+        self.assertIsNone(server._comm_pending)
+        server._socket.setsockopt.assert_called_once_with(zmq.RCVTIMEO, 17)
+        server.comm_metrics.record.assert_called_once_with(
+            ClearAction.STEP, "abandoned", ANY
+        )
+
+    def test_receive_errors_clear_previous_queued_result(self):
+        _, frames = self._frames()
+        for responses in (
+            (RuntimeError("probe failed"),),
+            (zmq.Again(), RuntimeError("blocking receive failed")),
+        ):
+            with self.subTest(responses=responses):
+                server = self._server(frames, *responses)
+                self.assertIsNotNone(server.recv_batch(17))
+                self.assertTrue(server.last_recv_queued)
+
+                self.assertIsNone(server.recv_batch(17))
+
+                self.assertFalse(server.last_recv_queued)
+                self.assertIsNone(server._comm_pending)
+                server.comm_metrics.record.assert_any_call("unknown", "recv_error")
+
+    def test_timeout_option_error_is_not_queued(self):
+        server = self._server(zmq.Again())
+        server.last_recv_queued = True
+        server._socket.setsockopt.side_effect = RuntimeError("setsockopt failed")
+
+        self.assertIsNone(server.recv_batch(17))
+
+        self.assertFalse(server.last_recv_queued)
+        server._socket.recv_multipart.assert_called_once_with(
+            flags=zmq.NOBLOCK, copy=False
+        )
+        server.comm_metrics.record.assert_called_once_with("unknown", "recv_error")
+
+    def test_empty_or_malformed_request_is_not_queued(self):
+        _, frames = self._frames()
+        for bad_frames in (
+            [],
+            [b"target", b"wrong magic"],
+            [b"target", b"CTCTRL", b"invalid pickle"],
+        ):
+            for queued in (True, False):
+                with self.subTest(frames=bad_frames, queued=queued):
+                    responses = [bad_frames] if queued else [zmq.Again(), bad_frames]
+                    server = self._server(frames, *responses)
+                    self.assertIsNotNone(server.recv_batch(17))
+                    self.assertTrue(server.last_recv_queued)
+
+                    self.assertIsNone(server.recv_batch(17))
+
+                    self.assertFalse(server.last_recv_queued)
+                    self.assertIsNone(server._comm_pending)
+                    if bad_frames:
+                        server.comm_metrics.record.assert_any_call(
+                            "unknown", "unpack_error"
+                        )
+
+    def test_unpack_preserves_multimodal_return(self):
+        batch, frames = self._frames()
+        mm = {"r": object()}
+        server = self._server(frames)
+        with patch.object(transport, "_unpack_request", return_value=(batch, mm)):
+            result = server.recv_batch(17)
+
+        self.assertEqual(result, (batch, mm))
+        self.assertIs(result[1], mm)
+        self.assertTrue(server.last_recv_queued)
 
 
 if __name__ == "__main__":

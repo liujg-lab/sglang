@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from functools import wraps
 from typing import Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ LAYER_MIN_SAMPLES = 4
 LAYER_SPAN_PAD = 128.0
 # Intercept, graph bucket, prefix sum. The prefix prior is one token's
 # 2 µs scaled by 128, so a flat prefix cannot set the slope.
-LAYER_RIDGE = (0.0, RIDGE, LAYER_SPAN_PAD ** 2)
+LAYER_RIDGE = (0.0, RIDGE, LAYER_SPAN_PAD**2)
 _PREFIX_FEATURE = 2
 VERIFY_MIN_SAMPLES = 6
 _DEFAULT_BUCKETS = (256, 512, 1024, 2048, 4096)
@@ -122,7 +123,9 @@ def _layer_features(active: int, sum_ell: int) -> List[float]:
     return [1.0, float(graph_bucket(active)), float(sum_ell)]
 
 
-def predict_layer_ms(scheduler, width: int, active: int, sum_ell: int) -> Optional[float]:
+def predict_layer_ms(
+    scheduler, width: int, active: int, sum_ell: int
+) -> Optional[float]:
     """Draft layer fit, or None when the prefix is outside the seen span.
 
     A non-positive prediction is also None. The served width then stays on
@@ -201,9 +204,7 @@ class ForgettingRegressor:
         self.span_min: Optional[float] = None
         self.span_max: Optional[float] = None
         self.n = 0
-        self.xtx = [
-            [0.0] * self.n_features for _ in range(self.n_features)
-        ]
+        self.xtx = [[0.0] * self.n_features for _ in range(self.n_features)]
         self.xty = [0.0] * self.n_features
         self._coef: Optional[List[float]] = None
         self._coef_n = -1
@@ -293,7 +294,8 @@ class _Round:
         "idle_before",
         "gap_actions",
         "gap_rpcs",
-        "idle_after_post",
+        "policy_ms",
+        "post_ms",
         "t_open",
         "t_stop",
         "t_send",
@@ -324,7 +326,8 @@ class _Round:
         self.idle_before = bool(idle_before)
         self.gap_actions: List[str] = []
         self.gap_rpcs: List[int] = []
-        self.idle_after_post = False
+        self.policy_ms = 0.0
+        self.post_ms = 0.0
         self.t_open = float(opened_at)
         self.t_stop: Optional[float] = None
         self.t_send: Optional[float] = None
@@ -370,6 +373,19 @@ class ClearLedger:
         self.layer_models: Dict[tuple, ForgettingRegressor] = {}
         self.verify_model: Optional[ForgettingRegressor] = None
         self.verify_samples = 0
+        self.pending_logs: List[tuple] = []
+
+    def queue_log(self, kind: str, record: dict) -> None:
+        self.pending_logs.append((kind, record))
+
+    def flush_logs(self) -> None:
+        pending, self.pending_logs = self.pending_logs, []
+        for kind, record in pending:
+            try:
+                _emit(kind, record)
+            except Exception:
+                # Diagnostics must not interrupt resource cleanup or model updates.
+                logger.warning("[CLEAR ledger] log output failed", exc_info=True)
 
     def drop_fitted(self) -> None:
         """Drop the open round and both regressions. Theta lives outside."""
@@ -387,6 +403,7 @@ class ClearLedger:
         prefix_lens: Sequence[int],
         width: int,
         now: Optional[float] = None,
+        recv_queued: bool = False,
     ) -> Optional[dict]:
         """Close the previous STEP when this packet is its next STEP.
 
@@ -398,7 +415,7 @@ class ClearLedger:
         closed = None
         if self.open is not None and self.open.t_send is not None:
             if name == "step":
-                closed = self._close(stamp, name, rids, prefix_lens)
+                closed = self._close(stamp, name, rids, prefix_lens, recv_queued)
             elif name in _GAP_ACTIONS:
                 self.open.gap_actions.append(name)
                 self.open.gap_rpcs.append(int(rpc_seq))
@@ -438,9 +455,8 @@ class ClearLedger:
                 forget_request(str(rid))
 
     def note_idle(self) -> None:
-        """The recv loop found no packet. This is a wait, not an empty server."""
-        if self.open is not None and self.open.t_post is not None:
-            self.open.idle_after_post = True
+        """Flush generated rows even when no subsequent reply is sent."""
+        self.flush_logs()
 
     def mark_stop(self, now: Optional[float] = None) -> None:
         """The first stop in a round wins. Later cuts stay inside ``T_K``."""
@@ -480,6 +496,7 @@ class ClearLedger:
         next_action: str,
         next_rids: Sequence[str],
         next_prefixes: Sequence[int] = (),
+        recv_queued: bool = False,
     ) -> dict:
         rnd = self.open
         self.open = None
@@ -498,21 +515,16 @@ class ClearLedger:
             reasons.append("target_gap")
         if rnd.fallback:
             reasons.append("fallback")
-        draft_floor = (
-            next_action == "step"
-            and rnd.t_post is not None
-            and not rnd.idle_after_post
+        draft_floor = next_action == "step" and bool(recv_queued)
+        wait_ms = (
+            max(0.0, (float(t_recv) - rnd.t_post) * 1000.0)
+            if rnd.t_post is not None
+            else 0.0
         )
         t_k_us = None
         if rnd.t_stop is not None and rnd.t_send is not None:
             t_k_us = int(
-                round(
-                    (
-                        (rnd.t_send - rnd.t_stop)
-                        + (t_recv - rnd.t_send)
-                    )
-                    * 1e6
-                )
+                round(((rnd.t_send - rnd.t_stop) + (t_recv - rnd.t_send)) * 1e6)
             )
         excluded = bool(reasons)
         verify_pred = None
@@ -549,9 +561,7 @@ class ClearLedger:
                     self.verify_samples += 1
         self._observe_round_verify(rnd, t_k_us, excluded)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
-        price_tokens, price_ms = _round_price(
-            rnd, t_recv, next_rids, next_prefixes
-        )
+        price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
         price_kept = (
             price_tokens is not None
             and price_ms is not None
@@ -574,6 +584,9 @@ class ClearLedger:
             "t_recv": t_recv,
             "t_k_us": t_k_us,
             "draft_floor": draft_floor,
+            "wait_ms": wait_ms,
+            "policy_ms": rnd.policy_ms,
+            "post_ms": rnd.post_ms,
             "excluded": excluded,
             "exclude_reason": reasons,
             "gap_rpc": list(rnd.gap_rpcs),
@@ -591,7 +604,7 @@ class ClearLedger:
             "layer_wall_ms": layer_wall_ms,
             "gain_ratio": _gain_ratio(),
         }
-        _emit("d_round", record)
+        self.queue_log("d_round", record)
         for sample in rnd.layers:
             self._finish_layer(rnd, sample, excluded)
         self._note_price(
@@ -753,7 +766,7 @@ class ClearLedger:
             "residual": residual,
             "fit": fitted,
         }
-        _emit("d_layer", sample_log)
+        self.queue_log("d_layer", sample_log)
 
 
 def _target_gap(next_rids: Sequence[str], next_prefixes: Sequence[int]) -> bool:
@@ -858,10 +871,63 @@ def note_target_prefill(
         return None
 
 
+def policy_timed(fn):
+    """Measure controller CPU work once, including nested controller calls."""
+
+    @wraps(fn)
+    def measured(owner, *args, **kwargs):
+        scheduler = getattr(owner, "_scheduler", owner)
+        if (
+            scheduler is None
+            or not ledger_enabled()
+            or getattr(scheduler, "_clear_in_post_reply", False)
+        ):
+            return fn(owner, *args, **kwargs)
+        depth = int(getattr(scheduler, "_clear_policy_depth", 0))
+        scheduler._clear_policy_depth = depth + 1
+        started = time.perf_counter() if depth == 0 else None
+        try:
+            return fn(owner, *args, **kwargs)
+        finally:
+            scheduler._clear_policy_depth = depth
+            if started is not None:
+                elapsed = max(0.0, (time.perf_counter() - started) * 1000.0)
+                ledger = getattr(scheduler, "_clear_ledger", None)
+                if ledger and ledger.open is not None and ledger.open.t_send is None:
+                    ledger.open.policy_ms += elapsed
+
+    return measured
+
+
+def queue_draft_log(scheduler, kind: str, record: dict) -> None:
+    _quiet(scheduler, lambda ledger: ledger.queue_log(kind, record))
+
+
+def flush_draft_logs(scheduler) -> None:
+    _quiet(scheduler, lambda ledger: ledger.flush_logs())
+
+
+def add_post_ms(scheduler, elapsed_ms: float) -> None:
+    def _add(ledger):
+        if ledger.open is not None:
+            ledger.open.post_ms += max(0.0, float(elapsed_ms))
+
+    _quiet(scheduler, _add)
+
+
+@policy_timed
 def note_packet(scheduler, batch) -> None:
+    # An interrupted reply must not execute its abandoned calculations later.
+    scheduler._clear_replay_pending = None
+    scheduler._clear_replay_to_hold = []
+    scheduler._clear_replay_closed = None
     serial = int(getattr(scheduler, "_clear_build_serial", 0) or 0) + 1
     scheduler._clear_build_serial = serial
     scheduler._clear_build_token = serial
+    scheduler._clear_replay_packet = (
+        str(getattr(batch, "session_id", "")),
+        int(getattr(batch, "rpc_seq", 0) or 0),
+    )
     scheduler._clear_plan_fallback = False
     reqs = list(getattr(batch, "reqs", None) or [])
     rids = [str(getattr(req, "rid", "")) for req in reqs]
@@ -884,6 +950,7 @@ def note_packet(scheduler, batch) -> None:
             int(getattr(batch, "rpc_seq", 0) or 0),
             prefix,
             width,
+            recv_queued=bool(getattr(scheduler, "_clear_recv_queued", False)),
         )
         if isinstance(record, dict):
             closed["record"] = record

@@ -23,6 +23,8 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     grow_active_layers,
 )
 from sglang.srt.speculative.clear_tree_remote import clear_tree_policy as policy
+from sglang.srt.speculative.clear_tree_remote import clear_tree_ledger as ledger_module
+from sglang.srt.speculative.clear_tree_remote import clear_tree_replay as replay
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     RoundPlan,
     accept_ratio,
@@ -129,8 +131,17 @@ _LEDGER_ENV = (
 )
 
 
-def _step(ledger, rids, prefix, rpc, now, width=8):
-    return ledger.on_packet("step", rids, "sess", rpc, prefix, width, now=now)
+def _step(ledger, rids, prefix, rpc, now, width=8, recv_queued=False):
+    return ledger.on_packet(
+        "step",
+        rids,
+        "sess",
+        rpc,
+        prefix,
+        width,
+        now=now,
+        recv_queued=recv_queued,
+    )
 
 
 def _pin_verify_ks(test, ks=(8, 16, 32)):
@@ -164,12 +175,171 @@ class ClearTreeLedgerTest(CustomTestCase):
         ledger.mark_stop(10.0)
         ledger.mark_send(10.25)
         ledger.mark_post(10.30)
-        record = _step(ledger, ["a"], [32], 2, 10.40)
+        record = _step(ledger, ["a"], [32], 2, 10.40, recv_queued=True)
 
         self.assertEqual(record["t_k_us"], 400000)
         self.assertTrue(record["draft_floor"])
         self.assertFalse(record["excluded"])
         self.assertEqual(ledger.verify_samples, 0)
+
+    def test_floor_follows_receive_queue_not_idle_or_post_time(self):
+        for recv_queued in (False, True):
+            for post_time in (None, 1.2):
+                with self.subTest(recv_queued=recv_queued, post_time=post_time):
+                    ledger = ClearLedger(active_rids=["a"])
+                    _step(ledger, ["a"], [8], 1, 1.0)
+                    ledger.mark_stop(1.0)
+                    ledger.mark_send(1.1)
+                    if post_time is not None:
+                        ledger.mark_post(post_time)
+                    ledger.note_idle()
+                    record = _step(
+                        ledger,
+                        ["a"],
+                        [8],
+                        2,
+                        1.5,
+                        recv_queued=recv_queued,
+                    )
+                    self.assertEqual(record["draft_floor"], recv_queued)
+                    self.assertFalse(record["excluded"])
+                    self.assertEqual(ledger.verify_samples, int(not recv_queued))
+                    self.assertEqual(record["post_ms"], 0.0)
+                    self.assertEqual(record["policy_ms"], 0.0)
+                    self.assertAlmostEqual(
+                        record["wait_ms"], 0.0 if post_time is None else 300.0
+                    )
+
+    def test_round_logs_are_deferred_ordered_and_flushed_once(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        ledger.queue_layer(
+            {
+                "layer": 0,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 8,
+                "host_us": 1000,
+                "gpu_us": 1000,
+                "path": "graph",
+                "post_reply": False,
+            }
+        )
+        ledger.mark_stop(1.1)
+        ledger.mark_send(1.2)
+        with patch.object(ledger_module, "_emit") as emit:
+            closed = _step(ledger, ["a"], [9], 2, 1.5)
+            emit.assert_not_called()
+            self.assertEqual(
+                [kind for kind, _record in ledger.pending_logs],
+                ["d_round", "d_layer"],
+            )
+            replay_record = {"rounds": 1}
+            ledger.queue_log("d_replay", replay_record)
+            ledger.flush_logs()
+            self.assertEqual(
+                [call.args[0] for call in emit.call_args_list],
+                ["d_round", "d_layer", "d_replay"],
+            )
+            self.assertIs(emit.call_args_list[0].args[1], closed)
+            self.assertIs(emit.call_args_list[-1].args[1], replay_record)
+            self.assertFalse(ledger.pending_logs)
+            ledger.flush_logs()
+            self.assertEqual(emit.call_count, 3)
+        self.assertEqual(ledger.layer_models[(8, "graph")].n, 1)
+
+    def test_idle_flushes_logs_without_dropping_open_round(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        opened = ledger.open
+        record = {"rpc_seq": 0}
+        ledger.queue_log("d_round", record)
+        with patch.object(ledger_module, "_emit") as emit:
+            ledger.note_idle()
+            ledger.note_idle()
+        emit.assert_called_once_with("d_round", record)
+        self.assertFalse(ledger.pending_logs)
+        self.assertIs(ledger.open, opened)
+        self.assertEqual(ledger.active_rids, {"a"})
+
+    def test_flush_continues_after_a_diagnostic_failure(self):
+        ledger = ClearLedger()
+        ledger.queue_log("d_round", {"rpc_seq": 1})
+        ledger.queue_log("d_replay", {"rounds": 1})
+        with patch.object(
+            ledger_module, "_emit", side_effect=[RuntimeError("log failed"), None]
+        ) as emit:
+            ledger.flush_logs()
+            ledger.flush_logs()
+        self.assertEqual(emit.call_count, 2)
+        self.assertFalse(ledger.pending_logs)
+
+    def test_nested_policy_timing_and_post_accounting(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        scheduler = SimpleNamespace(_clear_ledger=ledger)
+        owner = SimpleNamespace(_scheduler=scheduler)
+
+        @ledger_module.policy_timed
+        def inner(_owner):
+            return 7
+
+        @ledger_module.policy_timed
+        def outer(_scheduler):
+            return inner(owner)
+
+        with patch.object(
+            ledger_module.time, "perf_counter", side_effect=[2.0, 2.005, 3.0, 3.002]
+        ) as clock:
+            self.assertEqual(outer(scheduler), 7)
+            self.assertEqual(inner(owner), 7)
+        self.assertEqual(clock.call_count, 4)
+        self.assertEqual(scheduler._clear_policy_depth, 0)
+        self.assertAlmostEqual(ledger.open.policy_ms, 7.0)
+        ledger_module.add_post_ms(scheduler, 2.0)
+        ledger_module.add_post_ms(scheduler, 3.0)
+        ledger_module.add_post_ms(scheduler, -100.0)
+        ledger.mark_stop(1.1)
+        ledger.mark_send(1.2)
+        ledger.mark_post(1.3)
+        record = _step(ledger, ["a"], [9], 2, 1.5)
+        self.assertAlmostEqual(record["policy_ms"], 7.0)
+        self.assertAlmostEqual(record["post_ms"], 5.0)
+        self.assertAlmostEqual(record["wait_ms"], 200.0)
+        self.assertEqual(ledger.open.policy_ms, 0.0)
+        self.assertEqual(ledger.open.post_ms, 0.0)
+
+    def test_disabled_policy_timing_keeps_controller_behavior_without_clock(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        scheduler = SimpleNamespace(_clear_ledger=ledger)
+
+        @ledger_module.policy_timed
+        def controller(_scheduler):
+            return "kept"
+
+        with patch.dict(os.environ, {"SGLANG_CLEAR_LEDGER": "0"}), patch.object(
+            ledger_module.time, "perf_counter"
+        ) as clock:
+            self.assertEqual(controller(scheduler), "kept")
+        clock.assert_not_called()
+        self.assertEqual(ledger.open.policy_ms, 0.0)
+
+    def test_policy_timing_restores_depth_after_failure(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        scheduler = SimpleNamespace(_clear_ledger=ledger)
+
+        @ledger_module.policy_timed
+        def fail(_scheduler):
+            raise ValueError("controller failed")
+
+        with patch.object(ledger_module.time, "perf_counter", side_effect=[2.0, 2.004]):
+            with self.assertRaisesRegex(ValueError, "controller failed"):
+                fail(scheduler)
+        self.assertEqual(scheduler._clear_policy_depth, 0)
+        self.assertAlmostEqual(ledger.open.policy_ms, 4.0)
 
     def test_price_uses_open_to_recv_minus_prefill(self):
         reset_policy()
@@ -230,7 +400,9 @@ class ClearTreeLedgerTest(CustomTestCase):
         prefill.mark_stop(1.0)
         prefill.mark_send(1.1)
         prefill.mark_post(1.2)
-        self.assertIsNone(prefill.on_packet("prefill", ["b"], "sess", 2, [9], 8, now=1.3))
+        self.assertIsNone(
+            prefill.on_packet("prefill", ["b"], "sess", 2, [9], 8, now=1.3)
+        )
         prefill.note_idle()
         held = _step(prefill, ["a"], [4], 3, 1.5)
         self.assertIn("prefill", held["exclude_reason"])
@@ -406,8 +578,12 @@ class ClearTreeLedgerTest(CustomTestCase):
 
     def test_target_verify_over_bucket_is_eager(self):
         buckets = (256, 512)
-        self.assertEqual(smallest_bucket(100, buckets), select_tree_kv_bucket(100, buckets))
-        self.assertEqual(smallest_bucket(300, buckets), select_tree_kv_bucket(300, buckets))
+        self.assertEqual(
+            smallest_bucket(100, buckets), select_tree_kv_bucket(100, buckets)
+        )
+        self.assertEqual(
+            smallest_bucket(300, buckets), select_tree_kv_bucket(300, buckets)
+        )
         self.assertIsNone(smallest_bucket(900, buckets))
         self.assertIsNone(select_tree_kv_bucket(900, buckets))
 
@@ -572,7 +748,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         plan = make_round(sched, reqs)
         self.assertAlmostEqual(plan.theta_value, 2.0)
         observe_price(4, 20.0, 40.0)
-        self.assertAlmostEqual(theta(2), 2.0 ** -0.5)
+        self.assertAlmostEqual(theta(2), 2.0**-0.5)
 
     def test_subtracting_prefill_differs_from_dropping_the_round(self):
         report = compare_price(
@@ -1102,9 +1278,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             choose_build_width(2, ledger_on=True, eligible=False) for _ in range(20)
         ]
         self.assertTrue(all(item == (4, "ordinary") for item in cold))
-        hot = [
-            choose_build_width(2, ledger_on=True, eligible=True) for _ in range(20)
-        ]
+        hot = [choose_build_width(2, ledger_on=True, eligible=True) for _ in range(20)]
         self.assertEqual(hot[:4], [(2, "probe_w")] * 4)
         self.assertTrue(all(item == (4, "ordinary") for item in hot[4:-1]))
         self.assertEqual(hot[-1], (8, "explore"))
@@ -1122,9 +1296,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             observe_replay(1, 4, "measure", 10.0, 10.0)
         last = None
         for _ in range(40):
-            last = observe_replay(
-                1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
-            )
+            last = observe_replay(1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)})
         self.assertGreater(last["gain"], 0.03)
         self.assertNotIn("gate", last)
         self.assertGreater(abs(last["bias"]), 0.03)
@@ -1141,9 +1313,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             observe_replay(1, 4, "measure", 14.0, 10.0)
         last = None
         for _ in range(40):
-            last = observe_replay(
-                1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)}
-            )
+            last = observe_replay(1, 8, "ordinary", 10.0, 10.0, {4: (14.0, 10.0)})
         self.assertNotIn("gate", last)
         self.assertAlmostEqual(last["bias"], 0.0)
         self.assertTrue(last["applied"])
@@ -1160,15 +1330,11 @@ class TestFlatWidthOnlineK(CustomTestCase):
             observe_replay(1, 8, "ordinary", 10.0, 10.0)
         closed = None
         for _ in range(10):
-            closed = observe_replay(
-                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
-            )
+            closed = observe_replay(1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)})
         self.assertFalse(closed["applied"])
         self.assertEqual(persistent_width(1), 8)
         for _ in range(20):
-            closed = observe_replay(
-                1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)}
-            )
+            closed = observe_replay(1, 16, "explore", 12.0, 10.0, {8: (10.0, 10.0)})
         self.assertEqual(closed["would_w"], 16)
         self.assertNotIn("gate", closed)
         self.assertTrue(closed["applied"])
@@ -1249,48 +1415,95 @@ class TestFlatWidthOnlineK(CustomTestCase):
         plan = _value_plan()
         plan.replay_kind = "ordinary"
         plan.replay_eligible = True
-        sched = SimpleNamespace(_clear_ledger=False, tp_rank=0, tp_size=1)
-        req = SimpleNamespace(rid="a", output_ids=[11])
-        with patch(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
-            return_value=1.0,
-        ):
-            hold_replay(sched, [req], [state], plan)
-        req.output_ids = [11, 8]
-        sched._clear_replay_closed = {
-            "excluded": False,
-            "price_kept": True,
-            "price_ms": 12.0,
-        }
-        missed = settle_replay(sched, [req])
-        self.assertEqual(missed["candidates"]["4"]["tokens"], 1.0)
+        for index, (fresh, expected) in enumerate((([8], 1.0), ([1, 5], 2.0))):
+            with self.subTest(fresh=fresh):
+                req = SimpleNamespace(rid="a", output_ids=[11])
+                sched = SimpleNamespace(
+                    _clear_ledger=False,
+                    tp_rank=0,
+                    tp_size=1,
+                    _clear_build_token=index * 2 + 1,
+                    _clear_replay_packet=("sess", index * 2 + 1),
+                )
+                with patch.object(ledger_module, "predict_layer_ms", return_value=1.0):
+                    hold_replay(sched, [req], [state], plan)
+                req.output_ids.extend(fresh)
+                sched._clear_replay_closed = {
+                    "session_id": "sess",
+                    "rpc_seq": index * 2 + 1,
+                    "excluded": False,
+                    "price_kept": True,
+                    "price_ms": 12.0,
+                }
+                sched._clear_build_token += 1
+                sched._clear_replay_packet = ("sess", sched._clear_build_token)
+                with patch.object(replay, "_emit_replay") as emit:
+                    prepared = settle_replay(sched, [req])
+                    self.assertIsNotNone(prepared)
+                    emit.assert_not_called()
+                    replay.run_post_reply(sched)
+                record = emit.call_args.args[1]
+                self.assertEqual(record["candidates"]["4"]["tokens"], expected)
+                self.assertIsNotNone(record["candidates"]["4"]["ms"])
+                self.assertIsNone(sched._clear_replay_pending)
+                self.assertIsNone(sched._clear_replay_hold)
+
         req.output_ids = [11]
-        with patch(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
-            return_value=1.0,
-        ):
-            hold_replay(sched, [req], [state], plan)
-        req.output_ids = [11, 1, 5]
+        sched._clear_build_token += 1
+        sched._clear_replay_packet = ("sess", sched._clear_build_token)
+        hold_replay(sched, [req], [state], plan)
         sched._clear_replay_closed = {
-            "excluded": False,
-            "price_kept": True,
-            "price_ms": 12.0,
-        }
-        hit = settle_replay(sched, [req])
-        self.assertEqual(hit["candidates"]["4"]["tokens"], 2.0)
-        self.assertIsNotNone(hit["candidates"]["4"]["ms"])
-        req.output_ids = [11]
-        with patch(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
-            return_value=1.0,
-        ):
-            hold_replay(sched, [req], [state], plan)
-        sched._clear_replay_closed = {
+            "session_id": "sess",
+            "rpc_seq": sched._clear_build_token,
             "excluded": True,
             "price_kept": False,
             "price_ms": 12.0,
         }
-        self.assertIsNone(settle_replay(sched, [req]))
+        with patch.object(replay, "_replayed_counts") as heavy:
+            self.assertIsNone(settle_replay(sched, [req]))
+        heavy.assert_not_called()
+
+    def test_probe_cover_follows_served_width_at_depth_eight(self):
+        for batch, width, expected in (
+            (4, 4, [4, 16, 2, 32]),
+            (1, 8, [8, 32, 4, 64, 2]),
+            (1, 4, [8, 32, 4, 2]),
+        ):
+            with self.subTest(batch=batch, width=width):
+                reset_policy()
+                assign_persistent_width(batch, width)
+                scheduler = SimpleNamespace(
+                    server_args=SimpleNamespace(clear_tree_max_depth=8)
+                )
+                reqs = [
+                    SimpleNamespace(
+                        rid=str(index), origin_input_ids=[1] * 10, output_ids=[]
+                    )
+                    for index in range(batch)
+                ]
+                flat = 8 if batch == 4 else 16
+                observe_verify(batch, flat, 256, 10.0)
+                probed = []
+                with patch.object(ledger_module, "ledger_enabled", return_value=True):
+                    for k in expected:
+                        for _ in range(policy.PROBE_RUNS):
+                            plan = make_round(scheduler, reqs)
+                            self.assertTrue(plan.use_tau)
+                            self.assertEqual(plan.width, width)
+                            self.assertEqual(plan.locked_k, k)
+                            self.assertFalse(plan.replay_eligible)
+                            observe_verify(batch, k, 256, 10.0)
+                        probed.append(k)
+                    done = make_round(scheduler, reqs)
+                self.assertEqual(probed, expected)
+                self.assertEqual(done.locked_k, flat)
+                self.assertEqual(
+                    policy._probe_rounds, len(expected) * policy.PROBE_RUNS
+                )
+                if width == 4:
+                    self.assertNotIn(64, probed)
+                else:
+                    self.assertIn(64, probed)
 
     def test_rewritten_zero_temperature_explores_the_twentieth_round(self):
         reset_policy()
@@ -1319,9 +1532,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             eligible = []
             for _ in range(80):
                 plan = make_round(sched, reqs)
-                eligible.append(
-                    (plan.width, plan.replay_kind, plan.replay_eligible)
-                )
+                eligible.append((plan.width, plan.replay_kind, plan.replay_eligible))
                 if len(eligible) == 20:
                     break
         self.assertEqual(
@@ -1644,9 +1855,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         )
 
     def test_mixed_k_rows_are_padded_not_dropped(self):
-        tokens, parents, missing = align_draft_row(
-            [1] * 8, [-1] + [0] * 7, 16
-        )
+        tokens, parents, missing = align_draft_row([1] * 8, [-1] + [0] * 7, 16)
         self.assertFalse(missing)
         self.assertEqual(len(tokens), 16)
         self.assertEqual(parents[8:], [-2] * 8)
@@ -1820,9 +2029,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             "sglang.srt.speculative.clear_tree_remote.clear_tree_policy",
             level="WARNING",
         ) as logs:
-            ingest_verify_samples(
-                [[1, 8, 99999, 10000], [1, 8, 99999, 11000]]
-            )
+            ingest_verify_samples([[1, 8, 99999, 10000], [1, 8, 99999, 11000]])
             ingest_verify_samples([[1, 8, 256, 10000]])
         foreign = [line for line in logs.output if "99999" in line]
         self.assertEqual(len(foreign), 1)
@@ -2032,9 +2239,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched)
             for _ in range(3)
         ]
-        self.assertEqual(
-            again, [(4, "probe_w"), (4, "probe_w"), (8, "ordinary")]
-        )
+        self.assertEqual(again, [(4, "probe_w"), (4, "probe_w"), (8, "ordinary")])
 
     def test_narrow_width_probes_early_when_the_prefix_is_unpriced(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -2113,6 +2318,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
             _clear_ledger=ledger,
             _clear_replay_hold={"tree": 1},
             _clear_replay_closed={"excluded": False},
+            _clear_replay_pending={"old": True},
+            _clear_replay_to_hold=[object()],
         )
         price = theta(1)
         on_external_event(sched)
@@ -2128,6 +2335,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertIsNone(ledger.open)
         self.assertIsNone(sched._clear_replay_hold)
         self.assertIsNone(sched._clear_replay_closed)
+        self.assertIsNone(sched._clear_replay_pending)
+        self.assertFalse(sched._clear_replay_to_hold)
         fresh = observe_replay(1, 16, "ordinary", 10.0, 10.0, {8: (12.0, 9.0)})
         self.assertEqual(fresh["rounds"], 1)
 
@@ -2370,6 +2579,323 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(policy._gain_pred, 10.0)
         self.assertEqual(policy._gain_actual, 20.0)
         self.assertEqual(gain_ratio(), 1.0)
+
+
+class TestDeferredClearTreeReplay(CustomTestCase):
+    def setUp(self):
+        reset_policy()
+        environment = patch.dict(os.environ, {"SGLANG_CLEAR_LEDGER": "1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.ledger = ClearLedger(active_rids=["a"])
+        self.scheduler = SimpleNamespace(
+            _clear_ledger=self.ledger,
+            _clear_build_token=1,
+            _clear_build_serial=1,
+            _clear_replay_packet=("sess", 1),
+            server_args=SimpleNamespace(clear_tree_width=8, clear_tree_max_depth=8),
+            tp_rank=0,
+            tp_size=1,
+        )
+        self.req = SimpleNamespace(rid="a", output_ids=[11])
+        self.state = SimpleNamespace(
+            depth=1,
+            tokens=torch.arange(1, 9).reshape(1, 8),
+            parents=torch.arange(8).reshape(1, 8),
+            weight=torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.01, 0.01, 0.01, 0.01]]),
+            prefix=4,
+            rid="a",
+        )
+        self.plan = _value_plan()
+        self.plan.replay_kind = "ordinary"
+        self.plan.replay_eligible = True
+        self.plan._frozen_k = 8
+        self.plan._time = lambda _k: 5.0
+        _step(self.ledger, ["a"], [4], 1, 1.0)
+
+    def _packet(self, rpc=2, action="step", session="sess"):
+        return SimpleNamespace(
+            action=action,
+            reqs=[SimpleNamespace(rid="a", base_committed_len=5)],
+            session_id=session,
+            rpc_seq=rpc,
+        )
+
+    def _hold_and_prepare(self):
+        hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+        self.req.output_ids.extend([1, 9])
+        self.scheduler._clear_replay_closed = {
+            "session_id": "sess",
+            "rpc_seq": 1,
+            "excluded": False,
+            "price_kept": True,
+            "price_ms": 12.0,
+        }
+        self.scheduler._clear_build_token = 2
+        self.scheduler._clear_replay_packet = ("sess", 2)
+        return settle_replay(self.scheduler, [self.req])
+
+    def test_two_rounds_replay_previous_before_holding_current_and_flushing(self):
+        scheduler = self.scheduler
+        with patch.object(replay, "_layers_of", wraps=replay._layers_of) as freeze:
+            replay.queue_hold_replay(scheduler, [self.req], [self.state], self.plan)
+            freeze.assert_not_called()
+            self.assertIsNone(getattr(scheduler, "_clear_replay_hold", None))
+            replay.run_post_reply(scheduler)
+            self.assertEqual(freeze.call_count, 1)
+        first = scheduler._clear_replay_hold
+        self.assertEqual(first["trees"]["a"]["output_len"], 1)
+
+        for rpc in (2, 3):
+            with self.subTest(rpc=rpc):
+                old = scheduler._clear_replay_hold
+                self.ledger.mark_stop(float(rpc) - 0.9)
+                self.ledger.mark_send(float(rpc) - 0.8)
+                self.req.output_ids.append(1)
+                with patch.object(
+                    ledger_module.time, "perf_counter", return_value=float(rpc)
+                ):
+                    note_packet(scheduler, self._packet(rpc))
+                self.assertIs(scheduler._clear_replay_hold, old)
+                self.assertEqual(scheduler._clear_replay_closed["rpc_seq"], rpc - 1)
+                real_freeze = replay._layers_of
+                with patch.object(
+                    replay, "_replayed_counts", return_value={4: (2.0, 10.0)}
+                ) as heavy, patch.object(
+                    replay, "_layers_of", wraps=replay._layers_of
+                ) as freeze, patch.object(
+                    ledger_module, "_emit"
+                ) as emit:
+                    events = []
+                    heavy.side_effect = lambda *_args: events.append("replay") or {
+                        4: (2.0, 10.0)
+                    }
+                    freeze.side_effect = lambda state: events.append(
+                        "hold"
+                    ) or real_freeze(state)
+                    emit.side_effect = lambda kind, _record: events.append(kind)
+                    prepared = settle_replay(scheduler, [self.req])
+                    self.assertIsNotNone(prepared)
+                    self.assertIs(prepared["hold"], old)
+                    self.assertIsNone(scheduler._clear_replay_hold)
+                    replay.queue_hold_replay(
+                        scheduler, [self.req], [self.state], self.plan
+                    )
+                    heavy.assert_not_called()
+                    freeze.assert_not_called()
+                    emit.assert_not_called()
+                    replay.run_post_reply(scheduler)
+                self.assertEqual(events, ["replay", "hold", "d_round", "d_replay"])
+                self.assertEqual(scheduler._clear_replay_hold["token"], rpc)
+                self.assertEqual(
+                    scheduler._clear_replay_hold["trees"]["a"]["output_len"],
+                    len(self.req.output_ids),
+                )
+                self.assertFalse(self.ledger.pending_logs)
+
+    def test_settle_copies_tokens_and_defers_all_heavy_work(self):
+        with patch.object(replay, "_replayed_counts") as heavy, patch.object(
+            replay, "observe_replay"
+        ) as observe, patch.object(replay, "_emit_replay") as emit:
+            prepared = self._hold_and_prepare()
+            self.assertIs(prepared, self.scheduler._clear_replay_pending)
+            self.assertEqual(prepared["tokens"], {"a": [1, 9]})
+            self.assertEqual(prepared["actual"], 2)
+            self.req.output_ids[-1] = 99
+            self.assertEqual(prepared["tokens"]["a"], [1, 9])
+            heavy.assert_not_called()
+            observe.assert_not_called()
+            emit.assert_not_called()
+        self.assertIsNone(self.scheduler._clear_replay_hold)
+        self.assertIsNone(self.scheduler._clear_replay_closed)
+
+    def test_invalid_settlement_discards_hold_without_replay(self):
+        for invalid in (
+            "packet",
+            "excluded",
+            "unpriced",
+            "missing_rid",
+            "short_output",
+        ):
+            with self.subTest(invalid=invalid):
+                hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+                closed = {
+                    "session_id": "sess",
+                    "rpc_seq": 1,
+                    "excluded": False,
+                    "price_kept": True,
+                    "price_ms": 12.0,
+                }
+                reqs = [self.req]
+                output = list(self.req.output_ids)
+                if invalid == "packet":
+                    closed["session_id"] = "other"
+                elif invalid == "excluded":
+                    closed["excluded"] = True
+                elif invalid == "unpriced":
+                    closed["price_ms"] = 0.0
+                elif invalid == "missing_rid":
+                    reqs = []
+                else:
+                    self.req.output_ids = []
+                self.scheduler._clear_replay_closed = closed
+                with patch.object(replay, "_replayed_counts") as heavy:
+                    self.assertIsNone(settle_replay(self.scheduler, reqs))
+                heavy.assert_not_called()
+                self.assertIsNone(self.scheduler._clear_replay_hold)
+                self.assertIsNone(self.scheduler._clear_replay_closed)
+                self.assertIsNone(self.scheduler._clear_replay_pending)
+                self.req.output_ids = output
+
+    def test_post_reply_is_idempotent_and_accounts_post_time(self):
+        self._hold_and_prepare()
+        replay.queue_hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+        with patch.object(
+            replay, "_replayed_counts", return_value={}
+        ) as heavy, patch.object(
+            replay, "hold_replay", wraps=replay.hold_replay
+        ) as hold, patch.object(
+            ledger_module, "_emit"
+        ) as emit, patch.object(
+            replay.time, "perf_counter", side_effect=[2.0, 2.005, 3.0, 3.0]
+        ):
+            replay.run_post_reply(self.scheduler)
+            retained = self.scheduler._clear_replay_hold
+            replay.run_post_reply(self.scheduler)
+        heavy.assert_called_once()
+        hold.assert_called_once()
+        emit.assert_called_once()
+        self.assertIs(self.scheduler._clear_replay_hold, retained)
+        self.assertAlmostEqual(self.ledger.open.post_ms, 5.0)
+        self.assertIsNone(self.scheduler._clear_replay_pending)
+        self.assertFalse(self.scheduler._clear_replay_to_hold)
+
+    def test_new_packet_discards_stale_work_but_preserves_normal_hold(self):
+        for action in ("step", "prefill", "finish", "abort"):
+            with self.subTest(action=action):
+                scheduler = SimpleNamespace(
+                    _clear_ledger=False,
+                    _clear_replay_hold={"normal": True},
+                    _clear_replay_pending={"stale": True},
+                    _clear_replay_to_hold=[object()],
+                    _clear_replay_closed={"stale": True},
+                )
+                held = scheduler._clear_replay_hold
+                note_packet(scheduler, self._packet(action=action))
+                self.assertIs(scheduler._clear_replay_hold, held)
+                self.assertIsNone(scheduler._clear_replay_pending)
+                self.assertFalse(scheduler._clear_replay_to_hold)
+                self.assertIsNone(scheduler._clear_replay_closed)
+
+    def test_post_reply_ignores_stale_tokens_and_packets(self):
+        for stale in ("token", "packet"):
+            with self.subTest(stale=stale):
+                self.scheduler._clear_replay_post_done = None
+                prepared = self._hold_and_prepare()
+                replay.queue_hold_replay(
+                    self.scheduler, [self.req], [self.state], self.plan
+                )
+                if stale == "token":
+                    self.scheduler._clear_build_token = 99
+                else:
+                    self.scheduler._clear_replay_packet = ("other", 2)
+                self.assertIsNotNone(prepared)
+                with patch.object(replay, "_replayed_counts") as heavy, patch.object(
+                    replay, "hold_replay"
+                ) as hold:
+                    replay.run_post_reply(self.scheduler)
+                heavy.assert_not_called()
+                hold.assert_not_called()
+                self.assertIsNone(self.scheduler._clear_replay_hold)
+                self.assertIsNone(self.scheduler._clear_replay_pending)
+                self.assertFalse(self.scheduler._clear_replay_to_hold)
+                self.scheduler._clear_build_token = 1
+                self.scheduler._clear_replay_packet = ("sess", 1)
+
+    def test_cross_switch_transition_skips_but_exploration_does_not(self):
+        for switch_at in ("settle", "post"):
+            with self.subTest(switch_at=switch_at):
+                reset_policy()
+                self.scheduler._clear_replay_packet = ("sess", 1)
+                self.scheduler._clear_build_token = 1
+                if switch_at == "settle":
+                    hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+                    self.scheduler._clear_replay_closed = {
+                        "session_id": "sess",
+                        "rpc_seq": 1,
+                        "excluded": False,
+                        "price_kept": True,
+                        "price_ms": 12.0,
+                    }
+                    assign_persistent_width(1, 4)
+                    self.assertIsNone(settle_replay(self.scheduler, [self.req]))
+                else:
+                    self.assertIsNotNone(self._hold_and_prepare())
+                    assign_persistent_width(1, 4)
+                    with patch.object(replay, "_replayed_counts") as heavy:
+                        replay.run_post_reply(self.scheduler)
+                    heavy.assert_not_called()
+                self.assertIsNone(self.scheduler._clear_replay_pending)
+
+        reset_policy()
+        self.scheduler._clear_replay_packet = ("sess", 1)
+        self.scheduler._clear_build_token = 1
+        self.scheduler._clear_replay_post_done = None
+        self.plan.width = 16
+        self.plan.replay_kind = "explore"
+        prepared = self._hold_and_prepare()
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared["hold"]["served"], 8)
+        self.assertEqual(prepared["hold"]["width"], 16)
+        with patch.object(replay, "_replayed_counts", return_value={}) as heavy:
+            replay.run_post_reply(self.scheduler)
+        heavy.assert_called_once()
+
+    def test_fallback_or_empty_reply_does_not_retain_old_trees(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                self.scheduler._clear_replay_post_done = None
+                hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+                self.assertIsNotNone(self.scheduler._clear_replay_hold)
+                self.scheduler._clear_plan_fallback = fallback
+                if fallback:
+                    replay.queue_hold_replay(
+                        self.scheduler, [self.req], [self.state], self.plan
+                    )
+                self.ledger.queue_log("d_round", {"fallback": fallback})
+                with patch.object(replay, "hold_replay") as hold, patch.object(
+                    ledger_module, "_emit"
+                ) as emit:
+                    replay.run_post_reply(self.scheduler)
+                hold.assert_not_called()
+                emit.assert_called_once_with("d_round", {"fallback": fallback})
+                self.assertIsNone(self.scheduler._clear_replay_hold)
+                self.assertIsNone(self.scheduler._clear_replay_pending)
+                self.assertFalse(self.scheduler._clear_replay_to_hold)
+                self.assertFalse(self.ledger.pending_logs)
+
+    def test_queued_hold_keeps_served_width_before_previous_replay_switch(self):
+        self.assertIsNotNone(self._hold_and_prepare())
+        replay.queue_hold_replay(self.scheduler, [self.req], [self.state], self.plan)
+
+        def switch(*_args, **_kwargs):
+            assign_persistent_width(1, 4)
+            return {"applied": True}
+
+        with patch.object(replay, "_replayed_counts", return_value={}), patch.object(
+            replay, "observe_replay", side_effect=switch
+        ), patch.object(ledger_module, "_emit"):
+            replay.run_post_reply(self.scheduler)
+        self.assertEqual(persistent_width(1), 4)
+        self.assertEqual(self.scheduler._clear_replay_hold["served"], 8)
+        self.scheduler._clear_replay_closed = {
+            "session_id": "sess",
+            "rpc_seq": 2,
+            "excluded": False,
+            "price_kept": True,
+            "price_ms": 12.0,
+        }
+        self.assertIsNone(settle_replay(self.scheduler, [self.req]))
 
 
 def _rows_state(rows, rid, prefix):

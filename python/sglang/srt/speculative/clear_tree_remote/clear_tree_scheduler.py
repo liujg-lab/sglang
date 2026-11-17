@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -209,6 +210,9 @@ class ClearTreeSchedulerMixin:
         if self.tp_size == 1 or self.tp_rank == 0:
             if self.sr_server is not None:
                 packet = self.sr_server.recv_batch(timeout_ms=50)
+                self._clear_recv_queued = bool(
+                    getattr(self.sr_server, "last_recv_queued", False)
+                )
                 if packet is not None and self.tp_size == 1:
                     return packet
                 if packet is not None:
@@ -881,10 +885,10 @@ class ClearTreeSchedulerMixin:
             metrics.add_host("opt_grow", time.perf_counter() - t1)
             remember_choice(self, len(tokens), plan.width)
             from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
-                hold_replay,
+                queue_hold_replay,
             )
 
-            hold_replay(self, [req], tree_states, plan)
+            queue_hold_replay(self, [req], tree_states, plan)
             metrics.counts["opt_layer_forwards"] += layers
             if lookahead_launched is not None:
                 metrics.counts["opt_layer_forwards_critical"] += critical_layer_forwards(
@@ -1153,6 +1157,7 @@ class ClearTreeSchedulerMixin:
                                     getattr(batch, "verify_samples", None)
                                 )
                             note_packet(self, batch)
+                            reply_completed = False
                             try:
                                 round_start = time.perf_counter()
                                 if not supported_clear_protocol(batch.protocol_version):
@@ -1165,6 +1170,22 @@ class ClearTreeSchedulerMixin:
                                     self._sr_note_handled(batch)
                                 else:
                                     reply = self._clear_handle_batch_impl(batch, mm)
+                                valid_reply = (
+                                    batch.action == ClearAction.STEP
+                                    and supported_clear_protocol(batch.protocol_version)
+                                    and supported_clear_protocol(reply.protocol_version)
+                                    and reply.session_id == batch.session_id
+                                    and reply.rpc_seq == batch.rpc_seq
+                                    and bool(reply.reqs)
+                                    and len(reply.reqs) == len(batch.reqs)
+                                    and all(
+                                        getattr(item.status, "value", item.status)
+                                        in {"ok", "empty", "idempotent"}
+                                        and getattr(item, "reason", None)
+                                        != "commit_incomplete"
+                                        for item in reply.reqs
+                                    )
+                                )
                                 if (
                                     (self.tp_size == 1 or self.tp_rank == 0)
                                     and self.sr_server is not None
@@ -1174,6 +1195,14 @@ class ClearTreeSchedulerMixin:
                                         dump_tree_reply(reply)
                                     with metrics.phase("reply_send"):
                                         self.sr_server.send_batch(reply)
+                                    reply_completed = (
+                                        valid_reply
+                                        and getattr(self.sr_server, "_last_identity", None) is not None
+                                    )
+                                elif self.tp_size > 1 and self.tp_rank != 0:
+                                    # This rank follows the successfully built
+                                    # reply; only rank 0 owns the transport.
+                                    reply_completed = valid_reply
                                 if batch.action == ClearAction.STEP:
                                     mark_send(self)
                                 if measure and getattr(metrics, "active", False):
@@ -1216,6 +1245,12 @@ class ClearTreeSchedulerMixin:
                                     defer_drain=defer_drain,
                                     jobs=jobs,
                                 )
+                                if reply_completed and sys.exc_info()[0] is None:
+                                    from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+                                        run_post_reply,
+                                    )
+
+                                    run_post_reply(self)
                                 if batch.action == ClearAction.STEP:
                                     mark_post(self)
 

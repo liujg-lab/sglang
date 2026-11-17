@@ -4035,10 +4035,10 @@ def grow_batch(scheduler, reqs):
         if windows:
             remember_choice(scheduler, len(windows[0][0]), plan.width)
             from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
-                hold_replay,
+                queue_hold_replay,
             )
 
-            hold_replay(scheduler, reqs, states, plan)
+            queue_hold_replay(scheduler, reqs, states, plan)
         mark_stop(scheduler)
         return windows
     finally:
