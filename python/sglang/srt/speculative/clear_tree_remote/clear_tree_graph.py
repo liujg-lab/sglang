@@ -138,8 +138,10 @@ class ClearTreeGraphCapture:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
             capture_attention,
         )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
+            bonus_prediction_enabled,
+        )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
-            OPT_BONUS_GRAPH_EXTRA,
             OptLayerSpec,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
@@ -148,11 +150,10 @@ class ClearTreeGraphCapture:
         )
 
         query_width = int(draft_token_num)
-        is_bonus = (
-            query_width in BONUS_NTPBS
-            and getattr(runner, "_active_capture_extra", None) == OPT_BONUS_GRAPH_EXTRA
-        )
-        if query_width not in LAYER_WIDTHS and not is_bonus:
+        allowed = {int(width) for width in LAYER_WIDTHS}
+        if bonus_prediction_enabled():
+            allowed.update(int(width) for width in BONUS_NTPBS)
+        if query_width not in allowed:
             raise RuntimeError(
                 f"CLEAR_TREE_REMOTE draft TARGET_VERIFY graph ntpb {query_width} "
                 f"is not a layer width {LAYER_WIDTHS} or a bonus width {BONUS_NTPBS}"
@@ -164,7 +165,7 @@ class ClearTreeGraphCapture:
             num_tokens_per_req=query_width,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             apply_prefix_custom_mask=True,
-            is_bonus=is_bonus,
+            is_bonus=False,
         )
         capture_bs = num_tokens // query_width if query_width else 0
         spec_info.target_verify_attention = capture_attention(

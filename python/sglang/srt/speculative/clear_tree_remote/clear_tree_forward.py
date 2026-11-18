@@ -14,6 +14,7 @@ forwarded after the reply; the verify window is already fixed by then.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import logging
 import sys
@@ -1118,7 +1119,7 @@ class OptLayerSpec:
     num_tokens_per_req: int
     capture_hidden_mode: object = None
     # Earlier layers sit in the KV prefix, so every TARGET_VERIFY reads that
-    # part of the mask. ``is_bonus`` selects the dedicated bonus graph key.
+    # part of the mask. ``is_bonus`` only distinguishes a bonus forward.
     apply_prefix_custom_mask: bool = True
     is_bonus: bool = False
     # OPT draft cascade only. Other algorithms leave this unset.
@@ -1133,15 +1134,9 @@ class OptLayerSpec:
         return batch.global_num_tokens, batch.global_num_tokens_for_logprob
 
 
-# Graph-key suffix for the bonus verify graph. Layer forwards stay on the
-# unsuffixed ``r{N}_{bs}`` graph. Both graphs apply the prefix mask.
-OPT_BONUS_GRAPH_EXTRA = 0
-
-
 def opt_bonus_graph_extra(spec_info):
-    """Extra graph key for a bonus forward, or None for a layer forward."""
-    if getattr(spec_info, "is_bonus", False):
-        return OPT_BONUS_GRAPH_EXTRA
+    """Bonus and layer forwards share unsuffixed ``r{G}_{bs}`` graphs."""
+    del spec_info
     return None
 
 
@@ -1169,13 +1164,8 @@ def opt_draft_bonus_ntpb(server_args):
 
 
 def opt_draft_capture_extra_keys(server_args, ntpb) -> list:
-    """Preserve both keys when a layer width is also a K+1 bonus width."""
-    if getattr(server_args, "clear_tree_role", None) != "draft":
-        return [None]
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import LAYER_WIDTHS
-
-    if ntpb is not None and int(ntpb) in opt_draft_bonus_ntpbs(server_args):
-        return ([None] if int(ntpb) in LAYER_WIDTHS else []) + [OPT_BONUS_GRAPH_EXTRA]
+    """One graph per (bs, width); a width shared by layer and bonus is captured once."""
+    del server_args, ntpb
     return [None]
 
 
@@ -1183,8 +1173,7 @@ def opt_layer_verify_graph_matches(spec_info, actual_ntpb: int) -> bool:
     """True when this spec may replay a TARGET_VERIFY graph of this width.
 
     The captured ntpb must equal this spec's query width. The ntpb=1 dual
-    graph is DECODE, so width 1 stays eager. A bonus spec uses its group
-    width; ``opt_bonus_graph_extra`` selects the dedicated key.
+    graph is DECODE, so width 1 stays eager. A bonus spec uses its group width.
     """
     if not isinstance(spec_info, OptLayerSpec) or getattr(
         spec_info, "bonus_eager", False
@@ -2752,7 +2741,7 @@ def _bonus_result(result, count: int, width: int):
 
 
 class _BonusBatch:
-    """Ordinary request-major verify, always on the dedicated bonus key."""
+    """Ordinary request-major verify on the shared unsuffixed graph."""
 
     def __call__(self, scheduler, entries, width, tokens, positions, mask, loc, ends):
         batch = _verify_batch_many(
@@ -2844,35 +2833,56 @@ def _bonus_job_ready(scheduler, job) -> bool:
     )
 
 
-def _bonus_width(scheduler, bs: int, need: int) -> Tuple[int, bool]:
-    """Prefer an exact-batch dedicated key; otherwise one exact-width eager.
-
-    Shared can_run checks bonus extra keys before batch padding. In particular,
-    an r9_4_s0 graph does not admit a three-request forward.
-    """
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import BONUS_NTPBS
-
+def _bonus_graph(scheduler):
+    """CUDA graph runner that can replay a shared verify graph, or None."""
     device = torch.device(scheduler.req_to_token_pool.device)
     graph = getattr(_bonus_model_runner(scheduler), "graph_runner", None)
     if (
-        device.type == "cuda"
-        and graph is not None
-        and bs in graph.capture_bs
-        and not getattr(graph, "require_mlp_tp_gather", False)
-        and not getattr(graph, "require_attn_tp_gather", False)
-        and not getattr(graph, "require_gathered_buffer", False)
+        device.type != "cuda"
+        or graph is None
+        or getattr(graph, "require_mlp_tp_gather", False)
+        or getattr(graph, "require_attn_tp_gather", False)
+        or getattr(graph, "require_gathered_buffer", False)
     ):
+        return None
+    return graph
+
+
+def _replay_bs(graph, bs: int):
+    """The batch the shared replay uses: bisect pad, or exact without padding."""
+    capture = sorted(int(b) for b in graph.capture_bs)
+    if getattr(graph, "disable_padding", False):
+        return int(bs) if int(bs) in capture else None
+    index = bisect.bisect_left(capture, int(bs))
+    return capture[index] if index < len(capture) else None
+
+
+def _bonus_width(scheduler, bs: int, need: int) -> Tuple[int, bool]:
+    """Smallest captured verify width >= need at the batch replay pads to.
+
+    Bonus shares ``r{G}_{bs}`` graphs with layer forwards. The capture loop
+    skips ``bs * G > max_num_token`` (for example ``r65_4``), and shared
+    can_run does not check the padded key, so check it here. Too narrow:
+    widest, and the caller splits.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        BONUS_NTPBS,
+        LAYER_WIDTHS,
+    )
+
+    graph = _bonus_graph(scheduler)
+    replay_bs = _replay_bs(graph, bs) if graph is not None else None
+    if replay_bs is not None:
         stream = None
         if getattr(graph, "enable_pdmux", False):
             from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 
             stream = get_current_stream_idx()
-        widths = [
+        widths = sorted(
             w
-            for w in sorted(int(w) for w in BONUS_NTPBS)
-            if graph._make_graph_key(bs, stream, w, extra=OPT_BONUS_GRAPH_EXTRA)
-            in graph.graphs
-        ]
+            for w in {int(w) for w in (*BONUS_NTPBS, *LAYER_WIDTHS)}
+            if w > 1 and graph._make_graph_key(replay_bs, stream, w) in graph.graphs
+        )
         if widths:
             return next((w for w in widths if w >= need), widths[-1]), True
     return int(need), False

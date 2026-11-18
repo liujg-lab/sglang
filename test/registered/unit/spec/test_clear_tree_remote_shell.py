@@ -1167,16 +1167,17 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         launch.assert_called_once()
         self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
 
-    def test_bonus_width_uses_exact_batch_bonus_keys_and_eager_need(self):
+    def test_bonus_width_pads_to_captured_shared_key_or_eager(self):
         host, _jobs, _pool, _freed = self._batch_fixture()
         graph = SimpleNamespace(
             capture_bs=[1, 2, 4],
             disable_padding=False,
             graphs={
-                "r17_1_s0": object(),
-                "r9_4_s0": object(),
-                "r33_4_s0": object(),
+                "r17_1": object(),
+                "r9_4": object(),
+                "r33_4": object(),
                 "r64_4": object(),
+                "r8_4": object(),
             },
             _make_graph_key=lambda b, s, w, extra=None: (
                 f"r{w}_{b}" + (f"_s{extra}" if extra is not None else "")
@@ -1188,13 +1189,57 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         )
         self.assertEqual(self.forward._bonus_width(host, 1, 17), (17, True))
         self.assertEqual(self.forward._bonus_width(host, 4, 9), (9, True))
-        self.assertEqual(self.forward._bonus_width(host, 4, 65), (33, True))
-        # bs=3 must not reuse bs=4, even with ordinary graph padding enabled.
-        self.assertEqual(self.forward._bonus_width(host, 3, 17), (17, False))
-        graph.graphs.clear()
-        self.assertEqual(self.forward._bonus_width(host, 4, 65), (65, False))
+        # bs=3 pads to the captured batch 4 graph.
+        self.assertEqual(self.forward._bonus_width(host, 3, 9), (9, True))
+        # A layer width can cover a bonus need when it is the smaller captured key.
+        self.assertEqual(self.forward._bonus_width(host, 3, 6), (8, True))
+        # r65_4 is absent, so the caller splits at the widest captured key.
+        self.assertEqual(self.forward._bonus_width(host, 4, 65), (64, True))
+        self.assertEqual(self.forward._bonus_width(host, 5, 9), (9, False))
+        graph.disable_padding = True
+        self.assertEqual(self.forward._bonus_width(host, 3, 9), (9, False))
         host.model_worker.model_runner.graph_runner = None
         self.assertEqual(self.forward._bonus_width(host, 4, 7), (7, False))
+
+    def test_bonus_many_batch3_reuses_padded_shared_graph(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host, jobs, _pool, _freed = self._batch_fixture(3)
+        host.req_to_token_pool.device = "cuda"
+        graph = SimpleNamespace(
+            capture_bs=[1, 2, 4],
+            graphs={"r9_4": object()},
+            _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}",
+        )
+        host.model_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(graph_runner=graph)
+        )
+        plans = [self._candidate(i, i) for i in range(9)]
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "select_bonus_candidates", return_value=plans
+        ), patch.object(
+            self.forward, "_copy_bonus_host", side_effect=lambda tensor, _device: tensor
+        ), patch.object(
+            self.forward,
+            "_bonus_long_tensor",
+            side_effect=lambda values, _device: self.torch.tensor(
+                list(values), dtype=self.torch.long
+            ),
+        ), self._batch_runtime(host) as (_alloc, _assign, launched, output):
+            self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        self.assertEqual(launched.call_count, 1)
+        self.assertEqual(
+            [tuple(row.shape) for row in output["tokens"]], [(9,), (9,), (9,)]
+        )
+        host.run_batch.assert_called_once()
+        self.assertFalse(host.cur_batch.spec_info.bonus_eager)
+        counts = get_sr_round_metrics(host, "Draft").counts
+        self.assertEqual(counts["opt_bonus_graph"], 1)
+        self.assertEqual(counts["opt_bonus_forwards"], 1)
+        self.assertEqual(counts["opt_bonus_groups_split"], 0)
+        self.assertNotIn("opt_bonus_eager", counts)
 
     def test_bonus_many_k16_k8_and_k64_use_17_9_and_split33_not_layer_width(self):
         for count, k, expected, graphs_enabled in (
@@ -1211,13 +1256,13 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     capture_bs=[1, 2, 4],
                     graphs=(
                         {
-                            f"r{g}_{count}_s0": object()
+                            f"r{g}_{count}": object()
                             for g in (3, 5, 9, 17, 33) + ((65,) if count == 1 else ())
                         }
                         if graphs_enabled
                         else {}
                     ),
-                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}_s{extra}",
+                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}",
                 )
                 host.model_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(graph_runner=graph)
@@ -1685,8 +1730,8 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 host.req_to_token_pool.device = "cuda"
                 graph = SimpleNamespace(
                     capture_bs=[1, 2, 4],
-                    graphs={"r9_2_s0": object()},
-                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}_s{extra}",
+                    graphs={"r9_2": object()},
+                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}",
                 )
                 if gather is not None:
                     setattr(graph, gather, True)
@@ -2486,7 +2531,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             )
         self.assertIs(spec.custom_mask, runner._clear_tree_capture_masks[132 * 38])
         self.assertEqual(spec.positions.numel(), 132)
-        self.assertTrue(spec.is_bonus)
+        self.assertFalse(spec.is_bonus)
         self.assertEqual(spec.draft_token_num, 33)
 
     def _shared_cuda_runner(self, **overrides):
@@ -2585,7 +2630,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         expected = {
             f"r{w}_{bs}" for bs in (1, 2, 4) for w in (1, 2, 4, 8, 16, 32, 64)
         } | {
-            f"r{g}_{bs}_s0"
+            f"r{g}_{bs}"
             for bs in (1, 2, 4)
             for g in (3, 5, 9, 17, 33, 65)
             if bs * g <= 256
@@ -2593,10 +2638,11 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         self.assertEqual(set(runner.graphs), expected)
         self.assertEqual(len(runner.graphs), 38)
         self.assertEqual(runner.capture_one_batch_size.call_count, 38)
-        self.assertNotIn("r65_4_s0", runner.graphs)
-        self.assertIn("r33_4_s0", runner.graphs)
+        self.assertNotIn("r65_4", runner.graphs)
+        self.assertIn("r33_4", runner.graphs)
+        self.assertFalse(any(str(key).endswith("_s0") for key in runner.graphs))
 
-    def test_shared_can_run_extra_requires_exact_batch_and_suffixed_key(self):
+    def test_shared_can_run_unsuffixed_bonus_pads_and_eager_blocks(self):
         with _bonus_prediction("1"):
             runner, mode = self._shared_cuda_runner()
             spec = self.forward.OptLayerSpec(
@@ -2613,17 +2659,13 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 spec_info=spec,
                 capture_hidden_mode=0,
             )
-            runner.graphs = {"r9_4_s0": object(), "r9_3": object()}
-            self.assertFalse(runner.can_run(batch))
-            runner.graphs["r9_3_s0"] = object()
+            runner.graphs = {"r9_4": object()}
             self.assertTrue(runner.can_run(batch))
-            del runner.graphs["r9_3_s0"]
-            batch.batch_size = 4
-            self.assertTrue(runner.can_run(batch))
-            spec.is_bonus = False
             self.assertIsNone(runner._replay_graph_extra(batch))
+            spec.bonus_eager = True
+            self.assertFalse(runner.can_run(batch))
 
-    def test_capture_k_plus_one_is_independent_of_w_and_intersection_has_two_keys(self):
+    def test_capture_k_plus_one_is_independent_of_w_and_intersection_has_one_key(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
             ClearTreeGraphCapture,
         )
@@ -2639,17 +2681,15 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             self.assertEqual(
                 ClearTreeGraphCapture.dual_ntpb_options(args), [17, 9, 8, 4, 3, 1]
             )
-            self.assertEqual(
-                self.forward.opt_draft_capture_extra_keys(args, 3), [None, 0]
-            )
-            self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 9), [0])
+            self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 3), [None])
+            self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 9), [None])
             self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 8), [None])
             runner, _mode = self._shared_cuda_runner()
             runner.spectre_ntpb_options = ClearTreeGraphCapture.dual_ntpb_options(args)
             runner.capture()
             for bs in (1, 2, 4):
                 self.assertIn(f"r3_{bs}", runner.graphs)
-                self.assertIn(f"r3_{bs}_s0", runner.graphs)
+                self.assertNotIn(f"r3_{bs}_s0", runner.graphs)
 
     def test_bonus_capture_graphs_follow_flag_without_changing_layer_or_target(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
@@ -2672,8 +2712,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 )
                 self.assertEqual(self.forward.opt_draft_bonus_ntpbs(target), [])
                 self.assertEqual(
-                    self.forward.opt_draft_capture_extra_keys(draft, 3),
-                    [0] if enabled else [None],
+                    self.forward.opt_draft_capture_extra_keys(draft, 3), [None]
                 )
                 for width in (1, 2, 4, 8, 16, 32, 64):
                     self.assertEqual(
