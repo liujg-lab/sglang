@@ -1,0 +1,975 @@
+{
+  "schema_version": 4,
+  "status": "fail",
+  "runtime_status": "fail",
+  "raw_directory": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw",
+  "completed_trials": [],
+  "expected_trials_missing": [
+    "c4-A1"
+  ],
+  "matrix": {
+    "c1-A1": {
+      "concurrency": 1,
+      "requests": 100,
+      "max_new_tokens": 1024,
+      "bonus": 1,
+      "graph_bs": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "c4-A1": {
+      "concurrency": 4,
+      "requests": 100,
+      "max_new_tokens": 1024,
+      "bonus": 1,
+      "graph_bs": [
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  },
+  "trials": [
+    {
+      "trial": "c1-A1",
+      "kind": "formal",
+      "concurrency": 1,
+      "status": "fail",
+      "metrics": {
+        "scope": "formal client only; startup/capture/warmup excluded",
+        "requests": 0,
+        "success": 0,
+        "errors": 0,
+        "total_tokens": null,
+        "tokens_known_requests": 0,
+        "wall_s": null,
+        "wall_sources": [],
+        "output_tok_s": null,
+        "request_s": null,
+        "latency": {
+          "ttft_ms": {
+            "n": 0,
+            "mean": null,
+            "p50": null,
+            "p90": null,
+            "p95": null,
+            "p99": null
+          },
+          "client_e2e_ms": {
+            "n": 0,
+            "mean": null,
+            "p50": null,
+            "p90": null,
+            "p95": null,
+            "p99": null
+          },
+          "server_e2e_ms": {
+            "n": 0,
+            "mean": null,
+            "p50": null,
+            "p90": null,
+            "p95": null,
+            "p99": null
+          },
+          "tpot_ms": {
+            "n": 0,
+            "mean": null,
+            "p50": null,
+            "p90": null,
+            "p95": null,
+            "p99": null
+          },
+          "post_first_delivery_ms": {
+            "n": 0,
+            "mean": null,
+            "p50": null,
+            "p90": null,
+            "p95": null,
+            "p99": null
+          }
+        },
+        "accepted_tokens_known": null,
+        "draft_tokens_known": null,
+        "accept_rate_weighted": null,
+        "accept_rate_samples": 0,
+        "reported_summary": {},
+        "tpot_boundary": "decode_s/(completion_tokens-1) for first_chunk_tokens=1 and decode_tokens=n-1; multi-token first delivery separate; TPOT is not ITL"
+      },
+      "round_metrics": {
+        "target": {
+          "windows": 0,
+          "metered_rounds": null,
+          "counters": {},
+          "bonus": {
+            "rounds": null,
+            "forwards": null,
+            "requests": null,
+            "query_rows": null,
+            "padding_rows": null,
+            "graph": null,
+            "eager": null,
+            "unknown": null,
+            "failed": null,
+            "groups_split": null,
+            "skipped": null,
+            "skipped_kv": null,
+            "skipped_map": null,
+            "skipped_allocator": null,
+            "skipped_empty": null,
+            "skipped_unready": null,
+            "hits": null
+          },
+          "legacy_bonus_batch_counters": {},
+          "unified_bonus_schema_observed": false,
+          "lease_publish_failed": null,
+          "verify_graph_batches": null,
+          "width_submissions": {},
+          "host_mean_ms": {},
+          "host_denominator_rounds": {},
+          "host_max_ms": {},
+          "bad_counters": {},
+          "scope": "rank 0; sum independent flushed periodic windows over complete supplied logs including warmup; unflushed tail unknown; NOT formal-only",
+          "sparse_counter_rule": "missing key=0 ONLY within explicit valid role/rank0 counter windows; no windows=None. Legacy batch keys never satisfy unified gates",
+          "replay_by_bs_G": null,
+          "replay_by_bs_G_reason": "unified path counters and width submission counters do not identify a joint per-bs/G actual replay; capture keys are not hits"
+        },
+        "draft": {
+          "windows": 0,
+          "metered_rounds": null,
+          "counters": {},
+          "bonus": {
+            "rounds": null,
+            "forwards": null,
+            "requests": null,
+            "query_rows": null,
+            "padding_rows": null,
+            "graph": null,
+            "eager": null,
+            "unknown": null,
+            "failed": null,
+            "groups_split": null,
+            "skipped": null,
+            "skipped_kv": null,
+            "skipped_map": null,
+            "skipped_allocator": null,
+            "skipped_empty": null,
+            "skipped_unready": null,
+            "hits": null
+          },
+          "legacy_bonus_batch_counters": {},
+          "unified_bonus_schema_observed": false,
+          "lease_publish_failed": null,
+          "verify_graph_batches": null,
+          "width_submissions": {},
+          "host_mean_ms": {},
+          "host_denominator_rounds": {},
+          "host_max_ms": {},
+          "bad_counters": {},
+          "scope": "rank 0; sum independent flushed periodic windows over complete supplied logs including warmup; unflushed tail unknown; NOT formal-only",
+          "sparse_counter_rule": "missing key=0 ONLY within explicit valid role/rank0 counter windows; no windows=None. Legacy batch keys never satisfy unified gates",
+          "replay_by_bs_G": null,
+          "replay_by_bs_G_reason": "unified path counters and width submission counters do not identify a joint per-bs/G actual replay; capture keys are not hits"
+        }
+      },
+      "configuration": {
+        "config": {
+          "bonus": [
+            {
+              "value": true,
+              "source": "config.json:bonus_prediction",
+              "scope": "shared"
+            }
+          ],
+          "ledger": [
+            {
+              "value": false,
+              "source": "config.json:ledger",
+              "scope": "shared"
+            }
+          ],
+          "kv_reuse": [
+            {
+              "value": true,
+              "source": "config.json:kv_reuse",
+              "scope": "shared"
+            }
+          ],
+          "lookahead": [
+            {
+              "value": false,
+              "source": "config.json:lookahead",
+              "scope": "shared"
+            }
+          ],
+          "graph": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "config.json:graph_bs",
+              "scope": "shared"
+            }
+          ]
+        },
+        "manifest": {
+          "graph": []
+        },
+        "target_actual": {
+          "graph": [],
+          "ledger": [],
+          "kv_reuse": [],
+          "lookahead": []
+        },
+        "draft_actual": {
+          "graph": [],
+          "ledger": [],
+          "kv_reuse": [],
+          "lookahead": [],
+          "bonus": []
+        },
+        "target_launcher": {
+          "ledger": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ],
+          "kv_reuse": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ],
+          "lookahead": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ],
+          "graph": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:8",
+              "scope": "target"
+            }
+          ]
+        },
+        "draft_launcher": {
+          "ledger": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ],
+          "kv_reuse": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ],
+          "lookahead": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ],
+          "bonus": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:5",
+              "scope": "draft"
+            }
+          ],
+          "graph": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:8",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "lifecycle": {
+        "completed_client_evidence_valid": false,
+        "client_exit_code": null,
+        "completed_artifact": null,
+        "roles": {
+          "target": {
+            "identity_matches_owned_record": true,
+            "owned_SIGTERM_recorded": false,
+            "planned_stop_supported": false,
+            "file": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target-stop.json",
+              "bytes": 380,
+              "sha256": "7526461611b89443961d91b7000c2bbc503989d3175e2e7ad68a35f01c7e8f2e"
+            }
+          },
+          "draft": {
+            "identity_matches_owned_record": true,
+            "owned_SIGTERM_recorded": true,
+            "planned_stop_supported": false,
+            "file": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft-stop.json",
+              "bytes": 34703,
+              "sha256": "0b7db042dc117ab1895f475f83121028528617ab55ef4a461543158e9143c2e0"
+            }
+          }
+        },
+        "boundary": "successful completed client plus matching owned process/stop identity and actual SIGTERM; no blanket post-stop fault waiver"
+      },
+      "files": {
+        "manifests": [],
+        "jsonls": [],
+        "csvs": [],
+        "fingerprints": []
+      },
+      "logs": [
+        {
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target.log",
+            "bytes": 27425,
+            "sha256": "aa711fd90485fe47362c2fe621f41acfbe9c3a34e8959648a3fd4d1992666df1"
+          },
+          "role": "target",
+          "lines": 358,
+          "ledger_lines": 0,
+          "errors": {
+            "protocol": {
+              "count": 0,
+              "examples": []
+            },
+            "device": {
+              "count": 0,
+              "examples": []
+            },
+            "timeout": {
+              "count": 0,
+              "examples": []
+            },
+            "fallback": {
+              "count": 0,
+              "examples": []
+            },
+            "other": {
+              "count": 1,
+              "examples": [
+                {
+                  "line": 358,
+                  "text": "sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64"
+                }
+              ]
+            }
+          },
+          "ignored_diagnostics": {
+            "argparse_option_schema": {
+              "count": 294,
+              "examples": [
+                {
+                  "line": 5,
+                  "text": "[--tokenizer-path TOKENIZER_PATH]",
+                  "sha256": "5e34c14203c5de9e1a83cc1812ee40473493fe63e0ac1c461ef2b9f758157a41"
+                },
+                {
+                  "line": 6,
+                  "text": "[--tokenizer-mode {auto,slow}]",
+                  "sha256": "5f53b25da7dfa068b119d350e8cc9f3db1ee399d0d995eedc24377a4f29e7efa"
+                },
+                {
+                  "line": 7,
+                  "text": "[--tokenizer-worker-num TOKENIZER_WORKER_NUM]",
+                  "sha256": "ee249e227141bc41f594c24f6757788463acd128f62e4182e16b24c03efaee55"
+                },
+                {
+                  "line": 8,
+                  "text": "[--skip-tokenizer-init]",
+                  "sha256": "f8058bbea7064d8bca91c22eb432a6937b1250919f71b7b03d774083d4a12c5a"
+                },
+                {
+                  "line": 9,
+                  "text": "[--load-format {auto,pt,safetensors,npcache,dummy,sharded_state,gguf,bitsandbytes,mistral,layered,flash_rl,remote,remote_instance,fastsafetensors,private,runai_streamer}]",
+                  "sha256": "d2a9e7c75dc22fcf7a2fc81fbab3f0544a33e8c189558463e5eaf21ad2aac8f3"
+                },
+                {
+                  "line": 10,
+                  "text": "[--model-loader-extra-config MODEL_LOADER_EXTRA_CONFIG]",
+                  "sha256": "8853da15b4fd92010598ba5fdee1703aa40463eab9aba354789680e56f04ab1e"
+                },
+                {
+                  "line": 17,
+                  "text": "[--nccl-port NCCL_PORT]",
+                  "sha256": "1611f66bf8fe493b275eef226c2c050db1abebffe6db3d43e104d280ab938cde"
+                },
+                {
+                  "line": 18,
+                  "text": "[--checkpoint-engine-wait-weights-before-ready]",
+                  "sha256": "01d175ffbea11383e922892adf6c8e0eb07f0ca09f80172f4f6d33b00b23a194"
+                },
+                {
+                  "line": 20,
+                  "text": "[--ssl-ca-certs SSL_CA_CERTS]",
+                  "sha256": "1e7c8f7083069b5f2d5b89e3acfd4f97236daa5aec3c5d238918119fa7b697e7"
+                },
+                {
+                  "line": 21,
+                  "text": "[--ssl-keyfile-password SSL_KEYFILE_PASSWORD]",
+                  "sha256": "3580f622dfd7ce34006c85d262e8160119cdcc17d162b220da3157229550ca3d"
+                }
+              ]
+            }
+          },
+          "shutdown": {
+            "classification": "not_observed",
+            "boundary": null
+          },
+          "capture_batches": [],
+          "dedicated_capture_keys": [],
+          "capture_shapes": [],
+          "round_parse_errors": []
+        },
+        {
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft.log",
+            "bytes": 24399,
+            "sha256": "0b3295464e3c98f3f70c4cd527d67f27751cbfd4ca91127097afc0d9d00e523b"
+          },
+          "role": "draft",
+          "lines": 120,
+          "ledger_lines": 0,
+          "errors": {
+            "protocol": {
+              "count": 0,
+              "examples": []
+            },
+            "device": {
+              "count": 0,
+              "examples": []
+            },
+            "timeout": {
+              "count": 0,
+              "examples": []
+            },
+            "fallback": {
+              "count": 0,
+              "examples": []
+            },
+            "other": {
+              "count": 1,
+              "examples": [
+                {
+                  "line": 119,
+                  "text": "[2026-11-18 07:31:07] SIGTERM received. signum=None frame=None. Draining requests and shutting down..."
+                }
+              ]
+            }
+          },
+          "ignored_diagnostics": {
+            "startup_configuration": {
+              "count": 1,
+              "examples": [
+                {
+                  "line": 7,
+                  "text": "[2026-11-18 07:29:55] server_args=ServerArgs(model_path='/home_18T/liujg/Hugging_Face/mllmTeam/Qwen3-VL-2B-Instruct-W8A8-INT8', tokenizer_path='/home_18T/liujg/Hugging_Face/mllmTeam/Qwen3-VL-2B-Instruct-W8A8-INT8', tokenizer_mode='auto', tokenizer_worker_num=1, skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=False, context_length=None, is_embedding=False, enable_multimodal=None, revision=None, model_impl='auto', host='127.0.0.1', port=30001, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, warmups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, dtype='auto', quantization=None, quantization_param_path=None, kv_cache_dtype='auto', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpoint_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quant_profile=None, mem_fraction_static=0.6, max_running_requests=4, max_queued_requests=None, max_total_tokens=None, chunked_prefill_size=2048, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_policy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, schedule_conservativeness=1.0, page_size=1, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_policy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermark=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, device='cuda', tp_size=1, pp_size=1, pp_max_micro_batch_size=None, pp_async_batch_depth=0, stream_interval=1, stream_response_default_include_usage=False, incremental_streaming_output=False, enable_streaming_session=False, random_seed=258320274, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None, download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, use_ray=False, custom_sigquit_handler=None, log_level='info', log_level_http=None, log_requests=False, log_requests_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_folder=None, show_time_cost=False, enable_metrics=False, enable_mfu_metrics=False, enable_metrics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_custom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, collect_tokens_histogram=False, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_trace=False, otlp_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, api_key=None, admin_api_key=None, served_model_name='/home_18T/liujg/Hugging_Face/mllmTeam/Qwen3-VL-2B-Instruct-W8A8-INT8', weight_version='default', chat_template=None, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, tool_server=None, sampling_defaults='model', dp_size=1, load_balance_method='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend='csgmv', max_lora_chunk_size=16, experts_shared_outer_loras=None, attention_backend='triton', decode_attention_backend=None, prefill_attention_backend=None, sampling_backend='flashinfer', grammar_backend='xgrammar', mm_attention_backend='triton_attn', fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='auto', nsa_prefill_backend=None, nsa_decode_backend=None, disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm='CLEAR_TREE_REMOTE', speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative_num_steps=8, speculative_eagle_topk=8, speculative_num_draft_tokens=64, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_verify_mode='auto', speculative_rpd_tau=0.2, speculative_token_map=None, speculative_attention_mode='prefill', speculative_draft_attention_backend=None, speculative_moe_runner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization=None, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type='BFS', speculative_ngram_max_trie_depth=18, speculative_ngram_capacity=10000000, speculative_ngram_external_corpus_path=None, speculative_ngram_external_sam_budget=0, speculative_ngram_external_corpus_max_tokens=10000000, enable_multi_layer_eagle=False, spectre_role=None, spectre_max_batch_size=32, spectre_reject_interval=500, spectre_no_draft_ratio=0.5, spectre_retry_fail_ratio=0.5, spectre_retry_min_count=4, spectre_zmq_addr='127.0.0.1', spectre_zmq_port='30009', spectre_draft_priority=False, spectre_max_draft_priority_steps=0, standalone_remote_role=None, standalone_remote_addr='127.0.0.1', standalone_remote_port='30019', standalone_remote_rpc_timeout_ms=5000, standalone_remote_max_batch_size=32, standalone_remote_draft_ttl_s=60.0, standalone_remote_breaker_failures=3, standalone_remote_breaker_cooldown=32, standalone_remote_draft_vision_compress='none', standalone_remote_draft_vision_keep_ratio=0.25, standalone_remote_draft_vision_dominant_ratio=0.85, standalone_remote_draft_vision_score_layer=-2, opt_tree_role=None, opt_tree_width=None, opt_tree_tau=0.5, opt_tree_max_depth=None, opt_tree_addr='127.0.0.1', opt_tree_port='30029', clear_tree_role='draft', clear_tree_width=8, clear_tree_widths=[2, 4, 8, 16, 32, 64], clear_tree_ks=[2, 4, 8, 16, 32, 64], clear_tree_tau=0.5, clear_tree_max_depth=8, clear_tree_addr='localhost', clear_tree_port='30019', ep_size=1, moe_a2a_backend='none', moe_runner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enforce_disable_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=False, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancing_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, enable_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_elastic_expert_backup=False, mooncake_ib_device=None, max_mamba_cache_size=None, mamba_ssm_dtype=None, mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_interval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hierarchical_cache=False, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kernel', hicache_mem_layout='layer_first', hicache_storage_backend=None, hicache_storage_prefetch_policy='best_effort', hicache_storage_backend_extra_config=None, enable_hisparse=False, hisparse_config=None, enable_lmcache=False, kt_weight_path=None, kt_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=None, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, enable_double_sparsity=False, ds_channel_config_path=None, ds_heavy_channel_num=32, ds_heavy_token_num=256, ds_heavy_channel_type='qk', ds_sparse_decode_threshold=4096, cpu_offload_gb=0, offload_group_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', multi_item_scoring_delimiter=None, disable_radix_cache=False, cuda_graph_max_bs=4, cuda_graph_bs=[1, 2, 3, 4], disable_cuda_graph=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tokenizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, enable_torch_symm_mem=False, pre_warm_nccl=False, disable_overlap_schedule=True, enable_mixed_chunk=False, enable_dp_attention=False, enable_dp_lm_head=False, enable_two_batch_overlap=False, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, disable_piecewise_cuda_graph=True, enforce_piecewise_cuda_graph=False, enable_torch_compile_debug_mode=False, torch_compile_max_bs=32, piecewise_cuda_graph_max_tokens=2048, piecewise_cuda_graph_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048], piecewise_cuda_graph_compiler='eager', torchao_config='', enable_nan_detection=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, delete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_backup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disable_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_image_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=False, scheduler_recv_interval=1, numa_node=None, enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, gc_threshold=None, enable_nsa_prefill_context_parallel=False, nsa_prefill_cp_mode='round-robin-split', enable_fused_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_prefill_context_parallel=False, prefill_cp_mode='in-seq-split', enable_dynamic_batch_tokenizer=False, dynamic_batch_tokenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='null', disaggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=8998, disaggregation_ib_device=None, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens=512, disaggregation_decode_polling_interval=1, encoder_only=False, language_only=False, encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], enable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, remote_instance_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_weight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loader_start_seed_via_transfer_engine=False, engine_info_bootstrap_port=6789, modelexpress_config=None, enable_pdmux=False, pdmux_config_path=None, sm_group_num=8, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enable_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_config_file=None, decrypted_draft_config_file=None, forward_hooks=None)",
+                  "sha256": "df3f0bff084b82a5d0dfcf0d94d5679efcff559652950abe01e419a623383995"
+                }
+              ]
+            },
+            "optional_model_import": {
+              "count": 10,
+              "examples": [
+                {
+                  "line": 8,
+                  "text": "[2026-11-18 07:29:56] Ignore import error when loading sglang.srt.multimodal.processors.gemma4: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "02e681c94f36f42ad75a5872202b05a5cf905c95c0ffc251a01dbeabd5a39de5"
+                },
+                {
+                  "line": 9,
+                  "text": "[2026-11-18 07:29:58] Ignore import error when loading sglang.srt.models.gemma4_audio: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "7b78970db807c9e7e94d5b2708b6b2169cc146c25b7360f284e557c81c1784ab"
+                },
+                {
+                  "line": 10,
+                  "text": "[2026-11-18 07:29:58] Ignore import error when loading sglang.srt.models.gemma4_causal: cannot import name 'Gemma4TextConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "63f2c6bef6b03ae8664c83715a75fc9eebd99274cb45ed0e40fe5b3bb6354ed9"
+                },
+                {
+                  "line": 11,
+                  "text": "[2026-11-18 07:29:58] Ignore import error when loading sglang.srt.models.gemma4_mm: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "14433db9beb64ae8ddf4ede35031cff766b261e19d3123f0f6a1d0fc6798abc4"
+                },
+                {
+                  "line": 12,
+                  "text": "[2026-11-18 07:29:58] Ignore import error when loading sglang.srt.models.gemma4_vision: cannot import name 'Gemma4VisionConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "f25459610629ae12cecdbf164aabe268ccbe94bb2d605aafb4afcb96bde3343f"
+                },
+                {
+                  "line": 14,
+                  "text": "[2026-11-18 07:30:05] Ignore import error when loading sglang.srt.multimodal.processors.gemma4: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "10b8a6e9b7fd9b2741ae7fb8bd179e250668965af25f5e606f3f31a7149bcc8a"
+                },
+                {
+                  "line": 21,
+                  "text": "[2026-11-18 07:30:06] Ignore import error when loading sglang.srt.models.gemma4_audio: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "14128d421122be383d17311fab06957a8772f2e493668019a1e9c7c2fe5fe72e"
+                },
+                {
+                  "line": 22,
+                  "text": "[2026-11-18 07:30:06] Ignore import error when loading sglang.srt.models.gemma4_causal: cannot import name 'Gemma4TextConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "f52aed39ea1aa08c56b0ee7f538e2e9e577ce775c32e058bda51d1afb3cb222e"
+                },
+                {
+                  "line": 23,
+                  "text": "[2026-11-18 07:30:06] Ignore import error when loading sglang.srt.models.gemma4_mm: cannot import name 'Gemma4AudioConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "2f548078f130e787cb1d8df4c0be80f0b90f29f5ebf54e644b6aa92e09c2bf98"
+                },
+                {
+                  "line": 24,
+                  "text": "[2026-11-18 07:30:06] Ignore import error when loading sglang.srt.models.gemma4_vision: cannot import name 'Gemma4VisionConfig' from 'transformers' (/opt/conda/lib/python3.11/site-packages/transformers/__init__.py)",
+                  "sha256": "7cad8c6cdca781fa8fc8465becfa6489292bc5dcd0d1b5213376d01af44614f0"
+                }
+              ]
+            }
+          },
+          "shutdown": {
+            "classification": "unconfirmed_or_runtime_shutdown",
+            "boundary": 119
+          },
+          "capture_batches": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "dedicated_capture_keys": [
+            "r17_4_s0",
+            "r33_4_s0",
+            "r3_4_s0",
+            "r5_4_s0",
+            "r9_4_s0"
+          ],
+          "capture_shapes": [
+            {
+              "bs": 4,
+              "ntpb": 64,
+              "line": 40
+            },
+            {
+              "bs": 4,
+              "ntpb": 33,
+              "line": 41
+            },
+            {
+              "bs": 4,
+              "ntpb": 32,
+              "line": 42
+            },
+            {
+              "bs": 4,
+              "ntpb": 17,
+              "line": 43
+            },
+            {
+              "bs": 4,
+              "ntpb": 16,
+              "line": 44
+            },
+            {
+              "bs": 4,
+              "ntpb": 9,
+              "line": 45
+            },
+            {
+              "bs": 4,
+              "ntpb": 8,
+              "line": 46
+            },
+            {
+              "bs": 4,
+              "ntpb": 5,
+              "line": 47
+            },
+            {
+              "bs": 4,
+              "ntpb": 4,
+              "line": 48
+            },
+            {
+              "bs": 4,
+              "ntpb": 3,
+              "line": 49
+            },
+            {
+              "bs": 4,
+              "ntpb": 2,
+              "line": 50
+            },
+            {
+              "bs": 4,
+              "ntpb": 1,
+              "line": 51
+            },
+            {
+              "bs": 3,
+              "ntpb": 65,
+              "line": 54
+            },
+            {
+              "bs": 3,
+              "ntpb": 64,
+              "line": 55
+            },
+            {
+              "bs": 3,
+              "ntpb": 33,
+              "line": 56
+            },
+            {
+              "bs": 3,
+              "ntpb": 32,
+              "line": 57
+            },
+            {
+              "bs": 3,
+              "ntpb": 17,
+              "line": 58
+            },
+            {
+              "bs": 3,
+              "ntpb": 16,
+              "line": 59
+            },
+            {
+              "bs": 3,
+              "ntpb": 9,
+              "line": 60
+            },
+            {
+              "bs": 3,
+              "ntpb": 8,
+              "line": 61
+            },
+            {
+              "bs": 3,
+              "ntpb": 5,
+              "line": 62
+            },
+            {
+              "bs": 3,
+              "ntpb": 4,
+              "line": 63
+            },
+            {
+              "bs": 3,
+              "ntpb": 3,
+              "line": 64
+            },
+            {
+              "bs": 3,
+              "ntpb": 2,
+              "line": 65
+            },
+            {
+              "bs": 3,
+              "ntpb": 1,
+              "line": 66
+            },
+            {
+              "bs": 2,
+              "ntpb": 65,
+              "line": 69
+            },
+            {
+              "bs": 2,
+              "ntpb": 64,
+              "line": 70
+            },
+            {
+              "bs": 2,
+              "ntpb": 33,
+              "line": 71
+            },
+            {
+              "bs": 2,
+              "ntpb": 32,
+              "line": 72
+            },
+            {
+              "bs": 2,
+              "ntpb": 17,
+              "line": 73
+            },
+            {
+              "bs": 2,
+              "ntpb": 16,
+              "line": 74
+            },
+            {
+              "bs": 2,
+              "ntpb": 9,
+              "line": 75
+            },
+            {
+              "bs": 2,
+              "ntpb": 8,
+              "line": 76
+            },
+            {
+              "bs": 2,
+              "ntpb": 5,
+              "line": 77
+            },
+            {
+              "bs": 2,
+              "ntpb": 4,
+              "line": 78
+            },
+            {
+              "bs": 2,
+              "ntpb": 3,
+              "line": 79
+            },
+            {
+              "bs": 2,
+              "ntpb": 2,
+              "line": 80
+            },
+            {
+              "bs": 2,
+              "ntpb": 1,
+              "line": 81
+            },
+            {
+              "bs": 1,
+              "ntpb": 65,
+              "line": 84
+            },
+            {
+              "bs": 1,
+              "ntpb": 64,
+              "line": 85
+            },
+            {
+              "bs": 1,
+              "ntpb": 33,
+              "line": 86
+            },
+            {
+              "bs": 1,
+              "ntpb": 32,
+              "line": 87
+            },
+            {
+              "bs": 1,
+              "ntpb": 17,
+              "line": 88
+            },
+            {
+              "bs": 1,
+              "ntpb": 16,
+              "line": 89
+            },
+            {
+              "bs": 1,
+              "ntpb": 9,
+              "line": 90
+            },
+            {
+              "bs": 1,
+              "ntpb": 8,
+              "line": 91
+            },
+            {
+              "bs": 1,
+              "ntpb": 5,
+              "line": 92
+            },
+            {
+              "bs": 1,
+              "ntpb": 4,
+              "line": 93
+            },
+            {
+              "bs": 1,
+              "ntpb": 3,
+              "line": 94
+            },
+            {
+              "bs": 1,
+              "ntpb": 2,
+              "line": 95
+            },
+            {
+              "bs": 1,
+              "ntpb": 1,
+              "line": 96
+            }
+          ],
+          "round_parse_errors": []
+        }
+      ]
+    }
+  ],
+  "formal_by_concurrency": {
+    "1": {
+      "scope": "formal client only; startup/capture/warmup excluded",
+      "requests": 0,
+      "success": 0,
+      "errors": 0,
+      "total_tokens": null,
+      "tokens_known_requests": 0,
+      "wall_s": null,
+      "wall_sources": [],
+      "output_tok_s": null,
+      "request_s": null,
+      "latency": {
+        "ttft_ms": {
+          "n": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "client_e2e_ms": {
+          "n": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "server_e2e_ms": {
+          "n": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "tpot_ms": {
+          "n": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "post_first_delivery_ms": {
+          "n": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        }
+      },
+      "accepted_tokens_known": null,
+      "draft_tokens_known": null,
+      "accept_rate_weighted": null,
+      "accept_rate_samples": 0,
+      "reported_summary": {},
+      "tpot_boundary": "decode_s/(completion_tokens-1) for first_chunk_tokens=1 and decode_tokens=n-1; multi-token first delivery separate; TPOT is not ITL"
+    }
+  },
+  "boundaries": [
+    "rank 0; sum independent flushed periodic windows over complete supplied logs including warmup; unflushed tail unknown; NOT formal-only",
+    "No smoke, repetitions or bonus-off; c1 and c4 are different workloads, NOT repeat trials or causal A/B.",
+    "Dedicated bonus is_bonus=True r{G}_{bs}_s0, not a normal layer graph. Unified graph counter reports actual forward result.",
+    "Capture/width counters cannot establish per-bs/G replay; joint hit breakdown unavailable unless separately instrumented.",
+    "Default candidates, batch1/2/3/4, one stream, token capacity256 imply 51 Draft graphs (28 ordinary +23 dedicated). This is conditional inference, not observed hits; bs4*65=260 cannot fit and is NOT required.",
+    "requests counts installed request-group occurrences; c4 requires requests>forwards to prove at least one multi-request group. This does not prove split groups per request.",
+    "Empty/unready skips are reported separately; only KV skips <= forwards, map/allocator skips and lease_publish_failed must be zero.",
+    "Throughput=sum(actual output tokens)/formal elapsed client wall. Acceptance=sum accepted/sum draft, never average per-request rates.",
+    "Full archived logs are scanned; .recent tails are never health proof. Missing evidence remains missing."
+  ],
+  "final_status": "fail",
+  "finalization": {
+    "status": "fail",
+    "finalized_utc": "2026-11-18T07:36:29.121028+00:00",
+    "runtime_status": "fail",
+    "completed_trials": [],
+    "all_clients_completed": false,
+    "expected_trials_missing": [
+      "c4-A1"
+    ],
+    "cleanup_status": "pass",
+    "preflight_status": "pass",
+    "trial_cleanup_status": "missing",
+    "phase_status": "missing",
+    "blocking_records": [
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/formal-blocked.json",
+          "bytes": 299,
+          "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+        },
+        "record": {
+          "completed": false,
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "utc": "2026-11-18T07:31:48.168190+00:00",
+          "automatic_retry": false,
+          "remaining_trials_stopped": true
+        },
+        "issues": []
+      },
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/blocked.json",
+          "bytes": 307,
+          "sha256": "33cc88577703033ba304075ecc6760a0da74e0eae3fd409e88d96ad5a911cd52"
+        },
+        "record": {
+          "completed": false,
+          "trial": "c1-A1",
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "cleanup_errors": [],
+          "utc": "2026-11-18T07:31:34.762727+00:00",
+          "automatic_retry": false
+        },
+        "issues": []
+      },
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-blocked.json",
+          "bytes": 299,
+          "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+        },
+        "record": {
+          "completed": false,
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "utc": "2026-11-18T07:31:48.168190+00:00",
+          "automatic_retry": false,
+          "remaining_trials_stopped": true
+        },
+        "issues": []
+      }
+    ],
+    "prior_orchestrator_status": "blocked",
+    "services_stopped": true,
+    "tunnels_preserved": true,
+    "parse_issues": [],
+    "performance_status": "per_concurrency_descriptive_only_no_repeats_no_AB"
+  }
+}

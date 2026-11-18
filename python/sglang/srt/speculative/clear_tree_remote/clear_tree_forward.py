@@ -84,8 +84,7 @@ def flush_opt_ingest_phases(metrics, parts, wall: float) -> None:
         return
     wall = max(0.0, float(wall))
     amounts = {
-        name: max(0.0, float(parts.get(name, 0.0) or 0.0))
-        for name in OPT_INGEST_PHASES
+        name: max(0.0, float(parts.get(name, 0.0) or 0.0)) for name in OPT_INGEST_PHASES
     }
     gap = wall - sum(amounts.values())
     if gap >= 0.0:
@@ -329,9 +328,7 @@ def reprefill_tail_logits(scheduler, reqs) -> List[torch.Tensor]:
             rows[i] = row
     if any(row is None for row in rows):
         missing_rids = [
-            getattr(reqs[i], "rid", None)
-            for i, row in enumerate(rows)
-            if row is None
+            getattr(reqs[i], "rid", None) for i, row in enumerate(rows) if row is None
         ]
         raise RuntimeError(
             f"OPT draft reprefill returned no tail logits for {missing_rids}"
@@ -339,7 +336,9 @@ def reprefill_tail_logits(scheduler, reqs) -> List[torch.Tensor]:
     return rows
 
 
-def materialize_missing_prefix(scheduler, reqs, capture_tail_logits: bool = False) -> None:
+def materialize_missing_prefix(
+    scheduler, reqs, capture_tail_logits: bool = False
+) -> None:
     """Build draft KV before the seed forward.
 
     ``_sr_kv_len`` treats a request with no pool slot as already cached, so
@@ -472,9 +471,7 @@ def _as_layer_rows(logits, bs: int, width: int) -> List[torch.Tensor]:
     if isinstance(logits, (list, tuple)):
         rows = list(logits)
         if len(rows) != bs:
-            raise RuntimeError(
-                f"OPT layer returned {len(rows)} rows for {bs} requests"
-            )
+            raise RuntimeError(f"OPT layer returned {len(rows)} rows for {bs} requests")
         return rows
     t = logits.detach()
     if t.dim() == 3 and int(t.shape[0]) == bs and int(t.shape[1]) == width:
@@ -616,9 +613,7 @@ def _begin_layer_timing(scheduler):
         ev1 = factory(enable_timing=True)
     except Exception:
         return None
-    return _LayerTiming(
-        metrics, time.perf_counter(), ev0, ev1, ledger_only=ledger_only
-    )
+    return _LayerTiming(metrics, time.perf_counter(), ev0, ev1, ledger_only=ledger_only)
 
 
 def _close_layer_host(timing) -> None:
@@ -889,9 +884,7 @@ def drain_opt_layer_gpu_us(scheduler, metrics) -> None:
             remember_layer_gpu(sample, gpu_us)
     for start, end in pairs:
         try:
-            metrics.counts["opt_ingest_gpu_us"] += int(
-                start.elapsed_time(end) * 1000
-            )
+            metrics.counts["opt_ingest_gpu_us"] += int(start.elapsed_time(end) * 1000)
         except Exception as exc:
             if is_device_context_error(exc):
                 raise
@@ -1013,8 +1006,14 @@ def grow_active_layers(
     """
     tails = list(tail_logits)
     states = [ClearTreeState.create(config) for _ in tails]
-    plan = getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
-    rids = list(getattr(scheduler, "_clear_round_rids", None) or []) if scheduler is not None else []
+    plan = (
+        getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
+    )
+    rids = (
+        list(getattr(scheduler, "_clear_round_rids", None) or [])
+        if scheduler is not None
+        else []
+    )
     prefixes = (
         list(getattr(scheduler, "_clear_round_prefixes", None) or [])
         if scheduler is not None
@@ -1119,11 +1118,13 @@ class OptLayerSpec:
     num_tokens_per_req: int
     capture_hidden_mode: object = None
     # Earlier layers sit in the KV prefix, so every TARGET_VERIFY reads that
-    # part of the mask. ``is_bonus`` only selects the N+1 graph key.
+    # part of the mask. ``is_bonus`` selects the dedicated bonus graph key.
     apply_prefix_custom_mask: bool = True
     is_bonus: bool = False
     # OPT draft cascade only. Other algorithms leave this unset.
     target_verify_attention: object = None
+    # A locally rejected graph combination must not be readmitted downstream.
+    bonus_eager: bool = False
 
     def is_draft_input(self) -> bool:
         return False
@@ -1145,7 +1146,7 @@ def opt_bonus_graph_extra(spec_info):
 
 
 def opt_draft_bonus_ntpbs(server_args) -> list:
-    """Opt-in Draft bonus graphs, each one wider than its layer."""
+    """Opt-in Draft bonus graphs, each one wider than a verify K tier."""
     if (
         getattr(server_args, "clear_tree_role", None) != "draft"
         or not bonus_prediction_enabled()
@@ -1161,25 +1162,20 @@ def opt_draft_bonus_ntpbs(server_args) -> list:
 def opt_draft_bonus_ntpb(server_args):
     """Widest bonus graph, or None when this role has none.
 
-    Each bonus graph is one wider than a layer width.
+    Each bonus graph is one wider than a verify K tier.
     """
     widths = opt_draft_bonus_ntpbs(server_args)
-    if not widths:
-        return None
-    return int(widths[-1])
+    return max(widths) if widths else None
 
 
 def opt_draft_capture_extra_keys(server_args, ntpb) -> list:
-    """Layer graphs stay unsuffixed. Only the N+1 bonus graph uses extra 0.
-
-    ``ntpb == 1`` is the DECODE graph and is not duplicated. The width-N
-    verify graph is the layer forward. Both graphs apply the prefix mask;
-    the suffix only separates the bonus width.
-    """
+    """Preserve both keys when a layer width is also a K+1 bonus width."""
     if getattr(server_args, "clear_tree_role", None) != "draft":
         return [None]
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import LAYER_WIDTHS
+
     if ntpb is not None and int(ntpb) in opt_draft_bonus_ntpbs(server_args):
-        return [OPT_BONUS_GRAPH_EXTRA]
+        return ([None] if int(ntpb) in LAYER_WIDTHS else []) + [OPT_BONUS_GRAPH_EXTRA]
     return [None]
 
 
@@ -1187,10 +1183,12 @@ def opt_layer_verify_graph_matches(spec_info, actual_ntpb: int) -> bool:
     """True when this spec may replay a TARGET_VERIFY graph of this width.
 
     The captured ntpb must equal this spec's query width. The ntpb=1 dual
-    graph is DECODE, so width 1 stays eager. A bonus spec uses width N+1 and
-    the runner selects that graph via ``opt_bonus_graph_extra``.
+    graph is DECODE, so width 1 stays eager. A bonus spec uses its group
+    width; ``opt_bonus_graph_extra`` selects the dedicated key.
     """
-    if not isinstance(spec_info, OptLayerSpec):
+    if not isinstance(spec_info, OptLayerSpec) or getattr(
+        spec_info, "bonus_eager", False
+    ):
         return False
     width = int(getattr(spec_info, "num_tokens_per_req", 0) or 0)
     ntpb = int(actual_ntpb)
@@ -1492,7 +1490,9 @@ class OptLayerForward:
         batch.global_forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = tokens.to(dtype=torch.int64, device=device).reshape(-1)
         batch.output_ids = None
-        batch.seq_lens = torch.tensor([self.cached_len], dtype=torch.int64, device=device)
+        batch.seq_lens = torch.tensor(
+            [self.cached_len], dtype=torch.int64, device=device
+        )
         batch.seq_lens_cpu = torch.tensor([self.cached_len], dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(
             [self.cached_len], dtype=torch.int32, device=device
@@ -2014,9 +2014,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         ancestor = step.ancestor_mask
         anc_shape = None if ancestor is None else tuple(ancestor.shape)
         if anc_shape != (n, depth * n):
-            raise RuntimeError(
-                f"OPT ancestor mask {anc_shape} != [{n}, {depth * n}]"
-            )
+            raise RuntimeError(f"OPT ancestor mask {anc_shape} != [{n}, {depth * n}]")
         if runner.cached_len + n != runner.prefix_len + depth * n:
             raise RuntimeError(
                 f"OPT cache length {runner.cached_len} is not layer {depth} "
@@ -2026,9 +2024,7 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         ancestors.append(ancestor)
     prefix_lens = [runner.prefix_len for runner in runners]
     if len(runners) == 1:
-        flat_positions = layer_positions(prefix_lens[0], depth, width).to(
-            device=device
-        )
+        flat_positions = layer_positions(prefix_lens[0], depth, width).to(device=device)
         flat_mask = layer_verify_mask(runners[0], ancestors[0], device)
     else:
         flat_mask, flat_positions = pack_verify_attention(
@@ -2189,8 +2185,7 @@ def _decode_uncommitted_batch(scheduler, runners, phases=None) -> List[torch.Ten
         pending = nxt
     if pending:
         raise RuntimeError(
-            "OPT decode append left "
-            + ", ".join(runner.req.rid for runner in pending)
+            "OPT decode append left " + ", ".join(runner.req.rid for runner in pending)
         )
     return [saved[id(runner)] for runner in runners]
 
@@ -2507,11 +2502,15 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
     """
     if state is None or window is None or len(window) != 3 or runner is None:
         return []
-    tokens, parents, cols = window
-    if not tokens or not (len(tokens) == len(parents) == len(cols)):
-        return []
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import node_depths
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
+        node_depths,
+        strip_verify_padding,
+    )
 
+    parsed = strip_verify_padding(*window)
+    if parsed is None:
+        return []
+    tokens, parents, cols = parsed
     depths = node_depths(parents)
     if depths is None:
         return []
@@ -2524,10 +2523,14 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
         token = _first_unbanned(ids, banned)
         if token is None:
             return
-        plans.append(_BonusCandidate(int(parent), int(token), int(position), tuple(chain)))
+        plans.append(
+            _BonusCandidate(int(parent), int(token), int(position), tuple(chain))
+        )
 
     if bonus_ids:
-        banned = [int(tokens[i]) for i, parent in enumerate(parents) if int(parent) == -1]
+        banned = [
+            int(tokens[i]) for i, parent in enumerate(parents) if int(parent) == -1
+        ]
         add(-1, bonus_ids[0], banned, prefix, ())
     for index, depth in enumerate(depths):
         depth = int(depth)
@@ -2538,7 +2541,9 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
         row = bonus_ids[slot]
         if not torch.is_tensor(row) or row.dim() < 1 or col >= int(row.shape[0]):
             continue
-        banned = [int(tokens[j]) for j, parent in enumerate(parents) if int(parent) == index]
+        banned = [
+            int(tokens[j]) for j, parent in enumerate(parents) if int(parent) == index
+        ]
         add(
             index,
             row[col],
@@ -2551,21 +2556,13 @@ def select_bonus_candidates(state, window, runner) -> List[_BonusCandidate]:
         for i, depth in enumerate(depths):
             end_score[i] = float(state.weight[int(depth), int(cols[i])])
         for i, parent in enumerate(parents):
-            end_score[int(parent)] -= float(
-                state.weight[int(depths[i]), int(cols[i])]
-            )
+            end_score[int(parent)] -= float(state.weight[int(depths[i]), int(cols[i])])
         ranked = sorted(
             plans, key=lambda plan: end_score[int(plan.parent)], reverse=True
         )
         for rank, plan in enumerate(ranked):
             plan.end_rank = rank
     return plans
-
-
-def _free_bonus_ids(scheduler, slot_ids) -> None:
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import _free_slot_ids
-
-    _free_slot_ids(scheduler, slot_ids)
 
 
 @dataclass
@@ -2582,66 +2579,6 @@ class _BonusAdmit:
     delta: object = None
 
 
-@dataclass
-class _BonusLaunch:
-    """One bonus group whose slot ids are still on device."""
-
-    loc: Optional[torch.Tensor]
-    logits: torch.Tensor
-    chunk: list
-    tree_end: int
-    width: int
-
-
-def _alloc_bonus_slots(scheduler, runner, n: int, start: int) -> torch.Tensor:
-    """Page-1 bonus slots. Length tensors live on the scheduler.
-
-    ``fill_`` writes the current prefix and, when it changes, the pool index.
-    The two length-1 buffers are keyed by device in ``_opt_la_cache`` and
-    survive a new ``OptLayerForward``. No ``tree_cache`` keeps the caller's
-    ``_alloc_layer_slots`` stub. These slots are not appended to ``layer_slots``.
-    """
-    tree_cache = getattr(scheduler, "tree_cache", None)
-    token_pool = getattr(scheduler, "req_to_token_pool", None)
-    pool = getattr(token_pool, "req_to_token", None)
-    page = int(getattr(tree_cache, "page_size", 1) or 1) if tree_cache is not None else 1
-    pool_idx = getattr(getattr(runner, "req", None), "req_pool_idx", None)
-    if (
-        tree_cache is None
-        or token_pool is None
-        or pool is None
-        or page != 1
-        or pool_idx is None
-    ):
-        return runner._alloc_layer_slots(n, start=start)
-    from sglang.srt.mem_cache.common import alloc_token_slots
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
-    device = token_pool.device
-    cache = _bonus_len_cache(scheduler, device)
-    pool_idx = int(pool_idx)
-    if cache["pool_idx"] != pool_idx:
-        cache["pool"].fill_(pool_idx)
-        cache["pool_idx"] = pool_idx
-    cache["seq"].fill_(int(start))
-    out_cache_loc = alloc_token_slots(tree_cache, n)
-    if out_cache_loc is None or int(out_cache_loc.numel()) != n:
-        raise RuntimeError(
-            f"OPT bonus allocated "
-            f"{0 if out_cache_loc is None else int(out_cache_loc.numel())} "
-            f"slots for {n} tokens"
-        )
-    assign_req_to_token_pool_func(
-        cache["pool"],
-        pool,
-        cache["seq"],
-        cache["seq"] + n,
-        out_cache_loc,
-        1,
-    )
-    return out_cache_loc
-
-
 def _copy_ids_to_host(flat: torch.Tensor) -> List[int]:
     """Read slot ids. CUDA uses one pinned ``non_blocking`` copy and one sync."""
     flat = flat.detach().reshape(-1).to(dtype=torch.long)
@@ -2656,11 +2593,13 @@ def _copy_ids_to_host(flat: torch.Tensor) -> List[int]:
 
 
 def _read_bonus_slot_ids(locs: Sequence[torch.Tensor]) -> List[List[int]]:
-    """Split one host copy of every group's slot ids."""
+    """Read all request rows of one group with a single host copy."""
     pieces = []
     for loc in locs:
         if loc is None:
-            raise RuntimeError("OPT bonus slot ids were read after the buffer was cleared")
+            raise RuntimeError(
+                "OPT bonus slot ids were read after the buffer was cleared"
+            )
         pieces.append(loc.detach().reshape(-1))
     if not pieces:
         return []
@@ -2672,23 +2611,6 @@ def _read_bonus_slot_ids(locs: Sequence[torch.Tensor]) -> List[List[int]]:
         rows.append(values[start : start + width])
         start += width
     return rows
-
-
-def _abort_bonus_slots(scheduler, runner, loc, tree_end: int, width: int) -> None:
-    """Sync one failed group's ids, clear the map, and free those slots."""
-    slots = _read_bonus_slot_ids([loc])[0]
-    _clear_req_to_token_span(scheduler, runner.req, tree_end, tree_end + width)
-    runner.req.kv_allocated_len = tree_end
-    _free_bonus_ids(scheduler, slots)
-
-
-def _free_open_bonus_groups(scheduler, runner, groups: Sequence[_BonusLaunch]) -> None:
-    for group in groups:
-        if group.loc is None:
-            continue
-        loc = group.loc
-        group.loc = None
-        _abort_bonus_slots(scheduler, runner, loc, group.tree_end, group.width)
 
 
 def _bonus_model_runner(scheduler):
@@ -2757,36 +2679,14 @@ def _fill_bonus_schedule_batch(
     return batch
 
 
-def _bonus_fallback_logits(
-    scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int
-):
-    batch = _verify_batch_many(
-        scheduler,
-        [runner],
-        [tokens],
-        positions,
-        mask.reshape(-1),
-        loc.reshape(-1),
-        [tree_end],
-        is_bonus=True,
-    )
-    _bind_bonus_cascade(batch, runner, mask, loc, tree_end, width)
-    return _as_layer_rows(_run_batch(scheduler, batch), 1, width)[0]
-
-
 def _bonus_template_forward(scheduler, batch, template, delta, width: int):
-    """Replay the N+1 bonus graph. A false ``can_run_graph`` already ran eager.
+    """Forward once with the width-specific template; false graph means eager.
 
     Do not call ``run_batch`` after that forward: the slots were just written.
     """
     forward_batch = _refresh_lookahead_forward(template, batch, delta)
     out = scheduler.model_worker.model_runner.forward(forward_batch)
-    if getattr(out, "can_run_graph", True) is False:
-        _opt_draft_count(scheduler, "opt_bonus_eager_groups")
-    logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
-    if logits is None:
-        raise RuntimeError("OPT bonus forward returned no logits")
-    return _as_layer_rows(logits, 1, width)[0]
+    return _bonus_result(out, 1, width)
 
 
 def _bonus_batch_hit(scheduler, req):
@@ -2800,26 +2700,21 @@ def _bonus_batch_hit(scheduler, req):
     return hit
 
 
-def _load_bonus_admit(scheduler, req):
-    """Return a cached bonus template, or None when this pool has none."""
+def _load_bonus_admit(scheduler, req, width: int):
+    """Templates are specific to both the request pool and query width."""
     hit = _bonus_batch_hit(scheduler, req)
     if hit is None:
         return None
-    template = hit.get("bonus_template")
-    if template is None:
-        return None
-    return template, hit.get("bonus_delta")
+    return hit.get("bonus_templates", {}).get(int(width))
 
 
-def _store_bonus_admit(scheduler, req, template, delta) -> None:
-    """Keep a successful admission. A miss is not stored."""
+def _store_bonus_admit(scheduler, req, width: int, template, delta) -> None:
+    """Keep a successful width-specific admission. A miss is not stored."""
     if template is None:
         return
     hit = _bonus_batch_hit(scheduler, req)
-    if hit is None:
-        return
-    hit["bonus_template"] = template
-    hit["bonus_delta"] = delta
+    if hit is not None:
+        hit.setdefault("bonus_templates", {})[int(width)] = (template, delta)
 
 
 def _load_layer_admit(scheduler, req):
@@ -2844,23 +2739,59 @@ def _store_layer_admit(scheduler, req, template, delta) -> None:
     hit["layer_delta"] = delta
 
 
-def _bonus_group_logits(
-    scheduler, runner, tokens, positions, mask, loc, tree_end: int, width: int, admit: _BonusAdmit
-):
-    """One group. Reuse the cached N+1 template, or admit it once.
+def _bonus_result(result, count: int, width: int):
+    """Normalize worker and scheduler results without guessing graph success."""
+    flag = getattr(result, "can_run_cuda_graph", None)
+    if flag is None:
+        flag = getattr(result, "can_run_graph", None)
+    path = "unknown" if flag is None else ("graph" if flag else "eager")
+    logits = getattr(getattr(result, "logits_output", None), "next_token_logits", None)
+    if logits is None:
+        raise RuntimeError("ClearTree bonus forward returned no logits")
+    return _as_layer_rows(logits, count, width), path
 
-    ``_fill_bonus_schedule_batch`` refreshes the lookahead batch first, so a
-    pool change has already dropped the previous template. Later groups in
-    this round only copy lengths, the mask, and positions onto that template.
-    """
-    model_runner = _bonus_model_runner(scheduler)
-    if model_runner is not None and (not admit.tried or admit.template is not None):
-        batch = _fill_bonus_schedule_batch(
-            scheduler, runner, tokens, positions, mask, loc, tree_end, width
+
+class _BonusBatch:
+    """Ordinary request-major verify, always on the dedicated bonus key."""
+
+    def __call__(self, scheduler, entries, width, tokens, positions, mask, loc, ends):
+        batch = _verify_batch_many(
+            scheduler,
+            [job.runner for job, _chunk in entries],
+            list(tokens),
+            positions,
+            mask,
+            loc,
+            ends,
+            is_bonus=True,
         )
+        if len(entries) == 1:
+            _bind_bonus_cascade(batch, entries[0][0].runner, mask, loc, ends[0], width)
+        _selected, graph_expected = _bonus_width(scheduler, len(entries), width)
+        batch.spec_info.bonus_eager = not graph_expected
+        scheduler.cur_batch = batch
+        _opt_draft_count(scheduler, "opt_bonus_forwards")
+        _opt_draft_count(scheduler, f"opt_bonus_width_{width}")
+        return _bonus_result(scheduler.run_batch(batch), len(entries), width)
+
+
+class _BonusSingle:
+    """Cascade singleton with admission isolated by request and query width."""
+
+    def __init__(self):
+        self.admissions = {}
+
+    def __call__(self, scheduler, entries, width, tokens, positions, mask, loc, ends):
+        runner = entries[0][0].runner
+        batch = _fill_bonus_schedule_batch(
+            scheduler, runner, tokens, positions, mask, loc, ends[0], width
+        )
+        batch.spec_info.bonus_eager = not _bonus_width(scheduler, 1, width)[1]
+        key = (runner.req.rid, int(runner.req.req_pool_idx), int(width))
+        admit = self.admissions.setdefault(key, _BonusAdmit())
         if not admit.tried:
             admit.tried = True
-            cached = _load_bonus_admit(scheduler, runner.req)
+            cached = _load_bonus_admit(scheduler, runner.req, width)
             if cached is not None:
                 admit.template, admit.delta = cached
             else:
@@ -2871,129 +2802,30 @@ def _bonus_group_logits(
                     else None
                 )
                 _store_bonus_admit(
-                    scheduler, runner.req, admit.template, admit.delta
+                    scheduler, runner.req, width, admit.template, admit.delta
                 )
-        if admit.template is not None:
-            return _bonus_template_forward(
-                scheduler, batch, admit.template, admit.delta, width
+        if admit.template is None:
+            # Admission has not submitted a forward. This is the only fallback.
+            return _BonusBatch()(
+                scheduler, entries, width, tokens, positions, mask, loc, ends
             )
-    _opt_draft_count(scheduler, "opt_bonus_template_fallbacks")
-    return _bonus_fallback_logits(
-        scheduler, runner, tokens, positions, mask, loc, tree_end, width
-    )
-
-
-def _launch_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int, admit: _BonusAdmit):
-    """Forward one group and leave its slot ids on device."""
-    width = len(chunk)
-    device = scheduler.req_to_token_pool.device
-    chains = [plan.chain for plan in chunk]
-    mask = bonus_attention_mask(prefix, tree_end, chains, device=device)
-    positions = _bonus_long_tensor([plan.position for plan in chunk], device)
-    tokens = _bonus_long_tensor([plan.token for plan in chunk], device)
-    loc = _alloc_bonus_slots(scheduler, runner, width, tree_end)
-    runner.req.kv_allocated_len = tree_end + width
-    try:
-        logits = _bonus_group_logits(
-            scheduler, runner, tokens, positions, mask, loc, tree_end, width, admit
+        scheduler.cur_batch = batch
+        _opt_draft_count(scheduler, "opt_bonus_forwards")
+        _opt_draft_count(scheduler, f"opt_bonus_width_{width}")
+        return _bonus_template_forward(
+            scheduler, batch, admit.template, admit.delta, width
         )
-        # The next replay overwrites this graph output buffer.
-        logits = logits.detach().clone()
-    except Exception as exc:
-        _reraise_device_context(scheduler, exc)
-        _abort_bonus_slots(scheduler, runner, loc, tree_end, width)
-        raise
-    _clear_req_to_token_span(scheduler, runner.req, tree_end, tree_end + width)
-    runner.req.kv_allocated_len = tree_end
-    return _BonusLaunch(
-        loc=loc,
-        logits=logits,
-        chunk=list(chunk),
-        tree_end=int(tree_end),
-        width=int(width),
-    )
 
 
-def _materialize_bonus_guesses(scheduler, group: _BonusLaunch, slots: Sequence[int]):
-    """Turn host slot ids into guesses and free the padded ones."""
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import OptBonusGuess
-
-    if len(slots) != len(group.chunk):
-        raise RuntimeError(
-            f"OPT bonus returned {len(slots)} slots for {len(group.chunk)} queries"
+def _bonus_executor(entries, single):
+    if len(entries) == 1:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
+            _attention_for,
         )
-    guesses = []
-    dummy_slots = []
-    for index, plan in enumerate(group.chunk):
-        if not plan.keep:
-            dummy_slots.append(int(slots[index]))
-            continue
-        guesses.append(
-            OptBonusGuess(
-                parent=int(plan.parent),
-                token=int(plan.token),
-                slot=int(slots[index]),
-                logits=group.logits[index].detach().clone(),
-                end_rank=int(plan.end_rank),
-            )
-        )
-    try:
-        _free_bonus_ids(scheduler, dummy_slots)
-    except Exception:
-        _free_bonus_ids(scheduler, [guess.slot for guess in guesses])
-        raise
-    return guesses
 
-
-def _forward_one_bonus_group(scheduler, runner, chunk, tree_end: int, prefix: int):
-    """Forward one bonus group. Return guesses and free the padded slots."""
-    group = _launch_bonus_group(scheduler, runner, chunk, tree_end, prefix, _BonusAdmit())
-    slots = _read_bonus_slot_ids([group.loc])[0]
-    group.loc = None
-    return _materialize_bonus_guesses(scheduler, group, slots)
-
-
-def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate]) -> None:
-    """Write guess KV past the tree, then detach those columns from the map.
-
-    One forward has ``N + 1`` queries: the root guess plus one per verify
-    node. That matches the bonus CUDA graph. A short tail still repeats the
-    last real candidate. Publish sees only the tree span. Real guess slots
-    stay allocated until the next step installs one or frees them.
-
-    Every group of this round shares one admission attempt. A successful
-    template stays on the lookahead batch until the pool index changes or
-    the request is dropped. Slot ids stay on device until the last group
-    returns, then one copy reads them all.
-    """
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
-        release_opt_bonus_guesses,
-    )
-
-    plan = getattr(scheduler, "_clear_round_plan", None)
-    width = int(plan.width) + 1 if plan is not None else 9
-    tree_end = int(runner.cached_len)
-    prefix = int(runner.prefix_len)
-    launched: List[_BonusLaunch] = []
-    kept = []
-    admit = _BonusAdmit()
-    try:
-        for chunk in bonus_verify_chunks(plans, width):
-            launched.append(
-                _launch_bonus_group(scheduler, runner, chunk, tree_end, prefix, admit)
-            )
-        id_rows = _read_bonus_slot_ids([group.loc for group in launched])
-        for group, slots in zip(launched, id_rows):
-            group.loc = None
-            kept.extend(_materialize_bonus_guesses(scheduler, group, slots))
-    except Exception as exc:
-        _reraise_device_context(scheduler, exc)
-        _free_open_bonus_groups(scheduler, runner, launched)
-        if not getattr(scheduler, "_sr_device_poisoned", False):
-            release_opt_bonus_guesses(scheduler, runner.req, kept)
-        raise
-    release_opt_bonus_guesses(scheduler, runner.req)
-    runner.req.opt_bonus_guesses = kept
+        if _attention_for(entries[0][0].runner) is not None:
+            return single
+    return _BonusBatch()
 
 
 def _bonus_job_ready(scheduler, job) -> bool:
@@ -3004,52 +2836,46 @@ def _bonus_job_ready(scheduler, job) -> bool:
         and not getattr(scheduler, "_sr_device_poisoned", False)
         and not _request_finished(scheduler, job.req)
         and not getattr(runner, "lookahead_dropped", False)
+        and not getattr(runner, "lookahead_inflight", False)
+        and job.state is not None
         and hasattr(runner, "_alloc_layer_slots")
         and int(runner.cached_len)
         == int(runner.prefix_len) + int(job.state.depth) * int(job.state.config.width)
     )
 
 
-def _bonus_batch_width(scheduler, count: int, candidates: int) -> Optional[int]:
-    """Select an existing layer key, not merely a configured query width.
+def _bonus_width(scheduler, bs: int, need: int) -> Tuple[int, bool]:
+    """Prefer an exact-batch dedicated key; otherwise one exact-width eager.
 
-    Ordinary padded CUDA admission does not check the final replay key. Keep
-    that check here so an absent key cannot fail after KV has been written.
-    CPU/NPU and explicitly disabled graphs use the same layout eagerly.
+    Shared can_run checks bonus extra keys before batch padding. In particular,
+    an r9_4_s0 graph does not admit a three-request forward.
     """
-    from bisect import bisect_left
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import BONUS_NTPBS
 
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import LAYER_WIDTHS
-
-    widths = sorted(int(w) for w in LAYER_WIDTHS)
     device = torch.device(scheduler.req_to_token_pool.device)
-    model = _bonus_model_runner(scheduler)
-    graph = getattr(model, "graph_runner", None)
-    if device.type == "cuda" and graph is not None:
-        # ClearTree Draft currently runs TP1. Do not guess a DP/TP gather key.
-        if getattr(graph, "require_mlp_tp_gather", False):
-            return None
-        capture_bs = list(graph.capture_bs)
-        index = bisect_left(capture_bs, count)
-        if index == len(capture_bs):
-            return None
-        padded = capture_bs[index]
+    graph = getattr(_bonus_model_runner(scheduler), "graph_runner", None)
+    if (
+        device.type == "cuda"
+        and graph is not None
+        and bs in graph.capture_bs
+        and not getattr(graph, "require_mlp_tp_gather", False)
+        and not getattr(graph, "require_attn_tp_gather", False)
+        and not getattr(graph, "require_gathered_buffer", False)
+    ):
         stream = None
         if getattr(graph, "enable_pdmux", False):
             from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
 
             stream = get_current_stream_idx()
-        if not (getattr(graph, "disable_padding", False) and count != padded):
-            widths = [
-                w
-                for w in widths
-                if graph._make_graph_key(padded, stream, w) in graph.graphs
-            ]
-        # With padding disabled, a missing exact BS is explicitly rejected by
-        # can_run(), and scheduler.run_batch safely executes eager instead.
-    if not widths:
-        return None
-    return next((w for w in widths if w >= candidates), widths[-1])
+        widths = [
+            w
+            for w in sorted(int(w) for w in BONUS_NTPBS)
+            if graph._make_graph_key(bs, stream, w, extra=OPT_BONUS_GRAPH_EXTRA)
+            in graph.graphs
+        ]
+        if widths:
+            return next((w for w in widths if w >= need), widths[-1]), True
+    return int(need), False
 
 
 @dataclass
@@ -3115,12 +2941,11 @@ def _cleanup_bonus_batch(scheduler, owner) -> None:
         raise
 
 
-def _launch_bonus_batch(scheduler, entries, width: int) -> None:
-    """One request-major TARGET_VERIFY; bonus never evicts or grows tree KV."""
+def _run_bonus_group(scheduler, entries, width: int, executor=None) -> bool:
+    """One transactional bonus allocation; real guesses append across groups."""
     from sglang.srt.mem_cache.common import alloc_token_slots
     from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
         OptBonusGuess,
-        release_opt_bonus_guesses,
     )
     from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -3134,8 +2959,9 @@ def _launch_bonus_batch(scheduler, entries, width: int) -> None:
         or any(row < 0 or row >= pool.shape[0] for row in rows)
         or any(end < 0 or end + width > pool.shape[1] for end in ends)
     ):
-        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_map")
-        return
+        _opt_draft_count(scheduler, "opt_bonus_skipped_map")
+        _opt_draft_count(scheduler, "opt_bonus_skipped", count)
+        return False
     allocator = scheduler.tree_cache.token_to_kv_pool_allocator
     # SWA alloc() can remove slots from one sub-pool and then fail before the
     # caller receives them. Bonus is optional, so skip rather than risk a leak.
@@ -3143,12 +2969,14 @@ def _launch_bonus_batch(scheduler, entries, width: int) -> None:
     if hasattr(allocator, "full_attn_allocator") and hasattr(
         allocator, "swa_attn_allocator"
     ):
-        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_allocator")
-        return
+        _opt_draft_count(scheduler, "opt_bonus_skipped_allocator")
+        _opt_draft_count(scheduler, "opt_bonus_skipped", count)
+        return False
     # Do not include evictable_size: bonus must not evict useful prefix KV.
     if int(allocator.available_size()) < count * width:
-        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_kv")
-        return
+        _opt_draft_count(scheduler, "opt_bonus_skipped_kv")
+        _opt_draft_count(scheduler, "opt_bonus_skipped", count)
+        return False
     owner = _BonusBatchOwner(entries, width)
     try:
         owner.loc = alloc_token_slots(scheduler.tree_cache, count * width)
@@ -3182,30 +3010,12 @@ def _launch_bonus_batch(scheduler, entries, width: int) -> None:
             for (job, chunk), end in zip(entries, ends)
         ]
         mask = _copy_bonus_host(torch.cat(masks), device)
-        batch = _verify_batch_many(
-            scheduler,
-            [job.runner for job, _chunk in entries],
-            list(tokens),
-            positions,
-            mask,
-            owner.loc,
-            ends,
-            is_bonus=False,
+        if executor is None:
+            executor = _bonus_executor(entries, _BonusSingle())
+        logits, path = executor(
+            scheduler, entries, width, tokens, positions, mask, owner.loc, ends
         )
-        scheduler.cur_batch = batch
-        _opt_draft_count(scheduler, "opt_bonus_batch_forwards")
-        result = scheduler.run_batch(batch)
-        flag = getattr(result, "can_run_cuda_graph", None)
-        if flag is None:
-            flag = getattr(result, "can_run_graph", None)
-        path = "unknown" if flag is None else ("graph" if flag else "eager")
-        _opt_draft_count(scheduler, "opt_bonus_batch_" + path)
-        logits = getattr(
-            getattr(result, "logits_output", None), "next_token_logits", None
-        )
-        if logits is None:
-            raise RuntimeError("ClearTree bonus batch returned no logits")
-        logits = _as_layer_rows(logits, count, width)
+        _opt_draft_count(scheduler, "opt_bonus_" + path)
         slot_rows = _read_bonus_slot_ids(list(owner.loc.reshape(count, width)))
         owner.complete = True
         _clear_bonus_batch_map(scheduler, owner)
@@ -3231,26 +3041,25 @@ def _launch_bonus_batch(scheduler, entries, width: int) -> None:
         # Build everything (including indexed device tensors) before any free.
         real_loc = owner.loc[real_indices]
         dummy_loc = owner.loc[dummy_indices]
-        for job, _chunk in entries:
-            # release_opt_bonus_guesses clears the request field before free.
-            # Retain the old guesses if that submission has unknown outcome.
-            owner.previous_guesses = getattr(job.req, "opt_bonus_guesses", None)
-            owner.release_unknown = True
-            release_opt_bonus_guesses(scheduler, job.req)
-            owner.release_unknown = False
-            owner.previous_guesses = None
+        # Allocate merged Python lists before freeing anything. No fallible
+        # tensor work may happen between padding free and ownership transfer.
+        merged = [
+            list(getattr(job.req, "opt_bonus_guesses", None) or []) + kept
+            for (job, _chunk), kept in zip(entries, guesses)
+        ]
         if dummy_indices:
             owner.release_unknown = True
             scheduler.token_to_kv_pool_allocator.free(dummy_loc)
             owner.release_unknown = False
         owner.owned = real_loc
         # No further fallible device operations before ownership transfer.
-        for (job, _chunk), kept in zip(entries, guesses):
+        for (job, _chunk), kept in zip(entries, merged):
             job.req.opt_bonus_guesses = kept
         owner.owned = None
-        _opt_draft_count(scheduler, "opt_bonus_batch_requests", count)
-        _opt_draft_count(scheduler, "opt_bonus_batch_query_rows", count * width)
-        _opt_draft_count(scheduler, "opt_bonus_batch_padding_rows", len(dummy_indices))
+        _opt_draft_count(scheduler, "opt_bonus_requests", count)
+        _opt_draft_count(scheduler, "opt_bonus_query_rows", count * width)
+        _opt_draft_count(scheduler, "opt_bonus_padding_rows", len(dummy_indices))
+        return True
     except Exception as exc:
         try:
             _reraise_device_context(scheduler, exc)
@@ -3259,8 +3068,27 @@ def _launch_bonus_batch(scheduler, entries, width: int) -> None:
         raise
 
 
+def _release_previous_bonus(scheduler, selected) -> None:
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
+        release_opt_bonus_guesses,
+    )
+
+    for job, _plans in selected:
+        previous = getattr(job.req, "opt_bonus_guesses", None)
+        try:
+            release_opt_bonus_guesses(scheduler, job.req)
+        except Exception:
+            # release clears the field before submitting free. Preserve the
+            # detached guesses if the allocator may have released only a part.
+            owner = _BonusBatchOwner([(job, [])], 0, previous_guesses=previous)
+            owner.release_unknown = True
+            _quarantine_bonus_batch(scheduler, owner)
+            raise
+
+
 def maybe_attach_bonus_guesses_many(scheduler, jobs) -> None:
-    """Replace serial multi-request bonus with one optional batch forward."""
+    """Predict all eligible requests, including settled lookahead, group by group."""
+    jobs = list(jobs)
     try:
         if not bonus_prediction_enabled():
             return
@@ -3268,82 +3096,58 @@ def maybe_attach_bonus_guesses_many(scheduler, jobs) -> None:
         for job in jobs:
             if not _bonus_job_ready(scheduler, job):
                 _opt_draft_count(scheduler, "opt_bonus_skipped")
-                continue
-            if getattr(job.runner, "_lookahead_satisfied", False):
-                maybe_attach_bonus_guesses(scheduler, job)
+                _opt_draft_count(scheduler, "opt_bonus_skipped_unready")
                 continue
             plans = select_bonus_candidates(job.state, job.window, job.runner)
             if plans:
-                selected.append((job, plans))
+                selected.append((job, sorted(plans, key=lambda p: p.end_rank)))
             else:
                 _opt_draft_count(scheduler, "opt_bonus_skipped")
-        if len(selected) == 1:
-            maybe_attach_bonus_guesses(scheduler, selected[0][0], plans=selected[0][1])
-            return
+                _opt_draft_count(scheduler, "opt_bonus_skipped_empty")
         if not selected:
             return
-        width = _bonus_batch_width(
-            scheduler, len(selected), max(len(p) for _, p in selected)
-        )
-        if width is None:
-            _opt_draft_count(scheduler, "opt_bonus_batch_skipped_graph")
+        # Validate before releasing old guesses or writing any temporary map.
+        rows = [int(job.req.req_pool_idx) for job, _plans in selected]
+        if len(rows) != len(set(rows)):
+            _opt_draft_count(scheduler, "opt_bonus_skipped_map")
+            _opt_draft_count(scheduler, "opt_bonus_skipped", len(selected))
             return
-        entries = []
-        for job, plans in selected:
-            if len(plans) > width:
-                keep = {id(p) for p in sorted(plans, key=lambda p: p.end_rank)[:width]}
-                _opt_draft_count(
-                    scheduler, "opt_bonus_batch_truncated", len(plans) - width
-                )
-                plans = [p for p in plans if id(p) in keep]
-            entries.append((job, bonus_verify_chunks(plans, width)[0]))
-        _opt_draft_count(scheduler, "opt_bonus_rounds", len(entries))
-        _launch_bonus_batch(scheduler, entries, width)
+        _release_previous_bonus(scheduler, selected)
+        _opt_draft_count(scheduler, "opt_bonus_rounds", len(selected))
+        single = _BonusSingle()
+        split = set()
+        while selected:
+            width, _expected = _bonus_width(
+                scheduler, len(selected), max(len(plans) for _, plans in selected)
+            )
+            entries = []
+            remaining = []
+            for job, plans in selected:
+                entries.append((job, bonus_verify_chunks(plans[:width], width)[0]))
+                if len(plans) > width:
+                    if id(job) not in split:
+                        split.add(id(job))
+                        _opt_draft_count(scheduler, "opt_bonus_groups_split")
+                    remaining.append((job, plans[width:]))
+            if not _run_bonus_group(
+                scheduler, entries, width, _bonus_executor(entries, single)
+            ):
+                break
+            selected = remaining
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
         if getattr(scheduler, "_sr_device_poisoned", False):
             raise
-        _opt_draft_count(scheduler, "opt_bonus_batch_failed")
-        logger.warning("[ClearTree] bonus batch failed: %s", exc)
+        _opt_draft_count(scheduler, "opt_bonus_failed")
+        logger.warning("[ClearTree] bonus group failed: %s", exc)
     finally:
         for job in jobs:
             _drop_stored_logits(job.runner)
 
 
-def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree, *, plans=None) -> None:
-    """Predict bonus tokens while the tree KV is still mapped.
-
-    Disabled by default. Page size other than 1 never writes these slots.
-    Stored ids are dropped even when prediction is disabled or skipped.
-    """
-    runner = job.runner
-    try:
-        if not bonus_prediction_enabled():
-            return
-        if runner is None or _opt_page_size(scheduler) != 1:
-            _opt_draft_count(scheduler, "opt_bonus_skipped")
-            return
-        if getattr(scheduler, "_sr_device_poisoned", False) or _request_finished(
-            scheduler, job.req
-        ):
-            _opt_draft_count(scheduler, "opt_bonus_skipped")
-            return
-        if not hasattr(runner, "_alloc_layer_slots"):
-            _opt_draft_count(scheduler, "opt_bonus_skipped")
-            return
-        if plans is None:
-            plans = select_bonus_candidates(job.state, job.window, runner)
-        if not plans:
-            _opt_draft_count(scheduler, "opt_bonus_skipped")
-            return
-        _opt_draft_count(scheduler, "opt_bonus_rounds")
-        try:
-            _forward_bonus_candidates(scheduler, runner, plans)
-        except Exception as exc:
-            _reraise_device_context(scheduler, exc)
-            logger.warning("[OPT] bonus guess forward failed: %s", exc)
-    finally:
-        _drop_stored_logits(runner)
+def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree) -> None:
+    """Compatibility entry point; singleton uses the same ownership path."""
+    maybe_attach_bonus_guesses_many(scheduler, [job])
 
 
 def final_layer_step(state) -> ClearTreeStep:
@@ -3363,12 +3167,7 @@ def _clear_req_to_token_span(scheduler, req, start: int, end: int) -> None:
         return
     start = int(start)
     end = min(int(end), int(pool.shape[1]))
-    if (
-        start < 0
-        or end <= start
-        or int(row) < 0
-        or int(row) >= int(pool.shape[0])
-    ):
+    if start < 0 or end <= start or int(row) < 0 or int(row) >= int(pool.shape[0]):
         return
     pool[int(row), start:end] = -1
 
@@ -3478,7 +3277,9 @@ class _PinnedBonus:
 
     def __init__(self, width: int):
         n = int(width)
-        self.ids = torch.empty(n, n + 1, dtype=torch.long, device="cpu", pin_memory=True)
+        self.ids = torch.empty(
+            n, n + 1, dtype=torch.long, device="cpu", pin_memory=True
+        )
         self.event = torch.cuda.Event()
         self.ready = False
 
@@ -3537,12 +3338,20 @@ def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
 
     ``depth_rule`` stops once ``depth`` reaches ``max_depth - 1``. Lookahead
     forwards that last layer before the host decides to stop, so the tree
-    takes ``(max_depth - 1) * n`` slots. When prediction is enabled, its bonus
-    group allocates another ``n + 1``. Admission precedes ingest allocation.
+    takes ``(max_depth - 1) * n`` slots. Before K is known, reserve the
+    largest configured candidate set. Narrow singleton graphs may need one
+    padded tail while earlier real guesses remain allocated. This is an
+    admission estimate, not a reservation; every group rechecks free space.
     """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import BONUS_NTPBS
+
     n = _round_width(scheduler)
     depth = int(scheduler.server_args.clear_tree_max_depth)
-    bonus_slots = n + 1 if bonus_prediction_enabled() else 0
+    bonus_slots = 0
+    if bonus_prediction_enabled():
+        maximum = max(BONUS_NTPBS)
+        width, _expected = _bonus_width(scheduler, 1, maximum)
+        bonus_slots = ((maximum + width - 1) // width) * width
     return int(ingest_slots) + (depth - 1) * n + bonus_slots
 
 
@@ -3661,36 +3470,6 @@ def _refresh_lookahead_forward(template, batch, delta):
     return fb
 
 
-def _bonus_len_cache(scheduler, device):
-    """Length-1 seq and pool-index buffers for bonus slot assignment.
-
-    Stored on the scheduler next to the width cache and keyed by device.
-    A new ``OptLayerForward`` each step still reuses the same pair.
-    """
-    cache = getattr(scheduler, "_opt_la_cache", None)
-    if cache is None:
-        cache = {}
-        scheduler._opt_la_cache = cache
-    by_device = cache.get("_bonus_len")
-    if not isinstance(by_device, dict):
-        by_device = {}
-        cache["_bonus_len"] = by_device
-    key = device if isinstance(device, torch.device) else torch.device(device)
-    hit = by_device.get(key)
-    if (
-        hit is None
-        or not torch.is_tensor(hit.get("seq"))
-        or not torch.is_tensor(hit.get("pool"))
-    ):
-        hit = {
-            "seq": torch.empty(1, dtype=torch.int64, device=key),
-            "pool": torch.empty(1, dtype=torch.int64, device=key),
-            "pool_idx": None,
-        }
-        by_device[key] = hit
-    return hit
-
-
 def _lookahead_width_cache(scheduler, width: int, device):
     """Pinned slots, events, and device scratch for one tree width.
 
@@ -3731,11 +3510,7 @@ def _lookahead_batch(scheduler, req):
     rid = getattr(req, "rid", None)
     pool = getattr(req, "req_pool_idx", None)
     hit = batches.get(rid)
-    if (
-        hit is not None
-        and hit["pool_idx"] == pool
-        and hit["batch"] is not None
-    ):
+    if hit is not None and hit["pool_idx"] == pool and hit["batch"] is not None:
         batch = hit["batch"]
         if not batch.reqs or batch.reqs[0] is not req:
             batch.reqs[0] = req
@@ -3885,9 +3660,7 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     runner._la_seq.fill_(int(runner.cached_len))
     runner._la_seq_cpu.fill_(int(runner.cached_len))
     runner._la_orig.fill_(int(runner.cached_len))
-    mask = torch.ones(
-        n * (int(runner.prefix_len) + n), dtype=torch.bool, device=device
-    )
+    mask = torch.ones(n * (int(runner.prefix_len) + n), dtype=torch.bool, device=device)
     batch.forward_mode = ForwardMode.TARGET_VERIFY
     batch.global_forward_mode = ForwardMode.TARGET_VERIFY
     batch.input_ids = runner._la_dummy_tokens
@@ -3962,9 +3735,7 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
                 if predict_bonus:
                     runner.bonus_ids.append(cpu_ids[0, : n + 1].contiguous())
             else:
-                mirror_layer(
-                    state, cpu_scores, cpu_tokens, _cpu_parents, seed=False
-                )
+                mirror_layer(state, cpu_scores, cpu_tokens, _cpu_parents, seed=False)
                 if predict_bonus:
                     runner.bonus_ids.append(cpu_ids.contiguous())
             step = step_after_layer(state)
@@ -4013,7 +3784,8 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
         poisoned
         or _request_finished(scheduler, job.req)
         or _opt_page_size(scheduler) != 1
-        or int(runner.cached_len) != int(runner.prefix_len) + int(job.state.depth) * int(job.state.config.width)
+        or int(runner.cached_len)
+        != int(runner.prefix_len) + int(job.state.depth) * int(job.state.config.width)
     )
     if poisoned:
         runner.lookahead_dropped = True
@@ -4073,6 +3845,14 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
                     raise
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
+        # A failed bonus-copy event is not proof that the queued final
+        # layer completed. Confirm completion before publishing tree slots.
+        if bonus is not None and not getattr(scheduler, "_sr_device_poisoned", False):
+            try:
+                torch.get_device_module(scheduler.device).synchronize()
+            except Exception:
+                scheduler._sr_device_poisoned = True
+                scheduler._sr_clear_stamps_after_poison()
         bonus_failed = True
         logger.warning(
             "[OPT] lookahead settle failed for %s: %s",
@@ -4143,9 +3923,7 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
                 _reraise_device_context(scheduler, exc)
                 logger.warning("[OPT] deferred final layer failed: %s", exc)
             else:
-                _opt_draft_count(
-                    scheduler, "opt_layer_forwards_deferred", n_forwards
-                )
+                _opt_draft_count(scheduler, "opt_layer_forwards_deferred", n_forwards)
         skipped_ids = {id(job) for job in skipped}
         for job in skipped:
             _drop_stored_logits(job.runner)
@@ -4275,6 +4053,8 @@ def _publish_or_rollback(scheduler, req, runner, keep, window, expanded: bool) -
                 getattr(req, "rid", None),
                 exc,
             )
+        if not published and _opt_page_size(scheduler) == 1:
+            _opt_draft_count(scheduler, "opt_lease_publish_failed")
     if published or getattr(scheduler, "_sr_device_poisoned", False):
         return
     release_opt_bonus_guesses(scheduler, req)
@@ -4298,7 +4078,6 @@ def grow_batch(scheduler, reqs):
     from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
         consume_clear_tree_lease,
     )
-
     from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
         get_sr_round_metrics,
     )

@@ -111,9 +111,7 @@ class PrefixPlan:
 
     def __init__(self, indices: torch.Tensor, prefix_len: int):
         if indices.dim() != 1:
-            raise ValueError(
-                f"prefix indices must be 1-D, got {tuple(indices.shape)}"
-            )
+            raise ValueError(f"prefix indices must be 1-D, got {tuple(indices.shape)}")
         prefix_len = int(prefix_len)
         if int(indices.shape[0]) != prefix_len:
             raise ValueError(
@@ -139,9 +137,7 @@ def tree_kv_indices(req_to_token, pool_idx, prefix_len, cached_len, out_cache_lo
     prefix_len = int(prefix_len)
     cached_len = int(cached_len)
     if cached_len < prefix_len:
-        raise ValueError(
-            f"cached_len {cached_len} is before prefix_len {prefix_len}"
-        )
+        raise ValueError(f"cached_len {cached_len} is before prefix_len {prefix_len}")
     current = out_cache_loc.reshape(-1).to(dtype=torch.int64)
     if cached_len == prefix_len:
         return current.contiguous()
@@ -295,27 +291,38 @@ class _Workspace:
         )
 
 
-def tree_limit(backend) -> int:
-    """Tree columns the cascade workspace must hold.
+def _query_capacities(backend) -> tuple:
+    """Widest layer and enabled bonus, installed before the first capture."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
+        bonus_prediction_enabled,
+    )
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        BONUS_NTPBS,
+        LAYER_WIDTHS,
+    )
 
-    A full draft is ``(max_depth - 1) * N`` slots, and the bonus group adds
-    ``N + 1``. That is ``speculative_num_steps * num_draft_tokens + 1``.
-    Without a step count, the cap is one layer plus the bonus column, not
-    the context length.
+    width = max(int(getattr(backend, "num_draft_tokens", 0) or 0), max(LAYER_WIDTHS))
+    bonus = max(BONUS_NTPBS) if bonus_prediction_enabled() else 0
+    return width, bonus
+
+
+def tree_limit(backend) -> int:
+    """Hold ``(max_depth - 1) * max W`` plus the enabled ``max K + 1`` bonus.
+
+    Without a usable step count, reserve one layer. A disabled bonus does
+    not enlarge either the tree columns or the query workspace.
     """
-    width = int(getattr(backend, "num_draft_tokens", 0) or 0)
+    width, bonus = _query_capacities(backend)
     steps = int(getattr(backend, "speculative_num_steps", 0) or 0)
-    if steps >= 1 and width >= 1:
-        return steps * width + 1
-    return width + 1
+    return max(steps - 1, 1) * width + bonus
 
 
 def ensure_workspace(backend, query_width: int) -> _Workspace:
     """Allocate the static buffers once. Later calls only reuse them."""
     global _WORKSPACE
     device = torch.device(backend.device)
-    draft = int(getattr(backend, "num_draft_tokens", 0) or 0)
-    max_q = max(int(query_width), draft + 1, 1)
+    width, bonus = _query_capacities(backend)
+    max_q = max(int(query_width), width, bonus, 1)
     heads = int(backend.num_head)
     dim = int(backend.v_head_dim)
     context = int(getattr(backend, "max_context_len", 1) or 1)
@@ -416,11 +423,15 @@ class ClearTreeAttention:
                 _captured_cascade.add((id(backend), int(self.capture_query_width)))
         else:
             ok = self._fill_runtime(backend)
-        if not ok and self.plan is not None and (
-            not self._spec_mask_complete
-            or (
-                batch is None
-                and _replay_uses_captured_cascade(backend, self._tree_mask)
+        if (
+            not ok
+            and self.plan is not None
+            and (
+                not self._spec_mask_complete
+                or (
+                    batch is None
+                    and _replay_uses_captured_cascade(backend, self._tree_mask)
+                )
             )
         ):
             raise RuntimeError("OPT cascade prepare failed without a usable fallback")
@@ -671,9 +682,7 @@ def run_cascade_attention(
     )
     kv_indptr = torch.arange(queries + 1, dtype=torch.int32, device=device)
     kv_indptr.mul_(synthetic_kv_len(splits))
-    num_kv_splits = torch.full(
-        (queries,), splits + 1, dtype=torch.int32, device=device
-    )
+    num_kv_splits = torch.full((queries,), splits + 1, dtype=torch.int32, device=device)
     prefix_len_t = torch.tensor(prefix_len, dtype=torch.int32, device=device)
     prefix_splits_t = torch.tensor(splits, dtype=torch.int32, device=device)
     tree_cols_t = torch.tensor(cols, dtype=torch.int32, device=device)
@@ -864,7 +873,10 @@ if triton is not None:
         mask_d = offs_d < DIM
 
         q = tl.load(
-            Q + node[:, None] * stride_q_n + q_head[:, None] * stride_q_h + offs_d[None, :],
+            Q
+            + node[:, None] * stride_q_n
+            + q_head[:, None] * stride_q_h
+            + offs_d[None, :],
             mask=row_ok[:, None] & mask_d[None, :],
             other=0.0,
         )

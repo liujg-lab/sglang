@@ -76,7 +76,9 @@ def _normalize_tiers(values: Sequence[int], *, name: str) -> list:
     return found
 
 
-def install_candidates(widths: Optional[Sequence[int]], ks: Optional[Sequence[int]]) -> tuple:
+def install_candidates(
+    widths: Optional[Sequence[int]], ks: Optional[Sequence[int]]
+) -> tuple:
     """Install W and K candidates and the buffer capacities they require.
 
     ``None`` uses the default tier list. The returned lists are ascending.
@@ -92,7 +94,7 @@ def install_candidates(widths: Optional[Sequence[int]], ks: Optional[Sequence[in
     )
     LAYER_WIDTHS[:] = width_list
     CANDIDATE_WIDTHS[:] = width_list
-    BONUS_NTPBS[:] = [item + 1 for item in width_list]
+    BONUS_NTPBS[:] = [item + 1 for item in k_list]
     VERIFY_KS[:] = k_list
     DRAFT_CAPACITY = max(width_list)
     TARGET_CAPACITY = max(k_list) + 1
@@ -104,13 +106,21 @@ def capture_ntpb(role: Optional[str]) -> list:
     if role == "target":
         return sorted({int(k) + 1 for k in VERIFY_KS} | {1}, reverse=True)
     if role == "draft":
-        return sorted({int(width) for width in LAYER_WIDTHS} | {1}, reverse=True)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
+            bonus_prediction_enabled,
+        )
+
+        widths = {int(width) for width in LAYER_WIDTHS} | {1}
+        if bonus_prediction_enabled():
+            widths.update(int(width) for width in BONUS_NTPBS)
+        return sorted(widths, reverse=True)
     return [1]
 
 
 def bonus_ntpbs() -> tuple:
-    """Draft bonus graphs, widest first. Each is one wider than a layer width."""
+    """Draft bonus graphs, widest first. Each holds K verified tokens plus one."""
     return tuple(sorted((int(width) for width in BONUS_NTPBS), reverse=True))
+
 
 def batch_bucket(batch_size: int) -> int:
     """Replay state is shared inside 1, 2–4, and 5 or more."""
@@ -120,6 +130,7 @@ def batch_bucket(batch_size: int) -> int:
     if size <= 4:
         return 2
     return 5
+
 
 def persistent_width(batch_size: int) -> int:
     """Width served after a replay switch, or the flat table before one."""

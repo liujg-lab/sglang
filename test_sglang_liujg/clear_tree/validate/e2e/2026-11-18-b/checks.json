@@ -1,0 +1,2269 @@
+{
+  "schema_version": 4,
+  "status": "fail",
+  "runtime_status": "fail",
+  "global": {
+    "expected_trials": {
+      "status": "missing",
+      "detail": {
+        "expected": [
+          "c1-A1",
+          "c4-A1"
+        ],
+        "missing": [
+          "c4-A1"
+        ]
+      }
+    },
+    "trial_matrix": {
+      "status": "pass",
+      "detail": {
+        "unexpected": [],
+        "smoke": false,
+        "repeats": false,
+        "bonus_off": false
+      }
+    }
+  },
+  "trials": {
+    "c1-A1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft.log"
+      },
+      "client_log": {
+        "status": "missing",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/client.log"
+      },
+      "no_protocol_log_errors": {
+        "status": "missing",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "missing",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "missing",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "missing",
+        "detail": []
+      },
+      "no_other_log_errors": {
+        "status": "fail",
+        "detail": [
+          {
+            "role": "target",
+            "count": 1,
+            "examples": [
+              {
+                "line": 358,
+                "text": "sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64"
+              }
+            ]
+          },
+          {
+            "role": "draft",
+            "count": 1,
+            "examples": [
+              {
+                "line": 119,
+                "text": "[2026-11-18 07:31:07] SIGTERM received. signum=None frame=None. Draining requests and shutting down..."
+              }
+            ]
+          }
+        ]
+      },
+      "no_CLEAR_ledger": {
+        "status": "missing",
+        "detail": 0
+      },
+      "summary_consistency": {
+        "status": "missing",
+        "detail": {
+          "mismatches": [],
+          "missing": [
+            "manifest:n_total",
+            "manifest:n_ok",
+            "manifest:total_tokens",
+            "CSV:Total Items",
+            "CSV:Total Generated Tokens",
+            "client log:n_total",
+            "client log:n_ok",
+            "client log:total_tokens",
+            "manifest rate",
+            "CSV rate"
+          ]
+        }
+      },
+      "wall_clock": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "formal client elapsed wall; not sum of request durations or server startup"
+        }
+      },
+      "request_errors": {
+        "status": "missing",
+        "detail": 0
+      },
+      "token_coverage": {
+        "status": "missing",
+        "detail": {
+          "known": 0,
+          "successful": 0
+        }
+      },
+      "request_order": {
+        "status": "missing",
+        "detail": null
+      },
+      "fallback_zero": {
+        "status": "missing",
+        "detail": {
+          "known": 0,
+          "requests": 0
+        }
+      },
+      "ttft_ms_coverage": {
+        "status": "missing",
+        "detail": null
+      },
+      "client_e2e_ms_coverage": {
+        "status": "missing",
+        "detail": null
+      },
+      "acceptance_coverage": {
+        "status": "missing",
+        "detail": {
+          "paired": 0,
+          "successful": 0
+        }
+      },
+      "client_artifacts": {
+        "status": "missing",
+        "detail": {
+          "manifests": [],
+          "jsonls": [],
+          "csvs": [],
+          "fingerprints": []
+        }
+      },
+      "request_count": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "100/100 successful formal requests"
+        }
+      },
+      "concurrency": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "CSV max_concurrency == 1; not mean concurrency"
+        }
+      },
+      "config_concurrency": {
+        "status": "pass",
+        "detail": {
+          "value": 1.0,
+          "rule": "config concurrency == 1"
+        }
+      },
+      "config_max_items": {
+        "status": "pass",
+        "detail": {
+          "value": 100.0,
+          "rule": "config max_items == 100"
+        }
+      },
+      "max_new_tokens": {
+        "status": "pass",
+        "detail": {
+          "required": 1024,
+          "observed": [
+            1024.0,
+            1024
+          ]
+        }
+      },
+      "completion_budget": {
+        "status": "missing",
+        "detail": "1024 is an upper bound, not required generated length"
+      },
+      "flush_http_success": {
+        "status": "missing",
+        "detail": {}
+      },
+      "completed_client": {
+        "status": "missing",
+        "detail": {
+          "completed_client_evidence_valid": false,
+          "client_exit_code": null,
+          "completed_artifact": null,
+          "roles": {
+            "target": {
+              "identity_matches_owned_record": true,
+              "owned_SIGTERM_recorded": false,
+              "planned_stop_supported": false,
+              "file": {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target-stop.json",
+                "bytes": 380,
+                "sha256": "7526461611b89443961d91b7000c2bbc503989d3175e2e7ad68a35f01c7e8f2e"
+              }
+            },
+            "draft": {
+              "identity_matches_owned_record": true,
+              "owned_SIGTERM_recorded": true,
+              "planned_stop_supported": false,
+              "file": {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft-stop.json",
+                "bytes": 34703,
+                "sha256": "0b7db042dc117ab1895f475f83121028528617ab55ef4a461543158e9143c2e0"
+              }
+            }
+          },
+          "boundary": "successful completed client plus matching owned process/stop identity and actual SIGTERM; no blanket post-stop fault waiver"
+        }
+      },
+      "target_round_metrics": {
+        "status": "missing",
+        "detail": {
+          "windows": 0,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "missing",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "missing",
+        "detail": {
+          "windows": 0,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "missing",
+        "detail": {}
+      },
+      "unified_bonus_metrics": {
+        "status": "missing",
+        "detail": null
+      },
+      "bonus_forwards_positive": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "forwards > 0"
+        }
+      },
+      "bonus_graph_positive": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "graph > 0"
+        }
+      },
+      "bonus_eager_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "eager == 0"
+        }
+      },
+      "bonus_unknown_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "unknown == 0"
+        }
+      },
+      "bonus_failed_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "failed == 0"
+        }
+      },
+      "bonus_skipped_map_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "skipped_map == 0"
+        }
+      },
+      "bonus_skipped_allocator_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "skipped_allocator == 0"
+        }
+      },
+      "lease_publish_failed_zero": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "opt_lease_publish_failed == 0"
+        }
+      },
+      "bonus_kv_skip_limit": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "skipped_kv <= forwards; empty/unready reported separately"
+        }
+      },
+      "target_verify_graph_positive": {
+        "status": "missing",
+        "detail": {
+          "value": null,
+          "rule": "rank0 sum verify_graph_batches > 0; capture does not count"
+        }
+      },
+      "actual_configuration_parse": {
+        "status": "missing",
+        "detail": []
+      },
+      "target_actual_max_running_requests": {
+        "status": "missing",
+        "detail": {
+          "expected": 4,
+          "actual": null
+        }
+      },
+      "target_actual_disable_cuda_graph": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "actual": null
+        }
+      },
+      "target_actual_clear_tree_role": {
+        "status": "missing",
+        "detail": {
+          "expected": "target",
+          "actual": null
+        }
+      },
+      "target_actual_page_size": {
+        "status": "missing",
+        "detail": {
+          "expected": 128,
+          "actual": null
+        }
+      },
+      "target_actual_argv_graph": {
+        "status": "missing",
+        "detail": []
+      },
+      "draft_actual_max_running_requests": {
+        "status": "missing",
+        "detail": {
+          "expected": 4,
+          "actual": null
+        }
+      },
+      "draft_actual_disable_cuda_graph": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "actual": null
+        }
+      },
+      "draft_actual_clear_tree_role": {
+        "status": "missing",
+        "detail": {
+          "expected": "draft",
+          "actual": null
+        }
+      },
+      "draft_actual_page_size": {
+        "status": "missing",
+        "detail": {
+          "expected": 1,
+          "actual": null
+        }
+      },
+      "draft_actual_argv_graph": {
+        "status": "missing",
+        "detail": []
+      },
+      "config_graph": {
+        "status": "pass",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "config.json:graph_bs",
+              "scope": "shared"
+            }
+          ]
+        }
+      },
+      "config_bonus": {
+        "status": "pass",
+        "detail": {
+          "expected": true,
+          "evidence": [
+            {
+              "value": true,
+              "source": "config.json:bonus_prediction",
+              "scope": "shared"
+            }
+          ]
+        }
+      },
+      "config_ledger": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "config.json:ledger",
+              "scope": "shared"
+            }
+          ]
+        }
+      },
+      "config_kv_reuse": {
+        "status": "pass",
+        "detail": {
+          "expected": true,
+          "evidence": [
+            {
+              "value": true,
+              "source": "config.json:kv_reuse",
+              "scope": "shared"
+            }
+          ]
+        }
+      },
+      "config_lookahead": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "config.json:lookahead",
+              "scope": "shared"
+            }
+          ]
+        }
+      },
+      "manifest_graph": {
+        "status": "missing",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": []
+        }
+      },
+      "target_actual_graph": {
+        "status": "missing",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": []
+        }
+      },
+      "target_actual_ledger": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "evidence": []
+        }
+      },
+      "target_actual_kv_reuse": {
+        "status": "missing",
+        "detail": {
+          "expected": true,
+          "evidence": []
+        }
+      },
+      "target_actual_lookahead": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "evidence": []
+        }
+      },
+      "draft_actual_graph": {
+        "status": "missing",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": []
+        }
+      },
+      "draft_actual_ledger": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "evidence": []
+        }
+      },
+      "draft_actual_kv_reuse": {
+        "status": "missing",
+        "detail": {
+          "expected": true,
+          "evidence": []
+        }
+      },
+      "draft_actual_lookahead": {
+        "status": "missing",
+        "detail": {
+          "expected": false,
+          "evidence": []
+        }
+      },
+      "draft_actual_bonus": {
+        "status": "missing",
+        "detail": {
+          "expected": true,
+          "evidence": []
+        }
+      },
+      "target_launcher_graph": {
+        "status": "pass",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:8",
+              "scope": "target"
+            }
+          ]
+        }
+      },
+      "target_launcher_ledger": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ]
+        }
+      },
+      "target_launcher_kv_reuse": {
+        "status": "pass",
+        "detail": {
+          "expected": true,
+          "evidence": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ]
+        }
+      },
+      "target_launcher_lookahead": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-target.sh:4",
+              "scope": "target"
+            }
+          ]
+        }
+      },
+      "draft_launcher_graph": {
+        "status": "pass",
+        "detail": {
+          "expected": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "evidence": [
+            {
+              "value": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:8",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "draft_launcher_ledger": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "draft_launcher_kv_reuse": {
+        "status": "pass",
+        "detail": {
+          "expected": true,
+          "evidence": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "draft_launcher_lookahead": {
+        "status": "pass",
+        "detail": {
+          "expected": false,
+          "evidence": [
+            {
+              "value": false,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:4",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "draft_launcher_bonus": {
+        "status": "pass",
+        "detail": {
+          "expected": true,
+          "evidence": [
+            {
+              "value": true,
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/start-draft.sh:5",
+              "scope": "draft"
+            }
+          ]
+        }
+      },
+      "target_capture_batches": {
+        "status": "missing",
+        "detail": {
+          "required": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "observed": [],
+          "boundary": "capture only, not actual per-batch replay"
+        }
+      },
+      "target_server_graph_bs": {
+        "status": "missing",
+        "detail": []
+      },
+      "target_max_running_requests": {
+        "status": "missing",
+        "detail": {
+          "expected": 4,
+          "client_concurrency": 1,
+          "actual_ServerArgs": []
+        }
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "required": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "observed": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "boundary": "capture only, not actual per-batch replay"
+        }
+      },
+      "draft_server_graph_bs": {
+        "status": "pass",
+        "detail": [
+          [
+            1,
+            2,
+            3,
+            4
+          ]
+        ]
+      },
+      "draft_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "client_concurrency": 1,
+          "actual_ServerArgs": [
+            4.0
+          ]
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      }
+    }
+  },
+  "finalization": {
+    "preflight": {
+      "status": "pass",
+      "checks": {
+        "completed": {
+          "status": "pass",
+          "detail": null
+        },
+        "package_hashes_equal": {
+          "status": "pass",
+          "detail": null
+        },
+        "package_inventory_equal": {
+          "status": "pass",
+          "detail": null
+        },
+        "script_hashes": {
+          "status": "pass",
+          "detail": [
+            {
+              "status": "pass",
+              "detail": "preflight.py"
+            },
+            {
+              "status": "pass",
+              "detail": "runtime.py"
+            },
+            {
+              "status": "pass",
+              "detail": "lab_remote.py"
+            },
+            {
+              "status": "pass",
+              "detail": "run_experiment.py"
+            },
+            {
+              "status": "pass",
+              "detail": "strict_client.py"
+            }
+          ]
+        },
+        "dataset_identity": {
+          "status": "pass",
+          "detail": null
+        },
+        "draft_preflight_cleanup": {
+          "status": "pass",
+          "detail": {
+            "host": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "host_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "host_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "cuda",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    0
+                  ],
+                  "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                  "all_processes": [],
+                  "occupants": []
+                }
+              }
+            },
+            "container": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "container_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "container_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "cuda",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    0
+                  ],
+                  "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                  "all_processes": [],
+                  "occupants": []
+                }
+              }
+            },
+            "native_device_observation": {
+              "status": "pass",
+              "detail": "cuda"
+            },
+            "tunnels": {
+              "status": "pass",
+              "detail": {
+                "before": [
+                  "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                  [
+                    [
+                      867055,
+                      270206516,
+                      1008,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                    ]
+                  ]
+                ],
+                "after": [
+                  "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                  [
+                    [
+                      867055,
+                      270206516,
+                      1008,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                    ]
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "target_preflight_cleanup": {
+          "status": "pass",
+          "detail": {
+            "host": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "host_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "host_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "npu",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    2,
+                    3
+                  ],
+                  "physical_mapping": {
+                    "0": [
+                      0,
+                      0
+                    ],
+                    "1": [
+                      0,
+                      1
+                    ],
+                    "2": [
+                      1,
+                      0
+                    ],
+                    "3": [
+                      1,
+                      1
+                    ],
+                    "4": [
+                      2,
+                      0
+                    ],
+                    "5": [
+                      2,
+                      1
+                    ],
+                    "6": [
+                      3,
+                      0
+                    ],
+                    "7": [
+                      3,
+                      1
+                    ]
+                  },
+                  "visible_devices": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "all_processes": [
+                    {
+                      "npu": 0,
+                      "chip": 0,
+                      "pid": 2737317,
+                      "detail": "VLLMEngineCor",
+                      "physical_id": 0
+                    }
+                  ],
+                  "occupants": [],
+                  "explicit_empty": true,
+                  "empty_cards": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "global_empty": false,
+                  "unparsed_lines": []
+                }
+              }
+            },
+            "container": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "container_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "container_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "npu",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    2,
+                    3
+                  ],
+                  "physical_mapping": {
+                    "0": [
+                      0,
+                      0
+                    ],
+                    "1": [
+                      0,
+                      1
+                    ],
+                    "2": [
+                      1,
+                      0
+                    ],
+                    "3": [
+                      1,
+                      1
+                    ],
+                    "4": [
+                      2,
+                      0
+                    ],
+                    "5": [
+                      2,
+                      1
+                    ],
+                    "6": [
+                      3,
+                      0
+                    ],
+                    "7": [
+                      3,
+                      1
+                    ]
+                  },
+                  "visible_devices": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "all_processes": [
+                    {
+                      "npu": 0,
+                      "chip": 0,
+                      "pid": 2737317,
+                      "detail": "",
+                      "physical_id": 0
+                    }
+                  ],
+                  "occupants": [],
+                  "explicit_empty": true,
+                  "empty_cards": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "global_empty": false,
+                  "unparsed_lines": []
+                }
+              }
+            },
+            "native_device_observation": {
+              "status": "pass",
+              "detail": "npu"
+            },
+            "tunnels": {
+              "status": "pass",
+              "detail": {
+                "before": [
+                  "2451730f-667f-413d-9fe7-099dea47ffe3",
+                  [
+                    [
+                      6741,
+                      518134177,
+                      10710,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                    ]
+                  ]
+                ],
+                "after": [
+                  "2451730f-667f-413d-9fe7-099dea47ffe3",
+                  [
+                    [
+                      6741,
+                      518134177,
+                      10710,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                    ]
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "parse": {
+          "status": "pass",
+          "detail": []
+        }
+      },
+      "file": {
+        "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/preflight.json",
+        "bytes": 12855,
+        "sha256": "b81e2d3a3be3e581ee164d14a7b2f70289b78b377507ebacd0ecd7e52dad252f"
+      }
+    },
+    "phase": {
+      "status": "missing",
+      "detail": {
+        "record": {},
+        "links": {
+          "cleanup_sha256": {
+            "status": "missing",
+            "detail": null
+          },
+          "trials": {
+            "status": "missing",
+            "detail": null
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "status": "pass",
+      "services_stopped": true,
+      "tunnels_preserved": true,
+      "declaration": {
+        "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-cleanup.json",
+        "bytes": 529,
+        "sha256": "90ed4234088626945071556925873c656d6bfafb0b06f67c252deb3f5c1cc5ab"
+      },
+      "declared_phase": "formal",
+      "roles": {
+        "draft": {
+          "status": "pass",
+          "checks": {
+            "role_identity": {
+              "status": "pass",
+              "detail": "draft"
+            },
+            "phase_identity": {
+              "status": "pass",
+              "detail": {
+                "expected": "formal",
+                "actual": "formal"
+              }
+            },
+            "services_stopped": {
+              "status": "pass",
+              "detail": null
+            },
+            "tunnels_preserved": {
+              "status": "pass",
+              "detail": null
+            },
+            "errors": {
+              "status": "pass",
+              "detail": []
+            },
+            "after_host": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "after_host_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "after_host_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "cuda",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    0
+                  ],
+                  "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                  "all_processes": [],
+                  "occupants": []
+                }
+              }
+            },
+            "after_container": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "after_container_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "after_container_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "cuda",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    0
+                  ],
+                  "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                  "all_processes": [],
+                  "occupants": []
+                }
+              }
+            },
+            "after_native_device_observation": {
+              "status": "pass",
+              "detail": "cuda"
+            },
+            "tunnel_identities_preserved": {
+              "status": "pass",
+              "detail": {
+                "before": [
+                  "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                  [
+                    [
+                      867055,
+                      270206516,
+                      1008,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                    ]
+                  ]
+                ],
+                "after": [
+                  "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                  [
+                    [
+                      867055,
+                      270206516,
+                      1008,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                    ]
+                  ]
+                ],
+                "fields": [
+                  "host.boot_id",
+                  "pid",
+                  "start_ticks",
+                  "uid",
+                  "cmdline"
+                ]
+              }
+            },
+            "owned_sessions": {
+              "status": "pass",
+              "detail": [
+                {
+                  "directory": "/tmp/clear-bonus-20261118b/c1-A1",
+                  "check": {
+                    "status": "pass",
+                    "detail": {
+                      "bad_sessions": [],
+                      "missing": [],
+                      "sessions": 1
+                    }
+                  },
+                  "trial_cleanup_sha256": "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+                }
+              ]
+            }
+          },
+          "owned_entries": [
+            {
+              "directory": "/tmp/clear-bonus-20261118b/c1-A1",
+              "check": {
+                "status": "pass",
+                "detail": {
+                  "bad_sessions": [],
+                  "missing": [],
+                  "sessions": 1
+                }
+              },
+              "trial_cleanup_sha256": "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+            }
+          ],
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-draft-cleanup.json",
+            "bytes": 732945,
+            "sha256": "87ab2d277277d8cd6a50657c3aac4b01767206474172b7138ebc705b3a16d5be"
+          }
+        },
+        "target": {
+          "status": "pass",
+          "checks": {
+            "role_identity": {
+              "status": "pass",
+              "detail": "target"
+            },
+            "phase_identity": {
+              "status": "pass",
+              "detail": {
+                "expected": "formal",
+                "actual": "formal"
+              }
+            },
+            "services_stopped": {
+              "status": "pass",
+              "detail": null
+            },
+            "tunnels_preserved": {
+              "status": "pass",
+              "detail": null
+            },
+            "errors": {
+              "status": "pass",
+              "detail": []
+            },
+            "after_host": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "after_host_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "after_host_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "npu",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    2,
+                    3
+                  ],
+                  "physical_mapping": {
+                    "0": [
+                      0,
+                      0
+                    ],
+                    "1": [
+                      0,
+                      1
+                    ],
+                    "2": [
+                      1,
+                      0
+                    ],
+                    "3": [
+                      1,
+                      1
+                    ],
+                    "4": [
+                      2,
+                      0
+                    ],
+                    "5": [
+                      2,
+                      1
+                    ],
+                    "6": [
+                      3,
+                      0
+                    ],
+                    "7": [
+                      3,
+                      1
+                    ]
+                  },
+                  "visible_devices": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "all_processes": [
+                    {
+                      "npu": 0,
+                      "chip": 0,
+                      "pid": 2737317,
+                      "detail": "VLLMEngineCor",
+                      "physical_id": 0
+                    }
+                  ],
+                  "occupants": [],
+                  "explicit_empty": true,
+                  "empty_cards": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "global_empty": false,
+                  "unparsed_lines": []
+                }
+              }
+            },
+            "after_container": {
+              "status": "pass",
+              "detail": {
+                "process_scan_complete": true,
+                "process_errors": [],
+                "services": [],
+                "HTTP_occupied": [
+                  false,
+                  false
+                ],
+                "ports_complete": [
+                  true,
+                  true,
+                  true
+                ]
+              }
+            },
+            "after_container_RPC_port": {
+              "status": "pass",
+              "detail": "existing Target tunnel listens; Draft service RPC must be released"
+            },
+            "after_container_native_device_idle": {
+              "status": "pass",
+              "detail": {
+                "native": "npu",
+                "exit_code": 0,
+                "occupancy": {
+                  "complete": true,
+                  "selected_devices": [
+                    2,
+                    3
+                  ],
+                  "physical_mapping": {
+                    "0": [
+                      0,
+                      0
+                    ],
+                    "1": [
+                      0,
+                      1
+                    ],
+                    "2": [
+                      1,
+                      0
+                    ],
+                    "3": [
+                      1,
+                      1
+                    ],
+                    "4": [
+                      2,
+                      0
+                    ],
+                    "5": [
+                      2,
+                      1
+                    ],
+                    "6": [
+                      3,
+                      0
+                    ],
+                    "7": [
+                      3,
+                      1
+                    ]
+                  },
+                  "visible_devices": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7
+                  ],
+                  "all_processes": [
+                    {
+                      "npu": 0,
+                      "chip": 0,
+                      "pid": 2737317,
+                      "detail": "",
+                      "physical_id": 0
+                    }
+                  ],
+                  "occupants": [],
+                  "explicit_empty": true,
+                  "empty_cards": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "global_empty": false,
+                  "unparsed_lines": []
+                }
+              }
+            },
+            "after_native_device_observation": {
+              "status": "pass",
+              "detail": "npu"
+            },
+            "tunnel_identities_preserved": {
+              "status": "pass",
+              "detail": {
+                "before": [
+                  "2451730f-667f-413d-9fe7-099dea47ffe3",
+                  [
+                    [
+                      6741,
+                      518134177,
+                      10710,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                    ]
+                  ]
+                ],
+                "after": [
+                  "2451730f-667f-413d-9fe7-099dea47ffe3",
+                  [
+                    [
+                      6741,
+                      518134177,
+                      10710,
+                      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                    ]
+                  ]
+                ],
+                "fields": [
+                  "host.boot_id",
+                  "pid",
+                  "start_ticks",
+                  "uid",
+                  "cmdline"
+                ]
+              }
+            },
+            "owned_sessions": {
+              "status": "pass",
+              "detail": [
+                {
+                  "directory": "/tmp/clear-bonus-20261118b/c1-A1",
+                  "check": {
+                    "status": "pass",
+                    "detail": {
+                      "bad_sessions": [],
+                      "missing": [],
+                      "sessions": 1
+                    }
+                  },
+                  "trial_cleanup_sha256": "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+                }
+              ]
+            }
+          },
+          "owned_entries": [
+            {
+              "directory": "/tmp/clear-bonus-20261118b/c1-A1",
+              "check": {
+                "status": "pass",
+                "detail": {
+                  "bad_sessions": [],
+                  "missing": [],
+                  "sessions": 1
+                }
+              },
+              "trial_cleanup_sha256": "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+            }
+          ],
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-target-cleanup.json",
+            "bytes": 2488425,
+            "sha256": "26a0b5e1f3487f03adb9c9610b929e28eccc822bb814f513c188cfc1e79ef4a7"
+          }
+        }
+      },
+      "referenced_files": [
+        {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-draft-cleanup.json",
+          "bytes": 732945,
+          "sha256": "87ab2d277277d8cd6a50657c3aac4b01767206474172b7138ebc705b3a16d5be"
+        },
+        {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-target-cleanup.json",
+          "bytes": 2488425,
+          "sha256": "26a0b5e1f3487f03adb9c9610b929e28eccc822bb814f513c188cfc1e79ef4a7"
+        }
+      ],
+      "missing": [],
+      "issues": [],
+      "boundary": "offline validation of archived observations only; never live cleanup, process inspection, remote operations or tunnel modification"
+    },
+    "trial_cleanup": {
+      "c1-A1": {
+        "status": "missing",
+        "services_stopped": true,
+        "tunnels_preserved": true,
+        "declaration": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/cleanup.json",
+          "bytes": 430,
+          "sha256": "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+        },
+        "declared_phase": "formal",
+        "roles": {
+          "draft": {
+            "status": "pass",
+            "checks": {
+              "role_identity": {
+                "status": "pass",
+                "detail": "draft"
+              },
+              "phase_identity": {
+                "status": "pass",
+                "detail": {
+                  "expected": "formal",
+                  "actual": "formal"
+                }
+              },
+              "services_stopped": {
+                "status": "pass",
+                "detail": null
+              },
+              "tunnels_preserved": {
+                "status": "pass",
+                "detail": null
+              },
+              "errors": {
+                "status": "pass",
+                "detail": []
+              },
+              "after_host": {
+                "status": "pass",
+                "detail": {
+                  "process_scan_complete": true,
+                  "process_errors": [],
+                  "services": [],
+                  "HTTP_occupied": [
+                    false,
+                    false
+                  ],
+                  "ports_complete": [
+                    true,
+                    true,
+                    true
+                  ]
+                }
+              },
+              "after_host_RPC_port": {
+                "status": "pass",
+                "detail": "existing Target tunnel listens; Draft service RPC must be released"
+              },
+              "after_host_native_device_idle": {
+                "status": "pass",
+                "detail": {
+                  "native": "cuda",
+                  "exit_code": 0,
+                  "occupancy": {
+                    "complete": true,
+                    "selected_devices": [
+                      0
+                    ],
+                    "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                    "all_processes": [],
+                    "occupants": []
+                  }
+                }
+              },
+              "after_container": {
+                "status": "pass",
+                "detail": {
+                  "process_scan_complete": true,
+                  "process_errors": [],
+                  "services": [],
+                  "HTTP_occupied": [
+                    false,
+                    false
+                  ],
+                  "ports_complete": [
+                    true,
+                    true,
+                    true
+                  ]
+                }
+              },
+              "after_container_RPC_port": {
+                "status": "pass",
+                "detail": "existing Target tunnel listens; Draft service RPC must be released"
+              },
+              "after_container_native_device_idle": {
+                "status": "pass",
+                "detail": {
+                  "native": "cuda",
+                  "exit_code": 0,
+                  "occupancy": {
+                    "complete": true,
+                    "selected_devices": [
+                      0
+                    ],
+                    "uuid": "GPU-7647b29f-901d-9066-c279-642d380096a5",
+                    "all_processes": [],
+                    "occupants": []
+                  }
+                }
+              },
+              "after_native_device_observation": {
+                "status": "pass",
+                "detail": "cuda"
+              },
+              "tunnel_identities_preserved": {
+                "status": "pass",
+                "detail": {
+                  "before": [
+                    "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                    [
+                      [
+                        867055,
+                        270206516,
+                        1008,
+                        "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                      ]
+                    ]
+                  ],
+                  "after": [
+                    "117f344c-f5f8-4f82-847a-44f1e65c8ee7",
+                    [
+                      [
+                        867055,
+                        270206516,
+                        1008,
+                        "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30019:127.0.0.1:30019 liujg@10.42.206.123"
+                      ]
+                    ]
+                  ],
+                  "fields": [
+                    "host.boot_id",
+                    "pid",
+                    "start_ticks",
+                    "uid",
+                    "cmdline"
+                  ]
+                }
+              },
+              "owned_sessions": {
+                "status": "pass",
+                "detail": [
+                  {
+                    "directory": "c1-A1",
+                    "check": {
+                      "status": "pass",
+                      "detail": {
+                        "bad_sessions": [],
+                        "missing": [],
+                        "sessions": 1
+                      }
+                    },
+                    "trial_cleanup_sha256": null
+                  }
+                ]
+              }
+            },
+            "owned_entries": [
+              {
+                "directory": "c1-A1",
+                "check": {
+                  "status": "pass",
+                  "detail": {
+                    "bad_sessions": [],
+                    "missing": [],
+                    "sessions": 1
+                  }
+                },
+                "trial_cleanup_sha256": null
+              }
+            ],
+            "file": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft-cleanup.json",
+              "bytes": 729379,
+              "sha256": "3d8b6b906c56d024156f9345eb5adb620dbc49ef7151063af65840eb1812b8bd"
+            }
+          },
+          "target": {
+            "status": "pass",
+            "checks": {
+              "role_identity": {
+                "status": "pass",
+                "detail": "target"
+              },
+              "phase_identity": {
+                "status": "pass",
+                "detail": {
+                  "expected": "formal",
+                  "actual": "formal"
+                }
+              },
+              "services_stopped": {
+                "status": "pass",
+                "detail": null
+              },
+              "tunnels_preserved": {
+                "status": "pass",
+                "detail": null
+              },
+              "errors": {
+                "status": "pass",
+                "detail": []
+              },
+              "after_host": {
+                "status": "pass",
+                "detail": {
+                  "process_scan_complete": true,
+                  "process_errors": [],
+                  "services": [],
+                  "HTTP_occupied": [
+                    false,
+                    false
+                  ],
+                  "ports_complete": [
+                    true,
+                    true,
+                    true
+                  ]
+                }
+              },
+              "after_host_RPC_port": {
+                "status": "pass",
+                "detail": "existing Target tunnel listens; Draft service RPC must be released"
+              },
+              "after_host_native_device_idle": {
+                "status": "pass",
+                "detail": {
+                  "native": "npu",
+                  "exit_code": 0,
+                  "occupancy": {
+                    "complete": true,
+                    "selected_devices": [
+                      2,
+                      3
+                    ],
+                    "physical_mapping": {
+                      "0": [
+                        0,
+                        0
+                      ],
+                      "1": [
+                        0,
+                        1
+                      ],
+                      "2": [
+                        1,
+                        0
+                      ],
+                      "3": [
+                        1,
+                        1
+                      ],
+                      "4": [
+                        2,
+                        0
+                      ],
+                      "5": [
+                        2,
+                        1
+                      ],
+                      "6": [
+                        3,
+                        0
+                      ],
+                      "7": [
+                        3,
+                        1
+                      ]
+                    },
+                    "visible_devices": [
+                      0,
+                      1,
+                      2,
+                      3,
+                      4,
+                      5,
+                      6,
+                      7
+                    ],
+                    "all_processes": [
+                      {
+                        "npu": 0,
+                        "chip": 0,
+                        "pid": 2737317,
+                        "detail": "VLLMEngineCor",
+                        "physical_id": 0
+                      }
+                    ],
+                    "occupants": [],
+                    "explicit_empty": true,
+                    "empty_cards": [
+                      1,
+                      2,
+                      3
+                    ],
+                    "global_empty": false,
+                    "unparsed_lines": []
+                  }
+                }
+              },
+              "after_container": {
+                "status": "pass",
+                "detail": {
+                  "process_scan_complete": true,
+                  "process_errors": [],
+                  "services": [],
+                  "HTTP_occupied": [
+                    false,
+                    false
+                  ],
+                  "ports_complete": [
+                    true,
+                    true,
+                    true
+                  ]
+                }
+              },
+              "after_container_RPC_port": {
+                "status": "pass",
+                "detail": "existing Target tunnel listens; Draft service RPC must be released"
+              },
+              "after_container_native_device_idle": {
+                "status": "pass",
+                "detail": {
+                  "native": "npu",
+                  "exit_code": 0,
+                  "occupancy": {
+                    "complete": true,
+                    "selected_devices": [
+                      2,
+                      3
+                    ],
+                    "physical_mapping": {
+                      "0": [
+                        0,
+                        0
+                      ],
+                      "1": [
+                        0,
+                        1
+                      ],
+                      "2": [
+                        1,
+                        0
+                      ],
+                      "3": [
+                        1,
+                        1
+                      ],
+                      "4": [
+                        2,
+                        0
+                      ],
+                      "5": [
+                        2,
+                        1
+                      ],
+                      "6": [
+                        3,
+                        0
+                      ],
+                      "7": [
+                        3,
+                        1
+                      ]
+                    },
+                    "visible_devices": [
+                      0,
+                      1,
+                      2,
+                      3,
+                      4,
+                      5,
+                      6,
+                      7
+                    ],
+                    "all_processes": [
+                      {
+                        "npu": 0,
+                        "chip": 0,
+                        "pid": 2737317,
+                        "detail": "",
+                        "physical_id": 0
+                      }
+                    ],
+                    "occupants": [],
+                    "explicit_empty": true,
+                    "empty_cards": [
+                      1,
+                      2,
+                      3
+                    ],
+                    "global_empty": false,
+                    "unparsed_lines": []
+                  }
+                }
+              },
+              "after_native_device_observation": {
+                "status": "pass",
+                "detail": "npu"
+              },
+              "tunnel_identities_preserved": {
+                "status": "pass",
+                "detail": {
+                  "before": [
+                    "2451730f-667f-413d-9fe7-099dea47ffe3",
+                    [
+                      [
+                        6741,
+                        518134177,
+                        10710,
+                        "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                      ]
+                    ]
+                  ],
+                  "after": [
+                    "2451730f-667f-413d-9fe7-099dea47ffe3",
+                    [
+                      [
+                        6741,
+                        518134177,
+                        10710,
+                        "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:30019:127.0.0.1:30019 liujg@10.20.25.6"
+                      ]
+                    ]
+                  ],
+                  "fields": [
+                    "host.boot_id",
+                    "pid",
+                    "start_ticks",
+                    "uid",
+                    "cmdline"
+                  ]
+                }
+              },
+              "owned_sessions": {
+                "status": "pass",
+                "detail": [
+                  {
+                    "directory": "c1-A1",
+                    "check": {
+                      "status": "pass",
+                      "detail": {
+                        "bad_sessions": [],
+                        "missing": [],
+                        "sessions": 1
+                      }
+                    },
+                    "trial_cleanup_sha256": null
+                  }
+                ]
+              }
+            },
+            "owned_entries": [
+              {
+                "directory": "c1-A1",
+                "check": {
+                  "status": "pass",
+                  "detail": {
+                    "bad_sessions": [],
+                    "missing": [],
+                    "sessions": 1
+                  }
+                },
+                "trial_cleanup_sha256": null
+              }
+            ],
+            "file": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target-cleanup.json",
+              "bytes": 2483247,
+              "sha256": "14696b1fb97cdea4c05b5471caa602656a170918d3ab15645abee2bb62e20180"
+            }
+          }
+        },
+        "referenced_files": [
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/draft-cleanup.json",
+            "bytes": 729379,
+            "sha256": "3d8b6b906c56d024156f9345eb5adb620dbc49ef7151063af65840eb1812b8bd"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/target-cleanup.json",
+            "bytes": 2483247,
+            "sha256": "14696b1fb97cdea4c05b5471caa602656a170918d3ab15645abee2bb62e20180"
+          }
+        ],
+        "missing": [],
+        "issues": [],
+        "boundary": "offline validation of archived observations only; never live cleanup, process inspection, remote operations or tunnel modification",
+        "links": {
+          "trial_identity": {
+            "status": "pass",
+            "detail": null
+          },
+          "completed_cleanup_link": {
+            "status": "missing",
+            "detail": null
+          },
+          "target_phase_trial_link": {
+            "status": "pass",
+            "detail": [
+              "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+            ]
+          },
+          "draft_phase_trial_link": {
+            "status": "pass",
+            "detail": [
+              "1d4a8807b02182a2ca1f45934645ca405232fad1722122ca1b661817a0e147fb"
+            ]
+          }
+        }
+      },
+      "c4-A1": {
+        "status": "missing",
+        "roles": {
+          "target": {
+            "status": "missing",
+            "detail": []
+          },
+          "draft": {
+            "status": "missing",
+            "detail": []
+          }
+        },
+        "source": "phase cleanup's per-trial owned_sessions; no empty-list success"
+      }
+    },
+    "blocking_records": {
+      "status": "fail",
+      "detail": [
+        {
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/formal-blocked.json",
+            "bytes": 299,
+            "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+          },
+          "record": {
+            "completed": false,
+            "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+            "utc": "2026-11-18T07:31:48.168190+00:00",
+            "automatic_retry": false,
+            "remaining_trials_stopped": true
+          },
+          "issues": []
+        },
+        {
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/blocked.json",
+            "bytes": 307,
+            "sha256": "33cc88577703033ba304075ecc6760a0da74e0eae3fd409e88d96ad5a911cd52"
+          },
+          "record": {
+            "completed": false,
+            "trial": "c1-A1",
+            "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+            "cleanup_errors": [],
+            "utc": "2026-11-18T07:31:34.762727+00:00",
+            "automatic_retry": false
+          },
+          "issues": []
+        },
+        {
+          "file": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-blocked.json",
+            "bytes": 299,
+            "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+          },
+          "record": {
+            "completed": false,
+            "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+            "utc": "2026-11-18T07:31:48.168190+00:00",
+            "automatic_retry": false,
+            "remaining_trials_stopped": true
+          },
+          "issues": []
+        }
+      ]
+    },
+    "status": "fail"
+  }
+}

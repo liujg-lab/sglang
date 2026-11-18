@@ -1,0 +1,7 @@
+{
+  "completed": false,
+  "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+  "utc": "2026-11-18T07:31:48.168190+00:00",
+  "automatic_retry": false,
+  "remaining_trials_stopped": true
+}

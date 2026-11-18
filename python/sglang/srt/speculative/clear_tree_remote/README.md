@@ -2,25 +2,31 @@
 
 `CLEAR_TREE_REMOTE` 是从 `OPT_TREE_REMOTE` 复制出来的独立算法。服务 W 和 τ 上的 K 都从平表起步：一批一个请求时 W 为 8、K 为 16，其余 W 为 4、K 为 8。在线 K 和在线 W 由 Draft 的 `SGLANG_CLEAR_LEDGER=1` 打开。验证数 K 默认在 2、4、8、16、32、64 里选，可用 `--clear-tree-ks` 改。探测轮、平表档还没有样本的轮、层样本不够的轮、非贪心轮，以及批建树失败后的回退轮，都用 τ，并且 K 锁在平表。这一档的 KV 桶装不下时退到装得下的最大档；平表档超过本轮覆盖上界时，改用上界以内最大的一档。回退轮不加轮次、不取探测、不进回放统计，b 取整个包的请求数。τ 轮的停层按本轮锁定的 K 算质量，不是按层宽。相邻窄档和宽档配对都满 30 轮，并且增益超过 3%，才换服务 W。偏差只记在日志里。账本默认关闭；关着时不取探测，每一轮都是平表的 W 和 K，停层用 τ，质量按这个 K 算。
 
-启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30019`。`--clear-tree-widths` 未指定时是 2 4 8 16 32 64，`--clear-tree-ks` 未指定时是同一组数。平表要求宽度里有 4 和 8、验证数里有 8 和 16，缺了拒绝启动。`--speculative-num-draft-tokens` 是图和缓冲容量：Target 为最大 K 加 1，默认 65；Draft 为最大 W，默认 64。Draft 的 bonus 缓冲是最大 W 加 1，默认 65。省略该参数时按这个容量填上；显式传入的值必须等于它。握手仍用 `--clear-tree-width`，它不是候选列表。未设置 `--max-running-requests` 时改为 48。CUDA 和 NPU 图按该进程的 batch 列表捕获，这个列表不是算法常量。启动捕获每一个候选。Target 验证图默认是 65、33、17、9、5、3，另加 decode 的 1，回放按本轮 K+1 选图。Draft 层图默认是 64、32、16、8、4、2，另加 decode 的 1。Draft bonus 预测默认关闭，不捕获 bonus 专用图；显式开启时，bonus 图按候选宽度加 1 捕获，默认是 65、33、17、9、5、3，仍只在 batch 1 捕获。
+启动用 `--speculative-algorithm CLEAR_TREE_REMOTE` 和 `--clear-tree-role`。这些参数与 `--opt-tree-*` 分开。默认 RPC 地址是 `127.0.0.1`，端口是 `30019`。`--clear-tree-widths` 未指定时是 2 4 8 16 32 64，`--clear-tree-ks` 未指定时是同一组数。平表要求宽度里有 4 和 8、验证数里有 8 和 16，缺了拒绝启动。`--speculative-num-draft-tokens` 是图和缓冲容量：Target 为最大 K 加 1，默认 65；Draft 为最大 W，默认 64。Draft 的 bonus 缓冲是最大 K 加 1，默认 65。省略该参数时按这个容量填上；显式传入的值必须等于它。握手仍用 `--clear-tree-width`，它不是候选列表。未设置 `--max-running-requests` 时改为 48。CUDA 和 NPU 图按该进程的 batch 列表捕获，这个列表不是算法常量。启动捕获每一个候选。Target 验证图默认是 65、33、17、9、5、3，另加 decode 的 1，回放按本轮 K+1 选图。Draft 层图默认是 64、32、16、8、4、2，另加 decode 的 1。Draft bonus 预测默认开启，bonus 图按候选 K 加 1 捕获，默认是 65、33、17、9、5、3，并在每个已配置且容量允许的 batch 上捕获；显式设置 `SGLANG_CLEAR_BONUS_PREDICTION=0` 关闭时不捕获 bonus 专用图。层宽与 bonus 宽度重合时同时保留普通层图与 bonus 专用图。默认候选、最终 batch 列表为 1/2/4、单 stream、token 缓冲容量为 256 时，共捕获 38 张 Draft 图（21 张原图和 17 张 bonus 图），其中 batch 4 的 65 宽超过容量而不捕获；图数不是算法常量。
 
 在线 K、在线 W、账本和回放以本文件和本目录代码为准。[design/README.md](design/README.md) 是设计，不判断正在跑的服务。从 OPT 复制来的建树和验证细节见 [../opt_tree_remote/README.md](../opt_tree_remote/README.md)。
 
 ## Draft 回包后的 KV 补算与 bonus 预测
 
-Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION` 默认关闭（未设置或设为 `0`）。page size 为 1、`SGLANG_CLEAR_TREE_KV_REUSE` 开启且请求可复用时，回包后仍按各请求的停止深度分组补算最后一层 KV，再发布树 KV lease；下一轮照常复用已接受路径的 KV。关闭时不保存 bonus 候选、不做最后层 bonus 专用 top-k/拷贝，也不做猜测 token 的额外前向。Target 验证后实际提交的 bonus token 不受影响，在下一轮由正常 ingest 路径处理。
+Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION` 默认开启（未设置或设为 `1`），显式设为 `0` 可关闭。关闭时，page size 为 1、`SGLANG_CLEAR_TREE_KV_REUSE` 开启且请求可复用时，回包后仍按各请求的停止深度分组补算最后一层 KV，再发布树 KV lease；下一轮照常复用已接受路径的 KV。关闭时不保存 bonus 候选、不做最后层 bonus 专用 top-k/拷贝，也不做猜测 token 的额外前向。Target 验证后实际提交的 bonus token 不受影响，在下一轮由正常 ingest 路径处理。
 
-在 Draft 启动前设置 `SGLANG_CLEAR_BONUS_PREDICTION=1` 可开启预计算：在根和每个进入验证的节点处各猜一个未包含在验证子节点中的 token，提前写入其 KV 和后续 logits；命中且成为新提交尾部时可跳过该请求下一轮的 ingest 前向。此开关只控制 ClearTree Draft，独立于树 KV 复用，不修改 Target 的 K+1 验证图、协议、在线 K 或账本时间定义。按启动配置使用，修改开关后需重启 Draft，不支持运行中热切换。page size 非 1 的现有限制不变。
+默认开启的预计算行为（也可在 Draft 启动前显式设置 `SGLANG_CLEAR_BONUS_PREDICTION=1`）：在根和每个进入验证的节点处各猜一个未包含在验证子节点中的 token，提前写入其 KV 和后续 logits；命中且成为新提交尾部时可跳过该请求下一轮的 ingest 前向。此开关只控制 ClearTree Draft，独立于树 KV 复用，不修改 Target 的 K+1 验证图、协议、在线 K 或账本时间定义。按启动配置使用，修改开关后需重启 Draft，不支持运行中热切换。page size 非 1 的现有限制不变。
 
-同一次回包后补层中，至少两个非 lookahead 请求完成最后层且有 bonus 候选时，直接使用一次批量 bonus 前向，不再逐请求计算，也没有额外 batch 开关。各请求补齐到统一查询宽度 G：优先取能覆盖最大候选数的最小现有层图档。例如最多 9 个候选用 G=16，最多 5 个用 G=8。候选超过最大可用档时，按残余路径质量 `end_rank` 保留前 G 个，保留原有相对顺序；这会降低预计算覆盖率，不改变 Target 提交 bonus token 的规则。padding 行不保留为猜测，前向结束后释放其槽位。
+所有完成最后层且就绪的请求共用一个 bonus 入口，settle 完成的 lookahead 请求也参加。每个真实验证节点与根至多各产生一个候选，候选按残余路径质量 `end_rank` 排序。`finish()` 的尾部 `parent=-2` 行只在 bonus/lease 的本地元数据视图里剥离，不改变发给 Target 的 K 长度窗口、节点索引或实际树 KV 跨度；中间出现 `-2` 的非法窗口仍拒绝。
 
-CUDA Draft 通过 `is_bonus=False` 复用普通多请求层图，不新增图。只捕获 batch 1/2/4 且允许 graph padding 时，实际 batch 3 使用 batch 4 图；准入时检查实际 replay key，避免只根据配置宽度推定图存在。禁用 padding 且缺少精确 batch 图时走 eager；图显式关闭以及没有 Draft verify 图的 NPU 路径也走批量 eager。CUDA 图启用但找不到安全可复用的层图时跳过本批 bonus。只有一个合格请求或使用 lookahead 时，仍走原来的 W+1 单请求 bonus 图与 cascade 路径。
+CUDA Draft 统一用 `is_bonus=True` 的专用 `r{G}_{bs}_s0` 图，不再复用普通层图。G 优先取精确 batch 下能覆盖最大实际候选数的最小 bonus 档；图均不够宽时取最大可用档，依次计算剩余候选而不截断。例如完整树 batch 1/K16 用 G17 一次前向，batch 4/K8 用 G9 一次，默认容量下 batch 4/K64 用 G33 两组。每组完成后按剩余请求数重新选宽，第二组可能不再包含所有请求。没有安全的精确 batch 专用图时，用实际需要的精确宽度一次 eager；只捕获 1/2/4 时 batch 3 不会复用 batch 4 专用图。不同请求候选不足和最后一组仍需 padding，`keep=False` 行完成后释放，不保留为猜测。
 
-批量 bonus 仅使用 allocator 当前空闲的 b×G 个槽位，不把可驱逐前缀 KV 算入预算；空间不足、映射越界、重复请求行，或使用混合 SWA allocator 时整批跳过，不驱逐、不拆批、不回退逐请求串行 bonus。SWA 的 `alloc()` 可能先从一个子池取走槽位，再在另一侧失败，调用方拿不到返回值；这项优化因此直接跳过。临时映射在完成前向后清除，`kv_allocated_len` 恢复到树末尾，真实猜测槽位脱离映射后交给请求持有；下一轮命中安装和未用猜测释放不变。普通失败确认设备完成后回收全部未移交槽位，仍可发布有效树；设备完成或 allocator 释放结果不明时隔离槽位并停止正常复用，不冒险重复释放。
+batch 1 且模型支持 Triton cascade 时保留快速模板路径，模板按请求 pool index 和 G 分别缓存，切换 K 不混用模板或 M-RoPE delta；其余走普通批量 verify。已执行前向后不会再次提交 fallback。cascade 的静态查询和树缓冲覆盖最大层宽与最大 K+1，不随运行时切档重新分配。NPU Draft 的 page128 限制不变，仍跳过 bonus，不表示已验证 NPU bonus eager。
 
-批量路径沿用 Draft 周期计数器，`opt_bonus_rounds` 仍是请求尝试数，不是模型 forward 数。新增计数包括：`opt_bonus_batch_forwards`（提交调用次数，失败也可能计入）、`opt_bonus_batch_requests` / `opt_bonus_batch_query_rows` / `opt_bonus_batch_padding_rows`（成功安装的请求/查询/padding 行）、`opt_bonus_batch_truncated`（丢弃候选数）、`opt_bonus_batch_graph` / `opt_bonus_batch_eager` / `opt_bonus_batch_unknown`（前向返回的执行路径），以及 `opt_bonus_batch_skipped_kv` / `opt_bonus_batch_skipped_graph` / `opt_bonus_batch_skipped_map` / `opt_bonus_batch_skipped_allocator` / `opt_bonus_batch_failed`。这些不是普通建树层样本，不写入层耗时拟合。
+每组 bonus 仅使用 allocator 当前空闲的 b×G 个槽位，不把可驱逐前缀 KV 算入预算；空间不足、映射越界、重复请求行或混合 SWA allocator 时停止本轮后续组，不驱逐、不拆成逐请求串行。SWA 的 `alloc()` 可能在两个子池间部分失败，所以直接跳过。lookahead 建树前尚不知道 K，bonus 开启时预估最大 K+1 的额外预算；若 singleton 只能用窄图，则保守预留完整分组含尾部 padding 的上界。此估算不是 reservation，各组仍重新检查空闲空间，前组真实猜测继续占用 KV。`bonus_ids` 与 pinned top-k 缓冲仍存 top-(W+1)，和查询宽度无关。
 
-CPU/mock 测试覆盖 batch 2/3/4 的拼装、图 key 选择、预算、padding、logits 保活与异常回收，不代表 CUDA/NPU 实机验证通过。实机应先以固定前缀/树核对 position、可见 KV、槽位及参考 logits，再检查 batch 2/3/4 的一次前向和实际图命中；batch 1 与 lookahead 单独回归。没有受控测量不能把既有回包后耗时推算当成批量版本收益；既有 bonus 开关实验的输出分叉也不因本次修改而视为解决。
+旧猜测在第一组开始前只释放一次。每组一次分配和映射，前向完成后清除临时映射，`kv_allocated_len` 恢复到树末尾；真实槽位脱离映射后追加交给请求持有。下一轮命中安装和未用猜测释放不变。普通失败确认设备完成后只回收当前组尚未移交槽位，保留先前成功组，仍可发布有效树；设备完成或 allocator 释放结果不明时隔离归属并停止正常复用，不冒险重复释放或强行发布。
+
+统一计数同时覆盖单请求和批量路径：`opt_bonus_rounds` 为请求-轮尝试数，`opt_bonus_forwards` 为提交调用次数（失败可能计入），`opt_bonus_width_{G}` 为各组宽的提交次数。`opt_bonus_requests` / `opt_bonus_query_rows` / `opt_bonus_padding_rows` 为成功安装的请求-组数、查询行数和已释放 padding 行数；拆组时 requests 可以大于 rounds。`opt_bonus_graph` / `opt_bonus_eager` / `opt_bonus_unknown` 按实际前向返回标记计，不以选宽预判冒充图命中；`opt_bonus_failed` 为入口捕获的普通失败。`opt_bonus_groups_split` 为需要额外组的请求-轮数，每请求每轮只计一次。`opt_bonus_skipped` 按被跳过请求计（资源停止时计当前组），并拆出 `opt_bonus_skipped_empty` / `opt_bonus_skipped_unready`；资源跳过按组计，分别是 `opt_bonus_skipped_kv` / `opt_bonus_skipped_map` / `opt_bonus_skipped_allocator`。`opt_lease_publish_failed` 为适用 page1 发布尝试失败数，不计正常结束或非 page1 路径。`opt_bonus_hits` / `opt_ingest_zero_fwd` 语义不变。这些不是普通建树层样本，不写入层耗时拟合。
+
+原 `opt_bonus_batch_*` 中的 forwards/requests/query_rows/padding_rows/graph/eager/unknown/failed 及资源跳过名去掉 `batch_` 后统一使用；truncated/skipped_graph 不再产生（不截断，缺图改精确 eager）。历史实验脚本和产物保留原指标，不自动重解释其结果。
+
+CPU/mock 测试覆盖拼装、专用图 key、实际共享捕获循环、预算、padding、logits 保活与异常回收，不代表 CUDA/NPU 实机验证通过。实机应先以固定前缀/树核对 position、可见 KV、槽位及参考 logits，再检查 batch 1/2/3/4、K8/16/32/64 的前向次数与实际 graph/eager 路径；K>W、图关闭与 lookahead 单独回归。没有受控测量不能把既有回包后耗时推算当成批量版本收益；既有 bonus 开关实验的输出分叉也不因本次修改而视为解决。
 
 ## 账本
 

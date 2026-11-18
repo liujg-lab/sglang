@@ -78,9 +78,7 @@ def opt_kv_release_allowed(scheduler) -> bool:
     except Exception:
         return False
     try:
-        unresolved = has_unresolved_resources(
-            scheduler, include_quarantine=False
-        )
+        unresolved = has_unresolved_resources(scheduler, include_quarantine=False)
     except Exception:
         logger.warning("[OPT] lease release check failed", exc_info=True)
         return False
@@ -108,6 +106,32 @@ def detach_clear_tree_lease(req) -> Optional[ClearTreeKVLease]:
     if not isinstance(lease, ClearTreeKVLease):
         return None
     return lease
+
+
+def strip_verify_padding(tokens, parents, cols):
+    """Return a local real-node view without changing the K-row wire window.
+
+    Only a contiguous suffix of parent=-2 is padding. Filtering interior rows
+    would invalidate verify parent indices and their original layer columns.
+    """
+    if tokens is None or parents is None or cols is None:
+        return None
+    try:
+        tokens, parents, cols = list(tokens), list(parents), list(cols)
+        if not tokens or not (len(tokens) == len(parents) == len(cols)):
+            return None
+        end = len(parents)
+        while end and int(parents[end - 1]) == -2:
+            end -= 1
+        if not end or any(int(parent) == -2 for parent in parents[:end]):
+            return None
+        return (
+            [int(token) for token in tokens[:end]],
+            [int(parent) for parent in parents[:end]],
+            [int(col) for col in cols[:end]],
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def node_depths(parents: Sequence[int]) -> Optional[List[int]]:
@@ -239,15 +263,7 @@ def publish_clear_tree_lease(scheduler, req, runner, keep: int, window) -> bool:
 def _window_fields(window):
     if window is None or len(window) != 3:
         return None
-    tokens, parents, cols = window
-    if tokens is None or parents is None or cols is None:
-        return None
-    tokens = list(tokens)
-    parents = list(parents)
-    cols = list(cols)
-    if not tokens or not (len(tokens) == len(parents) == len(cols)):
-        return None
-    return tokens, parents, cols
+    return strip_verify_padding(*window)
 
 
 def _layer_slot_ids(slots) -> Tuple[Tuple[int, ...], ...]:
@@ -318,10 +334,7 @@ def _accepted_slots(req, lease: ClearTreeKVLease) -> Optional[List[int]]:
     if _logical_len(req) < int(lease.keep):
         return None
     if not (
-        len(lease.tokens)
-        == len(lease.parents)
-        == len(lease.cols)
-        == len(lease.depths)
+        len(lease.tokens) == len(lease.parents) == len(lease.cols) == len(lease.depths)
     ):
         return None
     kept: List[int] = []
@@ -350,15 +363,15 @@ def _accepted_slots(req, lease: ClearTreeKVLease) -> Optional[List[int]]:
 
 
 def _child_index(lease: ClearTreeKVLease, parent: int, token: int) -> Optional[int]:
-    for index, (node_parent, node_token) in enumerate(
-        zip(lease.parents, lease.tokens)
-    ):
+    for index, (node_parent, node_token) in enumerate(zip(lease.parents, lease.tokens)):
         if int(node_parent) == int(parent) and int(node_token) == int(token):
             return index
     return None
 
 
-def _install_accepted(scheduler, req, lease: ClearTreeKVLease, kept: Sequence[int]) -> bool:
+def _install_accepted(
+    scheduler, req, lease: ClearTreeKVLease, kept: Sequence[int]
+) -> bool:
     row = getattr(req, "req_pool_idx", None)
     pool = getattr(getattr(scheduler, "req_to_token_pool", None), "req_to_token", None)
     keep = int(lease.keep)
@@ -456,7 +469,9 @@ def _install_bonus_slot(scheduler, req, index: int, slot: int) -> bool:
     return True
 
 
-def accept_opt_bonus_guess(scheduler, req, lease: ClearTreeKVLease, kept: Sequence[int]) -> None:
+def accept_opt_bonus_guess(
+    scheduler, req, lease: ClearTreeKVLease, kept: Sequence[int]
+) -> None:
     """Install the guess at the rejected node when it is the bonus token.
 
     Every other guess is freed. The stored row becomes the next seed only
@@ -483,9 +498,7 @@ def accept_opt_bonus_guess(scheduler, req, lease: ClearTreeKVLease, kept: Sequen
         installed = _install_bonus_slot(scheduler, req, bonus_at, int(hit.slot))
     if installed:
         _draft_count(scheduler, "opt_bonus_hits")
-        _draft_count(
-            scheduler, f"opt_bonus_hit_rank_{min(int(hit.end_rank), 3)}"
-        )
+        _draft_count(scheduler, f"opt_bonus_hit_rank_{min(int(hit.end_rank), 3)}")
     if installed and bonus_at + 1 == _logical_len(req):
         req.opt_prefill_tail_logits = hit.logits.detach()
     release_opt_bonus_guesses(

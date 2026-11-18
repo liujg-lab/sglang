@@ -7,7 +7,7 @@ OPT or STANDALONE_REMOTE, and OPT must not pick up ClearTree fields.
 import ast
 import os
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
@@ -62,6 +62,40 @@ def _args(**overrides):
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _source_methods(relative_path, class_name, names, namespace=None):
+    """Execute production methods, not a test copy, without GPU-only imports."""
+    path = Path(__file__).resolve().parents[4] / relative_path
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    owner = (
+        next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
+        )
+        if class_name
+        else tree
+    )
+    methods = [
+        n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    if {m.name for m in methods} != set(names):
+        raise AssertionError(
+            f"Missing production methods: {set(names) - {m.name for m in methods}}"
+        )
+    for method in methods:
+        method.decorator_list = []
+    scope = {} if namespace is None else namespace
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            )
+        ]
+        + methods,
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+    return scope
 
 
 class ClearTreeRemoteShellTest(CustomTestCase):
@@ -128,10 +162,13 @@ class ClearTreeRemoteShellTest(CustomTestCase):
             SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(target),
             [65, 33, 17, 9, 5, 3, 1],
         )
-        self.assertEqual(
-            SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(draft),
-            [64, 32, 16, 8, 4, 2, 1],
-        )
+        with _bonus_prediction(None):
+            self.assertEqual(
+                SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                    draft
+                ),
+                [65, 64, 33, 32, 17, 16, 9, 8, 5, 4, 3, 2, 1],
+            )
         self.assertEqual(bonus_ntpbs(), (65, 33, 17, 9, 5, 3))
         self.assertEqual(
             SpeculativeAlgorithm.OPT_TREE_REMOTE.dual_ntpb_cuda_graph_options(opt),
@@ -167,13 +204,14 @@ class ClearTreeRemoteShellTest(CustomTestCase):
             )
             apply_clear_tree_settings(draft, on_npu=False)
             self.assertEqual(draft.speculative_num_draft_tokens, 8)
-            self.assertEqual(
-                SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
-                    draft
-                ),
-                [8, 4, 1],
-            )
-            self.assertEqual(bonus_ntpbs(), (9, 5))
+            with _bonus_prediction(None):
+                self.assertEqual(
+                    SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
+                        draft
+                    ),
+                    [17, 9, 8, 4, 1],
+                )
+            self.assertEqual(bonus_ntpbs(), (17, 9))
             rejected = _args(clear_tree_role="draft", clear_tree_widths=[1, 4])
             with self.assertRaises(ValueError):
                 apply_clear_tree_settings(rejected, on_npu=False)
@@ -229,8 +267,9 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         )
         self.assertEqual(local_spec_shape(opt), (7, 3, 7))
 
-        import sglang.srt.speculative.standalone_remote.sr_protocol as proto
         from pathlib import Path
+
+        import sglang.srt.speculative.standalone_remote.sr_protocol as proto
 
         source = Path(proto.__file__).read_text(encoding="utf-8").lower()
         self.assertNotIn("clear_tree", source)
@@ -773,7 +812,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 cached=cached,
                 kwargs=kwargs,
             )
-            return SimpleNamespace()
+            return SimpleNamespace(spec_info=SimpleNamespace(is_bonus=True))
 
         def run(_batch):
             if fail == "forward":
@@ -798,6 +837,10 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             yield common.alloc_token_slots, utils.assign_req_to_token_pool_func, batch, output
 
     def test_bonus_batch_one_allocation_forward_copy_and_owned_logits(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
         for count in (2, 3, 4):
             with self.subTest(count=count):
                 host, jobs, pool, freed = self._batch_fixture(count)
@@ -826,14 +869,26 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     "_read_bonus_slot_ids",
                     wraps=self.forward._read_bonus_slot_ids,
                 ) as read:
-                    self.forward._launch_bonus_batch(host, entries, width)
+                    self.assertTrue(self.forward._run_bonus_group(host, entries, width))
                 alloc.assert_called_once_with(host.tree_cache, count * width)
                 assign.assert_called_once()
                 batch.assert_called_once()
                 read.assert_called_once()
                 host.run_batch.assert_called_once()
                 host.tree_cache.evict.assert_not_called()
-                self.assertEqual(output["kwargs"], {"is_bonus": False})
+                self.assertEqual(output["kwargs"], {"is_bonus": True})
+                counts = get_sr_round_metrics(host, "Draft").counts
+                self.assertEqual(counts["opt_bonus_forwards"], 1)
+                self.assertEqual(counts["opt_bonus_graph"], 1)
+                self.assertEqual(counts["opt_bonus_requests"], count)
+                self.assertEqual(counts["opt_bonus_query_rows"], count * width)
+                self.assertEqual(
+                    counts["opt_bonus_padding_rows"],
+                    sum(width - 2 - i % 2 for i in range(count)),
+                )
+                self.assertFalse(
+                    any(name.startswith("opt_bonus_batch_") for name in counts)
+                )
                 self.assertEqual(output["positions"].tolist(), [3] * count * width)
                 self.assertEqual(output["cached"], [7 + i for i in range(count)])
                 offset = 0
@@ -901,7 +956,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     for job in jobs
                 ]
                 with self._batch_runtime(host) as (alloc, assign, batch, _output):
-                    self.forward._launch_bonus_batch(host, entries, 4)
+                    self.assertFalse(self.forward._run_bonus_group(host, entries, 4))
                 alloc.assert_not_called()
                 assign.assert_not_called()
                 batch.assert_not_called()
@@ -913,7 +968,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 if reason == "swa":
                     self.assertEqual(
                         get_sr_round_metrics(host, "Draft").counts[
-                            "opt_bonus_batch_skipped_allocator"
+                            "opt_bonus_skipped_allocator"
                         ],
                         1,
                     )
@@ -952,7 +1007,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                             )
                         )
                     with self.assertRaises(RuntimeError):
-                        self.forward._launch_bonus_batch(host, entries, 4)
+                        self.forward._run_bonus_group(host, entries, 4)
                 self.assertCountEqual(freed, range(100, 108))
                 self.assertTrue((pool == -1).all())
                 for job in jobs:
@@ -969,7 +1024,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         ]
         with self._batch_runtime(host) as (_alloc, assign, batch, _output):
             with self.assertRaisesRegex(RuntimeError, "alloc failed"):
-                self.forward._launch_bonus_batch(host, entries, 4)
+                self.forward._run_bonus_group(host, entries, 4)
         assign.assert_not_called()
         batch.assert_not_called()
         self.assertTrue((pool == -1).all())
@@ -985,7 +1040,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             side_effect=RuntimeError("free uncertain")
         )
         with self._batch_runtime(host), self.assertRaises(RuntimeError):
-            self.forward._launch_bonus_batch(host, entries, 4)
+            self.forward._run_bonus_group(host, entries, 4)
         host.token_to_kv_pool_allocator.free.assert_called_once()
         self.assertTrue(host._sr_device_poisoned)
         record = host._sr_kv_quarantine.records[0]
@@ -1008,7 +1063,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         with self._batch_runtime(host):
             host.run_batch.side_effect = poison
             with self.assertRaises(RuntimeError):
-                self.forward._launch_bonus_batch(host, entries, 4)
+                self.forward._run_bonus_group(host, entries, 4)
         self.assertEqual(freed, [])
         self.assertEqual(host._sr_kv_quarantine.records[0].owner.loc.numel(), 8)
 
@@ -1024,7 +1079,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             for i, job in enumerate(jobs)
         ]
         with self._batch_runtime(host):
-            self.forward._launch_bonus_batch(host, entries, 4)
+            self.forward._run_bonus_group(host, entries, 4)
         for i, job in enumerate(jobs):
             req = job.req
             req.origin_input_ids = list(range(3 + i))
@@ -1092,88 +1147,130 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                         return out
 
                     host.run_batch.side_effect = result
-                    self.forward._launch_bonus_batch(host, entries, 4)
+                    self.forward._run_bonus_group(host, entries, 4)
                 path = "unknown" if flag is None else ("graph" if flag else "eager")
                 self.assertEqual(
-                    get_sr_round_metrics(host, "Draft").counts[
-                        "opt_bonus_batch_" + path
-                    ],
+                    get_sr_round_metrics(host, "Draft").counts["opt_bonus_" + path],
                     1,
                 )
         host, jobs, _pool, _freed = self._batch_fixture()
         with _bonus_prediction("1"), patch.object(
             self.forward, "select_bonus_candidates", return_value=[self._candidate()]
         ), patch.object(
-            self.forward, "_bonus_batch_width", return_value=4
+            self.forward, "_bonus_width", return_value=(4, False)
         ), patch.object(
             self.forward,
-            "_launch_bonus_batch",
+            "_run_bonus_group",
             side_effect=RuntimeError("optional failure"),
-        ) as launch, patch.object(
-            self.forward, "_forward_bonus_candidates"
-        ) as serial:
+        ) as launch:
             self.forward.maybe_attach_bonus_guesses_many(host, jobs)
         launch.assert_called_once()
-        serial.assert_not_called()
         self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
 
-    def test_bonus_batch_width_checks_real_padded_layer_keys(self):
-        from sglang.srt.speculative.clear_tree_remote import clear_tree_width as widths
-
+    def test_bonus_width_uses_exact_batch_bonus_keys_and_eager_need(self):
         host, _jobs, _pool, _freed = self._batch_fixture()
         graph = SimpleNamespace(
             capture_bs=[1, 2, 4],
             disable_padding=False,
-            graphs={"r8_4": object(), "r16_4": object(), "r5_1_s0": object()},
-            _make_graph_key=lambda b, s, w: f"r{w}_{b}",
+            graphs={
+                "r17_1_s0": object(),
+                "r9_4_s0": object(),
+                "r33_4_s0": object(),
+                "r64_4": object(),
+            },
+            _make_graph_key=lambda b, s, w, extra=None: (
+                f"r{w}_{b}" + (f"_s{extra}" if extra is not None else "")
+            ),
         )
         host.req_to_token_pool.device = "cuda"
         host.model_worker = SimpleNamespace(
             model_runner=SimpleNamespace(graph_runner=graph)
         )
-        with patch.object(widths, "LAYER_WIDTHS", [4, 5, 8, 16]):
-            self.assertEqual(self.forward._bonus_batch_width(host, 3, 5), 8)
-            self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
-            self.assertEqual(self.forward._bonus_batch_width(host, 3, 65), 16)
-            self.assertIsNone(self.forward._bonus_batch_width(host, 5, 9))
-            graph.graphs.clear()
-            self.assertIsNone(self.forward._bonus_batch_width(host, 3, 9))
-            graph.disable_padding = True
-            self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
-            self.assertIsNone(self.forward._bonus_batch_width(host, 2, 9))
-            for device in ("cpu", "npu"):
-                # NPU torch.device is only available when torch_npu is loaded.
-                with patch.object(
-                    self.forward.torch,
-                    "device",
-                    return_value=SimpleNamespace(type=device),
-                ):
-                    self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
-            host.model_worker.model_runner.graph_runner = None
-            self.assertEqual(self.forward._bonus_batch_width(host, 3, 5), 5)
+        self.assertEqual(self.forward._bonus_width(host, 1, 17), (17, True))
+        self.assertEqual(self.forward._bonus_width(host, 4, 9), (9, True))
+        self.assertEqual(self.forward._bonus_width(host, 4, 65), (33, True))
+        # bs=3 must not reuse bs=4, even with ordinary graph padding enabled.
+        self.assertEqual(self.forward._bonus_width(host, 3, 17), (17, False))
+        graph.graphs.clear()
+        self.assertEqual(self.forward._bonus_width(host, 4, 65), (65, False))
+        host.model_worker.model_runner.graph_runner = None
+        self.assertEqual(self.forward._bonus_width(host, 4, 7), (7, False))
 
-    def test_bonus_many_truncates_by_rank_but_keeps_original_order(self):
+    def test_bonus_many_k16_k8_and_k64_use_17_9_and_split33_not_layer_width(self):
+        for count, k, expected, graphs_enabled in (
+            (1, 16, [17], True),
+            (4, 8, [9], True),
+            (4, 64, [33, 33], True),
+            (4, 64, [65], False),
+        ):
+            with self.subTest(count=count, k=k, graphs=graphs_enabled):
+                host, jobs, _pool, _freed = self._batch_fixture(count)
+                host.req_to_token_pool.device = "cuda"
+                host._clear_round_plan = SimpleNamespace(width=8 if count == 1 else 4)
+                graph = SimpleNamespace(
+                    capture_bs=[1, 2, 4],
+                    graphs=(
+                        {
+                            f"r{g}_{count}_s0": object()
+                            for g in (3, 5, 9, 17, 33) + ((65,) if count == 1 else ())
+                        }
+                        if graphs_enabled
+                        else {}
+                    ),
+                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}_s{extra}",
+                )
+                host.model_worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(graph_runner=graph)
+                )
+                plans = [self._candidate(i, i) for i in range(k + 1)]
+                with _bonus_prediction("1"), patch.object(
+                    self.forward, "select_bonus_candidates", return_value=plans
+                ), patch.object(
+                    self.forward, "_run_bonus_group", return_value=True
+                ) as launch:
+                    self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+                self.assertEqual([c.args[2] for c in launch.call_args_list], expected)
+                from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+                    get_sr_round_metrics,
+                )
+
+                counts = get_sr_round_metrics(host, "Draft").counts
+                self.assertEqual(counts["opt_bonus_rounds"], count)
+                self.assertEqual(
+                    counts["opt_bonus_groups_split"], count if len(expected) > 1 else 0
+                )
+                for job in jobs:
+                    actual = [
+                        p.token
+                        for c in launch.call_args_list
+                        for entry_job, chunk in c.args[1]
+                        if entry_job is job
+                        for p in chunk
+                        if p.keep
+                    ]
+                    self.assertEqual(actual, list(range(k + 1)))
+                self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_bonus_many_sorts_by_rank_without_truncation(self):
         host, jobs, _pool, _freed = self._batch_fixture()
         plans = [self._candidate(i, rank) for i, rank in enumerate((4, 1, 0, 3, 2))]
         with _bonus_prediction("1"), patch.object(
             self.forward, "select_bonus_candidates", return_value=plans
         ), patch.object(
-            self.forward, "_bonus_batch_width", return_value=4
+            self.forward, "_bonus_width", return_value=(3, True)
         ), patch.object(
-            self.forward, "_launch_bonus_batch"
-        ) as launch, patch.object(
-            self.forward, "_forward_bonus_candidates"
-        ) as serial:
+            self.forward, "_run_bonus_group", return_value=True
+        ) as launch:
             self.forward.maybe_attach_bonus_guesses_many(host, jobs)
-        launch.assert_called_once()
-        self.assertEqual(
-            [[p.token for p in chunk] for _, chunk in launch.call_args.args[1]],
-            [[1, 2, 3, 4]] * 2,
-        )
-        serial.assert_not_called()
+        self.assertEqual(launch.call_count, 2)
+        groups = [
+            [[p.token for p in chunk if p.keep] for _, chunk in c.args[1]]
+            for c in launch.call_args_list
+        ]
+        self.assertEqual(groups, [[[2, 1, 4]] * 2, [[3, 0]] * 2])
         self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
 
-    def test_bonus_many_filters_incomplete_and_preserves_single_lookahead(self):
+    def test_bonus_many_filters_incomplete_and_groups_single_lookahead(self):
         for mode in (
             "off",
             "single",
@@ -1201,20 +1298,541 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     "select_bonus_candidates",
                     return_value=[self._candidate()],
                 ), patch.object(
-                    self.forward,
-                    "_bonus_batch_width",
-                    return_value=None if mode == "no_graph" else 4,
+                    self.forward, "_bonus_width", return_value=(1, mode != "no_graph")
                 ), patch.object(
-                    self.forward, "_launch_bonus_batch"
-                ) as launch, patch.object(
-                    self.forward, "_forward_bonus_candidates"
-                ) as serial:
+                    self.forward, "_run_bonus_group", return_value=True
+                ) as launch:
                     self.forward.maybe_attach_bonus_guesses_many(host, jobs)
-                launch.assert_not_called()
-                self.assertEqual(
-                    serial.call_count, {"single": 1, "lookahead": 2}.get(mode, 0)
-                )
+                if mode in {"single", "lookahead", "no_graph"}:
+                    launch.assert_called_once()
+                    self.assertEqual(len(launch.call_args.args[1]), len(jobs))
+                else:
+                    launch.assert_not_called()
                 self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_bonus_many_replans_when_requests_finish_and_appends_every_candidate(self):
+        host, jobs, _pool, _freed = self._batch_fixture()
+        plans = [[self._candidate(i, i) for i in range(n)] for n in (2, 7)]
+        groups = []
+
+        def launch(_host, entries, width, *_args, **_kwargs):
+            groups.append((width, [job.req.rid for job, _ in entries]))
+            for job, chunk in entries:
+                old = list(getattr(job.req, "opt_bonus_guesses", []) or [])
+                job.req.opt_bonus_guesses = old + [p.token for p in chunk if p.keep]
+            return True
+
+        def width(_host, bs, need):
+            return (3, True) if bs == 2 else (need, False)
+
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "select_bonus_candidates", side_effect=plans
+        ), patch.object(
+            self.forward, "_bonus_width", side_effect=width
+        ) as choose, patch.object(
+            self.forward, "_run_bonus_group", side_effect=launch
+        ):
+            self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        self.assertEqual(groups, [(3, ["0", "1"]), (4, ["1"])])
+        self.assertEqual([c.args[1:] for c in choose.call_args_list], [(2, 7), (1, 4)])
+        self.assertEqual(jobs[0].req.opt_bonus_guesses, [0, 1])
+        self.assertEqual(jobs[1].req.opt_bonus_guesses, list(range(7)))
+
+    def test_bonus_many_skip_stops_without_retry_or_truncation(self):
+        host, jobs, _pool, _freed = self._batch_fixture()
+        with _bonus_prediction("1"), patch.object(
+            self.forward,
+            "select_bonus_candidates",
+            return_value=[self._candidate(i, i) for i in range(7)],
+        ), patch.object(
+            self.forward, "_bonus_width", return_value=(3, True)
+        ), patch.object(
+            self.forward, "_run_bonus_group", return_value=False
+        ) as launch:
+            self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        launch.assert_called_once()
+        self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_bonus_group_success_appends_without_releasing_previous_guesses(self):
+        host, jobs, pool, freed = self._batch_fixture()
+        allocations = iter((self.torch.arange(300, 308), self.torch.arange(400, 408)))
+        host.token_to_kv_pool_allocator.alloc.side_effect = lambda _n: next(allocations)
+        entries = [
+            (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+            for job in jobs
+        ]
+        with self._batch_runtime(host):
+            self.assertTrue(self.forward._run_bonus_group(host, entries, 4))
+            self.assertTrue(self.forward._run_bonus_group(host, entries, 4))
+        self.assertEqual(
+            [[g.slot for g in job.req.opt_bonus_guesses] for job in jobs],
+            [[300, 400], [304, 404]],
+        )
+        self.assertCountEqual(
+            freed, [301, 302, 303, 305, 306, 307, 401, 402, 403, 405, 406, 407]
+        )
+        self.assertTrue((pool == -1).all())
+        for job in jobs:
+            self.lease.release_opt_bonus_guesses(host, job.req)
+        self.assertCountEqual(freed, [*range(300, 308), *range(400, 408)])
+
+    def test_later_group_failure_keeps_previous_guesses_and_releases_only_new_slots(
+        self,
+    ):
+        host, jobs, pool, freed = self._batch_fixture()
+        allocations = iter((self.torch.arange(100, 108), self.torch.arange(200, 208)))
+        host.token_to_kv_pool_allocator.alloc.side_effect = lambda _n: next(allocations)
+        entries = [
+            (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+            for job in jobs
+        ]
+        with self._batch_runtime(host):
+            self.assertTrue(self.forward._run_bonus_group(host, entries, 4))
+        kept = [list(job.req.opt_bonus_guesses) for job in jobs]
+        with self._batch_runtime(host, fail="forward"):
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                self.forward._run_bonus_group(host, entries, 4)
+        self.assertEqual([job.req.opt_bonus_guesses for job in jobs], kept)
+        self.assertCountEqual(freed, [101, 102, 103, 105, 106, 107, *range(200, 208)])
+        self.assertTrue((pool == -1).all())
+        for job in jobs:
+            self.lease.release_opt_bonus_guesses(host, job.req)
+        self.assertCountEqual(freed, [*range(100, 108), *range(200, 208)])
+
+    def test_bonus_padding_repeats_safe_token_position_chain_without_keeping_slots(
+        self,
+    ):
+        real = self._candidate(31, 7, 0, (3, 5))
+        chunks = self.forward.bonus_verify_chunks([real], 3)
+        self.assertEqual(len(chunks), 1)
+        self.assertIs(chunks[0][0], real)
+        for pad in chunks[0][1:]:
+            self.assertEqual(pad.parent, real.parent)
+            self.assertFalse(pad.keep)
+            self.assertEqual((pad.token, pad.position, pad.chain), (31, 3, (3, 5)))
+        self.assertEqual(self.forward.bonus_verify_chunks([], 3), [])
+        with self.assertRaises(ValueError):
+            self.forward.bonus_verify_chunks([real], 0)
+
+    def test_verify_padding_tail_helper_rejects_interior_and_malformed_rows(self):
+        strip = self.lease.strip_verify_padding
+        real = ([20, 21], [-1, 0], [0, 0])
+        padded = ([20, 21, 777, 888], [-1, 0, -2, -2], [0, 0, -1, -1])
+        self.assertEqual(strip(*padded), real)
+        self.assertEqual(strip(*real), real)
+        self.assertEqual(padded[1], [-1, 0, -2, -2])
+        for window in (
+            ([], [], []),
+            ([9], [-2], [-1]),
+            ([20, 9, 21], [-1, -2, 0], [0, -1, 0]),
+            ([20], [-1, -2], [0]),
+            (None, [-1], [0]),
+            ([20], [object()], [0]),
+        ):
+            with self.subTest(window=window):
+                self.assertIsNone(strip(*window))
+
+    def test_finish_eight_real_nodes_plus_eight_padding_keeps_full_lease_span(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import (
+            ClearTreeState,
+            finish,
+            seed_from_topk,
+        )
+
+        host, jobs, pool, _freed = self._batch_fixture(1)
+        job = jobs[0]
+        state = ClearTreeState.create(
+            self.config.ClearTreeConfig(width=8, tau=-1.0, max_depth=4)
+        )
+        seed_from_topk(state, self.torch.ones(8) / 8, self.torch.arange(20, 28))
+        verify = finish(state, keep=16)
+        window = (verify.tokens.tolist(), verify.parents.tolist(), verify.cols.tolist())
+        self.assertEqual(window[1], [-1] * 8 + [-2] * 8)
+        job.runner.layer_slots = [self.torch.arange(100, 108)]
+        job.runner.cached_len = job.req.kv_allocated_len = 11
+        job.runner.bonus_ids = [
+            self.torch.tensor([*range(20, 28), 99]),
+            self.torch.arange(200, 272).reshape(8, 9),
+        ]
+        plans = self.forward.select_bonus_candidates(state, window, job.runner)
+        self.assertEqual(len(plans), 9)
+        self.assertEqual({p.parent for p in plans}, set(range(-1, 8)))
+        pool[0, 3:11] = self.torch.arange(100, 108)
+        self.assertTrue(
+            self.lease.publish_clear_tree_lease(host, job.req, job.runner, 3, window)
+        )
+        lease = job.req.clear_tree_lease
+        self.assertEqual(lease.tokens, tuple(range(20, 28)))
+        self.assertEqual(lease.layer_slots, (tuple(range(100, 108)),))
+        self.assertEqual(job.runner.cached_len, 11)
+        self.assertEqual(job.req.kv_allocated_len, 3)
+        self.assertTrue((pool[0, 3:11] == -1).all())
+        self.assertEqual(window[1], [-1] * 8 + [-2] * 8)
+
+    def test_padded_window_candidate_selection_publish_and_bonus_accept_close_loop(
+        self,
+    ):
+        host, jobs, pool, freed = self._batch_fixture(1)
+        job = jobs[0]
+        job.window = ([20, 21, 777, 888], [-1, 0, -2, -2], [0, 0, -1, -1])
+        job.runner.bonus_ids = [
+            self.torch.tensor([20, 8, 9]),
+            self.torch.tensor([[21, 30, 31], [22, 32, 33]]),
+            self.torch.tensor([[40, 41, 42], [43, 44, 45]]),
+        ]
+        plans = self.forward.select_bonus_candidates(job.state, job.window, job.runner)
+        self.assertEqual(
+            [(p.parent, p.token) for p in plans], [(-1, 8), (0, 30), (1, 40)]
+        )
+        self.assertCountEqual([p.end_rank for p in plans], [0, 1, 2])
+        self.assertEqual([p.chain for p in plans], [(), (3,), (5, 3)])
+        entries = [(job, self.forward.bonus_verify_chunks(plans, 4)[0])]
+        host.token_to_kv_pool_allocator.alloc.side_effect = lambda n: self.torch.arange(
+            300, 300 + n
+        )
+        with self._batch_runtime(host), patch.object(
+            self.forward, "_bind_bonus_cascade"
+        ):
+            self.assertTrue(
+                self.forward._run_bonus_group(
+                    host, entries, 4, self.forward._BonusBatch()
+                )
+            )
+        selected = next(g for g in job.req.opt_bonus_guesses if g.parent == 1)
+        seed = selected.logits.clone()
+        self.assertTrue(
+            self.lease.publish_clear_tree_lease(
+                host, job.req, job.runner, 3, job.window
+            )
+        )
+        lease = job.req.clear_tree_lease
+        self.assertEqual(
+            (lease.tokens, lease.parents, lease.cols), ((20, 21), (-1, 0), (0, 0))
+        )
+        self.assertEqual(lease.depths, (0, 1))
+        job.req.output_ids = [20, 21, 40]
+        job.req.sr_align_result = SimpleNamespace(kind="append_n", old_local_len=3)
+        self.lease.consume_clear_tree_lease(host, job.req)
+        self.assertEqual(pool[0, 3:6].tolist(), [100, 200, selected.slot])
+        self.assertEqual(job.req.kv_committed_len, 6)
+        self.assertTrue(
+            self.torch.equal(self.forward.take_cached_tail_logits(job.req, 6), seed)
+        )
+        self.assertIsNone(job.req.opt_bonus_guesses)
+        self.assertCountEqual(freed, [303, 300, 301, 101, 201])
+
+    def test_bonus_templates_are_cached_by_width_and_invalidated_by_pool(self):
+        host, _pool, _freed = self._host()
+        req = self._req()
+        host._opt_la_batches = {req.rid: {"pool_idx": req.req_pool_idx}}
+        first, second, delta = object(), object(), object()
+        self.forward._store_bonus_admit(host, req, 9, first, delta)
+        self.forward._store_bonus_admit(host, req, 17, second, None)
+        self.assertEqual(self.forward._load_bonus_admit(host, req, 9), (first, delta))
+        self.assertEqual(self.forward._load_bonus_admit(host, req, 17), (second, None))
+        self.assertIsNone(self.forward._load_bonus_admit(host, req, 33))
+        self.forward._store_bonus_admit(host, req, 9, None, None)
+        self.assertEqual(self.forward._load_bonus_admit(host, req, 9), (first, delta))
+        req.req_pool_idx += 1
+        self.assertIsNone(self.forward._load_bonus_admit(host, req, 9))
+        self.forward._store_bonus_admit(host, req, 9, second, None)
+        self.assertEqual(
+            host._opt_la_batches[req.rid]["bonus_templates"][9], (first, delta)
+        )
+        host._opt_la_batches[req.rid] = {"pool_idx": req.req_pool_idx}
+        self.assertIsNone(self.forward._load_bonus_admit(host, req, 17))
+
+    def test_single_cascade_admission_is_once_per_width_and_reuses_cached_template(
+        self,
+    ):
+        host, jobs, _pool, _freed = self._batch_fixture(1)
+        req = jobs[0].req
+        host._opt_la_batches = {req.rid: {"pool_idx": req.req_pool_idx}}
+        template, delta = object(), object()
+        self.forward._store_bonus_admit(host, req, 9, template, delta)
+        entries = [(jobs[0], [])]
+        executor = self.forward._BonusSingle()
+        with patch.object(
+            self.forward,
+            "_fill_bonus_schedule_batch",
+            return_value=SimpleNamespace(spec_info=SimpleNamespace(is_bonus=True)),
+        ), patch.object(
+            self.forward, "_lookahead_forward_template", return_value=None
+        ) as admit, patch.object(
+            self.forward,
+            "_bonus_template_forward",
+            return_value=(self.torch.zeros(1, 9, 3), "graph"),
+        ) as replay, patch.object(
+            self.forward, "_BonusBatch"
+        ) as batch:
+            executor(host, entries, 9, None, None, None, None, [7])
+            executor(host, entries, 9, None, None, None, None, [7])
+            admit.assert_not_called()
+            self.assertEqual(replay.call_count, 2)
+            self.assertIs(replay.call_args.args[2], template)
+            self.assertIs(replay.call_args.args[3], delta)
+            batch.assert_not_called()
+            executor(host, entries, 17, None, None, None, None, [7])
+            executor(host, entries, 17, None, None, None, None, [7])
+            admit.assert_called_once()
+            self.assertEqual(batch.return_value.call_count, 2)
+            self.assertEqual(replay.call_count, 2)
+
+    def test_single_real_template_forward_alternates_width_without_second_fallback(
+        self,
+    ):
+        torch = self.torch
+        host, jobs, _pool, _freed = self._batch_fixture(1)
+        req = jobs[0].req
+        host._opt_la_batches = {req.rid: {"pool_idx": req.req_pool_idx}}
+        batch = SimpleNamespace(
+            seq_lens=torch.zeros(1, dtype=torch.long),
+            orig_seq_lens=torch.zeros(1, dtype=torch.long),
+        )
+        forwarded = []
+
+        def admit(_host, schedule):
+            return SimpleNamespace(width=schedule.spec_info.draft_token_num)
+
+        def refresh(template, schedule, _delta):
+            self.assertEqual(template.width, schedule.spec_info.draft_token_num)
+            template.spec_info = schedule.spec_info
+            return template
+
+        def forward(template):
+            forwarded.append(template)
+            return SimpleNamespace(
+                can_run_graph=False,
+                logits_output=SimpleNamespace(
+                    next_token_logits=torch.zeros(template.width, 3)
+                ),
+            )
+
+        host.model_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(forward=Mock(side_effect=forward))
+        )
+        host.run_batch = Mock()
+        executor = self.forward._BonusSingle()
+        with patch.object(
+            self.forward, "_lookahead_batch", return_value=batch
+        ), patch.object(self.forward, "_bind_bonus_cascade"), patch.object(
+            self.forward, "_bonus_width", side_effect=lambda _h, _bs, g: (g, False)
+        ), patch.object(
+            self.forward, "_lookahead_forward_template", side_effect=admit
+        ) as admission, patch.object(
+            self.forward, "_mrope_delta_from_template", return_value=None
+        ), patch.object(
+            self.forward, "_refresh_lookahead_forward", side_effect=refresh
+        ), patch.object(
+            self.forward, "_BonusBatch"
+        ) as fallback:
+            for width in (9, 17, 9, 17):
+                logits, path = executor(
+                    host,
+                    [(jobs[0], [])],
+                    width,
+                    torch.zeros(1, width),
+                    torch.zeros(width),
+                    torch.ones(width * (7 + width)),
+                    torch.arange(width),
+                    [7],
+                )
+                self.assertEqual(len(logits), 1)
+                self.assertEqual((tuple(logits[0].shape), path), ((width, 3), "eager"))
+                self.assertTrue(batch.spec_info.bonus_eager)
+                self.assertTrue(batch.spec_info.is_bonus)
+            self.assertEqual(admission.call_count, 2)
+            self.assertIs(forwarded[0], forwarded[2])
+            self.assertIs(forwarded[1], forwarded[3])
+            self.assertIsNot(forwarded[0], forwarded[1])
+            # A new per-round executor still uses the host's G-specific cache.
+            fresh = self.forward._BonusSingle()
+            fresh(
+                host,
+                [(jobs[0], [])],
+                9,
+                torch.zeros(1, 9),
+                torch.zeros(9),
+                torch.ones(9 * 16),
+                torch.arange(9),
+                [7],
+            )
+            self.assertEqual(admission.call_count, 2)
+            host.model_worker.model_runner.forward.side_effect = RuntimeError(
+                "submitted forward failed"
+            )
+            with self.assertRaisesRegex(RuntimeError, "submitted forward failed"):
+                fresh(
+                    host,
+                    [(jobs[0], [])],
+                    9,
+                    torch.zeros(1, 9),
+                    torch.zeros(9),
+                    torch.ones(9 * 16),
+                    torch.arange(9),
+                    [7],
+                )
+            fallback.assert_not_called()
+            host.run_batch.assert_not_called()
+        self.assertEqual(host.model_worker.model_runner.forward.call_count, 6)
+
+    def test_batch_gather_graph_rejection_sets_eager_and_blocks_downstream_admission(
+        self,
+    ):
+        for gather in (None, "require_mlp_tp_gather", "require_attn_tp_gather"):
+            with self.subTest(gather=gather):
+                host, jobs, _pool, _freed = self._batch_fixture()
+                host.req_to_token_pool.device = "cuda"
+                graph = SimpleNamespace(
+                    capture_bs=[1, 2, 4],
+                    graphs={"r9_2_s0": object()},
+                    _make_graph_key=lambda b, s, w, extra=None: f"r{w}_{b}_s{extra}",
+                )
+                if gather is not None:
+                    setattr(graph, gather, True)
+                host.model_worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(graph_runner=graph)
+                )
+                with self._batch_runtime(host):
+                    self.forward._BonusBatch()(
+                        host,
+                        [(job, []) for job in jobs],
+                        9,
+                        self.torch.zeros(2, 9),
+                        self.torch.zeros(18),
+                        self.torch.ones(288),
+                        self.torch.arange(18),
+                        [7, 8],
+                    )
+                self.assertEqual(
+                    host.cur_batch.spec_info.bonus_eager, gather is not None
+                )
+                spec = self.forward.OptLayerSpec(
+                    custom_mask=None,
+                    positions=None,
+                    draft_token_num=9,
+                    num_tokens_per_req=9,
+                    is_bonus=True,
+                    bonus_eager=host.cur_batch.spec_info.bonus_eager,
+                )
+                self.assertEqual(
+                    self.forward.opt_layer_verify_graph_matches(spec, 9), gather is None
+                )
+                host.run_batch.assert_called_once()
+
+    def test_previous_guess_free_failure_quarantines_without_new_forward_or_retry(self):
+        host, jobs, _pool, freed = self._batch_fixture()
+        old = [
+            self.lease.OptBonusGuess(
+                parent=-1, token=8, slot=300, logits=self.torch.zeros(3)
+            )
+        ]
+        jobs[0].req.opt_bonus_guesses = old
+        host._sr_clear_stamps_after_poison = Mock()
+        host.token_to_kv_pool_allocator.free = Mock(
+            side_effect=RuntimeError("previous free uncertain")
+        )
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "select_bonus_candidates", return_value=[self._candidate()]
+        ), patch.object(self.forward, "_run_bonus_group") as launch:
+            with self.assertRaisesRegex(RuntimeError, "previous free uncertain"):
+                self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        launch.assert_not_called()
+        self.assertTrue(host._sr_device_poisoned)
+        host._sr_clear_stamps_after_poison.assert_called_once()
+        self.assertIsNone(jobs[0].req.opt_bonus_guesses)
+        record = host._sr_kv_quarantine.records[0]
+        self.assertIs(record.owner.previous_guesses, old)
+        self.assertTrue(record.owner.release_unknown)
+        self.assertIsNotNone(record.release_error)
+        self.assertEqual(
+            host._sr_kv_quarantine.reclaim(host.token_to_kv_pool_allocator), 0
+        )
+        host.token_to_kv_pool_allocator.free.assert_called_once()
+        self.assertEqual(freed, [])
+        self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_lease_publish_failed_count_only_records_applicable_page1_attempts(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        for mode in (
+            "false",
+            "exception",
+            "success",
+            "finished",
+            "page128",
+            "not_expanded",
+            "poisoned",
+        ):
+            with self.subTest(mode=mode):
+                host, _pool, _freed = self._host(finished=mode == "finished")
+                job = self._job(host, complete=True)
+                if mode == "page128":
+                    host.tree_cache.page_size = 128
+                host._sr_device_poisoned = mode == "poisoned"
+                with patch.object(
+                    self.lease,
+                    "publish_clear_tree_lease",
+                    return_value=mode == "success",
+                    side_effect=(
+                        RuntimeError("publish failed") if mode == "exception" else None
+                    ),
+                ) as publish:
+                    self.forward._publish_or_rollback(
+                        host, job.req, job.runner, 3, job.window, mode != "not_expanded"
+                    )
+                expected = int(mode in {"false", "exception"})
+                self.assertEqual(
+                    get_sr_round_metrics(host, "Draft").counts[
+                        "opt_lease_publish_failed"
+                    ],
+                    expected,
+                )
+                self.assertEqual(
+                    publish.call_count,
+                    int(mode not in {"finished", "not_expanded", "poisoned"}),
+                )
+                self.assertEqual(
+                    host._clear_rollback.call_count,
+                    int(mode not in {"success", "poisoned"}),
+                )
+
+    def test_bonus_group_default_executor_selects_single_cascade_or_batch(self):
+        from types import ModuleType
+
+        attention = ModuleType(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_attention"
+        )
+        for count, cascade in ((1, True), (1, False), (2, True)):
+            with self.subTest(count=count, cascade=cascade):
+                host, jobs, _pool, _freed = self._batch_fixture(count)
+                entries = [
+                    (job, self.forward.bonus_verify_chunks([self._candidate()], 3)[0])
+                    for job in jobs
+                ]
+                attention._attention_for = Mock(
+                    return_value=object() if cascade else None
+                )
+                logits = self.torch.zeros(count, 3, 4)
+                single, batch = Mock(return_value=(logits, "graph")), Mock(
+                    return_value=(logits, "eager")
+                )
+                with self._batch_runtime(host), patch.dict(
+                    "sys.modules", {attention.__name__: attention}
+                ), patch.object(
+                    self.forward, "_BonusSingle", return_value=single
+                ), patch.object(
+                    self.forward, "_BonusBatch", return_value=batch
+                ):
+                    self.assertTrue(self.forward._run_bonus_group(host, entries, 3))
+                selected, unused = (
+                    (single, batch) if count == 1 and cascade else (batch, single)
+                )
+                selected.assert_called_once()
+                unused.assert_not_called()
+                host.run_batch.assert_not_called()
 
     def test_deferred_flush_batches_before_publishing(self):
         host, jobs, _pool, _freed = self._batch_fixture()
@@ -1224,8 +1842,9 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             events.append("layer")
             return [], 1
 
-        def launch(_host, _entries, _width):
+        def launch(_host, _entries, _width, *_args, **_kwargs):
             events.append("bonus")
+            return True
 
         def publish(*_args):
             self.assertTrue(all(not j.runner.bonus_ids for j in jobs))
@@ -1236,30 +1855,46 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         ), patch.object(
             self.forward, "select_bonus_candidates", return_value=[self._candidate()]
         ), patch.object(
-            self.forward, "_bonus_batch_width", return_value=4
+            self.forward, "_bonus_width", return_value=(4, False)
         ), patch.object(
-            self.forward, "_launch_bonus_batch", side_effect=launch
+            self.forward, "_run_bonus_group", side_effect=launch
         ), patch.object(
             self.forward, "_publish_or_rollback", side_effect=publish
         ):
             self.forward.forward_deferred_final_layers(host, jobs)
         self.assertEqual(events, ["layer", "bonus", "publish", "publish"])
 
-    def test_bonus_prediction_flag_defaults_off_and_accepts_explicit_values(self):
-        for value, expected in ((None, False), ("0", False), ("1", True)):
+    def test_bonus_prediction_flag_defaults_on_and_accepts_explicit_values(self):
+        for value, expected in (
+            (None, True),
+            ("0", False),
+            ("", False),
+            ("false", False),
+            ("unexpected", False),
+            ("1", True),
+            ("true", True),
+            (" YES ", True),
+            ("y", True),
+        ):
             with self.subTest(value=value), _bonus_prediction(value):
                 self.assertIs(self.config.bonus_prediction_enabled(), expected)
 
+    def test_bonus_default_does_not_enable_other_diagnostic_flags(self):
+        with _bonus_prediction(None), patch.dict(os.environ):
+            os.environ.pop("SGLANG_CLEAR_DRAFT_LOOKAHEAD", None)
+            os.environ.pop("SGLANG_CLEAR_PROBE_LAYER_WAIT", None)
+            self.assertTrue(self.config.bonus_prediction_enabled())
+            self.assertFalse(self.config.opt_draft_lookahead_enabled())
+            self.assertFalse(self.config.opt_probe_layer_wait_enabled())
+
     def test_disabled_attach_drops_ids_without_selection_or_forward(self):
-        for value in (None, "0"):
+        for value in ("0", ""):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 job = self._job(host)
                 with patch.object(
                     self.forward, "select_bonus_candidates"
-                ) as select, patch.object(
-                    self.forward, "_forward_bonus_candidates"
-                ) as predict:
+                ) as select, patch.object(self.forward, "_run_bonus_group") as predict:
                     self.forward.maybe_attach_bonus_guesses(host, job)
                 select.assert_not_called()
                 predict.assert_not_called()
@@ -1268,7 +1903,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
 
     def test_disabled_append_does_not_run_dedicated_topk(self):
         torch = self.torch
-        for value, expected_calls in ((None, 0), ("0", 0), ("1", 1)):
+        for value, expected_calls in ((None, 1), ("0", 0), ("1", 1)):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 runner = SimpleNamespace(scheduler=host, bonus_ids=[])
@@ -1283,7 +1918,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
 
     def test_deferred_final_layer_publishes_lease_and_leaves_only_real_bonus(self):
         torch = self.torch
-        for value in (None, "0"):
+        for value in ("0", ""):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, pool, freed = self._host()
                 job = self._job(host)
@@ -1300,7 +1935,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 with patch.object(
                     self.forward, "_forward_verify_fitting", side_effect=fitting
                 ) as fit, patch.object(
-                    self.forward, "_forward_bonus_candidates"
+                    self.forward, "_run_bonus_group"
                 ) as predict, patch.object(
                     self.forward, "_host_bonus_ids"
                 ) as topk:
@@ -1338,7 +1973,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         )
 
         for depths, expected in (((2, 2), [["a", "b"]]), ((1, 2), [["a"], ["b"]])):
-            with self.subTest(depths=depths), _bonus_prediction(None):
+            with self.subTest(depths=depths), _bonus_prediction("0"):
                 host, _pool, _freed = self._host()
                 jobs = [self._job(host), self._job(host)]
                 for job, rid, depth in zip(jobs, ("a", "b"), depths):
@@ -1365,7 +2000,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
     def test_deferred_failure_drops_partial_layer_and_finished_releases_tree(self):
         torch = self.torch
         for finished in (False, True):
-            with self.subTest(finished=finished), _bonus_prediction(None):
+            with self.subTest(finished=finished), _bonus_prediction("0"):
                 host, pool, freed = self._host(finished=finished)
                 job = self._job(host)
                 pool[0, 3:5] = torch.tensor([100, 101])
@@ -1405,17 +2040,19 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 job.runner._alloc_layer_slots = Mock()
                 pool[0, 3:7] = self.torch.tensor([100, 101, 200, 201])
                 events = []
-                plans = [object()]
+                plans = [self._candidate()]
                 publish = self.forward._publish_or_rollback
 
-                def predict(_host, runner, selected):
-                    self.assertIs(selected, plans)
+                def predict(_host, entries, width, *_args, **_kwargs):
+                    self.assertIs(entries[0][0], job)
+                    self.assertEqual([p for p in entries[0][1] if p.keep], plans)
                     self.assertIsNone(job.req.clear_tree_lease)
                     self.assertEqual(pool[0, 3:7].tolist(), [100, 101, 200, 201])
-                    self.assertTrue(runner.bonus_ids)
+                    self.assertTrue(job.runner.bonus_ids)
                     events.append("predict")
                     if fail:
                         raise RuntimeError("bonus failed")
+                    return True
 
                 def published(*args):
                     self.assertEqual(job.runner.bonus_ids, [])
@@ -1425,7 +2062,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 with patch.object(
                     self.forward, "select_bonus_candidates", return_value=plans
                 ), patch.object(
-                    self.forward, "_forward_bonus_candidates", side_effect=predict
+                    self.forward, "_run_bonus_group", side_effect=predict
                 ), patch.object(
                     self.forward, "_publish_or_rollback", side_effect=published
                 ), patch.object(
@@ -1474,9 +2111,9 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 self.lease.release_opt_bonus_guesses(host, req)
                 self.assertEqual(len(freed), 2 if hit else 3)
 
-    def test_lookahead_runtime_bonus_buffer_is_opt_in(self):
+    def test_lookahead_runtime_bonus_buffer_follows_prediction_flag(self):
         torch = self.torch
-        for value, enabled in ((None, False), ("0", False), ("1", True)):
+        for value, enabled in ((None, True), ("0", False), ("1", True)):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 runner = SimpleNamespace(req=self._req())
@@ -1508,7 +2145,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         # A one-layer tree still launches its final layer, but must not score
         # that layer solely to predict bonus ids when prediction is disabled.
         config = self.config.ClearTreeConfig(width=2, tau=-1.0, max_depth=2)
-        for value, enabled in ((None, False), ("0", False), ("1", True)):
+        for value, enabled in ((None, True), ("0", False), ("1", True)):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 runner = SimpleNamespace(
@@ -1545,7 +2182,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     bonus.copy.assert_called_once()
 
     def test_lookahead_without_bonus_waits_before_publish_and_never_reforwards(self):
-        with _bonus_prediction(None):
+        with _bonus_prediction("0"):
             host, _pool, _freed = self._host()
             job = self._job(host, complete=True)
             runner = job.runner
@@ -1574,7 +2211,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             with patch.object(
                 self.forward, "_forward_verify_fitting"
             ) as fit, patch.object(
-                self.forward, "_forward_bonus_candidates"
+                self.forward, "_run_bonus_group"
             ) as predict, patch.object(
                 self.forward, "_publish_or_rollback", side_effect=published
             ):
@@ -1591,13 +2228,13 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
 
     def test_lookahead_disabled_omits_candidate_copies_and_bonus_kv_budget(self):
         torch = self.torch
-        for value, enabled in ((None, False), ("0", False), ("1", True)):
+        for value, enabled in ((None, True), ("0", False), ("1", True)):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 host.server_args.clear_tree_max_depth = 4
                 self.assertEqual(
                     self.forward._lookahead_kv_need(host, 1),
-                    7 + (3 if enabled else 0),
+                    7 + (65 if enabled else 0),
                 )
 
                 def cpu_empty(*args, **kwargs):
@@ -1620,9 +2257,94 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 self.assertEqual(slot.clone_cpu()[3] is not None, enabled)
                 self.assertEqual(slot.event.synchronize.call_count, 2)
 
+    def test_lookahead_budget_reserves_maximum_bonus_and_conservative_split_tail(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        install_candidates(None, None)
+        self.addCleanup(install_candidates, None, None)
+        for width, expected in ((65, 72), (33, 73), (17, 75), (9, 79)):
+            with self.subTest(width=width), _bonus_prediction("1"):
+                host, _pool, _freed = self._host()
+                host.server_args.clear_tree_max_depth = 4
+                host.tree_cache.token_to_kv_pool_allocator = (
+                    host.token_to_kv_pool_allocator
+                )
+                available = Mock(return_value=expected - 1)
+                host.token_to_kv_pool_allocator.available_size = available
+                with patch.object(
+                    self.forward, "_bonus_width", return_value=(width, True)
+                ) as choose:
+                    self.assertEqual(self.forward._lookahead_kv_need(host, 1), expected)
+                    self.assertTrue(self.forward._lookahead_would_evict(host, 1))
+                    available.return_value = expected
+                    self.assertFalse(self.forward._lookahead_would_evict(host, 1))
+                choose.assert_called_with(host, 1, 65)
+        with _bonus_prediction("0"), patch.object(
+            self.forward, "_bonus_width"
+        ) as choose:
+            self.assertEqual(self.forward._lookahead_kv_need(host, 1), 7)
+        choose.assert_not_called()
+
+    def test_cascade_workspace_capacity_is_static_across_layer_and_bonus_widths(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        self.addCleanup(install_candidates, None, None)
+        install_candidates([4, 8], [8, 64])
+        allocated = []
+
+        def allocate(device, queries, heads, dim, context, columns):
+            workspace = SimpleNamespace(
+                device=device,
+                max_queries=queries,
+                heads=heads,
+                dim=dim,
+                max_prefix=context,
+                max_tree=columns,
+            )
+            allocated.append(workspace)
+            return workspace
+
+        namespace = _source_methods(
+            "python/sglang/srt/speculative/clear_tree_remote/clear_tree_attention.py",
+            None,
+            {"_query_capacities", "tree_limit", "ensure_workspace"},
+            {
+                "torch": self.torch,
+                "_WORKSPACE": None,
+                "_Workspace": SimpleNamespace(allocate=allocate),
+            },
+        )
+        backend = SimpleNamespace(
+            device="cpu",
+            num_draft_tokens=4,
+            speculative_num_steps=8,
+            num_head=2,
+            v_head_dim=16,
+            max_context_len=128,
+        )
+        with _bonus_prediction(None):
+            self.assertEqual(namespace["tree_limit"](backend), 7 * 8 + 65)
+            first = namespace["ensure_workspace"](backend, 4)
+            self.assertEqual((first.max_queries, first.max_tree), (65, 121))
+            for width in (8, 9, 17, 33, 65, 4):
+                self.assertIs(namespace["ensure_workspace"](backend, width), first)
+            self.assertEqual(len(allocated), 1)
+        namespace["_WORKSPACE"] = None
+        with _bonus_prediction("0"):
+            without_bonus = namespace["ensure_workspace"](backend, 4)
+            self.assertEqual(
+                (without_bonus.max_queries, without_bonus.max_tree), (8, 56)
+            )
+            backend.speculative_num_steps = 0
+            self.assertEqual(namespace["tree_limit"](backend), 8)
+
     def test_lookahead_failed_wait_requires_completion_before_lease_publish(self):
         for sync_fails in (False, True):
-            with self.subTest(sync_fails=sync_fails), _bonus_prediction(None):
+            with self.subTest(sync_fails=sync_fails), _bonus_prediction("0"):
                 host, _pool, freed = self._host()
                 host.device = "cpu"
                 host._sr_clear_stamps_after_poison = Mock()
@@ -1660,7 +2382,276 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 else:
                     self.assertIsNotNone(job.req.clear_tree_lease)
 
-    def test_bonus_capture_graphs_are_opt_in_without_changing_layer_or_target(self):
+    def test_lookahead_bonus_copy_failed_wait_requires_confirmed_completion_before_publish(
+        self,
+    ):
+        for sync_fails in (False, True):
+            with self.subTest(sync_fails=sync_fails), _bonus_prediction("1"):
+                host, pool, freed = self._host()
+                host.device = "cpu"
+                host._sr_clear_stamps_after_poison = Mock()
+                job = self._job(host, complete=True)
+                pool[0, 3:7] = self.torch.tensor([100, 101, 200, 201])
+                runner = job.runner
+                runner.lookahead_inflight = True
+                bonus = self.forward._PinnedBonus.__new__(self.forward._PinnedBonus)
+                bonus.ready = True
+                bonus.ids = self.torch.tensor([[1, 2, 3], [4, 5, 6]])
+                bonus.event = SimpleNamespace(
+                    synchronize=Mock(
+                        side_effect=RuntimeError("bonus copy event failed")
+                    )
+                )
+                runner._lookahead_bonus = bonus
+                sync = Mock(
+                    side_effect=(
+                        RuntimeError("completion unknown") if sync_fails else None
+                    )
+                )
+                publish = self.lease.publish_clear_tree_lease
+                with patch.object(
+                    self.torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(synchronize=sync),
+                ), patch.object(
+                    self.forward, "_forward_verify_fitting"
+                ) as fit, patch.object(
+                    self.forward, "_run_bonus_group"
+                ) as launch, patch.object(
+                    self.lease, "publish_clear_tree_lease", wraps=publish
+                ) as published:
+                    self.forward.forward_deferred_final_layers(host, [job])
+                    self.forward._settle_lookahead_job(host, job)
+                bonus.event.synchronize.assert_called_once()
+                sync.assert_called_once()
+                fit.assert_not_called()
+                launch.assert_not_called()
+                self.assertFalse(runner.lookahead_inflight)
+                self.assertTrue(runner._lookahead_satisfied)
+                self.assertTrue(runner.lookahead_dropped)
+                self.assertEqual(host._sr_device_poisoned, sync_fails)
+                self.assertEqual(
+                    host._sr_clear_stamps_after_poison.call_count, int(sync_fails)
+                )
+                self.assertEqual(published.call_count, int(not sync_fails))
+                self.assertEqual(freed, [])
+                host._clear_rollback.assert_not_called()
+                if sync_fails:
+                    self.assertIsNone(job.req.clear_tree_lease)
+                    self.assertEqual(pool[0, 3:7].tolist(), [100, 101, 200, 201])
+                else:
+                    self.assertEqual(
+                        job.req.clear_tree_lease.layer_slots, ((100, 101), (200, 201))
+                    )
+                    self.assertEqual(pool[0, 3:7].tolist(), [-1] * 4)
+                self.assertEqual(runner.bonus_ids, [])
+
+    def test_capture_mask_capacity_retains_replacements_and_reuses_sufficient_shared_buffer(
+        self,
+    ):
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_graph as graph
+
+        torch = self.torch
+        shared = torch.ones(100, dtype=torch.bool)
+        runner = SimpleNamespace(
+            seq_len_fill_value=5, buffers=SimpleNamespace(custom_mask=shared)
+        )
+        small = graph._capture_mask(runner, 6, 3)
+        self.assertEqual(small.numel(), 48)
+        self.assertEqual(small.data_ptr(), shared.data_ptr())
+        self.assertFalse(hasattr(runner, "_clear_tree_capture_masks"))
+        for bs, width in ((1, 65), (4, 33), (2, 17)):
+            required = bs * width * (5 + width)
+            replacement = graph._capture_mask(runner, bs * width, width)
+            self.assertEqual(replacement.numel(), required)
+            self.assertEqual(replacement.dtype, shared.dtype)
+            self.assertEqual(replacement.device, shared.device)
+            self.assertTrue(replacement.all())
+            self.assertIs(runner._clear_tree_capture_masks[required], replacement)
+            self.assertIs(graph._capture_mask(runner, bs * width, width), replacement)
+        # The production capture hook must pass the grown mask into its spec.
+        runner.model_runner = SimpleNamespace(
+            server_args=_args(clear_tree_role="draft")
+        )
+        runner.buffers.positions = torch.arange(132)
+        runner.num_tokens_per_bs = 64
+        runner._active_capture_extra = 0
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_attention as attention,
+        )
+
+        with patch.object(attention, "capture_attention", return_value=None):
+            spec = graph.ClearTreeGraphCapture.capture_verify_spec(
+                runner, 132, 33, True
+            )
+        self.assertIs(spec.custom_mask, runner._clear_tree_capture_masks[132 * 38])
+        self.assertEqual(spec.positions.numel(), 132)
+        self.assertTrue(spec.is_bonus)
+        self.assertEqual(spec.draft_token_num, 33)
+
+    def _shared_cuda_runner(self, **overrides):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
+            ClearTreeGraphCapture,
+        )
+
+        mode = SimpleNamespace(
+            DECODE=SimpleNamespace(is_target_verify=lambda: False),
+            TARGET_VERIFY=SimpleNamespace(is_target_verify=lambda: True),
+        )
+        namespace = dict(
+            torch=self.torch,
+            ForwardMode=mode,
+            CaptureHiddenMode=SimpleNamespace(NULL=0),
+            _uses_dual_ntpb=lambda _runner: True,
+            _dual_ntpb_log_tag=lambda _runner: "test",
+            _is_spectre=lambda _runner: False,
+            empty_context=nullcontext,
+            freeze_gc=lambda *_a, **_kw: nullcontext(),
+            graph_capture=lambda **_kw: nullcontext(SimpleNamespace(stream=object())),
+            patch_model=lambda *_a, **_kw: nullcontext(object()),
+            get_available_gpu_memory=lambda *_a, **_kw: 100.0,
+            get_tensor_model_parallel_rank=lambda: 1,
+            get_current_stream_idx=lambda: None,
+            log_info_on_rank0=Mock(),
+            logger=Mock(),
+            cuda_graph_hidden_mode_can_run=lambda requested, captured: requested
+            <= captured,
+            decode_cuda_graph_accepts_spec_info=lambda _spec: True,
+        )
+        names = {
+            "capture",
+            "can_run",
+            "_capture_extra_keys",
+            "_replay_graph_extra",
+            "_graph_bs_supported",
+            "_make_graph_key",
+            "_graph_key_captured",
+            "_get_actual_ntpb",
+        }
+        scope = _source_methods(
+            "python/sglang/srt/model_executor/cuda_graph_runner.py",
+            "CudaGraphRunner",
+            names,
+            namespace,
+        )
+        runner_type = type(
+            "ExtractedCudaGraphRunner", (), {name: scope[name] for name in names}
+        )
+        runner = runner_type()
+        args = _args(clear_tree_role="draft", speculative_num_draft_tokens=64)
+        args.enable_cudagraph_gc = False
+        runner.model_runner = SimpleNamespace(
+            server_args=args,
+            spec_algorithm=SpeculativeAlgorithm.CLEAR_TREE_REMOTE,
+            device="cuda",
+            gpu_id=0,
+            model=object(),
+            tp_group=None,
+        )
+        runner.enable_profile_cuda_graph = False
+        runner.enable_pdmux = False
+        runner.require_mlp_tp_gather = False
+        runner.require_mlp_sync = False
+        runner.disable_padding = False
+        runner.enable_two_batch_overlap = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = 0
+        runner.capture_forward_mode = mode.TARGET_VERIFY
+        runner.capture_bs = [1, 2, 4]
+        runner.compile_bs = []
+        runner.max_bs = 4
+        runner.max_num_token = 256
+        runner.num_tokens_per_bs = 64
+        runner.spectre_ntpb_options = ClearTreeGraphCapture.dual_ntpb_options(args)
+        runner.graphs = {}
+        runner.output_buffers = {}
+        runner.capture_one_batch_size = Mock(
+            side_effect=lambda *_a, **_kw: (object(), object())
+        )
+        for name, value in overrides.items():
+            setattr(runner, name, value)
+        return runner, mode
+
+    def test_shared_capture_executes_default_38_graphs_and_skips_oversized_bonus(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        install_candidates(None, None)
+        self.addCleanup(install_candidates, None, None)
+        with _bonus_prediction(None):
+            runner, _mode = self._shared_cuda_runner()
+            runner.capture()
+        expected = {
+            f"r{w}_{bs}" for bs in (1, 2, 4) for w in (1, 2, 4, 8, 16, 32, 64)
+        } | {
+            f"r{g}_{bs}_s0"
+            for bs in (1, 2, 4)
+            for g in (3, 5, 9, 17, 33, 65)
+            if bs * g <= 256
+        }
+        self.assertEqual(set(runner.graphs), expected)
+        self.assertEqual(len(runner.graphs), 38)
+        self.assertEqual(runner.capture_one_batch_size.call_count, 38)
+        self.assertNotIn("r65_4_s0", runner.graphs)
+        self.assertIn("r33_4_s0", runner.graphs)
+
+    def test_shared_can_run_extra_requires_exact_batch_and_suffixed_key(self):
+        with _bonus_prediction("1"):
+            runner, mode = self._shared_cuda_runner()
+            spec = self.forward.OptLayerSpec(
+                custom_mask=None,
+                positions=None,
+                draft_token_num=9,
+                num_tokens_per_req=9,
+                capture_hidden_mode=0,
+                is_bonus=True,
+            )
+            batch = SimpleNamespace(
+                batch_size=3,
+                forward_mode=mode.TARGET_VERIFY,
+                spec_info=spec,
+                capture_hidden_mode=0,
+            )
+            runner.graphs = {"r9_4_s0": object(), "r9_3": object()}
+            self.assertFalse(runner.can_run(batch))
+            runner.graphs["r9_3_s0"] = object()
+            self.assertTrue(runner.can_run(batch))
+            del runner.graphs["r9_3_s0"]
+            batch.batch_size = 4
+            self.assertTrue(runner.can_run(batch))
+            spec.is_bonus = False
+            self.assertIsNone(runner._replay_graph_extra(batch))
+
+    def test_capture_k_plus_one_is_independent_of_w_and_intersection_has_two_keys(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
+            ClearTreeGraphCapture,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            install_candidates,
+        )
+
+        self.addCleanup(install_candidates, None, None)
+        install_candidates([3, 4, 8], [2, 8, 16])
+        args = _args(clear_tree_role="draft", speculative_num_draft_tokens=8)
+        with _bonus_prediction("1"):
+            self.assertEqual(self.forward.opt_draft_bonus_ntpbs(args), [17, 9, 3])
+            self.assertEqual(
+                ClearTreeGraphCapture.dual_ntpb_options(args), [17, 9, 8, 4, 3, 1]
+            )
+            self.assertEqual(
+                self.forward.opt_draft_capture_extra_keys(args, 3), [None, 0]
+            )
+            self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 9), [0])
+            self.assertEqual(self.forward.opt_draft_capture_extra_keys(args, 8), [None])
+            runner, _mode = self._shared_cuda_runner()
+            runner.spectre_ntpb_options = ClearTreeGraphCapture.dual_ntpb_options(args)
+            runner.capture()
+            for bs in (1, 2, 4):
+                self.assertIn(f"r3_{bs}", runner.graphs)
+                self.assertIn(f"r3_{bs}_s0", runner.graphs)
+
+    def test_bonus_capture_graphs_follow_flag_without_changing_layer_or_target(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_graph import (
             ClearTreeGraphCapture,
         )
@@ -1672,12 +2663,12 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
         self.addCleanup(install_candidates, None, None)
         draft = _args(clear_tree_role="draft", speculative_num_draft_tokens=64)
         target = _args(clear_tree_role="target", speculative_num_draft_tokens=65)
-        for value, enabled in ((None, False), ("0", False), ("1", True)):
+        for value, enabled in ((None, True), ("0", False), ("1", True)):
             with self.subTest(value=value), _bonus_prediction(value):
                 expected = [65, 33, 17, 9, 5, 3] if enabled else []
                 self.assertEqual(self.forward.opt_draft_bonus_ntpbs(draft), expected)
                 self.assertEqual(
-                    ClearTreeGraphCapture.bonus_ntpbs_for_capture(draft), expected
+                    ClearTreeGraphCapture.bonus_ntpbs_for_capture(draft), []
                 )
                 self.assertEqual(self.forward.opt_draft_bonus_ntpbs(target), [])
                 self.assertEqual(
@@ -1695,7 +2686,11 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
                         draft
                     ),
-                    [64, 32, 16, 8, 4, 2, 1],
+                    (
+                        [65, 64, 33, 32, 17, 16, 9, 8, 5, 4, 3, 2, 1]
+                        if enabled
+                        else [64, 32, 16, 8, 4, 2, 1]
+                    ),
                 )
                 self.assertEqual(
                     SpeculativeAlgorithm.CLEAR_TREE_REMOTE.dual_ntpb_cuda_graph_options(
@@ -1725,7 +2720,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             for node in mixin.body
             if isinstance(node, ast.FunctionDef) and node.name == "_clear_expand_one"
         )
-        for value, enabled in ((None, False), ("0", False), ("1", True)):
+        for value, enabled in ((None, True), ("0", False), ("1", True)):
             for batch in (False, True):
                 with self.subTest(value=value, batch=batch), _bonus_prediction(
                     value

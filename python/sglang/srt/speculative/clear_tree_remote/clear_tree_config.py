@@ -50,8 +50,10 @@ def _env_flag(name: str) -> bool:
 
 
 def bonus_prediction_enabled() -> bool:
-    """Draft bonus KV/seed-logits precomputation. Default off; set at startup."""
-    return _env_flag("SGLANG_CLEAR_BONUS_PREDICTION")
+    """Draft bonus KV/seed-logits precomputation. Default on; set at startup."""
+    return "SGLANG_CLEAR_BONUS_PREDICTION" not in os.environ or _env_flag(
+        "SGLANG_CLEAR_BONUS_PREDICTION"
+    )
 
 
 def opt_draft_lookahead_enabled() -> bool:

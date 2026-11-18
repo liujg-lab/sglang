@@ -9,6 +9,30 @@ from __future__ import annotations
 from typing import Optional
 
 
+def _capture_mask(runner, num_tokens: int, query_width: int):
+    """Synthetic all-visible mask for this bs/G, retained for graph lifetime.
+
+    Shared input buffers are sized using the layer width, which can be
+    smaller than a K+1 bonus graph. Capture metadata reads
+    ``bs * G * (seq_len_fill_value + G)`` entries even when the shared mask
+    was allocated with fewer. Keep any replacement on the runner rather
+    than letting capture refer to a temporary allocation.
+    """
+    required = int(num_tokens) * (int(runner.seq_len_fill_value) + int(query_width))
+    mask = runner.buffers.custom_mask
+    if mask.numel() >= required:
+        return mask[:required]
+    import torch
+
+    masks = getattr(runner, "_clear_tree_capture_masks", None)
+    if masks is None:
+        masks = {}
+        runner._clear_tree_capture_masks = masks
+    if required not in masks:
+        masks[required] = torch.ones(required, dtype=mask.dtype, device=mask.device)
+    return masks[required]
+
+
 class ClearTreeGraphCapture:
     log_tag = "[ClearTree CudaGraph]"
 
@@ -22,7 +46,7 @@ class ClearTreeGraphCapture:
 
     @staticmethod
     def draft_buffer_tokens(server_args) -> Optional[int]:
-        """Widest draft bonus graph. Target buffers stay at the verify capacity."""
+        """Keep max K + 1 draft capacity; target keeps its verify capacity."""
         if getattr(server_args, "clear_tree_role", None) != "draft":
             return None
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
@@ -53,11 +77,13 @@ class ClearTreeGraphCapture:
 
     @staticmethod
     def bonus_ntpbs_for_capture(server_args) -> list:
-        from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
-            opt_draft_bonus_ntpbs,
-        )
+        """No bs=1-only extras: bonus widths are already in ``dual_ntpb_options``.
 
-        return list(opt_draft_bonus_ntpbs(server_args))
+        The shared runner treats this supplemental list as unconditionally
+        bs=1-only. ClearTree captures bonus graphs at every batch size that
+        fits the ordinary token buffers instead.
+        """
+        return []
 
     @staticmethod
     def is_draft(server_args) -> bool:
@@ -84,6 +110,8 @@ class ClearTreeGraphCapture:
             ntpb_override if ntpb_override is not None else runner.num_tokens_per_bs
         )
         if uses_dual and draft_token_num == 1:
+            return None
+        if role not in ("target", "draft"):
             return None
         if role == "target":
             from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -130,7 +158,7 @@ class ClearTreeGraphCapture:
                 f"is not a layer width {LAYER_WIDTHS} or a bonus width {BONUS_NTPBS}"
             )
         spec_info = OptLayerSpec(
-            custom_mask=runner.buffers.custom_mask,
+            custom_mask=_capture_mask(runner, num_tokens, query_width),
             positions=runner.buffers.positions[:num_tokens],
             draft_token_num=query_width,
             num_tokens_per_req=query_width,

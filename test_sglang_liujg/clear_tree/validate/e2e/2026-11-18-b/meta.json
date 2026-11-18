@@ -1,0 +1,142 @@
+{
+  "run_id": "2026-11-18-b",
+  "status": "blocked",
+  "execution_outcome": "c1 Target shared argument parser rejected explicit candidate flags before client launch; c4 not started; owned cleanup verified; no retry",
+  "completed_formal_requests": 0,
+  "diagnosis": "raw/startup-diagnosis.json",
+  "question": "当前ClearTree bonus专用图在NPU Target和CUDA Draft下是否实际图回放、完整处理并发1与4负载",
+  "matrix": [
+    {
+      "trial": "c1-A1",
+      "concurrency": 1,
+      "max_items": 100,
+      "max_new_tokens": 1024
+    },
+    {
+      "trial": "c4-A1",
+      "concurrency": 4,
+      "max_items": 100,
+      "max_new_tokens": 1024
+    }
+  ],
+  "bonus_prediction": true,
+  "ledger": false,
+  "kv_reuse": true,
+  "lookahead": false,
+  "graph_bs": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "max_running_requests": 4,
+  "width_candidates": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "k_candidates": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "spec_capacity": {
+    "target": 65,
+    "draft": 64
+  },
+  "cold_start_both_per_trial": true,
+  "independent_smoke": false,
+  "warmup": "first item once per trial, discarded; strict flush before formal timing",
+  "temperature": 0,
+  "request_rate": "inf",
+  "dataset_expected_sha256": "8cf47bd9104c062c0ae2729f582044c97b407847a092fc2f3fa343280b4eec22",
+  "timeouts_seconds": {
+    "startup_per_role": 2400,
+    "request": 600,
+    "client_per_trial": 5400
+  },
+  "criteria_source": "question.md",
+  "counter_scope": "sum independent rank0 windows; includes warmup; separate from formal timing",
+  "historical_reference": "2026-11-18-a for orchestration only; not a controlled performance baseline",
+  "limitations": [
+    "no bonus-off control",
+    "one run per concurrency",
+    "no token/logits equality proof",
+    "no K32/K64 replay sweep",
+    "no per batch x G replay dimension"
+  ],
+  "finalization": {
+    "status": "fail",
+    "finalized_utc": "2026-11-18T07:36:29.121028+00:00",
+    "runtime_status": "fail",
+    "completed_trials": [],
+    "all_clients_completed": false,
+    "expected_trials_missing": [
+      "c4-A1"
+    ],
+    "cleanup_status": "pass",
+    "preflight_status": "pass",
+    "trial_cleanup_status": "missing",
+    "phase_status": "missing",
+    "blocking_records": [
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/formal-blocked.json",
+          "bytes": 299,
+          "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+        },
+        "record": {
+          "completed": false,
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "utc": "2026-11-18T07:31:48.168190+00:00",
+          "automatic_retry": false,
+          "remaining_trials_stopped": true
+        },
+        "issues": []
+      },
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/c1-A1/blocked.json",
+          "bytes": 307,
+          "sha256": "33cc88577703033ba304075ecc6760a0da74e0eae3fd409e88d96ad5a911cd52"
+        },
+        "record": {
+          "completed": false,
+          "trial": "c1-A1",
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "cleanup_errors": [],
+          "utc": "2026-11-18T07:31:34.762727+00:00",
+          "automatic_retry": false
+        },
+        "issues": []
+      },
+      {
+        "file": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-b/raw/formal-blocked.json",
+          "bytes": 299,
+          "sha256": "676280fd37e0e3fc7f0bb8cc55eb0ef926159e53ccc252fc6f767a130dabcbb0"
+        },
+        "record": {
+          "completed": false,
+          "error": "RuntimeError('target: runtime failure: sglang serve: error: unrecognized arguments: --clear-tree-widths 2 4 8 16 32 64 --clear-tree-ks 2 4 8 16 32 64')",
+          "utc": "2026-11-18T07:31:48.168190+00:00",
+          "automatic_retry": false,
+          "remaining_trials_stopped": true
+        },
+        "issues": []
+      }
+    ],
+    "prior_orchestrator_status": "blocked",
+    "services_stopped": true,
+    "tunnels_preserved": true,
+    "parse_issues": [],
+    "performance_status": "per_concurrency_descriptive_only_no_repeats_no_AB"
+  },
+  "analysis_status": "fail"
+}
