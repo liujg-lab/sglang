@@ -1,0 +1,9 @@
+{
+  "resolved": true,
+  "original_aborted_trial": "smoke-A",
+  "retry_trial": "smoke-A-retry1",
+  "original_blocked_sha256": "9fc2fb3366c1b86357abc5bb5f8b734f1ce584d52d03b31e90ea7d59885a085d",
+  "retry_completed_sha256": "42932644ba4c33b9f7a1eeffba491d30f5a364e88ee6e20a31826500de00bcd9",
+  "cleanup_sha256": "1be5f455782dbe6071511a5fae3def10c33b326ef1ec1531dd24c11bcbe5c77a",
+  "utc": "2026-11-17T18:15:50.231117+00:00"
+}

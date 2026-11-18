@@ -1,0 +1,306 @@
+{
+  "run_id": "2026-11-18-a",
+  "experiment": "batch-bonus-c4-on-only",
+  "completed": true,
+  "ledger": false,
+  "bonus_prediction": true,
+  "concurrency": [
+    4
+  ],
+  "formal_trials": [
+    "c4-A1",
+    "c4-A2"
+  ],
+  "temperature": 0,
+  "max_items": 100,
+  "max_new_tokens": 1024,
+  "request_rate": "inf",
+  "smoke": {
+    "max_items": 4,
+    "max_new_tokens": 128,
+    "concurrency": 4
+  },
+  "warmup": "one first-item request discarded, followed by flush cache",
+  "cold_start": "both processes restarted per trial",
+  "cuda_graph_bs": [
+    1,
+    2,
+    4
+  ],
+  "clear_tree_widths": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "clear_tree_ks": [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "max_depth": 8,
+  "max_running_requests": 4,
+  "target_capacity": 65,
+  "draft_capacity": 64,
+  "tree_kv_reuse": true,
+  "lookahead": false,
+  "dataset_expected_sha256": "8cf47bd9104c062c0ae2729f582044c97b407847a092fc2f3fa343280b4eec22",
+  "historical_baseline": "2026-11-17-c c4-A1/A2; AA1/AA2 separately; descriptive cross-session comparison only",
+  "validation_boundary": "No bonus-off arm or concurrency1; no output equivalence or causal performance claim; periodic counters include warmup and only flushed windows",
+  "batch_skip_threshold": "sum(skipped_graph,skipped_kv,skipped_allocator,skipped_map) <= forwards per formal trial",
+  "cpu_checks": {
+    "shell_tests": 47,
+    "ledger_tests": 112,
+    "analyzer_tests": 5,
+    "finalizer_tests": 3,
+    "passed": true
+  },
+  "package_provenance": "raw/preflight.json",
+  "status": "pass",
+  "runtime_status": "pass",
+  "completed_trials": [
+    "c4-A1",
+    "c4-A2",
+    "smoke-A"
+  ],
+  "completed_utc": "2026-11-17T19:16:43.162587+00:00",
+  "formal_requests": 200,
+  "smoke_requests": 4,
+  "services_stopped": true,
+  "tunnels_preserved": true,
+  "performance_status": "descriptive_only_no_AB_or_equivalence_gate",
+  "finalization": {
+    "status": "pass",
+    "finalized_utc": "2026-11-17T19:16:43.162587+00:00",
+    "runtime_status": "pass",
+    "completed_trials": [
+      "c4-A1",
+      "c4-A2",
+      "smoke-A"
+    ],
+    "expected_trials_missing": [],
+    "all_clients_completed": true,
+    "cleanup_status": "pass",
+    "blocking_records": [],
+    "smoke_resolution": {
+      "status": "pass",
+      "resolution": {
+        "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/smoke-blocked-resolved.json",
+        "bytes": 422,
+        "sha256": "3f37160fdd33fe503e27b1b4035de68a01652f6d6ae4cd00ff88372c898d6968"
+      },
+      "declaration": {
+        "resolved": true,
+        "original_aborted_trial": "smoke-A",
+        "retry_trial": "smoke-A-retry1",
+        "original_blocked_sha256": "9fc2fb3366c1b86357abc5bb5f8b734f1ce584d52d03b31e90ea7d59885a085d",
+        "retry_completed_sha256": "42932644ba4c33b9f7a1eeffba491d30f5a364e88ee6e20a31826500de00bcd9",
+        "cleanup_sha256": "1be5f455782dbe6071511a5fae3def10c33b326ef1ec1531dd24c11bcbe5c77a",
+        "utc": "2026-11-17T18:15:50.231117+00:00"
+      },
+      "issues": [],
+      "cleanup": {
+        "status": "pass",
+        "services_stopped": true,
+        "tunnels_preserved": true,
+        "declaration": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-cleanup.json",
+          "bytes": 497,
+          "sha256": "1be5f455782dbe6071511a5fae3def10c33b326ef1ec1531dd24c11bcbe5c77a"
+        },
+        "declared_observations": {
+          "phase": "smoke",
+          "evidence_files": [
+            "draft-cleanup.txt",
+            "target-cleanup.txt"
+          ],
+          "evidence_sha256": {
+            "draft": "8867860c2c149da77332cc18809dfc0badba244f0a0b6b1453289bd8b866aa2c",
+            "target": "aed69652cc9af0349c2db601e156285cf15d0dd862ae6925cdc80fb6dcfe9a13"
+          },
+          "services_stopped": true,
+          "tunnels_preserved": true,
+          "tunnel_identity_fields": [
+            "pid",
+            "start_ticks",
+            "uid",
+            "cmdline"
+          ],
+          "errors": [],
+          "utc": "2026-11-17T18:15:50.225277+00:00"
+        },
+        "referenced_files": [
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-draft-cleanup.txt",
+            "bytes": 674978,
+            "sha256": "8867860c2c149da77332cc18809dfc0badba244f0a0b6b1453289bd8b866aa2c"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-target-cleanup.txt",
+            "bytes": 2476888,
+            "sha256": "aed69652cc9af0349c2db601e156285cf15d0dd862ae6925cdc80fb6dcfe9a13"
+          }
+        ],
+        "missing_references": [],
+        "archived_snapshots": [
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/draft-cleanup.txt",
+            "bytes": 686968,
+            "sha256": "0f5fcb9143c0e35a13ec0b250efa5d128427740db05d3d3cb7e9f2d30b6a8774"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/formal-draft-cleanup.txt",
+            "bytes": 686968,
+            "sha256": "0f5fcb9143c0e35a13ec0b250efa5d128427740db05d3d3cb7e9f2d30b6a8774"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/formal-target-cleanup.txt",
+            "bytes": 2598169,
+            "sha256": "000b93809e1f493f620b3d31384a729e3c170fe58e131eb0209966b3634603d0"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-draft-cleanup.txt",
+            "bytes": 674978,
+            "sha256": "8867860c2c149da77332cc18809dfc0badba244f0a0b6b1453289bd8b866aa2c"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-target-cleanup.txt",
+            "bytes": 2476888,
+            "sha256": "aed69652cc9af0349c2db601e156285cf15d0dd862ae6925cdc80fb6dcfe9a13"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/target-cleanup.txt",
+            "bytes": 2598169,
+            "sha256": "000b93809e1f493f620b3d31384a729e3c170fe58e131eb0209966b3634603d0"
+          }
+        ],
+        "issues": [],
+        "boundary": "offline inventory of orchestrator observations, not a new live cleanup probe; pass needs explicit true booleans and at least two nonempty evidence files (Target and Draft). The finalizer never kills services, inspects devices or alters tunnels."
+      }
+    },
+    "prior_attempts": [
+      {
+        "trial": "smoke-A",
+        "classification": "instrumentation_abort_before_client",
+        "abort_reason": "RuntimeError(\"target: runtime failure:  error when loading sglang.srt.models.gemma4_causal: cannot import name 'Gemma4TextConfig' from 'transformers' (/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/__init__.py)\")",
+        "full_optional_import_corroborated": true,
+        "blocked_artifact": {
+          "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/smoke-blocked.json",
+          "bytes": 273,
+          "sha256": "9fc2fb3366c1b86357abc5bb5f8b734f1ce584d52d03b31e90ea7d59885a085d"
+        },
+        "inventory": [
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/client-kill.json",
+            "bytes": 63,
+            "sha256": "66aecce1bb9b39c3e48aa14647b5606b629d0915eeb41424fa1988d97361c237"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/client-stop.json",
+            "bytes": 63,
+            "sha256": "66aecce1bb9b39c3e48aa14647b5606b629d0915eeb41424fa1988d97361c237"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/config.json",
+            "bytes": 346,
+            "sha256": "eb4d95d05f44b6963a72e6e497261cec5d301207456d1f839e7ab6d6507cbf88"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-before-launch.json",
+            "bytes": 9060,
+            "sha256": "96622cbab2e88c1fd78b8e32efdede1b5726559adda40be853a6e63a01840456"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-kill.json",
+            "bytes": 311,
+            "sha256": "c87cc134a3b7ed7c2572280058a18f0eb372902c9b52f55c2c4404085222240c"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-model-info.json",
+            "bytes": 499,
+            "sha256": "f6567a92b582328016a5feeeebf7f993be547e99ce9c3be266716f11fca8895a"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-process.json",
+            "bytes": 222,
+            "sha256": "749371fe679b0b3f0691cb484733b11345ab7c2c5dd1d53997b29d6876ca45de"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-stop.json",
+            "bytes": 32334,
+            "sha256": "cd7db1034ba5202ed36549825ab6c3a0851439f6941aea0b32e6b20ddb547f0b"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft.log",
+            "bytes": 22176,
+            "sha256": "f1b2034bf783f908caf3a4242d528fd7db6476c27f43191fb986f65e189b5711"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft.log.recent",
+            "bytes": 6000,
+            "sha256": "758028b289bc7de4997b1c8170f80604b76781f7084a712ebe315907f70f9aec"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-client.sh",
+            "bytes": 601,
+            "sha256": "abea392c748bb24c73b789e00ad41e937f79587fb5db3e01278282fa67789035"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-draft.sh",
+            "bytes": 937,
+            "sha256": "190a6c03991cbfaffd5fed12c1b229eb49be35ffec2e84139966fd2b6ce5d18d"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-target.sh",
+            "bytes": 914,
+            "sha256": "d17736a8975d9dae418a1c81a23da1a633ae5dec173f61101b03ea38e9935873"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-artifacts.tgz",
+            "bytes": 17243,
+            "sha256": "c9261e548a7d2d6c80610dd25243b9bfdd02dbf22f0b00c5c98dfdf67279cbd8"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-before-launch.json",
+            "bytes": 41813,
+            "sha256": "c3f44e87160f076ab16e1d552def3921a9ca992e24de148ff5979a2994b5c610"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-kill.json",
+            "bytes": 8950,
+            "sha256": "6ca91f03a1138a5d3f8ca23a426e1ee69c123f9d29da859e62ebfa40eb3d23b8"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-process.json",
+            "bytes": 7488,
+            "sha256": "6a8e0b219e08175b4ee38d4e7f3a1f661a849aadff949186988244f51050e951"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-stop.json",
+            "bytes": 143412,
+            "sha256": "344175a7368a014d6b06ed674b50419e791b26158d241a48727c25e092cfb714"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target.log",
+            "bytes": 36968,
+            "sha256": "47fe562588936caecffcfe5c5ae904d8d276b8ac32b2ac18f3eb75283086f0fa"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target.log.recent",
+            "bytes": 6000,
+            "sha256": "713a015e49ed3d1bdd5a2f08e110816ce02af7ebfc94b535d70b65fce9f3f0b5"
+          }
+        ],
+        "runtime_errors": []
+      }
+    ],
+    "prior_orchestrator_status": "pass",
+    "performance_status": "descriptive_only_no_AB_or_equivalence_gate",
+    "repeat_output_status": "matched_saved_text"
+  }
+}

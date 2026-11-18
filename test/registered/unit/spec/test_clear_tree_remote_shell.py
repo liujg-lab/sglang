@@ -706,6 +706,545 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             state=self._state(),
         )
 
+    def _batch_fixture(self, count=2):
+        torch = self.torch
+        host, _pool, freed = self._host()
+        pool = torch.full((count, 128), -1, dtype=torch.int64)
+        host.req_to_token_pool.req_to_token = pool
+        jobs = []
+        for i in range(count):
+            job = self._job(host, complete=True)
+            job.req.rid = str(i)
+            job.req.req_pool_idx = i
+            job.runner.prefix_len += i
+            job.runner.cached_len += i
+            job.req.kv_allocated_len = job.runner.cached_len
+            job.runner._alloc_layer_slots = Mock()
+            jobs.append(job)
+        allocator = host.token_to_kv_pool_allocator
+        allocator.available_size = Mock(return_value=1000)
+        allocator.alloc = Mock(side_effect=lambda n: torch.arange(100, 100 + n))
+        host.tree_cache.token_to_kv_pool_allocator = allocator
+        host.tree_cache.evictable_size = Mock(return_value=10000)
+        host.tree_cache.evict = Mock()
+        return host, jobs, pool, freed
+
+    def _candidate(self, token=9, rank=0, parent=-1, chain=()):
+        return self.forward._BonusCandidate(parent, token, 3, chain, end_rank=rank)
+
+    @contextmanager
+    def _batch_runtime(self, host, *, fail=None):
+        # Scoped stubs keep this CPU check independent of Triton/sgl_kernel.
+        from types import ModuleType
+
+        torch = self.torch
+        common = ModuleType("sglang.srt.mem_cache.common")
+        utils = ModuleType("sglang.srt.speculative.spec_utils")
+
+        def alloc(cache, n):
+            if cache.token_to_kv_pool_allocator.available_size() < n:
+                cache.evict(n)
+            return cache.token_to_kv_pool_allocator.alloc(n)
+
+        def assign(rows, pool, starts, ends, loc, count):
+            offset = 0
+            for i in range(count):
+                n = int(ends[i] - starts[i])
+                pool[int(rows[i]), int(starts[i]) : int(ends[i])] = loc[
+                    offset : offset + n
+                ]
+                offset += n
+            if fail == "assign":
+                raise RuntimeError("assign failed after writing")
+
+        common.alloc_token_slots = Mock(side_effect=alloc)
+        utils.assign_req_to_token_pool_func = Mock(side_effect=assign)
+        output = {}
+
+        def verify(_host, runners, tokens, positions, mask, loc, cached, **kwargs):
+            if fail == "batch":
+                raise RuntimeError("batch construction failed")
+            output.update(
+                runners=runners,
+                tokens=tokens,
+                positions=positions,
+                mask=mask,
+                loc=loc,
+                cached=cached,
+                kwargs=kwargs,
+            )
+            return SimpleNamespace()
+
+        def run(_batch):
+            if fail == "forward":
+                raise RuntimeError("forward failed")
+            n = output["loc"].numel()
+            output["logits"] = torch.arange(n * 3, dtype=torch.float32).reshape(n, 3)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(next_token_logits=output["logits"]),
+                can_run_cuda_graph=True,
+            )
+
+        host.run_batch = Mock(side_effect=run)
+        with patch.dict(
+            "sys.modules",
+            {
+                common.__name__: common,
+                utils.__name__: utils,
+            },
+        ), patch.object(
+            self.forward, "_verify_batch_many", side_effect=verify
+        ) as batch:
+            yield common.alloc_token_slots, utils.assign_req_to_token_pool_func, batch, output
+
+    def test_bonus_batch_one_allocation_forward_copy_and_owned_logits(self):
+        for count in (2, 3, 4):
+            with self.subTest(count=count):
+                host, jobs, pool, freed = self._batch_fixture(count)
+                width = 4
+                entries = [
+                    (
+                        job,
+                        self.forward.bonus_verify_chunks(
+                            [
+                                self._candidate(20 + i),
+                                self._candidate(30 + i, 1, 0, (3 + i,)),
+                            ]
+                            + ([self._candidate(40 + i, 2)] if i % 2 else []),
+                            width,
+                        )[0],
+                    )
+                    for i, job in enumerate(jobs)
+                ]
+                with self._batch_runtime(host) as (
+                    alloc,
+                    assign,
+                    batch,
+                    output,
+                ), patch.object(
+                    self.forward,
+                    "_read_bonus_slot_ids",
+                    wraps=self.forward._read_bonus_slot_ids,
+                ) as read:
+                    self.forward._launch_bonus_batch(host, entries, width)
+                alloc.assert_called_once_with(host.tree_cache, count * width)
+                assign.assert_called_once()
+                batch.assert_called_once()
+                read.assert_called_once()
+                host.run_batch.assert_called_once()
+                host.tree_cache.evict.assert_not_called()
+                self.assertEqual(output["kwargs"], {"is_bonus": False})
+                self.assertEqual(output["positions"].tolist(), [3] * count * width)
+                self.assertEqual(output["cached"], [7 + i for i in range(count)])
+                offset = 0
+                for i, job in enumerate(jobs):
+                    end = 7 + i
+                    mask = output["mask"][
+                        offset : offset + width * (end + width)
+                    ].reshape(width, end + width)
+                    offset += width * (end + width)
+                    self.assertTrue(mask[0, : 3 + i].all())
+                    self.assertFalse(mask[0, 3 + i : end].any())
+                    self.assertTrue(mask[1, 3 + i])
+                    self.assertEqual(
+                        mask[:, end:].tolist(),
+                        self.torch.eye(width, dtype=self.torch.bool).tolist(),
+                    )
+                    self.assertEqual(pool[i, end : end + width].tolist(), [-1] * width)
+                    self.assertEqual(job.req.kv_allocated_len, end)
+                    self.assertEqual(job.runner.cached_len, end)
+                    self.assertEqual(len(job.runner.layer_slots), 2)
+                    self.assertEqual(
+                        [g.slot for g in job.req.opt_bonus_guesses],
+                        list(range(100 + i * width, 102 + i * width + i % 2)),
+                    )
+                    self.assertEqual(
+                        job.req.opt_bonus_guesses[0].logits.tolist(),
+                        [float(i * width * 3 + j) for j in range(3)],
+                    )
+                output["logits"].fill_(-100)
+                self.assertEqual(
+                    jobs[0].req.opt_bonus_guesses[0].logits.tolist(), [0.0, 1.0, 2.0]
+                )
+                self.assertCountEqual(
+                    freed,
+                    [
+                        100 + i * width + j
+                        for i in range(count)
+                        for j in range(2 + i % 2, width)
+                    ],
+                )
+                for job in jobs:
+                    self.lease.release_opt_bonus_guesses(host, job.req)
+                    self.lease.release_opt_bonus_guesses(host, job.req)
+                self.assertCountEqual(freed, range(100, 100 + count * width))
+
+    def test_bonus_batch_free_budget_excludes_evictable_and_checks_map(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        for reason in ("kv", "map", "duplicate", "swa"):
+            with self.subTest(reason=reason):
+                host, jobs, pool, freed = self._batch_fixture()
+                if reason == "kv":
+                    host.token_to_kv_pool_allocator.available_size.return_value = 7
+                elif reason == "map":
+                    jobs[0].runner.cached_len = 127
+                elif reason == "duplicate":
+                    jobs[1].req.req_pool_idx = 0
+                else:
+                    host.token_to_kv_pool_allocator.full_attn_allocator = object()
+                    host.token_to_kv_pool_allocator.swa_attn_allocator = object()
+                entries = [
+                    (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+                    for job in jobs
+                ]
+                with self._batch_runtime(host) as (alloc, assign, batch, _output):
+                    self.forward._launch_bonus_batch(host, entries, 4)
+                alloc.assert_not_called()
+                assign.assert_not_called()
+                batch.assert_not_called()
+                host.tree_cache.evict.assert_not_called()
+                if reason != "swa":
+                    host.tree_cache.evictable_size.assert_not_called()
+                self.assertEqual(freed, [])
+                self.assertTrue((pool == -1).all())
+                if reason == "swa":
+                    self.assertEqual(
+                        get_sr_round_metrics(host, "Draft").counts[
+                            "opt_bonus_batch_skipped_allocator"
+                        ],
+                        1,
+                    )
+
+    def test_bonus_batch_failure_restores_all_requests_without_double_free(self):
+        for fail in ("assign", "batch", "forward", "d2h", "clone", "shape"):
+            with self.subTest(fail=fail):
+                host, jobs, pool, freed = self._batch_fixture()
+                entries = [
+                    (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+                    for job in jobs
+                ]
+                with self._batch_runtime(host, fail=fail), ExitStack() as stack:
+                    if fail == "d2h":
+                        stack.enter_context(
+                            patch.object(
+                                self.forward,
+                                "_read_bonus_slot_ids",
+                                side_effect=RuntimeError("copy failed"),
+                            )
+                        )
+                    elif fail == "clone":
+                        stack.enter_context(
+                            patch.object(
+                                self.lease,
+                                "OptBonusGuess",
+                                side_effect=[object(), RuntimeError("clone failed")],
+                            )
+                        )
+                    elif fail == "shape":
+                        stack.enter_context(
+                            patch.object(
+                                self.forward,
+                                "_as_layer_rows",
+                                side_effect=RuntimeError("bad shape"),
+                            )
+                        )
+                    with self.assertRaises(RuntimeError):
+                        self.forward._launch_bonus_batch(host, entries, 4)
+                self.assertCountEqual(freed, range(100, 108))
+                self.assertTrue((pool == -1).all())
+                for job in jobs:
+                    self.assertEqual(job.req.kv_allocated_len, job.runner.cached_len)
+                    self.assertIsNone(getattr(job.req, "opt_bonus_guesses", None))
+                self.assertFalse(host._sr_device_poisoned)
+
+    def test_bonus_batch_allocation_failure_has_no_map_or_slots(self):
+        host, jobs, pool, freed = self._batch_fixture()
+        host.token_to_kv_pool_allocator.alloc.side_effect = RuntimeError("alloc failed")
+        entries = [
+            (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+            for job in jobs
+        ]
+        with self._batch_runtime(host) as (_alloc, assign, batch, _output):
+            with self.assertRaisesRegex(RuntimeError, "alloc failed"):
+                self.forward._launch_bonus_batch(host, entries, 4)
+        assign.assert_not_called()
+        batch.assert_not_called()
+        self.assertTrue((pool == -1).all())
+        self.assertEqual(freed, [])
+
+    def test_bonus_batch_unknown_free_is_quarantined_not_retried(self):
+        host, jobs, _pool, freed = self._batch_fixture()
+        entries = [
+            (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+            for job in jobs
+        ]
+        host.token_to_kv_pool_allocator.free = Mock(
+            side_effect=RuntimeError("free uncertain")
+        )
+        with self._batch_runtime(host), self.assertRaises(RuntimeError):
+            self.forward._launch_bonus_batch(host, entries, 4)
+        host.token_to_kv_pool_allocator.free.assert_called_once()
+        self.assertTrue(host._sr_device_poisoned)
+        record = host._sr_kv_quarantine.records[0]
+        self.assertEqual(record.owner.loc.numel(), 8)
+        host._sr_kv_quarantine.reclaim(host.token_to_kv_pool_allocator)
+        host.token_to_kv_pool_allocator.free.assert_called_once()
+        self.assertEqual(freed, [])
+
+    def test_bonus_batch_poison_retains_slots_without_free(self):
+        host, jobs, _pool, freed = self._batch_fixture()
+        entries = [
+            (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+            for job in jobs
+        ]
+
+        def poison(_batch):
+            host._sr_device_poisoned = True
+            raise RuntimeError("device lost")
+
+        with self._batch_runtime(host):
+            host.run_batch.side_effect = poison
+            with self.assertRaises(RuntimeError):
+                self.forward._launch_bonus_batch(host, entries, 4)
+        self.assertEqual(freed, [])
+        self.assertEqual(host._sr_kv_quarantine.records[0].owner.loc.numel(), 8)
+
+    def test_batch_guesses_use_existing_accept_and_seed_logits(self):
+        host, jobs, pool, freed = self._batch_fixture()
+        entries = [
+            (
+                job,
+                self.forward.bonus_verify_chunks(
+                    [self._candidate(30 + i, parent=0, chain=(3 + i,))], 4
+                )[0],
+            )
+            for i, job in enumerate(jobs)
+        ]
+        with self._batch_runtime(host):
+            self.forward._launch_bonus_batch(host, entries, 4)
+        for i, job in enumerate(jobs):
+            req = job.req
+            req.origin_input_ids = list(range(3 + i))
+            req.output_ids = [20, 30 + i if i == 0 else 99]
+            lease = self.lease.ClearTreeKVLease(
+                keep=3 + i,
+                layer_slots=((50 + i, 60 + i),),
+                tokens=(20,),
+                parents=(-1,),
+                cols=(0,),
+                depths=(0,),
+            )
+            self.lease.accept_opt_bonus_guess(host, req, lease, [50 + i])
+            self.assertIsNone(req.opt_bonus_guesses)
+            if i == 0:
+                self.assertEqual(pool[i, 4 + i].item(), 100 + i * 4)
+                self.assertEqual(req.opt_prefill_tail_logits.tolist(), [0.0, 1.0, 2.0])
+            else:
+                self.assertFalse(hasattr(req, "opt_prefill_tail_logits"))
+        self.assertCountEqual(freed, [101, 102, 103, 104, 105, 106, 107])
+
+    def test_bonus_batch_cleanup_wait_failure_quarantines_owner(self):
+        host, jobs, _pool, freed = self._batch_fixture()
+        loc = SimpleNamespace(device=self.torch.device("cuda"))
+        owner = self.forward._BonusBatchOwner(
+            [(job, []) for job in jobs],
+            4,
+            loc=loc,
+            owned=self.torch.arange(100, 108),
+            mapped=True,
+        )
+        stream = SimpleNamespace(
+            synchronize=Mock(side_effect=RuntimeError("sync unknown"))
+        )
+        with patch.object(
+            self.torch,
+            "get_device_module",
+            return_value=SimpleNamespace(current_stream=lambda: stream),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sync unknown"):
+                self.forward._cleanup_bonus_batch(host, owner)
+        self.assertTrue(host._sr_device_poisoned)
+        self.assertTrue(owner.mapped)
+        self.assertEqual(freed, [])
+        self.assertIs(host._sr_kv_quarantine.records[0].owner, owner)
+
+    def test_bonus_batch_path_metrics_and_no_serial_retry(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        for flag in (True, False, None):
+            with self.subTest(flag=flag):
+                host, jobs, _pool, _freed = self._batch_fixture()
+                entries = [
+                    (job, self.forward.bonus_verify_chunks([self._candidate()], 4)[0])
+                    for job in jobs
+                ]
+                with self._batch_runtime(host):
+                    run = host.run_batch.side_effect
+
+                    def result(batch):
+                        out = run(batch)
+                        out.can_run_cuda_graph = flag
+                        return out
+
+                    host.run_batch.side_effect = result
+                    self.forward._launch_bonus_batch(host, entries, 4)
+                path = "unknown" if flag is None else ("graph" if flag else "eager")
+                self.assertEqual(
+                    get_sr_round_metrics(host, "Draft").counts[
+                        "opt_bonus_batch_" + path
+                    ],
+                    1,
+                )
+        host, jobs, _pool, _freed = self._batch_fixture()
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "select_bonus_candidates", return_value=[self._candidate()]
+        ), patch.object(
+            self.forward, "_bonus_batch_width", return_value=4
+        ), patch.object(
+            self.forward,
+            "_launch_bonus_batch",
+            side_effect=RuntimeError("optional failure"),
+        ) as launch, patch.object(
+            self.forward, "_forward_bonus_candidates"
+        ) as serial:
+            self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        launch.assert_called_once()
+        serial.assert_not_called()
+        self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_bonus_batch_width_checks_real_padded_layer_keys(self):
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_width as widths
+
+        host, _jobs, _pool, _freed = self._batch_fixture()
+        graph = SimpleNamespace(
+            capture_bs=[1, 2, 4],
+            disable_padding=False,
+            graphs={"r8_4": object(), "r16_4": object(), "r5_1_s0": object()},
+            _make_graph_key=lambda b, s, w: f"r{w}_{b}",
+        )
+        host.req_to_token_pool.device = "cuda"
+        host.model_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(graph_runner=graph)
+        )
+        with patch.object(widths, "LAYER_WIDTHS", [4, 5, 8, 16]):
+            self.assertEqual(self.forward._bonus_batch_width(host, 3, 5), 8)
+            self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
+            self.assertEqual(self.forward._bonus_batch_width(host, 3, 65), 16)
+            self.assertIsNone(self.forward._bonus_batch_width(host, 5, 9))
+            graph.graphs.clear()
+            self.assertIsNone(self.forward._bonus_batch_width(host, 3, 9))
+            graph.disable_padding = True
+            self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
+            self.assertIsNone(self.forward._bonus_batch_width(host, 2, 9))
+            for device in ("cpu", "npu"):
+                # NPU torch.device is only available when torch_npu is loaded.
+                with patch.object(
+                    self.forward.torch,
+                    "device",
+                    return_value=SimpleNamespace(type=device),
+                ):
+                    self.assertEqual(self.forward._bonus_batch_width(host, 3, 9), 16)
+            host.model_worker.model_runner.graph_runner = None
+            self.assertEqual(self.forward._bonus_batch_width(host, 3, 5), 5)
+
+    def test_bonus_many_truncates_by_rank_but_keeps_original_order(self):
+        host, jobs, _pool, _freed = self._batch_fixture()
+        plans = [self._candidate(i, rank) for i, rank in enumerate((4, 1, 0, 3, 2))]
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "select_bonus_candidates", return_value=plans
+        ), patch.object(
+            self.forward, "_bonus_batch_width", return_value=4
+        ), patch.object(
+            self.forward, "_launch_bonus_batch"
+        ) as launch, patch.object(
+            self.forward, "_forward_bonus_candidates"
+        ) as serial:
+            self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+        launch.assert_called_once()
+        self.assertEqual(
+            [[p.token for p in chunk] for _, chunk in launch.call_args.args[1]],
+            [[1, 2, 3, 4]] * 2,
+        )
+        serial.assert_not_called()
+        self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_bonus_many_filters_incomplete_and_preserves_single_lookahead(self):
+        for mode in (
+            "off",
+            "single",
+            "lookahead",
+            "incomplete",
+            "finished",
+            "page",
+            "no_graph",
+        ):
+            with self.subTest(mode=mode):
+                host, jobs, _pool, _freed = self._batch_fixture()
+                if mode == "single":
+                    jobs = jobs[:1]
+                elif mode == "lookahead":
+                    jobs[0].runner._lookahead_satisfied = True
+                elif mode == "incomplete":
+                    for job in jobs:
+                        job.runner.cached_len -= 2
+                elif mode == "finished":
+                    host._sr_is_finished = lambda _req: True
+                elif mode == "page":
+                    host.tree_cache.page_size = 128
+                with _bonus_prediction("0" if mode == "off" else "1"), patch.object(
+                    self.forward,
+                    "select_bonus_candidates",
+                    return_value=[self._candidate()],
+                ), patch.object(
+                    self.forward,
+                    "_bonus_batch_width",
+                    return_value=None if mode == "no_graph" else 4,
+                ), patch.object(
+                    self.forward, "_launch_bonus_batch"
+                ) as launch, patch.object(
+                    self.forward, "_forward_bonus_candidates"
+                ) as serial:
+                    self.forward.maybe_attach_bonus_guesses_many(host, jobs)
+                launch.assert_not_called()
+                self.assertEqual(
+                    serial.call_count, {"single": 1, "lookahead": 2}.get(mode, 0)
+                )
+                self.assertTrue(all(not job.runner.bonus_ids for job in jobs))
+
+    def test_deferred_flush_batches_before_publishing(self):
+        host, jobs, _pool, _freed = self._batch_fixture()
+        events = []
+
+        def fitting(_host, _runners, _steps, **_kwargs):
+            events.append("layer")
+            return [], 1
+
+        def launch(_host, _entries, _width):
+            events.append("bonus")
+
+        def publish(*_args):
+            self.assertTrue(all(not j.runner.bonus_ids for j in jobs))
+            events.append("publish")
+
+        with _bonus_prediction("1"), patch.object(
+            self.forward, "_forward_verify_fitting", side_effect=fitting
+        ), patch.object(
+            self.forward, "select_bonus_candidates", return_value=[self._candidate()]
+        ), patch.object(
+            self.forward, "_bonus_batch_width", return_value=4
+        ), patch.object(
+            self.forward, "_launch_bonus_batch", side_effect=launch
+        ), patch.object(
+            self.forward, "_publish_or_rollback", side_effect=publish
+        ):
+            self.forward.forward_deferred_final_layers(host, jobs)
+        self.assertEqual(events, ["layer", "bonus", "publish", "publish"])
+
     def test_bonus_prediction_flag_defaults_off_and_accepts_explicit_values(self):
         for value, expected in ((None, False), ("0", False), ("1", True)):
             with self.subTest(value=value), _bonus_prediction(value):

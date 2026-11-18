@@ -2996,7 +2996,321 @@ def _forward_bonus_candidates(scheduler, runner, plans: Sequence[_BonusCandidate
     runner.req.opt_bonus_guesses = kept
 
 
-def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree) -> None:
+def _bonus_job_ready(scheduler, job) -> bool:
+    runner = job.runner
+    return (
+        runner is not None
+        and _opt_page_size(scheduler) == 1
+        and not getattr(scheduler, "_sr_device_poisoned", False)
+        and not _request_finished(scheduler, job.req)
+        and not getattr(runner, "lookahead_dropped", False)
+        and hasattr(runner, "_alloc_layer_slots")
+        and int(runner.cached_len)
+        == int(runner.prefix_len) + int(job.state.depth) * int(job.state.config.width)
+    )
+
+
+def _bonus_batch_width(scheduler, count: int, candidates: int) -> Optional[int]:
+    """Select an existing layer key, not merely a configured query width.
+
+    Ordinary padded CUDA admission does not check the final replay key. Keep
+    that check here so an absent key cannot fail after KV has been written.
+    CPU/NPU and explicitly disabled graphs use the same layout eagerly.
+    """
+    from bisect import bisect_left
+
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import LAYER_WIDTHS
+
+    widths = sorted(int(w) for w in LAYER_WIDTHS)
+    device = torch.device(scheduler.req_to_token_pool.device)
+    model = _bonus_model_runner(scheduler)
+    graph = getattr(model, "graph_runner", None)
+    if device.type == "cuda" and graph is not None:
+        # ClearTree Draft currently runs TP1. Do not guess a DP/TP gather key.
+        if getattr(graph, "require_mlp_tp_gather", False):
+            return None
+        capture_bs = list(graph.capture_bs)
+        index = bisect_left(capture_bs, count)
+        if index == len(capture_bs):
+            return None
+        padded = capture_bs[index]
+        stream = None
+        if getattr(graph, "enable_pdmux", False):
+            from sglang.srt.multiplex.pdmux_context import get_current_stream_idx
+
+            stream = get_current_stream_idx()
+        if not (getattr(graph, "disable_padding", False) and count != padded):
+            widths = [
+                w
+                for w in widths
+                if graph._make_graph_key(padded, stream, w) in graph.graphs
+            ]
+        # With padding disabled, a missing exact BS is explicitly rejected by
+        # can_run(), and scheduler.run_batch safely executes eager instead.
+    if not widths:
+        return None
+    return next((w for w in widths if w >= candidates), widths[-1])
+
+
+@dataclass
+class _BonusBatchOwner:
+    """One allocation, retained until every row is released or transferred."""
+
+    entries: list
+    width: int
+    loc: Optional[torch.Tensor] = None
+    # After padding release this holds only the real slots, never freed rows.
+    owned: Optional[torch.Tensor] = None
+    mapped: bool = False
+    complete: bool = False
+    release_unknown: bool = False
+    previous_guesses: object = None
+
+
+def _quarantine_bonus_batch(scheduler, owner) -> None:
+    from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+        quarantine,
+    )
+
+    scheduler._sr_device_poisoned = True
+    clear = getattr(scheduler, "_sr_clear_stamps_after_poison", None)
+    if callable(clear):
+        clear()
+    record = quarantine(scheduler).retain(owner)
+    # No event/units: neither an unknown consumer nor a failed free may be
+    # retried by a later quarantine poll. The owner retains the device ids.
+    record.release_error = RuntimeError("ClearTree bonus batch ownership unresolved")
+
+
+def _clear_bonus_batch_map(scheduler, owner) -> None:
+    if not owner.mapped:
+        return
+    for job, _chunk in owner.entries:
+        end = int(job.runner.cached_len)
+        _clear_req_to_token_span(scheduler, job.req, end, end + owner.width)
+        job.req.kv_allocated_len = end
+    owner.mapped = False
+
+
+def _cleanup_bonus_batch(scheduler, owner) -> None:
+    if owner.loc is None:
+        return
+    if getattr(scheduler, "_sr_device_poisoned", False) or owner.release_unknown:
+        _quarantine_bonus_batch(scheduler, owner)
+        return
+    try:
+        if not owner.complete and owner.loc.device.type != "cpu":
+            torch.get_device_module(owner.loc.device).current_stream().synchronize()
+        owner.complete = True
+        _clear_bonus_batch_map(scheduler, owner)
+        if owner.owned is not None:
+            # Mark before submission: a throwing allocator may have freed a
+            # subset already. Never retry that submission or free siblings.
+            owner.release_unknown = True
+            scheduler.token_to_kv_pool_allocator.free(owner.owned)
+            owner.release_unknown = False
+            owner.owned = None
+    except Exception:
+        _quarantine_bonus_batch(scheduler, owner)
+        raise
+
+
+def _launch_bonus_batch(scheduler, entries, width: int) -> None:
+    """One request-major TARGET_VERIFY; bonus never evicts or grows tree KV."""
+    from sglang.srt.mem_cache.common import alloc_token_slots
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
+        OptBonusGuess,
+        release_opt_bonus_guesses,
+    )
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    device = scheduler.req_to_token_pool.device
+    pool = scheduler.req_to_token_pool.req_to_token
+    count = len(entries)
+    ends = [int(job.runner.cached_len) for job, _chunk in entries]
+    rows = [int(job.req.req_pool_idx) for job, _chunk in entries]
+    if (
+        len(set(rows)) != count
+        or any(row < 0 or row >= pool.shape[0] for row in rows)
+        or any(end < 0 or end + width > pool.shape[1] for end in ends)
+    ):
+        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_map")
+        return
+    allocator = scheduler.tree_cache.token_to_kv_pool_allocator
+    # SWA alloc() can remove slots from one sub-pool and then fail before the
+    # caller receives them. Bonus is optional, so skip rather than risk a leak.
+    # Detect by dual sub-pools to avoid importing the SWA module on CPU checks.
+    if hasattr(allocator, "full_attn_allocator") and hasattr(
+        allocator, "swa_attn_allocator"
+    ):
+        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_allocator")
+        return
+    # Do not include evictable_size: bonus must not evict useful prefix KV.
+    if int(allocator.available_size()) < count * width:
+        _opt_draft_count(scheduler, "opt_bonus_batch_skipped_kv")
+        return
+    owner = _BonusBatchOwner(entries, width)
+    try:
+        owner.loc = alloc_token_slots(scheduler.tree_cache, count * width)
+        owner.owned = owner.loc
+        if owner.loc is None or owner.loc.numel() != count * width:
+            raise RuntimeError("ClearTree bonus batch allocation has wrong size")
+        starts = _bonus_long_tensor(ends, device)
+        # Assign may partially submit before throwing, so cleanup owns every
+        # request span before calling it.
+        owner.mapped = True
+        for job, _chunk in entries:
+            job.req.kv_allocated_len = int(job.runner.cached_len) + width
+        assign_req_to_token_pool_func(
+            _bonus_long_tensor(rows, device),
+            pool,
+            starts,
+            starts + width,
+            owner.loc,
+            count,
+        )
+        tokens = _bonus_long_tensor(
+            [p.token for _job, chunk in entries for p in chunk], device
+        ).reshape(count, width)
+        positions = _bonus_long_tensor(
+            [p.position for _job, chunk in entries for p in chunk], device
+        )
+        masks = [
+            bonus_attention_mask(
+                job.runner.prefix_len, end, [p.chain for p in chunk], query_width=width
+            ).reshape(-1)
+            for (job, chunk), end in zip(entries, ends)
+        ]
+        mask = _copy_bonus_host(torch.cat(masks), device)
+        batch = _verify_batch_many(
+            scheduler,
+            [job.runner for job, _chunk in entries],
+            list(tokens),
+            positions,
+            mask,
+            owner.loc,
+            ends,
+            is_bonus=False,
+        )
+        scheduler.cur_batch = batch
+        _opt_draft_count(scheduler, "opt_bonus_batch_forwards")
+        result = scheduler.run_batch(batch)
+        flag = getattr(result, "can_run_cuda_graph", None)
+        if flag is None:
+            flag = getattr(result, "can_run_graph", None)
+        path = "unknown" if flag is None else ("graph" if flag else "eager")
+        _opt_draft_count(scheduler, "opt_bonus_batch_" + path)
+        logits = getattr(
+            getattr(result, "logits_output", None), "next_token_logits", None
+        )
+        if logits is None:
+            raise RuntimeError("ClearTree bonus batch returned no logits")
+        logits = _as_layer_rows(logits, count, width)
+        slot_rows = _read_bonus_slot_ids(list(owner.loc.reshape(count, width)))
+        owner.complete = True
+        _clear_bonus_batch_map(scheduler, owner)
+        guesses = []
+        real_indices, dummy_indices = [], []
+        for i, ((_job, chunk), slots) in enumerate(zip(entries, slot_rows)):
+            kept = []
+            for j, (plan, slot) in enumerate(zip(chunk, slots)):
+                if not plan.keep:
+                    dummy_indices.append(i * width + j)
+                    continue
+                real_indices.append(i * width + j)
+                kept.append(
+                    OptBonusGuess(
+                        parent=int(plan.parent),
+                        token=int(plan.token),
+                        slot=int(slot),
+                        logits=logits[i][j].detach().clone(),
+                        end_rank=int(plan.end_rank),
+                    )
+                )
+            guesses.append(kept)
+        # Build everything (including indexed device tensors) before any free.
+        real_loc = owner.loc[real_indices]
+        dummy_loc = owner.loc[dummy_indices]
+        for job, _chunk in entries:
+            # release_opt_bonus_guesses clears the request field before free.
+            # Retain the old guesses if that submission has unknown outcome.
+            owner.previous_guesses = getattr(job.req, "opt_bonus_guesses", None)
+            owner.release_unknown = True
+            release_opt_bonus_guesses(scheduler, job.req)
+            owner.release_unknown = False
+            owner.previous_guesses = None
+        if dummy_indices:
+            owner.release_unknown = True
+            scheduler.token_to_kv_pool_allocator.free(dummy_loc)
+            owner.release_unknown = False
+        owner.owned = real_loc
+        # No further fallible device operations before ownership transfer.
+        for (job, _chunk), kept in zip(entries, guesses):
+            job.req.opt_bonus_guesses = kept
+        owner.owned = None
+        _opt_draft_count(scheduler, "opt_bonus_batch_requests", count)
+        _opt_draft_count(scheduler, "opt_bonus_batch_query_rows", count * width)
+        _opt_draft_count(scheduler, "opt_bonus_batch_padding_rows", len(dummy_indices))
+    except Exception as exc:
+        try:
+            _reraise_device_context(scheduler, exc)
+        finally:
+            _cleanup_bonus_batch(scheduler, owner)
+        raise
+
+
+def maybe_attach_bonus_guesses_many(scheduler, jobs) -> None:
+    """Replace serial multi-request bonus with one optional batch forward."""
+    try:
+        if not bonus_prediction_enabled():
+            return
+        selected = []
+        for job in jobs:
+            if not _bonus_job_ready(scheduler, job):
+                _opt_draft_count(scheduler, "opt_bonus_skipped")
+                continue
+            if getattr(job.runner, "_lookahead_satisfied", False):
+                maybe_attach_bonus_guesses(scheduler, job)
+                continue
+            plans = select_bonus_candidates(job.state, job.window, job.runner)
+            if plans:
+                selected.append((job, plans))
+            else:
+                _opt_draft_count(scheduler, "opt_bonus_skipped")
+        if len(selected) == 1:
+            maybe_attach_bonus_guesses(scheduler, selected[0][0], plans=selected[0][1])
+            return
+        if not selected:
+            return
+        width = _bonus_batch_width(
+            scheduler, len(selected), max(len(p) for _, p in selected)
+        )
+        if width is None:
+            _opt_draft_count(scheduler, "opt_bonus_batch_skipped_graph")
+            return
+        entries = []
+        for job, plans in selected:
+            if len(plans) > width:
+                keep = {id(p) for p in sorted(plans, key=lambda p: p.end_rank)[:width]}
+                _opt_draft_count(
+                    scheduler, "opt_bonus_batch_truncated", len(plans) - width
+                )
+                plans = [p for p in plans if id(p) in keep]
+            entries.append((job, bonus_verify_chunks(plans, width)[0]))
+        _opt_draft_count(scheduler, "opt_bonus_rounds", len(entries))
+        _launch_bonus_batch(scheduler, entries, width)
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        if getattr(scheduler, "_sr_device_poisoned", False):
+            raise
+        _opt_draft_count(scheduler, "opt_bonus_batch_failed")
+        logger.warning("[ClearTree] bonus batch failed: %s", exc)
+    finally:
+        for job in jobs:
+            _drop_stored_logits(job.runner)
+
+
+def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree, *, plans=None) -> None:
     """Predict bonus tokens while the tree KV is still mapped.
 
     Disabled by default. Page size other than 1 never writes these slots.
@@ -3017,7 +3331,8 @@ def maybe_attach_bonus_guesses(scheduler, job: OptDeferredTree) -> None:
         if not hasattr(runner, "_alloc_layer_slots"):
             _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
-        plans = select_bonus_candidates(job.state, job.window, runner)
+        if plans is None:
+            plans = select_bonus_candidates(job.state, job.window, runner)
         if not plans:
             _opt_draft_count(scheduler, "opt_bonus_skipped")
             return
@@ -3834,15 +4149,9 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
         skipped_ids = {id(job) for job in skipped}
         for job in skipped:
             _drop_stored_logits(job.runner)
-        for job in jobs:
-            if id(job) in skipped_ids:
-                continue
-            try:
-                maybe_attach_bonus_guesses(scheduler, job)
-            except Exception as exc:
-                _reraise_device_context(scheduler, exc)
-                logger.warning("[OPT] bonus attach failed: %s", exc)
-                _opt_draft_count(scheduler, "opt_bonus_attach_failed")
+        maybe_attach_bonus_guesses_many(
+            scheduler, [job for job in jobs if id(job) not in skipped_ids]
+        )
     finally:
         set_post_reply(scheduler, False)
         for job in jobs:

@@ -10,7 +10,17 @@
 
 Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION` 默认关闭（未设置或设为 `0`）。page size 为 1、`SGLANG_CLEAR_TREE_KV_REUSE` 开启且请求可复用时，回包后仍按各请求的停止深度分组补算最后一层 KV，再发布树 KV lease；下一轮照常复用已接受路径的 KV。关闭时不保存 bonus 候选、不做最后层 bonus 专用 top-k/拷贝，也不做猜测 token 的额外前向。Target 验证后实际提交的 bonus token 不受影响，在下一轮由正常 ingest 路径处理。
 
-在 Draft 启动前设置 `SGLANG_CLEAR_BONUS_PREDICTION=1` 可恢复原来的预计算：在根和每个进入验证的节点处各猜一个未包含在验证子节点中的 token，以 W+1 个为一组、逐请求前向，提前写入其 KV 和后续 logits；命中且成为新提交尾部时可跳过该请求下一轮的 ingest 前向。此开关只控制 ClearTree Draft，独立于树 KV 复用，不修改 Target 的 K+1 验证图、协议、在线 K 或账本时间定义。按启动配置使用，修改开关后需重启 Draft，不支持运行中热切换。page size 非 1 的现有限制不变。
+在 Draft 启动前设置 `SGLANG_CLEAR_BONUS_PREDICTION=1` 可开启预计算：在根和每个进入验证的节点处各猜一个未包含在验证子节点中的 token，提前写入其 KV 和后续 logits；命中且成为新提交尾部时可跳过该请求下一轮的 ingest 前向。此开关只控制 ClearTree Draft，独立于树 KV 复用，不修改 Target 的 K+1 验证图、协议、在线 K 或账本时间定义。按启动配置使用，修改开关后需重启 Draft，不支持运行中热切换。page size 非 1 的现有限制不变。
+
+同一次回包后补层中，至少两个非 lookahead 请求完成最后层且有 bonus 候选时，直接使用一次批量 bonus 前向，不再逐请求计算，也没有额外 batch 开关。各请求补齐到统一查询宽度 G：优先取能覆盖最大候选数的最小现有层图档。例如最多 9 个候选用 G=16，最多 5 个用 G=8。候选超过最大可用档时，按残余路径质量 `end_rank` 保留前 G 个，保留原有相对顺序；这会降低预计算覆盖率，不改变 Target 提交 bonus token 的规则。padding 行不保留为猜测，前向结束后释放其槽位。
+
+CUDA Draft 通过 `is_bonus=False` 复用普通多请求层图，不新增图。只捕获 batch 1/2/4 且允许 graph padding 时，实际 batch 3 使用 batch 4 图；准入时检查实际 replay key，避免只根据配置宽度推定图存在。禁用 padding 且缺少精确 batch 图时走 eager；图显式关闭以及没有 Draft verify 图的 NPU 路径也走批量 eager。CUDA 图启用但找不到安全可复用的层图时跳过本批 bonus。只有一个合格请求或使用 lookahead 时，仍走原来的 W+1 单请求 bonus 图与 cascade 路径。
+
+批量 bonus 仅使用 allocator 当前空闲的 b×G 个槽位，不把可驱逐前缀 KV 算入预算；空间不足、映射越界、重复请求行，或使用混合 SWA allocator 时整批跳过，不驱逐、不拆批、不回退逐请求串行 bonus。SWA 的 `alloc()` 可能先从一个子池取走槽位，再在另一侧失败，调用方拿不到返回值；这项优化因此直接跳过。临时映射在完成前向后清除，`kv_allocated_len` 恢复到树末尾，真实猜测槽位脱离映射后交给请求持有；下一轮命中安装和未用猜测释放不变。普通失败确认设备完成后回收全部未移交槽位，仍可发布有效树；设备完成或 allocator 释放结果不明时隔离槽位并停止正常复用，不冒险重复释放。
+
+批量路径沿用 Draft 周期计数器，`opt_bonus_rounds` 仍是请求尝试数，不是模型 forward 数。新增计数包括：`opt_bonus_batch_forwards`（提交调用次数，失败也可能计入）、`opt_bonus_batch_requests` / `opt_bonus_batch_query_rows` / `opt_bonus_batch_padding_rows`（成功安装的请求/查询/padding 行）、`opt_bonus_batch_truncated`（丢弃候选数）、`opt_bonus_batch_graph` / `opt_bonus_batch_eager` / `opt_bonus_batch_unknown`（前向返回的执行路径），以及 `opt_bonus_batch_skipped_kv` / `opt_bonus_batch_skipped_graph` / `opt_bonus_batch_skipped_map` / `opt_bonus_batch_skipped_allocator` / `opt_bonus_batch_failed`。这些不是普通建树层样本，不写入层耗时拟合。
+
+CPU/mock 测试覆盖 batch 2/3/4 的拼装、图 key 选择、预算、padding、logits 保活与异常回收，不代表 CUDA/NPU 实机验证通过。实机应先以固定前缀/树核对 position、可见 KV、槽位及参考 logits，再检查 batch 2/3/4 的一次前向和实际图命中；batch 1 与 lookahead 单独回归。没有受控测量不能把既有回包后耗时推算当成批量版本收益；既有 bonus 开关实验的输出分叉也不因本次修改而视为解决。
 
 ## 账本
 

@@ -1,0 +1,1604 @@
+{
+  "schema_version": 3,
+  "status": "pass",
+  "runtime_status": "pass",
+  "global": {
+    "expected_trials": {
+      "status": "pass",
+      "detail": {
+        "expected": [
+          "smoke-A",
+          "c4-A1",
+          "c4-A2"
+        ],
+        "missing": []
+      }
+    },
+    "smoke_trial_selection": {
+      "status": "pass",
+      "detail": {
+        "status": "pass",
+        "declared": true,
+        "selected": "smoke-A-retry1",
+        "declarations": [
+          {
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/instrumentation-revision.json",
+            "value": {
+              "schema_version": 1,
+              "reason": "Healthy optional-import diagnostics were truncated at the last-6000-byte progress window: the missing 'Ignore import' prefix turned a harmless 'error when loading...' suffix into a false runtime failure. Discard the incomplete first binary line after a nonzero seek. No production code, launch flags, environment, dataset, or formal matrix changes.",
+              "original_aborted_trial": "smoke-A",
+              "original_trial_artifacts": "smoke-A/",
+              "retry_trial": "smoke-A-retry1",
+              "original_blocked_artifact": "../smoke-blocked.json",
+              "original_blocked_sha256": "9fc2fb3366c1b86357abc5bb5f8b734f1ce584d52d03b31e90ea7d59885a085d",
+              "resolution_status": "pending_successful_retry",
+              "resolution_policy": "Keep original smoke-blocked.json immutable. Emit ../smoke-blocked-resolved.json only after successful smoke-A-retry1 completion and proved cleanup; no resolution asserted by this revision.",
+              "original_scripts_directory": "attempts/initial-driver/",
+              "preflight_sha256": "c722206349517b1402b3c5538f5af03672ce5b54e0feab850c5a574d84d69255",
+              "scripts": {
+                "runtime.py": {
+                  "original_sha256": "f5105e605b47b9023d068670b41fdecd40788b23810d1efd4d42515939ae0b7b",
+                  "new_sha256": "db17fc023ef64e30bdfe2229a65cd9f2a3a9ea52dd0f130f7b737201fad8b997"
+                },
+                "run_experiment.py": {
+                  "original_sha256": "763d10d7e94e66ce1d2e372b8f0df907c85d8e1e7dac167fda87d8d46b3ebd9d",
+                  "new_sha256": "1040f946674e3ca764047ee88ed4c2542335a6e8e8be153a0350f0778023455b"
+                }
+              }
+            }
+          }
+        ],
+        "prior_attempts": [
+          {
+            "trial": "smoke-A",
+            "classification": "instrumentation_abort_before_client",
+            "abort_reason": "RuntimeError(\"target: runtime failure:  error when loading sglang.srt.models.gemma4_causal: cannot import name 'Gemma4TextConfig' from 'transformers' (/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/__init__.py)\")",
+            "full_optional_import_corroborated": true,
+            "blocked_artifact": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/smoke-blocked.json",
+              "bytes": 273,
+              "sha256": "9fc2fb3366c1b86357abc5bb5f8b734f1ce584d52d03b31e90ea7d59885a085d"
+            },
+            "inventory": [
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/client-kill.json",
+                "bytes": 63,
+                "sha256": "66aecce1bb9b39c3e48aa14647b5606b629d0915eeb41424fa1988d97361c237"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/client-stop.json",
+                "bytes": 63,
+                "sha256": "66aecce1bb9b39c3e48aa14647b5606b629d0915eeb41424fa1988d97361c237"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/config.json",
+                "bytes": 346,
+                "sha256": "eb4d95d05f44b6963a72e6e497261cec5d301207456d1f839e7ab6d6507cbf88"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-before-launch.json",
+                "bytes": 9060,
+                "sha256": "96622cbab2e88c1fd78b8e32efdede1b5726559adda40be853a6e63a01840456"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-kill.json",
+                "bytes": 311,
+                "sha256": "c87cc134a3b7ed7c2572280058a18f0eb372902c9b52f55c2c4404085222240c"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-model-info.json",
+                "bytes": 499,
+                "sha256": "f6567a92b582328016a5feeeebf7f993be547e99ce9c3be266716f11fca8895a"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-process.json",
+                "bytes": 222,
+                "sha256": "749371fe679b0b3f0691cb484733b11345ab7c2c5dd1d53997b29d6876ca45de"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft-stop.json",
+                "bytes": 32334,
+                "sha256": "cd7db1034ba5202ed36549825ab6c3a0851439f6941aea0b32e6b20ddb547f0b"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft.log",
+                "bytes": 22176,
+                "sha256": "f1b2034bf783f908caf3a4242d528fd7db6476c27f43191fb986f65e189b5711"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/draft.log.recent",
+                "bytes": 6000,
+                "sha256": "758028b289bc7de4997b1c8170f80604b76781f7084a712ebe315907f70f9aec"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-client.sh",
+                "bytes": 601,
+                "sha256": "abea392c748bb24c73b789e00ad41e937f79587fb5db3e01278282fa67789035"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-draft.sh",
+                "bytes": 937,
+                "sha256": "190a6c03991cbfaffd5fed12c1b229eb49be35ffec2e84139966fd2b6ce5d18d"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/start-target.sh",
+                "bytes": 914,
+                "sha256": "d17736a8975d9dae418a1c81a23da1a633ae5dec173f61101b03ea38e9935873"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-artifacts.tgz",
+                "bytes": 17243,
+                "sha256": "c9261e548a7d2d6c80610dd25243b9bfdd02dbf22f0b00c5c98dfdf67279cbd8"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-before-launch.json",
+                "bytes": 41813,
+                "sha256": "c3f44e87160f076ab16e1d552def3921a9ca992e24de148ff5979a2994b5c610"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-kill.json",
+                "bytes": 8950,
+                "sha256": "6ca91f03a1138a5d3f8ca23a426e1ee69c123f9d29da859e62ebfa40eb3d23b8"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-process.json",
+                "bytes": 7488,
+                "sha256": "6a8e0b219e08175b4ee38d4e7f3a1f661a849aadff949186988244f51050e951"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target-stop.json",
+                "bytes": 143412,
+                "sha256": "344175a7368a014d6b06ed674b50419e791b26158d241a48727c25e092cfb714"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target.log",
+                "bytes": 36968,
+                "sha256": "47fe562588936caecffcfe5c5ae904d8d276b8ac32b2ac18f3eb75283086f0fa"
+              },
+              {
+                "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A/target.log.recent",
+                "bytes": 6000,
+                "sha256": "713a015e49ed3d1bdd5a2f08e110816ce02af7ebfc94b535d70b65fce9f3f0b5"
+              }
+            ],
+            "runtime_errors": []
+          }
+        ],
+        "support_directory": "attempts",
+        "support_inventory": [
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/attempts/initial-driver/run_experiment.py",
+            "bytes": 20863,
+            "sha256": "763d10d7e94e66ce1d2e372b8f0df907c85d8e1e7dac167fda87d8d46b3ebd9d"
+          },
+          {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/attempts/initial-driver/runtime.py",
+            "bytes": 11648,
+            "sha256": "f5105e605b47b9023d068670b41fdecd40788b23810d1efd4d42515939ae0b7b"
+          }
+        ],
+        "issues": [],
+        "boundary": "explicit declared candidate only, never newest; candidate becomes logical smoke only after every normal smoke check passes; no waiver for real runtime faults",
+        "accepted": true
+      }
+    },
+    "root_metadata_parse": {
+      "status": "pass",
+      "detail": []
+    },
+    "trial_layout": {
+      "status": "pass",
+      "detail": {
+        "unexpected_trial_directories": []
+      }
+    }
+  },
+  "trials": {
+    "c4-A1": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": []
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest tokens/rate (exact client wall reconstruction)",
+            473.0215671341866
+          ],
+          [
+            "client log wall (rounded 0.001s)",
+            473.022
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": 0
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL global_index 0..n-1 in request order"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": null
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.run.json",
+              "bytes": 2624,
+              "sha256": "e6927af8fbf47155e54cea684861d35c7b6a4497670acce65af489d1bfb34b40"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.jsonl",
+              "bytes": 3852139,
+              "sha256": "a296519d3f1e1371483e2829a1177ab4f72fdc5fc19c21b9f7d23597571faac5"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.csv",
+              "bytes": 1015,
+              "sha256": "f5adbc253e1179065a42b252d6560c163bebe46a40f3a1a6b0c615a95e082e21"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": 0
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_batch_warning_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.20261117T183413.286247Z-39bf7d23.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "target_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/target.log:24",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "draft_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/draft.log:7",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "request_count": {
+        "status": "pass",
+        "detail": {
+          "expected": 100,
+          "actual": 100
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "CSV": 4.0
+        }
+      },
+      "max_new_tokens": {
+        "status": "pass",
+        "detail": {
+          "expected": 1024,
+          "evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/config.json",
+              "value": 1024.0
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/start-client.sh",
+              "value": 1024
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/client.log",
+              "value": 1024
+            }
+          ]
+        }
+      },
+      "completion_budget": {
+        "status": "pass",
+        "detail": "max-new-tokens is an upper bound, not an exact generated length requirement"
+      },
+      "completed_client": {
+        "status": "pass",
+        "detail": {
+          "completed_artifact": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A1/completed.json",
+            "bytes": 1387,
+            "sha256": "8517ad0927c663dddd08e4f8f98ba2e23616ff46157e1e2bd73237240d2cdb6c"
+          },
+          "completed_client_evidence_valid": true,
+          "client_exit_code": 0,
+          "completion_before_owned_SIGTERM_policy": true,
+          "policy_files": {
+            "run_experiment.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/run_experiment.py",
+              "bytes": 23134,
+              "sha256": "1040f946674e3ca764047ee88ed4c2542335a6e8e8be153a0350f0778023455b"
+            },
+            "runtime.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/runtime.py",
+              "bytes": 11919,
+              "sha256": "db17fc023ef64e30bdfe2229a65cd9f2a3a9ea52dd0f130f7b737201fad8b997"
+            }
+          },
+          "planned_stop_supported": true,
+          "boundary_rule": "only successful completed client + inspected completion-before-owned-SIGTERM policy + explicit SIGTERM/drain permits exact cleanup diagnostics; no suppression of independent post-stop faults"
+        }
+      },
+      "batch_forwards_positive": {
+        "status": "pass",
+        "detail": {
+          "value": 4696,
+          "rule": "forwards > 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_requests_multiple": {
+        "status": "pass",
+        "detail": {
+          "value": 17760,
+          "rule": "requests >= 2 successful installed requests (aggregate, not instantaneous concurrency)",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_graph_positive": {
+        "status": "pass",
+        "detail": {
+          "value": 4696,
+          "rule": "graph > 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_failed_zero": {
+        "status": "pass",
+        "detail": {
+          "value": 0,
+          "rule": "failed == 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_skips_non_dominant": {
+        "status": "pass",
+        "detail": {
+          "value": 0,
+          "rule": "non-dominant := sum(skipped_graph, skipped_kv, skipped_allocator, skipped_map) <= forwards; equality permitted",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      }
+    },
+    "c4-A2": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": []
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest tokens/rate (exact client wall reconstruction)",
+            475.47815952822566
+          ],
+          [
+            "client log wall (rounded 0.001s)",
+            475.478
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": 0
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "successful": 100
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL global_index 0..n-1 in request order"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 100,
+          "requests": 100
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": null
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired": 100,
+          "successful": 100
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.run.json",
+              "bytes": 2621,
+              "sha256": "b0970bb62757cc2721c418e2ce33ec5b34527b386c7a052a3df3f0e6d84f507b"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.jsonl",
+              "bytes": 3851259,
+              "sha256": "a8d729a4e9f14889c8facc590a4aa8726e0cd87c94da2fb2a6d98760fa30152c"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.csv",
+              "bytes": 1015,
+              "sha256": "ed65ce742be9f591aac8eed1118e891a2e01adfefbf5bd28e795862ad2bf4bbb"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": 0
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_batch_warning_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 158,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.20261117T190209.768204Z-a3b307a8.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "target_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/target.log:24",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "draft_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/draft.log:7",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "request_count": {
+        "status": "pass",
+        "detail": {
+          "expected": 100,
+          "actual": 100
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "CSV": 4.0
+        }
+      },
+      "max_new_tokens": {
+        "status": "pass",
+        "detail": {
+          "expected": 1024,
+          "evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/config.json",
+              "value": 1024.0
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/start-client.sh",
+              "value": 1024
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/client.log",
+              "value": 1024
+            }
+          ]
+        }
+      },
+      "completion_budget": {
+        "status": "pass",
+        "detail": "max-new-tokens is an upper bound, not an exact generated length requirement"
+      },
+      "completed_client": {
+        "status": "pass",
+        "detail": {
+          "completed_artifact": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/c4-A2/completed.json",
+            "bytes": 1385,
+            "sha256": "47775e0706f95e4cea858b853bd99968b722690feb3d69ef9d91f6443fea6fac"
+          },
+          "completed_client_evidence_valid": true,
+          "client_exit_code": 0,
+          "completion_before_owned_SIGTERM_policy": true,
+          "policy_files": {
+            "run_experiment.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/run_experiment.py",
+              "bytes": 23134,
+              "sha256": "1040f946674e3ca764047ee88ed4c2542335a6e8e8be153a0350f0778023455b"
+            },
+            "runtime.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/runtime.py",
+              "bytes": 11919,
+              "sha256": "db17fc023ef64e30bdfe2229a65cd9f2a3a9ea52dd0f130f7b737201fad8b997"
+            }
+          },
+          "planned_stop_supported": true,
+          "boundary_rule": "only successful completed client + inspected completion-before-owned-SIGTERM policy + explicit SIGTERM/drain permits exact cleanup diagnostics; no suppression of independent post-stop faults"
+        }
+      },
+      "batch_forwards_positive": {
+        "status": "pass",
+        "detail": {
+          "value": 4696,
+          "rule": "forwards > 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_requests_multiple": {
+        "status": "pass",
+        "detail": {
+          "value": 17760,
+          "rule": "requests >= 2 successful installed requests (aggregate, not instantaneous concurrency)",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_graph_positive": {
+        "status": "pass",
+        "detail": {
+          "value": 4696,
+          "rule": "graph > 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_failed_zero": {
+        "status": "pass",
+        "detail": {
+          "value": 0,
+          "rule": "failed == 0",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      },
+      "batch_skips_non_dominant": {
+        "status": "pass",
+        "detail": {
+          "value": 0,
+          "rule": "non-dominant := sum(skipped_graph, skipped_kv, skipped_allocator, skipped_map) <= forwards; equality permitted",
+          "scope": "rank 0; sum independent flushed periodic counter windows across complete supplied logs, including warmup; not benchmark-only; unflushed tail unknown"
+        }
+      }
+    },
+    "smoke-A": {
+      "target_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/target.log"
+      },
+      "draft_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/draft.log"
+      },
+      "client_log": {
+        "status": "pass",
+        "detail": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.log"
+      },
+      "summary_consistency": {
+        "status": "pass",
+        "detail": []
+      },
+      "wall_clock": {
+        "status": "pass",
+        "detail": [
+          [
+            "manifest tokens/rate (exact client wall reconstruction)",
+            4.093914685770869
+          ],
+          [
+            "client log wall (rounded 0.001s)",
+            4.094
+          ]
+        ]
+      },
+      "request_errors": {
+        "status": "pass",
+        "detail": 0
+      },
+      "token_coverage": {
+        "status": "pass",
+        "detail": {
+          "known": 4,
+          "successful": 4
+        }
+      },
+      "request_order": {
+        "status": "pass",
+        "detail": "JSONL global_index 0..n-1 in request order"
+      },
+      "fallback_zero": {
+        "status": "pass",
+        "detail": {
+          "known": 4,
+          "requests": 4
+        }
+      },
+      "ttft_coverage": {
+        "status": "pass",
+        "detail": null
+      },
+      "acceptance_coverage": {
+        "status": "pass",
+        "detail": {
+          "paired": 4,
+          "successful": 4
+        }
+      },
+      "input_parse": {
+        "status": "pass",
+        "detail": []
+      },
+      "client_artifacts": {
+        "status": "pass",
+        "detail": {
+          "manifests": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.run.json"
+          ],
+          "jsonls": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.jsonl"
+          ],
+          "csvs": [
+            "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.csv"
+          ],
+          "fingerprints": [
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.run.json",
+              "bytes": 2567,
+              "sha256": "ef43e06909d50218dd2906b68783717672048fbfd8566c386c4462761f517466"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.jsonl",
+              "bytes": 31556,
+              "sha256": "9449aac8cb3f9613c8c9200a17a2a1bca11058e85c64ac62ea625d224f2d2eee"
+            },
+            {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.csv",
+              "bytes": 993,
+              "sha256": "81bc1139d76a7c25081a2fc272ae751246b82d0e8176f836713b84ca67707837"
+            }
+          ]
+        }
+      },
+      "no_CLEAR_ledger": {
+        "status": "pass",
+        "detail": 0
+      },
+      "no_protocol_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_device_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_timeout_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_fallback_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_batch_warning_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "no_other_error_log_errors": {
+        "status": "pass",
+        "detail": []
+      },
+      "target_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 4,
+          "malformed_lines": []
+        }
+      },
+      "target_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "draft_round_metrics": {
+        "status": "pass",
+        "detail": {
+          "windows": 4,
+          "malformed_lines": []
+        }
+      },
+      "draft_no_bad_counters": {
+        "status": "pass",
+        "detail": {}
+      },
+      "bonus_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:bonus_prediction",
+            "scope": "shared"
+          },
+          {
+            "value": true,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-draft.sh:5",
+            "scope": "draft"
+          }
+        ]
+      },
+      "ledger_configuration": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-draft.sh:4",
+            "scope": "draft"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-target.sh:4",
+            "scope": "target"
+          }
+        ]
+      },
+      "target_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.20261117T181318.685154Z-6f99c805.run.json:server:settings:cuda_graph_bs",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-target.sh:9",
+              "scope": "target"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/target.log:24",
+              "scope": "target"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "draft_ledger_off": {
+        "status": "pass",
+        "detail": [
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:ledger",
+            "scope": "shared"
+          },
+          {
+            "value": false,
+            "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-draft.sh:4",
+            "scope": "draft"
+          }
+        ]
+      },
+      "draft_capture_batches": {
+        "status": "pass",
+        "detail": {
+          "configured": [
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/meta.json:cuda_graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json:graph_bs",
+              "scope": "shared"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-draft.sh:8",
+              "scope": "draft"
+            },
+            {
+              "value": [
+                1,
+                2,
+                4
+              ],
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/draft.log:7",
+              "scope": "draft"
+            }
+          ],
+          "observed": [
+            1,
+            2,
+            4
+          ],
+          "unparsed_capture_lines": 0,
+          "required": [
+            1,
+            2,
+            4
+          ],
+          "scope": "capture bs, not query/KV/ntpb widths"
+        }
+      },
+      "target_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/target.log:24",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "draft_max_running_requests": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual_server_evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/draft.log:7",
+              "value": 4.0
+            }
+          ]
+        }
+      },
+      "request_count": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "actual": 4
+        }
+      },
+      "concurrency": {
+        "status": "pass",
+        "detail": {
+          "expected": 4,
+          "CSV": 4.0
+        }
+      },
+      "max_new_tokens": {
+        "status": "pass",
+        "detail": {
+          "expected": 128,
+          "evidence": [
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/config.json",
+              "value": 128.0
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/start-client.sh",
+              "value": 128
+            },
+            {
+              "source": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/client.log",
+              "value": 128
+            }
+          ]
+        }
+      },
+      "completion_budget": {
+        "status": "pass",
+        "detail": "max-new-tokens is an upper bound, not an exact generated length requirement"
+      },
+      "completed_client": {
+        "status": "pass",
+        "detail": {
+          "completed_artifact": {
+            "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/smoke-A-retry1/completed.json",
+            "bytes": 1311,
+            "sha256": "42932644ba4c33b9f7a1eeffba491d30f5a364e88ee6e20a31826500de00bcd9"
+          },
+          "completed_client_evidence_valid": true,
+          "client_exit_code": 0,
+          "completion_before_owned_SIGTERM_policy": true,
+          "policy_files": {
+            "run_experiment.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/run_experiment.py",
+              "bytes": 23134,
+              "sha256": "1040f946674e3ca764047ee88ed4c2542335a6e8e8be153a0350f0778023455b"
+            },
+            "runtime.py": {
+              "path": "/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-18-a/raw/runtime.py",
+              "bytes": 11919,
+              "sha256": "db17fc023ef64e30bdfe2229a65cd9f2a3a9ea52dd0f130f7b737201fad8b997"
+            }
+          },
+          "planned_stop_supported": true,
+          "boundary_rule": "only successful completed client + inspected completion-before-owned-SIGTERM policy + explicit SIGTERM/drain permits exact cleanup diagnostics; no suppression of independent post-stop faults"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "completed": false,
+  "error": "RuntimeError(\"target: runtime failure:  error when loading sglang.srt.models.gemma4_causal: cannot import name 'Gemma4TextConfig' from 'transformers' (/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/__init__.py)\")"
+}
