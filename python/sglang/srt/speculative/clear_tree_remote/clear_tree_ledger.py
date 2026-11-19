@@ -25,10 +25,11 @@ FORGET = 0.999
 RIDGE = 1e-6
 LAYER_MIN_SAMPLES = 4
 LAYER_SPAN_PAD = 128.0
-# Intercept, graph bucket, prefix sum. The prefix prior is one token's
-# 2 µs scaled by 128, so a flat prefix cannot set the slope.
-LAYER_RIDGE = (0.0, RIDGE, LAYER_SPAN_PAD**2)
-_PREFIX_FEATURE = 2
+# Intercept and prefix sum. The prefix prior is one token's 2 µs scaled by
+# 128, so a flat prefix cannot set the slope. The capture batch is the cell
+# key, not a feature.
+LAYER_RIDGE = (0.0, LAYER_SPAN_PAD**2)
+_PREFIX_FEATURE = 1
 VERIFY_MIN_SAMPLES = 6
 _DEFAULT_BUCKETS = (256, 512, 1024, 2048, 4096)
 _GAP_ACTIONS = ("prefill", "finish", "abort")
@@ -66,6 +67,33 @@ def graph_bucket(active: int) -> int:
     return bucket
 
 
+def layer_graph_bs(scheduler, active: int) -> int:
+    """Capture batch a layer replay would use, else a power of two.
+
+    The list is cached on the scheduler after CUDA-graph capture. With
+    padding, this is the smallest captured batch that holds ``active``.
+    Without padding, only an exact captured batch counts. A missing list, or
+    no batch that can hold ``active``, falls back to ``graph_bucket``.
+    """
+    size = max(int(active), 1)
+    capture = (
+        None
+        if scheduler is None
+        else getattr(scheduler, "_clear_layer_capture_bs", None)
+    )
+    if not capture:
+        return graph_bucket(size)
+    buckets = sorted(int(item) for item in capture)
+    if bool(getattr(scheduler, "_clear_layer_disable_padding", False)):
+        if size in buckets:
+            return size
+        return graph_bucket(size)
+    for bucket in buckets:
+        if size <= bucket:
+            return bucket
+    return graph_bucket(size)
+
+
 def smallest_bucket(needed: int, buckets: Sequence[int]) -> Optional[int]:
     """Smallest bucket that can hold ``needed``, or None when all are too small."""
     for bucket in buckets:
@@ -74,20 +102,23 @@ def smallest_bucket(needed: int, buckets: Sequence[int]) -> Optional[int]:
     return None
 
 
-def _scan_layer_models(models, width: int, *, ready: bool):
-    """Graph-path fit for this width, else the first other path.
+def _scan_layer_models(models, width: int, g: int, *, ready: bool):
+    """Graph-path fit for this width and capture batch, else another path.
 
     ``ready`` keeps only a fit that can already be solved. The sample count
-    used to decide a narrow probe still sees a short graph fit.
+    used to decide a narrow probe still sees a short graph fit, and does not
+    fall through to an eager cell at the same capture batch.
     """
     preferred = None
     fallback = None
     for key, model in models.items():
-        if int(key[0]) != int(width):
+        if len(key) < 3:
+            continue
+        if int(key[0]) != int(width) or int(key[2]) != int(g):
             continue
         if ready and (model.n < LAYER_MIN_SAMPLES or model.coefficients() is None):
             continue
-        if len(key) > 1 and str(key[1]) == "graph":
+        if str(key[1]) == "graph":
             preferred = model
             break
         if fallback is None:
@@ -97,30 +128,35 @@ def _scan_layer_models(models, width: int, *, ready: bool):
     return fallback
 
 
-def _layer_model(scheduler, width: int):
-    """Fitted layer model for this width. A graph-path fit wins over eager."""
+def _layer_model(scheduler, width: int, g: int):
+    """Fitted layer model for this width and capture batch.
+
+    A graph-path fit wins over eager.
+    """
     ledger = bind_ledger(scheduler)
     if ledger is None:
         return None
-    return _scan_layer_models(ledger.layer_models, width, ready=True)
+    return _scan_layer_models(ledger.layer_models, width, g, ready=True)
 
 
-def layer_sample_count(scheduler, width: int) -> int:
+def layer_sample_count(scheduler, width: int, active: int) -> int:
     """Samples in the model ``predict_layer_ms`` will use, even below four.
 
-    A missing ledger counts as zero. This does not create one.
+    ``active`` selects the capture batch. A missing ledger counts as zero.
+    This does not create one.
     """
     existing = None if scheduler is None else getattr(scheduler, "_clear_ledger", None)
     if not existing:
         return 0
-    model = _scan_layer_models(existing.layer_models, width, ready=False)
+    g = layer_graph_bs(scheduler, active)
+    model = _scan_layer_models(existing.layer_models, width, g, ready=False)
     if model is None:
         return 0
     return int(model.n)
 
 
-def _layer_features(active: int, sum_ell: int) -> List[float]:
-    return [1.0, float(graph_bucket(active)), float(sum_ell)]
+def _layer_features(sum_ell: int) -> List[float]:
+    return [1.0, float(sum_ell)]
 
 
 def predict_layer_ms(
@@ -128,13 +164,16 @@ def predict_layer_ms(
 ) -> Optional[float]:
     """Draft layer fit, or None when the prefix is outside the seen span.
 
-    A non-positive prediction is also None. The served width then stays on
-    the flat K, and a replay candidate with this result does not pair.
+    The cell is this width and the capture batch of ``active``. A missing
+    cell, a prefix outside that cell, or a non-positive prediction is None.
+    The served width then stays on the flat K, and a replay candidate with
+    this result does not pair.
     """
-    model = _layer_model(scheduler, width)
+    g = layer_graph_bs(scheduler, active)
+    model = _layer_model(scheduler, width, g)
     if model is None:
         return None
-    features = _layer_features(active, sum_ell)
+    features = _layer_features(sum_ell)
     if not model.span_allows(features):
         return None
     pred = model.predict(features)
@@ -143,15 +182,19 @@ def predict_layer_ms(
     return float(pred)
 
 
-def layer_sum_ell_slope(scheduler, width: int) -> Optional[float]:
-    """Coefficient of prefix length in the layer fit. None until that fit exists."""
-    model = _layer_model(scheduler, width)
+def layer_sum_ell_slope(scheduler, width: int, active: int) -> Optional[float]:
+    """Prefix slope for this width and the capture batch of ``active``.
+
+    None until that cell can be solved.
+    """
+    g = layer_graph_bs(scheduler, active)
+    model = _layer_model(scheduler, width, g)
     if model is None:
         return None
     beta = model.coefficients()
-    if beta is None or len(beta) < 3:
+    if beta is None or len(beta) < 2:
         return None
-    return float(beta[2])
+    return float(beta[1])
 
 
 def _action_name(action) -> str:
@@ -275,7 +318,7 @@ class ForgettingRegressor:
 
 def _new_layer_model() -> ForgettingRegressor:
     return ForgettingRegressor(
-        3,
+        2,
         LAYER_MIN_SAMPLES,
         ridge=LAYER_RIDGE,
         span_feature=_PREFIX_FEATURE,
@@ -730,14 +773,14 @@ class ClearLedger:
         elif host is not None and gpu is not None:
             measured = (int(host) + int(gpu)) / 1000.0
         if measured is not None:
-            features = [
-                1.0,
-                float(sample["graph_bucket"]),
-                float(sample["sum_ell"]),
-            ]
+            features = [1.0, float(sample["sum_ell"])]
         model = None
         if features is not None and not post_reply:
-            key = (int(sample["w"]), str(sample["path"]))
+            key = (
+                int(sample["w"]),
+                str(sample["path"]),
+                int(sample["graph_bucket"]),
+            )
             model = self.layer_models.get(key)
             if model is None:
                 model = _new_layer_model()
@@ -1039,7 +1082,7 @@ def queue_layer_sample(
         sample = {
             "layer": int(layer),
             "active": len(prefix),
-            "graph_bucket": graph_bucket(len(prefix)),
+            "graph_bucket": layer_graph_bs(scheduler, len(prefix)),
             "w": int(width),
             "sum_ell": sum(prefix),
             "host_us": None if host_us is None else int(host_us),

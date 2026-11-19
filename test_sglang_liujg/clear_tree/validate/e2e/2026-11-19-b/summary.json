@@ -1,0 +1,648 @@
+{
+  "01": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 46374.0,
+      "accept": 34465.0,
+      "draft": 96528.0,
+      "ratio": 0.3570466600364661,
+      "fallback": 0.0
+    },
+    "flush_failed": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 12164,
+      "left": 6153,
+      "histogram": [
+        [
+          "b=1,w=8,k=16",
+          6011
+        ],
+        [
+          "b=1,w=8,k=32",
+          4535
+        ],
+        [
+          "b=1,w=8,k=8",
+          604
+        ],
+        [
+          "b=1,w=16,k=32",
+          401
+        ],
+        [
+          "b=1,w=8,k=4",
+          285
+        ],
+        [
+          "b=1,w=16,k=16",
+          137
+        ],
+        [
+          "b=1,w=4,k=16",
+          56
+        ],
+        [
+          "b=1,w=8,k=64",
+          39
+        ]
+      ],
+      "exclude": [
+        [
+          "prefill",
+          101
+        ],
+        [
+          "finish",
+          101
+        ],
+        [
+          "new_rid",
+          101
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 12164,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 11950,
+      "kinds": [
+        [
+          "ordinary",
+          11355
+        ],
+        [
+          "explore",
+          595
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            1,
+            8
+          ],
+          11950
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 47687,
+      "residual": 35505,
+      "post_reply": 12164,
+      "wall_us": 35523,
+      "groups": [
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 33523,
+          "median": -0.029169292192546936,
+          "mae": 0.07522717815495295
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 1757,
+          "median": -0.027834666479238157,
+          "mae": 0.06832916980847192
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 225,
+          "median": -0.01589045890115559,
+          "mae": 0.07744019675587532
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 12164,
+      "opt_bonus_requests": 12164,
+      "opt_bonus_graph": 12164,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 380,
+        "idle": 1
+      }
+    }
+  },
+  "02": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 45696.0,
+      "accept": 30619.0,
+      "draft": 121064.0,
+      "ratio": 0.2529158131236371,
+      "fallback": 0.0
+    },
+    "flush_failed": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 3995,
+      "left": 531,
+      "histogram": [
+        [
+          "b=4,w=4,k=8",
+          3156
+        ],
+        [
+          "b=3,w=4,k=8",
+          191
+        ],
+        [
+          "b=4,w=8,k=8",
+          141
+        ],
+        [
+          "b=1,w=8,k=16",
+          112
+        ],
+        [
+          "b=4,w=4,k=4",
+          101
+        ],
+        [
+          "b=4,w=4,k=16",
+          97
+        ],
+        [
+          "b=1,w=8,k=32",
+          71
+        ],
+        [
+          "b=4,w=8,k=16",
+          31
+        ]
+      ],
+      "exclude": [
+        [
+          "finish",
+          100
+        ],
+        [
+          "prefill",
+          97
+        ],
+        [
+          "new_rid",
+          97
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 3995,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 3642,
+      "kinds": [
+        [
+          "ordinary",
+          3463
+        ],
+        [
+          "explore",
+          179
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            2,
+            4
+          ],
+          3446
+        ],
+        [
+          [
+            1,
+            8
+          ],
+          196
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 13006,
+      "residual": 8190,
+      "post_reply": 4812,
+      "wall_us": 8194,
+      "groups": [
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 6525,
+          "median": -0.0059857968159801045,
+          "mae": 0.06306248480508003
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 563,
+          "median": -0.029696814383584513,
+          "mae": 0.07722544215513905
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 443,
+          "median": 0.039372939401285834,
+          "mae": 0.05081309211916385
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 334,
+          "median": -0.003609071409891196,
+          "mae": 0.06075747181450952
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 222,
+          "median": -0.15990865231538487,
+          "mae": 0.16616920608351382
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 37,
+          "median": 0.08223368288548039,
+          "mae": 0.08223368288548039
+        },
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 31,
+          "median": -0.014315819125282014,
+          "mae": 0.04894584571275229
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 30,
+          "median": -0.03933535992377807,
+          "mae": 0.0731409192547765
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 3995,
+      "opt_bonus_requests": 15143,
+      "opt_bonus_graph": 3995,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 124,
+        "idle": 1
+      }
+    }
+  },
+  "03": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 29608.0,
+      "accept": 22451.0,
+      "draft": 58384.0,
+      "ratio": 0.38454028500959164,
+      "fallback": 0.0
+    },
+    "flush_failed": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 7356,
+      "left": 7356,
+      "histogram": [
+        [
+          "b=1,w=8,k=8",
+          3788
+        ],
+        [
+          "b=1,w=8,k=32",
+          3142
+        ],
+        [
+          "b=1,w=16,k=32",
+          234
+        ],
+        [
+          "b=1,w=16,k=8",
+          127
+        ],
+        [
+          "b=1,w=4,k=8",
+          45
+        ],
+        [
+          "b=1,w=8,k=64",
+          5
+        ],
+        [
+          "b=1,w=8,k=4",
+          4
+        ],
+        [
+          "b=1,w=16,k=64",
+          4
+        ]
+      ],
+      "exclude": [
+        [
+          "prefill",
+          101
+        ],
+        [
+          "finish",
+          101
+        ],
+        [
+          "new_rid",
+          101
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 7356,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 7196,
+      "kinds": [
+        [
+          "ordinary",
+          6836
+        ],
+        [
+          "explore",
+          360
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            1,
+            8
+          ],
+          7196
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 30220,
+      "residual": 22864,
+      "post_reply": 7356,
+      "wall_us": 22864,
+      "groups": [
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 21562,
+          "median": -0.039593164551732285,
+          "mae": 0.08551158825153021
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 1199,
+          "median": -0.04437661302844287,
+          "mae": 0.08257989017308098
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 103,
+          "median": -0.10784458254130591,
+          "mae": 0.12223454849960191
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 7356,
+      "opt_bonus_requests": 7356,
+      "opt_bonus_graph": 7356,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 229,
+        "idle": 1
+      }
+    }
+  },
+  "04": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 30329.0,
+      "accept": 19793.0,
+      "draft": 84624.0,
+      "ratio": 0.23389345812062773,
+      "fallback": 0.0
+    },
+    "flush_failed": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 2778,
+      "left": 1494,
+      "histogram": [
+        [
+          "b=4,w=4,k=4",
+          1196
+        ],
+        [
+          "b=4,w=4,k=8",
+          1081
+        ],
+        [
+          "b=3,w=4,k=8",
+          155
+        ],
+        [
+          "b=4,w=8,k=4",
+          65
+        ],
+        [
+          "b=4,w=8,k=8",
+          53
+        ],
+        [
+          "b=2,w=4,k=8",
+          48
+        ],
+        [
+          "b=1,w=8,k=8",
+          42
+        ],
+        [
+          "b=1,w=8,k=32",
+          32
+        ]
+      ],
+      "exclude": [
+        [
+          "finish",
+          99
+        ],
+        [
+          "prefill",
+          96
+        ],
+        [
+          "new_rid",
+          96
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 2778,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 2466,
+      "kinds": [
+        [
+          "ordinary",
+          2344
+        ],
+        [
+          "explore",
+          122
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            2,
+            4
+          ],
+          2390
+        ],
+        [
+          [
+            1,
+            8
+          ],
+          76
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 8148,
+      "residual": 4636,
+      "post_reply": 3512,
+      "wall_us": 4636,
+      "groups": [
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 3548,
+          "median": -0.014398326071402012,
+          "mae": 0.04645898731316106
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 379,
+          "median": 0.1812257624400342,
+          "mae": 0.1812257624400342
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 247,
+          "median": -0.03918167224113134,
+          "mae": 0.08571133181630897
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 215,
+          "median": -0.34875175941160463,
+          "mae": 0.34980534949463593
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 149,
+          "median": -0.004438109669038903,
+          "mae": 0.04154816551407814
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 56,
+          "median": 0.35270927492878046,
+          "mae": 0.35270927492878046
+        },
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 19,
+          "median": -0.09316714031446105,
+          "mae": 0.11641328589249422
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 11,
+          "median": -0.07453013614889437,
+          "mae": 0.09105552610177836
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 2701,
+      "opt_bonus_requests": 10242,
+      "opt_bonus_graph": 2701,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 86,
+        "idle": 1
+      }
+    }
+  },
+  "capture": {
+    "draft": {
+      "4": 12,
+      "2": 13,
+      "1": 13
+    },
+    "target": {
+      "4": 7,
+      "2": 7,
+      "1": 7
+    }
+  }
+}

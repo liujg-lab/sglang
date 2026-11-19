@@ -629,6 +629,23 @@ class ClearTreeSchedulerMixin:
                 self.server_args.clear_tree_addr,
                 self.server_args.clear_tree_port,
             )
+        self._clear_cache_layer_capture()
+
+    def _clear_cache_layer_capture(self) -> None:
+        """Remember the captured layer batches. A missing runner leaves them unset."""
+        try:
+            worker = getattr(self, "model_worker", None)
+            runner = getattr(worker, "model_runner", None)
+            graph = getattr(runner, "graph_runner", None)
+            capture = None if graph is None else getattr(graph, "capture_bs", None)
+            if not capture:
+                return
+            self._clear_layer_capture_bs = tuple(sorted(int(item) for item in capture))
+            self._clear_layer_disable_padding = bool(
+                getattr(graph, "disable_padding", False)
+            )
+        except Exception:
+            logger.warning("[OPT] layer capture batches were not cached", exc_info=True)
 
     def _clear_run_verify_round(self, batch) -> None:
         """Same verify round as standalone-remote.
@@ -1109,9 +1126,24 @@ class ClearTreeSchedulerMixin:
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def _clear_run_layer_bench(self, path: str) -> None:
+        """Run one local layer-forward grid, then return. Unset means unused."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("clear_layer_bench", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"SGLANG_CLEAR_LAYER_BENCH cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.run(self)
+
     @DynamicGradMode()
     def event_loop_normal_clear_tree_draft(self) -> None:
         self._init_clear_tree_draft()
+        bench = os.environ.get("SGLANG_CLEAR_LAYER_BENCH", "").strip()
+        if bench:
+            self._clear_run_layer_bench(bench)
+            return
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)

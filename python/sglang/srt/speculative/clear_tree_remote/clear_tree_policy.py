@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, Optional, Sequence
+from typing import Callable, Dict, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
@@ -165,21 +165,27 @@ def keep_by_net_benefit(
     theta: float,
     verify_times: Dict[int, float],
     layer_cost,
-    kappa: Optional[float],
+    kappa: Optional[Union[float, Callable]],
 ) -> Optional[list]:
     """Requests to forward, or None when no candidate has a layer cost.
 
     Each request maps ``e`` and ``g`` from K to path mass and marginal gain,
     plus ``ell``, ``c``, ``item``, and ``growing``. ``J`` uses every request.
     The layer cost is charged only for the ``m`` requests that would continue.
-    An empty list means stop. Ties keep the larger K, then the larger group.
+    ``kappa`` is a prefix slope, or a function of ``m``. Each distinct slope
+    is sorted once, and ``m`` uses that slope's own prefix. An empty list
+    means stop. Ties keep the larger K, then the larger group.
     """
     rows = list(requests)
     growing = [row for row in rows if row.get("growing", True)]
     if not growing:
         return []
     price = float(theta)
-    slope = 0.0 if kappa is None else float(kappa)
+    slope_of = (
+        kappa
+        if callable(kappa)
+        else (lambda _m: 0.0 if kappa is None else float(kappa))
+    )
     joint = {}
     gains = {}
     for k, spent in verify_times.items():
@@ -199,17 +205,26 @@ def keep_by_net_benefit(
     best = None
     any_cost = False
     for k, base in joint.items():
-        ranked = []
-        for row in growing:
-            gain = float(gains[k].get(id(row), 0.0))
-            ell = int(row["ell"])
-            ranked.append((gain - price * slope * ell, gain, ell, row["item"]))
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        running_gain = 0.0
-        running_ell = 0
-        for m, (_net, gain, ell, _item) in enumerate(ranked, start=1):
-            running_gain += gain
-            running_ell += ell
+        orders = {}
+        for m in range(1, len(growing) + 1):
+            slope = slope_of(m)
+            if slope is None:
+                slope = 0.0
+            slope = float(slope)
+            ranked = orders.get(slope)
+            if ranked is None:
+                ranked = []
+                for row in growing:
+                    gain = float(gains[k].get(id(row), 0.0))
+                    ell = int(row["ell"])
+                    ranked.append(
+                        (gain - price * slope * ell, gain, ell, row["item"])
+                    )
+                ranked.sort(key=lambda item: item[0], reverse=True)
+                orders[slope] = ranked
+            chosen = ranked[:m]
+            running_gain = sum(item[1] for item in chosen)
+            running_ell = sum(item[2] for item in chosen)
             cost = layer_cost(m, running_ell)
             if cost is None:
                 continue
@@ -217,7 +232,7 @@ def keep_by_net_benefit(
             value = base + running_gain - price * float(cost)
             choice = (value, int(k), int(m))
             if best is None or choice > best[0]:
-                best = (choice, [item[3] for item in ranked[:m]])
+                best = (choice, [item[3] for item in chosen])
     if not any_cost or best is None:
         return None
     if best[0][0] > stop_value:
@@ -232,12 +247,13 @@ def select_continuing(
     theta: float,
     verify_times: Dict[int, float],
     layer_cost,
-    kappa: Optional[float],
+    kappa: Optional[Union[float, Callable]],
 ) -> Optional[list]:
     """Requests to forward, or None when no candidate has a layer cost.
 
-    Each request is sorted once. Path mass at a tier is a prefix of that
-    order. Tiers with no verify time are left out.
+    Path mass at a tier is a prefix of the benefit order. When ``kappa``
+    depends on how many requests continue, each count uses its own order.
+    Tiers with no verify time are left out.
     """
     growing_ids = {id(state) for state in eligible}
     timed = []
@@ -907,14 +923,20 @@ class RoundPlan:
 
         return predict_layer_ms(self._scheduler, self.width, int(active), int(sum_ell))
 
-    def _kappa(self) -> Optional[float]:
+    def _kappa(self):
         if self._scheduler is None:
             return None
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
             layer_sum_ell_slope,
         )
 
-        return layer_sum_ell_slope(self._scheduler, self.width)
+        scheduler = self._scheduler
+        width = self.width
+
+        def slope(active: int):
+            return layer_sum_ell_slope(scheduler, width, int(active))
+
+        return slope
 
     def _time(self, k: int) -> Optional[float]:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (

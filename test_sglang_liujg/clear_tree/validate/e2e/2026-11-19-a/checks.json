@@ -1,0 +1,44 @@
+{
+  "run_id": "2026-11-19-a",
+  "requests_ok": {
+    "01": "100/100",
+    "02": "100/100"
+  },
+  "fallback_steps": {
+    "01": 0,
+    "02": 0
+  },
+  "output_tokens": {
+    "01": 66869,
+    "02": 66200
+  },
+  "formal_wall_s": {
+    "01": 1135.208,
+    "02": 454.654
+  },
+  "output_tok_s": {
+    "01": 58.905,
+    "02": 145.605
+  },
+  "accept": {
+    "01": "51548/123920",
+    "02": "45647/164888"
+  },
+  "accept_ratio": {
+    "01": 0.4159780503550678,
+    "02": 0.27683639803988164
+  },
+  "flush": "both trials logged Cache flushed successfully on TP0 and TP1; client did not print flush_cache failed",
+  "online_w_applied": 0,
+  "online_k_left_flat": true,
+  "verify_residual_all_null": true,
+  "capture": {
+    "draft_capturing_lines": 38,
+    "target_capturing_lines": 21,
+    "bs": [
+      1,
+      2,
+      4
+    ]
+  }
+}

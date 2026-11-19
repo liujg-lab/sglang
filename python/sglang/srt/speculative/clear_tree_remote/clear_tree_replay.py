@@ -84,15 +84,18 @@ def _mark_width_ran(bucket: int, width: int) -> None:
     _probe_w_left[key] = 0
 
 
-def _layer_samples(scheduler, width: int) -> int:
-    """Layer samples already stored for ``width``. No ledger counts as zero."""
+def _layer_samples(scheduler, width: int, batch_size: int) -> int:
+    """Layer samples for ``width`` at this round's capture batch.
+
+    No ledger counts as zero.
+    """
     if scheduler is None:
         return 0
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         layer_sample_count,
     )
 
-    return int(layer_sample_count(scheduler, width))
+    return int(layer_sample_count(scheduler, width, int(batch_size)))
 
 
 def _narrow_unpriced(scheduler, width: int, batch: int, sum_ell: int) -> bool:
@@ -141,7 +144,7 @@ def choose_build_width(
         key = (int(bucket), int(narrow))
         left = int(_probe_w_left.get(key, 0))
         idle = int(_narrow_idle.get(key, PROBE_W_IDLE))
-        samples = _layer_samples(scheduler, narrow)
+        samples = _layer_samples(scheduler, narrow, batch_size)
         if left > 0 and _probe_w_fill.get(key, False) and samples >= LAYER_MIN_SAMPLES:
             _probe_w_left[key] = 0
             _probe_w_fill[key] = False

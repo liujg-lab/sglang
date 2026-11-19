@@ -37,6 +37,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     ingest_verify_samples,
     install_fallback_plan,
     compare_price,
+    keep_by_net_benefit,
     layer_should_continue,
     hold_replay,
     make_round,
@@ -103,6 +104,8 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     consume_verify_device,
     emit_verify_device,
     graph_bucket,
+    layer_graph_bs,
+    layer_sum_ell_slope,
     note_target_prefill,
     read_verify_host_us,
     reset_target_verify_model,
@@ -247,7 +250,7 @@ class ClearTreeLedgerTest(CustomTestCase):
             self.assertFalse(ledger.pending_logs)
             ledger.flush_logs()
             self.assertEqual(emit.call_count, 3)
-        self.assertEqual(ledger.layer_models[(8, "graph")].n, 1)
+        self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
 
     def test_idle_flushes_logs_without_dropping_open_round(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -466,7 +469,7 @@ class ClearTreeLedgerTest(CustomTestCase):
         record = _step(ledger, ["a"], [16], 2, 1.4)
 
         self.assertEqual(record["bonus_hit_rids"], ["a"])
-        self.assertEqual(ledger.layer_models[(8, "graph")].n, 1)
+        self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
 
     def test_layer_line_and_graph_bucket(self):
         self.assertEqual(graph_bucket(1), 1)
@@ -2185,7 +2188,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
     def test_layer_prefix_ridge_stays_inside_the_seen_span(self):
         model = ForgettingRegressor(
-            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
         )
         for prefix, cost in (
             (900.0, 5.8),
@@ -2193,10 +2196,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
             (903.0, 5.7),
             (903.0, 6.3),
         ):
-            model.update([1.0, 1.0, prefix], cost)
-        self.assertLess(abs(model.coefficients()[2]), 1e-3)
+            model.update([1.0, prefix], cost)
+        self.assertLess(abs(model.coefficients()[1]), 1e-3)
         ledger = ClearLedger()
-        ledger.layer_models[(4, "graph")] = model
+        ledger.layer_models[(4, "graph", 1)] = model
         sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
         near = predict_layer_ms(sched, 4, 1, 1000)
         self.assertIsNotNone(near)
@@ -2205,12 +2208,135 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertIsNone(predict_layer_ms(sched, 4, 1, 2500))
 
         negative = ForgettingRegressor(
-            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
         )
         for prefix in (900.0, 900.0, 903.0, 903.0):
-            negative.update([1.0, 1.0, prefix], -1.0)
-        ledger.layer_models[(8, "graph")] = negative
+            negative.update([1.0, prefix], -1.0)
+        ledger.layer_models[(8, "graph", 1)] = negative
         self.assertIsNone(predict_layer_ms(sched, 8, 1, 901))
+
+    def test_layer_cells_keep_their_own_slope_and_span(self):
+        def fit(pairs):
+            model = ForgettingRegressor(
+                2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+            )
+            for prefix, cost in pairs:
+                model.update([1.0, float(prefix)], float(cost))
+            return model
+
+        small = [(200.0, 4.2), (400.0, 6.0), (600.0, 8.1), (800.0, 10.0)]
+        large = [(200.0, 14.0), (400.0, 24.2), (600.0, 34.0), (800.0, 44.1)]
+        wide = [(4000.0, 14.0), (5000.0, 15.0), (6000.0, 16.0), (7000.0, 17.0)]
+        ledger = ClearLedger()
+        ledger.layer_models[(8, "graph", 1)] = fit(small)
+        ledger.layer_models[(8, "graph", 4)] = fit(large)
+        sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
+        low = predict_layer_ms(sched, 8, 1, 500)
+        high = predict_layer_ms(sched, 8, 3, 500)
+        self.assertIsNotNone(low)
+        self.assertIsNotNone(high)
+        self.assertLess(abs(low - 7.0), 1.0)
+        self.assertGreater(high, low + 10.0)
+        slope_low = layer_sum_ell_slope(sched, 8, 1)
+        slope_high = layer_sum_ell_slope(sched, 8, 3)
+        self.assertIsNotNone(slope_low)
+        self.assertIsNotNone(slope_high)
+        self.assertGreater(slope_high, slope_low + 0.02)
+        self.assertIsNone(predict_layer_ms(sched, 8, 2, 500))
+
+        ledger.layer_models[(8, "graph", 4)] = fit(wide)
+        self.assertIsNotNone(predict_layer_ms(sched, 8, 3, 2000))
+        self.assertIsNone(predict_layer_ms(sched, 8, 1, 2000))
+        self.assertLess(abs(predict_layer_ms(sched, 8, 1, 500) - low), 1e-6)
+
+    def test_layer_graph_bs_uses_the_captured_list(self):
+        padded = SimpleNamespace(_clear_layer_capture_bs=(1, 2, 4))
+        exact = SimpleNamespace(_clear_layer_capture_bs=(1, 2, 3, 4))
+        self.assertEqual(layer_graph_bs(padded, 3), 4)
+        self.assertEqual(layer_graph_bs(exact, 3), 3)
+        self.assertEqual(layer_graph_bs(SimpleNamespace(), 3), 4)
+        strict = SimpleNamespace(
+            _clear_layer_capture_bs=(1, 2, 4),
+            _clear_layer_disable_padding=True,
+        )
+        self.assertEqual(layer_graph_bs(strict, 2), 2)
+        self.assertEqual(layer_graph_bs(strict, 3), 4)
+
+    def test_keep_uses_each_count_its_own_order(self):
+        long = {
+            "e": {8: 0.0},
+            "g": {8: 10.0},
+            "ell": 100,
+            "c": 1.0,
+            "item": "long",
+            "growing": True,
+        }
+        shorts = [
+            {
+                "e": {8: 0.0},
+                "g": {8: 3.0},
+                "ell": 1,
+                "c": 1.0,
+                "item": name,
+                "growing": True,
+            }
+            for name in ("b", "c", "d", "e")
+        ]
+        requests = [long, *shorts]
+
+        def kappa(m):
+            return 0.0 if int(m) < 4 else 100.0
+
+        one = keep_by_net_benefit(
+            requests,
+            theta=1.0,
+            verify_times={8: 1.0},
+            layer_cost=lambda m, _ell: 0.0 if int(m) == 1 else None,
+            kappa=kappa,
+        )
+        four = keep_by_net_benefit(
+            requests,
+            theta=1.0,
+            verify_times={8: 1.0},
+            layer_cost=lambda m, _ell: 0.0 if int(m) == 4 else None,
+            kappa=kappa,
+        )
+        self.assertEqual(one, ["long"])
+        self.assertEqual(four, ["b", "c", "d", "e"])
+
+    def test_narrow_probe_counts_samples_at_this_graph_batch(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+            PROBE_W_IDLE,
+            _narrow_idle,
+            _probe_w_fill,
+        )
+
+        reset_policy()
+        ledger = ClearLedger()
+        other = ForgettingRegressor(
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+        )
+        other.n = LAYER_MIN_SAMPLES
+        ledger.layer_models[(4, "graph", 4)] = other
+        sched = SimpleNamespace(
+            _clear_ledger=ledger,
+            _clear_layer_capture_bs=(1, 2, 4),
+        )
+        _narrow_idle[(1, 4)] = PROBE_W_IDLE
+        self.assertEqual(
+            choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched),
+            (4, "probe_w"),
+        )
+        self.assertTrue(_probe_w_fill[(1, 4)])
+        ready = ForgettingRegressor(
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+        )
+        ready.n = LAYER_MIN_SAMPLES
+        ledger.layer_models[(4, "graph", 1)] = ready
+        self.assertEqual(
+            choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched),
+            (8, "ordinary"),
+        )
 
     def test_probe_w_stops_once_four_layer_samples_exist(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
@@ -2226,10 +2352,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
             (4, "probe_w"),
         )
         filled = ForgettingRegressor(
-            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
         )
         filled.n = LAYER_MIN_SAMPLES
-        ledger.layer_models[(4, "graph")] = filled
+        ledger.layer_models[(4, "graph", 1)] = filled
         self.assertEqual(
             choose_build_width(1, ledger_on=True, eligible=True, scheduler=sched),
             (8, "ordinary"),
@@ -2250,10 +2376,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
             reset_policy()
             ledger = ClearLedger()
             filled = ForgettingRegressor(
-                3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+                2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
             )
             filled.n = LAYER_MIN_SAMPLES
-            ledger.layer_models[(4, "graph")] = filled
+            ledger.layer_models[(4, "graph", 1)] = filled
             _narrow_idle[(1, 4)] = idle
             return SimpleNamespace(_clear_ledger=ledger)
 
@@ -2307,10 +2433,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
         observe_replay(1, 16, "ordinary", 10.0, 10.0, {8: (12.0, 9.0)})
         ledger = ClearLedger()
         fitted = ForgettingRegressor(
-            3, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=2
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
         )
         fitted.n = 4
-        ledger.layer_models[(8, "graph")] = fitted
+        ledger.layer_models[(8, "graph", 1)] = fitted
         ledger.verify_model = ForgettingRegressor(4, 6)
         ledger.verify_samples = 3
         ledger.open = object()
@@ -2368,7 +2494,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertTrue(jumped["excluded"])
         self.assertFalse(jumped["price_kept"])
         self.assertEqual(theta(1), before)
-        self.assertEqual(ledger.layer_models[(8, "graph")].n, 0)
+        self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 0)
         self.assertNotIn("a", policy._sum_a)
         self.assertEqual(policy._pending, {})
 
@@ -2446,7 +2572,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.note_idle()
         record = _step(ledger, ["a"], [16], 2, 0.050)
         self.assertEqual([item["wall_us"] for item in samples], [12000, 13000, 15000])
-        model = ledger.layer_models[(8, "graph")]
+        model = ledger.layer_models[(8, "graph", 1)]
         self.assertEqual(model.n, 3)
         expected = ((12.0 * FORGET + 13.0) * FORGET) + 15.0
         self.assertAlmostEqual(model.xty[0], expected)
@@ -2488,7 +2614,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.mark_post(1.2)
         ledger.note_idle()
         _step(ledger, ["a"], [16], 2, 1.4)
-        self.assertEqual(ledger.layer_models[(8, "graph")].n, 1)
+        self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
 
     def test_mark_stop_keeps_the_first_time(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -2541,7 +2667,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertIn("fallback", record["exclude_reason"])
         self.assertFalse(record["price_kept"])
         self.assertEqual(policy._clock, {})
-        self.assertEqual(ledger.layer_models[(8, "graph")].n, 0)
+        self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 0)
         self.assertNotIn("a", policy._sum_a)
         self.assertEqual(policy._pending, {})
 

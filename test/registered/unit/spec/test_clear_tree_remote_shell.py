@@ -403,6 +403,7 @@ class ClearTreeRemoteShellTest(CustomTestCase):
                 namespace = {
                     "time": __import__("time"),
                     "sys": __import__("sys"),
+                    "os": __import__("os"),
                     "ClearAction": ClearAction,
                     "get_sr_round_metrics": lambda *_args: metrics,
                     "supported_clear_protocol": supported_clear_protocol,

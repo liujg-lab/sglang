@@ -1,0 +1,14 @@
+{
+  "run_id": "2026-11-19-c",
+  "requests_ok": {"01": "100/100", "02": "100/100"},
+  "fallback_steps": {"01": 0, "02": 0},
+  "output_tokens": {"01": 46206, "02": 46104},
+  "formal_wall_s": {"01": 856.893, "02": 329.411},
+  "output_tok_s": {"01": 53.923, "02": 139.959},
+  "accept": {"01": "34283/96496", "02": "30917/121952"},
+  "online_w_applied": 0,
+  "online_k_left_flat": true,
+  "verify_residual_all_null": true,
+  "capture": {"draft_capturing_lines": 38, "target_capturing_lines": 21, "bs": [1, 2, 4]},
+  "devices": "ASCEND_RT_VISIBLE_DEVICES=4,5 after logic 2,3 were occupied"
+}

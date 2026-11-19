@@ -1,0 +1,339 @@
+{
+  "01": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 46206.0,
+      "accept": 34283.0,
+      "draft": 96496.0,
+      "ratio": 0.35527897529431274,
+      "fallback": 0.0
+    },
+    "flush_failed_text": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 12060,
+      "left": 5880,
+      "histogram": [
+        [
+          "b=1,w=8,k=16",
+          6180
+        ],
+        [
+          "b=1,w=8,k=32",
+          4076
+        ],
+        [
+          "b=1,w=8,k=8",
+          871
+        ],
+        [
+          "b=1,w=16,k=32",
+          381
+        ],
+        [
+          "b=1,w=8,k=2",
+          149
+        ],
+        [
+          "b=1,w=16,k=16",
+          149
+        ],
+        [
+          "b=1,w=8,k=4",
+          69
+        ],
+        [
+          "b=1,w=4,k=16",
+          41
+        ]
+      ],
+      "exclude": [
+        [
+          "prefill",
+          101
+        ],
+        [
+          "finish",
+          101
+        ],
+        [
+          "new_rid",
+          101
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 12060,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 11944,
+      "kinds": [
+        [
+          "ordinary",
+          11350
+        ],
+        [
+          "explore",
+          594
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            1,
+            8
+          ],
+          11944
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 47003,
+      "residual": 34824,
+      "post_reply": 12161,
+      "wall_us": 34842,
+      "groups": [
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 32872,
+          "median": -0.028724729510566094,
+          "mae": 0.0807425026824149
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 1737,
+          "median": -0.028770322896980338,
+          "mae": 0.0693296328088302
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 215,
+          "median": -0.03264704283244668,
+          "mae": 0.08908921626573274
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 12161,
+      "opt_bonus_requests": 12161,
+      "opt_bonus_graph": 12161,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 380,
+        "idle": 1
+      },
+      "windows": 381
+    }
+  },
+  "02": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 46104.0,
+      "accept": 30917.0,
+      "draft": 121952.0,
+      "ratio": 0.25351777748622406,
+      "fallback": 0.0
+    },
+    "flush_failed_text": false,
+    "flush_lines": 2,
+    "rounds": {
+      "n": 3826,
+      "left": 704,
+      "histogram": [
+        [
+          "b=4,w=4,k=8",
+          3006
+        ],
+        [
+          "b=4,w=4,k=16",
+          221
+        ],
+        [
+          "b=4,w=4,k=4",
+          158
+        ],
+        [
+          "b=4,w=8,k=8",
+          128
+        ],
+        [
+          "b=1,w=8,k=16",
+          92
+        ],
+        [
+          "b=1,w=8,k=32",
+          61
+        ],
+        [
+          "b=4,w=8,k=16",
+          44
+        ],
+        [
+          "b=4,w=2,k=4",
+          19
+        ]
+      ],
+      "exclude": [
+        [
+          "finish",
+          101
+        ],
+        [
+          "prefill",
+          98
+        ],
+        [
+          "new_rid",
+          98
+        ]
+      ],
+      "fallback": 0,
+      "verify_null": 3826,
+      "verify_fit": 0
+    },
+    "replay": {
+      "n": 3660,
+      "kinds": [
+        [
+          "ordinary",
+          3487
+        ],
+        [
+          "explore",
+          173
+        ]
+      ],
+      "applied": 0,
+      "would": [
+        [
+          [
+            4,
+            4
+          ],
+          3454
+        ],
+        [
+          [
+            1,
+            8
+          ],
+          176
+        ],
+        [
+          [
+            2,
+            4
+          ],
+          27
+        ],
+        [
+          [
+            3,
+            4
+          ],
+          3
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 12999,
+      "residual": 8156,
+      "post_reply": 4812,
+      "wall_us": 8187,
+      "groups": [
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 6627,
+          "median": -0.011701614283421646,
+          "mae": 0.06652005337278177
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 489,
+          "median": -0.019450194026408463,
+          "mae": 0.08328749227943211
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 370,
+          "median": 0.010396013915007107,
+          "mae": 0.036880303395386504
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 347,
+          "median": -0.02026335700203663,
+          "mae": 0.07195433451319944
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 268,
+          "median": -0.098261277724626,
+          "mae": 0.09904861611771887
+        },
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 29,
+          "median": 0.012195736906727372,
+          "mae": 0.06383768952307234
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 26,
+          "median": -0.03136385367854416,
+          "mae": 0.06334210973745769
+        }
+      ]
+    },
+    "bonus": {
+      "opt_bonus_forwards": 4021,
+      "opt_bonus_requests": 15261,
+      "opt_bonus_graph": 4021,
+      "opt_bonus_eager": 0,
+      "opt_bonus_unknown": 0,
+      "opt_bonus_failed": 0,
+      "reasons": {
+        "full": 125,
+        "idle": 1
+      },
+      "windows": 126
+    }
+  },
+  "capture": {
+    "draft": {
+      "4": 12,
+      "2": 13,
+      "1": 13
+    },
+    "target": {
+      "4": 7,
+      "2": 7,
+      "1": 7
+    }
+  }
+}

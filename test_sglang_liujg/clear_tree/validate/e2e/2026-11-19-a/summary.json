@@ -1,0 +1,561 @@
+{
+  "01": {
+    "client": {
+      "file": "client.20261119T051553.951259Z-260fbf72.jsonl",
+      "rows": 100,
+      "errors": 0,
+      "accept": 51548.0,
+      "draft": 123920.0,
+      "ratio": 0.4159780503550678,
+      "completion_field_present": true,
+      "keys_sample": [
+        "completion_tokens",
+        "decode_tokens",
+        "draft_tokens_per_verify",
+        "first_chunk_tokens",
+        "spec_accept_length",
+        "spec_accept_rate",
+        "spec_accept_token_num",
+        "spec_draft_token_num",
+        "spec_fallback_ct",
+        "spec_verify_ct",
+        "token_events",
+        "token_ids_complete",
+        "token_metrics_available"
+      ],
+      "completion_tokens": 66869,
+      "fallback": 0
+    },
+    "rounds": {
+      "rounds": 15721,
+      "left_flat": 9008,
+      "left_flat_ratio": 0.5729915399783729,
+      "histogram": [
+        [
+          "b=1,w=8,k=16",
+          6713
+        ],
+        [
+          "b=1,w=8,k=32",
+          5899
+        ],
+        [
+          "b=1,w=8,k=8",
+          1991
+        ],
+        [
+          "b=1,w=16,k=32",
+          461
+        ],
+        [
+          "b=1,w=16,k=16",
+          187
+        ],
+        [
+          "b=1,w=8,k=4",
+          83
+        ],
+        [
+          "b=1,w=16,k=8",
+          83
+        ],
+        [
+          "b=1,w=8,k=64",
+          78
+        ],
+        [
+          "b=1,w=8,k=2",
+          74
+        ],
+        [
+          "b=1,w=4,k=8",
+          49
+        ],
+        [
+          "b=1,w=4,k=16",
+          41
+        ],
+        [
+          "b=1,w=16,k=64",
+          37
+        ],
+        [
+          "b=1,w=4,k=32",
+          11
+        ],
+        [
+          "b=1,w=16,k=2",
+          6
+        ],
+        [
+          "b=1,w=4,k=4",
+          4
+        ],
+        [
+          "b=1,w=16,k=4",
+          3
+        ],
+        [
+          "b=1,w=4,k=2",
+          1
+        ]
+      ],
+      "exclude_reasons": [
+        [
+          "prefill",
+          101
+        ],
+        [
+          "finish",
+          101
+        ],
+        [
+          "new_rid",
+          101
+        ]
+      ],
+      "fallback_rounds": 0,
+      "verify_residual_null": 15721,
+      "verify_fit_true": 0
+    },
+    "replay": {
+      "rows": 15462,
+      "kinds": [
+        [
+          "ordinary",
+          14692
+        ],
+        [
+          "explore",
+          770
+        ]
+      ],
+      "applied": 0,
+      "would_top": [
+        [
+          [
+            1,
+            8,
+            8
+          ],
+          14692
+        ],
+        [
+          [
+            1,
+            8,
+            16
+          ],
+          770
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 68453,
+      "with_residual": 52714,
+      "post_reply": 15721,
+      "wall_us": 52732,
+      "groups": [
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 318,
+          "median": -0.031205902729078916,
+          "mae_median": 0.08017802996987977
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 49808,
+          "median": -0.02936977916732636,
+          "mae_median": 0.07586796247829336
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 2588,
+          "median": -0.028939754346068103,
+          "mae_median": 0.07267409396300906
+        }
+      ]
+    },
+    "bonus": {
+      "windows": 492,
+      "idle_windows": 1,
+      "last_reason": "idle",
+      "idle": {
+        "forwards": 9,
+        "requests": 9,
+        "graph": 9,
+        "eager": 0,
+        "unknown": 0,
+        "failed": 0
+      },
+      "tail_unflushed": false
+    },
+    "flush": 2,
+    "bonus_all_windows": {
+      "windows": 492,
+      "full": 491,
+      "idle": 1,
+      "forwards": 15721,
+      "requests": 15721,
+      "graph": 15721,
+      "eager": 0,
+      "unknown": 0,
+      "failed": 0
+    }
+  },
+  "02": {
+    "client": {
+      "file": "client.20261119T053629.228553Z-a377a8ff.jsonl",
+      "rows": 100,
+      "errors": 0,
+      "accept": 45647.0,
+      "draft": 164888.0,
+      "ratio": 0.27683639803988164,
+      "completion_field_present": true,
+      "keys_sample": [
+        "completion_tokens",
+        "decode_tokens",
+        "draft_tokens_per_verify",
+        "first_chunk_tokens",
+        "spec_accept_length",
+        "spec_accept_rate",
+        "spec_accept_token_num",
+        "spec_draft_token_num",
+        "spec_fallback_ct",
+        "spec_verify_ct",
+        "token_events",
+        "token_ids_complete",
+        "token_metrics_available"
+      ],
+      "completion_tokens": 66200,
+      "fallback": 0
+    },
+    "rounds": {
+      "rounds": 5507,
+      "left_flat": 1453,
+      "left_flat_ratio": 0.26384601416379155,
+      "histogram": [
+        [
+          "b=4,w=4,k=8",
+          3682
+        ],
+        [
+          "b=4,w=4,k=4",
+          552
+        ],
+        [
+          "b=4,w=4,k=16",
+          286
+        ],
+        [
+          "b=4,w=8,k=8",
+          188
+        ],
+        [
+          "b=3,w=4,k=8",
+          184
+        ],
+        [
+          "b=1,w=8,k=16",
+          136
+        ],
+        [
+          "b=1,w=8,k=32",
+          110
+        ],
+        [
+          "b=4,w=4,k=2",
+          86
+        ],
+        [
+          "b=2,w=4,k=8",
+          52
+        ],
+        [
+          "b=2,w=4,k=16",
+          48
+        ],
+        [
+          "b=4,w=8,k=16",
+          37
+        ],
+        [
+          "b=4,w=2,k=4",
+          19
+        ],
+        [
+          "b=1,w=8,k=8",
+          16
+        ],
+        [
+          "b=4,w=8,k=4",
+          12
+        ],
+        [
+          "b=2,w=4,k=4",
+          12
+        ],
+        [
+          "b=4,w=2,k=8",
+          10
+        ],
+        [
+          "b=4,w=4,k=32",
+          9
+        ],
+        [
+          "b=3,w=8,k=8",
+          9
+        ],
+        [
+          "b=1,w=16,k=32",
+          7
+        ],
+        [
+          "b=3,w=4,k=4",
+          6
+        ],
+        [
+          "b=3,w=4,k=16",
+          5
+        ],
+        [
+          "b=2,w=4,k=32",
+          5
+        ],
+        [
+          "b=1,w=16,k=16",
+          4
+        ],
+        [
+          "b=4,w=8,k=2",
+          4
+        ],
+        [
+          "b=3,w=4,k=2",
+          4
+        ],
+        [
+          "b=3,w=4,k=32",
+          4
+        ],
+        [
+          "b=2,w=4,k=2",
+          4
+        ],
+        [
+          "b=2,w=8,k=16",
+          4
+        ],
+        [
+          "b=3,w=2,k=8",
+          3
+        ],
+        [
+          "b=4,w=2,k=2",
+          3
+        ]
+      ],
+      "exclude_reasons": [
+        [
+          "finish",
+          101
+        ],
+        [
+          "prefill",
+          98
+        ],
+        [
+          "new_rid",
+          98
+        ]
+      ],
+      "fallback_rounds": 0,
+      "verify_residual_null": 5507,
+      "verify_fit_true": 0
+    },
+    "replay": {
+      "rows": 5106,
+      "kinds": [
+        [
+          "ordinary",
+          4854
+        ],
+        [
+          "explore",
+          252
+        ]
+      ],
+      "applied": 0,
+      "would_top": [
+        [
+          [
+            2,
+            4,
+            4
+          ],
+          4595
+        ],
+        [
+          [
+            1,
+            8,
+            8
+          ],
+          259
+        ],
+        [
+          [
+            2,
+            4,
+            8
+          ],
+          238
+        ],
+        [
+          [
+            1,
+            8,
+            16
+          ],
+          14
+        ]
+      ]
+    },
+    "layers": {
+      "layers": 20134,
+      "with_residual": 12742,
+      "post_reply": 7388,
+      "wall_us": 12746,
+      "groups": [
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 10,
+          "median": -0.18232997091335795,
+          "mae_median": 0.18232997091335795
+        },
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 20,
+          "median": 0.08594808110217289,
+          "mae_median": 0.08594808110217289
+        },
+        {
+          "w": 2,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 54,
+          "median": -0.012784998651780122,
+          "mae_median": 0.05523441564060394
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 380,
+          "median": -0.22235407012416303,
+          "mae_median": 0.2227241186193593
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 1297,
+          "median": 0.038026613875356885,
+          "mae_median": 0.05813802264359724
+        },
+        {
+          "w": 4,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 9424,
+          "median": -0.004443913629264606,
+          "mae_median": 0.060120631530862445
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 906,
+          "median": -0.032959989127692324,
+          "mae_median": 0.08305744197313242
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 2,
+          "n": 101,
+          "median": 0.10494097431766836,
+          "mae_median": 0.10494097431766836
+        },
+        {
+          "w": 8,
+          "path": "graph",
+          "graph_bucket": 4,
+          "n": 487,
+          "median": -0.010041876465856525,
+          "mae_median": 0.059191089371342986
+        },
+        {
+          "w": 16,
+          "path": "graph",
+          "graph_bucket": 1,
+          "n": 63,
+          "median": -0.04678545238981002,
+          "mae_median": 0.08526471470000174
+        }
+      ]
+    },
+    "bonus": {
+      "windows": 173,
+      "idle_windows": 1,
+      "last_reason": "idle",
+      "idle": {
+        "forwards": 3,
+        "requests": 3,
+        "graph": 3,
+        "eager": 0,
+        "unknown": 0,
+        "failed": 0
+      },
+      "tail_unflushed": false
+    },
+    "flush": 2,
+    "bonus_all_windows": {
+      "windows": 173,
+      "full": 172,
+      "idle": 1,
+      "forwards": 5507,
+      "requests": 20727,
+      "graph": 5507,
+      "eager": 0,
+      "unknown": 0,
+      "failed": 0
+    }
+  },
+  "capture": {
+    "draft_bs": {
+      "4": 12,
+      "2": 13,
+      "1": 13
+    },
+    "target_bs": {
+      "4": 7,
+      "2": 7,
+      "1": 7
+    },
+    "draft_bs_n": 38,
+    "target_bs_n": 21
+  },
+  "note": "bonus.idle is only the last idle window. bonus_all_windows sums every flushed Draft rank 0 window."
+}
