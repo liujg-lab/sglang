@@ -1753,7 +1753,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                 self.assertEqual(
                     host.cur_batch.spec_info.bonus_eager, gather is not None
                 )
-                spec = self.forward.OptLayerSpec(
+                spec = self.forward.ClearLayerSpec(
                     custom_mask=None,
                     positions=None,
                     draft_token_num=9,
@@ -1858,9 +1858,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
                     (job, self.forward.bonus_verify_chunks([self._candidate()], 3)[0])
                     for job in jobs
                 ]
-                attention._attention_for = Mock(
-                    return_value=object() if cascade else None
-                )
+                attention.cascade_enabled = Mock(return_value=bool(cascade))
                 logits = self.torch.zeros(count, 3, 4)
                 single, batch = Mock(return_value=(logits, "graph")), Mock(
                     return_value=(logits, "eager")
@@ -2646,7 +2644,7 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
     def test_shared_can_run_unsuffixed_bonus_pads_and_eager_blocks(self):
         with _bonus_prediction("1"):
             runner, mode = self._shared_cuda_runner()
-            spec = self.forward.OptLayerSpec(
+            spec = self.forward.ClearLayerSpec(
                 custom_mask=None,
                 positions=None,
                 draft_token_num=9,

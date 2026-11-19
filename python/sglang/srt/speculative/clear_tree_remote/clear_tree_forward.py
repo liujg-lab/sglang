@@ -143,19 +143,100 @@ def layer_attention_mask(
     return out.reshape(-1)
 
 
+@dataclass(frozen=True)
+class CascadeRows:
+    """One forward's cascade inputs. Nothing here is reused by the next layer."""
+
+    prefix_lens: list
+    width: int
+    tree_mask: torch.Tensor
+    prefix_rows: Optional[torch.Tensor] = None
+
+
+def _model_runner_of(scheduler):
+    worker = getattr(scheduler, "model_worker", None)
+    return getattr(worker, "model_runner", None)
+
+
+def _cascade_on(runner) -> bool:
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
+        cascade_enabled,
+    )
+
+    scheduler = getattr(runner, "scheduler", None)
+    return cascade_enabled(_model_runner_of(scheduler))
+
+
 def layer_verify_mask(runner, ancestor, device) -> torch.Tensor:
     """Mask stored on the verify spec.
 
-    Cascade attention reads the ancestor columns from its own workspace, so
-    the prefix of ones is not allocated. The ordinary kernel still needs it.
+    Cascade attention reads ancestor columns from the static buffers, so the
+    prefix of ones is not allocated. The ordinary kernel still needs it.
     """
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-        _attention_for,
-    )
-
-    if _attention_for(runner) is not None:
+    if _cascade_on(runner):
         return ancestor.reshape(-1).to(device=device, dtype=torch.bool)
     return layer_attention_mask(runner.prefix_len, ancestor, device)
+
+
+def bind_cascade(
+    spec,
+    runners,
+    ancestors,
+    width: int,
+    prefix_rows=None,
+    cached_lens=None,
+) -> None:
+    """Attach this forward's rows. Slots are already in ``req_to_token``."""
+    if not runners:
+        return
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
+        ClearTreeAttention,
+        cascade_enabled,
+    )
+
+    scheduler = runners[0].scheduler
+    if not cascade_enabled(_model_runner_of(scheduler)):
+        return
+    width = int(width)
+    if cached_lens is None:
+        cached_lens = [int(runner.cached_len) for runner in runners]
+    if len(ancestors) != len(runners) or len(cached_lens) != len(runners):
+        raise RuntimeError(
+            f"cascade bind has {len(runners)} runners, {len(ancestors)} masks, "
+            f"and {len(cached_lens)} lengths"
+        )
+    device = scheduler.req_to_token_pool.device
+    pieces = []
+    for runner, ancestor, cached in zip(runners, ancestors, cached_lens):
+        if ancestor is None or ancestor.dim() != 2 or int(ancestor.shape[0]) != width:
+            shape = None if ancestor is None else tuple(ancestor.shape)
+            raise RuntimeError(f"cascade tree mask {shape} != [{width}, cols]")
+        expect = int(cached) - int(runner.prefix_len) + width
+        if int(ancestor.shape[1]) != expect:
+            raise RuntimeError(
+                f"cascade tree columns {int(ancestor.shape[1])} != "
+                f"{int(cached)} - {int(runner.prefix_len)} + {width}"
+            )
+        pieces.append(ancestor.to(device=device, dtype=torch.uint8))
+    max_cols = max(int(piece.shape[1]) for piece in pieces)
+    tree = torch.zeros((len(runners) * width, max_cols), dtype=torch.uint8, device=device)
+    for index, piece in enumerate(pieces):
+        tree[index * width : (index + 1) * width, : int(piece.shape[1])].copy_(piece)
+    rows = None
+    if prefix_rows is not None:
+        rows = prefix_rows.to(device=device, dtype=torch.int32).reshape(-1)
+        if int(rows.shape[0]) != len(runners) * width:
+            raise RuntimeError(
+                f"cascade prefix rows {int(rows.shape[0])} != {len(runners) * width}"
+            )
+    spec.target_verify_attention = ClearTreeAttention(
+        CascadeRows(
+            [int(runner.prefix_len) for runner in runners],
+            width,
+            tree,
+            rows,
+        )
+    )
 
 
 def pack_verify_attention(
@@ -164,22 +245,33 @@ def pack_verify_attention(
     depth: int,
     width: int,
     device,
+    model_runner=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Concatenate per-request TARGET_VERIFY masks and positions on ``device``.
 
-    Mask segment ``b`` is ``[N, prefix_lens[b] + depth * N]`` flattened, which
-    is ``[N, cached_len_b + N]`` once ``cached_len`` counts layers already
-    forwarded. Positions for one request are identical.
+    With cascade on, each mask is the ancestor columns only. Otherwise mask
+    segment ``b`` is ``[N, prefix_lens[b] + depth * N]`` flattened. Positions
+    for one request are identical.
     """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
+        cascade_enabled,
+    )
+
     if len(prefix_lens) != len(ancestors):
         raise ValueError(
             f"OPT verify pack has {len(prefix_lens)} prefixes and "
             f"{len(ancestors)} masks"
         )
-    masks = [
-        layer_attention_mask(prefix, ancestor, device)
-        for prefix, ancestor in zip(prefix_lens, ancestors)
-    ]
+    if cascade_enabled(model_runner):
+        masks = [
+            ancestor.reshape(-1).to(device=device, dtype=torch.bool)
+            for ancestor in ancestors
+        ]
+    else:
+        masks = [
+            layer_attention_mask(prefix, ancestor, device)
+            for prefix, ancestor in zip(prefix_lens, ancestors)
+        ]
     positions = [
         layer_positions(prefix, depth, width).to(device=device)
         for prefix in prefix_lens
@@ -1104,7 +1196,7 @@ def grow_active_layers(
 
 
 @dataclass
-class OptLayerSpec:
+class ClearLayerSpec:
     """Fields TARGET_VERIFY attention already reads. Not an EAGLE verify input.
 
     ``seq_lens`` is the prefix. A DECODE graph counts the token being written,
@@ -1122,7 +1214,7 @@ class OptLayerSpec:
     # part of the mask. ``is_bonus`` only distinguishes a bonus forward.
     apply_prefix_custom_mask: bool = True
     is_bonus: bool = False
-    # OPT draft cascade only. Other algorithms leave this unset.
+    # ClearTree cascade only. Other algorithms leave this unset.
     target_verify_attention: object = None
     # A locally rejected graph combination must not be readmitted downstream.
     bonus_eager: bool = False
@@ -1175,7 +1267,7 @@ def opt_layer_verify_graph_matches(spec_info, actual_ntpb: int) -> bool:
     The captured ntpb must equal this spec's query width. The ntpb=1 dual
     graph is DECODE, so width 1 stays eager. A bonus spec uses its group width.
     """
-    if not isinstance(spec_info, OptLayerSpec) or getattr(
+    if not isinstance(spec_info, ClearLayerSpec) or getattr(
         spec_info, "bonus_eager", False
     ):
         return False
@@ -1295,13 +1387,7 @@ class OptLayerForward:
         out_cache_loc = self._alloc_layer_slots(n)
         self.req.kv_allocated_len = self.cached_len + n
         batch = self._verify_batch(tokens.to(device), positions, mask, out_cache_loc)
-        from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-            bind_opt_cascade,
-        )
-
-        bind_opt_cascade(
-            batch.spec_info, self, out_cache_loc, ancestor, append_slots=True
-        )
+        bind_cascade(batch.spec_info, [self], [ancestor], n)
         _mark_layer_launch(timing)
         logits = self._run(batch)
         _queue_ledger_layer(self.scheduler, timing, [self], depth, n)
@@ -1359,20 +1445,14 @@ class OptLayerForward:
         batch.extend_logprob_start_lens = [self.cached_len]
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        batch.spec_info = OptLayerSpec(
+        batch.spec_info = ClearLayerSpec(
             custom_mask=mask.reshape(-1),
             positions=self._la_positions.reshape(-1),
             draft_token_num=n,
             num_tokens_per_req=n,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-            bind_opt_cascade,
-        )
-
-        bind_opt_cascade(
-            batch.spec_info, self, out_cache_loc, ancestor, append_slots=True
-        )
+        bind_cascade(batch.spec_info, [self], [ancestor], n)
         _close_layer_host(timing)
         _note_lookahead_launch_wait(self)
         _mark_layer_launch(timing)
@@ -1492,7 +1572,7 @@ class OptLayerForward:
         batch.prefix_lens = [self.cached_len]
         batch.extend_num_tokens = n
         batch.extend_logprob_start_lens = [self.cached_len]
-        batch.spec_info = OptLayerSpec(
+        batch.spec_info = ClearLayerSpec(
             custom_mask=mask.reshape(-1),
             positions=positions.to(dtype=torch.int64, device=device).reshape(-1),
             draft_token_num=n,
@@ -1713,7 +1793,7 @@ def _verify_batch_many(
     batch.prefix_lens = list(cached)
     batch.extend_num_tokens = width * len(runners)
     batch.extend_logprob_start_lens = list(cached)
-    batch.spec_info = OptLayerSpec(
+    batch.spec_info = ClearLayerSpec(
         custom_mask=custom_mask.reshape(-1),
         positions=positions.reshape(-1).to(dtype=torch.int64, device=device),
         draft_token_num=width,
@@ -2012,13 +2092,14 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         token_rows.append(tokens.to(dtype=torch.long, device=device))
         ancestors.append(ancestor)
     prefix_lens = [runner.prefix_len for runner in runners]
-    if len(runners) == 1:
-        flat_positions = layer_positions(prefix_lens[0], depth, width).to(device=device)
-        flat_mask = layer_verify_mask(runners[0], ancestors[0], device)
-    else:
-        flat_mask, flat_positions = pack_verify_attention(
-            prefix_lens, ancestors, depth, width, device
-        )
+    flat_mask, flat_positions = pack_verify_attention(
+        prefix_lens,
+        ancestors,
+        depth,
+        width,
+        device,
+        model_runner=_model_runner_of(scheduler),
+    )
     locs = []
     cached = []
     for runner in runners:
@@ -2035,19 +2116,9 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         torch.cat(locs),
         cached,
     )
-    if len(runners) == 1:
-        from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-            bind_opt_cascade,
-        )
-
-        bind_opt_cascade(
-            batch.spec_info,
-            runners[0],
-            locs[0],
-            ancestors[0],
-            cached_len=cached[0],
-            append_slots=True,
-        )
+    bind_cascade(
+        batch.spec_info, runners, ancestors, width, cached_lens=cached
+    )
     _mark_layer_launch(timing)
     logits = _run_batch(scheduler, batch)
     _queue_ledger_layer(scheduler, timing, runners, depth, width)
@@ -2607,24 +2678,51 @@ def _bonus_model_runner(scheduler):
     return getattr(worker, "model_runner", None)
 
 
-def _bind_bonus_cascade(batch, runner, mask, loc, tree_end: int, width: int) -> None:
-    """Attach this bonus group's cascade buffers before replay or eager forward."""
-    mask_rows = mask.reshape(int(width), int(tree_end) + int(width))
-    prefix = int(getattr(runner, "prefix_len", 0) or 0)
+def _bind_bonus_cascade(batch, runners, mask, ends, width: int) -> None:
+    """Attach this bonus group's rows. Slots already sit at ``[end, end + width)``."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-        bind_opt_cascade,
+        cascade_enabled,
     )
 
-    prefix_rows = None
-    if prefix > 0:
-        prefix_rows = mask_rows[:, 0]
-    bind_opt_cascade(
+    if not isinstance(runners, (list, tuple)):
+        runners = [runners]
+        ends = [ends]
+    if not runners or not cascade_enabled(
+        _model_runner_of(getattr(runners[0], "scheduler", None))
+    ):
+        return
+    width = int(width)
+    flat = mask.reshape(-1)
+    ancestors = []
+    prefix_chunks = []
+    saw_prefix = False
+    offset = 0
+    for runner, end in zip(runners, ends):
+        end = int(end)
+        row_width = end + width
+        block = flat[offset : offset + width * row_width].reshape(width, row_width)
+        offset += width * row_width
+        prefix = int(getattr(runner, "prefix_len", 0) or 0)
+        ancestors.append(block[:, prefix:])
+        if prefix > 0:
+            saw_prefix = True
+            prefix_chunks.append(block[:, 0].to(dtype=torch.int32))
+        else:
+            prefix_chunks.append(
+                torch.ones(width, dtype=torch.int32, device=block.device)
+            )
+    if offset != int(flat.shape[0]):
+        raise RuntimeError(
+            f"bonus mask length {int(flat.shape[0])} does not match tree ends {list(ends)}"
+        )
+    prefix_rows = torch.cat(prefix_chunks) if saw_prefix else None
+    bind_cascade(
         batch.spec_info,
-        runner,
-        loc,
-        mask_rows[:, prefix:],
+        list(runners),
+        ancestors,
+        width,
         prefix_rows=prefix_rows,
-        cached_len=int(tree_end),
+        cached_lens=[int(end) for end in ends],
     )
 
 
@@ -2655,7 +2753,7 @@ def _fill_bonus_schedule_batch(
     batch.prefix_lens = [int(tree_end)]
     batch.extend_num_tokens = int(width)
     batch.extend_logprob_start_lens = [int(tree_end)]
-    batch.spec_info = OptLayerSpec(
+    batch.spec_info = ClearLayerSpec(
         custom_mask=mask.reshape(-1),
         positions=positions.reshape(-1).to(dtype=torch.int64),
         draft_token_num=int(width),
@@ -2664,7 +2762,7 @@ def _fill_bonus_schedule_batch(
         apply_prefix_custom_mask=True,
         is_bonus=True,
     )
-    _bind_bonus_cascade(batch, runner, mask, loc, tree_end, width)
+    _bind_bonus_cascade(batch, [runner], mask, [tree_end], width)
     return batch
 
 
@@ -2754,8 +2852,9 @@ class _BonusBatch:
             ends,
             is_bonus=True,
         )
-        if len(entries) == 1:
-            _bind_bonus_cascade(batch, entries[0][0].runner, mask, loc, ends[0], width)
+        _bind_bonus_cascade(
+            batch, [job.runner for job, _chunk in entries], mask, ends, width
+        )
         _selected, graph_expected = _bonus_width(scheduler, len(entries), width)
         batch.spec_info.bonus_eager = not graph_expected
         scheduler.cur_batch = batch
@@ -2809,10 +2908,11 @@ class _BonusSingle:
 def _bonus_executor(entries, single):
     if len(entries) == 1:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_attention import (
-            _attention_for,
+            cascade_enabled,
         )
 
-        if _attention_for(entries[0][0].runner) is not None:
+        runner = entries[0][0].runner
+        if cascade_enabled(_model_runner_of(getattr(runner, "scheduler", None))):
             return single
     return _BonusBatch()
 
@@ -3684,7 +3784,7 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     batch.prefix_lens = [int(runner.cached_len)]
     batch.extend_num_tokens = n
     batch.extend_logprob_start_lens = [int(runner.cached_len)]
-    batch.spec_info = OptLayerSpec(
+    batch.spec_info = ClearLayerSpec(
         custom_mask=mask,
         positions=runner._la_positions,
         draft_token_num=n,

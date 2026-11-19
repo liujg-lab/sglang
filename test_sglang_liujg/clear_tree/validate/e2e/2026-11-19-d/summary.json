@@ -1,0 +1,54 @@
+{
+  "01": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 46018,
+      "accept": 34182,
+      "draft": 95912,
+      "ratio": 0.356389,
+      "fallback": 0,
+      "wall_s": 855.698,
+      "output_tok_s": 53.778,
+      "concurrency": 1.0
+    },
+    "flush_lines": 2,
+    "bonus": {
+      "windows": 378,
+      "full": 377,
+      "idle": 1,
+      "opt_bonus_forwards": 12089,
+      "opt_bonus_requests": 12089,
+      "opt_bonus_graph": 12089,
+      "opt_bonus_eager": 0
+    }
+  },
+  "02": {
+    "client": {
+      "rows": 100,
+      "errors": 0,
+      "completion": 45519,
+      "accept": 30553,
+      "draft": 120384,
+      "ratio": 0.253796,
+      "fallback": 0,
+      "wall_s": 321.349,
+      "output_tok_s": 141.65,
+      "concurrency": 3.921
+    },
+    "flush_lines": 2,
+    "bonus": {
+      "windows": 125,
+      "full": 124,
+      "idle": 1,
+      "opt_bonus_forwards": 3974,
+      "opt_bonus_requests": 15054,
+      "opt_bonus_graph": 3974,
+      "opt_bonus_eager": 0
+    }
+  },
+  "baseline_2026_11_19_c": {
+    "01": {"output_tok_s": 53.923, "accept": "34283/96496", "wall_s": 856.893},
+    "02": {"output_tok_s": 139.959, "accept": "30917/121952", "wall_s": 329.411}
+  }
+}

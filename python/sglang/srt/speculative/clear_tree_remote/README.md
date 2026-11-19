@@ -16,7 +16,7 @@ Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION` 默认开启（未设置或设为 `1`�
 
 CUDA Draft 的 bonus 和层前向共用 `r{G}_{bs}`。G 从层宽和 K+1 宽度的并集里取能覆盖候选数的最小值；都不够宽时取最大可用档，由调用方拆组，不截断。batch 按共享规则补齐，并检查补齐后的 key 存在；没有可用的 key 或关闭补齐时，用实际需要的精确宽度走 eager。例如完整树 batch 1/K16 用 G17 一次前向，batch 4/K8 用 G9 一次，默认容量下 batch 4/K64 先用 G64，剩余 1 个候选再用最小层宽 G2。每组完成后按剩余请求数重新选宽，第二组可能不再包含所有请求。不同请求候选不足和最后一组仍需 padding，`keep=False` 行完成后释放，不保留为猜测。
 
-batch 1 且模型支持 Triton cascade 时保留快速模板路径，模板按请求 pool index 和 G 分别缓存，切换 K 不混用模板或 M-RoPE delta；其余走普通批量 verify。已执行前向后不会再次提交 fallback。cascade 的静态查询和树缓冲覆盖最大层宽与最大 K+1，不随运行时切档重新分配。NPU Draft 的 page128 限制不变，仍跳过 bonus，不表示已验证 NPU bonus eager。
+启动时模型满足 Triton、page size 1、且注意力层没有 sliding window、量化 scale 或 sinks，则本进程的层前向和 bonus 都走 cascade，不再按层退回 extend。不满足时全部走原来的 extend。batch 1 仍保留快速模板路径，模板按请求 pool index 和 G 分别缓存，切换 K 不混用模板或 M-RoPE delta；更大的 batch 走同一条 cascade，只是没有这份模板。已执行前向后不会再次提交 fallback。cascade 直接读 ``req_to_token``，静态缓冲按启动时的最大 batch、最大层宽和最大 K+1 一次分配，不随运行时切档重新分配。切分数随捕获 batch 变小，同一张图里不变。NPU Draft 的 page128 限制不变，仍跳过 bonus，不表示已验证 NPU bonus eager。
 
 每组 bonus 仅使用 allocator 当前空闲的 b×G 个槽位，不把可驱逐前缀 KV 算入预算；空间不足、映射越界、重复请求行或混合 SWA allocator 时停止本轮后续组，不驱逐、不拆成逐请求串行。SWA 的 `alloc()` 可能在两个子池间部分失败，所以直接跳过。lookahead 建树前尚不知道 K，bonus 开启时预估最大 K+1 的额外预算；若 singleton 只能用窄图，则保守预留完整分组含尾部 padding 的上界。此估算不是 reservation，各组仍重新检查空闲空间，前组真实猜测继续占用 KV。`bonus_ids` 与 pinned top-k 缓冲仍存 top-(W+1)，和查询宽度无关。
 

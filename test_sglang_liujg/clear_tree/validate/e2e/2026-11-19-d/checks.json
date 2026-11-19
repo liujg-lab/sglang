@@ -1,0 +1,23 @@
+{
+  "run_id": "2026-11-19-d",
+  "requests_ok": {"01": "100/100", "02": "100/100"},
+  "fallback_steps": {"01": 0, "02": 0},
+  "output_tokens": {"01": 46018, "02": 45519},
+  "formal_wall_s": {"01": 855.698, "02": 321.349},
+  "output_tok_s": {"01": 53.778, "02": 141.65},
+  "accept": {"01": "34182/95912", "02": "30553/120384"},
+  "online_w_applied": 0,
+  "online_k_left_flat": true,
+  "verify_residual_all_null": true,
+  "capture": {
+    "draft_capturing_lines": 38,
+    "draft_missing_shape": "bs=4 ntpb=65",
+    "target_capturing_lines": 21,
+    "bs": [1, 2, 4]
+  },
+  "bonus": {
+    "01": {"forwards": 12089, "requests": 12089, "graph": 12089, "eager": 0, "windows": 378, "last": "idle"},
+    "02": {"forwards": 3974, "requests": 15054, "graph": 3974, "eager": 0, "windows": 125, "last": "idle"}
+  },
+  "devices": "ASCEND_RT_VISIBLE_DEVICES=2,3; npu-smi NPU 1 had no process"
+}

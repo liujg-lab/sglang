@@ -142,7 +142,7 @@ class ClearTreeGraphCapture:
             bonus_prediction_enabled,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
-            OptLayerSpec,
+            ClearLayerSpec,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
             BONUS_NTPBS,
@@ -158,7 +158,7 @@ class ClearTreeGraphCapture:
                 f"CLEAR_TREE_REMOTE draft TARGET_VERIFY graph ntpb {query_width} "
                 f"is not a layer width {LAYER_WIDTHS} or a bonus width {BONUS_NTPBS}"
             )
-        spec_info = OptLayerSpec(
+        spec_info = ClearLayerSpec(
             custom_mask=_capture_mask(runner, num_tokens, query_width),
             positions=runner.buffers.positions[:num_tokens],
             draft_token_num=query_width,
