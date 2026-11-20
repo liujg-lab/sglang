@@ -13,6 +13,8 @@
 | 项 | 状态 |
 |---|---|
 | 在线 W | 2026-11-20（D82）：账本开启时唯一规则是分段配对。删除 explore、回放臂、3% 判定、偏差和跨轮 settle，不留开关。宽度上限只来自 `--clear-tree-widths`。依据 results.md 7.53 和第 50 轮（7.55） |
+| 在线 W 样本 | 2026-11-20（D83）：只在超集轮统计。三档样本数相同才比较；满 15 个用 g−2se，攒到 30 个用 g−se；两边都过则停留。最宽档按 virt 只记缩窄 |
+| 在线 W 段末 | 2026-11-20（D84）：满 15 两边都成立则继续探测。满 30 两边都成立则清空样本，超集比例不变。两边都不成立仍把比例减半 |
 | TollTree（`TOLL_TREE_REMOTE`） | 2026-11-07 停止开发，代码停在 T2，保留作参考，见 `toll-tree-remote` 分支上的 `toll_tree_remote/README.md`（本分支不含 TollTree 代码） |
 | 部署配置 | OPT，N=8，短前缀 τ=0.8、长前缀 τ=0.4，KV 复用开；短前缀 b≥7、4096 b≥3 时 Target-only 更快 |
 | Draft KV 窗口（O1a） | 完成，选定 w=256，默认关闭（`SGLANG_OPT_DRAFT_KV_WINDOW`）。代码在 `toll-tree-remote` 分支的提交 9741321748，本分支（`clear-tree-remote`）没有带过来；做 4096 测量需要时再单独取 |

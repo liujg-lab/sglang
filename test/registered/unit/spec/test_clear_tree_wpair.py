@@ -94,99 +94,160 @@ class TestPairBlocks(CustomTestCase):
         wpair.superset_due(1, 8, lambda _w: False)
         self.assertAlmostEqual(wpair._blocks[1]["acc"], 0.6)
         last = None
+        values = {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (-1.0, 1.0)}
         for _ in range(15):
-            last = self._observe(16, {16: (3.0, 1.0), 8: (0.0, 100.0)})
+            last = self._observe(16, values)
         self.assertEqual(last["decision"], "up")
         self.assertEqual(last["target"], 16)
         self.assertEqual(persistent_width(1), 16)
         self.assertAlmostEqual(wpair._blocks[1]["p"], wpair.P0)
         self.assertEqual(wpair._blocks[1]["acc"], 0.0)
 
-    def test_fifteen_negative_up_samples_stay_and_keep_acc(self):
+    def test_negative_up_samples_wait_until_thirty_then_stay(self):
         for _ in range(3):
             self.assertFalse(wpair.superset_due(1, 8, lambda _w: False))
+        values = {16: (-3.0, 1.0), 8: (0.0, 100.0), 4: (-3.0, 1.0)}
         last = None
-        for _ in range(14):
-            last = self._observe(16, {16: (-3.0, 1.0), 8: (0.0, 100.0)})
+        for _ in range(29):
+            last = self._observe(16, values)
             self.assertIsNone(last)
-        last = self._observe(16, {16: (-3.0, 1.0), 8: (0.0, 100.0)})
+        last = self._observe(16, values)
         self.assertEqual(last["decision"], "stay")
         self.assertEqual(last["target"], 8)
+        self.assertEqual(last["n_up"], 30)
         self.assertEqual(persistent_width(1), 8)
         self.assertAlmostEqual(wpair._blocks[1]["p"], 0.10)
         self.assertAlmostEqual(wpair._blocks[1]["acc"], 0.6)
         self.assertEqual(wpair._blocks[1]["up"], [])
 
     def test_undecided_samples_wait_until_thirty_then_stay(self):
+        values = {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (0.0, 1.0)}
         last = None
         for _ in range(29):
-            last = self._observe(16, {16: (0.0, 1.0), 8: (0.0, 100.0)})
+            last = self._observe(16, values)
             self.assertIsNone(last)
-        last = self._observe(16, {16: (0.0, 1.0), 8: (0.0, 100.0)})
+        last = self._observe(16, values)
         self.assertEqual(last["decision"], "stay")
         self.assertEqual(last["n_up"], 30)
         self.assertAlmostEqual(wpair._blocks[1]["p"], 0.10)
 
     def test_stay_halves_p_down_to_the_floor(self):
+        values = {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (0.0, 1.0)}
         rates = []
         for _ in range(3):
             for _step in range(30):
-                record = self._observe(16, {16: (0.0, 1.0), 8: (0.0, 100.0)})
+                record = self._observe(16, values)
             rates.append(record["p"])
             self.assertEqual(record["decision"], "stay")
         self.assertEqual(rates, [0.20, 0.10, 0.05])
         self.assertAlmostEqual(wpair._blocks[1]["p"], 0.05)
 
-    def test_down_samples_do_not_end_the_block_early(self):
+    def test_ordinary_rounds_record_nothing(self):
         for _ in range(15):
             record = self._observe(8, {4: (8.0, 1.0), 8: (0.0, 100.0)})
             self.assertIsNone(record)
+        self.assertEqual(wpair._blocks[1]["down"], [])
+        self.assertEqual(wpair._blocks[1]["up"], [])
+        record = self._observe(4, {4: (8.0, 1.0), 8: (0.0, 100.0), 16: (3.0, 1.0)})
+        self.assertIsNone(record)
+        self.assertEqual(wpair._blocks[1]["down"], [])
         for _ in range(10):
-            record = self._observe(16, {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (8.0, 1.0)})
+            record = self._observe(
+                16, {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (8.0, 1.0)}
+            )
             self.assertIsNone(record)
-        self.assertEqual(len(wpair._blocks[1]["down"]), 25)
+        self.assertEqual(len(wpair._blocks[1]["down"]), 10)
+        self.assertEqual(len(wpair._blocks[1]["up"]), 10)
         self.assertEqual(persistent_width(1), 8)
 
-    def test_both_directions_take_the_larger_lower_bound(self):
+    def test_both_directions_keep_probing_until_thirty(self):
+        values = {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (8.0, 1.0)}
+        last = None
+        for _ in range(15):
+            last = self._observe(16, values)
+        self.assertIsNone(last)
+        self.assertEqual(len(wpair._blocks[1]["up"]), 15)
+        self.assertEqual(len(wpair._blocks[1]["down"]), 15)
+        self.assertEqual(persistent_width(1), 8)
+        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.20)
+        for _ in range(14):
+            last = self._observe(16, values)
+            self.assertIsNone(last)
+        last = self._observe(16, values)
+        self.assertEqual(last["decision"], "stay")
+        self.assertEqual(last["target"], 8)
+        self.assertEqual(last["n_up"], 30)
+        self.assertEqual(persistent_width(1), 8)
+        self.assertEqual(wpair._blocks[1]["up"], [])
+        self.assertEqual(wpair._blocks[1]["down"], [])
+        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.20)
+
+    def test_only_down_switches(self):
         last = None
         for _ in range(15):
             last = self._observe(
-                16, {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (8.0, 1.0)}
+                16, {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (8.0, 1.0)}
             )
         self.assertEqual(last["decision"], "down")
         self.assertEqual(last["target"], 4)
         self.assertEqual(persistent_width(1), 4)
 
-    def test_equal_lower_bounds_stay(self):
+    def test_equal_lower_bounds_keep_the_rate_at_thirty(self):
+        values = {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (3.0, 1.0)}
         last = None
         for _ in range(15):
-            last = self._observe(
-                16, {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (3.0, 1.0)}
-            )
+            last = self._observe(16, values)
+        self.assertIsNone(last)
+        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.20)
+        for _ in range(15):
+            last = self._observe(16, values)
         self.assertEqual(last["decision"], "stay")
         self.assertEqual(persistent_width(1), 8)
-        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.10)
+        self.assertEqual(wpair._blocks[1]["up"], [])
+        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.20)
 
-    def test_identical_samples_do_not_trip_a_zero_standard_error(self):
+    def test_identical_samples_use_one_se_at_thirty(self):
         gain, se = wpair._gs([(1.0, 100.0)] * 15)
         self.assertAlmostEqual(gain, 0.01)
         self.assertGreaterEqual(se, 0.01 / math.sqrt(15) - 1e-12)
         self.assertLessEqual(gain - wpair.Z * se, wpair.BAND)
+        gain30, se30 = wpair._gs([(1.0, 100.0)] * 30)
+        self.assertGreater(gain30 - se30, wpair.BAND)
+        values = {16: (1.0, 1.0), 8: (0.0, 100.0), 4: (0.0, 1.0)}
         last = None
-        for _ in range(15):
-            last = self._observe(16, {16: (1.0, 1.0), 8: (0.0, 100.0)})
-        self.assertIsNone(last)
+        for _ in range(29):
+            last = self._observe(16, values)
+            self.assertIsNone(last)
+        last = self._observe(16, values)
+        self.assertEqual(last["decision"], "up")
+        self.assertEqual(last["target"], 16)
+        self.assertEqual(last["n_up"], 30)
 
     def test_widest_width_uses_virtual_superset_rounds(self):
         assign_persistent_width(1, 64)
-        for _ in range(149):
+        last = None
+        for _ in range(75):
             self.assertFalse(wpair.superset_due(1, 64, lambda _w: True))
-            self.assertIsNone(self._observe(64, {32: (8.0, 1.0), 64: (0.0, 100.0)}))
-        self.assertFalse(wpair.superset_due(1, 64, lambda _w: True))
-        last = self._observe(64, {32: (8.0, 1.0), 64: (0.0, 100.0)})
+            last = self._observe(64, {32: (8.0, 1.0), 64: (0.0, 100.0)})
         self.assertEqual(last["decision"], "down")
         self.assertEqual(last["target"], 32)
+        self.assertEqual(last["n_down"], 75)
         self.assertIsNone(last["g_up"])
+        self.assertEqual(persistent_width(1), 32)
+
+    def test_widest_width_uses_one_se_at_virt_thirty(self):
+        assign_persistent_width(1, 64)
+        values = {32: (0.7, 1.0), 64: (0.0, 100.0)}
+        last = None
+        for _ in range(149):
+            self.assertFalse(wpair.superset_due(1, 64, lambda _w: True))
+            last = self._observe(64, values)
+            self.assertIsNone(last)
+        self.assertFalse(wpair.superset_due(1, 64, lambda _w: True))
+        last = self._observe(64, values)
+        self.assertEqual(last["decision"], "down")
+        self.assertEqual(last["target"], 32)
+        self.assertEqual(last["n_down"], 150)
         self.assertEqual(persistent_width(1), 32)
 
     def test_unready_superset_is_spent_on_the_next_ready_round(self):
@@ -197,23 +258,30 @@ class TestPairBlocks(CustomTestCase):
         self.assertAlmostEqual(wpair._blocks[1]["acc"], 0.2)
 
     def test_reset_restores_the_opening_rate(self):
+        values = {16: (0.0, 1.0), 8: (0.0, 100.0), 4: (0.0, 1.0)}
         for _ in range(30):
-            self._observe(16, {16: (0.0, 1.0), 8: (0.0, 100.0)})
+            self._observe(16, values)
         self.assertAlmostEqual(wpair._blocks[1]["p"], 0.10)
         wpair.reset_pair_state()
         self.assertFalse(wpair.superset_due(1, 8, lambda _w: False))
         self.assertAlmostEqual(wpair._blocks[1]["p"], 0.20)
         self.assertAlmostEqual(wpair._blocks[1]["acc"], 0.20)
 
-    def test_one_missing_side_still_records_the_other(self):
+    def test_missing_side_records_nothing(self):
         self._observe(16, {16: (3.0, 1.0), 8: (0.0, 100.0)})
-        self.assertEqual(len(wpair._blocks[1]["up"]), 1)
+        self.assertEqual(wpair._blocks[1]["up"], [])
         self.assertEqual(wpair._blocks[1]["down"], [])
         self._observe(16, {8: (0.0, 100.0), 4: (2.0, 1.0)})
+        self.assertEqual(wpair._blocks[1]["up"], [])
+        self.assertEqual(wpair._blocks[1]["down"], [])
+        self._observe(16, {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (2.0, 1.0)})
         self.assertEqual(len(wpair._blocks[1]["up"]), 1)
         self.assertEqual(len(wpair._blocks[1]["down"]), 1)
-        self._observe(16, {16: (3.0, 1.0)})
+        assign_persistent_width(1, 2)
+        self._observe(4, {4: (3.0, 1.0)})
         self.assertEqual(len(wpair._blocks[1]["up"]), 1)
+        self._observe(4, {4: (3.0, 1.0), 2: (0.0, 100.0)})
+        self.assertEqual(len(wpair._blocks[1]["up"]), 2)
         self.assertEqual(len(wpair._blocks[1]["down"]), 1)
 
 

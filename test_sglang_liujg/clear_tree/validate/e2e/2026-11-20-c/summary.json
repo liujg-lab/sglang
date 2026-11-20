@@ -1,0 +1,33 @@
+{
+  "run_id": "2026-11-20-c",
+  "devices": "2,3",
+  "restart_between_trials": false,
+  "trials": {
+    "01": {
+      "concurrency": 1,
+      "ok": 100,
+      "items": 100,
+      "completion_tokens": 45610,
+      "wall_s": 846.355,
+      "output_tok_s": 53.890,
+      "spec_accept_token_num": 34398,
+      "spec_draft_token_num": 90800,
+      "accept_rate": 0.378833,
+      "fallback_ratio": 0.0,
+      "client_concurrency": 1.0
+    },
+    "02": {
+      "concurrency": 4,
+      "ok": 100,
+      "items": 100,
+      "completion_tokens": 45942,
+      "wall_s": 320.511,
+      "output_tok_s": 143.340,
+      "spec_accept_token_num": 31842,
+      "spec_draft_token_num": 113456,
+      "accept_rate": 0.280655,
+      "fallback_ratio": 0.0,
+      "client_concurrency": 3.929
+    }
+  }
+}

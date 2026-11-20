@@ -1,10 +1,14 @@
 """Block-wise paired width rule for one ClearTree batch bucket.
 
-A block builds the next wider candidate on a share of eligible rounds. Ordinary
-rounds price the next narrower cut. Superset rounds price both neighbors. The
-block ends early when the widen samples are already decisive, and otherwise at
-30. One judgment then moves to the neighbor with the larger lower bound, or
-stays. This module does not import the replay module at load time.
+A block builds the next wider candidate on a share of eligible rounds. Only a
+superset round records samples, and only when the served width and both
+neighbors that exist are priced on that same round. The widest tier records
+the narrower cut and times the block with ``virt``. At 15 samples a side must
+clear ``g - 2 se``; exactly one passing side switches, and both passing sides
+keep probing until 30. At 30 a side must clear ``g - se``. One passing side
+switches. Both passing sides stay and clear the samples without changing the
+rate. Neither passing side stays and halves the rate. This module does not
+import the replay module at load time.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ _blocks: Dict[int, dict] = {}
 
 
 def _fresh() -> dict:
-    return {"up": [], "down": [], "acc": 0.0, "virt": 0.0, "p": P0}
+    return {"up": [], "down": [], "acc": 0.0, "virt": 0.0, "p": P0, "n1": False}
 
 
 def _block(bucket: int) -> dict:
@@ -160,8 +164,22 @@ def _sample(values: dict, left: int, right: int):
     return (float(value_left) - float(value_right), float(expect_right))
 
 
+def _record_superset(blk: dict, values: dict, served: int, narrow, wider) -> None:
+    """Keep one round only when every compared width has a value."""
+    up = _sample(values, int(wider), int(served))
+    if narrow is None:
+        if up is not None:
+            blk["up"].append(up)
+        return
+    down = _sample(values, int(narrow), int(served))
+    if up is None or down is None:
+        return
+    blk["up"].append(up)
+    blk["down"].append(down)
+
+
 def observe_pair(frozen: dict) -> Optional[dict]:
-    """Record this round's paired values and judge the block when it ends."""
+    """Record a superset round and judge at 15 and 30 paired samples."""
     if not isinstance(frozen, dict) or "width" not in frozen:
         return None
     batch = int(frozen.get("batch", 1))
@@ -171,27 +189,26 @@ def observe_pair(frozen: dict) -> Optional[dict]:
     blk = _block(bucket)
     narrow = _next_narrower(served)
     wider = _next_wider(served)
-    wanted = []
-    if built == int(served) or (wider is not None and built == int(wider)):
-        wanted.append(int(served))
+    if wider is not None and built == int(wider):
+        wanted = [int(served), int(wider)]
         if narrow is not None:
             wanted.append(int(narrow))
-        if wider is not None and built == int(wider):
-            wanted.append(int(wider))
-    values = pair_values(frozen, wanted) if wanted else {}
-    if built == int(served) and narrow is not None:
-        sample = _sample(values, narrow, served)
+        _record_superset(blk, pair_values(frozen, wanted), served, narrow, wider)
+        return _block_check(bucket, blk, served, batch)
+    if wider is None and built == int(served) and narrow is not None:
+        values = pair_values(frozen, [int(served), int(narrow)])
+        sample = _sample(values, int(narrow), int(served))
         if sample is not None:
             blk["down"].append(sample)
-    elif wider is not None and built == int(wider):
-        sample = _sample(values, wider, served)
-        if sample is not None:
-            blk["up"].append(sample)
-        if narrow is not None:
-            sample = _sample(values, narrow, served)
-            if sample is not None:
-                blk["down"].append(sample)
-    return _block_check(bucket, blk, served, batch)
+        return _block_check(bucket, blk, served, batch)
+    return None
+
+
+def _bound_clears(rows: Sequence[tuple], zmul: float):
+    gain, se = _gs(rows)
+    if gain is None or se is None:
+        return False, gain, se
+    return gain - zmul * se > BAND, gain, se
 
 
 def _block_check(bucket: int, blk: dict, served: int, batch: int) -> Optional[dict]:
@@ -200,34 +217,33 @@ def _block_check(bucket: int, blk: dict, served: int, batch: int) -> Optional[di
     counted = float(len(blk["up"])) if has_up else float(blk["virt"])
     if counted + _COUNT_EPS < N1:
         return None
-    ended = counted + _COUNT_EPS >= N2
-    if not ended and has_up:
-        gain, se = _gs(blk["up"])
-        if gain is not None and (
-            gain - Z * se > BAND or gain + Z * se < -BAND
-        ):
-            ended = True
-    if not ended:
-        return None
-    cands = []
+    at_thirty = counted + _COUNT_EPS >= N2
+    if not at_thirty:
+        if blk.get("n1"):
+            return None
+        blk["n1"] = True
+        zmul = Z
+    else:
+        zmul = 1.0
+    up_ok = False
+    down_ok = False
     gain_up, se_up = (None, None)
     gain_down, se_down = (None, None)
     if has_up:
-        gain_up, se_up = _gs(blk["up"])
-        if gain_up is not None and gain_up - Z * se_up > BAND:
-            cands.append((gain_up - Z * se_up, int(wider), "up"))
+        up_ok, gain_up, se_up = _bound_clears(blk["up"], zmul)
     narrow = _next_narrower(served)
     if narrow is not None and len(blk["down"]) >= MIN_DOWN:
-        gain_down, se_down = _gs(blk["down"])
-        if gain_down is not None and gain_down - Z * se_down > BAND:
-            cands.append((gain_down - Z * se_down, int(narrow), "down"))
+        down_ok, gain_down, se_down = _bound_clears(blk["down"], zmul)
+    if not at_thirty and up_ok == down_ok:
+        return None
     decision = "stay"
     target = int(served)
-    if cands:
-        best = max(item[0] for item in cands)
-        winners = [item for item in cands if abs(item[0] - best) <= 1e-12]
-        if len(winners) == 1:
-            _bound, target, decision = winners[0]
+    if up_ok and not down_ok:
+        decision = "up"
+        target = int(wider)
+    elif down_ok and not up_ok:
+        decision = "down"
+        target = int(narrow)
     record = {
         "bucket": int(bucket),
         "b": int(batch),
@@ -247,7 +263,9 @@ def _block_check(bucket: int, blk: dict, served: int, batch: int) -> Optional[di
         blk["up"] = []
         blk["down"] = []
         blk["virt"] = 0.0
-        blk["p"] = max(rate / 2.0, P_MIN)
+        blk["n1"] = False
+        if not (up_ok and down_ok):
+            blk["p"] = max(rate / 2.0, P_MIN)
     else:
         assign_persistent_width(int(bucket), int(target))
         _blocks[int(bucket)] = _fresh()

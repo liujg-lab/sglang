@@ -1,0 +1,14 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "kind_strings_superset_probe_w": false,
+  "d_wpair_count": 28,
+  "switch_up_at_15": {"b": 1, "from": 8, "to": 16, "n": 15},
+  "switch_up_at_30": {"b": 4, "from": 4, "to": 8, "n": 30},
+  "down_decisions": 0,
+  "bonus_rank0_last_window": "idle",
+  "servers_restarted_between_trials": false
+}
