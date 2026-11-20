@@ -1,21 +1,19 @@
-"""Shadow replay for a ClearTree round.
+"""Build width and frozen trees for one ClearTree round.
 
-The served width changes when a candidate's gain clears 3 percent. A move to
-either neighbor needs 30 paired rounds, and a narrower move is only the next
-smaller width. Measured bias is logged and does not decide the switch. When
-the next narrower width has missed 300 eligible rounds, it is built until its
-layer fit has four samples, at most four rounds, and for two rounds after
-that. If that width already has four samples but cannot price this round's
-prefix sum, it is built for one round after 20 eligible rounds. This module
-may call the price policy and the ledger. The ledger does not import it.
+Eligible rounds sometimes build the next wider candidate. Paired values on
+that tree and on ordinary trees decide the served width at the end of a
+block. When the next narrower width has missed 300 eligible rounds, it is
+built until its layer fit has four samples, at most four rounds, and for two
+rounds after that. If that width already has four samples but cannot price
+this round's prefix sum, it is built for one round after 20 eligible rounds.
+This module may call the price policy and the ledger. The ledger does not
+import it.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional, Sequence
-
-from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import policy_timed
+from typing import Dict, Optional
 
 from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     EXPLORE_EVERY,
@@ -24,57 +22,33 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     _prefix_mass,
     _tier_for_nodes,
     accept_ratio,
-    gain_ratio,
-    keep_by_net_benefit,
     select_k,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     CANDIDATE_WIDTHS,
     _next_narrower,
     _next_wider,
-    assign_persistent_width,
     batch_bucket,
     flat_k,
     persistent_width,
 )
 
-REPLAY_GAIN = 0.03
-MIN_PAIRS = 30
 PROBE_W_IDLE = 300
 
-_eligible_n: Dict[int, int] = {}
-_replay_n: Dict[int, int] = {}
-_replay_arms: Dict[int, Dict[int, Dict[str, float]]] = {}
-_would_w: Dict[int, int] = {}
-_real_n: Dict[tuple, int] = {}
-_real_tok: Dict[tuple, float] = {}
-_real_ms: Dict[tuple, float] = {}
-_pair_n: Dict[tuple, int] = {}
-_pair_replay_tok: Dict[tuple, float] = {}
-_pair_replay_ms: Dict[tuple, float] = {}
-_pair_wide_tok: Dict[tuple, float] = {}
-_pair_wide_ms: Dict[tuple, float] = {}
 _narrow_idle: Dict[tuple, int] = {}
 _probe_w_left: Dict[tuple, int] = {}
 _probe_w_fill: Dict[tuple, bool] = {}
 
 
 def reset_replay_state() -> None:
-    _eligible_n.clear()
-    _replay_n.clear()
-    _replay_arms.clear()
-    _would_w.clear()
-    _real_n.clear()
-    _real_tok.clear()
-    _real_ms.clear()
-    _pair_n.clear()
-    _pair_replay_tok.clear()
-    _pair_replay_ms.clear()
-    _pair_wide_tok.clear()
-    _pair_wide_ms.clear()
     _narrow_idle.clear()
     _probe_w_left.clear()
     _probe_w_fill.clear()
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        reset_pair_state,
+    )
+
+    reset_pair_state()
 
 
 def _mark_width_ran(bucket: int, width: int) -> None:
@@ -116,6 +90,7 @@ def choose_build_width(
     eligible: bool,
     scheduler=None,
     sum_ell: int = 0,
+    ready=None,
 ) -> tuple:
     """Flat or switched width, plus a narrow timing probe and a wider build.
 
@@ -125,16 +100,14 @@ def choose_build_width(
     two rounds. A width that already has four samples, cannot price this
     round's prefix sum, and has waited 20 eligible rounds is built for one
     round. The counter starts at 300, so the first eligible round is a
-    probe. Those rounds are ``probe_w`` and take the slot ahead of
-    exploration. Every 20th remaining eligible round builds the next larger
-    candidate. The widest candidate stays on that round. The departure does
-    not happen while the ledger is off, or on a K-probe or locked round.
+    probe. Those rounds are ``probe_w`` and take the slot ahead of a superset
+    build. A missing ``ready`` does not spend a superset round. The departure
+    does not happen while the ledger is off, or on a K-probe or locked round.
     """
     base = persistent_width(batch_size)
     if not ledger_on or not eligible:
         return base, "ordinary"
     bucket = batch_bucket(batch_size)
-    _eligible_n[bucket] = int(_eligible_n.get(bucket, 0)) + 1
     narrow = _next_narrower(base)
     if narrow is not None:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
@@ -168,17 +141,27 @@ def choose_build_width(
             _narrow_idle[key] = 0
             return int(narrow), "probe_w"
         _narrow_idle[key] = idle + 1
-    if _eligible_n[bucket] % EXPLORE_EVERY == 0:
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        superset_due,
+    )
+
+    if superset_due(bucket, base, ready):
         nxt = _next_wider(base)
         if nxt is not None:
             _mark_width_ran(bucket, nxt)
-            return int(nxt), "explore"
+            return int(nxt), "superset"
     _mark_width_ran(bucket, base)
     return base, "ordinary"
 
 
 def _cached_build_width(
-    scheduler, batch: int, *, ledger_on: bool, eligible: bool, sum_ell: int = 0
+    scheduler,
+    batch: int,
+    *,
+    ledger_on: bool,
+    eligible: bool,
+    sum_ell: int = 0,
+    ready=None,
 ):
     """One width per packet. A fallback expand must not take a second departure."""
     token = (
@@ -195,6 +178,7 @@ def _cached_build_width(
         eligible=eligible,
         scheduler=scheduler,
         sum_ell=sum_ell,
+        ready=ready,
     )
     if token is not None and scheduler is not None:
         scheduler._clear_build_cache = (token, chosen)
@@ -223,202 +207,12 @@ def truncate_columns(layers, width: int) -> list:
     return kept
 
 
-def matched_depth(layers, kept, tokens) -> int:
-    """How many committed tokens walk the kept columns, from the root."""
-    parent = None
-    matched = 0
-    sequence = [int(token) for token in tokens]
-    for depth, cols in enumerate(kept):
-        if matched >= len(sequence):
-            break
-        found = None
-        for col in cols:
-            node = layers[depth][col]
-            if depth > 0 and int(node["parent"]) != parent:
-                continue
-            if int(node["token"]) == sequence[matched]:
-                found = int(col)
-                break
-        if found is None:
-            break
-        parent = found
-        matched += 1
-    return matched
-
-
-def replay_accept(layers, width: int, tokens, stop: Optional[int] = None) -> int:
-    """Accepted draft tokens on the truncated tree, plus one bonus when present."""
-    kept = truncate_columns(layers, width)
-    depth = len(layers) if stop is None else min(len(layers), max(int(stop), 0))
-    matched = matched_depth(layers[:depth], kept[:depth], tokens)
-    if len(list(tokens)) > matched:
-        return matched + 1
-    return matched
-
-
 def _kept_scores(layers, kept, end: int) -> list:
     scores = []
     for depth in range(min(int(end), len(kept))):
         for col in kept[depth]:
             scores.append(float(layers[depth][col]["score"]))
     return scores
-
-
-def _list_marginal(scores, latest, k: int) -> float:
-    if not latest:
-        return 0.0
-    ordered = sorted((float(value) for value in scores), reverse=True)
-    theta_k = ordered[int(k) - 1] if len(ordered) >= int(k) else 0.0
-    return float(sum(max(0.0, float(score) - theta_k) for score in latest))
-
-
-def candidate_stop_depth(
-    layers,
-    kept,
-    *,
-    theta,
-    verify_ms: Dict[int, Optional[float]],
-    layer_costs: Sequence[Optional[float]],
-    ratio: float,
-) -> int:
-    """Built depth, or up to two layers earlier when the batch J says stop.
-
-    ``layer_costs[i]`` is the forward of written layer ``i``. The gain is the
-    latest written layer, not the next layer's real nodes.
-    """
-    rows = [
-        {"pred": {0: None if cost is None else float(cost)}}
-        for cost in list(layer_costs or [])
-    ]
-    return batch_stop_depth(
-        [
-            {
-                "layers": layers,
-                "kept": kept,
-                "ratio": float(ratio),
-                "prefix": 0,
-            }
-        ],
-        theta=theta,
-        verify_ms=verify_ms,
-        layer_rows=rows,
-        width=0,
-    )
-
-
-def _top_kept_nodes(layers, kept, end: int, limit: int) -> set:
-    """Top ``limit`` kept nodes: score desc, depth asc, column asc."""
-    nodes = []
-    for depth in range(min(int(end), len(kept))):
-        for col in kept[depth]:
-            nodes.append(
-                (
-                    float(layers[depth][col]["score"]),
-                    int(depth),
-                    int(col),
-                )
-            )
-    nodes.sort(key=lambda item: (-item[0], item[1], item[2]))
-    return {(depth, col) for _score, depth, col in nodes[: max(int(limit), 0)]}
-
-
-def replay_accept_k(layers, kept, tokens, stop: int, k_prime: int) -> int:
-    """Accepted drafts on the top ``k_prime`` nodes, plus one bonus when present."""
-    chosen = _top_kept_nodes(layers, kept, stop, k_prime)
-    parent = None
-    matched = 0
-    sequence = [int(token) for token in tokens]
-    depth_limit = min(len(layers), max(int(stop), 0))
-    for depth in range(depth_limit):
-        if matched >= len(sequence):
-            break
-        found = None
-        for col in kept[depth]:
-            if (depth, int(col)) not in chosen:
-                continue
-            node = layers[depth][col]
-            if depth > 0 and int(node["parent"]) != parent:
-                continue
-            if int(node["token"]) == sequence[matched]:
-                found = int(col)
-                break
-        if found is None:
-            break
-        parent = found
-        matched += 1
-    if len(sequence) > matched:
-        return matched + 1
-    return matched
-
-
-def batch_stop_depth(
-    trees, *, theta, verify_ms, layer_rows, width: int, gain_ratio: float = 1.0
-) -> int:
-    """One kept depth for the batch. The gain uses the latest written layer.
-
-    ``trees`` carry ``layers``, ``kept``, ``ratio``, and ``prefix``. A missing
-    layer cost keeps the built depth. The comparison is the shared net-benefit
-    rule, so one request does not pay the whole batch's layer cost alone. A
-    tree whose own build depth is already at or behind ``stop`` is not growing.
-    """
-    if not trees or theta is None:
-        return max((len(tree["layers"]) for tree in trees), default=0)
-    depth = max(len(tree["layers"]) for tree in trees)
-    if depth < 2:
-        return depth
-    earliest = max(1, depth - 2)
-    times = {
-        int(k): float(spent)
-        for k, spent in (verify_ms or {}).items()
-        if spent is not None
-    }
-    for stop in range(earliest, depth):
-        row = layer_rows[stop - 1] if 0 <= stop - 1 < len(layer_rows) else None
-        pred = None if row is None else row.get("pred", {}).get(int(width))
-        if pred is None:
-            return depth
-        requests = []
-        for tree in trees:
-            end = min(int(stop), len(tree["layers"]))
-            if end < 1:
-                continue
-            scores = _kept_scores(tree["layers"], tree["kept"], end)
-            latest = [
-                float(tree["layers"][end - 1][col]["score"])
-                for col in tree["kept"][end - 1]
-            ]
-            scale = float(gain_ratio)
-            requests.append(
-                {
-                    "e": {int(k): _prefix_mass(scores, int(k)) for k in VERIFY_KS},
-                    "g": {
-                        int(k): _list_marginal(scores, latest, int(k)) * scale
-                        for k in VERIFY_KS
-                    },
-                    "ell": int(tree.get("prefix", 0) or 0),
-                    "c": float(tree["ratio"]),
-                    "item": tree,
-                    "growing": len(tree["layers"]) > int(stop),
-                }
-            )
-        if not requests:
-            return depth
-
-        def layer_cost(_count, _ell, _pred=float(pred)):
-            return _pred
-
-        kept_items = keep_by_net_benefit(
-            requests,
-            theta=float(theta),
-            verify_times=times,
-            layer_cost=layer_cost,
-            kappa=0.0,
-        )
-        if kept_items is None:
-            return depth
-        if not kept_items:
-            return stop
-    return depth
 
 
 def _schedule_ms(layer_rows, width: int, n_layers: int, verify_ms, k: int):
@@ -483,220 +277,6 @@ def _select_replay_k(
     return select_k(values)
 
 
-def _blank_arm() -> Dict[str, float]:
-    return {"tok": 0.0, "ms": 0.0, "cur_tok": 0.0, "cur_ms": 0.0, "n": 0.0}
-
-
-def _arm(bucket: int, width: int) -> Dict[str, float]:
-    row = _replay_arms.get(bucket)
-    if row is None:
-        row = {}
-        _replay_arms[bucket] = row
-    found = row.get(int(width))
-    if found is None:
-        found = _blank_arm()
-        row[int(width)] = found
-    return found
-
-
-def _clear_arms(bucket: int) -> None:
-    _replay_arms.pop(int(bucket), None)
-    _replay_n[int(bucket)] = 0
-
-
-def _real_key(bucket: int, width: int) -> tuple:
-    return (int(bucket), int(width))
-
-
-def _pair_key(bucket: int, wide: int, narrow: int) -> tuple:
-    return (int(bucket), int(wide), int(narrow))
-
-
-def _ordered_pair(left: int, right: int) -> tuple:
-    if int(left) >= int(right):
-        return int(left), int(right)
-    return int(right), int(left)
-
-
-def replay_bias(bucket: int, wide: int, narrow: int) -> Optional[float]:
-    """Gap between truncated throughput and real narrow throughput.
-
-    Both are divided by the real wide throughput of rounds that replayed this
-    pair. None until each side has ``MIN_PAIRS`` rounds.
-    """
-    real = _real_key(bucket, narrow)
-    pair = _pair_key(bucket, wide, narrow)
-    if int(_real_n.get(real, 0)) < MIN_PAIRS:
-        return None
-    if int(_pair_n.get(pair, 0)) < MIN_PAIRS:
-        return None
-    wide_ms = float(_pair_wide_ms.get(pair, 0.0))
-    replay_ms = float(_pair_replay_ms.get(pair, 0.0))
-    narrow_ms = float(_real_ms.get(real, 0.0))
-    if wide_ms <= 0.0 or replay_ms <= 0.0 or narrow_ms <= 0.0:
-        return None
-    base = float(_pair_wide_tok.get(pair, 0.0)) / wide_ms
-    if base <= 0.0:
-        return None
-    replay_ratio = (float(_pair_replay_tok.get(pair, 0.0)) / replay_ms) / base - 1.0
-    real_ratio = (float(_real_tok.get(real, 0.0)) / narrow_ms) / base - 1.0
-    return float(replay_ratio - real_ratio)
-
-
-def _bias_report(bucket: int, served: int, would: int) -> Optional[float]:
-    """Bias of the served width against ``would``. Diagnostic only."""
-    if int(served) == int(would):
-        return None
-    wide, narrow = _ordered_pair(served, would)
-    return replay_bias(bucket, wide, narrow)
-
-
-def _note_bias(bucket: int, built: int, actual_tokens, actual_ms, replayed) -> None:
-    if float(actual_ms) <= 0.0:
-        return
-    real = _real_key(bucket, built)
-    _real_n[real] = int(_real_n.get(real, 0)) + 1
-    _real_tok[real] = float(_real_tok.get(real, 0.0)) + float(actual_tokens)
-    _real_ms[real] = float(_real_ms.get(real, 0.0)) + float(actual_ms)
-    for width, pair in replayed.items():
-        if int(width) >= int(built) or pair[1] is None:
-            continue
-        key = _pair_key(bucket, built, width)
-        _pair_n[key] = int(_pair_n.get(key, 0)) + 1
-        _pair_replay_tok[key] = float(_pair_replay_tok.get(key, 0.0)) + float(pair[0])
-        _pair_replay_ms[key] = float(_pair_replay_ms.get(key, 0.0)) + float(pair[1])
-        _pair_wide_tok[key] = float(_pair_wide_tok.get(key, 0.0)) + float(actual_tokens)
-        _pair_wide_ms[key] = float(_pair_wide_ms.get(key, 0.0)) + float(actual_ms)
-
-
-def _judge(bucket: int, current: int, *, allow_apply: bool) -> tuple:
-    """Best width under the 20-round, 3 percent, 30-pair rule.
-
-    Both a narrower and a wider candidate need 30 rounds. ``would_w`` is the
-    largest gain, including a width that is not the adjacent narrower step.
-    The served width moves only to that adjacent narrower candidate or to a
-    wider one.
-    """
-    best = int(current)
-    best_gain = 0.0
-    shadow = int(current)
-    shadow_gain = 0.0
-    adjacent = _next_narrower(current)
-    for cand in CANDIDATE_WIDTHS:
-        if int(cand) == int(current):
-            continue
-        arm = _arm(bucket, cand)
-        needed = MIN_PAIRS
-        if (
-            arm["n"] < needed
-            or arm["ms"] <= 0.0
-            or arm["cur_ms"] <= 0.0
-            or arm["tok"] <= 0.0
-            or arm["cur_tok"] <= 0.0
-        ):
-            continue
-        gain = (arm["tok"] / arm["ms"]) / (arm["cur_tok"] / arm["cur_ms"]) - 1.0
-        if gain > shadow_gain and gain > REPLAY_GAIN:
-            shadow = int(cand)
-            shadow_gain = float(gain)
-        if int(cand) < int(current) and int(cand) != adjacent:
-            continue
-        if gain > best_gain and gain > REPLAY_GAIN:
-            best = int(cand)
-            best_gain = float(gain)
-    _would_w[int(bucket)] = int(shadow)
-    applied = False
-    if allow_apply and best != int(current):
-        assign_persistent_width(int(bucket), int(best))
-        _clear_arms(bucket)
-        applied = True
-    return best, shadow_gain, applied
-
-
-def observe_replay(
-    batch: int,
-    built: int,
-    kind: str,
-    actual_tokens: float,
-    actual_ms: float,
-    replayed: Optional[Dict[int, tuple]] = None,
-    *,
-    counted: bool = True,
-    apply: bool = True,
-) -> dict:
-    """Accumulate one labeled round and return the shadow decision.
-
-    ``counted`` is false for K-probe and locked rounds. A measure
-    round updates bias only. ``would_w`` can name a candidate that is not the
-    adjacent narrower step. The logged bias is the pair of the width served
-    at the start of this round and ``would_w``.
-    """
-    pairs = (
-        {} if replayed is None else {int(key): value for key, value in replayed.items()}
-    )
-    bucket = batch_bucket(batch)
-    served = persistent_width(batch)
-    current = served
-    if counted:
-        _note_bias(bucket, int(built), actual_tokens, actual_ms, pairs)
-    gain = 0.0
-    applied = False
-    judged_rounds = int(_replay_n.get(bucket, 0))
-    if counted and kind != "measure":
-        arms = {}
-        if int(built) == int(current):
-            arms[int(current)] = (float(actual_tokens), float(actual_ms))
-            for width, pair in pairs.items():
-                if int(width) < int(current) and pair[1] is not None:
-                    arms[int(width)] = (float(pair[0]), float(pair[1]))
-        elif int(built) > int(current):
-            arms[int(built)] = (float(actual_tokens), float(actual_ms))
-            for width, pair in pairs.items():
-                if pair[1] is not None:
-                    arms[int(width)] = (float(pair[0]), float(pair[1]))
-        if int(current) in arms and float(arms[int(current)][1]) > 0.0:
-            cur_tok, cur_ms = arms[int(current)]
-            for width, pair in arms.items():
-                if int(width) == int(current) or float(pair[1]) <= 0.0:
-                    continue
-                arm = _arm(bucket, width)
-                arm["tok"] += float(pair[0])
-                arm["ms"] += float(pair[1])
-                arm["cur_tok"] += float(cur_tok)
-                arm["cur_ms"] += float(cur_ms)
-                arm["n"] += 1.0
-        _replay_n[bucket] = int(_replay_n.get(bucket, 0)) + 1
-        judged_rounds = int(_replay_n[bucket])
-        if judged_rounds % EXPLORE_EVERY == 0:
-            _best, gain, applied = _judge(bucket, current, allow_apply=apply)
-    rounds = judged_rounds
-    would = int(_would_w.get(bucket, served))
-    bias = _bias_report(bucket, served, would)
-    record = {
-        "bucket": int(bucket),
-        "b": int(batch),
-        "w": int(built),
-        "kind": str(kind),
-        "candidates": _candidate_log(int(built), actual_tokens, actual_ms, pairs),
-        "rounds": rounds,
-        "gain": float(gain),
-        "would_w": would,
-        "bias": bias,
-        "applied": bool(applied),
-    }
-    return record
-
-
-def _candidate_log(built, actual_tokens, actual_ms, replayed) -> dict:
-    logged = {str(int(built)): {"tokens": float(actual_tokens), "ms": float(actual_ms)}}
-    for width, pair in replayed.items():
-        logged[str(int(width))] = {
-            "tokens": float(pair[0]),
-            "ms": None if pair[1] is None else float(pair[1]),
-        }
-    return logged
-
-
 def _layers_of(state) -> list:
     depth = int(getattr(state, "depth", 0) or 0)
     if depth < 1 or not hasattr(state, "tokens"):
@@ -753,8 +333,8 @@ def _freeze_layer_rows(scheduler, states) -> list:
 def queue_hold_replay(scheduler, reqs, states, plan) -> None:
     """Register references only; freeze tensors and prices after the reply.
 
-    Capture the served width now: settling the previous round in post-reply
-    may switch it before this round's trees are held.
+    Capture the served width now. This packet's post-reply may switch it
+    after the trees are scored.
     """
     queued = getattr(scheduler, "_clear_replay_to_hold", None)
     if queued is None:
@@ -774,8 +354,8 @@ def queue_hold_replay(scheduler, reqs, states, plan) -> None:
 
 def hold_replay(
     scheduler, reqs, states, plan, *, token=None, served=None, packet=None
-) -> None:
-    """Freeze this round's trees until the next STEP brings committed text."""
+):
+    """Freeze this packet's trees for the width rule. Returns the dict, or None."""
     try:
         if token is None:
             token = getattr(scheduler, "_clear_build_token", None)
@@ -790,16 +370,14 @@ def hold_replay(
             if not layers:
                 continue
             rid = str(getattr(req, "rid", "") or getattr(state, "rid", ""))
-            output = getattr(req, "output_ids", None) or []
             trees[rid] = {
                 "layers": layers,
-                "output_len": len(output),
                 "prefix": int(getattr(state, "prefix", 0) or 0),
                 "ratio": float(accept_ratio(rid)),
             }
             usable.append(state)
         if not trees:
-            return
+            return None
         verify = {}
         for k in VERIFY_KS:
             try:
@@ -812,194 +390,39 @@ def hold_replay(
             k_actual = int(plan.locked_k)
         else:
             k_actual = int(plan.verify_k(usable[0]))
-        existing = getattr(scheduler, "_clear_replay_hold", None)
-        if (
-            existing is None
-            or existing.get("token") != token
-            or existing.get("packet") != packet
-            or len(list(reqs)) > 1
-        ):
-            existing = {
-                "token": token,
-                "packet": packet,
-                "served": int(served),
-                "trees": {},
-                "width": int(plan.width),
-                "kind": str(getattr(plan, "replay_kind", "ordinary")),
-                "eligible": bool(getattr(plan, "replay_eligible", False)),
-                "batch": int(plan.batch),
-                "theta": plan.theta_value,
-                "verify_ms": verify,
-                "k": k_actual,
-                "flat_k": int(getattr(plan, "flat_k", flat_k(int(plan.batch)))),
-                "layers": _freeze_layer_rows(scheduler, usable),
-                "gain_ratio": float(gain_ratio()),
-            }
-        existing["trees"].update(trees)
-        existing["gain_ratio"] = float(gain_ratio())
-        scheduler._clear_replay_hold = existing
+        return {
+            "token": token,
+            "packet": packet,
+            "served": int(served),
+            "trees": trees,
+            "width": int(plan.width),
+            "kind": str(getattr(plan, "replay_kind", "ordinary")),
+            "eligible": bool(getattr(plan, "replay_eligible", False)),
+            "batch": int(plan.batch),
+            "theta": plan.theta_value,
+            "verify_ms": verify,
+            "k": k_actual,
+            "flat_k": int(getattr(plan, "flat_k", flat_k(int(plan.batch)))),
+            "layers": _freeze_layer_rows(scheduler, usable),
+        }
     except Exception:
         import logging
 
         logging.getLogger(__name__).warning(
             "[CLEAR ledger] replay hold failed", exc_info=True
         )
-
-
-def _replayed_counts(hold, tokens_by_rid) -> Dict[int, tuple]:
-    built = int(hold["width"])
-    theta = hold.get("theta")
-    verify_ms = hold.get("verify_ms") or {}
-    layer_rows = list(hold.get("layers") or [])
-    trees = hold["trees"]
-    out = {}
-    for width in CANDIDATE_WIDTHS:
-        if int(width) >= built:
-            continue
-        prepared = []
-        for rid, tree in trees.items():
-            tokens = tokens_by_rid.get(rid)
-            if tokens is None:
-                return {}
-            layers = tree["layers"]
-            prepared.append(
-                {
-                    "layers": layers,
-                    "kept": truncate_columns(layers, width),
-                    "tokens": tokens,
-                    "ratio": float(tree["ratio"]),
-                    "prefix": int(tree.get("prefix", 0) or 0),
-                }
-            )
-        stop = batch_stop_depth(
-            prepared,
-            theta=theta,
-            verify_ms=verify_ms,
-            layer_rows=layer_rows,
-            width=int(width),
-            gain_ratio=float(hold.get("gain_ratio", 1.0) or 1.0),
-        )
-        scores = []
-        ratios = []
-        retained = 0
-        for tree in prepared:
-            end = min(int(stop), len(tree["layers"]))
-            scores.append(_kept_scores(tree["layers"], tree["kept"], end))
-            ratios.append(float(tree["ratio"]))
-            retained = max(retained, _retained_nodes(tree, stop))
-        cap = None if retained <= 0 else _tier_for_nodes(retained, VERIFY_KS)
-        stored_flat = hold.get("flat_k")
-        if stored_flat is None:
-            stored_flat = flat_k(int(hold.get("batch", 1)))
-        k_prime = _select_replay_k(
-            scores,
-            ratios,
-            theta,
-            verify_ms,
-            int(hold["k"]),
-            cap,
-            flat_k_value=int(stored_flat),
-        )
-        accepts = [
-            replay_accept_k(
-                tree["layers"],
-                tree["kept"],
-                tree["tokens"],
-                min(int(stop), len(tree["layers"])),
-                k_prime,
-            )
-            for tree in prepared
-        ]
-        model_actual = _schedule_ms(
-            layer_rows, built, len(layer_rows), verify_ms, int(hold["k"])
-        )
-        model_cand = _schedule_ms(
-            layer_rows,
-            int(width),
-            max(int(stop) - 1, 0),
-            verify_ms,
-            k_prime,
-        )
-        measured = hold.get("measured_ms")
-        if measured is None or model_actual is None or model_cand is None:
-            out[int(width)] = (float(sum(accepts)), None)
-            continue
-        counterfactual = float(measured) - float(model_actual) + float(model_cand)
-        if counterfactual <= 0.0:
-            out[int(width)] = (float(sum(accepts)), None)
-        else:
-            out[int(width)] = (float(sum(accepts)), counterfactual)
-    return out
-
-
-@policy_timed
-def settle_replay(scheduler, reqs) -> Optional[dict]:
-    """Consume the previous hold and copy committed tails; defer replay work."""
-    hold = getattr(scheduler, "_clear_replay_hold", None)
-    closed = getattr(scheduler, "_clear_replay_closed", None)
-    scheduler._clear_replay_hold = None
-    scheduler._clear_replay_closed = None
-    scheduler._clear_replay_pending = None
-    if not isinstance(hold, dict) or not isinstance(closed, dict):
-        return None
-    try:
-        packet = hold.get("packet")
-        if packet is None or packet != (
-            str(closed.get("session_id", "")),
-            closed.get("rpc_seq"),
-        ):
-            return None
-        if not hold.get("eligible"):
-            return None
-        # Exploration deliberately builds wider than served. Only a persistent
-        # switch since the build makes this a cross-switch transition round.
-        if int(hold["served"]) != persistent_width(int(hold["batch"])):
-            return None
-        if closed.get("excluded") or not closed.get("price_kept"):
-            return None
-        measured = closed.get("price_ms")
-        if measured is None or float(measured) <= 0.0:
-            return None
-        by_rid = {str(getattr(req, "rid", "")): req for req in reqs}
-        tokens_by_rid = {}
-        actual = 0
-        for rid, tree in hold["trees"].items():
-            req = by_rid.get(rid)
-            if req is None:
-                return None
-            output = getattr(req, "output_ids", None) or []
-            old = int(tree["output_len"])
-            if old < 0 or old > len(output):
-                return None
-            fresh = output[old:]
-            tokens_by_rid[rid] = fresh
-            actual += len(fresh)
-        if not tokens_by_rid:
-            return None
-        hold["measured_ms"] = float(measured)
-        pending = {
-            "token": getattr(scheduler, "_clear_build_token", None),
-            "packet": getattr(scheduler, "_clear_replay_packet", None),
-            "hold": hold,
-            "tokens": tokens_by_rid,
-            "actual": actual,
-        }
-        scheduler._clear_replay_pending = pending
-        return pending
-    except Exception:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "[CLEAR ledger] replay settle failed", exc_info=True
-        )
         return None
 
 
 def run_post_reply(scheduler) -> None:
-    """Settle the previous round, hold this build, then flush Draft logs once."""
+    """Freeze this packet, judge its width block, then flush Draft logs once."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         add_post_ms,
         flush_draft_logs,
+        queue_draft_log,
+    )
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        observe_pair,
     )
 
     started = time.perf_counter()
@@ -1012,63 +435,51 @@ def run_post_reply(scheduler) -> None:
     previous_post = getattr(scheduler, "_clear_in_post_reply", False)
     scheduler._clear_in_post_reply = True
     try:
-        pending = getattr(scheduler, "_clear_replay_pending", None)
         queued = getattr(scheduler, "_clear_replay_to_hold", None) or []
-        scheduler._clear_replay_pending = None
         scheduler._clear_replay_to_hold = None
-        # A STEP that returned early must not leave an old hold looking like
-        # the reply just sent. Non-STEP packets never enter this function.
-        scheduler._clear_replay_hold = None
-        scheduler._clear_replay_closed = None
         try:
-            if (
-                isinstance(pending, dict)
-                and pending.get("token") == token
-                and pending.get("packet") == packet
-            ):
-                hold = pending["hold"]
-                if int(hold["served"]) == persistent_width(int(hold["batch"])):
-                    replayed = _replayed_counts(hold, pending["tokens"])
-                    record = observe_replay(
-                        int(hold["batch"]),
-                        int(hold["width"]),
-                        str(hold["kind"]),
-                        float(pending["actual"]),
-                        float(hold["measured_ms"]),
-                        replayed,
-                        counted=True,
-                        apply=int(getattr(scheduler, "tp_size", 1) or 1) <= 1,
-                    )
-                    _emit_replay(scheduler, record)
+            if not getattr(scheduler, "_clear_plan_fallback", False):
+                matched = [
+                    item
+                    for item in queued
+                    if item[3] == token and item[5] == packet
+                ]
+                if matched:
+                    served = int(matched[0][4])
+                    plan = matched[0][2]
+                    same = all(int(item[4]) == served for item in matched)
+                    reqs = []
+                    states = []
+                    for item in matched:
+                        reqs.extend(item[0])
+                        states.extend(item[1])
+                    frozen = None
+                    if same:
+                        frozen = hold_replay(
+                            scheduler,
+                            reqs,
+                            states,
+                            plan,
+                            token=token,
+                            served=served,
+                            packet=packet,
+                        )
+                    if (
+                        isinstance(frozen, dict)
+                        and frozen.get("eligible")
+                        and int(frozen["served"])
+                        == persistent_width(int(frozen["batch"]))
+                    ):
+                        record = observe_pair(frozen)
+                        if record is not None:
+                            queue_draft_log(scheduler, "d_wpair", record)
         except Exception:
             import logging
 
             logging.getLogger(__name__).warning(
                 "[CLEAR ledger] replay post failed", exc_info=True
             )
-        # A failed batch build may already have registered its primary trees.
-        # Fallback rounds are excluded, so do not retain any of those trees.
-        if not getattr(scheduler, "_clear_plan_fallback", False):
-            for reqs, states, plan, build_token, served, build_packet in queued:
-                if build_token == token and build_packet == packet:
-                    hold_replay(
-                        scheduler,
-                        reqs,
-                        states,
-                        plan,
-                        token=build_token,
-                        served=served,
-                        packet=build_packet,
-                    )
         flush_draft_logs(scheduler)
     finally:
         scheduler._clear_in_post_reply = previous_post
         add_post_ms(scheduler, (time.perf_counter() - started) * 1000.0)
-
-
-def _emit_replay(scheduler, record: dict) -> None:
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        queue_draft_log,
-    )
-
-    queue_draft_log(scheduler, "d_replay", record)

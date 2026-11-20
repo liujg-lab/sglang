@@ -101,9 +101,6 @@ def on_external_event(scheduler) -> None:
     ledger = getattr(scheduler, "_clear_ledger", None)
     if ledger:
         ledger.drop_fitted()
-    scheduler._clear_replay_hold = None
-    scheduler._clear_replay_closed = None
-    scheduler._clear_replay_pending = None
     scheduler._clear_replay_to_hold = []
 
 
@@ -1020,6 +1017,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     """Choose W and the probe or value rule for these requests."""
     global _rounds
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        LAYER_MIN_SAMPLES,
+        layer_sample_count,
         ledger_enabled,
         predict_layer_ms,
         runtime_kv_buckets,
@@ -1038,8 +1037,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     fitting = fitting_ks(max_ell, buckets)
     max_depth = _round_max_depth(scheduler)
     # A K-probe round is not eligible, so its tree stays on the served width.
-    # Only the served width's covering tier bounds K probes. Exploration
-    # needs the flat tier's sample, not samples for every wider tier.
+    # Only the served width's covering tier bounds K probes. A superset build
+    # needs the wider width's own layer sample and flat-tier verify time.
     served = persistent_width(batch)
     probe_cover = _cover_for(served, max_depth, fitting)
     served_flat = _covered_flat_k(
@@ -1061,12 +1060,26 @@ def make_round(scheduler, reqs) -> RoundPlan:
         _cached_build_width,
     )
 
+    sum_ell = sum(drafts)
+
+    def superset_ready(candidate):
+        if layer_sample_count(scheduler, int(candidate), batch) < LAYER_MIN_SAMPLES:
+            return True
+        if price is None:
+            return False
+        if predict_layer_ms(scheduler, int(candidate), batch, sum_ell) is None:
+            return False
+        cover_k = _cover_for(int(candidate), max_depth, fitting)
+        flat = _covered_flat_k(batch, max_ell, buckets, cover_k)
+        return _time_for(batch, max_ell, flat, buckets) is not None
+
     width, kind = _cached_build_width(
         scheduler,
         batch,
         ledger_on=ledger_on,
         eligible=eligible,
-        sum_ell=sum(drafts),
+        sum_ell=sum_ell,
+        ready=superset_ready,
     )
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     cover = _cover_for(width, max_depth, fitting)
@@ -1313,14 +1326,7 @@ def _requests_greedy(reqs) -> bool:
 
 _REPLAY_EXPORTS = frozenset(
     {
-        "candidate_stop_depth",
         "choose_build_width",
-        "hold_replay",
-        "matched_depth",
-        "observe_replay",
-        "replay_accept",
-        "replay_bias",
-        "settle_replay",
         "truncate_columns",
     }
 )

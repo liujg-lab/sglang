@@ -960,10 +960,8 @@ def add_post_ms(scheduler, elapsed_ms: float) -> None:
 
 @policy_timed
 def note_packet(scheduler, batch) -> None:
-    # An interrupted reply must not execute its abandoned calculations later.
-    scheduler._clear_replay_pending = None
+    # An interrupted reply must not freeze its abandoned trees later.
     scheduler._clear_replay_to_hold = []
-    scheduler._clear_replay_closed = None
     serial = int(getattr(scheduler, "_clear_build_serial", 0) or 0) + 1
     scheduler._clear_build_serial = serial
     scheduler._clear_build_token = serial
@@ -982,11 +980,10 @@ def note_packet(scheduler, batch) -> None:
         if rid:
             stored[rid] = int(length)
     scheduler._clear_target_prefix = stored
-    closed = {}
 
     def _run(ledger: ClearLedger) -> None:
         width = int(scheduler.server_args.clear_tree_width)
-        record = ledger.on_packet(
+        ledger.on_packet(
             batch.action,
             rids,
             str(getattr(batch, "session_id", "")),
@@ -995,12 +992,8 @@ def note_packet(scheduler, batch) -> None:
             width,
             recv_queued=bool(getattr(scheduler, "_clear_recv_queued", False)),
         )
-        if isinstance(record, dict):
-            closed["record"] = record
 
     _quiet(scheduler, _run)
-    if "record" in closed:
-        scheduler._clear_replay_closed = closed["record"]
 
 
 def note_idle(scheduler) -> None:

@@ -1,0 +1,18 @@
+{
+  "requests_100": true,
+  "tokens_match_jsonl": true,
+  "throughput_is_tokens_over_wall": true,
+  "accept_rate_is_sum_not_mean": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "capture_bs_1_2_4": true,
+  "draft_bs4_ntpb65_absent_capacity": true,
+  "d_wpair_present": true,
+  "d_replay_absent": true,
+  "width_switched": true,
+  "kind_strings_superset_probe_w_not_in_log": true,
+  "bonus_eager_zero": true,
+  "trial_01_bonus_tail_missing": true,
+  "trial_02_bonus_tail_flushed": true,
+  "same_process_pair": true
+}
