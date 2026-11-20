@@ -13,6 +13,7 @@
 | `decode_table.py` | 从 Target 日志的 `Decode batch` 行算 Target-only 的步时表，只用 `#running-req` 等于 b 的行 | V5 |
 | `mixed_throughput.py` | 几个请求池同时跑时，统计所有池都满的那段时间的吞吐；可以按时间点切成前后两段 | V3 |
 | `echo_test.py` | `delay_proxy.py` 的自测：在本机起一个回显服务，经代理测 0 / 10 / 40 ms 设定下的实际往返时间。在本目录下运行，会占用 29100、29101 端口 | 代理自测 |
+| `layer_fit_compare.py` | 按 Draft 日志里 `[CLEAR ledger d_layer]` 的原顺序先预测后更新，对比三种层耗时拟合：现行 `(W, path)` 加线性图档、`(W, path)` 加图档 one-hot 截距、按 `(W, path, 图档)` 分开存。`--synthetic` 用合成流演示机制，不是实测 | 层耗时（cost-layer） |
 | `selftest/fake_server.py` | 模拟 `/generate` 的本地 HTTP 服务（固定的 token 和 top-2 logprobs，支持流式），监听本机 29201 端口，用来自测客户端和分析脚本。自测产生的数据不放进仓库 | 工具自测 |
 
 用法见各脚本开头的说明。代理和客户端的地址、端口都由命令行给出；只有两个自测脚本固定使用本机回环地址和上表里的端口。

@@ -69,6 +69,17 @@
 | `ext28.py`、`run37.py`、`analyze37.py` | 第三十七批（conda `sglang`）：切宽最少对数（`wide_need`）、最近 200 对、探索比例、K 选用快照、回放和影子树对照（`BatchAccount21`） |
 | `ext29.py`、`run38.py`、`analyze38.py` | 第三十八批（conda `sglang`）：验证回归去掉负斜率（`vnn`）、三个斜率的岭项（`vprior`）、探索轮回放日志（`explog`）（`BatchAccount22`） |
 | `ext30.py`、`run39.py`、`analyze39.py` | 第三十九批（conda `sglang`）：最近 200 对、窗口路径上的 2 倍标准误、n0=6 的斜率先验，加探索衰减（`BatchAccount23`） |
+| `ext31.py`、`run40.py`、`analyze40.py` | 第四十批起（conda `sglang`，探索性，没有预先登记）：现行代码（提交 ba6911d670）在线 K 和在线 W 规则的复刻 `CodeMirror`，以及 2026-11-18 提议的开关（`k1`、`level`、`refresh`、`selfb`、`bias`、`win`、`confirm`、`guard`、`rcell`）。第四十批的结果文件没有保留，见 results.md 7.44 |
+| `ext32.py`、`run41.py`、`analyze41.py` | 第四十一批：按根层 Draft 概率逐轮选宽度（`RootW`） |
+| `ext33.py`、`run42.py`、`analyze42.py` | 第四十二批：beam 约束信号（一阶加宽收益 + 截树缩窄损失 − 层成本，`SigW`）和固定 W 参照（`FixW`）；`RecTree2` 记录每层被 beam 挤掉的候选（第 W+1 到 2W 名），之后各批都用它建树 |
+| `ext34.py`、`run43.py`、`analyze43.py` | 第四十三批：按 RTX 3090 实测层耗时表搭的世界（`measure_world`，表来自 `../validate/cost-layer/2026-11-19-a/`）、按 (W, g) 的层拟合（`GFit`，对应提交 ef69d22973）、饱和率臂（`SatW`）、固定 W 到 16 |
+| `ext35.py`、`run44.py`、`analyze44.py` | 第四十四批：对称的收益 / 成本规则（截树缩窄损失、卡住树数 × ĝ 的加宽收益，`SatD`） |
+| `ext36.py`、`ext37.py`、`run45.py`、`analyze45.py` | 第四十五批：只按真实探测轮吞吐选 W（`ProbeZ`、AdaCost 式 `ProbeAC`）；饱和率提议、真实探测否决或确认（`SatP`；`satpv_g` 只保留换宽后的验证和退回） |
+| `noise47.py`、`noise48.py`、`noise49.py`、`noise50.py` | 单轮吞吐噪声：不同轮比较的实际吞吐、Draft 期望 token、同一轮配对的截树差、共用 K 和各自最优 K |
+| `ext38.py`、`run46.py`、`analyze46.py` | 第四十六批：固定 W 臂上记录候选 W 指标（`IndFix`），按 AUC、决策价值和从起点爬坡筛选 |
+| `ext39.py`、`run47.py`、`analyze47.py` | 第四十七批：指标臂 `satc_g`（饱和率 + 拟合出的加宽成本门槛）、`net0_g`（两个方向都用一阶净收益），都带 `satpv_g` 的验证和退回（`IndW`） |
+| `ext40.py`、`run48.py`、`analyze48.py` | 第四十八批：反事实宽度估计的偏差。策略用世界的真实层成本（`TCFix`），在 W 的运行里估 W/2：截树共用 K、截树自选 K、满深度影子超集树上回放 W/2 的生长和选 K（`CutView`） |
+| `ext41.py`、`run49.py`、`analyze49.py`、`analyze49b.py` | 第四十九批：纯配对控制器 `PairW`（2W 超集轮 + 截树 + 各宽度自己的 K + 配对标准误判定），层拟合乘共享水平（`LevelFit`）；同一层拟合下的对照臂 `FixL`、`SatL`、`SatPL` |
 
 跨轮的 rollout 基线在 `../theory/cross_round_rollout.py`。
 
@@ -152,6 +163,19 @@ python analyze38.py p; python analyze38.py b; python analyze38.py w; python anal
 for p in 0 1; do python run39.py $p eval > results/r39e.$p.jsonl; done
 for p in 0 1; do python run39.py $p seed20 > results/r39s.$p.jsonl; done   # 只在 7.42 的无结论区间补跑
 python analyze39.py eval; python analyze39.py seed20
+# 第四十批起：python runNN.py <进程号> <进程数> <part> [臂...]，不写臂时跑该批全部臂；输出重定向到 results/
+for p in 0 1; do python run41.py $p 2 main > results/r41m.$p.jsonl; done; python analyze41.py r41m
+for p in 0 1; do python run42.py $p 2 main > results/r42m.$p.jsonl; python run42.py $p 2 flat > results/r42f.$p.jsonl; done; python analyze42.py r42m r42f
+for p in 0 1; do python run43.py $p 2 main > results/r43m.$p.jsonl; done; python analyze43.py
+for p in 0 1; do python run44.py $p 2 main > results/r44m.$p.jsonl; done; python analyze44.py
+for p in 0 1; do python run45.py $p 2 main satp_g satpv_g > results/r45a.$p.jsonl; python run45.py $p 2 main probe_z probe_ac > results/r45b.$p.jsonl; done; python analyze45.py
+for n in 47 48 49 50; do python noise$n.py > results/noise$n.out; done
+for p in 0 1; do python run46.py $p 2 main ind2 ind4 ind8 ind16 > results/r46.$p.jsonl; done; python analyze46.py a; python analyze46.py v
+for p in 0 1; do python run47.py $p 2 main satc_g net0_g > results/r47.$p.jsonl; done; python analyze47.py
+for p in 0 1; do python run48.py $p 2 main tc2 tc4 tc8 tc16 > results/r48.$p.jsonl; done; python analyze48.py
+for p in 0 1; do python run49.py $p 2 main pair_g pair_s > results/r49.$p.jsonl; done; python analyze49.py
+for p in 0 1; do python run49.py $p 2 main fixL2 fixL4 fixL8 fixL16 satL_g satpvL_g > results/r49c.$p.jsonl; done   # 跑到第 8 组时进程被中断
+for p in 0 1; do SKIP_IDX=0,1,2,3,4,5,6,8 python run49.py $p 2 main fixL2 fixL4 fixL8 fixL16 satL_g satpvL_g > results/r49d.$p.jsonl; done; python analyze49b.py   # 续跑其余 38 组
 python3 analyze4.py; python3 analyze5.py; python3 analyze6.py; python3 analyze7.py; python3 analyze8.py; python3 analyze9.py; python3 analyze10.py; python3 analyze11.py; python3 analyze12.py; python3 analyze13.py; python3 analyze14.py; python3 analyze16.py; python3 analyze17.py; python3 analyze18.py; python3 analyze18L.py; python3 analyze19.py   # 读 results/
 python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 ```
@@ -203,6 +227,14 @@ python3 gen_cases.py && node planner_bench.js && node planner_bench_opt.js
 | `r36bp.*.jsonl`、`r36be.*.jsonl`、`r36bs.*.jsonl`、`r36bg.*.jsonl`、`r36b_param.json` | 第三十六批修复后重跑。CUSUM 和 win200 在成本事件后清状态。60 组 CUSUM +0.298%，无结论（D78） |
 | `r37k.*.jsonl`、`r37b.*.jsonl`、`r37x.*.jsonl`、`r37e.*.jsonl`、`r37s.*.jsonl` | 第三十七批。K=32 的来源、回放偏差、关掉探索和持续探测；种子 11–13 上的窗口和切宽 30 对。60 组窗口 +0.230%，无结论；切宽 30 对不采纳（D79）。没有守卫 |
 | `r38p.*.jsonl`、`r38_param.json`、`r38b.*.jsonl`、`r38w.*.jsonl`、`r38g.*.jsonl`、`r38e.*.jsonl`、`r38s.*.jsonl` | 第三十八批。n0=6。`vnn` 60 组 +0.056%，不采纳；`vprior` 60 组 +0.112%，无结论（D80）。没有守卫 |
+| `r41m.*`、`r42m.*`、`r42f.*` | 第四十一、四十二批（46 组；r42f 是 W 项压到 1/5 的 12 组）。`.log` 是同名运行的 stderr |
+| `r43m.*`、`r44m.*` | 第四十三、四十四批，实测层耗时世界，46 组 |
+| `r45a.*`、`r45b.*` | 第四十五批：`satp_g`、`satpv_g`（a），`probe_z`、`probe_ac`（b） |
+| `noise47.out`–`noise50.out` | 单轮噪声测量的输出（2026-11-20 在本目录重跑，和第一次运行的数字逐位相同） |
+| `r46.*` | 第四十六批：四个固定 W 臂和指标记录 |
+| `r47.*` | 第四十七批：`satc_g`、`net0_g` |
+| `r48.*` | 第四十八批：真实层成本的固定 W 臂和 W/2 的三种估计 |
+| `r49.*`、`r49c.*`、`r49d.*` | 第四十九批：`pair_g`、`pair_s`（r49）；带共享水平的对照臂（r49c 前 8 组、r49d 其余 38 组） |
 | `r39e.*.jsonl`、`r39s.*.jsonl` | 第三十九批。`b3` 75 组 +0.339%，`b4` 75 组 +0.405%，无结论（D81）。没有守卫 |
 | `r29.*.jsonl`、`r29s.*.jsonl`、`analyze29.txt` | 第二十九批：护栏、开关世界、RTT 世界（`r29`：W、R 部分，另有 2 组按原计划比 v11 和三个都开的 S；`r29s`：S 部分 v11 对 G1） |
 | `r28.*.jsonl`、`analyze28.txt` | 第二十八批：清零累计量和持续计时探测（conda 环境；参照取自 r25–r27） |

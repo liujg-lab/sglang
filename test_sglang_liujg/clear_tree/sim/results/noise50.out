@@ -1,0 +1,6 @@
+mid  short  b=1  n  797  gap(fixed K)  7.32%  gap(own K*)  6.63%  K*(W4 cut) != round K in 59.8% (smaller 59.2%)
+het  mixed  b=1  n  767  gap(fixed K)  8.77%  gap(own K*)  7.72%  K*(W4 cut) != round K in 64.0% (smaller 63.2%)
+mid  short  b=4  n  419  gap(fixed K)  6.02%  gap(own K*)  5.43%  K*(W4 cut) != round K in 34.4% (smaller 34.4%)
+het  mixed  b=4  n  240  gap(fixed K)  3.62%  gap(own K*)  3.42%  K*(W4 cut) != round K in 16.2% (smaller 16.2%)
+mid  short  b=8  n  463  gap(fixed K)  4.45%  gap(own K*)  3.54%  K*(W4 cut) != round K in 36.7% (smaller 36.7%)
+high short  b=8  n  274  gap(fixed K)  1.66%  gap(own K*)  1.46%  K*(W4 cut) != round K in 16.8% (smaller 16.8%)

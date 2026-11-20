@@ -1,0 +1,12 @@
+mid  short  b=1 W= 4  rounds   864  sigma_rel 0.449  lag1 +0.27
+mid  short  b=1 W= 8  rounds   797  sigma_rel 0.402  lag1 +0.25
+het  mixed  b=1 W= 4  rounds   878  sigma_rel 0.517  lag1 +0.30
+het  mixed  b=1 W= 8  rounds   767  sigma_rel 0.477  lag1 +0.25
+mid  short  b=4 W= 4  rounds   441  sigma_rel 0.230  lag1 +0.31
+mid  short  b=4 W= 8  rounds   419  sigma_rel 0.232  lag1 +0.39
+het  mixed  b=4 W= 4  rounds   273  sigma_rel 0.411  lag1 +0.72
+het  mixed  b=4 W= 8  rounds   240  sigma_rel 0.352  lag1 +0.73
+mid  short  b=8 W= 4  rounds   476  sigma_rel 0.186  lag1 +0.36
+mid  short  b=8 W= 8  rounds   463  sigma_rel 0.191  lag1 +0.44
+high short  b=8 W= 4  rounds   286  sigma_rel 0.130  lag1 +0.38
+high short  b=8 W= 8  rounds   274  sigma_rel 0.121  lag1 +0.42

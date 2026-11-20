@@ -1,0 +1,6 @@
+mid  short  b=1  paired gap W8 vs W4 cut: mean  7.32% of tokens, sd/round  3.95%, rounds for se 0.5%: 63
+het  mixed  b=1  paired gap W8 vs W4 cut: mean  8.77% of tokens, sd/round  4.49%, rounds for se 0.5%: 81
+mid  short  b=4  paired gap W8 vs W4 cut: mean  6.02% of tokens, sd/round  3.82%, rounds for se 0.5%: 59
+het  mixed  b=4  paired gap W8 vs W4 cut: mean  3.62% of tokens, sd/round  2.07%, rounds for se 0.5%: 18
+mid  short  b=8  paired gap W8 vs W4 cut: mean  4.45% of tokens, sd/round  4.10%, rounds for se 0.5%: 68
+high short  b=8  paired gap W8 vs W4 cut: mean  1.66% of tokens, sd/round  1.16%, rounds for se 0.5%: 6
