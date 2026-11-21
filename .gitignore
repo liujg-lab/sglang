@@ -280,6 +280,8 @@ python/sglang/srt/speculative/toll_tree_remote/notes/raw/
 python/sglang/srt/speculative/toll_tree_remote/notes/validate/raw/
 python/sglang/srt/speculative/toll_tree_remote/notes/scripts/
 python/sglang/srt/speculative/clear_tree/scratchpad/
+python/sglang/srt/speculative/clear_tree_remote/clear_tree_fit.json
+python/sglang/srt/speculative/clear_tree_remote/clear_tree_fit.json.tmp
 test_sglang_liujg/clear_tree/sim/results/*.err
 !test_sglang_liujg/clear_tree/sim/results/*.jsonl
 !test_sglang_liujg/clear_tree/sim/results/*.out

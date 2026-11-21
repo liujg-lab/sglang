@@ -182,6 +182,9 @@ class ClearTargetClient(_CommEndpoint):
         self.comm_metrics = SRCommMetrics("Target", transport)
         self._comm_pending = None
         self.connection_generation = 0
+        self._last_reply_ns = None
+        self._last_reply_key = None
+        self._last_reply_queued = False
         self._open()
 
     def _open(self) -> None:
@@ -251,6 +254,7 @@ class ClearTargetClient(_CommEndpoint):
         )
         self._comm_pending = call
         try:
+            self._stamp_target_residence(batch)
             frames = _pack_request(batch, mm_by_rid)
             packed = time.perf_counter_ns()
             call.values["request_pack_ms"] = (packed - call.start_ns) / 1e6
@@ -262,8 +266,26 @@ class ClearTargetClient(_CommEndpoint):
         except Exception:
             self._finish_comm("send_error")
             raise
+        finally:
+            self._last_reply_ns = None
+            self._last_reply_key = None
+            self._last_reply_queued = False
         if batch.action in (ClearAction.FINISH, ClearAction.ABORT):
             self._finish_comm("send_only")
+
+    def _stamp_target_residence(self, batch: ClearBatchRequest) -> None:
+        """Attach the hold since the previous matching reply, then forget that reply."""
+        key = self._last_reply_key
+        started = self._last_reply_ns
+        if (
+            batch.action == ClearAction.STEP
+            and key is not None
+            and key[0] == batch.session_id
+            and type(started) is int
+        ):
+            batch.target_residence_ns = time.perf_counter_ns() - started
+            batch.target_residence_rpc_seq = key[1]
+            batch.target_queued = bool(self._last_reply_queued)
 
     def recv_batch(self, session_id: str, rpc_seq: int) -> Optional[ClearBatchReply]:
         import zmq
@@ -276,6 +298,7 @@ class ClearTargetClient(_CommEndpoint):
         if call is not None:
             call.values["recv_entry_gap_ms"] = (recv_entry - call.sent_ns) / 1e6
         deadline = time.perf_counter() + self.timeout_ms / 1000.0
+        skip_probe = False
         while True:
             remaining_ms = int((deadline - time.perf_counter()) * 1000)
             if remaining_ms <= 0:
@@ -290,15 +313,28 @@ class ClearTargetClient(_CommEndpoint):
                     waited_ms,
                 )
                 return None
+            from_probe = False
             try:
-                self._socket.setsockopt(zmq.RCVTIMEO, max(1, remaining_ms))
-                frames = self._socket.recv_multipart(copy=False)
+                if skip_probe:
+                    skip_probe = False
+                    self._socket.setsockopt(zmq.RCVTIMEO, max(1, remaining_ms))
+                    frames = self._socket.recv_multipart(copy=False)
+                else:
+                    try:
+                        frames = self._socket.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False
+                        )
+                        from_probe = True
+                    except zmq.Again:
+                        self._socket.setsockopt(zmq.RCVTIMEO, max(1, remaining_ms))
+                        frames = self._socket.recv_multipart(copy=False)
             except zmq.Again:
                 continue
             except Exception as exc:
                 self._finish_comm("recv_error")
                 logger.warning("[CLEAR] Target recv error: %s", exc)
                 return None
+            received_ns = time.perf_counter_ns()
             try:
                 unpack_start = time.perf_counter_ns()
                 reply = _unpack_reply(frames)
@@ -307,13 +343,20 @@ class ClearTargetClient(_CommEndpoint):
                 self._count_comm("unpack_error")
                 logger.warning("[CLEAR] Target failed to unpack reply: %s", exc)
                 self._note_drop("rpc_seq")
+                if from_probe:
+                    skip_probe = True
                 continue
             if reply.session_id != session_id or reply.rpc_seq != rpc_seq:
                 self._count_comm("stale_reply")
                 self._note_drop(
                     "session" if reply.session_id != session_id else "rpc_seq"
                 )
+                if from_probe:
+                    skip_probe = True
                 continue
+            self._last_reply_ns = received_ns
+            self._last_reply_key = (reply.session_id, reply.rpc_seq)
+            self._last_reply_queued = from_probe
             if call is not None:
                 elapsed = unpack_end - call.start_ns
                 call.values.update(
@@ -353,6 +396,8 @@ class ClearDraftServer(_CommEndpoint):
         self._socket = sock
         self._last_identity = None
         self.last_recv_queued = False
+        self.last_request_bytes = None
+        self.last_reply_bytes = None
         logger.info("[CLEAR] Draft ROUTER bound on %s", self._url)
 
     def close(self) -> None:
@@ -425,6 +470,7 @@ class ClearDraftServer(_CommEndpoint):
                 "request_bytes": _multipart_nbytes(frames[1:]),
             },
         )
+        self.last_request_bytes = self._comm_pending.values["request_bytes"]
         if batch.action in (ClearAction.FINISH, ClearAction.ABORT):
             self._finish_comm("receive_only")
         self.last_recv_queued = queued
@@ -451,9 +497,11 @@ class ClearDraftServer(_CommEndpoint):
                 call.values["draft_residence_ms"] = batch.draft_residence_ns / 1e6
             payload = _pack_reply(batch)
             pack_end = time.perf_counter_ns()
+            reply_bytes = _multipart_nbytes(payload)
+            self.last_reply_bytes = reply_bytes
             if call is not None:
                 call.values["reply_pack_ms"] = (pack_end - pack_start) / 1e6
-                call.values["reply_bytes"] = _multipart_nbytes(payload)
+                call.values["reply_bytes"] = reply_bytes
             frames = [ident, *payload]
             send_start = time.perf_counter_ns()
             self._socket.send_multipart(frames, copy=False)

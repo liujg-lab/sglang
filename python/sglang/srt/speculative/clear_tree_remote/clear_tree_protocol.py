@@ -42,6 +42,40 @@ def parse_spec_shape(value: Any) -> Optional[Tuple[int, ...]]:
     return ()
 
 
+_TARGET_INFO_KEYS = (
+    "backend",
+    "device",
+    "tp",
+    "model",
+    "served_model_name",
+    "dtype",
+    "quantization",
+    "verify_capture",
+    "kv_buckets",
+)
+
+
+def _target_info_value(value: Any) -> bool:
+    """A header value is a string, a real int, None, or a list of real ints."""
+    if value is None or type(value) is str or type(value) is int:
+        return True
+    return isinstance(value, list) and all(type(item) is int for item in value)
+
+
+def parse_target_info(value: Any) -> Optional[dict]:
+    """Keep the Target header keys whose values are strings, ints, None, or int lists."""
+    if not isinstance(value, dict):
+        return None
+    kept = {}
+    for key in _TARGET_INFO_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if _target_info_value(item):
+            kept[key] = item
+    return kept
+
+
 def parse_verify_samples(value: Any) -> List[List[int]]:
     """Keep only four-int samples. Anything else is dropped, not coerced."""
     if not isinstance(value, list):
@@ -232,6 +266,10 @@ class ClearBatchRequest:
     protocol_version: Optional[int] = CLEAR_PROTOCOL_VERSION
     spec_shape: Optional[Tuple[int, ...]] = None
     verify_samples: Optional[List[List[int]]] = None
+    target_residence_ns: Optional[int] = None
+    target_residence_rpc_seq: Optional[int] = None
+    target_queued: Optional[bool] = None
+    target_info: Optional[dict] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -245,6 +283,15 @@ class ClearBatchRequest:
             result["spec_shape"] = [int(item) for item in self.spec_shape]
         if self.verify_samples:
             result["verify_samples"] = [list(sample) for sample in self.verify_samples]
+        if type(self.target_residence_ns) is int and self.target_residence_ns >= 0:
+            result["target_residence_ns"] = self.target_residence_ns
+        if type(self.target_residence_rpc_seq) is int:
+            result["target_residence_rpc_seq"] = self.target_residence_rpc_seq
+        if type(self.target_queued) is bool:
+            result["target_queued"] = self.target_queued
+        info = parse_target_info(self.target_info)
+        if info:
+            result["target_info"] = info
         return result
 
     @classmethod
@@ -261,6 +308,9 @@ class ClearBatchRequest:
             if "verify_samples" in data
             else None
         )
+        residence = data.get("target_residence_ns")
+        residence_seq = data.get("target_residence_rpc_seq")
+        queued = data.get("target_queued")
         return cls(
             session_id=data["session_id"],
             rpc_seq=int(data["rpc_seq"]),
@@ -271,6 +321,14 @@ class ClearBatchRequest:
                 parse_spec_shape(data["spec_shape"]) if "spec_shape" in data else None
             ),
             verify_samples=samples,
+            target_residence_ns=(
+                residence if type(residence) is int and residence >= 0 else None
+            ),
+            target_residence_rpc_seq=(
+                residence_seq if type(residence_seq) is int else None
+            ),
+            target_queued=queued if type(queued) is bool else None,
+            target_info=parse_target_info(data.get("target_info")),
         )
 
 
@@ -281,6 +339,7 @@ class ClearBatchReply:
     reqs: List[ClearDraftReply] = field(default_factory=list)
     draft_residence_ns: Optional[int] = None
     protocol_version: Optional[int] = CLEAR_PROTOCOL_VERSION
+    fit_ready: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -291,6 +350,8 @@ class ClearBatchReply:
         }
         if type(self.draft_residence_ns) is int and self.draft_residence_ns >= 0:
             result["draft_residence_ns"] = self.draft_residence_ns
+        if type(self.fit_ready) is bool:
+            result["fit_ready"] = self.fit_ready
         return result
 
     @classmethod
@@ -299,12 +360,14 @@ class ClearBatchReply:
             ClearDraftReply.from_dict(item) if isinstance(item, dict) else item
             for item in (data.get("reqs") or [])
         ]
+        ready = data.get("fit_ready")
         return cls(
             session_id=data["session_id"],
             rpc_seq=int(data["rpc_seq"]),
             reqs=reqs,
             draft_residence_ns=data.get("draft_residence_ns"),
             protocol_version=parse_protocol_version(data.get("protocol_version", None)),
+            fit_ready=ready if type(ready) is bool else None,
         )
 
 

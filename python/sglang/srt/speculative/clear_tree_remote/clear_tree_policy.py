@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections import deque
 from typing import Callable, Dict, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,12 @@ PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
 
 _clock: Dict[tuple, list] = {}
+_curve_cache: Dict[tuple, dict] = {}
+_q_fit: Dict[int, object] = {}
+_q_res: Dict[int, deque] = {}
+Q_MIN_SAMPLES = 4
+Q_RIDGE = (0.0, 1.0)
+Q_RES_WINDOW = 32
 _price_n: Dict[int, int] = {}
 _price_tok: Dict[int, float] = {}
 _price_ms: Dict[int, float] = {}
@@ -82,26 +89,48 @@ _gain_pred = 0.0
 _gain_actual = 0.0
 
 
-def on_external_event(scheduler) -> None:
-    """Target session advanced. Clear fits and replay totals. Keep W and theta.
+def on_external_event(scheduler, batch=None) -> None:
+    """Target session advanced.
 
-    The open ledger round is dropped so the packet that observes the new
-    session cannot write the straddling round into the cleared models.
-    Settled accept totals stay. Pending ones do not.
+    The same Target header keeps H, Q, and the layer fit. Anything else
+    clears those fits and then tries the file for the new header. Neither
+    path writes the file. A missing batch keeps the full clear.
     """
     global _probe_rounds
-    _clock.clear()
-    _probe_rounds = 0
-    _pending.clear()
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+        on_target_info,
+        target_headers_match,
+    )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         reset_replay_state,
     )
 
-    reset_replay_state()
+    info = getattr(batch, "target_info", None) if batch is not None else None
+    current = getattr(scheduler, "_clear_target_header", None)
     ledger = getattr(scheduler, "_clear_ledger", None)
+    if target_headers_match(info, current):
+        _pending.clear()
+        reset_replay_state()
+        if ledger:
+            ledger.drop_open()
+        scheduler._clear_replay_to_hold = []
+        return
+    _clock.clear()
+    _curve_cache.clear()
+    _q_fit.clear()
+    _q_res.clear()
+    _probe_rounds = 0
+    _pending.clear()
+    reset_replay_state()
     if ledger:
         ledger.drop_fitted()
+        ledger.residence_misses = 0
+        ledger.legacy_target = False
     scheduler._clear_replay_to_hold = []
+    scheduler._clear_fit_installed = False
+    scheduler._clear_prefit = None
+    if isinstance(info, dict):
+        on_target_info(scheduler, info)
 
 
 def reset_gain_calibration() -> None:
@@ -111,11 +140,18 @@ def reset_gain_calibration() -> None:
     _gain_actual = 0.0
 
 
-def reset_policy() -> None:
-    """Drop prices, accept ratios, probe counts, verify samples, and replay."""
+def reset_policy(keep_fits: bool = False) -> None:
+    """Drop prices, accept ratios, probe counts, and replay.
+
+    ``keep_fits`` leaves the H table, the Q fit, and the layer regressions.
+    """
     global _total_a, _total_e, _rounds, _probe_rounds
     global _bucket_warned
-    _clock.clear()
+    if not keep_fits:
+        _clock.clear()
+        _q_fit.clear()
+        _q_res.clear()
+    _curve_cache.clear()
     _price_n.clear()
     _price_tok.clear()
     _price_ms.clear()
@@ -331,10 +367,11 @@ def locked_k_from_env() -> Optional[int]:
 
 
 def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None:
-    """One clean graph verify. Eager and over-bucket rows are not recorded.
+    """One H sample. Eager and over-bucket rows are not recorded.
 
     Each cell keeps the latest ``VERIFY_WINDOW`` samples. One sample is enough
-    to use that cell.
+    to use that cell. The name stays ``observe_verify`` so the Target device
+    fit can keep calling it; that process does not choose K.
     """
     if int(k) not in VERIFY_KS or bucket is None or ms is None:
         return
@@ -343,6 +380,7 @@ def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None
     rows.append(float(ms))
     if len(rows) > VERIFY_WINDOW:
         del rows[:-VERIFY_WINDOW]
+    _curve_cache.pop((int(batch), int(bucket)), None)
 
 
 def _median(values: Sequence[float]) -> float:
@@ -355,34 +393,173 @@ def _median(values: Sequence[float]) -> float:
 
 
 def _steady_verify_samples(rows: Sequence[float]) -> list:
-    """Drop one high spike, then average what remains.
+    """Drop samples above 1.5 times the median, then average the rest.
 
-    The comparison is against the median of the other samples. With only two
-    or three probes, that median would include the spike and hide it.
+    Two samples use the smaller one as the median, so one spike cannot hide
+    inside the comparison. A single sample is kept as it is.
     """
     kept = [float(value) for value in rows]
     if len(kept) < 2:
         return kept
-    largest = max(kept)
-    rest = list(kept)
-    rest.remove(largest)
-    if largest > _median(rest) * 1.5:
-        return rest
-    return kept
+    center = min(kept) if len(kept) == 2 else _median(kept)
+    filtered = [value for value in kept if value <= center * 1.5]
+    return filtered or kept
+
+
+def _pava(points: Sequence[tuple]) -> Dict[int, float]:
+    """Weighted isotonic regression, non-decreasing in K.
+
+    Each point is ``(k, value, weight)``. Adjacent violators merge into the
+    weighted mean of the block.
+    """
+    stack = []
+    for k, value, weight in points:
+        stack.append([[int(k)], float(value), float(weight)])
+        while len(stack) >= 2 and stack[-2][1] > stack[-1][1] + 1e-12:
+            right = stack.pop()
+            left = stack.pop()
+            total = left[2] + right[2]
+            if total <= 0:
+                merged = right[1]
+                total = 1.0
+            else:
+                merged = (left[1] * left[2] + right[1] * right[2]) / total
+            stack.append([left[0] + right[0], merged, total])
+    fitted = {}
+    for ks, value, _weight in stack:
+        for key in ks:
+            fitted[int(key)] = float(value)
+    return fitted
+
+
+def _hold_curve(batch: int, bucket: int) -> Dict[int, float]:
+    """Robust H means for one (batch, bucket), forced non-decreasing in K."""
+    key = (int(batch), int(bucket))
+    cached = _curve_cache.get(key)
+    if cached is not None:
+        return cached
+    points = []
+    for k in VERIFY_KS:
+        rows = _clock.get((int(batch), int(k), int(bucket)))
+        if not rows:
+            continue
+        kept = _steady_verify_samples(rows)
+        if not kept:
+            continue
+        points.append((int(k), sum(kept) / float(len(kept)), float(len(kept))))
+    fitted = _pava(points)
+    _curve_cache[key] = fitted
+    return fitted
+
+
+def predict_hold_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:
+    """Isotonic H for this cell, or None when the cell has no sample."""
+    if bucket is None:
+        return None
+    return _hold_curve(int(batch), int(bucket)).get(int(k))
+
+
+def _q_model(batch: int):
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        ForgettingRegressor,
+    )
+
+    key = int(batch)
+    model = _q_fit.get(key)
+    if model is None:
+        model = ForgettingRegressor(2, Q_MIN_SAMPLES, ridge=Q_RIDGE)
+        _q_fit[key] = model
+    return model
+
+
+def _q_slope(batch: int) -> float:
+    model = _q_fit.get(int(batch))
+    if model is None:
+        return 0.0
+    coef = model.coefficients()
+    if not coef or len(coef) < 2:
+        return 0.0
+    return float(coef[1])
+
+
+def observe_q(batch: int, k: int, ms: float) -> None:
+    """One Q sample. A residual above 1.5 times the window median is not fit.
+
+    The residual window is updated first, using the slope already solved.
+    Key 0 is the pool across batch sizes.
+    """
+    if int(k) not in VERIFY_KS or ms is None:
+        return
+    k = int(k)
+    ms = float(ms)
+    for key in (int(batch), 0):
+        residual = ms - _q_slope(key) * k
+        window = _q_res.setdefault(key, deque(maxlen=Q_RES_WINDOW))
+        window.append(residual)
+        center = _median(window)
+        if len(window) >= 2 and center > 0 and residual > center * 1.5:
+            continue
+        _q_model(key).update((1.0, float(k)), ms)
+
+
+def predict_q_ms(batch: int, k: int) -> float:
+    """Robust intercept plus the K slope. An empty batch uses the pooled fit."""
+    key = int(batch)
+    window = _q_res.get(key)
+    slope_key = key
+    if not window:
+        window = _q_res.get(0)
+        slope_key = 0
+    if not window:
+        return 0.0
+    return float(_median(window) + _q_slope(slope_key) * int(k))
 
 
 def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:
-    """Device time for this cell, after one high spike is dropped.
+    """H plus Q for this cell.
 
-    A tier is usable only when its own ``(batch, K, bucket)`` cell has a sample.
+    A tier is usable only when its own ``(batch, K, bucket)`` H cell has a
+    sample. An empty Q fit adds nothing, so a constant network delay that
+    has not been seen yet does not change the ranking.
     """
-    if bucket is None:
+    hold = predict_hold_ms(batch, k, bucket)
+    if hold is None:
         return None
-    rows = _clock.get((int(batch), int(k), int(bucket)))
-    if not rows:
-        return None
-    kept = _steady_verify_samples(rows)
-    return sum(kept) / float(len(kept))
+    return float(hold) + predict_q_ms(batch, k)
+
+
+def replace_hold_cells(rows) -> None:
+    """Install saved H samples. Later ``observe_verify`` calls extend them."""
+    _clock.clear()
+    _curve_cache.clear()
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        samples = row.get("samples_ms")
+        if not isinstance(samples, list) or not samples:
+            continue
+        key = (int(row["b"]), int(row["k"]), int(row["bucket"]))
+        kept = [float(value) for value in samples][-VERIFY_WINDOW:]
+        _clock[key] = kept
+
+
+def export_hold_cells() -> list:
+    """H cells in stable order, for the one prefit write."""
+    rows = []
+    for key in sorted(_clock):
+        samples = _clock.get(key) or []
+        if not samples:
+            continue
+        batch, k, bucket = key
+        rows.append(
+            {
+                "b": int(batch),
+                "k": int(k),
+                "bucket": int(bucket),
+                "samples_ms": [float(value) for value in samples],
+            }
+        )
+    return rows
 
 
 def _observe_price_into(counts, tokens_ema, ms_ema, batch, tokens, ms) -> bool:
@@ -780,6 +957,8 @@ class RoundPlan:
         self.buckets = tuple(buckets)
         self._scheduler = scheduler
         self.cover_k = int(max(VERIFY_KS))
+        self.fixed_depth = None
+        self.prefit = None
         self._peers = []
         self._all = []
         self._at = None
@@ -836,6 +1015,9 @@ class RoundPlan:
     def should_grow(self, state) -> bool:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import depth_rule
 
+        if self.fixed_depth is not None:
+            cap = min(int(self.fixed_depth), int(state.config.max_depth) - 1)
+            return int(state.depth) < cap
         if int(state.depth) >= int(state.config.max_depth) - 1:
             return False
         if self.use_tau or self.theta_value is None or self.layer_ms is None:
@@ -1031,6 +1213,9 @@ def make_round(scheduler, reqs) -> RoundPlan:
     max_ell = max(prefixes) if prefixes else 0
     buckets = runtime_kv_buckets()
     _rounds += 1
+    planned = _prefit_round(scheduler, reqs, max_ell, buckets, batch)
+    if planned is not None:
+        return planned
     greedy = _requests_greedy(reqs)
     ledger_on = ledger_enabled()
     locked_env = locked_k_from_env()
@@ -1123,6 +1308,44 @@ def make_round(scheduler, reqs) -> RoundPlan:
     return plan
 
 
+def _prefit_round(scheduler, reqs, max_ell, buckets, batch) -> Optional[RoundPlan]:
+    """A locked prefit plan, or None when this packet is ordinary traffic."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import prefit_plan
+
+    info = prefit_plan(scheduler, reqs, batch, max_ell, buckets)
+    if not info:
+        return None
+    use_tau = bool(info.get("use_tau"))
+    if use_tau:
+        width = int(info.get("width") or flat_width(batch))
+        chosen = int(info.get("k") or flat_k(batch))
+        depth = None
+    else:
+        width = int(info["width"])
+        chosen = int(info["k"])
+        depth = info.get("depth")
+    plan = RoundPlan(
+        width=width,
+        k=chosen,
+        use_tau=use_tau,
+        locked_k=chosen,
+        theta_value=theta(batch),
+        layer_ms=None,
+        max_ell=max_ell,
+        batch=batch,
+        buckets=buckets,
+        scheduler=scheduler,
+    )
+    plan.cover_k = int(max(VERIFY_KS))
+    plan.flat_k = int(flat_k(batch))
+    plan.fixed_depth = None if depth is None else int(depth)
+    plan.prefit = info
+    plan.replay_kind = "prefit"
+    plan.replay_eligible = False
+    plan.fallback = False
+    return plan
+
+
 def make_fallback_round(scheduler, reqs) -> RoundPlan:
     """Tau and the flat K for the whole packet. No extra round or probe."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
@@ -1166,6 +1389,11 @@ def _bind_round(scheduler, plan, reqs) -> None:
     scheduler._clear_round_plan = plan
     scheduler._clear_round_rids = [getattr(req, "rid", "") for req in reqs]
     scheduler._clear_round_prefixes = [_draft_prefix(req) for req in reqs]
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import bind_ledger
+
+    ledger = bind_ledger(scheduler)
+    if ledger is not None and ledger.open is not None:
+        ledger.open.prefit = getattr(plan, "prefit", None)
 
 
 @policy_timed

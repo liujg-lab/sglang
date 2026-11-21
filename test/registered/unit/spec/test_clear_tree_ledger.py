@@ -2195,6 +2195,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertAlmostEqual(policy._sum_a["a"], 99.0)
 
     def test_close_writes_draft_t_k_into_the_verify_table(self):
+        reset_policy()
         ledger = ClearLedger(active_rids=["a", "b", "c", "d"])
         _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 1, 0.0)
         ledger.open.k = 16
@@ -2206,16 +2207,25 @@ class TestFlatWidthOnlineK(CustomTestCase):
         bucket = smallest_bucket(100 + 16 + 1, runtime_kv_buckets())
         self.assertEqual(record["t_k_us"], 80000)
         self.assertFalse(record["excluded"])
+        self.assertIsNone(record["hold_ms"])
+        self.assertNotIn((4, 16, bucket), policy._clock)
+
+        ledger.open.k = 16
+        ledger.mark_stop(2.0)
+        ledger.mark_send(2.02)
+        ledger.mark_post(2.03)
+        second = _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 3, 2.08)
+        self.assertFalse(second["excluded"])
         self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
 
         idle = ClearLedger(active_rids=[])
-        _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 3, 2.0)
+        _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 4, 3.0)
         idle.open.k = 16
-        idle.mark_stop(2.0)
-        idle.mark_send(2.0)
-        idle.mark_post(2.01)
+        idle.mark_stop(3.0)
+        idle.mark_send(3.0)
+        idle.mark_post(3.01)
         idle.note_idle()
-        skipped = _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 4, 2.08)
+        skipped = _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 5, 3.08)
         self.assertIn("idle_start", skipped["exclude_reason"])
         self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
 
@@ -2496,6 +2506,119 @@ def _value_plan():
         batch=1,
         buckets=(256, 512, 1024, 2048, 4096),
     )
+
+
+class TestHoldAndPrefitExclusions(CustomTestCase):
+    def setUp(self):
+        reset_policy()
+
+    def _close(self, ledger, rpc, now, **kwargs):
+        return ledger.on_packet(
+            "step",
+            ["a"],
+            "sess",
+            rpc,
+            [32],
+            8,
+            now=now,
+            **kwargs,
+        )
+
+    def test_matching_hold_splits_h_and_q(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger,
+            2,
+            1.4,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            target_queued=True,
+            step_bytes=40,
+            reply_bytes=80,
+        )
+        self.assertEqual(record["t_k_us"], 400000)
+        self.assertAlmostEqual(record["hold_ms"], 100.0)
+        self.assertAlmostEqual(record["q_ms"], 300.0)
+        self.assertTrue(record["target_queued"])
+        self.assertEqual(record["step_bytes"], 40)
+        self.assertEqual(record["reply_bytes"], 80)
+        self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
+        self.assertTrue(policy._q_res[1])
+
+    def test_hold_above_t_k_is_dropped(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(ledger, 2, 1.4, hold_ns=500_000_000, hold_rpc_seq=1)
+        self.assertIsNone(record["hold_ms"])
+        self.assertEqual(ledger.hold_invalid, 1)
+        self.assertEqual(policy._clock, {})
+
+    def test_mismatched_rpc_does_not_write_hold(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(ledger, 2, 1.4, hold_ns=100_000_000, hold_rpc_seq=99)
+        self.assertIsNone(record["hold_ms"])
+        self.assertEqual(ledger.hold_invalid, 0)
+        self.assertEqual(policy._clock, {})
+
+    def test_draft_floor_still_writes_q(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger, 2, 1.4, recv_queued=True, hold_ns=100_000_000, hold_rpc_seq=1
+        )
+        self.assertTrue(record["draft_floor"])
+        self.assertFalse(record["excluded"])
+        self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
+        self.assertTrue(policy._q_res[1])
+
+    def test_prefit_rounds_skip_theta_and_accepts(self):
+        for phase, group, reason in (
+            ("warmup", "warm", "warmup"),
+            ("mixed", "mixed", "prefit_mixed"),
+            ("keep", "v", "prefit_bucket"),
+        ):
+            with self.subTest(phase=phase):
+                reset_policy()
+                ledger = ClearLedger(active_rids=["a"])
+                _step(ledger, ["a"], [32], 1, 1.0)
+                ledger.open.prefit = {
+                    "phase": phase,
+                    "group": group,
+                    "bucket": 512,
+                }
+                ledger.mark_stop(1.0)
+                ledger.mark_send(1.1)
+                note_verified("a", 32, 1.0, 1)
+                before = theta(1)
+                record = self._close(ledger, 2, 1.4)
+                self.assertIn(reason, record["exclude_reason"])
+                self.assertFalse(record["price_kept"])
+                self.assertEqual(theta(1), before)
+                self.assertEqual(policy._pending, {})
+                self.assertEqual(policy._clock, {})
+
+    def test_width_sweep_skips_hold_and_q(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.open.prefit = {"phase": "keep", "group": "w"}
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(ledger, 2, 1.4, hold_ns=100_000_000, hold_rpc_seq=1)
+        self.assertNotIn("warmup", record["exclude_reason"])
+        self.assertNotIn("prefit_bucket", record["exclude_reason"])
+        self.assertFalse(record["price_kept"])
+        self.assertEqual(policy._clock, {})
+        self.assertEqual(policy._q_res, {})
 
 
 if __name__ == "__main__":

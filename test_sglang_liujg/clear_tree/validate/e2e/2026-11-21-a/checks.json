@@ -1,0 +1,12 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "prefit_finished_before_client": true,
+  "fit_file_once_no_q": true,
+  "formal_hold_and_q": {"rounds": 15951, "with_hold_and_q": 15658, "hold_null_excluded": 293, "hold_invalid": 0, "prefit_flag": 0},
+  "bonus_rank0_last_window": "idle",
+  "servers_restarted_between_trials": false
+}

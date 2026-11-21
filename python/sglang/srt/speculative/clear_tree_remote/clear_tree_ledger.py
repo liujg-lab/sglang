@@ -294,6 +294,40 @@ class ForgettingRegressor:
         self._coef_n = self.n
         return self._coef
 
+    def to_dict(self) -> dict:
+        """Numeric state. The next predict solves ``_coef`` again."""
+        return {
+            "n": int(self.n),
+            "xtx": [list(row) for row in self.xtx],
+            "xty": [float(value) for value in self.xty],
+            "span_min": self.span_min,
+            "span_max": self.span_max,
+        }
+
+    def from_dict(self, data: dict) -> None:
+        """Load a snapshot. ``_coef`` stays empty until the next solve."""
+        xtx = data.get("xtx")
+        xty = data.get("xty")
+        if (
+            not isinstance(xtx, list)
+            or len(xtx) != self.n_features
+            or any(
+                not isinstance(row, list) or len(row) != self.n_features for row in xtx
+            )
+        ):
+            raise ValueError("regressor xtx does not match n_features")
+        if not isinstance(xty, list) or len(xty) != self.n_features:
+            raise ValueError("regressor xty does not match n_features")
+        self.n = int(data.get("n", 0))
+        self.xtx = [[float(value) for value in row] for row in xtx]
+        self.xty = [float(value) for value in xty]
+        span_min = data.get("span_min")
+        span_max = data.get("span_max")
+        self.span_min = None if span_min is None else float(span_min)
+        self.span_max = None if span_max is None else float(span_max)
+        self._coef = None
+        self._coef_n = -1
+
     def span_allows(self, features: Sequence[float]) -> bool:
         """False when ``span_feature`` is past the seen range by the margin.
 
@@ -347,6 +381,9 @@ class _Round:
         "bonus_hit_rids",
         "layers",
         "fallback",
+        "prefit",
+        "reply_bytes",
+        "hold_ms",
     )
 
     def __init__(
@@ -379,6 +416,9 @@ class _Round:
         self.bonus_hit_rids: List[str] = []
         self.layers: List[dict] = []
         self.fallback = False
+        self.prefit = None
+        self.reply_bytes = None
+        self.hold_ms = None
 
 
 def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
@@ -417,6 +457,9 @@ class ClearLedger:
         self.verify_model: Optional[ForgettingRegressor] = None
         self.verify_samples = 0
         self.pending_logs: List[tuple] = []
+        self.residence_misses = 0
+        self.legacy_target = False
+        self.hold_invalid = 0
 
     def queue_log(self, kind: str, record: dict) -> None:
         self.pending_logs.append((kind, record))
@@ -437,6 +480,12 @@ class ClearLedger:
         self.verify_model = None
         self.verify_samples = 0
 
+    def drop_open(self) -> None:
+        """Drop the round that has not closed. Keep both regressions."""
+        self.open = None
+        self.residence_misses = 0
+        self.legacy_target = False
+
     def on_packet(
         self,
         action,
@@ -447,6 +496,12 @@ class ClearLedger:
         width: int,
         now: Optional[float] = None,
         recv_queued: bool = False,
+        hold_ns: Optional[int] = None,
+        hold_rpc_seq: Optional[int] = None,
+        target_queued: Optional[bool] = None,
+        step_bytes: Optional[int] = None,
+        reply_bytes: Optional[int] = None,
+        scheduler=None,
     ) -> Optional[dict]:
         """Close the previous STEP when this packet is its next STEP.
 
@@ -458,7 +513,19 @@ class ClearLedger:
         closed = None
         if self.open is not None and self.open.t_send is not None:
             if name == "step":
-                closed = self._close(stamp, name, rids, prefix_lens, recv_queued)
+                closed = self._close(
+                    stamp,
+                    name,
+                    rids,
+                    prefix_lens,
+                    recv_queued,
+                    hold_ns=hold_ns,
+                    hold_rpc_seq=hold_rpc_seq,
+                    target_queued=target_queued,
+                    step_bytes=step_bytes,
+                    reply_bytes=reply_bytes,
+                    scheduler=scheduler,
+                )
             elif name in _GAP_ACTIONS:
                 self.open.gap_actions.append(name)
                 self.open.gap_rpcs.append(int(rpc_seq))
@@ -540,6 +607,12 @@ class ClearLedger:
         next_rids: Sequence[str],
         next_prefixes: Sequence[int] = (),
         recv_queued: bool = False,
+        hold_ns: Optional[int] = None,
+        hold_rpc_seq: Optional[int] = None,
+        target_queued: Optional[bool] = None,
+        step_bytes: Optional[int] = None,
+        reply_bytes: Optional[int] = None,
+        scheduler=None,
     ) -> dict:
         rnd = self.open
         self.open = None
@@ -558,6 +631,18 @@ class ClearLedger:
             reasons.append("target_gap")
         if rnd.fallback:
             reasons.append("fallback")
+        prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
+        phase = prefit.get("phase") if prefit else None
+        if phase == "warmup":
+            reasons.append("warmup")
+        elif phase == "mixed":
+            reasons.append("prefit_mixed")
+        elif phase == "keep" and prefit.get("group") == "v":
+            planned = prefit.get("bucket")
+            grown = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
+            actual = smallest_bucket(grown, runtime_kv_buckets())
+            if planned is None or actual != int(planned):
+                reasons.append("prefit_bucket")
         draft_floor = next_action == "step" and bool(recv_queued)
         wait_ms = (
             max(0.0, (float(t_recv) - rnd.t_post) * 1000.0)
@@ -569,6 +654,9 @@ class ClearLedger:
             t_k_us = int(
                 round(((rnd.t_send - rnd.t_stop) + (t_recv - rnd.t_send)) * 1e6)
             )
+        hold_ms, q_ms = self._split_hold(rnd, t_k_us, hold_ns, hold_rpc_seq)
+        rnd.hold_ms = hold_ms
+        rnd.reply_bytes = reply_bytes
         excluded = bool(reasons)
         verify_pred = None
         verify_residual = None
@@ -602,14 +690,24 @@ class ClearLedger:
                 if fit_verify:
                     model.update(features, t_k_us / 1000.0)
                     self.verify_samples += 1
-        self._observe_round_verify(rnd, t_k_us, excluded)
+        h_pred_ms, q_pred_ms = self._predict_split(rnd)
+        self._observe_round_verify(
+            rnd,
+            t_k_us,
+            excluded,
+            hold_ms=hold_ms,
+            q_ms=q_ms,
+            scheduler=scheduler,
+        )
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
+        prefit_round = prefit is not None
         price_kept = (
             price_tokens is not None
             and price_ms is not None
             and not excluded
             and not over_bucket
+            and not prefit_round
         )
         record = {
             "rpc_seq": rnd.rpc_seq,
@@ -646,6 +744,14 @@ class ClearLedger:
             "seed_ms": seed_ms,
             "layer_wall_ms": layer_wall_ms,
             "gain_ratio": _gain_ratio(),
+            "hold_ms": hold_ms,
+            "q_ms": q_ms,
+            "target_queued": target_queued if type(target_queued) is bool else None,
+            "reply_bytes": reply_bytes,
+            "step_bytes": step_bytes,
+            "h_pred_ms": h_pred_ms,
+            "q_pred_ms": q_pred_ms,
+            "prefit": prefit,
         }
         self.queue_log("d_round", record)
         for sample in rnd.layers:
@@ -657,22 +763,72 @@ class ClearLedger:
             price_tokens,
             price_ms,
             price_kept,
-            skip_accept="target_gap" in reasons or "fallback" in reasons,
+            skip_accept=(
+                prefit_round or "target_gap" in reasons or "fallback" in reasons
+            ),
         )
         return record
 
+    def _split_hold(self, rnd: _Round, t_k_us, hold_ns, hold_rpc_seq):
+        """H is the Target hold for this round's reply. Q is the rest of T_K.
+
+        A value is H only when it names this round and fits inside T_K.
+        Two closing STEPs in a row with no residence mark an old Target;
+        from that second STEP on, the table keeps the whole T_K.
+        """
+        if hold_ns is not None:
+            self.residence_misses = 0
+        else:
+            self.residence_misses += 1
+            if self.residence_misses >= 2:
+                self.legacy_target = True
+        if t_k_us is None:
+            return None, None
+        t_k_ms = float(t_k_us) / 1000.0
+        if (
+            hold_ns is None
+            or hold_rpc_seq is None
+            or int(hold_rpc_seq) != int(rnd.rpc_seq)
+        ):
+            return None, None
+        candidate = float(hold_ns) / 1e6
+        if candidate < 0 or candidate > t_k_ms:
+            self.hold_invalid += 1
+            return None, None
+        return candidate, t_k_ms - candidate
+
+    def _predict_split(self, rnd: _Round):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            predict_hold_ms,
+            predict_q_ms,
+        )
+
+        needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
+        bucket = smallest_bucket(needed, runtime_kv_buckets())
+        hold = predict_hold_ms(rnd.b, int(rnd.k), bucket)
+        if hold is None:
+            return None, None
+        return float(hold), float(predict_q_ms(rnd.b, int(rnd.k)))
+
     def _observe_round_verify(
-        self, rnd: _Round, t_k_us: Optional[int], excluded: bool
+        self,
+        rnd: _Round,
+        t_k_us: Optional[int],
+        excluded: bool,
+        hold_ms: Optional[float] = None,
+        q_ms: Optional[float] = None,
+        scheduler=None,
     ) -> None:
-        """Write Draft ``T_K`` into the table that chooses K.
+        """Write H, or the whole T_K when the Target never sends a hold.
 
         A draft-floor round is not excluded: that wait is on the critical
-        path and still depends on K. An over-bucket prefix yields no bucket
-        and ``observe_verify`` drops it.
+        path and still depends on K. Width-sweep rounds update the layer
+        fit only. An over-bucket prefix yields no bucket and is dropped.
         """
         if excluded or t_k_us is None:
             return
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            observe_q,
             observe_verify,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
@@ -681,13 +837,29 @@ class ClearLedger:
 
         if int(rnd.k) not in VERIFY_KS:
             return
+        prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
+        if prefit is not None and prefit.get("group") == "w":
+            return
         needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
-        observe_verify(
-            rnd.b,
-            int(rnd.k),
-            smallest_bucket(needed, runtime_kv_buckets()),
-            float(t_k_us) / 1000.0,
-        )
+        bucket = smallest_bucket(needed, runtime_kv_buckets())
+        if hold_ms is not None and q_ms is not None:
+            observe_verify(rnd.b, int(rnd.k), bucket, float(hold_ms))
+            observe_q(rnd.b, int(rnd.k), float(q_ms))
+            if (
+                scheduler is not None
+                and prefit is not None
+                and prefit.get("group") == "v"
+                and prefit.get("phase") == "keep"
+                and bucket is not None
+            ):
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                    note_kept,
+                )
+
+                note_kept(scheduler, rnd.b, int(rnd.k), int(bucket))
+            return
+        if self.legacy_target:
+            observe_verify(rnd.b, int(rnd.k), bucket, float(t_k_us) / 1000.0)
 
     def _assign_layer_walls(self, rnd: _Round) -> tuple:
         """Wall time between forwards. The last pre-reply sample ends at stop.
@@ -980,6 +1152,16 @@ def note_packet(scheduler, batch) -> None:
         if rid:
             stored[rid] = int(length)
     scheduler._clear_target_prefix = stored
+    info = getattr(batch, "target_info", None)
+    if isinstance(info, dict):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            on_target_info,
+        )
+
+        on_target_info(scheduler, info)
+    server = getattr(scheduler, "sr_server", None)
+    hold_ns = getattr(batch, "target_residence_ns", None)
+    hold_rpc = getattr(batch, "target_residence_rpc_seq", None)
 
     def _run(ledger: ClearLedger) -> None:
         width = int(scheduler.server_args.clear_tree_width)
@@ -991,9 +1173,33 @@ def note_packet(scheduler, batch) -> None:
             prefix,
             width,
             recv_queued=bool(getattr(scheduler, "_clear_recv_queued", False)),
+            hold_ns=hold_ns if type(hold_ns) is int else None,
+            hold_rpc_seq=hold_rpc if type(hold_rpc) is int else None,
+            target_queued=getattr(batch, "target_queued", None),
+            step_bytes=getattr(server, "last_request_bytes", None),
+            reply_bytes=getattr(server, "last_reply_bytes", None),
+            scheduler=scheduler,
         )
 
     _quiet(scheduler, _run)
+    _note_prefit_done(scheduler, batch)
+
+
+def _note_prefit_done(scheduler, batch) -> None:
+    """A done prefill ends the sweep. The open round stays open until the next STEP."""
+    name = _action_name(getattr(batch, "action", None))
+    if name != "prefill":
+        return
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+        maybe_finish,
+        parse_rid,
+    )
+
+    for req in list(getattr(batch, "reqs", None) or []):
+        parsed = parse_rid(getattr(req, "rid", ""))
+        if parsed is not None and parsed.get("kind") == "done":
+            maybe_finish(scheduler, "clearfit-done")
+            return
 
 
 def note_idle(scheduler) -> None:

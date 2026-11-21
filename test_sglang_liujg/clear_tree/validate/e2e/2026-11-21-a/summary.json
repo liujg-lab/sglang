@@ -1,0 +1,42 @@
+{
+  "run_id": "2026-11-21-a",
+  "devices": "2,3",
+  "restart_between_trials": false,
+  "prefit": {
+    "skipped": false,
+    "finished_reason": "cells",
+    "missing_cells": [],
+    "hold_cells": 90,
+    "layers": 7,
+    "wrote_once": true,
+    "contains_q": false
+  },
+  "trials": {
+    "01": {
+      "concurrency": 1,
+      "ok": 100,
+      "items": 100,
+      "completion_tokens": 45926,
+      "wall_s": 854.246,
+      "output_tok_s": 53.762,
+      "spec_accept_token_num": 34076,
+      "spec_draft_token_num": 95864,
+      "accept_rate": 0.355462,
+      "fallback_steps": 0,
+      "client_concurrency": 1.0
+    },
+    "02": {
+      "concurrency": 4,
+      "ok": 100,
+      "items": 100,
+      "completion_tokens": 46032,
+      "wall_s": 317.137,
+      "output_tok_s": 145.149,
+      "spec_accept_token_num": 31457,
+      "spec_draft_token_num": 117400,
+      "accept_rate": 0.267947,
+      "fallback_steps": 0,
+      "client_concurrency": 3.931
+    }
+  }
+}

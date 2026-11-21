@@ -394,6 +394,14 @@ class ClearTreeSchedulerMixin:
             spec_shape=local_spec_shape(getattr(self, "server_args", None)),
             verify_samples=samples,
         )
+        if clear_action == ClearAction.PREFILL and (
+            self.tp_size == 1 or self.tp_rank == 0
+        ):
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                target_info,
+            )
+
+            batch.target_info = target_info(self)
         send_ok = True
         if self.tp_size == 1 or self.tp_rank == 0:
             if self.sr_client is None:
@@ -482,6 +490,12 @@ class ClearTreeSchedulerMixin:
                 self._sr_note_stale(reason or "step")
                 continue
             result[item.rid] = item
+        if self.tp_size == 1 or self.tp_rank == 0:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                maybe_start_prefit,
+            )
+
+            maybe_start_prefit(self, reply.fit_ready)
         self._sr_observe_rpc(inflight, got_packet=got_packet)
         return result, pending
 
@@ -630,6 +644,11 @@ class ClearTreeSchedulerMixin:
                 self.server_args.clear_tree_port,
             )
         self._clear_cache_layer_capture()
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            load_draft_part,
+        )
+
+        load_draft_part(self)
 
     def _clear_cache_layer_capture(self) -> None:
         """Remember the captured layer batches. A missing runner leaves them unset."""
@@ -990,20 +1009,23 @@ class ClearTreeSchedulerMixin:
                 batch.rpc_seq,
                 len(batch.reqs),
             )
-            return ClearBatchReply(
-                session_id=batch.session_id,
-                rpc_seq=batch.rpc_seq,
-                protocol_version=CLEAR_PROTOCOL_VERSION,
-                reqs=[
-                    ClearDraftReply(
-                        rid=d.rid,
-                        step_id=d.step_id,
-                        base_committed_len=d.base_committed_len,
-                        draft_tokens=[],
-                        status=ClearReplyStatus.REJECT,
-                    )
-                    for d in batch.reqs
-                ],
+            return self._clear_apply_fit_ready(
+                batch,
+                ClearBatchReply(
+                    session_id=batch.session_id,
+                    rpc_seq=batch.rpc_seq,
+                    protocol_version=CLEAR_PROTOCOL_VERSION,
+                    reqs=[
+                        ClearDraftReply(
+                            rid=d.rid,
+                            step_id=d.step_id,
+                            base_committed_len=d.base_committed_len,
+                            draft_tokens=[],
+                            status=ClearReplyStatus.REJECT,
+                        )
+                        for d in batch.reqs
+                    ],
+                ),
             )
         n = len(batch.reqs)
         replies: List[Optional[object]] = [None] * n
@@ -1037,16 +1059,28 @@ class ClearTreeSchedulerMixin:
                     reply = self._sr_annotate_prompt_compaction(req, reply)
                 replies[i] = self._sr_finalize_v2_commit(wire, req, reply)
         self._sr_note_handled(batch)
-        return clear_batch_reply(
-            _ReplyBatch(
-                batch.session_id,
-                batch.rpc_seq,
-                [
-                    item if item is not None else self._sr_empty_reply(req)
-                    for item, req in zip(replies, batch.reqs)
-                ],
-            )
+        return self._clear_apply_fit_ready(
+            batch,
+            clear_batch_reply(
+                _ReplyBatch(
+                    batch.session_id,
+                    batch.rpc_seq,
+                    [
+                        item if item is not None else self._sr_empty_reply(req)
+                        for item, req in zip(replies, batch.reqs)
+                    ],
+                )
+            ),
         )
+
+    def _clear_apply_fit_ready(self, batch, reply):
+        """Tell the Target whether this Draft already has a matching fit."""
+        if batch.action != ClearAction.PREFILL or not getattr(batch, "target_info", None):
+            return reply
+        ready = getattr(self, "_clear_fit_ready", None)
+        if type(ready) is bool:
+            reply.fit_ready = ready
+        return reply
 
     @DynamicGradMode()
     def event_loop_normal_clear_tree_target(self):
@@ -1170,7 +1204,7 @@ class ClearTreeSchedulerMixin:
                         )
 
                         flush_sr_round_metrics(self, "session_reset")
-                        on_external_event(self)
+                        on_external_event(self, batch)
                     timing = False
                     try:
                         def _work(counts):
