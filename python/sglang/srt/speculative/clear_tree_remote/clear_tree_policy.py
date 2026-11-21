@@ -124,8 +124,7 @@ def on_external_event(scheduler, batch=None) -> None:
     reset_replay_state()
     if ledger:
         ledger.drop_fitted()
-        ledger.residence_misses = 0
-        ledger.legacy_target = False
+        ledger.split_capable = False
     scheduler._clear_replay_to_hold = []
     scheduler._clear_fit_installed = False
     scheduler._clear_prefit = None

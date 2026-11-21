@@ -156,6 +156,36 @@ class ClearTreeFitProtocolTest(CustomTestCase):
             parse_target_info({"kv_buckets": [256, True], "model": None}),
             {"model": None},
         )
+        header = parse_target_info(
+            {
+                "disable_cuda_graph": True,
+                "attention_backend": "ascend",
+                "page_size": 128,
+                "cuda_graph_bs": [1, 2, 4],
+                "tp": True,
+            }
+        )
+        self.assertIs(header["disable_cuda_graph"], True)
+        self.assertEqual(header["attention_backend"], "ascend")
+        self.assertEqual(header["page_size"], 128)
+        self.assertEqual(header["cuda_graph_bs"], [1, 2, 4])
+        self.assertIs(header["tp"], True)
+        request = ClearBatchRequest(
+            session_id="s",
+            rpc_seq=3,
+            action=ClearAction.PREFILL,
+            target_info={
+                "disable_cuda_graph": False,
+                "attention_backend": "triton",
+                "page_size": 128,
+                "cuda_graph_bs": [1, 4],
+            },
+        )
+        decoded = ClearBatchRequest.from_dict(request.to_dict())
+        self.assertIs(decoded.target_info["disable_cuda_graph"], False)
+        self.assertEqual(decoded.target_info["attention_backend"], "triton")
+        self.assertEqual(decoded.target_info["page_size"], 128)
+        self.assertEqual(decoded.target_info["cuda_graph_bs"], [1, 4])
 
 
 class ClearTreeTargetResidenceTest(CustomTestCase):
@@ -420,6 +450,105 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         self.assertEqual(tight["max_new"], 60)
         self.assertEqual(tight["depth"], 7)
         self.assertGreaterEqual(tight["max_new"], 56)
+        roomy = next(
+            item
+            for item in verify
+            if item["b"] == 4 and item["bucket"] == 4096 and item["k"] == 2
+        )
+        self.assertEqual(roomy["max_new"], 8 * (roomy["depth"] + 1))
+        width_groups = [item for item in groups if item["kind"] == "w" and item["b"] == 1]
+        self.assertEqual(width_groups[0]["max_new"], 160)
+
+    def test_retry_attempt_restarts_warmup(self):
+        scheduler = self._scheduler()
+        reqs = [SimpleNamespace(rid="clearfit-v-1-128-16-0")]
+        phases = [
+            fit.prefit_plan(scheduler, reqs, 1, 0, (256,))["phase"] for _ in range(3)
+        ]
+        self.assertEqual(phases, ["warmup", "warmup", "keep"])
+        retry = [SimpleNamespace(rid="clearfit-v-1-128-16-1")]
+        info = fit.prefit_plan(scheduler, retry, 1, 0, (256,))
+        self.assertEqual(info["phase"], "warmup")
+
+    def test_body_error_still_sends_done(self):
+        cfg = prefit.PrefitConfig(
+            url="http://127.0.0.1:9",
+            buckets=(256,),
+            max_depth=8,
+            ks=(8,),
+            widths=(8,),
+            batches=(1,),
+            token_range=(1, 2),
+        )
+        groups = [
+            {"kind": "v", "b": 1, "max_new": 8, "prefix": 8},
+            {"kind": "done", "b": 1, "max_new": 1, "prefix": 8},
+        ]
+        seen = []
+
+        def fake_group(group_cfg, group, rng):
+            del group_cfg, rng
+            seen.append(group["kind"])
+            if group["kind"] == "v":
+                raise RuntimeError("boom")
+            return {"kind": group["kind"]}
+
+        with patch.object(prefit, "build_schedule", return_value=groups), patch.object(
+            prefit, "_wait_until"
+        ), patch.object(prefit, "_run_group", side_effect=fake_group):
+            with self.assertLogs(prefit.logger, level="INFO") as logs:
+                with self.assertRaises(RuntimeError):
+                    prefit.run_prefit(cfg)
+        self.assertEqual(seen, ["v", "done"])
+        self.assertTrue(any("elapsed_s=" in line for line in logs.output))
+
+    def test_wait_timeout_does_not_send_done(self):
+        cfg = prefit.PrefitConfig(
+            url="http://127.0.0.1:9",
+            buckets=(256,),
+            max_depth=8,
+            ks=(8,),
+            widths=(8,),
+            batches=(1,),
+            token_range=(1, 2),
+        )
+        seen = []
+
+        def fail_wait(url, timeout_s, ready):
+            del url, timeout_s, ready
+            raise TimeoutError("not ready")
+
+        with patch.object(prefit, "_wait_until", side_effect=fail_wait), patch.object(
+            prefit, "_run_group", side_effect=lambda *args, **kwargs: seen.append("ran")
+        ):
+            with self.assertRaises(TimeoutError):
+                prefit.run_prefit(cfg)
+        self.assertEqual(seen, [])
+
+    def test_request_sends_bearer_only_when_set(self):
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(req, timeout):
+            captured["headers"] = {key.lower(): value for key, value in req.header_items()}
+            captured["timeout"] = timeout
+            return _Resp()
+
+        with patch.object(prefit.urllib.request, "urlopen", fake_urlopen):
+            prefit._request("http://127.0.0.1/generate", "POST", {"rid": "a"}, 1.0, "secret")
+        self.assertEqual(captured["headers"].get("authorization"), "Bearer secret")
+        with patch.object(prefit.urllib.request, "urlopen", fake_urlopen):
+            prefit._request("http://127.0.0.1/model_info", "GET", None, 1.0, "")
+        self.assertNotIn("authorization", captured["headers"])
 
 
 class ClearTreeFitFileTest(CustomTestCase):
@@ -550,6 +679,86 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertIn((8, "graph", 1), scheduler._clear_ledger.layer_models)
         self.assertTrue(scheduler._clear_fit_ready)
         self.assertIsNone(scheduler._clear_prefit)
+        pending = scheduler._clear_fit_pending
+        self.assertEqual(pending["target"], scheduler._clear_target_header)
+        self.assertTrue(pending["h"])
+        self.assertEqual(pending["layers"][0]["w"], 8)
+
+    def test_full_grid_waits_for_done(self):
+        scheduler = self._scheduler()
+        scheduler._clear_prefit = fit.PrefitState()
+        scheduler._clear_target_header = fit.target_info(scheduler)
+        policy.observe_verify(1, 8, 256, 12.5)
+        state = scheduler._clear_prefit
+        cells = fit.expected_cells()
+        for cell in cells:
+            state.kept[cell] = 4
+        last = cells[-1]
+        state.kept[last] = 3
+        with self.assertLogs(fit.logger, level="INFO") as logs:
+            fit.note_kept(scheduler, *last)
+            fit.note_kept(scheduler, *last)
+        self.assertEqual(sum("cells complete" in line for line in logs.output), 1)
+        self.assertTrue(state.cells_announced)
+        self.assertFalse(state.finished)
+        self.assertFalse(Path(self._path).is_file())
+        fit.maybe_finish(scheduler, "cells")
+        self.assertIs(scheduler._clear_prefit, state)
+        self.assertFalse(Path(self._path).is_file())
+        fit.maybe_finish(scheduler, "clearfit-done")
+        self.assertTrue(Path(self._path).is_file())
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertIsNone(scheduler._clear_prefit)
+
+    def test_save_error_still_closes_the_sweep(self):
+        scheduler = self._scheduler()
+        scheduler._clear_prefit = fit.PrefitState()
+        scheduler._clear_fit_pending = {"h": [], "layers": [], "target": {"backend": "old"}}
+        policy.observe_verify(1, 8, 256, 12.5)
+        policy.observe_price(1, 4.0, 2.0)
+        scheduler._clear_target_header = fit.target_info(scheduler)
+        with patch.object(fit, "save_prefit", side_effect=OSError("disk")):
+            fit.maybe_finish(scheduler, "clearfit-done")
+        self.assertIsNone(scheduler._clear_prefit)
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertTrue(scheduler._clear_fit_installed)
+        self.assertEqual(scheduler._clear_fit_pending["target"], {"backend": "old"})
+        self.assertIsNone(policy.theta(1))
+        self.assertEqual(policy._clock[(1, 8, 256)], [12.5])
+
+    def test_old_target_header_reopens_prefit(self):
+        scheduler = self._scheduler()
+        scheduler.server_args.attention_backend = "triton"
+        scheduler.server_args.disable_cuda_graph = True
+        scheduler.server_args.cuda_graph_bs = [1, 2, 4]
+        policy.observe_verify(1, 8, 256, 12.5)
+        scheduler._clear_target_header = fit.target_info(scheduler)
+        self.assertIsNotNone(fit.save_prefit(scheduler))
+        payload = json.loads(Path(self._path).read_text())
+        self.assertIn("disable_cuda_graph", payload["header"]["target"])
+        self.assertIn("attention_backend", payload["header"]["draft"])
+        self.assertTrue(payload["header"]["target"]["disable_cuda_graph"])
+        for key in (
+            "disable_cuda_graph",
+            "attention_backend",
+            "page_size",
+            "cuda_graph_bs",
+        ):
+            payload["header"]["target"].pop(key, None)
+        Path(self._path).write_text(json.dumps(payload))
+        reset_policy()
+        fit.load_draft_part(scheduler)
+        self.assertIsNotNone(scheduler._clear_fit_pending)
+        fit.on_target_info(scheduler, fit.target_info(scheduler))
+        self.assertFalse(scheduler._clear_fit_ready)
+        self.assertIsNotNone(scheduler._clear_prefit)
+
+    def test_prefit_config_copies_api_key(self):
+        scheduler = self._scheduler()
+        scheduler.server_args.api_key = "secret"
+        self.assertEqual(fit.prefit_config(scheduler).api_key, "secret")
+        scheduler.server_args.api_key = "  "
+        self.assertIsNone(fit.prefit_config(scheduler).api_key)
 
     def test_same_target_keeps_fits(self):
         scheduler = self._scheduler()

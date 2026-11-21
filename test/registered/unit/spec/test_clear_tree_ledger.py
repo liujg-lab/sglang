@@ -2208,7 +2208,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(record["t_k_us"], 80000)
         self.assertFalse(record["excluded"])
         self.assertIsNone(record["hold_ms"])
-        self.assertNotIn((4, 16, bucket), policy._clock)
+        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
 
         ledger.open.k = 16
         ledger.mark_stop(2.0)
@@ -2216,7 +2216,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.mark_post(2.03)
         second = _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 3, 2.08)
         self.assertFalse(second["excluded"])
-        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
+        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0, 80.0])
 
         idle = ClearLedger(active_rids=[])
         _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 4, 3.0)
@@ -2227,7 +2227,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         idle.note_idle()
         skipped = _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 5, 3.08)
         self.assertIn("idle_start", skipped["exclude_reason"])
-        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
+        self.assertEqual(policy._clock[(4, 16, bucket)], [80.0, 80.0])
 
     def test_layer_wall_uses_the_gap_between_forwards(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -2619,6 +2619,89 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         self.assertFalse(record["price_kept"])
         self.assertEqual(policy._clock, {})
         self.assertEqual(policy._q_res, {})
+
+    def test_unseen_target_writes_t_k_on_the_first_round(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(ledger, 2, 1.4)
+        self.assertIsNone(record["hold_ms"])
+        self.assertFalse(ledger.split_capable)
+        self.assertEqual(policy._clock[(1, 8, 256)], [400.0])
+
+    def test_capable_target_does_not_store_t_k(self):
+        ledger = ClearLedger(active_rids=["a"])
+        ledger.split_capable = True
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(ledger, 2, 1.4)
+        self.assertIsNone(record["hold_ms"])
+        self.assertEqual(policy._clock, {})
+        self.assertTrue(ledger.split_capable)
+
+    def test_excluded_gap_does_not_make_a_capable_target_legacy(self):
+        saved = os.environ.get("SGLANG_CLEAR_LEDGER")
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        try:
+            ledger = ClearLedger(active_rids=["a"])
+            scheduler = SimpleNamespace(
+                server_args=SimpleNamespace(clear_tree_width=8),
+                tp_rank=0,
+                tp_size=1,
+                _clear_ledger=ledger,
+                sr_server=None,
+            )
+            ledger_module.note_packet(
+                scheduler,
+                SimpleNamespace(
+                    action="prefill",
+                    reqs=[SimpleNamespace(rid="a", base_committed_len=32)],
+                    session_id="sess",
+                    rpc_seq=1,
+                    target_info={"backend": "npu", "tp": 2},
+                    target_residence_ns=None,
+                    target_residence_rpc_seq=None,
+                    target_queued=None,
+                ),
+            )
+            self.assertTrue(ledger.split_capable)
+            _step(ledger, ["a"], [32], 2, 1.0)
+            ledger.mark_stop(1.0)
+            ledger.mark_send(1.1)
+            ledger.on_packet("prefill", ["extra"], "sess", 3, [8], 8, now=1.2)
+            record = self._close(ledger, 4, 1.5)
+            self.assertIn("prefill", record["exclude_reason"])
+            self.assertTrue(ledger.split_capable)
+            self.assertEqual(policy._clock, {})
+            ledger.mark_stop(1.5)
+            ledger.mark_send(1.6)
+            record = self._close(ledger, 5, 1.9)
+            self.assertEqual(record["exclude_reason"], [])
+            self.assertEqual(policy._clock, {})
+            self.assertTrue(ledger.split_capable)
+            ledger.drop_open()
+            self.assertFalse(ledger.split_capable)
+            ledger_module.note_packet(
+                scheduler,
+                SimpleNamespace(
+                    action="step",
+                    reqs=[SimpleNamespace(rid="a", base_committed_len=32)],
+                    session_id="sess",
+                    rpc_seq=6,
+                    target_info=None,
+                    target_residence_ns=100_000_000,
+                    target_residence_rpc_seq=5,
+                    target_queued=None,
+                ),
+            )
+            self.assertTrue(ledger.split_capable)
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+            else:
+                os.environ["SGLANG_CLEAR_LEDGER"] = saved
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ disable-model-invocation: true
 
 - 新建 `test_sglang_liujg/clear_tree/validate/e2e/<YYYY-MM-DD-后缀>/`，不覆盖既有场次。同时在 `test_sglang_liujg/clear_tree/validate/e2e/README.md` 的场次索引补一行：运行号、测什么、结果先写「未跑」。「测什么」写明条件和是 ABAB 还是同一条件的重复。跑完只改结果这一格，不把数字抄进索引。
 - 开跑前写 `run.md` 的「事先」一节：范围、预热与 flush。每次试验用两位序号 `01`、`02`，负载、条件、第几次和阶段写在表内。看到结果后不回改这一节。跑完把数字和总结写进「结果」。`meta.json` 保留运行号和实验格；`voided` 只在你决定跳过这场汇总时设置。其余只记整场共用的开关，按这场实际因素增减。
-- 在新场的 `tools/` 里写这次的启动脚本。模板的 `tools/` 是空目录，没有可直接执行的起步脚本。并发、条数、温度和 `max-new-tokens` 写在这场脚本里，并与试验表一致。计时调用 `test_sglang_liujg/evaluation/eval_spectre_text_serving.py`。不回改其他场次的脚本。
+- 在新场的 `tools/` 里写这次的启动脚本。模板的 `tools/` 是空目录，没有可直接执行的起步脚本。并发、条数、温度和 `max-new-tokens` 写在这场脚本里，并与试验表一致。图文负载的计时客户端用 `test_sglang_liujg/evaluation/eval_spectre_rsteller_serving.py` 或 `eval_spectre_watercaption_serving.py`；纯文本仍用 `eval_spectre_text_serving.py`。不回改其他场次的脚本。
 - 每个试验使用和序号相同的新容器临时目录，日志放在 `raw/<序号>/`。失败记录、原始日志和脚本 hash 保留。重试是新场次，不把多次 client 输出拼成一轮。
 - `raw/` 放双端日志、客户端 JSONL/CSV/manifest、包与数据 hash、同步前备份和清理证据。不创建 commit 或 branch，不改已有启动脚本和已批准计划。
 
@@ -29,13 +29,14 @@ disable-model-invocation: true
 - 确认本机 Docker 和远端 SSH 可用。沙箱看不到 Docker socket 时，用相应权限在宿主机重试。
 - 同步前和每次启动前确认：没有他人的非僵尸服务、HTTP 端口空闲、所选设备空闲、既有 `ssh -N` 的 PID、启动时间、UID、命令和 boot ID 不变。观测不完整或有冲突任务就停止，不结束他人任务。不新建、不杀掉 `ssh -N`，不运行 `sudo tc`。
 - 本地和 NPU 是两份代码。先备份远端 ClearTree 包，再只同步本次授权包：NPU `/tmp` 中转、`docker cp`、容器内解包、属主改回。禁止直接写入无权限的包目录或覆盖整仓。
-- 两端包逐文件 SHA256 比对，排除 pycache 和 pyc。核对数据身份。两端先用即将执行的完整 argv 做解析核对，确认该端当前入口能识别，再启动进程。候选与该端包的默认列表相同时，省略 `--clear-tree-widths` 和 `--clear-tree-ks`。实验凭据不写入脚本或产物。
+- 包摘要用 `.cursor/skills/clear-tree-e2e-validation/scripts/package_manifest.py`。本机和 NPU 容器各跑一次，再 diff 两份输出。需要把同一组文件打包时加 `--tar`。脚本排除 `__pycache__`、`.pyc`、`clear_tree_fit.json` 和 `.tmp`。核对数据身份。
+- 启动前用 `PYTHONPATH=python python3 .cursor/skills/clear-tree-e2e-validation/scripts/parse_argv.py --role draft -- <Draft argv>`，Target 把 `--role` 换成 `target`。它调用 `prepare_server_args` 和 `apply_clear_tree_settings`，Draft 的 `on_npu` 为假，Target 为真，不启动服务。解析失败就不要启动。候选与该端包的默认列表相同时，省略 `--clear-tree-widths` 和 `--clear-tree-ks`。实验凭据不写入脚本或产物。
 
 ## 3. 运行
 
 - 先建好该试验的容器临时目录，再把 stdout 重定向进去。目录不存在时重定向会让进程立刻退出。
 - 先启动 Draft 并等到 HTTP 就绪，再启动 Target。Target 的内置预热会访问 Draft；Draft 未就绪时单独启动 Target 会形成 RPC 超时，这种启动不作为端到端结果。用户没有要求每轮冷启动时，一次拉起的服务可以连续跑该场的多个试验。要求冷启动时，每轮都重新走这一顺序。
-- 启动参数核对角色、设备、TP、page、注意力后端、静态内存、最大请求数、候选、容量和捕图 batch。NPU 容器设置 `PYTHONPATH`。客户端在 NPU 上请求 Target HTTP。把 `eval_spectre_text_serving.py` 及其同目录依赖拷到 NPU 的独立目录。输出文件名会带唯一 run id。用户没有要求 BLEU/ROUGE 时加 `--skip-metrics`。
+- 启动参数核对角色、设备、TP、page、注意力后端、静态内存、最大请求数、候选、容量和捕图 batch。NPU 容器设置 `PYTHONPATH`。客户端在 NPU 上请求 Target HTTP。按试验表把图文或纯文本计时脚本及其同目录依赖拷到 NPU 的独立目录。输出文件名会带唯一 run id。用户没有要求 BLEU/ROUGE 时加 `--skip-metrics`。
 - 正式客户端内部的一次预热和 flush 不计入吞吐。flush 是否成功看 Target 日志里的 `Cache flushed successfully` 和 HTTP 200。客户端在 flush 失败时仍会进入正式计时。`max-new-tokens` 是预算。
 - 捕图和预热可以持续数十分钟。只根据日志是否继续推进、进程是否存活判断；静默本身不是挂死。用 `ps -p` 看进程。对容器内 uid 0 的进程执行 `kill -0` 会因权限失败，看起来像进程已经退出。设备、形状、捕图或正式请求失败时停止并留证。
 - 性能用客户端自身计时。日志按完整行判断。可选模型导入提示，以及已证明为本场停止造成的停机输出，不是运行失败。
@@ -45,10 +46,11 @@ disable-model-invocation: true
 - 捕图证据是日志里的 `Capturing: bs=` 行。用户指定的 batch 都出现才算捕到。容量不够而没有出现的形状单独写出，不算捕图失败。捕获完成不等于运行时命中。
 - 只记录当次矩阵打开的开关。Bonus 开启时，核对 Draft 的 `SGLANG_CLEAR_BONUS_PREDICTION`、lookahead、page size 和 KV reuse 是否与矩阵一致，并记录当前实现的 bonus 计数。周期计数是每个已刷窗口的增量，只加 Draft rank 0。窗口原因是 `idle` 表示该窗已刷出。没有指标窗口，或窗末尾没刷出的尾数，记为 missing，不记成 0。
 - 指标名以当前 README 和实现为准。历史的 `opt_bonus_batch_*`、`skipped_graph`，以及 `is_bonus=False` 的普通层图复用，不当作批量 bonus 证据。客户端并发不等于每轮 batch。
-- 请求数、成功数、输出 token 和正式 wall time 要互相符合。吞吐是总输出 token 除以正式 wall。接受率是总 `spec_accept_token_num` 除以总 `spec_draft_token_num`，不用按请求平均的接受率。结论写入 `run.md` 的「结果」一节，并保留 `summary.json`、`checks.json`、`meta.json` 和产物 hashes。客户端结束不等于验收通过。
+- 日志收回 `raw/` 后运行 `python3 .cursor/skills/clear-tree-e2e-validation/scripts/accept_logs.py --raw <场次>/raw`。它按试验目录汇总 JSONL 的成功数、输出 token、正式 wall 和吞吐，以及总 `spec_accept_token_num / spec_draft_token_num`。Target 日志列出 `Capturing: bs=` 的 batch 与 ntpb、各 TP 的 `Cache flushed successfully` 和 `POST /flush_cache` 的 HTTP 200。Draft 日志加 rank 0 的 `[SR Draft round]`：`full`、`idle`、四个 `opt_bonus_*`；末窗不是 `idle` 时尾数记 `tail=missing`。正式 `d_round` 给出 `hold_ms`、`q_ms`、`hold_invalid` 和排除轮。脚本只打印数字，不判定通过。
+- 请求数、成功数、输出 token 和正式 wall time 要互相符合。吞吐是总输出 token 除以正式 wall。接受率是总 `spec_accept_token_num` 除以总 `spec_draft_token_num`，不用按请求平均的接受率。把上述数字写入 `run.md` 的「结果」、`summary.json` 和 `checks.json`，并保留 `meta.json` 和产物 hashes。客户端结束不等于验收通过。
 
 ## 5. 清理
 
-- 启动时记录宿主机 PID、容器内 NSpid、session、starttime、UID 和 boot ID。发信号前复核身份。容器进程常常是 uid 0，宿主机用户发信号会被拒绝；在容器内对核对过的 NSpid 发信号。只停止本场 owned session。禁止 `pkill -f clear-tree-role`、按命令行广杀 Python，或停止 SSH 隧道。
+- 启动时用 `python3 .cursor/skills/clear-tree-e2e-validation/scripts/process_identity.py <宿主机 PID>` 记录 NSpid、session、start ticks、UID 和 boot ID。发信号前再跑一次，这些字段一致才在容器内对 `container_nspid` 发信号。容器进程常常是 uid 0，宿主机用户发信号会被拒绝。只停止本场 owned session。禁止 `pkill -f clear-tree-role`、按命令行广杀 Python，或停止 SSH 隧道。
 - 已经存在的交互式 `docker exec` 和 `tail` 不属于本场，不停止。清理证据要能看出 owned session 没有存活成员、HTTP 端口已释放、所选设备空闲、隧道身份未变。僵尸进程不是正在运行的服务。
 - 交付结果目录、实际命令、每轮请求与吞吐、图捕获、失败与重试、清理状态和未验证项。缺必要证据时写明阻塞。

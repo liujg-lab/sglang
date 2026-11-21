@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class PrefitConfig:
     retries: int = 3
     seed: int = 0
     ready_timeout_s: float = 600.0
+    api_key: Optional[str] = None
 
 
 def prefixes_for(buckets: Sequence[int]) -> list:
@@ -108,7 +110,7 @@ def build_schedule(cfg: PrefitConfig) -> list:
                         "prefix": int(prefix),
                         "k": int(k),
                         "bucket": int(bucket),
-                        "max_new": int(room),
+                        "max_new": int(min(room, 8 * (depth + 1))),
                         "depth": int(depth),
                     }
                 )
@@ -143,12 +145,23 @@ def _rid(group: dict, n: int) -> str:
     return f"clearfit-done-{int(n)}"
 
 
-def _request(url: str, method: str, payload: Optional[dict], timeout: float):
+def _request(
+    url: str,
+    method: str,
+    payload: Optional[dict],
+    timeout: float,
+    api_key: Optional[str] = None,
+):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         url,
         data=data,
-        headers={} if data is None else {"Content-Type": "application/json"},
+        headers=headers,
         method=method,
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -171,13 +184,13 @@ def _wait_until(url: str, timeout_s: float, ready) -> None:
     raise TimeoutError(f"prefit wait failed for {url}: {last}")
 
 
-def _model_ready(url: str) -> bool:
-    _request(url + "/model_info", "GET", None, 5.0)
+def _model_ready(url: str, api_key: Optional[str] = None) -> bool:
+    _request(url + "/model_info", "GET", None, 5.0, api_key)
     return True
 
 
-def _server_idle(url: str) -> bool:
-    body = _request(url + "/v1/loads", "GET", None, 5.0)
+def _server_idle(url: str, api_key: Optional[str] = None) -> bool:
+    body = _request(url + "/v1/loads", "GET", None, 5.0, api_key)
     loads = body.get("loads") if isinstance(body, dict) else None
     if not isinstance(loads, list):
         return False
@@ -206,9 +219,9 @@ def _tokens(rng: random.Random, length: int, token_range: Tuple[int, int]) -> li
     return [rng.randrange(lo, hi) for _ in range(max(int(length), 1))]
 
 
-def _post_payload(url: str, payload: dict) -> int:
+def _post_payload(url: str, payload: dict, api_key: Optional[str] = None) -> int:
     try:
-        body = _request(url + "/generate", "POST", payload, 600.0)
+        body = _request(url + "/generate", "POST", payload, 600.0, api_key)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
         logger.warning(
             "[CLEAR] prefit request failed rid=%s", payload.get("rid"), exc_info=True
@@ -240,7 +253,8 @@ def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random) -> dict:
         ]
         with ThreadPoolExecutor(max_workers=size) as pool:
             futures = [
-                pool.submit(_post_payload, cfg.url, payload) for payload in payloads
+                pool.submit(_post_payload, cfg.url, payload, cfg.api_key)
+                for payload in payloads
             ]
             steps = [int(future.result()) for future in futures]
         if need == 0 or (steps and min(steps) >= need):
@@ -256,15 +270,39 @@ def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random) -> dict:
 
 
 def run_prefit(cfg: PrefitConfig) -> list:
-    """Wait until the server is idle, then run the schedule. Do not abort traffic."""
+    """Wait until the server is idle, then run the schedule. Do not abort traffic.
+
+    The done request is sent after the server is ready, including when an
+    earlier group raises. A wait timeout does not send it.
+    """
     logger.info("[CLEAR] prefit waiting for %s", cfg.url)
-    _wait_until(cfg.url, cfg.ready_timeout_s, _model_ready)
-    _wait_until(cfg.url, cfg.ready_timeout_s, _server_idle)
+    _wait_until(
+        cfg.url, cfg.ready_timeout_s, partial(_model_ready, api_key=cfg.api_key)
+    )
+    _wait_until(
+        cfg.url, cfg.ready_timeout_s, partial(_server_idle, api_key=cfg.api_key)
+    )
+    started = time.monotonic()
     rng = random.Random(int(cfg.seed))
+    groups = build_schedule(cfg)
+    body = [group for group in groups if group["kind"] != "done"]
+    done = [group for group in groups if group["kind"] == "done"]
     summary = []
-    for group in build_schedule(cfg):
-        summary.append(_run_group(cfg, group, rng))
-    logger.info("[CLEAR] prefit driver finished groups=%d", len(summary))
+    try:
+        for group in body:
+            summary.append(_run_group(cfg, group, rng))
+    finally:
+        for group in done:
+            try:
+                summary.append(_run_group(cfg, group, rng))
+            except Exception:
+                logger.warning("[CLEAR] prefit done request failed", exc_info=True)
+        elapsed = time.monotonic() - started
+        logger.info(
+            "[CLEAR] prefit driver finished groups=%d elapsed_s=%.3f",
+            len(summary),
+            elapsed,
+        )
     return summary
 
 
@@ -281,6 +319,7 @@ def _parse_args(argv=None) -> PrefitConfig:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ready-timeout-s", type=float, default=600.0)
+    parser.add_argument("--api-key", default="")
     args = parser.parse_args(argv)
     return PrefitConfig(
         url=args.url,
@@ -293,6 +332,7 @@ def _parse_args(argv=None) -> PrefitConfig:
         retries=int(args.retries),
         seed=int(args.seed),
         ready_timeout_s=float(args.ready_timeout_s),
+        api_key=args.api_key or None,
     )
 
 

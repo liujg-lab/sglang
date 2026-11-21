@@ -1,0 +1,22 @@
+{
+  "run_id": "2026-11-21-b",
+  "servers_restarted_between_trials": false,
+  "draft_host_pid": 3387013,
+  "target_host_pid": 2636967,
+  "prefit": {
+    "cells_complete_logs": 1,
+    "finished_reason": "clearfit-done",
+    "reason_cells": 0,
+    "driver_groups": 109,
+    "driver_elapsed_s": 164.612,
+    "h_rows": 90,
+    "layer_rows": 7,
+    "contains_q": false
+  },
+  "trials": {
+    "01": {"dataset": "RSTeller", "concurrency": 1, "ok": 100, "tokens": 45598, "wall_s": 850.301, "output_tok_s": 53.626, "accept": 33805, "draft": 95368, "accept_rate": 0.354469, "fallback": 0, "client_concurrency": 1.0},
+    "02": {"dataset": "RSTeller", "concurrency": 4, "ok": 100, "tokens": 45534, "wall_s": 315.067, "output_tok_s": 144.522, "accept": 31195, "draft": 115320, "accept_rate": 0.270508, "fallback": 0, "client_concurrency": 3.917},
+    "03": {"dataset": "WaterCaption", "concurrency": 1, "ok": 100, "tokens": 29704, "wall_s": 666.059, "output_tok_s": 44.597, "accept": 23125, "draft": 53952, "accept_rate": 0.428622, "fallback": 0, "client_concurrency": 1.0},
+    "04": {"dataset": "WaterCaption", "concurrency": 4, "ok": 100, "tokens": 30321, "wall_s": 310.439, "output_tok_s": 97.671, "accept": 21283, "draft": 72776, "accept_rate": 0.292445, "fallback": 0, "client_concurrency": 3.99}
+  }
+}

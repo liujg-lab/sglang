@@ -1,0 +1,23 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "prefit_finished_on_done": true,
+  "cells_complete_once": true,
+  "finished_reason_cells": false,
+  "fit_file_once_new_header": true,
+  "fit_h_rows": 90,
+  "fit_layer_rows": 7,
+  "wide_layers_post_reply_unfitted": [16, 32, 64],
+  "formal_hold_and_q": {
+    "01": {"rounds": 12025, "with_hold_and_q": 11924, "hold_null_excluded": 101, "hold_invalid": 0},
+    "02": {"rounds": 3825, "with_hold_and_q": 3635, "hold_null_excluded": 190, "hold_invalid": 0},
+    "03": {"rounds": 6796, "with_hold_and_q": 6695, "hold_null_excluded": 101, "hold_invalid": 0},
+    "04": {"rounds": 2366, "with_hold_and_q": 2176, "hold_null_excluded": 190, "hold_invalid": 0}
+  },
+  "bonus_rank0_last_window": "idle",
+  "servers_restarted_between_trials": false,
+  "not_injected": ["api_key", "save_prefit_disk_error", "retry_group_warmup"]
+}

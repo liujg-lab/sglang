@@ -457,8 +457,7 @@ class ClearLedger:
         self.verify_model: Optional[ForgettingRegressor] = None
         self.verify_samples = 0
         self.pending_logs: List[tuple] = []
-        self.residence_misses = 0
-        self.legacy_target = False
+        self.split_capable = False
         self.hold_invalid = 0
 
     def queue_log(self, kind: str, record: dict) -> None:
@@ -483,8 +482,7 @@ class ClearLedger:
     def drop_open(self) -> None:
         """Drop the round that has not closed. Keep both regressions."""
         self.open = None
-        self.residence_misses = 0
-        self.legacy_target = False
+        self.split_capable = False
 
     def on_packet(
         self,
@@ -506,8 +504,12 @@ class ClearLedger:
         """Close the previous STEP when this packet is its next STEP.
 
         PREFILL, FINISH, and ABORT between send and the next STEP stay on the
-        open round and exclude it. They do not start a round.
+        open round and exclude it. They do not start a round. A residence
+        value marks this session as able to split H, even when the value
+        does not belong to the round being closed.
         """
+        if type(hold_ns) is int:
+            self.split_capable = True
         stamp = time.perf_counter() if now is None else float(now)
         name = _action_name(action)
         closed = None
@@ -773,15 +775,7 @@ class ClearLedger:
         """H is the Target hold for this round's reply. Q is the rest of T_K.
 
         A value is H only when it names this round and fits inside T_K.
-        Two closing STEPs in a row with no residence mark an old Target;
-        from that second STEP on, the table keeps the whole T_K.
         """
-        if hold_ns is not None:
-            self.residence_misses = 0
-        else:
-            self.residence_misses += 1
-            if self.residence_misses >= 2:
-                self.legacy_target = True
         if t_k_us is None:
             return None, None
         t_k_ms = float(t_k_us) / 1000.0
@@ -819,7 +813,7 @@ class ClearLedger:
         q_ms: Optional[float] = None,
         scheduler=None,
     ) -> None:
-        """Write H, or the whole T_K when the Target never sends a hold.
+        """Write H, or the whole T_K when this session has not seen a split.
 
         A draft-floor round is not excluded: that wait is on the critical
         path and still depends on K. Width-sweep rounds update the layer
@@ -858,7 +852,7 @@ class ClearLedger:
 
                 note_kept(scheduler, rnd.b, int(rnd.k), int(bucket))
             return
-        if self.legacy_target:
+        if not self.split_capable:
             observe_verify(rnd.b, int(rnd.k), bucket, float(t_k_us) / 1000.0)
 
     def _assign_layer_walls(self, rnd: _Round) -> tuple:
@@ -1164,6 +1158,8 @@ def note_packet(scheduler, batch) -> None:
     hold_rpc = getattr(batch, "target_residence_rpc_seq", None)
 
     def _run(ledger: ClearLedger) -> None:
+        if isinstance(info, dict) or type(hold_ns) is int:
+            ledger.split_capable = True
         width = int(scheduler.server_args.clear_tree_width)
         ledger.on_packet(
             batch.action,

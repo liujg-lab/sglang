@@ -52,18 +52,22 @@ _TARGET_INFO_KEYS = (
     "quantization",
     "verify_capture",
     "kv_buckets",
+    "disable_cuda_graph",
+    "attention_backend",
+    "page_size",
+    "cuda_graph_bs",
 )
 
 
 def _target_info_value(value: Any) -> bool:
-    """A header value is a string, a real int, None, or a list of real ints."""
-    if value is None or type(value) is str or type(value) is int:
+    """A header value is a string, a real int, a bool, None, or a list of real ints."""
+    if value is None or type(value) is str or type(value) is int or type(value) is bool:
         return True
     return isinstance(value, list) and all(type(item) is int for item in value)
 
 
 def parse_target_info(value: Any) -> Optional[dict]:
-    """Keep the Target header keys whose values are strings, ints, None, or int lists."""
+    """Keep the Target header keys whose values are strings, ints, bools, None, or int lists."""
     if not isinstance(value, dict):
         return None
     kept = {}

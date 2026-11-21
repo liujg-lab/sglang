@@ -26,6 +26,10 @@ _TARGET_KEYS = (
     "quantization",
     "verify_capture",
     "kv_buckets",
+    "disable_cuda_graph",
+    "attention_backend",
+    "page_size",
+    "cuda_graph_bs",
 )
 
 
@@ -36,6 +40,7 @@ class PrefitState:
         self.counts = {}
         self.kept = {}
         self.finished = False
+        self.cells_announced = False
 
 
 def fit_path() -> str:
@@ -126,6 +131,7 @@ def draft_header(scheduler) -> dict:
     except Exception:
         cascade = False
     capture = getattr(scheduler, "_clear_layer_capture_bs", ()) or ()
+    attention = getattr(args, "attention_backend", None)
     return {
         "schema": 1,
         "ks": [int(k) for k in VERIFY_KS],
@@ -140,6 +146,8 @@ def draft_header(scheduler) -> dict:
             "capture_bs": [int(item) for item in capture],
             "cascade": cascade,
             "bonus": bool(bonus_prediction_enabled()),
+            "attention_backend": None if attention is None else str(attention),
+            "disable_cuda_graph": bool(getattr(args, "disable_cuda_graph", False)),
         },
     }
 
@@ -158,6 +166,8 @@ def target_info(scheduler) -> dict:
 
     args = scheduler.server_args
     device = getattr(args, "device", None) or getattr(scheduler, "device", None)
+    attention = getattr(args, "attention_backend", None)
+    graph_bs = getattr(args, "cuda_graph_bs", None)
     name = ""
     try:
         import torch
@@ -179,6 +189,10 @@ def target_info(scheduler) -> dict:
         "quantization": getattr(args, "quantization", None),
         "verify_capture": [int(item) for item in capture_ntpb("target")],
         "kv_buckets": [int(item) for item in runtime_kv_buckets()],
+        "disable_cuda_graph": bool(getattr(args, "disable_cuda_graph", False)),
+        "attention_backend": None if attention is None else str(attention),
+        "page_size": int(getattr(args, "page_size", 1) or 1),
+        "cuda_graph_bs": None if graph_bs is None else [int(item) for item in graph_bs],
     }
     return parse_target_info(raw) or {}
 
@@ -339,8 +353,12 @@ def _layer_rows(scheduler) -> list:
     return rows
 
 
-def save_prefit(scheduler) -> bool:
-    """Write the fit once. Refuse when the Target is unknown or H is empty."""
+def save_prefit(scheduler) -> Optional[dict]:
+    """Write the fit once. Refuse when the Target is unknown or H is empty.
+
+    A successful write returns the H rows, layer rows, and Target header that
+    went into the file. Refusal returns None and leaves the file alone.
+    """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
         export_hold_cells,
     )
@@ -348,18 +366,19 @@ def save_prefit(scheduler) -> bool:
     target = getattr(scheduler, "_clear_target_header", None)
     if not target:
         logger.warning("[CLEAR] prefit save refused: Target header is unknown")
-        return False
+        return None
     rows = export_hold_cells()
     if not rows:
         logger.warning("[CLEAR] prefit save refused: no hold cells")
-        return False
+        return None
     header = draft_header(scheduler)
     header["target"] = target
+    layers = _layer_rows(scheduler)
     payload = {
         "schema": 1,
         "header": header,
         "h": rows,
-        "layers": _layer_rows(scheduler),
+        "layers": layers,
     }
     path = fit_path()
     tmp = path + ".tmp"
@@ -371,7 +390,7 @@ def save_prefit(scheduler) -> bool:
         handle.write("\n")
     os.replace(tmp, path)
     logger.info("[CLEAR] wrote fit file %s cells=%d", path, len(rows))
-    return True
+    return {"h": rows, "layers": layers, "target": target}
 
 
 def expected_cells() -> list:
@@ -394,25 +413,34 @@ def _cells_ready(state: PrefitState) -> bool:
 
 
 def note_kept(scheduler, batch, k, bucket) -> None:
-    """Count one retained v-group round. A full grid ends the sweep."""
+    """Count one retained v-group round. A full grid does not end the sweep."""
     state = getattr(scheduler, "_clear_prefit", None)
     if state is None or state.finished:
         return
     key = (int(batch), int(k), int(bucket))
     state.kept[key] = int(state.kept.get(key, 0)) + 1
-    if _cells_ready(state):
-        maybe_finish(scheduler, "cells")
+    if _cells_ready(state) and not state.cells_announced:
+        state.cells_announced = True
+        logger.info("[CLEAR] cells complete")
 
 
 def maybe_finish(scheduler, reason: str) -> None:
-    """Save, drop theta, and close the sweep. Later traffic does not rewrite the file."""
+    """Save, drop theta, and close the sweep when the done request arrives.
+
+    A full grid does not finish the sweep. A save error is logged and still
+    closes it, so a later session cannot open a second sweep in this process.
+    """
     state = getattr(scheduler, "_clear_prefit", None)
     if state is None or state.finished:
         return
-    if reason != "clearfit-done" and not _cells_ready(state):
+    if reason != "clearfit-done":
         return
     state.finished = True
-    save_prefit(scheduler)
+    written = None
+    try:
+        written = save_prefit(scheduler)
+    except Exception:
+        logger.error("[CLEAR] prefit save failed", exc_info=True)
     missing = [cell for cell in expected_cells() if int(state.kept.get(cell, 0)) < 4]
     logger.info("[CLEAR] prefit finished reason=%s missing=%s", reason, missing)
     from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import reset_policy
@@ -421,6 +449,12 @@ def maybe_finish(scheduler, reason: str) -> None:
     scheduler._clear_prefit = None
     scheduler._clear_fit_ready = True
     scheduler._clear_fit_installed = True
+    if written:
+        scheduler._clear_fit_pending = {
+            "h": list(written["h"]),
+            "layers": list(written["layers"]),
+            "target": written["target"],
+        }
 
 
 def prefit_plan(scheduler, reqs, batch, max_ell, buckets) -> Optional[dict]:
@@ -453,9 +487,11 @@ def prefit_plan(scheduler, reqs, batch, max_ell, buckets) -> Optional[dict]:
     if info["kind"] == "done" or len(parsed) != int(info["b"]):
         return mixed
     key = _group_key(info)
-    state.counts[key] = int(state.counts.get(key, 0)) + 1
-    index = int(state.counts[key]) - 1
     size = int(info["b"])
+    attempt = 0 if size <= 0 else min(int(item["n"]) for item in parsed) // size
+    count_key = key + (int(attempt),)
+    state.counts[count_key] = int(state.counts.get(count_key, 0)) + 1
+    index = int(state.counts[count_key]) - 1
     args = scheduler.server_args
     max_depth = int(getattr(args, "clear_tree_max_depth", 0) or 0)
     widths = list(getattr(args, "clear_tree_widths", None) or CANDIDATE_WIDTHS)
@@ -526,6 +562,8 @@ def prefit_config(scheduler):
     lo = 1000 if hi > 1000 else 0
     if hi <= lo:
         hi = lo + 1
+    api_key = getattr(args, "api_key", None)
+    api_key = "" if api_key is None else str(api_key).strip()
     return PrefitConfig(
         url=f"http://{host}:{int(args.port)}",
         buckets=tuple(int(bucket) for bucket in runtime_kv_buckets()),
@@ -537,6 +575,7 @@ def prefit_config(scheduler):
         ),
         batches=batches,
         token_range=(lo, hi),
+        api_key=api_key or None,
     )
 
 
