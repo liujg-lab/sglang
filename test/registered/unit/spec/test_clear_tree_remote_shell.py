@@ -144,6 +144,17 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         apply_clear_tree_settings(draft, on_npu=False)
         self.assertEqual(draft.speculative_num_draft_tokens, 64)
 
+    def test_omitted_depth_defaults_to_ten_on_both_roles(self):
+        for role, on_npu, page_size in (("target", True, 128), ("draft", False, 1)):
+            with self.subTest(role=role):
+                args = _args(
+                    clear_tree_role=role, clear_tree_max_depth=None, page_size=page_size
+                )
+                apply_clear_tree_settings(args, on_npu=on_npu)
+                self.assertEqual(args.clear_tree_max_depth, 10)
+                self.assertEqual(args.speculative_num_steps, 10)
+                self.assertEqual(local_spec_shape(args), (4, 10, 4))
+
     def test_capture_widths_follow_role(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
             bonus_ntpbs,

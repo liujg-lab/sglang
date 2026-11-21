@@ -3,6 +3,7 @@
 These types are not the standalone-remote messages. A peer that still speaks
 that protocol cannot decode a ClearTree batch. ``verify_samples`` rides on
 the batch request: each item is ``[batch, k, kv_bucket, device_us]``.
+``target_verify_*`` names one finished verify by the reply rpc frozen at its start.
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ _TARGET_INFO_KEYS = (
     "attention_backend",
     "page_size",
     "cuda_graph_bs",
+    "prefit_batches",
+    "rpc_batch_limit",
 )
 
 
@@ -100,6 +103,118 @@ class ClearAction(Enum):
     STEP = "step"
     FINISH = "finish"
     ABORT = "abort"
+    FIT = "fit"
+    CONTROL = "control"
+
+
+_CONTROL_OPS = ("begin", "commit", "abandon", "status")
+
+
+def parse_control(value: Any) -> Optional[dict]:
+    """Keep one ClearTree control op. Other shapes are dropped, not coerced."""
+    if not isinstance(value, dict):
+        return None
+    op = value.get("op")
+    run = value.get("run")
+    seq = value.get("seq")
+    fingerprint = value.get("fingerprint")
+    if op not in _CONTROL_OPS or not isinstance(run, str) or not run:
+        return None
+    if type(seq) is not int or not isinstance(fingerprint, str):
+        return None
+    return {"op": op, "run": run, "seq": seq, "fingerprint": fingerprint}
+
+
+def parse_fit_status(value: Any) -> Optional[dict]:
+    """Keep a ClearTree fit status. Other shapes are dropped, not coerced."""
+    if not isinstance(value, dict):
+        return None
+    kept: Dict[str, Any] = {}
+    run = value.get("run")
+    if isinstance(run, str):
+        kept["run"] = run
+    seq = value.get("seq")
+    if type(seq) is int:
+        kept["seq"] = seq
+    ready = value.get("ready")
+    if type(ready) is bool:
+        kept["ready"] = ready
+    reason = value.get("reason")
+    if isinstance(reason, str):
+        kept["reason"] = reason
+    state = value.get("state")
+    if isinstance(state, str):
+        kept["state"] = state
+    written = value.get("written")
+    if type(written) is bool:
+        kept["written"] = written
+    for key in ("missing_h", "missing_layers", "skipped"):
+        item = value.get(key)
+        if isinstance(item, list):
+            kept[key] = item
+    pairs = value.get("b_to_g")
+    if (
+        isinstance(pairs, list)
+        and all(
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and type(pair[0]) is int
+            and type(pair[1]) is int
+            for pair in pairs
+        )
+    ):
+        kept["b_to_g"] = [[int(pair[0]), int(pair[1])] for pair in pairs]
+    groups = value.get("refill_groups")
+    if isinstance(groups, list) and all(_refill_group_ok(item) for item in groups):
+        kept["refill_groups"] = [_refill_group_row(item) for item in groups]
+    batches = value.get("prefit_batches")
+    if (
+        isinstance(batches, list)
+        and batches
+        and all(type(item) is int and item > 0 for item in batches)
+    ):
+        kept["prefit_batches"] = [int(item) for item in batches]
+    return kept or None
+
+
+def _refill_group_ok(item) -> bool:
+    """A stable scan-group id: warm, v, or w."""
+    if not isinstance(item, (list, tuple)) or not item or not isinstance(item[0], str):
+        return False
+    kind = item[0]
+    if kind == "v":
+        return len(item) == 4 and all(type(part) is int for part in item[1:])
+    if kind == "w":
+        return len(item) == 3 and all(type(part) is int for part in item[1:])
+    if kind == "warm":
+        return len(item) == 2 and type(item[1]) is int
+    return False
+
+
+def _refill_group_row(item) -> list:
+    return [item[0], *[int(part) for part in item[1:]]]
+
+
+_VERIFY_PATHS = ("graph", "eager", "fallback")
+
+
+def attach_verify_report(batch, report, session_id) -> bool:
+    """Copy a frozen verify onto this STEP. A missing rpc is not a report."""
+    if not isinstance(report, dict) or type(report.get("rpc_seq")) is not int:
+        return False
+    session = report.get("session")
+    if session not in (None, session_id):
+        return False
+    batch.target_verify_rpc_seq = int(report["rpc_seq"])
+    batch.target_verify_b = report.get("b") if type(report.get("b")) is int else None
+    batch.target_verify_k = report.get("k") if type(report.get("k")) is int else None
+    bucket = report.get("bucket")
+    batch.target_verify_bucket = bucket if type(bucket) is int and bucket > 0 else None
+    fallback = report.get("fallback")
+    batch.target_verify_fallback = fallback if type(fallback) is bool else None
+    path = report.get("path")
+    batch.target_verify_path = path if path in _VERIFY_PATHS else None
+    return True
 
 
 class ClearReplyStatus(Enum):
@@ -274,6 +389,13 @@ class ClearBatchRequest:
     target_residence_rpc_seq: Optional[int] = None
     target_queued: Optional[bool] = None
     target_info: Optional[dict] = None
+    control: Optional[dict] = None
+    target_verify_rpc_seq: Optional[int] = None
+    target_verify_b: Optional[int] = None
+    target_verify_k: Optional[int] = None
+    target_verify_bucket: Optional[int] = None
+    target_verify_fallback: Optional[bool] = None
+    target_verify_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -296,6 +418,21 @@ class ClearBatchRequest:
         info = parse_target_info(self.target_info)
         if info:
             result["target_info"] = info
+        control = parse_control(self.control)
+        if control:
+            result["control"] = control
+        if type(self.target_verify_rpc_seq) is int:
+            result["target_verify_rpc_seq"] = self.target_verify_rpc_seq
+        if type(self.target_verify_b) is int and self.target_verify_b > 0:
+            result["target_verify_b"] = self.target_verify_b
+        if type(self.target_verify_k) is int and self.target_verify_k > 0:
+            result["target_verify_k"] = self.target_verify_k
+        if type(self.target_verify_bucket) is int and self.target_verify_bucket > 0:
+            result["target_verify_bucket"] = self.target_verify_bucket
+        if type(self.target_verify_fallback) is bool:
+            result["target_verify_fallback"] = self.target_verify_fallback
+        if self.target_verify_path in ("graph", "eager", "fallback"):
+            result["target_verify_path"] = self.target_verify_path
         return result
 
     @classmethod
@@ -315,6 +452,12 @@ class ClearBatchRequest:
         residence = data.get("target_residence_ns")
         residence_seq = data.get("target_residence_rpc_seq")
         queued = data.get("target_queued")
+        verify_rpc = data.get("target_verify_rpc_seq")
+        verify_b = data.get("target_verify_b")
+        verify_k = data.get("target_verify_k")
+        verify_bucket = data.get("target_verify_bucket")
+        verify_fallback = data.get("target_verify_fallback")
+        verify_path = data.get("target_verify_path")
         return cls(
             session_id=data["session_id"],
             rpc_seq=int(data["rpc_seq"]),
@@ -333,6 +476,17 @@ class ClearBatchRequest:
             ),
             target_queued=queued if type(queued) is bool else None,
             target_info=parse_target_info(data.get("target_info")),
+            control=parse_control(data.get("control")),
+            target_verify_rpc_seq=verify_rpc if type(verify_rpc) is int else None,
+            target_verify_b=verify_b if type(verify_b) is int and verify_b > 0 else None,
+            target_verify_k=verify_k if type(verify_k) is int and verify_k > 0 else None,
+            target_verify_bucket=(
+                verify_bucket if type(verify_bucket) is int and verify_bucket > 0 else None
+            ),
+            target_verify_fallback=verify_fallback if type(verify_fallback) is bool else None,
+            target_verify_path=(
+                verify_path if verify_path in ("graph", "eager", "fallback") else None
+            ),
         )
 
 
@@ -344,6 +498,7 @@ class ClearBatchReply:
     draft_residence_ns: Optional[int] = None
     protocol_version: Optional[int] = CLEAR_PROTOCOL_VERSION
     fit_ready: Optional[bool] = None
+    fit_status: Optional[dict] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -356,6 +511,9 @@ class ClearBatchReply:
             result["draft_residence_ns"] = self.draft_residence_ns
         if type(self.fit_ready) is bool:
             result["fit_ready"] = self.fit_ready
+        status = parse_fit_status(self.fit_status)
+        if status:
+            result["fit_status"] = status
         return result
 
     @classmethod
@@ -372,6 +530,7 @@ class ClearBatchReply:
             draft_residence_ns=data.get("draft_residence_ns"),
             protocol_version=parse_protocol_version(data.get("protocol_version", None)),
             fit_ready=ready if type(ready) is bool else None,
+            fit_status=parse_fit_status(data.get("fit_status")),
         )
 
 

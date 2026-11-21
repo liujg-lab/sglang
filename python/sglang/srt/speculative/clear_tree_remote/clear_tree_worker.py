@@ -197,14 +197,10 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         )
 
         enabled = ledger_enabled()
-        seq_lens = None
-        metrics = getattr(batch, "sr_round_metrics", None) if enabled else None
-        if enabled:
-            try:
-                seq_lens = _seq_lens_before_verify(batch)
-            except Exception:
-                seq_lens = []
-        if metrics is not None:
+        metrics = getattr(batch, "sr_round_metrics", None)
+        frozen = self._freeze_verify_shape(batch, spec_info)
+        seq_lens = list(frozen["seq_lens"])
+        if enabled and metrics is not None:
             from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
                 install_clear_device_emit,
             )
@@ -216,10 +212,12 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             result = super().verify(batch, spec_info)
             ok = True
         finally:
-            if metrics is not None:
+            if enabled and metrics is not None:
                 metrics._clear_ledger_device = False
                 if not ok:
                     metrics._clear_device_open.clear()
+        if ok:
+            self._store_verify_report(batch, spec_info, result, metrics, frozen)
         if not enabled:
             return result
         try:
@@ -234,7 +232,7 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                 select_tree_kv_bucket,
             )
 
-            k = max(int(getattr(spec_info, "draft_token_num", 1) or 1) - 1, 0)
+            k = int(frozen["k"])
             ran_graph = bool(result[3]) if len(result) > 3 else False
             buckets = runtime_kv_buckets()
             max_ell = max(seq_lens) if seq_lens else 0
@@ -282,6 +280,73 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         except Exception:
             logger.warning("[CLEAR ledger] target verify log failed", exc_info=True)
         return result
+
+    def _freeze_verify_shape(self, batch, spec_info) -> dict:
+        """Snapshot the reply being verified, before accept sends the next STEP.
+
+        Sequence lengths and K are the pre-verify values. The rpc is the
+        reply key still held by the Target client.
+        """
+        try:
+            seq_lens = _seq_lens_before_verify(batch)
+        except Exception:
+            seq_lens = []
+        k = max(int(getattr(spec_info, "draft_token_num", 1) or 1) - 1, 0)
+        size_fn = getattr(batch, "batch_size", None)
+        try:
+            size = int(size_fn()) if callable(size_fn) else len(seq_lens)
+        except Exception:
+            size = len(seq_lens)
+        session = None
+        rpc = None
+        scheduler = getattr(self, "_clear_target_scheduler", None)
+        if scheduler is not None:
+            live = getattr(scheduler, "sr_session_id", None)
+            session = None if live in (None, "") else str(live)
+            client = getattr(scheduler, "sr_client", None)
+            key = None if client is None else getattr(client, "_last_reply_key", None)
+            if (
+                session is not None
+                and isinstance(key, tuple)
+                and len(key) == 2
+                and key[0] == session
+                and type(key[1]) is int
+            ):
+                rpc = int(key[1])
+        return {
+            "session": session,
+            "rpc_seq": rpc,
+            "b": int(size) if int(size) > 0 else len(seq_lens),
+            "k": int(k),
+            "seq_lens": [int(item) for item in seq_lens],
+        }
+
+    def _store_verify_report(self, batch, spec_info, result, metrics, frozen) -> None:
+        """Remember the frozen shape so a later STEP can name this verify.
+
+        ``fallback`` is only a verify that did not use draft tokens. Eager
+        verify and an over-bucket prefix stay distinct: neither is a graph
+        sample. The bucket uses the length frozen before accept.
+        """
+        del spec_info
+        if metrics is None or not isinstance(frozen, dict):
+            return
+        mode = getattr(batch, "forward_mode", None)
+        if mode is not None and bool(getattr(mode, "is_idle", lambda: False)()):
+            return
+        try:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                complete_verify_report,
+            )
+
+            ran_graph = (
+                bool(result[3])
+                if isinstance(result, (tuple, list)) and len(result) > 3
+                else False
+            )
+            metrics._clear_verify_report = complete_verify_report(frozen, ran_graph)
+        except Exception:
+            logger.warning("[CLEAR] verify report failed", exc_info=True)
 
 
 def _seq_lens_before_verify(batch) -> List[int]:

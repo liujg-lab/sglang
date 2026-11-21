@@ -2298,6 +2298,60 @@ class TestFlatWidthOnlineK(CustomTestCase):
         _step(ledger, ["a"], [16], 2, 1.4)
         self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
 
+    def test_post_reply_sample_does_not_count_for_prefit(self):
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_fit as fit
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_prefit as prefit
+
+        plan = prefit.build_plan(prefit.PlanInputs((1,), (8,), (8,), (256,), 8))
+        state = fit.PrefitState("abcd12341", plan)
+        scheduler = SimpleNamespace(_clear_prefit=state)
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [16], 1, 0.0)
+        ledger.open.prefit = {"phase": "keep", "group": "w", "run": "abcd12341"}
+        ledger.queue_layer(
+            {
+                "layer": 0,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 16,
+                "host_us": 1000,
+                "gpu_us": 1000,
+                "path": "graph",
+                "post_reply": False,
+            }
+        )
+        ledger.queue_layer(
+            {
+                "layer": 1,
+                "active": 1,
+                "graph_bucket": 1,
+                "w": 8,
+                "sum_ell": 16,
+                "host_us": 9000,
+                "gpu_us": 9000,
+                "path": "graph",
+                "post_reply": True,
+                "t0": 1.0,
+            }
+        )
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        ledger.mark_post(1.2)
+        ledger.note_idle()
+        ledger.on_packet(
+            "step",
+            ["a"],
+            "sess",
+            2,
+            [16],
+            8,
+            now=1.4,
+            scheduler=scheduler,
+        )
+        self.assertEqual(state.layers[(8, "graph", 1)].n, 1)
+        self.assertEqual(getattr(ledger.layer_models.get((8, "graph", 1)), "n", 0), 0)
+
     def test_mark_stop_keeps_the_first_time(self):
         ledger = ClearLedger(active_rids=["a"])
         _step(ledger, ["a"], [8], 1, 0.0)
@@ -2538,6 +2592,13 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
             target_queued=True,
             step_bytes=40,
             reply_bytes=80,
+            verify={
+                "rpc_seq": 1,
+                "fallback": False,
+                "b": 1,
+                "k": 8,
+                "bucket": 256,
+            },
         )
         self.assertEqual(record["t_k_us"], 400000)
         self.assertAlmostEqual(record["hold_ms"], 100.0)
@@ -2546,7 +2607,7 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         self.assertEqual(record["step_bytes"], 40)
         self.assertEqual(record["reply_bytes"], 80)
         self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
-        self.assertTrue(policy._q_res[1])
+        self.assertTrue(policy._q_raw[(1, 8)])
 
     def test_hold_above_t_k_is_dropped(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -2574,12 +2635,24 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         ledger.mark_stop(1.0)
         ledger.mark_send(1.1)
         record = self._close(
-            ledger, 2, 1.4, recv_queued=True, hold_ns=100_000_000, hold_rpc_seq=1
+            ledger,
+            2,
+            1.4,
+            recv_queued=True,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            verify={
+                "rpc_seq": 1,
+                "fallback": False,
+                "b": 1,
+                "k": 8,
+                "bucket": 256,
+            },
         )
         self.assertTrue(record["draft_floor"])
         self.assertFalse(record["excluded"])
         self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
-        self.assertTrue(policy._q_res[1])
+        self.assertTrue(policy._q_raw[(1, 8)])
 
     def test_prefit_rounds_skip_theta_and_accepts(self):
         for phase, group, reason in (
@@ -2618,7 +2691,7 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         self.assertNotIn("prefit_bucket", record["exclude_reason"])
         self.assertFalse(record["price_kept"])
         self.assertEqual(policy._clock, {})
-        self.assertEqual(policy._q_res, {})
+        self.assertEqual(policy._q_raw, {})
 
     def test_unseen_target_writes_t_k_on_the_first_round(self):
         ledger = ClearLedger(active_rids=["a"])
@@ -2640,6 +2713,63 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         self.assertIsNone(record["hold_ms"])
         self.assertEqual(policy._clock, {})
         self.assertTrue(ledger.split_capable)
+
+    def test_over_bucket_writes_neither_h_nor_q(self):
+        saved = os.environ.get("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS")
+        os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = "256"
+        try:
+            ledger = ClearLedger(active_rids=["a"])
+            ledger.split_capable = True
+            _step(ledger, ["a"], [300], 1, 1.0)
+            ledger.mark_stop(1.0)
+            ledger.mark_send(1.1)
+            record = self._close(
+                ledger, 2, 1.4, hold_ns=100_000_000, hold_rpc_seq=1
+            )
+            self.assertAlmostEqual(record["q_ms"], 300.0)
+            self.assertEqual(policy._clock, {})
+            self.assertEqual(policy._q_raw, {})
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_NPU_TREE_GRAPH_KV_BUCKETS", None)
+            else:
+                os.environ["SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"] = saved
+
+    def test_target_fallback_skips_h_and_q(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger,
+            2,
+            1.4,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            verify={"rpc_seq": 1, "fallback": True, "b": 1, "k": 8, "bucket": 256},
+        )
+        self.assertIn("target_fallback", record["exclude_reason"])
+        self.assertEqual(policy._clock, {})
+        self.assertEqual(policy._q_raw, {})
+
+    def test_target_shape_labels_h_and_q(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger,
+            2,
+            1.4,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            verify={"rpc_seq": 1, "fallback": False, "b": 1, "k": 16, "bucket": 512},
+        )
+        self.assertEqual(record["k"], 8)
+        self.assertEqual(policy._clock[(1, 16, 512)], [100.0])
+        self.assertNotIn((1, 8, 256), policy._clock)
+        self.assertTrue(policy._q_raw[(1, 16)])
+        self.assertNotIn((1, 8), policy._q_raw)
 
     def test_excluded_gap_does_not_make_a_capable_target_legacy(self):
         saved = os.environ.get("SGLANG_CLEAR_LEDGER")
@@ -2702,6 +2832,92 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
                 os.environ.pop("SGLANG_CLEAR_LEDGER", None)
             else:
                 os.environ["SGLANG_CLEAR_LEDGER"] = saved
+
+
+    def test_late_report_merges_by_the_original_rpc(self):
+        ledger = ClearLedger(active_rids=["a"])
+        ledger.split_capable = True
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger, 2, 1.4, hold_ns=100_000_000, hold_rpc_seq=1
+        )
+        self.assertEqual(policy._clock, {})
+        self.assertIn(("sess", 1), ledger._pending_rounds)
+        ledger.mark_stop(1.4)
+        ledger.mark_send(1.5)
+        self._close(
+            ledger,
+            3,
+            1.8,
+            hold_ns=80_000_000,
+            hold_rpc_seq=2,
+            verify={
+                "rpc_seq": 1,
+                "fallback": False,
+                "path": "graph",
+                "b": 1,
+                "k": 8,
+                "bucket": 256,
+            },
+        )
+        self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
+        self.assertTrue(policy._q_raw[(1, 8)])
+        self.assertNotIn(("sess", 1), ledger._pending_rounds)
+        self.assertIn(("sess", 2), ledger._pending_rounds)
+        self.assertNotIn("target_fallback", record["exclude_reason"])
+
+    def test_eager_report_does_not_exclude_or_write(self):
+        ledger = ClearLedger(active_rids=["a"])
+        ledger.split_capable = True
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        record = self._close(
+            ledger,
+            2,
+            1.4,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            verify={
+                "rpc_seq": 1,
+                "fallback": False,
+                "path": "eager",
+                "b": 1,
+                "k": 8,
+                "bucket": 256,
+            },
+        )
+        self.assertNotIn("target_fallback", record["exclude_reason"])
+        self.assertEqual(policy._clock, {})
+        self.assertEqual(policy._q_raw, {})
+        self.assertEqual(ledger._pending_rounds, {})
+
+    def test_unmatched_report_does_not_label_the_closed_round(self):
+        ledger = ClearLedger(active_rids=["a"])
+        ledger.split_capable = True
+        _step(ledger, ["a"], [32], 1, 1.0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.1)
+        self._close(
+            ledger,
+            2,
+            1.4,
+            hold_ns=100_000_000,
+            hold_rpc_seq=1,
+            verify={
+                "rpc_seq": 99,
+                "fallback": False,
+                "path": "graph",
+                "b": 1,
+                "k": 64,
+                "bucket": 512,
+            },
+        )
+        self.assertEqual(policy._clock, {})
+        self.assertIn(("sess", 1), ledger._pending_rounds)
+        self.assertEqual(ledger._pending_reports[("sess", 99)]["k"], 64)
 
 
 if __name__ == "__main__":

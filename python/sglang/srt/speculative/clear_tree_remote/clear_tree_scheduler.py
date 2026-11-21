@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -52,6 +53,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
     ClearReplyStatus,
     action_value,
     as_clear_action,
+    attach_verify_report,
     clear_batch_reply,
     protocol_mismatch_reply,
     supported_clear_protocol,
@@ -134,6 +136,22 @@ def dump_tree_reply(reply) -> None:
             logger.info("[CLEAR tree] %s", json.dumps(record, separators=(",", ":")))
     except Exception:
         logger.warning("[CLEAR tree] dump failed", exc_info=True)
+
+
+_LAYER_PAIR = re.compile(r"r(\d+)_(\d+)(?:_s\d+)?$")
+
+
+def captured_layer_pairs(graph) -> tuple:
+    """``(width, batch)`` keys that were actually captured, such as ``r8_1``."""
+    graphs = getattr(graph, "graphs", None)
+    if not isinstance(graphs, dict):
+        return ()
+    found = set()
+    for key in graphs:
+        match = _LAYER_PAIR.search(str(key))
+        if match:
+            found.add((int(match.group(1)), int(match.group(2))))
+    return tuple(sorted(found))
 
 
 def drain_deferred_layer_events(scheduler, metrics, *, defer_drain, jobs) -> None:
@@ -242,7 +260,11 @@ class ClearTreeSchedulerMixin:
         return batch, mm
 
     def _clear_spec_shape_rejected(self, batch) -> bool:
-        if batch.action not in (ClearAction.PREFILL, ClearAction.STEP):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            shape_check_covers,
+        )
+
+        if not shape_check_covers(batch.action):
             return False
         if batch.spec_shape is None:
             return True
@@ -378,8 +400,7 @@ class ClearTreeSchedulerMixin:
                 mm_by_rid[req.rid] = mm
         if not draft_reqs:
             return None
-        self.sr_rpc_seq += 1
-        rpc_seq = self.sr_rpc_seq
+        rpc_seq = self._sr_take_rpc_seq()
         samples = None
         sample_metrics = None
         if self.tp_size == 1 or self.tp_rank == 0:
@@ -394,6 +415,14 @@ class ClearTreeSchedulerMixin:
             spec_shape=local_spec_shape(getattr(self, "server_args", None)),
             verify_samples=samples,
         )
+        report = (
+            getattr(sample_metrics, "_clear_verify_report", None)
+            if sample_metrics is not None
+            else None
+        )
+        if clear_action == ClearAction.STEP and isinstance(report, dict):
+            attach_verify_report(batch, report, self.sr_session_id)
+            sample_metrics._clear_verify_report = None
         if clear_action == ClearAction.PREFILL and (
             self.tp_size == 1 or self.tp_rank == 0
         ):
@@ -417,13 +446,15 @@ class ClearTreeSchedulerMixin:
             send_ok = self._sr_broadcast_obj(send_ok)
         if not send_ok and samples:
             restore_verify_samples(sample_metrics, samples)
-        return SRInflight(
+        inflight = SRInflight(
             session_id=self.sr_session_id,
             rpc_seq=rpc_seq,
             pending=pending,
             wait_reply=clear_action not in (ClearAction.FINISH, ClearAction.ABORT),
             send_ok=send_ok,
         )
+        inflight.clear_action = clear_action
+        return inflight
 
     def _clear_recv(self, inflight):
         from sglang.srt.speculative.standalone_remote.sr_protocol import SRReplyStatus
@@ -492,10 +523,14 @@ class ClearTreeSchedulerMixin:
             result[item.rid] = item
         if self.tp_size == 1 or self.tp_rank == 0:
             from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
-                maybe_start_prefit,
+                note_prefill_fit,
+                publish_fit_status,
             )
 
-            maybe_start_prefit(self, reply.fit_ready)
+            if getattr(reply, "fit_status", None):
+                publish_fit_status(self, reply.fit_status)
+            if getattr(inflight, "clear_action", None) == ClearAction.PREFILL:
+                note_prefill_fit(self, reply)
         self._sr_observe_rpc(inflight, got_packet=got_packet)
         return result, pending
 
@@ -581,6 +616,12 @@ class ClearTreeSchedulerMixin:
     def _init_clear_tree_target(self) -> None:
         self._sync_sr_session_id()
         self.sr_rpc_seq = 0
+        self._clear_fit_state = "unknown"
+        self._clear_fit_reason = None
+        self._clear_fit_run = None
+        self._clear_fit_timeouts = 0
+        self._clear_fit_next_at = 0.0
+        self._clear_fit_box = {"cond": threading.Condition(), "items": {}}
         self.sr_client = None
         self._sr_hold_finish_flush = False
         self.sr_breaker = SRRpcBreaker(
@@ -598,6 +639,9 @@ class ClearTreeSchedulerMixin:
             assert isinstance(client, ClearTargetClient)
             client.drop_callback = self._sr_note_stale
             self.sr_client = client
+        worker = getattr(self, "model_worker", None)
+        if worker is not None:
+            worker._clear_target_scheduler = self
         if self.tp_rank == 0:
             logger.info(
                 "[OPT] Target session_id=%s addr=%s port=%s",
@@ -663,6 +707,7 @@ class ClearTreeSchedulerMixin:
             self._clear_layer_disable_padding = bool(
                 getattr(graph, "disable_padding", False)
             )
+            self._clear_layer_capture_pairs = captured_layer_pairs(graph)
         except Exception:
             logger.warning("[OPT] layer capture batches were not cached", exc_info=True)
 
@@ -991,7 +1036,49 @@ class ClearTreeSchedulerMixin:
             finally:
                 metrics.add_host("opt_finish", time.perf_counter() - finish_start)
 
+    def _sr_take_rpc_seq(self) -> int:
+        """One RPC number for every rank. Rank 0 allocates it; the rest copy it."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            allocate_rpc_seq,
+        )
+
+        return allocate_rpc_seq(self)
+
     def _clear_handle_batch_impl(self, batch: ClearBatchRequest, mm_by_rid: Dict[str, SRMMPayload]):
+        if batch.action == ClearAction.CONTROL:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                execute_control,
+            )
+
+            status = execute_control(self, batch)
+            reply = ClearBatchReply(
+                session_id=batch.session_id,
+                rpc_seq=batch.rpc_seq,
+                protocol_version=CLEAR_PROTOCOL_VERSION,
+                fit_status=status if isinstance(status, dict) else None,
+            )
+            if isinstance(status, dict) and type(status.get("ready")) is bool:
+                reply.fit_ready = status["ready"]
+            self._sr_note_handled(batch)
+            return reply
+        if batch.action == ClearAction.FIT:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                fit_handshake_status,
+            )
+
+            status = fit_handshake_status(self)
+            reply = ClearBatchReply(
+                session_id=batch.session_id,
+                rpc_seq=batch.rpc_seq,
+                protocol_version=CLEAR_PROTOCOL_VERSION,
+                fit_status=status,
+            )
+            if status.get("state") == "ready":
+                reply.fit_ready = True
+            elif status.get("state") == "need_prefit":
+                reply.fit_ready = False
+            self._sr_note_handled(batch)
+            return reply
         metrics = get_sr_round_metrics(self, "Draft")
         prepare_start = time.perf_counter()
         last_session = self.sr_state.session_id
@@ -1074,13 +1161,139 @@ class ClearTreeSchedulerMixin:
         )
 
     def _clear_apply_fit_ready(self, batch, reply):
-        """Tell the Target whether this Draft already has a matching fit."""
+        """Attach a commit result, or whether this Draft already has a covering fit."""
+        status = getattr(self, "_clear_fit_reply_status", None)
+        if batch.action == ClearAction.PREFILL and isinstance(status, dict):
+            reply.fit_status = status
+            if type(status.get("ready")) is bool:
+                reply.fit_ready = status["ready"]
+            self._clear_fit_reply_status = None
+            return reply
         if batch.action != ClearAction.PREFILL or not getattr(batch, "target_info", None):
             return reply
         ready = getattr(self, "_clear_fit_ready", None)
         if type(ready) is bool:
             reply.fit_ready = ready
         return reply
+
+    def _clear_fit_query(self):
+        """Ask the Draft whether a saved fit covers this Target. Idle only."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import target_info
+
+        rpc_seq = self._sr_take_rpc_seq()
+        payload = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            client = getattr(self, "sr_client", None)
+            if client is not None:
+                batch = ClearBatchRequest(
+                    session_id=self.sr_session_id,
+                    rpc_seq=rpc_seq,
+                    action=ClearAction.FIT,
+                    reqs=[],
+                    protocol_version=CLEAR_PROTOCOL_VERSION,
+                    target_info=target_info(self),
+                )
+                old_rebuild = client.rebuild_on_timeout
+                old_timeout = client.timeout_ms
+                client.rebuild_on_timeout = False
+                client.timeout_ms = 5000
+                try:
+                    client.send_batch(batch)
+                    reply = client.recv_batch(batch.session_id, batch.rpc_seq)
+                    payload = None if reply is None else reply.to_dict()
+                except Exception:
+                    logger.warning("[CLEAR] fit query failed", exc_info=True)
+                    payload = None
+                finally:
+                    client.rebuild_on_timeout = old_rebuild
+                    client.timeout_ms = old_timeout
+        if self.tp_size > 1:
+            payload = self._sr_broadcast_obj(payload)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return ClearBatchReply.from_dict(payload)
+        except Exception:
+            logger.warning("[CLEAR] fit query reply was unreadable", exc_info=True)
+            return None
+
+    def _clear_send_control(self, control: dict):
+        """Send one control RPC. Every rank allocates the same sequence first."""
+        rpc_seq = self._sr_take_rpc_seq()
+        payload = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            client = getattr(self, "sr_client", None)
+            if client is not None:
+                batch = ClearBatchRequest(
+                    session_id=self.sr_session_id,
+                    rpc_seq=rpc_seq,
+                    action=ClearAction.CONTROL,
+                    reqs=[],
+                    protocol_version=CLEAR_PROTOCOL_VERSION,
+                    spec_shape=local_spec_shape(getattr(self, "server_args", None)),
+                    control=dict(control),
+                )
+                old_rebuild = client.rebuild_on_timeout
+                old_timeout = client.timeout_ms
+                client.rebuild_on_timeout = False
+                client.timeout_ms = 5000
+                try:
+                    client.send_batch(batch)
+                    reply = client.recv_batch(batch.session_id, batch.rpc_seq)
+                    payload = None if reply is None else reply.to_dict()
+                except Exception:
+                    logger.warning("[CLEAR] control RPC failed", exc_info=True)
+                    payload = None
+                finally:
+                    client.rebuild_on_timeout = old_rebuild
+                    client.timeout_ms = old_timeout
+        if self.tp_size > 1:
+            payload = self._sr_broadcast_obj(payload)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return ClearBatchReply.from_dict(payload)
+        except Exception:
+            logger.warning("[CLEAR] control reply was unreadable", exc_info=True)
+            return None
+
+    def _clear_service_idle(self) -> None:
+        """Drain one control op, then maybe one FIT. Both collectives include every rank."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            apply_fit_query,
+            fit_query_due,
+            mirror_fit_reply,
+            pop_control,
+            publish_fit_status,
+        )
+
+        now = time.monotonic()
+        control = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            control = pop_control(self)
+        if self.tp_size > 1:
+            control = self._sr_broadcast_obj(control)
+        if isinstance(control, dict):
+            reply = self._clear_send_control(control)
+            if self.tp_size == 1 or self.tp_rank == 0:
+                status = None if reply is None else getattr(reply, "fit_status", None)
+                if isinstance(status, dict):
+                    publish_fit_status(self, status)
+        due = False
+        if self.tp_size == 1 or self.tp_rank == 0:
+            due = fit_query_due(self, now)
+        if self.tp_size > 1:
+            due = bool(self._sr_broadcast_obj(due))
+        if not due:
+            return
+        reply = self._clear_fit_query()
+        if self.tp_size == 1 or self.tp_rank == 0:
+            apply_fit_query(self, reply, now)
+        else:
+            mirror_fit_reply(self, reply)
+
+    def _clear_fit_idle(self) -> None:
+        self._clear_service_idle()
 
     @DynamicGradMode()
     def event_loop_normal_clear_tree_target(self):
@@ -1155,6 +1368,7 @@ class ClearTreeSchedulerMixin:
             else:
                 self.self_check_during_idle()
                 idle_sr_round_metrics(self)
+                self._clear_fit_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1236,6 +1450,14 @@ class ClearTreeSchedulerMixin:
                                     reply = clear_batch_reply(
                                         self._sr_spec_shape_mismatch_reply(batch)
                                     )
+                                    if batch.action == ClearAction.CONTROL:
+                                        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                                            control_shape_status,
+                                        )
+
+                                        status = control_shape_status(batch)
+                                        if status is not None:
+                                            reply.fit_status = status
                                     self._sr_note_handled(batch)
                                 else:
                                     reply = self._clear_handle_batch_impl(batch, mm)

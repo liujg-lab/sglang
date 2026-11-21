@@ -5656,9 +5656,10 @@ class ServerArgs:
             type=int,
             default=ServerArgs.clear_tree_max_depth,
             help=(
-                "ClearTree depth cap, including the seed layer. The longest "
-                "verified chain is max_depth - 1. Omitted --speculative-num-steps "
-                "is set to this depth; an explicit value must equal it."
+                "ClearTree depth cap, including the seed layer (default: 10). "
+                "The longest verified chain is max_depth - 1. Omitted "
+                "--speculative-num-steps is set to this depth; an explicit "
+                "value must equal it."
             ),
         )
         parser.add_argument(

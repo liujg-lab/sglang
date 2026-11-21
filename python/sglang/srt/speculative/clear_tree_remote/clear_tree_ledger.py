@@ -459,6 +459,9 @@ class ClearLedger:
         self.pending_logs: List[tuple] = []
         self.split_capable = False
         self.hold_invalid = 0
+        self._pending_rounds: Dict[tuple, dict] = {}
+        self._pending_reports: Dict[tuple, dict] = {}
+        self._pending_order: List[tuple] = []
 
     def queue_log(self, kind: str, record: dict) -> None:
         self.pending_logs.append((kind, record))
@@ -478,6 +481,7 @@ class ClearLedger:
         self.layer_models.clear()
         self.verify_model = None
         self.verify_samples = 0
+        self._clear_pending()
 
     def drop_open(self) -> None:
         """Drop the round that has not closed. Keep both regressions."""
@@ -499,6 +503,7 @@ class ClearLedger:
         target_queued: Optional[bool] = None,
         step_bytes: Optional[int] = None,
         reply_bytes: Optional[int] = None,
+        verify=None,
         scheduler=None,
     ) -> Optional[dict]:
         """Close the previous STEP when this packet is its next STEP.
@@ -515,6 +520,8 @@ class ClearLedger:
         closed = None
         if self.open is not None and self.open.t_send is not None:
             if name == "step":
+                closed_session = str(self.open.session_id)
+                self._drop_other_sessions(str(session_id))
                 closed = self._close(
                     stamp,
                     name,
@@ -526,8 +533,11 @@ class ClearLedger:
                     target_queued=target_queued,
                     step_bytes=step_bytes,
                     reply_bytes=reply_bytes,
+                    verify=verify,
                     scheduler=scheduler,
                 )
+                if closed_session != str(session_id):
+                    self._clear_pending()
             elif name in _GAP_ACTIONS:
                 self.open.gap_actions.append(name)
                 self.open.gap_rpcs.append(int(rpc_seq))
@@ -614,6 +624,7 @@ class ClearLedger:
         target_queued: Optional[bool] = None,
         step_bytes: Optional[int] = None,
         reply_bytes: Optional[int] = None,
+        verify=None,
         scheduler=None,
     ) -> dict:
         rnd = self.open
@@ -633,17 +644,30 @@ class ClearLedger:
             reasons.append("target_gap")
         if rnd.fallback:
             reasons.append("fallback")
+        report = _take_verify_report(rnd, verify)
+        incoming = _valid_verify_report(verify)
+        if incoming is not None and report is None:
+            self._park_report(str(rnd.session_id), incoming)
+        if report is not None and report["fallback"]:
+            reasons.append("target_fallback")
         prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
         phase = prefit.get("phase") if prefit else None
         if phase == "warmup":
             reasons.append("warmup")
         elif phase == "mixed":
             reasons.append("prefit_mixed")
+        elif phase == "stale":
+            reasons.append("prefit_stale")
+        elif phase == "control":
+            reasons.append("prefit_control")
         elif phase == "keep" and prefit.get("group") == "v":
             planned = prefit.get("bucket")
-            grown = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
-            actual = smallest_bucket(grown, runtime_kv_buckets())
-            if planned is None or actual != int(planned):
+            if report is not None and not report["fallback"]:
+                actual = report["bucket"]
+            else:
+                grown = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
+                actual = smallest_bucket(grown, runtime_kv_buckets())
+            if planned is None or actual is None or int(actual) != int(planned):
                 reasons.append("prefit_bucket")
         draft_floor = next_action == "step" and bool(recv_queued)
         wait_ms = (
@@ -699,8 +723,10 @@ class ClearLedger:
             excluded,
             hold_ms=hold_ms,
             q_ms=q_ms,
+            verify=report,
             scheduler=scheduler,
         )
+        self.merge_pending(scheduler)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
         prefit_round = prefit is not None
@@ -757,7 +783,7 @@ class ClearLedger:
         }
         self.queue_log("d_round", record)
         for sample in rnd.layers:
-            self._finish_layer(rnd, sample, excluded)
+            self._finish_layer(rnd, sample, excluded, scheduler)
         self._note_price(
             rnd,
             next_rids,
@@ -811,49 +837,206 @@ class ClearLedger:
         excluded: bool,
         hold_ms: Optional[float] = None,
         q_ms: Optional[float] = None,
+        verify=None,
         scheduler=None,
     ) -> None:
-        """Write H, or the whole T_K when this session has not seen a split.
+        """Write H and Q together, or the whole T_K before a split exists.
 
         A draft-floor round is not excluded: that wait is on the critical
         path and still depends on K. Width-sweep rounds update the layer
-        fit only. An over-bucket prefix yields no bucket and is dropped.
+        fit only. Prefit keep rounds write the active run. Ordinary rounds
+        write the online tables. An over-bucket round, an eager report, and
+        a fallback report write neither H nor Q. A missing report is stashed
+        until that rpc arrives.
         """
         if excluded or t_k_us is None:
             return
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            note_online_h,
+            prefit_record_h,
+        )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
-            observe_q,
             observe_verify,
         )
         from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
             VERIFY_KS,
         )
 
-        if int(rnd.k) not in VERIFY_KS:
-            return
         prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
         if prefit is not None and prefit.get("group") == "w":
             return
+        keep = prefit is not None and prefit.get("phase") == "keep"
+        if self.split_capable:
+            if hold_ms is None or q_ms is None or verify is None or verify.get("fallback"):
+                if (
+                    verify is None
+                    and hold_ms is not None
+                    and q_ms is not None
+                    and not excluded
+                ):
+                    self._stash_unpaired(rnd, float(hold_ms), float(q_ms), prefit)
+                return
+            if verify.get("path") == "eager":
+                return
+            batch = int(verify["b"])
+            k = int(verify["k"])
+            bucket = verify.get("bucket")
+            if bucket is None or k not in VERIFY_KS:
+                return
+            self._write_hq(
+                scheduler,
+                rpc=int(verify["rpc_seq"]),
+                batch=batch,
+                k=k,
+                bucket=int(bucket),
+                hold_ms=float(hold_ms),
+                q_ms=float(q_ms),
+                prefit=prefit,
+                path=str(verify.get("path") or "graph"),
+                keep=keep,
+            )
+            return
+        if int(rnd.k) not in VERIFY_KS:
+            return
         needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
         bucket = smallest_bucket(needed, runtime_kv_buckets())
-        if hold_ms is not None and q_ms is not None:
-            observe_verify(rnd.b, int(rnd.k), bucket, float(hold_ms))
-            observe_q(rnd.b, int(rnd.k), float(q_ms))
-            if (
-                scheduler is not None
-                and prefit is not None
-                and prefit.get("group") == "v"
-                and prefit.get("phase") == "keep"
-                and bucket is not None
-            ):
-                from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
-                    note_kept,
-                )
-
-                note_kept(scheduler, rnd.b, int(rnd.k), int(bucket))
+        if bucket is None:
             return
-        if not self.split_capable:
-            observe_verify(rnd.b, int(rnd.k), bucket, float(t_k_us) / 1000.0)
+        measured = float(t_k_us) / 1000.0
+        if keep:
+            if prefit.get("group") == "v":
+                prefit_record_h(
+                    scheduler, rnd.b, int(rnd.k), int(bucket), measured, prefit
+                )
+            return
+        if prefit is not None:
+            return
+        observe_verify(rnd.b, int(rnd.k), int(bucket), measured)
+        note_online_h(scheduler, rnd.b, int(rnd.k), int(bucket), measured)
+
+    def _write_hq(
+        self,
+        scheduler,
+        *,
+        rpc,
+        batch,
+        k,
+        bucket,
+        hold_ms,
+        q_ms,
+        prefit,
+        path,
+        keep,
+    ) -> None:
+        """Write one graph sample and log the b, K, and bucket that landed."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            note_online_h,
+            prefit_record_h,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            observe_q,
+            observe_verify,
+        )
+
+        logger.info(
+            "[CLEAR] fit write rpc=%s b=%s k=%s bucket=%s path=%s",
+            int(rpc),
+            int(batch),
+            int(k),
+            int(bucket),
+            path,
+        )
+        if keep:
+            if isinstance(prefit, dict) and prefit.get("group") == "v":
+                prefit_record_h(
+                    scheduler, int(batch), int(k), int(bucket), float(hold_ms), prefit
+                )
+            return
+        if prefit is not None:
+            return
+        observe_verify(int(batch), int(k), int(bucket), float(hold_ms))
+        observe_q(int(batch), int(k), float(q_ms))
+        note_online_h(scheduler, int(batch), int(k), int(bucket), float(hold_ms))
+
+    def _pending_key(self, session, rpc) -> tuple:
+        return (str(session), int(rpc))
+
+    def _remember_pending(self, key) -> None:
+        if key in self._pending_order:
+            self._pending_order.remove(key)
+        self._pending_order.append(key)
+        while len(self._pending_order) > 64:
+            old = self._pending_order.pop(0)
+            self._pending_rounds.pop(old, None)
+            self._pending_reports.pop(old, None)
+
+    def _clear_pending(self) -> None:
+        self._pending_rounds.clear()
+        self._pending_reports.clear()
+        self._pending_order.clear()
+
+    def _drop_other_sessions(self, session: str) -> None:
+        for key in list(self._pending_order):
+            if key[0] != str(session):
+                self._pending_order.remove(key)
+                self._pending_rounds.pop(key, None)
+                self._pending_reports.pop(key, None)
+
+    def _stash_unpaired(self, rnd: _Round, hold_ms: float, q_ms: float, prefit) -> None:
+        key = self._pending_key(rnd.session_id, rnd.rpc_seq)
+        self._pending_rounds[key] = {
+            "hold_ms": float(hold_ms),
+            "q_ms": float(q_ms),
+            "prefit": None if prefit is None else dict(prefit),
+        }
+        self._remember_pending(key)
+
+    def _park_report(self, session: str, report: dict) -> None:
+        key = self._pending_key(session, report["rpc_seq"])
+        self._pending_reports[key] = dict(report)
+        self._remember_pending(key)
+
+    def merge_pending(self, scheduler) -> None:
+        """Apply reports that now have a closed round. Unmatched rounds stay."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+            VERIFY_KS,
+        )
+
+        for key in list(self._pending_order):
+            report = self._pending_reports.get(key)
+            held = self._pending_rounds.get(key)
+            if report is None or held is None:
+                continue
+            self._pending_reports.pop(key, None)
+            self._pending_rounds.pop(key, None)
+            if key in self._pending_order:
+                self._pending_order.remove(key)
+            if report.get("fallback") or report.get("path") == "eager":
+                continue
+            bucket = report.get("bucket")
+            k = report.get("k")
+            batch = report.get("b")
+            if (
+                type(bucket) is not int
+                or type(k) is not int
+                or type(batch) is not int
+                or int(k) not in VERIFY_KS
+            ):
+                continue
+            prefit = held.get("prefit")
+            keep = isinstance(prefit, dict) and prefit.get("phase") == "keep"
+            self._write_hq(
+                scheduler,
+                rpc=int(report["rpc_seq"]),
+                batch=int(batch),
+                k=int(k),
+                bucket=int(bucket),
+                hold_ms=float(held["hold_ms"]),
+                q_ms=float(held["q_ms"]),
+                prefit=prefit,
+                path=str(report.get("path") or "graph"),
+                keep=keep,
+            )
 
     def _assign_layer_walls(self, rnd: _Round) -> tuple:
         """Wall time between forwards. The last pre-reply sample ends at stop.
@@ -924,7 +1107,7 @@ class ClearLedger:
             self.verify_model = ForgettingRegressor(width, VERIFY_MIN_SAMPLES)
         return self.verify_model
 
-    def _finish_layer(self, rnd: _Round, sample: dict, excluded: bool) -> None:
+    def _finish_layer(self, rnd: _Round, sample: dict, excluded: bool, scheduler=None) -> None:
         host = sample.get("host_us")
         gpu = sample.get("gpu_us")
         wall = sample.get("wall_us")
@@ -948,16 +1131,46 @@ class ClearLedger:
                 int(sample["graph_bucket"]),
             )
             model = self.layer_models.get(key)
-            if model is None:
+            prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
+            keep = prefit is not None and prefit.get("phase") == "keep"
+            if prefit is None and model is None:
                 model = _new_layer_model()
                 self.layer_models[key] = model
-            if model.n >= LAYER_MIN_SAMPLES:
+            if model is not None and model.n >= LAYER_MIN_SAMPLES:
                 pred = model.predict(features)
                 if pred not in (None, 0.0) and measured is not None:
                     residual = measured / pred - 1.0
             if not excluded:
-                model.update(features, measured)
-                fitted = True
+                if keep:
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                        prefit_record_layer,
+                    )
+
+                    prefit_record_layer(
+                        scheduler,
+                        sample["w"],
+                        sample["path"],
+                        sample["graph_bucket"],
+                        features,
+                        measured,
+                        prefit,
+                    )
+                    fitted = True
+                elif prefit is None:
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+                        note_online_layer,
+                    )
+
+                    model.update(features, measured)
+                    note_online_layer(
+                        scheduler,
+                        sample["w"],
+                        sample["path"],
+                        sample["graph_bucket"],
+                        features,
+                        measured,
+                    )
+                    fitted = True
         sample_log = {
             "rpc_seq": rnd.rpc_seq,
             "session_id": rnd.session_id,
@@ -976,6 +1189,76 @@ class ClearLedger:
             "fit": fitted,
         }
         self.queue_log("d_layer", sample_log)
+
+
+def _valid_verify_report(verify) -> Optional[dict]:
+    """One normalized Target shape. A bad type is not a report.
+
+    A report that omits ``path`` is a graph report. Eager and unused-draft
+    fallback stay valid even when the prefix has no KV bucket.
+    """
+    if not isinstance(verify, dict):
+        return None
+    rpc = verify.get("rpc_seq")
+    fallback = verify.get("fallback")
+    if type(rpc) is not int or type(fallback) is not bool:
+        return None
+    path = verify.get("path")
+    if path not in (None, "graph", "eager", "fallback"):
+        return None
+    if fallback or path == "fallback":
+        return {"fallback": True, "rpc_seq": int(rpc), "path": "fallback"}
+    batch = verify.get("b")
+    k = verify.get("k")
+    bucket = verify.get("bucket")
+    if type(batch) is not int or type(k) is not int or batch <= 0 or k <= 0:
+        return None
+    if type(bucket) is int and bucket > 0:
+        bucket = int(bucket)
+    elif bucket is None:
+        bucket = None
+    else:
+        return None
+    return {
+        "fallback": False,
+        "path": "eager" if path == "eager" else "graph",
+        "rpc_seq": int(rpc),
+        "b": int(batch),
+        "k": int(k),
+        "bucket": bucket,
+    }
+
+
+def _take_verify_report(rnd: _Round, verify) -> Optional[dict]:
+    """The Target shape for this round, or None when the packet does not name it."""
+    report = _valid_verify_report(verify)
+    if report is None or int(report["rpc_seq"]) != int(rnd.rpc_seq):
+        return None
+    return report
+
+
+def _batch_verify_report(batch) -> Optional[dict]:
+    """Copy a verified shape off the next STEP. Bad types are not a report."""
+    if batch is None:
+        return None
+    return _valid_verify_report(
+        {
+            "rpc_seq": getattr(batch, "target_verify_rpc_seq", None),
+            "fallback": getattr(batch, "target_verify_fallback", None),
+            "b": getattr(batch, "target_verify_b", None),
+            "k": getattr(batch, "target_verify_k", None),
+            "bucket": getattr(batch, "target_verify_bucket", None),
+            "path": getattr(batch, "target_verify_path", None),
+        }
+    )
+
+
+def merge_pending_verify(scheduler) -> None:
+    """Write stashed H/Q whose reports have already arrived."""
+    ledger = None if scheduler is None else getattr(scheduler, "_clear_ledger", None)
+    merge = None if ledger is None else getattr(ledger, "merge_pending", None)
+    if callable(merge):
+        merge(scheduler)
 
 
 def _target_gap(next_rids: Sequence[str], next_prefixes: Sequence[int]) -> bool:
@@ -1174,28 +1457,11 @@ def note_packet(scheduler, batch) -> None:
             target_queued=getattr(batch, "target_queued", None),
             step_bytes=getattr(server, "last_request_bytes", None),
             reply_bytes=getattr(server, "last_reply_bytes", None),
+            verify=_batch_verify_report(batch),
             scheduler=scheduler,
         )
 
     _quiet(scheduler, _run)
-    _note_prefit_done(scheduler, batch)
-
-
-def _note_prefit_done(scheduler, batch) -> None:
-    """A done prefill ends the sweep. The open round stays open until the next STEP."""
-    name = _action_name(getattr(batch, "action", None))
-    if name != "prefill":
-        return
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
-        maybe_finish,
-        parse_rid,
-    )
-
-    for req in list(getattr(batch, "reqs", None) or []):
-        parsed = parse_rid(getattr(req, "rid", ""))
-        if parsed is not None and parsed.get("kind") == "done":
-            maybe_finish(scheduler, "clearfit-done")
-            return
 
 
 def note_idle(scheduler) -> None:
@@ -1295,6 +1561,38 @@ def queue_layer_sample(
 def remember_layer_gpu(sample, gpu_us: Optional[int]) -> None:
     if isinstance(sample, dict):
         sample["gpu_us"] = None if gpu_us is None else int(gpu_us)
+
+
+def complete_verify_report(frozen, ran_graph: bool) -> dict:
+    """Build the verify report from the shape frozen before accept.
+
+    The bucket is ``pre-verify length + K + 1``. Eager is not fallback.
+    ``K <= 0`` means the verify did not use a draft.
+    """
+    from sglang.srt.speculative.tree_attn_fallback import (
+        select_tree_kv_bucket,
+    )
+
+    seq_lens = [int(item) for item in (frozen.get("seq_lens") or [])]
+    k = int(frozen.get("k") or 0)
+    if k <= 0:
+        path = "fallback"
+        bucket = None
+    else:
+        path = "graph" if ran_graph else "eager"
+        max_ell = max(seq_lens) if seq_lens else 0
+        chosen = select_tree_kv_bucket(max_ell + k + 1, runtime_kv_buckets())
+        bucket = None if chosen is None else int(chosen)
+    rpc = frozen.get("rpc_seq")
+    return {
+        "session": frozen.get("session"),
+        "rpc_seq": rpc if type(rpc) is int else None,
+        "b": int(frozen.get("b") or 0),
+        "k": int(k),
+        "bucket": bucket,
+        "path": path,
+        "fallback": path == "fallback",
+    }
 
 
 def runtime_kv_buckets() -> tuple:

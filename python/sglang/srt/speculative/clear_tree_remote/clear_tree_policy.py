@@ -69,9 +69,7 @@ PRICE_PRIOR_N0 = 10.0
 
 _clock: Dict[tuple, list] = {}
 _curve_cache: Dict[tuple, dict] = {}
-_q_fit: Dict[int, object] = {}
-_q_res: Dict[int, deque] = {}
-Q_MIN_SAMPLES = 4
+_q_raw: Dict[tuple, deque] = {}
 Q_RIDGE = (0.0, 1.0)
 Q_RES_WINDOW = 32
 _price_n: Dict[int, int] = {}
@@ -114,11 +112,12 @@ def on_external_event(scheduler, batch=None) -> None:
         if ledger:
             ledger.drop_open()
         scheduler._clear_replay_to_hold = []
+        if isinstance(info, dict):
+            on_target_info(scheduler, info)
         return
     _clock.clear()
     _curve_cache.clear()
-    _q_fit.clear()
-    _q_res.clear()
+    _q_raw.clear()
     _probe_rounds = 0
     _pending.clear()
     reset_replay_state()
@@ -142,14 +141,13 @@ def reset_gain_calibration() -> None:
 def reset_policy(keep_fits: bool = False) -> None:
     """Drop prices, accept ratios, probe counts, and replay.
 
-    ``keep_fits`` leaves the H table, the Q fit, and the layer regressions.
+    ``keep_fits`` leaves the H table, the Q samples, and the layer regressions.
     """
     global _total_a, _total_e, _rounds, _probe_rounds
     global _bucket_warned
     if not keep_fits:
         _clock.clear()
-        _q_fit.clear()
-        _q_res.clear()
+        _q_raw.clear()
     _curve_cache.clear()
     _price_n.clear()
     _price_tok.clear()
@@ -458,60 +456,61 @@ def predict_hold_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float
     return _hold_curve(int(batch), int(bucket)).get(int(k))
 
 
-def _q_model(batch: int):
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        ForgettingRegressor,
-    )
+def _fit_q_line(points: Sequence[tuple]) -> tuple:
+    """Intercept and slope for kept ``(k, ms)`` points. Ridge is ``Q_RIDGE``."""
+    count = float(len(points))
+    sum_k = 0.0
+    sum_k2 = 0.0
+    sum_y = 0.0
+    sum_ky = 0.0
+    for k, ms in points:
+        value = float(k)
+        measured = float(ms)
+        sum_k += value
+        sum_k2 += value * value
+        sum_y += measured
+        sum_ky += value * measured
+    det = (count + Q_RIDGE[0]) * (sum_k2 + Q_RIDGE[1]) - sum_k * sum_k
+    if abs(det) < 1e-12:
+        return 0.0, 0.0
+    intercept = ((sum_y * (sum_k2 + Q_RIDGE[1])) - (sum_k * sum_ky)) / det
+    slope = (((count + Q_RIDGE[0]) * sum_ky) - (sum_k * sum_y)) / det
+    return float(intercept), float(slope)
 
-    key = int(batch)
-    model = _q_fit.get(key)
-    if model is None:
-        model = ForgettingRegressor(2, Q_MIN_SAMPLES, ridge=Q_RIDGE)
-        _q_fit[key] = model
-    return model
 
-
-def _q_slope(batch: int) -> float:
-    model = _q_fit.get(int(batch))
-    if model is None:
-        return 0.0
-    coef = model.coefficients()
-    if not coef or len(coef) < 2:
-        return 0.0
-    return float(coef[1])
+def _q_kept(batch: int) -> list:
+    """Raw Q samples for one batch, filtered inside each K."""
+    kept = []
+    for k in VERIFY_KS:
+        rows = _q_raw.get((int(batch), int(k)))
+        if not rows:
+            continue
+        for ms in _steady_verify_samples(rows):
+            kept.append((int(k), float(ms)))
+    return kept
 
 
 def observe_q(batch: int, k: int, ms: float) -> None:
-    """One Q sample. A residual above 1.5 times the window median is not fit.
+    """Keep one raw Q sample for this ``(batch, K)``.
 
-    The residual window is updated first, using the slope already solved.
-    Key 0 is the pool across batch sizes.
+    Prediction filters inside that K, then fits the batch line. A rejected
+    sample stays in the raw window and is left out of the fit.
     """
     if int(k) not in VERIFY_KS or ms is None:
         return
-    k = int(k)
-    ms = float(ms)
-    for key in (int(batch), 0):
-        residual = ms - _q_slope(key) * k
-        window = _q_res.setdefault(key, deque(maxlen=Q_RES_WINDOW))
-        window.append(residual)
-        center = _median(window)
-        if len(window) >= 2 and center > 0 and residual > center * 1.5:
-            continue
-        _q_model(key).update((1.0, float(k)), ms)
+    key = (int(batch), int(k))
+    window = _q_raw.setdefault(key, deque(maxlen=Q_RES_WINDOW))
+    window.append(float(ms))
 
 
 def predict_q_ms(batch: int, k: int) -> float:
-    """Robust intercept plus the K slope. An empty batch uses the pooled fit."""
-    key = int(batch)
-    window = _q_res.get(key)
-    slope_key = key
-    if not window:
-        window = _q_res.get(0)
-        slope_key = 0
-    if not window:
+    """Median residual plus the current K slope. An empty batch predicts 0."""
+    kept = _q_kept(int(batch))
+    if not kept:
         return 0.0
-    return float(_median(window) + _q_slope(slope_key) * int(k))
+    _intercept, slope = _fit_q_line(kept)
+    residuals = [ms - slope * float(item_k) for item_k, ms in kept]
+    return float(_median(residuals) + slope * int(k))
 
 
 def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:

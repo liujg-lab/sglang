@@ -1,0 +1,24 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_01_http_400_pending_request": true,
+  "flush_02_04_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "fit_schema": 2,
+  "fit_written_once": true,
+  "fit_has_q": false,
+  "fit_unchanged_during_trials": true,
+  "prefit_started_only_rank0": true,
+  "formal_hold_invalid": 0,
+  "bonus_rank0_last_window": "idle",
+  "servers_restarted_between_trials": false,
+  "not_injected": [
+    "api_key",
+    "save_prefit_disk_error",
+    "cancel_written_run",
+    "graph_unsupported",
+    "SGLANG_CLEAR_AUTO_PREFIT=0",
+    "omitted_max_depth_default_10"
+  ]
+}

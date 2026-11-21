@@ -23,9 +23,9 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
     length: Target holds the longest verify graph (max K + 1) and Draft holds
     the widest layer (max W). An omitted value is filled with that capacity;
     an explicit value must already equal it.
-    ``--clear-tree-max-depth`` includes the seed layer. When
-    ``--speculative-num-steps`` is omitted it is set to that depth; an explicit
-    value must already equal it.
+    ``--clear-tree-max-depth`` defaults to 10 and includes the seed layer.
+    Omitted ``--speculative-num-steps`` follows that depth; an explicit value
+    must already equal it.
     """
     server_args.disable_overlap_schedule = True
     server_args.enable_mixed_chunk = False
@@ -55,7 +55,7 @@ def apply_clear_tree_settings(server_args, *, on_npu: bool) -> None:
     if server_args.clear_tree_width is None:
         raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-width.")
     if server_args.clear_tree_max_depth is None:
-        raise ValueError("CLEAR_TREE_REMOTE requires --clear-tree-max-depth.")
+        server_args.clear_tree_max_depth = 10
     from sglang.srt.speculative.clear_tree_remote import clear_tree_width as width_mod
 
     installed_widths, installed_ks = width_mod.install_candidates(

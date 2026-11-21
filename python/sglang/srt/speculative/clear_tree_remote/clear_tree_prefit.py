@@ -7,6 +7,7 @@ HTTP server. Draft decides which rounds to keep and writes the fit file.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -14,12 +15,17 @@ import random
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
+
+PREFIT_VERIFY_WARMUP_ROUNDS = 2
+PREFIT_CELL_SAMPLES = 4
+_VERIFY_TAIL_ROUNDS = 2
+_VERIFY_ROUNDS = PREFIT_VERIFY_WARMUP_ROUNDS + PREFIT_CELL_SAMPLES + _VERIFY_TAIL_ROUNDS
+_VERIFY_BUDGET_VERSION = 1
 
 
 @dataclass
@@ -35,6 +41,37 @@ class PrefitConfig:
     seed: int = 0
     ready_timeout_s: float = 600.0
     api_key: Optional[str] = None
+    fit_timeout_s: float = 60.0
+
+
+@dataclass(frozen=True)
+class PlanInputs:
+    batches: Tuple[int, ...]
+    ks: Tuple[int, ...]
+    widths: Tuple[int, ...]
+    buckets: Tuple[int, ...]
+    max_depth: int
+    rpc_batch_limit: Optional[int] = None
+
+
+@dataclass
+class PrefitPlan:
+    inputs: PlanInputs
+    groups: list
+    required_h: list
+    skipped_h: list
+    fingerprint: str
+    required_layers: list = None
+    skipped_layers: list = None
+    b_to_g: dict = None
+
+    def __post_init__(self) -> None:
+        if self.required_layers is None:
+            self.required_layers = []
+        if self.skipped_layers is None:
+            self.skipped_layers = []
+        if self.b_to_g is None:
+            self.b_to_g = {}
 
 
 def prefixes_for(buckets: Sequence[int]) -> list:
@@ -50,6 +87,13 @@ def depth_for(k: int, width: int, max_depth: int) -> int:
     if int(width) <= 0:
         return 0
     return max(0, min(math.ceil(int(k) / float(width)), int(max_depth) - 1))
+
+
+def depth_for_width(k: int, width: int, max_depth: int) -> int:
+    """Width-sweep depth. A usable sweep is at least two layers."""
+    if int(width) <= 0:
+        return 0
+    return min(max(2, math.ceil(int(k) / float(width))), int(max_depth) - 1)
 
 
 def max_new_for_verify(bucket: int, prefix: int, k: int) -> int:
@@ -74,75 +118,308 @@ def _ordered(values, center: int, *, include_center: bool) -> list:
     return sorted(pool, key=lambda value: (abs(math.log2(value) - math.log2(center)), value))
 
 
-def build_schedule(cfg: PrefitConfig) -> list:
-    """Warm, then verify cells, then one width sweep per prefix, then done."""
+_PLAN_BATCHES = (1, 2, 4)
+
+
+def _fingerprint(inputs: PlanInputs) -> str:
+    """Hash the normalized plan. A raw batch cap is not part of the identity."""
+    payload = {
+        "batches": [int(item) for item in inputs.batches],
+        "buckets": [int(item) for item in inputs.buckets],
+        "ks": [int(item) for item in inputs.ks],
+        "max_depth": int(inputs.max_depth),
+        "widths": [int(item) for item in inputs.widths],
+        "verify_budget_version": _VERIFY_BUDGET_VERSION,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:8]
+
+
+def _previous_bucket(buckets, bucket: int):
+    prev = None
+    for item in buckets:
+        size = int(item)
+        if size < int(bucket) and (prev is None or size > prev):
+            prev = size
+    return prev
+
+
+def recorded_span(prefix: int, k: int, max_new: int):
+    """KV lengths a verify round of this group can be charged to.
+
+    The ledger records ``prefix + K + 1``. Generation can grow the prefix by
+    ``max_new`` before that addend.
+    """
+    lo = int(prefix) + int(k) + 1
+    hi = int(prefix) + int(max_new) + int(k) + 1
+    return lo, hi
+
+
+def span_fits_bucket(prefix: int, k: int, max_new: int, bucket: int, previous) -> bool:
+    """True when every recorded length of this group lands in ``bucket``."""
+    lo, hi = recorded_span(prefix, k, max_new)
+    if hi > int(bucket) or lo > int(bucket):
+        return False
+    if previous is not None and lo <= int(previous):
+        return False
+    return True
+
+
+def make_run_id(session_id: str, fingerprint: str, nonce: str) -> str:
+    """Session-scoped run id. It does not contain a hyphen."""
+    session = "".join(ch for ch in str(session_id) if ch.isalnum() or ch == "_") or "local"
+    stamp = "".join(ch for ch in str(nonce) if ch.isalnum()) or "0"
+    return f"{session}_{fingerprint}_{stamp}"
+
+
+def build_plan(inputs: PlanInputs) -> PrefitPlan:
+    """One sweep plan. The same inputs always produce the same fingerprint."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         flat_k,
         flat_width,
     )
 
+    raw_batches = tuple(int(item) for item in inputs.batches)
+    limit = None if inputs.rpc_batch_limit is None else int(inputs.rpc_batch_limit)
+    selected = {
+        int(item)
+        for item in raw_batches
+        if limit is None or int(item) <= int(limit)
+    }
+    # The fingerprint covers the batches that remain, not the raw cap.
+    canonical = PlanInputs(
+        batches=tuple(batch for batch in _PLAN_BATCHES if batch in selected),
+        ks=tuple(int(item) for item in inputs.ks),
+        widths=tuple(int(item) for item in inputs.widths),
+        buckets=tuple(int(item) for item in inputs.buckets),
+        max_depth=int(inputs.max_depth),
+        rpc_batch_limit=None,
+    )
     groups = []
-    prefixes = prefixes_for(cfg.buckets)
-    for batch in cfg.batches:
-        size = int(batch)
-        groups.append({"kind": "warm", "b": size, "max_new": 8, "prefix": 32})
-        flat_verify = int(flat_k(size))
-        flat_w = int(flat_width(size))
-        for bucket, prefix in zip(cfg.buckets, prefixes):
-            for k in _ordered(cfg.ks, flat_verify, include_center=True):
-                depth = depth_for(k, flat_w, cfg.max_depth)
-                room = max_new_for_verify(bucket, prefix, k)
-                need = 7 * (depth + 1)
-                if room < need:
+    required_h = []
+    skipped_h = []
+    prefixes = prefixes_for(canonical.buckets)
+    for batch in _PLAN_BATCHES:
+        if batch not in selected:
+            for bucket in canonical.buckets:
+                for k in canonical.ks:
+                    skipped_h.append(((batch, int(k), int(bucket)), "batch_limit"))
+            continue
+        flat_verify = int(flat_k(batch))
+        flat_w = int(flat_width(batch))
+        groups.append(
+            {
+                "kind": "warm",
+                "b": batch,
+                "max_new": 8,
+                "prefix": 32,
+                "produces_h": [],
+                "produces_layers": [],
+            }
+        )
+        for bucket, prefix in zip(canonical.buckets, prefixes):
+            previous = _previous_bucket(canonical.buckets, int(bucket))
+            for k in _ordered(canonical.ks, flat_verify, include_center=True):
+                depth = depth_for(k, flat_w, canonical.max_depth)
+                cell = (batch, int(k), int(bucket))
+                if depth <= 0:
+                    skipped_h.append((cell, "depth"))
+                    continue
+                tokens_per_verify = depth + 1
+                # The limit must outlast the prefill token and the first seven verifies.
+                min_new = 2 + (_VERIFY_ROUNDS - 1) * tokens_per_verify
+                first_prefix = 1 if previous is None else max(1, previous - k)
+                last_prefix = max_new_for_verify(bucket, 0, k) - min_new
+                if first_prefix > last_prefix:
+                    reason = "room" if last_prefix < 1 else "bucket_span"
+                    skipped_h.append((cell, reason))
                     logger.info(
-                        "[CLEAR] skip prefit cell b=%s bucket=%s k=%s room=%s need=%s",
-                        size,
+                        "[CLEAR] skip prefit cell b=%s bucket=%s k=%s reason=%s prefix_range=%s",
+                        batch,
                         bucket,
                         k,
-                        room,
-                        need,
+                        reason,
+                        (first_prefix, last_prefix),
                     )
                     continue
+                verify_prefix = min(max(prefix, first_prefix), last_prefix)
+                room = max_new_for_verify(bucket, verify_prefix, k)
+                max_new = min(room, _VERIFY_ROUNDS * tokens_per_verify)
+                if not span_fits_bucket(verify_prefix, k, max_new, bucket, previous):
+                    skipped_h.append((cell, "bucket_span"))
+                    logger.info(
+                        "[CLEAR] skip prefit cell b=%s bucket=%s k=%s span=%s",
+                        batch,
+                        bucket,
+                        k,
+                        recorded_span(verify_prefix, k, max_new),
+                    )
+                    continue
+                required_h.append(cell)
                 groups.append(
                     {
                         "kind": "v",
-                        "b": size,
-                        "prefix": int(prefix),
+                        "b": batch,
+                        "prefix": int(verify_prefix),
                         "k": int(k),
                         "bucket": int(bucket),
-                        "max_new": int(min(room, 8 * (depth + 1))),
+                        "max_new": max_new,
                         "depth": int(depth),
+                        "produces_h": [cell],
+                        "produces_layers": [],
                     }
                 )
-            others = _ordered(cfg.widths, flat_w, include_center=False)
+            others = _ordered(canonical.widths, flat_w, include_center=False)
             if not others:
                 continue
-            d_max = max(depth_for(flat_verify, width, cfg.max_depth) for width in others)
+            depths = [
+                depth_for_width(flat_verify, width, canonical.max_depth)
+                for width in others
+            ]
+            d_max = max(depths) if depths else 0
             groups.append(
                 {
                     "kind": "w",
-                    "b": size,
+                    "b": batch,
                     "prefix": int(prefix),
                     "bucket": int(bucket),
-                    "max_new": int(max_new_for_width(d_max)),
+                    "max_new": int(max_new_for_width(max(d_max, 0))),
+                    "depth": int(d_max),
+                    "produces_h": [],
+                    "produces_layers": [],
                 }
             )
-    groups.append({"kind": "done", "b": 1, "max_new": 1, "prefix": 8})
-    return groups
+    return PrefitPlan(
+        inputs=canonical,
+        groups=groups,
+        required_h=required_h,
+        skipped_h=skipped_h,
+        fingerprint=_fingerprint(canonical),
+    )
 
 
-def _rid(group: dict, n: int) -> str:
+def plan_from_config(cfg: PrefitConfig) -> PrefitPlan:
+    return build_plan(
+        PlanInputs(
+            batches=tuple(int(item) for item in cfg.batches),
+            ks=tuple(int(item) for item in cfg.ks),
+            widths=tuple(int(item) for item in cfg.widths),
+            buckets=tuple(int(item) for item in cfg.buckets),
+            max_depth=int(cfg.max_depth),
+        )
+    )
+
+
+def groups_for_missing(plan: PrefitPlan, missing_h, missing_layers, b_to_g=None) -> list:
+    """Groups whose yield map lists a missing cell.
+
+    ``b_to_g`` stays in the signature for callers that still pass the capture
+    pairs. It does not select a group on its own.
+    """
+    del b_to_g
+    wanted_h = set()
+    for cell in list(missing_h or []):
+        if isinstance(cell, (list, tuple)) and len(cell) == 3:
+            wanted_h.add((int(cell[0]), int(cell[1]), int(cell[2])))
+    wanted_layers = set()
+    for cell in list(missing_layers or []):
+        if isinstance(cell, (list, tuple)) and len(cell) == 3:
+            wanted_layers.add((int(cell[0]), str(cell[1]), int(cell[2])))
+    chosen = []
+    seen = set()
+
+    def _add(group) -> None:
+        key = _group_id(group)
+        if key in seen:
+            return
+        seen.add(key)
+        chosen.append(group)
+
+    for group in plan.groups:
+        produced_h = group.get("produces_h")
+        if produced_h is None and group.get("kind") == "v":
+            produced_h = [(int(group["b"]), int(group["k"]), int(group["bucket"]))]
+        if any(tuple(cell) in wanted_h for cell in list(produced_h or [])):
+            _add(group)
+            continue
+        produced_layers = group.get("produces_layers")
+        if produced_layers and any(
+            tuple(cell) in wanted_layers for cell in produced_layers
+        ):
+            _add(group)
+    return chosen
+
+
+def groups_by_id(plan: PrefitPlan, ids) -> list:
+    """Groups whose stable id is in ``ids``. Unknown ids are ignored."""
+    wanted = set()
+    for item in list(ids or []):
+        parsed = _parse_group_id(item)
+        if parsed is not None:
+            wanted.add(parsed)
+    chosen = []
+    seen = set()
+    for group in plan.groups:
+        key = _group_id(group)
+        if key not in wanted or key in seen:
+            continue
+        seen.add(key)
+        chosen.append(group)
+    return chosen
+
+
+def groups_for_refill(plan: PrefitPlan, status) -> list:
+    """Refill groups named by the Draft.
+
+    A present id list is the only selector. An older receipt without that
+    list can still refill H from ``produces_h``. It does not infer layers.
+    """
+    if not isinstance(status, dict):
+        return []
+    ids = status.get("refill_groups")
+    if isinstance(ids, list):
+        return groups_by_id(plan, ids)
+    return groups_for_missing(plan, status.get("missing_h"), [])
+
+
+def _parse_group_id(item):
+    if not isinstance(item, (list, tuple)) or not item or not isinstance(item[0], str):
+        return None
+    kind = item[0]
+    try:
+        if kind == "v" and len(item) == 4:
+            return ("v", int(item[1]), int(item[2]), int(item[3]))
+        if kind == "w" and len(item) == 3:
+            return ("w", int(item[1]), int(item[2]))
+        if kind == "warm" and len(item) == 2:
+            return ("warm", int(item[1]))
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _group_id(group: dict):
     kind = group["kind"]
+    if kind == "v":
+        return ("v", int(group["b"]), int(group["prefix"]), int(group["k"]))
+    if kind == "w":
+        return ("w", int(group["b"]), int(group["prefix"]))
+    return (kind, int(group.get("b") or 0))
+
+
+def _rid(group: dict, n: int, run: str) -> str:
+    kind = group["kind"]
+    size = int(group["b"])
     if kind == "warm":
-        return f"clearfit-warm-{int(group['b'])}-{int(n)}"
+        return f"clearfit-{run}-warm-{size}-{int(n)}"
     if kind == "v":
         return (
-            f"clearfit-v-{int(group['b'])}-{int(group['prefix'])}-"
+            f"clearfit-{run}-v-{size}-{int(group['prefix'])}-"
             f"{int(group['k'])}-{int(n)}"
         )
     if kind == "w":
-        return f"clearfit-w-{int(group['b'])}-{int(group['prefix'])}-{int(n)}"
-    return f"clearfit-done-{int(n)}"
+        return f"clearfit-{run}-w-{size}-{int(group['prefix'])}-{int(n)}"
+    return f"clearfit-{run}-{kind}-{int(n)}"
 
 
 def _request(
@@ -199,12 +476,19 @@ def _server_idle(url: str, api_key: Optional[str] = None) -> bool:
     return running == 0 and waiting == 0
 
 
-def _steps(payload) -> int:
+def _steps(payload, *, verify_only: bool = False) -> int:
+    if isinstance(payload, list):
+        if not payload:
+            return 0
+        return min(_steps(item, verify_only=verify_only) for item in payload)
     meta = payload.get("meta_info") if isinstance(payload, dict) else None
     if not isinstance(meta, dict):
         meta = {}
-    if meta.get("spec_verify_ct") is not None:
-        return int(meta["spec_verify_ct"])
+    count = meta.get("spec_verify_ct")
+    if verify_only:
+        return count if type(count) is int and count >= 0 else 0
+    if count is not None:
+        return int(count)
     if meta.get("completion_tokens") is not None:
         return int(meta["completion_tokens"])
     if isinstance(payload, dict) and payload.get("completion_tokens") is not None:
@@ -219,7 +503,13 @@ def _tokens(rng: random.Random, length: int, token_range: Tuple[int, int]) -> li
     return [rng.randrange(lo, hi) for _ in range(max(int(length), 1))]
 
 
-def _post_payload(url: str, payload: dict, api_key: Optional[str] = None) -> int:
+def _post_payload(
+    url: str,
+    payload: dict,
+    api_key: Optional[str] = None,
+    *,
+    verify_only: bool = False,
+) -> int:
     try:
         body = _request(url + "/generate", "POST", payload, 600.0, api_key)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
@@ -227,37 +517,34 @@ def _post_payload(url: str, payload: dict, api_key: Optional[str] = None) -> int
             "[CLEAR] prefit request failed rid=%s", payload.get("rid"), exc_info=True
         )
         return 0
-    return _steps(body)
+    return _steps(body, verify_only=verify_only)
 
 
-def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random) -> dict:
-    need = 7 if group["kind"] == "v" else 20 if group["kind"] == "w" else 0
+def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random, run: str, n0: int) -> dict:
+    """One batched generate. ``n0`` is the first rid counter for this try."""
+    is_verify = group["kind"] == "v"
+    need = _VERIFY_ROUNDS if is_verify else 20 if group["kind"] == "w" else 0
     size = int(group["b"])
     attempts = 0
-    steps = []
+    steps = 0
     limit = max(int(cfg.retries), 1)
     while attempts < limit:
         attempts += 1
-        base = (attempts - 1) * size
-        payloads = [
-            {
-                "input_ids": _tokens(rng, int(group.get("prefix") or 8), cfg.token_range),
-                "rid": _rid(group, base + index),
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": int(group["max_new"]),
-                    "ignore_eos": True,
-                },
-            }
-            for index in range(size)
-        ]
-        with ThreadPoolExecutor(max_workers=size) as pool:
-            futures = [
-                pool.submit(_post_payload, cfg.url, payload, cfg.api_key)
-                for payload in payloads
-            ]
-            steps = [int(future.result()) for future in futures]
-        if need == 0 or (steps and min(steps) >= need):
+        base = int(n0) + (attempts - 1) * size
+        payload = {
+            "input_ids": [
+                _tokens(rng, int(group.get("prefix") or 8), cfg.token_range)
+                for _ in range(size)
+            ],
+            "rid": [_rid(group, base + index, run) for index in range(size)],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": int(group["max_new"]),
+                "ignore_eos": True,
+            },
+        }
+        steps = _post_payload(cfg.url, payload, cfg.api_key, verify_only=is_verify)
+        if need == 0 or steps >= need:
             break
     record = {
         "kind": group["kind"],
@@ -269,11 +556,153 @@ def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random) -> dict:
     return record
 
 
-def run_prefit(cfg: PrefitConfig) -> list:
-    """Wait until the server is idle, then run the schedule. Do not abort traffic.
+def _post_control(
+    cfg: PrefitConfig,
+    run: str,
+    kind: str,
+    seq: int,
+    rng: random.Random,
+    fingerprint: str = "",
+) -> Optional[dict]:
+    """POST one control op. The response body is the fit status, when present."""
+    del rng
+    payload = {
+        "op": kind,
+        "run": run,
+        "seq": int(seq),
+        "fingerprint": str(fingerprint or ""),
+    }
+    try:
+        body = _request(
+            cfg.url + "/clear_tree_control",
+            "POST",
+            payload,
+            float(cfg.fit_timeout_s),
+            cfg.api_key,
+        )
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        logger.warning("[CLEAR] prefit %s request failed", kind, exc_info=True)
+        return None
+    if isinstance(body, dict) and (
+        "reason" in body or "ready" in body or "state" in body
+    ):
+        return body
+    return None
 
-    The done request is sent after the server is ready, including when an
-    earlier group raises. A wait timeout does not send it.
+
+def _is_committed(status) -> bool:
+    return isinstance(status, dict) and (
+        status.get("ready") is True
+        or status.get("written") is True
+        or status.get("reason") == "committed"
+    )
+
+
+def _send_control(cfg, run, kind, seq, rng, fingerprint, submit_control):
+    if submit_control is not None:
+        return submit_control(kind, run, int(seq), str(fingerprint))
+    return _post_control(cfg, run, kind, int(seq), rng, fingerprint=str(fingerprint))
+
+
+def _recover_commit(cfg, plan, run, seq, rng, wait_status, submit_control):
+    """Resend the same commit, then ask for status. A missing body is not acceptance."""
+    resent = _send_control(
+        cfg, run, "commit", seq, rng, plan.fingerprint, submit_control
+    )
+    status = resent if isinstance(resent, dict) and "reason" in resent else None
+    if status is None and wait_status is not None:
+        status = wait_status(run, int(seq), float(cfg.fit_timeout_s))
+    if _is_committed(status):
+        return status
+    queried = _send_control(
+        cfg, run, "status", seq, rng, plan.fingerprint, submit_control
+    )
+    if isinstance(queried, dict) and ("reason" in queried or "ready" in queried):
+        return queried
+    if wait_status is None:
+        return status
+    return wait_status(run, int(seq), float(cfg.fit_timeout_s))
+
+
+def _exchange(cfg, plan, run, op, seq, rng, wait_status, submit_control, recover=False):
+    if submit_control is not None:
+        sent = submit_control(op, run, int(seq), plan.fingerprint)
+        if isinstance(sent, dict) and ("reason" in sent or "ready" in sent):
+            return sent
+        if wait_status is None:
+            if recover and op == "commit":
+                return _recover_commit(
+                    cfg, plan, run, seq, rng, None, submit_control
+                )
+            return None
+        status = wait_status(run, int(seq), float(cfg.fit_timeout_s))
+        if status is None and recover and op == "commit":
+            return _recover_commit(
+                cfg, plan, run, seq, rng, wait_status, submit_control
+            )
+        return status
+    sent = _post_control(cfg, run, op, int(seq), rng, fingerprint=plan.fingerprint)
+    if isinstance(sent, dict) and ("reason" in sent or "ready" in sent):
+        return sent
+    if sent is True and op == "begin":
+        return {"reason": "begun", "ready": False, "run": run, "seq": int(seq)}
+    if sent is False or sent is None:
+        if recover and op == "commit":
+            return _recover_commit(cfg, plan, run, seq, rng, wait_status, submit_control)
+        return None
+    if wait_status is None:
+        if op == "commit":
+            return _recover_commit(cfg, plan, run, seq, rng, None, submit_control)
+        return None
+    status = wait_status(run, int(seq), float(cfg.fit_timeout_s))
+    if status is None and recover and op == "commit":
+        return _recover_commit(cfg, plan, run, seq, rng, wait_status, submit_control)
+    return status
+
+
+def _attempt(cfg, plan, run, rng, wait_status, counters, submit_control=None) -> str:
+    groups = list(plan.groups)
+    for _commit in range(3):
+        try:
+            for group in groups:
+                key = _group_id(group)
+                n0 = int(counters.get(key, 0))
+                record = _run_group(cfg, group, rng, run, n0)
+                counters[key] = n0 + int(group["b"]) * int(record["retries"])
+        except Exception:
+            logger.warning("[CLEAR] prefit group failed", exc_info=True)
+            return "request_error"
+        seq = int(counters.get(("commit",), 0)) + 1
+        counters[("commit",)] = seq
+        status = _exchange(
+            cfg, plan, run, "commit", seq, rng, wait_status, submit_control, recover=True
+        )
+        if not isinstance(status, dict):
+            return "timeout"
+        if _is_committed(status):
+            return "ready"
+        reason = status.get("reason")
+        if reason == "missing":
+            groups = groups_for_refill(plan, status)
+            if not groups:
+                return "missing"
+            continue
+        return str(reason or "rejected")
+    return "missing"
+
+
+def run_prefit(
+    cfg: PrefitConfig,
+    plan: Optional[PrefitPlan] = None,
+    wait_status: Optional[Callable] = None,
+    submit_control: Optional[Callable] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Sweep, then commit. HTTP 200 is not acceptance.
+
+    A wait that fails before the first group does not commit or abandon.
+    A group error does not commit; that uncommitted run is abandoned.
+    A commit that might already have landed is queried, not cancelled.
     """
     logger.info("[CLEAR] prefit waiting for %s", cfg.url)
     _wait_until(
@@ -284,26 +713,47 @@ def run_prefit(cfg: PrefitConfig) -> list:
     )
     started = time.monotonic()
     rng = random.Random(int(cfg.seed))
-    groups = build_schedule(cfg)
-    body = [group for group in groups if group["kind"] != "done"]
-    done = [group for group in groups if group["kind"] == "done"]
-    summary = []
-    try:
-        for group in body:
-            summary.append(_run_group(cfg, group, rng))
-    finally:
-        for group in done:
-            try:
-                summary.append(_run_group(cfg, group, rng))
-            except Exception:
-                logger.warning("[CLEAR] prefit done request failed", exc_info=True)
-        elapsed = time.monotonic() - started
-        logger.info(
-            "[CLEAR] prefit driver finished groups=%d elapsed_s=%.3f",
-            len(summary),
-            elapsed,
+    plan = plan if plan is not None else plan_from_config(cfg)
+    counters = {}
+    last = "failed"
+    session = str(session_id or "local")
+    for attempt in (1, 2):
+        run = make_run_id(session, plan.fingerprint, f"{int(attempt)}{time.time_ns()}")
+        begun = _exchange(
+            cfg, plan, run, "begin", 0, rng, wait_status, submit_control, recover=False
         )
-    return summary
+        if not (
+            isinstance(begun, dict)
+            and (begun.get("reason") == "begun" or begun.get("ready") is True)
+        ):
+            last = "begin_failed" if begun is None else str(begun.get("reason") or "begin_failed")
+            if _is_committed(begun):
+                return "ready"
+            continue
+        last = _attempt(cfg, plan, run, rng, wait_status, counters, submit_control)
+        if last == "ready":
+            logger.info(
+                "[CLEAR] prefit driver finished state=ready elapsed_s=%.3f",
+                time.monotonic() - started,
+            )
+            return "ready"
+        if last == "timeout":
+            logger.info(
+                "[CLEAR] prefit driver finished state=failed reason=timeout elapsed_s=%.3f",
+                time.monotonic() - started,
+            )
+            return "timeout"
+        seq = int(counters.get(("abandon",), 0)) + 1
+        counters[("abandon",)] = seq
+        _exchange(
+            cfg, plan, run, "abandon", seq, rng, wait_status, submit_control, recover=False
+        )
+    logger.info(
+        "[CLEAR] prefit driver finished state=failed reason=%s elapsed_s=%.3f",
+        last,
+        time.monotonic() - started,
+    )
+    return last
 
 
 def _parse_args(argv=None) -> PrefitConfig:
@@ -336,6 +786,25 @@ def _parse_args(argv=None) -> PrefitConfig:
     )
 
 
+def _cli_wait(cfg: PrefitConfig, fingerprint: str):
+    """Status query on the same control POST the commit uses."""
+
+    def _wait(run, seq, timeout):
+        del timeout
+        return _post_control(
+            cfg, run, "status", int(seq), random.Random(0), fingerprint=fingerprint
+        )
+
+    return _wait
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run_prefit(_parse_args())
+    _cfg = _parse_args()
+    _plan = plan_from_config(_cfg)
+    run_prefit(
+        _cfg,
+        plan=_plan,
+        wait_status=_cli_wait(_cfg, _plan.fingerprint),
+        session_id=f"cli{time.time_ns()}",
+    )
