@@ -1,0 +1,29 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "prefit_rank0_once": true,
+  "fit_schema": 3,
+  "fit_ells_match_samples": true,
+  "fit_written_once": true,
+  "fit_has_no_q": true,
+  "fit_unchanged_after_write": true,
+  "fit_write_path_graph_only": true,
+  "h_curve_on": true,
+  "formal_hold_invalid": 0,
+  "formal_prefit_tag": 0,
+  "policy_fields_present": true,
+  "policy_split_equals_total": true,
+  "close_deferred_true_on_assigned_rounds": true,
+  "depth_src_only_cell_pooled_none_before_reply": true,
+  "same_processes": true,
+  "not_observed": [
+    "stashed_fit_file",
+    "installed_hold_cells_from_old_file",
+    "second_wrote_fit_file",
+    "close_deferred_false",
+    "curve_off"
+  ]
+}

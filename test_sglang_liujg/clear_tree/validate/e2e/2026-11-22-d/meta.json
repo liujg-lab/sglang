@@ -1,0 +1,20 @@
+{
+  "run_id": "2026-11-22-d",
+  "experiment": "e2e",
+  "voided": false,
+  "void_reason": "",
+  "bonus_prediction": true,
+  "ledger": true,
+  "kv_reuse": true,
+  "lookahead": false,
+  "defer_close": true,
+  "layer_depth": true,
+  "h_curve": true,
+  "graph_bs": [1, 2, 4],
+  "max_running_requests": 4,
+  "temperature": 0,
+  "max_items": 100,
+  "max_new_tokens": 1024,
+  "datasets": ["RSTeller", "WaterCaption"],
+  "reuse_fit_file": false
+}
