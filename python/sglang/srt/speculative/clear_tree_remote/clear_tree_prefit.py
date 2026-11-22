@@ -551,6 +551,7 @@ def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random, run: str, n0:
         "b": size,
         "steps": steps,
         "retries": attempts,
+        "step_target_met": steps >= need,
     }
     logger.info("[CLEAR] prefit group %s", record)
     return record
@@ -662,6 +663,7 @@ def _exchange(cfg, plan, run, op, seq, rng, wait_status, submit_control, recover
 
 def _attempt(cfg, plan, run, rng, wait_status, counters, submit_control=None) -> str:
     groups = list(plan.groups)
+    refill_after_seq = None
     for _commit in range(3):
         try:
             for group in groups:
@@ -669,6 +671,20 @@ def _attempt(cfg, plan, run, rng, wait_status, counters, submit_control=None) ->
                 n0 = int(counters.get(key, 0))
                 record = _run_group(cfg, group, rng, run, n0)
                 counters[key] = n0 + int(group["b"]) * int(record["retries"])
+                if refill_after_seq is not None:
+                    logger.info(
+                        "[CLEAR prefit_refill_group] %s",
+                        json.dumps(
+                            {
+                                "run": run,
+                                "commit_seq": refill_after_seq,
+                                "group_id": key,
+                                "attempts": record["retries"],
+                                "steps": record["steps"],
+                                "step_target_met": record["step_target_met"],
+                            }
+                        ),
+                    )
         except Exception:
             logger.warning("[CLEAR] prefit group failed", exc_info=True)
             return "request_error"
@@ -677,17 +693,29 @@ def _attempt(cfg, plan, run, rng, wait_status, counters, submit_control=None) ->
         status = _exchange(
             cfg, plan, run, "commit", seq, rng, wait_status, submit_control, recover=True
         )
-        if not isinstance(status, dict):
-            return "timeout"
-        if _is_committed(status):
+        committed = _is_committed(status)
+        status = status if isinstance(status, dict) else {"reason": "timeout"}
+        reason = str(status.get("reason") or "rejected")
+        groups = groups_for_refill(plan, status) if reason == "missing" else []
+        logger.info(
+            "[CLEAR prefit_commit] %s",
+            json.dumps(
+                {
+                    "run": run,
+                    "seq": seq,
+                    "ready": committed,
+                    "reason": reason,
+                    "missing_h": status.get("missing_h", []),
+                    "missing_layers": status.get("missing_layers", []),
+                    "refill_groups": [_group_id(group) for group in groups],
+                }
+            ),
+        )
+        if committed:
             return "ready"
-        reason = status.get("reason")
-        if reason == "missing":
-            groups = groups_for_refill(plan, status)
-            if not groups:
-                return "missing"
-            continue
-        return str(reason or "rejected")
+        if reason != "missing" or not groups:
+            return reason
+        refill_after_seq = seq
     return "missing"
 
 

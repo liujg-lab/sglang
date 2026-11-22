@@ -1442,33 +1442,38 @@ def _ensure_fit_runtime(scheduler) -> None:
         scheduler._clear_fit_next_at = 0.0
 
 
-def set_fit_state(scheduler, state: str, reason=None, run=None) -> None:
+def set_fit_state(scheduler, state: str, reason=None, run=None, *, session=None) -> None:
     """Log one line each time the fit handshake changes."""
-    _ensure_fit_runtime(scheduler)
-    if run is not None:
-        scheduler._clear_fit_run = run
-    if reason is not None:
-        scheduler._clear_fit_reason = reason
-    previous = (
-        scheduler._clear_fit_state,
-        scheduler._clear_fit_reason,
-        scheduler._clear_fit_run,
-    )
-    scheduler._clear_fit_state = state
-    current = (state, scheduler._clear_fit_reason, scheduler._clear_fit_run)
-    if current == previous:
+    current_session = str(getattr(scheduler, "sr_session_id", "") or "")
+    if session is not None and session != current_session:
         return
-    logger.info(
-        "[CLEAR fit_state] %s",
-        json.dumps(
-            {
-                "state": state,
-                "run": scheduler._clear_fit_run,
-                "reason": scheduler._clear_fit_reason,
-            },
-            ensure_ascii=False,
-        ),
-    )
+    _ensure_fit_runtime(scheduler)
+    snapshot = (current_session, state, reason, run)
+    previous = getattr(scheduler, "_clear_fit_snapshot", None)
+    scheduler._clear_fit_state = state
+    scheduler._clear_fit_reason = reason
+    scheduler._clear_fit_run = run
+    scheduler._clear_fit_snapshot = snapshot
+    if snapshot != previous:
+        logger.info(
+            "[CLEAR fit_state] %s",
+            json.dumps(
+                {
+                    "state": state,
+                    "run": run,
+                    "reason": reason,
+                    "session": current_session,
+                }
+            ),
+        )
+
+
+def mirror_fit_terminal(scheduler, snapshot) -> None:
+    if snapshot is None:
+        return
+    session, state, reason, run = snapshot
+    if state in ("ready", "failed"):
+        set_fit_state(scheduler, state, reason=reason, run=run, session=session)
 
 
 def fit_handshake_status(scheduler) -> dict:
@@ -1534,11 +1539,7 @@ def pop_control(scheduler):
 
 
 def start_prefit_driver(scheduler) -> bool:
-    """Start the scan on rank 0. ``prefitting`` is set only after the thread starts.
-
-    The retry budget belongs to the current Target session. A new session can
-    scan again. A rank other than 0 never starts a thread.
-    """
+    """Start a rank-0 scan within the current Target session's retry budget."""
     if int(getattr(scheduler, "tp_rank", 0) or 0) != 0:
         return False
     if os.environ.get("SGLANG_CLEAR_AUTO_PREFIT", "").strip() == "0":
@@ -1552,8 +1553,12 @@ def start_prefit_driver(scheduler) -> bool:
     if current is not None and current.is_alive():
         return False
     cfg = prefit_config(scheduler)
+    active_run = None
 
     def _submit(op, run, seq, fingerprint):
+        nonlocal active_run
+        if op == "begin":
+            active_run = run
         enqueue_control(
             scheduler,
             {
@@ -1584,16 +1589,18 @@ def start_prefit_driver(scheduler) -> bool:
             logger.warning("[CLEAR] prefit failed", exc_info=True)
             result = "failed"
         if result == "ready":
-            set_fit_state(scheduler, "ready", reason="prefit")
+            set_fit_state(scheduler, "ready", reason="prefit", run=active_run, session=session)
         else:
-            set_fit_state(scheduler, "failed", reason=str(result))
+            set_fit_state(
+                scheduler, "failed", reason=str(result), run=active_run, session=session
+            )
 
     thread = threading.Thread(target=_run, name="clear-prefit", daemon=True)
     scheduler._clear_prefit_thread = thread
-    thread.start()
     scheduler._clear_prefit_spent_session = session
     set_fit_state(scheduler, "prefitting", reason="need_prefit")
     logger.info("[CLEAR] prefit started")
+    thread.start()
     return True
 
 

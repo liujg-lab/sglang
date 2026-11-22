@@ -985,6 +985,33 @@ class ClearTreeFitFileTest(CustomTestCase):
         scheduler.server_args.api_key = "  "
         self.assertIsNone(fit.prefit_config(scheduler).api_key)
 
+    def test_prefit_driver_publishes_terminal_state_for_its_run(self):
+        class ImmediateThread(_Thread):
+            def start(self):
+                self.target()
+
+        for current_session in ("sess", "new-session"):
+            with self.subTest(session=current_session):
+                scheduler = self._scheduler()
+                scheduler.sr_session_id = "sess"
+
+                def run_prefit(_cfg, *, submit_control, **_kwargs):
+                    submit_control("begin", "run", 0, "fingerprint")
+                    scheduler.sr_session_id = current_session
+                    return "ready"
+
+                with patch.object(fit.threading, "Thread", ImmediateThread), patch.object(
+                    prefit, "run_prefit", side_effect=run_prefit
+                ), patch.dict(os.environ, {"SGLANG_CLEAR_AUTO_PREFIT": "1"}):
+                    self.assertTrue(fit.start_prefit_driver(scheduler))
+
+                expected = (
+                    ("sess", "ready", "prefit", "run")
+                    if current_session == "sess"
+                    else ("sess", "prefitting", "need_prefit", None)
+                )
+                self.assertEqual(scheduler._clear_fit_snapshot, expected)
+
     def test_same_target_keeps_fits(self):
         scheduler = self._scheduler()
         header = fit.target_info(scheduler)
@@ -1137,7 +1164,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         def fake_group(group_cfg, group, rng, run, n0):
             del group_cfg, rng, run
             seen.append((group["kind"], group.get("k"), n0))
-            return {"kind": group["kind"], "b": group["b"], "steps": 8, "retries": 1}
+            return {"steps": 8, "retries": 1, "step_target_met": True}
 
         def fake_control(group_cfg, run, kind, seq, rng, fingerprint=""):
             del group_cfg, rng, fingerprint
@@ -1150,6 +1177,7 @@ class ClearTreeFitFileTest(CustomTestCase):
                 "reason": "missing",
                 "missing_h": [[1, 8, 256]],
                 "missing_layers": [],
+                "refill_groups": [["v", 1, 128, 8]],
             },
             {"ready": True, "reason": "ready"},
         ]
@@ -1160,9 +1188,38 @@ class ClearTreeFitFileTest(CustomTestCase):
 
         with patch.object(prefit, "_wait_until"), patch.object(
             prefit, "_run_group", side_effect=fake_group
-        ), patch.object(prefit, "_post_control", side_effect=fake_control):
+        ), patch.object(prefit, "_post_control", side_effect=fake_control), self.assertLogs(
+            prefit.logger, level="INFO"
+        ) as logs:
             result = prefit.run_prefit(cfg, plan=plan, wait_status=wait_status)
         self.assertEqual(result, "ready")
+        commits = [
+            json.loads(entry.split("[CLEAR prefit_commit] ", 1)[1])
+            for entry in logs.output
+            if "[CLEAR prefit_commit]" in entry
+        ]
+        refills = [
+            json.loads(entry.split("[CLEAR prefit_refill_group] ", 1)[1])
+            for entry in logs.output
+            if "[CLEAR prefit_refill_group]" in entry
+        ]
+        self.assertEqual([event["reason"] for event in commits], ["missing", "ready"])
+        self.assertEqual(commits[0]["missing_h"], [[1, 8, 256]])
+        self.assertEqual(commits[0]["refill_groups"], [["v", 1, 128, 8]])
+        self.assertEqual(commits[1]["refill_groups"], [])
+        self.assertEqual(
+            refills,
+            [
+                {
+                    "run": commits[0]["run"],
+                    "commit_seq": 1,
+                    "group_id": ["v", 1, 128, 8],
+                    "attempts": 1,
+                    "steps": 8,
+                    "step_target_met": True,
+                }
+            ],
+        )
         kinds = [item[0] for item in seen]
         self.assertIn("v", kinds)
         rerun = [item for item in seen if item[1] == 8]

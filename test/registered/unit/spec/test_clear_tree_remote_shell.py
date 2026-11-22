@@ -99,6 +99,151 @@ def _source_methods(relative_path, class_name, names, namespace=None):
 
 
 class ClearTreeRemoteShellTest(CustomTestCase):
+    def test_prefit_terminal_state_uses_the_existing_idle_collective(self):
+        import time
+        from collections import deque
+
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_fit as fit
+
+        idle = _source_methods(
+            "python/sglang/srt/speculative/clear_tree_remote/clear_tree_scheduler.py",
+            "ClearTreeSchedulerMixin",
+            {"_clear_service_idle"},
+            {"time": time},
+        )["_clear_service_idle"]
+        wire = deque()
+
+        def broadcast(rank, value):
+            if rank == 0:
+                wire.append(value)
+                return value
+            return wire.popleft()
+
+        def make_rank(rank):
+            return SimpleNamespace(
+                tp_rank=rank,
+                tp_size=2,
+                sr_session_id="sess",
+                sr_speculation_stopped=False,
+                _sr_broadcast_obj=lambda value: broadcast(rank, value),
+                _clear_send_control=Mock(),
+                _clear_fit_query=Mock(),
+            )
+
+        leader, follower = make_rank(0), make_rank(1)
+        for scheduler in (leader, follower):
+            fit.set_fit_state(scheduler, "prefitting", reason="need_prefit")
+
+        def tick():
+            idle(leader)
+            self.assertEqual(len(wire), 2)
+            idle(follower)
+            self.assertFalse(wire)
+
+        control = {"op": "commit", "run": "run", "seq": 1}
+        missing = {"run": "run", "seq": 1, "ready": False, "reason": "missing"}
+        fit.enqueue_control(leader, control)
+        for scheduler in (leader, follower):
+            scheduler._clear_send_control.return_value = SimpleNamespace(
+                fit_status=missing
+            )
+        tick()
+        self.assertEqual(fit.wait_fit_status(leader, "run", 1, 0), missing)
+        self.assertIsNone(fit.wait_fit_status(follower, "run", 1, 0))
+        self.assertEqual(follower._clear_fit_state, "prefitting")
+
+        fit.set_fit_state(leader, "ready", reason="prefit", run="run")
+        tick()
+        self.assertEqual(
+            follower._clear_fit_snapshot, ("sess", "ready", "prefit", "run")
+        )
+        fit.set_fit_state(leader, "failed", reason="write_failed", run="run2")
+        tick()
+        self.assertEqual(follower._clear_fit_snapshot, leader._clear_fit_snapshot)
+
+        follower.sr_session_id = "other"
+        fit.set_fit_state(follower, "prefitting", reason="need_prefit")
+        tick()
+        self.assertEqual(follower._clear_fit_state, "prefitting")
+        for scheduler in (leader, follower):
+            scheduler._clear_send_control.assert_called_once_with(control)
+            scheduler._clear_fit_query.assert_not_called()
+
+    def test_acceptance_distinguishes_scan_refill_and_fit_reuse(self):
+        import io
+        import json
+        import runpy
+        import tempfile
+        from contextlib import redirect_stdout
+
+        script = (
+            Path(__file__).resolve().parents[4]
+            / ".cursor/skills/clear-tree-e2e-validation/scripts/accept_logs.py"
+        )
+        report = runpy.run_path(str(script))["server_report"]
+        run = "run"
+        group = ["v", 1, 128, 8]
+
+        def event(marker, value):
+            return f"[2026-11-21 15:03:21 TP0] [CLEAR {marker}] " + json.dumps(value)
+
+        leader = event("fit_state", {"state": "ready", "reason": "prefit", "run": run})
+        wrote = "[2026-11-21 15:04:56] [CLEAR] wrote fit file cells=90"
+        installed = "[2026-11-21 15:04:56] [CLEAR] installed 90 hold cells from the fit file"
+        scan = '[2026-11-21 15:04:55] [CLEAR ledger d_round] {"prefit": null}'
+        tail = '[2026-11-21 15:11:18] [CLEAR ledger d_round] {"prefit": {"run": "run"}}'
+        serving = '[2026-11-21 15:11:19] [CLEAR ledger d_round] {"prefit": null}'
+        missing = event(
+            "prefit_commit", {"run": run, "seq": 1, "refill_groups": [group]}
+        )
+        refill = event(
+            "prefit_refill_group",
+            {
+                "run": run,
+                "commit_seq": 1,
+                "group_id": group,
+                "attempts": 2,
+                "step_target_met": False,
+            },
+        )
+        committed = {"run": run, "ready": True, "refill_groups": []}
+        ready = event("prefit_commit", {**committed, "seq": 1})
+        next_ready = event("prefit_commit", {**committed, "seq": 2})
+        follower = leader.replace("TP0", "TP1")
+
+        def read_report(target, draft):
+            with tempfile.TemporaryDirectory() as directory:
+                target_log = Path(directory, "target.log")
+                draft_log = Path(directory, "draft.log")
+                target_log.write_text("\n".join(target), encoding="utf-8")
+                draft_log.write_text("\n".join(draft), encoding="utf-8")
+                with redirect_stdout(io.StringIO()) as output:
+                    target_fit = report(target_log, "target", 20.0)
+                    report(draft_log, "draft", 20.0, target_fit)
+                return output.getvalue()
+
+        draft = [scan, wrote, tail, serving]
+        result = read_report([missing, refill, refill, next_ready, leader, follower], draft)
+        self.assertIn("prefit_status scanned_ready", result)
+        self.assertIn("tp0=ready run=run tp1=ready run=run", result)
+        self.assertIn(
+            "refill_groups=1 requested=1 executions=1 http_attempts=2 step_target_met=0",
+            result,
+        )
+        self.assertEqual(result.count("formal_segment 1 "), 2)
+        self.assertIn("rounds=1", result)
+        self.assertNotIn("formal_segment 2 ", result)
+        self.assertIn("refill_groups=unobserved", read_report([leader], draft))
+        self.assertIn("refill_groups=0", read_report([ready, leader], draft))
+        reused = event("fit_state", {"state": "ready", "reason": "ready"})
+        result = read_report([reused], [installed, serving])
+        self.assertIn("prefit_status reused", result)
+        self.assertIn("refill_groups=0", result)
+        failed = event("fit_state", {"state": "failed", "reason": "write_failed"})
+        result = read_report([missing, failed], [tail])
+        self.assertIn("prefit_status failed", result)
+        self.assertIn("refill_groups=unobserved requested=1", result)
+
     def test_algorithm_is_distinct(self):
         clear = SpeculativeAlgorithm.from_string("CLEAR_TREE_REMOTE")
         opt = SpeculativeAlgorithm.from_string("OPT_TREE_REMOTE")

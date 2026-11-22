@@ -214,11 +214,6 @@ def keep_by_net_benefit(
     if not growing:
         return []
     price = float(theta)
-    slope_of = (
-        kappa
-        if callable(kappa)
-        else (lambda _m: 0.0 if kappa is None else float(kappa))
-    )
     joint = {}
     gains = {}
     for k, spent in verify_times.items():
@@ -235,15 +230,24 @@ def keep_by_net_benefit(
     if not joint:
         return None
     stop_value = max(joint.values())
+    if len(growing) == 1:
+        row = growing[0]
+        cost = layer_cost(1, int(row["ell"]))
+        if cost is None:
+            return None
+        charge = price * float(cost)
+        next_value = max(base + gains[k][id(row)] - charge for k, base in joint.items())
+        return [row["item"]] if next_value > stop_value else []
+
+    slopes = [
+        float((kappa(m) if callable(kappa) else kappa) or 0.0)
+        for m in range(1, len(growing) + 1)
+    ]
+    costs = {}
     best = None
-    any_cost = False
     for k, base in joint.items():
         orders = {}
-        for m in range(1, len(growing) + 1):
-            slope = slope_of(m)
-            if slope is None:
-                slope = 0.0
-            slope = float(slope)
+        for m, slope in enumerate(slopes, start=1):
             ranked = orders.get(slope)
             if ranked is None:
                 ranked = []
@@ -258,15 +262,17 @@ def keep_by_net_benefit(
             chosen = ranked[:m]
             running_gain = sum(item[1] for item in chosen)
             running_ell = sum(item[2] for item in chosen)
-            cost = layer_cost(m, running_ell)
+            cost_key = (m, running_ell)
+            if cost_key not in costs:
+                costs[cost_key] = layer_cost(*cost_key)
+            cost = costs[cost_key]
             if cost is None:
                 continue
-            any_cost = True
             value = base + running_gain - price * float(cost)
             choice = (value, int(k), int(m))
             if best is None or choice > best[0]:
                 best = (choice, [item[3] for item in chosen])
-    if not any_cost or best is None:
+    if best is None:
         return None
     if best[0][0] > stop_value:
         return list(best[1])
@@ -281,6 +287,7 @@ def select_continuing(
     verify_times: Dict[int, float],
     layer_cost,
     kappa: Optional[Union[float, Callable]],
+    scores_for=None,
 ) -> Optional[list]:
     """Requests to forward, or None when no candidate has a layer cost.
 
@@ -295,16 +302,15 @@ def select_continuing(
             continue
         timed.append(int(key))
     ratio = gain_ratio()
+    scores_for = _score_paths if scores_for is None else scores_for
     requests = []
-    for state in list(all_states):
-        scores = _path_scores(state)
-        ordered = sorted(scores, reverse=True)
+    for state in all_states:
+        _, ordered, latest = scores_for(state)
         prefix = []
         running = 0.0
         for value in ordered:
-            running += float(value)
+            running += value
             prefix.append(running)
-        latest = _latest_scores(state)
         mass = {}
         gain = {}
         count = len(ordered)
@@ -963,6 +969,7 @@ class RoundPlan:
         self._at = None
         self._keep_ids = set()
         self._raw_gain: Dict[int, float] = {}
+        self._score_cache: Dict[int, tuple] = {}
         self._frozen_k = None
 
     @property
@@ -990,7 +997,19 @@ class RoundPlan:
         self._peers = list(states)
         self._at = None
         self._keep_ids = set()
-        self._note_layer_gain(states)
+        # Stopped trees still contribute to J, but their layers no longer change.
+        for state in self._peers:
+            self._score_cache.pop(id(state), None)
+        self._note_layer_gain(self._peers)
+
+    def _scores_for(self, state):
+        key = id(state)
+        depth = int(getattr(state, "depth", 0) or 0)
+        cached = self._score_cache.get(key)
+        if cached is None or cached[0] is not state or cached[1] != depth:
+            cached = (state, depth, _score_paths(state))
+            self._score_cache[key] = cached
+        return cached[2]
 
     def _note_layer_gain(self, states) -> None:
         """Compare the previous flat-K upper bound with this layer's mass.
@@ -1003,12 +1022,18 @@ class RoundPlan:
         )
 
         k = int(flat_k(self.batch))
-        for state in list(states or []):
+        for state in states:
             depth = int(getattr(state, "depth", 0) or 0)
             key = id(state)
+            scores, ordered, latest = self._scores_for(state)
             if depth >= 2 and key in self._raw_gain:
-                _observe_gain(self._raw_gain[key], _quality_increment(state, k), FORGET)
-            self._raw_gain[key] = _raw_marginal(state, k)
+                actual = (
+                    float(sum(ordered[:k])) - _prefix_mass(scores[: -len(latest)], k)
+                    if scores and latest
+                    else 0.0
+                )
+                _observe_gain(self._raw_gain[key], actual, FORGET)
+            self._raw_gain[key] = _raw_marginal_for(ordered, latest, k)
 
     @policy_timed
     def should_grow(self, state) -> bool:
@@ -1062,11 +1087,11 @@ class RoundPlan:
             prefix = int(state.prefix)
         else:
             return
-        scores = _path_scores(state)
+        _, ordered, _ = self._scores_for(state)
         note_verified(
             key,
             prefix,
-            _prefix_mass(scores, self.verify_k(state)),
+            float(sum(ordered[: self.verify_k(state)])),
             int(state.depth),
         )
 
@@ -1085,6 +1110,7 @@ class RoundPlan:
             verify_times=times,
             layer_cost=self._layer_cost,
             kappa=self._kappa(),
+            scores_for=self._scores_for,
         )
         if kept is None:
             if self._continue(eligible):
@@ -1161,19 +1187,24 @@ class RoundPlan:
             return {}
         cap = int(self.cover_k if limit is None else limit)
         values = {}
+        rows = None
+        gain_scale = gain_ratio() if include_gain else None
         for k in VERIFY_KS:
             if int(k) > cap:
                 continue
             spent = self._time(k)
             if spent is None:
                 continue
+            if rows is None:
+                rows = [
+                    (accept_ratio(str(getattr(state, "rid", ""))), self._scores_for(state))
+                    for state in states
+                ]
             benefit = 0.0
-            for state in states:
-                ratio = accept_ratio(str(getattr(state, "rid", "")))
-                scores = _path_scores(state)
-                benefit += ratio * _prefix_mass(scores, k)
-                if include_gain:
-                    benefit += ratio * _marginal_gain(state, k)
+            for ratio, (_, ordered, latest) in rows:
+                benefit += ratio * float(sum(ordered[:k]))
+                if gain_scale is not None:
+                    benefit += ratio * (_raw_marginal_for(ordered, latest, k) * gain_scale)
             values[int(k)] = benefit - float(self.theta_value) * float(spent)
         return values
 
@@ -1472,32 +1503,23 @@ def _prefix_mass(scores: Sequence[float], k: int) -> float:
     return float(sum(ordered[: int(k)]))
 
 
-def _latest_scores(state) -> list:
-    depth = int(getattr(state, "depth", 0) or 0)
-    weight = getattr(state, "weight", None)
-    if depth < 1 or weight is None:
-        return []
-    return [float(value) for value in weight[depth - 1].tolist()]
+def _score_paths(state) -> tuple:
+    scores = _path_scores(state)
+    width = len(scores) // int(state.depth) if scores else 0
+    return scores, sorted(scores, reverse=True), scores[-width:] if width else []
+
+
+def _raw_marginal_for(ordered, latest, k: int) -> float:
+    if not ordered:
+        return 0.0
+    theta_k = ordered[k - 1] if len(ordered) >= k else 0.0
+    return float(sum(max(0.0, score - theta_k) for score in latest))
 
 
 def _raw_marginal(state, k: int) -> float:
     """Upper bound on the newest layer, before the gain ratio."""
-    scores = _path_scores(state)
-    if not scores or int(getattr(state, "depth", 0) or 0) < 1:
-        return 0.0
-    ordered = sorted(scores, reverse=True)
-    theta_k = ordered[int(k) - 1] if len(ordered) >= int(k) else 0.0
-    return float(sum(max(0.0, score - theta_k) for score in _latest_scores(state)))
-
-
-def _quality_increment(state, k: int) -> float:
-    """Top-K mass this layer added, at one flat verify count."""
-    scores = _path_scores(state)
-    latest = _latest_scores(state)
-    if not scores or not latest:
-        return 0.0
-    previous = scores[: -len(latest)] if len(latest) <= len(scores) else []
-    return _prefix_mass(scores, k) - _prefix_mass(previous, k)
+    _, ordered, latest = _score_paths(state)
+    return _raw_marginal_for(ordered, latest, int(k))
 
 
 def _observe_gain(predicted: float, actual: float, forget: float) -> None:

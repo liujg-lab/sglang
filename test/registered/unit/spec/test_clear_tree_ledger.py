@@ -850,6 +850,55 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertTrue(windows[0][0])
         self.assertTrue(windows[1][0])
 
+    def test_each_layer_shape_is_priced_once_across_k(self):
+        times = {8: 1.0, 16: 1.0, 32: 1.0}
+        rows = [
+            {
+                "item": name,
+                "e": dict.fromkeys(times, 1.0),
+                "g": dict.fromkeys(times, gain),
+                "c": 1.0,
+                "ell": prefix,
+            }
+            for name, gain, prefix in (("good", 2.0, 4), ("poor", 0.0, 8))
+        ]
+        for active in (1, 2):
+            with self.subTest(active=active):
+                cost = Mock(side_effect=lambda m, _ell: 0.1 if m == 1 else None)
+                slope = Mock(return_value=0.0)
+                kept = keep_by_net_benefit(
+                    rows[:active],
+                    theta=1.0,
+                    verify_times=times,
+                    layer_cost=cost,
+                    kappa=slope,
+                )
+                self.assertEqual(kept, ["good"])
+                expected = [(1, 4)] if active == 1 else [(1, 4), (2, 12)]
+                self.assertEqual([call.args for call in cost.call_args_list], expected)
+                self.assertEqual(slope.call_count, 0 if active == 1 else 2)
+
+    def test_round_reuses_scores_until_the_next_layer(self):
+        state = _rows_state([[0.5, 0.25], [0.125, 0.0625]], "live", 4)
+        state.depth = 1
+        plan = _value_plan()
+        plan._time = lambda _k: 1.0
+        plan._layer_cost = lambda _active, _ell: 0.1
+        plan.bind_states([state])
+        with patch.object(policy, "_path_scores", wraps=policy._path_scores) as scores:
+            plan.begin_layer([state])
+            plan.should_grow(state)
+            self.assertEqual(plan._values([state], include_gain=False)[8], -0.25)
+            plan.verify_k(state)
+            plan.note(state)
+            scores.assert_called_once_with(state)
+
+            state.depth = 2
+            plan.begin_layer([state])
+            plan.should_grow(state)
+            self.assertEqual(plan._values([state], include_gain=False)[8], -0.0625)
+            self.assertEqual(scores.call_count, 2)
+
     def test_only_the_positive_net_request_continues(self):
         good = _rows_state([[0.5, 0, 0, 0, 0, 0, 0, 0]], "good", 1)
         poor = _rows_state([[0.05, 0, 0, 0, 0, 0, 0, 0]], "poor", 100)

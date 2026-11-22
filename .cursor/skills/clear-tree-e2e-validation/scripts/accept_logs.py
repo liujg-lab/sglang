@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Print ClearTree client totals and log counters for one raw/ directory.
 
-Numbers only. A missing window tail stays ``tail=missing`` and is not printed
-as zero. Formal rounds are the gap-separated ``d_round`` lines after the last
-``prefit finished`` marker. Rank-0 bonus windows before the first formal round
-stay in the prefit bucket; later windows follow the midpoint between rounds.
+Report prefit outcomes and observed refill groups before formal round counters.
+Use Draft log order to exclude scan rounds and the prefit tag to exclude late tails.
 """
 
 from __future__ import annotations
@@ -157,6 +155,16 @@ def load_server_log(path: Path):
     captures = []
     flushes = Counter()
     http_flush = Counter()
+    fit = {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": False,
+        "written": False,
+        "installed": False,
+        "legacy_finished": False,
+        "driver": None,
+    }
     parse_errors = 0
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -168,10 +176,39 @@ def load_server_log(path: Path):
                 flushes[match.group(1)] += 1
             for match in HTTP_FLUSH.finditer(line):
                 http_flush[match.group(1)] += 1
-            if "prefit finished" in line:
+            if "[CLEAR] wrote fit file" in line:
+                fit["written"] = True
                 generation += 1
-                if when is not None:
-                    finish_at = when
+                finish_at = when
+            elif "[CLEAR] prefit finished" in line:
+                fit["legacy_finished"] = True
+                generation += 1
+                finish_at = when
+            elif "[CLEAR] installed " in line and "hold cells from the fit file" in line:
+                fit["installed"] = True
+            elif "[CLEAR] prefit started" in line:
+                fit["started"] = True
+            elif tp in (None, "0") and "[CLEAR] prefit driver finished state=" in line:
+                tail = line.split("prefit driver finished state=", 1)[1]
+                fit["driver"] = tail.strip().partition(" ")[0]
+            for marker, key in (
+                ("[CLEAR fit_state]", "states"),
+                ("[CLEAR prefit_commit]", "commits"),
+                ("[CLEAR prefit_refill_group]", "refills"),
+            ):
+                if marker not in line:
+                    continue
+                try:
+                    event = json.loads(line.split(marker, 1)[1])
+                    if not isinstance(event, dict):
+                        raise ValueError("expected a JSON object")
+                    if key == "states":
+                        fit[key][tp or "0"] = event
+                    elif tp in (None, "0"):
+                        fit[key].append(event)
+                except ValueError:
+                    parse_errors += 1
+                break
             if when is None:
                 continue
             if "[CLEAR ledger d_round]" in line:
@@ -191,13 +228,12 @@ def load_server_log(path: Path):
                     parse_errors += 1
                     continue
                 windows.append((when, reason.group(1), counters))
-    if generation == 0:
-        rounds = [(when, record) for when, record, _ in tagged]
-    else:
-        rounds = [
-            (when, record) for when, record, seen in tagged if seen == generation
-        ]
-    return rounds, windows, finish_at, captures, flushes, http_flush, parse_errors
+    rounds = [
+        (when, record)
+        for when, record, seen in tagged
+        if seen == generation and record.get("prefit") is None
+    ]
+    return rounds, windows, finish_at, captures, flushes, http_flush, fit, parse_errors
 
 
 def print_captures(captures: list) -> None:
@@ -306,28 +342,104 @@ def assign_windows(formal: list, windows: list) -> tuple[list, list]:
     return prefit, buckets
 
 
-def server_report(path: Path | None, role: str, gap_s: float) -> None:
+def refill_group_key(event: dict, group) -> tuple | None:
+    run = event.get("run")
+    if (
+        not isinstance(run, str)
+        or not isinstance(group, list)
+        or not group
+        or any(type(item) not in (str, int) for item in group)
+    ):
+        return None
+    return run, tuple(group)
+
+
+def print_prefit(target: dict, draft: dict, finish_at) -> None:
+    states = target.get("states", {})
+    leader = states.get("0", {})
+    terminal = leader.get("state")
+    driver = target.get("driver")
+    scan_confirmed = driver == "ready" or (
+        terminal == "ready" and leader.get("reason") == "prefit"
+    )
+    if terminal == "failed" or (terminal != "ready" and driver == "failed"):
+        outcome = "failed"
+    elif draft["legacy_finished"] or (draft["written"] and scan_confirmed):
+        outcome = "scanned_ready"
+    elif (
+        terminal == "ready"
+        and draft["installed"]
+        and not target.get("started")
+        and not draft["written"]
+    ):
+        outcome = "reused"
+    else:
+        outcome = "unobserved"
+    finish = "unobserved" if finish_at is None else finish_at.isoformat()
+    print(f"prefit_status {outcome} draft_finished_at={finish}")
+    if states:
+        parts = [
+            f"tp{rank}={value.get('state', 'unobserved')} run={value.get('run') or '-'}"
+            for rank, value in sorted(states.items(), key=lambda item: int(item[0]))
+        ]
+        print("fit_states " + " ".join(parts))
+
+    commits = target.get("commits", [])
+    requested = set()
+    for event in commits:
+        group_ids = event.get("refill_groups")
+        if isinstance(group_ids, list):
+            for group in group_ids:
+                key = refill_group_key(event, group)
+                if key is not None:
+                    requested.add(key)
+    executions = {}
+    for event in target.get("refills", []):
+        key = refill_group_key(event, event.get("group_id"))
+        seq = event.get("commit_seq")
+        if key is not None and type(seq) is int and type(event.get("attempts")) is int:
+            executions[(key, seq)] = event
+    seqs = {event["seq"] for event in commits if type(event.get("seq")) is int}
+    complete = (
+        outcome == "scanned_ready"
+        and seqs == set(range(1, len(seqs) + 1))
+        and any(event.get("ready") is True for event in commits)
+        and all(isinstance(event.get("refill_groups"), list) for event in commits)
+    )
+    requested_count = len(requested) if commits or outcome == "reused" else "unobserved"
+    if executions or outcome == "reused" or (complete and not requested):
+        groups = len({key for key, _ in executions})
+        attempts = sum(event["attempts"] for event in executions.values())
+        met = sum(event.get("step_target_met") is True for event in executions.values())
+        print(
+            f"prefit_refill refill_groups={groups} requested={requested_count} "
+            f"executions={len(executions)} http_attempts={attempts} step_target_met={met}"
+        )
+    else:
+        print(f"prefit_refill refill_groups=unobserved requested={requested_count}")
+
+
+def server_report(path: Path | None, role: str, gap_s: float, target_fit=None):
     if path is None:
         print(f"{role}_log missing")
-        return
-    rounds, windows, finish_at, captures, flushes, http_flush, errors = load_server_log(
-        path
-    )
+        return None
+    (
+        rounds,
+        windows,
+        finish_at,
+        captures,
+        flushes,
+        http_flush,
+        fit,
+        errors,
+    ) = load_server_log(path)
     print(f"{role}_log {path} parse_errors={errors}")
     print_captures(captures)
     if role == "target":
         print_flushes(flushes, http_flush)
-        return
-    if finish_at is None:
-        print("prefit_finished missing")
-    else:
-        print("prefit_finished " + finish_at.strftime("%Y-%m-%d %H:%M:%S"))
-    groups = segments(rounds, gap_s)
-    if groups and all(record.get("prefit") is not None for _, record in groups[0]):
-        tail = groups.pop(0)
-        span = tail[0][0].strftime("%H:%M:%S")
-        print(f"prefit_tail {span} {round_counts(tail)}")
-    formal = groups
+        return fit
+    print_prefit(target_fit or {}, fit, finish_at)
+    formal = segments(rounds, gap_s)
     prefit_windows, buckets = assign_windows(formal, windows)
     print_windows("prefit_windows", prefit_windows)
     for index, group in enumerate(formal, start=1):
@@ -349,8 +461,8 @@ def main() -> None:
         raise SystemExit(f"not a directory: {raw}")
     for directory in trial_dirs(raw):
         client_report(directory)
-    server_report(find_log(raw, "target"), "target", args.gap_s)
-    server_report(find_log(raw, "draft"), "draft", args.gap_s)
+    target_fit = server_report(find_log(raw, "target"), "target", args.gap_s)
+    server_report(find_log(raw, "draft"), "draft", args.gap_s, target_fit)
 
 
 if __name__ == "__main__":

@@ -619,6 +619,7 @@ class ClearTreeSchedulerMixin:
         self._clear_fit_state = "unknown"
         self._clear_fit_reason = None
         self._clear_fit_run = None
+        self._clear_fit_snapshot = None
         self._clear_fit_timeouts = 0
         self._clear_fit_next_at = 0.0
         self._clear_fit_box = {"cond": threading.Condition(), "items": {}}
@@ -1263,6 +1264,7 @@ class ClearTreeSchedulerMixin:
             apply_fit_query,
             fit_query_due,
             mirror_fit_reply,
+            mirror_fit_terminal,
             pop_control,
             publish_fit_status,
         )
@@ -1283,7 +1285,12 @@ class ClearTreeSchedulerMixin:
         if self.tp_size == 1 or self.tp_rank == 0:
             due = fit_query_due(self, now)
         if self.tp_size > 1:
-            due = bool(self._sr_broadcast_obj(due))
+            snapshot = (
+                getattr(self, "_clear_fit_snapshot", None) if self.tp_rank == 0 else None
+            )
+            due, snapshot = self._sr_broadcast_obj((due, snapshot))
+            if self.tp_rank != 0:
+                mirror_fit_terminal(self, snapshot)
         if not due:
             return
         reply = self._clear_fit_query()
