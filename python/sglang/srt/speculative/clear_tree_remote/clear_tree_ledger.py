@@ -372,6 +372,10 @@ class _Round:
         "gap_actions",
         "gap_rpcs",
         "policy_ms",
+        "policy_recv_ms",
+        "policy_plan_ms",
+        "policy_grow_ms",
+        "policy_final_k_ms",
         "post_ms",
         "t_open",
         "t_stop",
@@ -407,6 +411,10 @@ class _Round:
         self.gap_actions: List[str] = []
         self.gap_rpcs: List[int] = []
         self.policy_ms = 0.0
+        self.policy_recv_ms = 0.0
+        self.policy_plan_ms = 0.0
+        self.policy_grow_ms = 0.0
+        self.policy_final_k_ms = 0.0
         self.post_ms = 0.0
         self.t_open = float(opened_at)
         self.t_stop: Optional[float] = None
@@ -755,6 +763,10 @@ class ClearLedger:
             "draft_floor": draft_floor,
             "wait_ms": wait_ms,
             "policy_ms": rnd.policy_ms,
+            "policy_recv_ms": rnd.policy_recv_ms,
+            "policy_plan_ms": rnd.policy_plan_ms,
+            "policy_grow_ms": rnd.policy_grow_ms,
+            "policy_final_k_ms": rnd.policy_final_k_ms,
             "post_ms": rnd.post_ms,
             "excluded": excluded,
             "exclude_reason": reasons,
@@ -1363,32 +1375,66 @@ def note_target_prefill(
         return None
 
 
-def policy_timed(fn):
-    """Measure controller CPU work once, including nested controller calls."""
+_POLICY_STAGE_FIELDS = {
+    "recv": "policy_recv_ms",
+    "plan": "policy_plan_ms",
+    "grow": "policy_grow_ms",
+    "final_k": "policy_final_k_ms",
+}
 
-    @wraps(fn)
-    def measured(owner, *args, **kwargs):
-        scheduler = getattr(owner, "_scheduler", owner)
-        if (
-            scheduler is None
-            or not ledger_enabled()
-            or getattr(scheduler, "_clear_in_post_reply", False)
-        ):
-            return fn(owner, *args, **kwargs)
-        depth = int(getattr(scheduler, "_clear_policy_depth", 0))
-        scheduler._clear_policy_depth = depth + 1
-        started = time.perf_counter() if depth == 0 else None
-        try:
-            return fn(owner, *args, **kwargs)
-        finally:
-            scheduler._clear_policy_depth = depth
-            if started is not None:
-                elapsed = max(0.0, (time.perf_counter() - started) * 1000.0)
-                ledger = getattr(scheduler, "_clear_ledger", None)
-                if ledger and ledger.open is not None and ledger.open.t_send is None:
-                    ledger.open.policy_ms += elapsed
 
-    return measured
+def policy_timed(fn=None, *, stage=None):
+    """Measure controller CPU work once, including nested controller calls.
+
+    ``stage`` names the outermost call. Nested controller work stays inside
+    that sample and is not added again.
+    """
+
+    def deco(func):
+        @wraps(func)
+        def measured(owner, *args, **kwargs):
+            scheduler = getattr(owner, "_scheduler", owner)
+            if (
+                scheduler is None
+                or not ledger_enabled()
+                or getattr(scheduler, "_clear_in_post_reply", False)
+            ):
+                return func(owner, *args, **kwargs)
+            depth = int(getattr(scheduler, "_clear_policy_depth", 0))
+            scheduler._clear_policy_depth = depth + 1
+            if depth == 0:
+                scheduler._clear_policy_stage = stage
+                started = time.perf_counter()
+            else:
+                started = None
+            try:
+                return func(owner, *args, **kwargs)
+            finally:
+                scheduler._clear_policy_depth = depth
+                if started is not None:
+                    elapsed = max(0.0, (time.perf_counter() - started) * 1000.0)
+                    ledger = getattr(scheduler, "_clear_ledger", None)
+                    if (
+                        ledger
+                        and ledger.open is not None
+                        and ledger.open.t_send is None
+                    ):
+                        ledger.open.policy_ms += elapsed
+                        attr = _POLICY_STAGE_FIELDS.get(
+                            getattr(scheduler, "_clear_policy_stage", None)
+                        )
+                        if attr is not None:
+                            setattr(
+                                ledger.open,
+                                attr,
+                                getattr(ledger.open, attr) + elapsed,
+                            )
+
+        return measured
+
+    if fn is None:
+        return deco
+    return deco(fn)
 
 
 def queue_draft_log(scheduler, kind: str, record: dict) -> None:
@@ -1407,7 +1453,7 @@ def add_post_ms(scheduler, elapsed_ms: float) -> None:
     _quiet(scheduler, _add)
 
 
-@policy_timed
+@policy_timed(stage="recv")
 def note_packet(scheduler, batch) -> None:
     # An interrupted reply must not freeze its abandoned trees later.
     scheduler._clear_replay_to_hold = []

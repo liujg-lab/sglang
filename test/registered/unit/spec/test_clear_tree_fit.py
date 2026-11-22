@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import torch
 import zmq
@@ -654,6 +655,85 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         self.assertEqual(result, "request_error")
         self.assertEqual(seen, ["begin", "v", "abandon", "begin", "v", "abandon"])
 
+    def test_prefit_waits_for_health_then_idle(self):
+        cfg = prefit.PrefitConfig(
+            url="http://127.0.0.1:9",
+            buckets=(256,),
+            max_depth=8,
+            ks=(8,),
+            widths=(8,),
+            batches=(1,),
+            token_range=(1, 2),
+            ready_timeout_s=2.0,
+            api_key="test-key",
+        )
+        idle = {"num_running_reqs": 0, "num_waiting_reqs": 0}
+        for eventually_ready in (False, True):
+            with self.subTest(eventually_ready=eventually_ready):
+                events = []
+                now = 0.0
+                loads = iter(
+                    [dict(idle, num_running_reqs=1), dict(idle, num_waiting_reqs=1), idle]
+                )
+
+                def request(url, method, _payload, _timeout, api_key):
+                    self.assertEqual((method, api_key), ("GET", "test-key"))
+                    path = url.removeprefix(cfg.url)
+                    events.append(path)
+                    if path == "/model_info":
+                        return {}
+                    if path == "/health":
+                        if not eventually_ready or events.count(path) == 1:
+                            raise HTTPError(url, 503, "Starting", None, None)
+                        return {}
+                    return {"loads": [next(loads) if eventually_ready else idle]}
+
+                def sleep(delay):
+                    nonlocal now
+                    now += delay
+
+                def exchange(_cfg, _plan, _run, op, *_args, **_kwargs):
+                    events.append(op)
+                    return {"reason": "begun"} if op == "begin" else {"ready": True}
+
+                def group(*_args):
+                    events.append("group")
+                    return {"retries": 1}
+
+                with patch.object(prefit, "_request", side_effect=request), patch.object(
+                    prefit.time, "monotonic", side_effect=lambda: now
+                ), patch.object(prefit.time, "sleep", side_effect=sleep), patch.object(
+                    prefit, "_exchange", side_effect=exchange
+                ), patch.object(prefit, "_run_group", side_effect=group):
+                    if eventually_ready:
+                        self.assertEqual(prefit.run_prefit(cfg), "ready")
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            prefit.run_prefit(cfg)
+                if eventually_ready:
+                    self.assertEqual(
+                        events,
+                        ["/health"] * 2 + ["/v1/loads"] * 3 + ["begin", "group", "group", "commit"],
+                    )
+                else:
+                    self.assertEqual(events, ["/health"] * 4)
+
+    def test_idle_requires_valid_counts_from_every_load_shard(self):
+        idle = {"num_running_reqs": 0, "num_waiting_reqs": 0}
+        cases = [
+            ({}, False),
+            ({"loads": []}, False),
+            ({"loads": [idle, {}]}, False),
+            ({"loads": [idle, "invalid"]}, False),
+            ({"loads": [dict(idle, num_waiting_reqs=None)]}, False),
+            ({"loads": [dict(idle, num_running_reqs=False)]}, False),
+            ({"loads": [idle, dict(idle, num_waiting_reqs=1)]}, False),
+            ({"loads": [idle, idle]}, True),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body), patch.object(prefit, "_request", return_value=body):
+                self.assertEqual(prefit._server_idle("http://127.0.0.1:9"), expected)
+
     def test_wait_timeout_does_not_send_done(self):
         cfg = prefit.PrefitConfig(
             url="http://127.0.0.1:9",
@@ -1011,6 +1091,48 @@ class ClearTreeFitFileTest(CustomTestCase):
                     else ("sess", "prefitting", "need_prefit", None)
                 )
                 self.assertEqual(scheduler._clear_fit_snapshot, expected)
+
+    def test_no_pending_fit_keeps_header_without_building_plan(self):
+        scheduler = self._scheduler()
+        header = fit.target_info(scheduler)
+        scheduler._clear_fit_ready = True
+        scheduler._clear_fit_installed = True
+        scheduler._clear_fit_plan_fp = "old"
+        active_run = object()
+        scheduler._clear_prefit = active_run
+        model = _new_layer_model()
+        scheduler._clear_ledger.layer_models[(8, "graph", 1)] = model
+        policy.observe_verify(1, 8, 256, 12.5)
+        policy.observe_q(1, 8, 3.0)
+
+        with patch.object(fit, "draft_plan") as plan, patch.object(fit.logger, "info") as log:
+            fit.on_target_info(scheduler, header)
+            fit.on_target_info(scheduler, dict(header, page_size=128))
+        plan.assert_not_called()
+        log.assert_not_called()
+        self.assertEqual(scheduler._clear_target_header["page_size"], 128)
+        self.assertFalse(scheduler._clear_fit_ready)
+        self.assertFalse(scheduler._clear_fit_installed)
+        self.assertIsNone(scheduler._clear_fit_plan_fp)
+        self.assertIs(scheduler._clear_prefit, active_run)
+        self.assertIs(scheduler._clear_ledger.layer_models[(8, "graph", 1)], model)
+        self.assertEqual(policy.predict_hold_ms(1, 8, 256), 12.5)
+        self.assertEqual(policy.predict_q_ms(1, 8), 3.0)
+
+    def test_pending_fit_is_revalidated_with_one_plan_and_logs_new_rejections(self):
+        scheduler = self._scheduler()
+        header = fit.target_info(scheduler)
+        scheduler._clear_fit_pending = {"payload": {"schema": 2}, "target": header}
+        with patch.object(fit, "draft_plan", wraps=fit.draft_plan) as plan, patch.object(
+            fit.logger, "info"
+        ) as log:
+            fit.on_target_info(scheduler, header)
+            fit.on_target_info(scheduler, dict(header))
+            self.assertEqual(log.call_count, 1)
+            fit.on_target_info(scheduler, dict(header, page_size=128))
+        self.assertEqual(plan.call_count, 3)
+        self.assertEqual(log.call_count, 2)
+        self.assertFalse(scheduler._clear_fit_ready)
 
     def test_same_target_keeps_fits(self):
         scheduler = self._scheduler()

@@ -1062,7 +1062,7 @@ def _cut_deferred(plan, states, pending, results) -> None:
     keep = int(plan.freeze_k(states))
     for index in list(pending):
         verify = finish(states[index], keep)
-        plan.note(states[index])
+        plan.note(states[index], keep)
         results[index] = (
             [int(token) for token in verify.tokens.tolist()],
             [int(parent) for parent in verify.parents.tolist()],

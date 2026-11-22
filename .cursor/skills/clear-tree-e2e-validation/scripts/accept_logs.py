@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Print ClearTree client totals and log counters for one raw/ directory.
 
-Report prefit outcomes and observed refill groups before formal round counters.
-Use Draft log order to exclude scan rounds and the prefit tag to exclude late tails.
+Separate formal rounds by client request IDs after filtering prefit rounds.
+Report Draft windows for the entire log; they do not carry request IDs.
 """
 
 from __future__ import annotations
@@ -60,19 +60,6 @@ def parse_counters(line: str):
     return None
 
 
-def segments(events: list, gap_s: float) -> list:
-    if not events:
-        return []
-    groups = [[events[0]]]
-    for event in events[1:]:
-        previous = groups[-1][-1][0]
-        if (event[0] - previous).total_seconds() > gap_s:
-            groups.append([event])
-        else:
-            groups[-1].append(event)
-    return groups
-
-
 def trial_dirs(raw: Path) -> list[Path]:
     found = []
     for child in sorted(path for path in raw.iterdir() if path.is_dir()):
@@ -95,7 +82,8 @@ def number(value):
     return float(value)
 
 
-def client_report(directory: Path) -> None:
+def client_report(directory: Path) -> set[str]:
+    rids = set()
     stdout = directory / "client.stdout"
     text = stdout.read_text(encoding="utf-8", errors="replace") if stdout.is_file() else ""
     walls = WALL.findall(text)
@@ -115,6 +103,10 @@ def client_report(directory: Path) -> None:
                 if record.get("error"):
                     continue
                 ok += 1
+                meta = record.get("response_meta_info")
+                rid = meta.get("id") if isinstance(meta, dict) else None
+                if isinstance(rid, str) and rid:
+                    rids.add(rid)
                 completion = number(record.get("completion_tokens"))
                 if completion is not None:
                     tokens += int(completion)
@@ -145,6 +137,7 @@ def client_report(directory: Path) -> None:
             f"fallback={fallback_text} wall_s={wall_text} tok_s={tok_s} "
             f"stdout_tok_s={stdout_tok_s}"
         )
+    return rids
 
 
 def load_server_log(path: Path):
@@ -317,29 +310,34 @@ def print_windows(label: str, group: list) -> None:
     print(f"{label} {start} {end} {window_counts(group)}")
 
 
-def assign_windows(formal: list, windows: list) -> tuple[list, list]:
-    if not formal:
-        return windows, [[] for _ in formal]
-    starts = [group[0][0] for group in formal]
-    ends = [group[-1][0] for group in formal]
-    mids = []
-    for index in range(len(formal) - 1):
-        gap = ends[index] + (starts[index + 1] - ends[index]) / 2
-        mids.append(gap)
-    prefit = []
-    buckets = [[] for _ in formal]
-    for window in windows:
-        when = window[0]
-        if when < starts[0]:
-            prefit.append(window)
+def assign_trial_rounds(
+    rounds: list, trial_rids: dict[str, set[str]]
+) -> tuple[dict, Counter]:
+    owners = {}
+    for trial, rids in trial_rids.items():
+        for rid in rids:
+            if owners.setdefault(rid, trial) != trial:
+                owners[rid] = None
+    groups = {trial: [] for trial in trial_rids}
+    counts = Counter()
+    for row in rounds:
+        rids = row[1].get("rids")
+        if not isinstance(rids, list) or not all(isinstance(rid, str) for rid in rids):
+            counts["unmatched"] += 1
             continue
-        placed = len(formal) - 1
-        for index, mid in enumerate(mids):
-            if when < mid:
-                placed = index
-                break
-        buckets[placed].append(window)
-    return prefit, buckets
+        matches = {owners[rid] for rid in rids if rid in owners}
+        if None in matches:
+            counts["ambiguous_id"] += 1
+        elif len(matches) > 1:
+            counts["mixed_trial"] += 1
+        elif not matches:
+            counts["unmatched"] += 1
+        elif any(rid not in owners for rid in rids):
+            counts["mixed_untracked"] += 1
+        else:
+            groups[next(iter(matches))].append(row)
+            counts["assigned"] += 1
+    return groups, counts
 
 
 def refill_group_key(event: dict, group) -> tuple | None:
@@ -419,7 +417,7 @@ def print_prefit(target: dict, draft: dict, finish_at) -> None:
         print(f"prefit_refill refill_groups=unobserved requested={requested_count}")
 
 
-def server_report(path: Path | None, role: str, gap_s: float, target_fit=None):
+def server_report(path: Path | None, role: str, *, target_fit=None, trial_rids=None):
     if path is None:
         print(f"{role}_log missing")
         return None
@@ -439,30 +437,41 @@ def server_report(path: Path | None, role: str, gap_s: float, target_fit=None):
         print_flushes(flushes, http_flush)
         return fit
     print_prefit(target_fit or {}, fit, finish_at)
-    formal = segments(rounds, gap_s)
-    prefit_windows, buckets = assign_windows(formal, windows)
-    print_windows("prefit_windows", prefit_windows)
-    for index, group in enumerate(formal, start=1):
+    print_windows("draft_windows_all", windows)
+    groups, counts = assign_trial_rounds(rounds, trial_rids or {})
+    for trial, group in groups.items():
+        if not group:
+            print(f"formal_trial {trial} rounds=unobserved")
+            continue
         start = group[0][0].strftime("%Y-%m-%d %H:%M:%S")
         end = group[-1][0].strftime("%Y-%m-%d %H:%M:%S")
-        print(f"formal_segment {index} {start} {end} {round_counts(group)}")
-        print_windows(f"formal_segment {index}", buckets[index - 1])
-    if not formal:
-        print("formal_segment missing")
+        print(f"formal_trial {trial} {start} {end} {round_counts(group)}")
+    print("post_prefit_rounds " + (round_counts(rounds) if rounds else "rounds=unobserved"))
+    print(
+        "round_assignment "
+        + " ".join(
+            f"{key}={counts[key]}"
+            for key in (
+                "assigned", "unmatched", "mixed_trial", "ambiguous_id", "mixed_untracked"
+            )
+        )
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw", type=Path, required=True, help="one run's raw directory")
-    parser.add_argument("--gap-s", type=float, default=20.0)
     args = parser.parse_args()
     raw = args.raw
     if not raw.is_dir():
         raise SystemExit(f"not a directory: {raw}")
-    for directory in trial_dirs(raw):
-        client_report(directory)
-    target_fit = server_report(find_log(raw, "target"), "target", args.gap_s)
-    server_report(find_log(raw, "draft"), "draft", args.gap_s, target_fit)
+    trial_rids = {
+        directory.name: client_report(directory) for directory in trial_dirs(raw)
+    }
+    target_fit = server_report(find_log(raw, "target"), "target")
+    server_report(
+        find_log(raw, "draft"), "draft", target_fit=target_fit, trial_rids=trial_rids
+    )
 
 
 if __name__ == "__main__":

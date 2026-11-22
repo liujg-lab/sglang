@@ -20,6 +20,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
     ClearTreeConfig,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+    _cut_deferred,
     grow_active_layers,
 )
 from sglang.srt.speculative.clear_tree_remote import clear_tree_policy as policy
@@ -61,6 +62,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
     _select_replay_k,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import (
+    ClearTreeState,
     acceptance_mass,
     depth_rule,
     step_after_layer,
@@ -818,7 +820,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             def verify_k(self, state):
                 return width
 
-            def note(self, state):
+            def note(self, state, keep):
                 return None
 
         def forward_active(steps, indices):
@@ -889,8 +891,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
             plan.begin_layer([state])
             plan.should_grow(state)
             self.assertEqual(plan._values([state], include_gain=False)[8], -0.25)
-            plan.verify_k(state)
-            plan.note(state)
+            keep = plan.verify_k(state)
+            plan.note(state, keep)
             scores.assert_called_once_with(state)
 
             state.depth = 2
@@ -2967,6 +2969,343 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         self.assertEqual(policy._clock, {})
         self.assertIn(("sess", 1), ledger._pending_rounds)
         self.assertEqual(ledger._pending_reports[("sess", 99)]["k"], 64)
+
+
+class TestRoundQuoteAndPolicySplit(CustomTestCase):
+    def setUp(self):
+        reset_policy()
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SGLANG_CLEAR_LEDGER", None))
+
+    def test_one_quote_covers_layers_and_the_final_k(self):
+        state = _rows_state([[0.5, 0.25, 0.12, 0.08, 0.04, 0.02, 0.01, 0.005]], "live", 4)
+        plan = _value_plan()
+        plan.cover_k = 32
+        plan._verify_quotes = {}
+        plan._layer_cost = lambda _active, _ell: 0.01
+        plan.bind_states([state])
+        prices = {8: 1.0, 16: 1.0}
+        calls = []
+
+        def fake(_batch, k, _bucket):
+            calls.append(int(k))
+            return prices.get(int(k))
+
+        with patch.object(policy, "predict_verify_ms", side_effect=fake):
+            plan.begin_layer([state])
+            grew = plan.should_grow(state)
+            times = {
+                int(k): float(spent)
+                for k, spent in plan._verify_quotes.items()
+                if spent is not None and int(k) <= int(plan.cover_k)
+            }
+            kept = select_continuing(
+                [state],
+                [state],
+                theta=float(plan.theta_value),
+                verify_times=times,
+                layer_cost=plan._layer_cost,
+                kappa=plan._kappa(),
+                scores_for=plan._scores_for,
+            )
+            self.assertEqual(grew, state in list(kept or []))
+            self.assertEqual(calls.count(8), 1)
+            self.assertEqual(calls.count(16), 1)
+            self.assertEqual(calls.count(32), 1)
+            self.assertIsNone(plan._verify_quotes[32])
+            self.assertNotIn(64, calls)
+            quoted = list(calls)
+
+            state.weight = torch.cat(
+                [state.weight, torch.tensor([[0.2, 0, 0, 0, 0, 0, 0, 0]])], dim=0
+            )
+            state.depth = 2
+            plan.begin_layer([state])
+            plan.should_grow(state)
+            keep = plan.verify_k(state)
+            plan.note(state, keep)
+            self.assertEqual(calls, quoted)
+            _, ordered, _ = plan._scores_for(state)
+            ratio = accept_ratio(str(state.rid))
+            values = {
+                int(k): ratio * float(sum(ordered[: int(k)]))
+                - float(plan.theta_value) * float(spent)
+                for k, spent in plan._verify_quotes.items()
+                if spent is not None and int(k) <= int(plan.cover_k)
+            }
+            self.assertEqual(keep, 16)
+            self.assertEqual(keep, policy.select_k(values))
+            self.assertAlmostEqual(policy._pending["live"]["e"], float(sum(ordered[:keep])))
+
+            prices[16] = 100.0
+            self.assertEqual(plan.verify_k(state), keep)
+            self.assertEqual(calls, quoted)
+            self.assertEqual(plan._quoted(16), 1.0)
+            width = int(state.weight.shape[1])
+            state.tokens = torch.zeros(state.depth, width, dtype=torch.long)
+            state.parents = torch.zeros(state.depth, width, dtype=torch.long)
+            plan._frozen_k = keep
+            frozen = replay.hold_replay(
+                SimpleNamespace(),
+                [SimpleNamespace(rid="live")],
+                [state],
+                plan,
+            )
+            self.assertEqual(frozen["k"], keep)
+            self.assertEqual(frozen["verify_ms"][16], 100.0)
+            self.assertEqual(frozen["verify_ms"][8], 1.0)
+            fresh = _value_plan()
+            fresh.cover_k = 32
+            fresh._verify_quotes = {}
+            fresh.bind_states([state])
+            self.assertEqual(fresh.verify_k(state), 8)
+            self.assertEqual(plan._quoted(16), 1.0)
+
+    def test_make_round_keeps_the_readiness_quote_for_the_online_plan(self):
+        policy._probe_rounds = 12
+        observe_verify(1, 16, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertIsNone(plan.locked_k)
+        self.assertIn(16, plan._verify_quotes)
+        seen = []
+        real = policy.predict_verify_ms
+
+        def spy(batch, k, bucket):
+            seen.append(int(k))
+            return real(batch, k, bucket)
+
+        state = _score_state([0.4, 0.2, 0.1, 0.05])
+        plan.bind_states([state])
+        with patch.object(policy, "predict_verify_ms", side_effect=spy):
+            plan.begin_layer([state])
+            plan.should_grow(state)
+            plan.verify_k(state)
+        self.assertNotIn(16, seen)
+        self.assertEqual(seen.count(8), 1)
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_locked_prefit_and_fallback_do_not_hang_a_quote_table(self):
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        seen = []
+        real = policy.predict_verify_ms
+
+        def spy(batch, k, bucket):
+            seen.append(int(k))
+            return real(batch, k, bucket)
+
+        with patch.object(policy, "predict_verify_ms", side_effect=spy):
+            os.environ["SGLANG_CLEAR_LOCK_K"] = "32"
+            try:
+                locked = make_round(SimpleNamespace(_clear_ledger=False), [req])
+            finally:
+                os.environ.pop("SGLANG_CLEAR_LOCK_K", None)
+            self.assertTrue(locked.use_tau)
+            self.assertIsNone(locked._verify_quotes)
+            self.assertEqual(seen, [16])
+            seen.clear()
+            fallback = policy.make_fallback_round(
+                SimpleNamespace(_clear_target_prefix={}), [req]
+            )
+            self.assertTrue(fallback.fallback)
+            self.assertIsNone(fallback._verify_quotes)
+            self.assertEqual(seen, [])
+            with patch(
+                "sglang.srt.speculative.clear_tree_remote.clear_tree_fit.prefit_plan",
+                return_value={"use_tau": True, "width": 8, "k": 8},
+            ):
+                prefit = make_round(SimpleNamespace(), [req])
+            self.assertEqual(prefit.prefit["k"], 8)
+            self.assertIsNone(prefit._verify_quotes)
+            self.assertEqual(seen, [])
+
+    def test_cut_and_note_share_one_selected_k(self):
+        prices = {8: 1.0, 16: 1.0}
+
+        def fake(_batch, k, _bucket):
+            return prices.get(int(k))
+
+        def counted(plan):
+            calls = {"n": 0}
+            real = plan._select
+
+            def wrapped(states):
+                calls["n"] += 1
+                return real(states)
+
+            plan._select = wrapped
+            return calls
+
+        def tree(rid, scores):
+            state = ClearTreeState.create(ClearTreeConfig(width=8, tau=0.4, max_depth=2))
+            state.depth = 1
+            state.weight[0, : len(scores)] = torch.tensor(scores, dtype=torch.float32)
+            state.tokens[0] = torch.arange(8)
+            state.rid = rid
+            state.prefix = 4
+            return state
+
+        with patch.object(policy, "predict_verify_ms", side_effect=fake):
+            single = tree("one", [0.5, 0.2, 0.1, 0.05, 0.04, 0.03, 0.02, 0.01])
+            plan = _value_plan()
+            plan._verify_quotes = {}
+            plan.bind_states([single])
+            calls = counted(plan)
+            single.decider = plan
+            step = step_after_layer(single)
+            keep = int(plan._frozen_k)
+            ordered = sorted(float(v) for v in single.weight[0].tolist())
+            ordered.reverse()
+            self.assertEqual(calls["n"], 1)
+            self.assertTrue(step.is_final)
+            self.assertEqual(int(step.verify.tokens.shape[0]), keep)
+            self.assertAlmostEqual(
+                policy._pending["one"]["e"], float(sum(ordered[:keep]))
+            )
+
+            left = tree("left", [0.6, 0.2, 0.05, 0.04, 0.03, 0.02, 0.01, 0.005])
+            right = tree("right", [0.3, 0.2, 0.1, 0.08, 0.04, 0.02, 0.01, 0.005])
+            batch = _value_plan()
+            batch.batch = 2
+            batch.layer_ms = 0.1
+            batch._verify_quotes = {}
+            batch.bind_states([left, right])
+            self.assertTrue(batch.defer_finish)
+            calls = counted(batch)
+            pending = {0, 1}
+            results = {}
+            _cut_deferred(batch, [left, right], pending, results)
+            shared = int(batch._frozen_k)
+            self.assertEqual(calls["n"], 1)
+            self.assertFalse(pending)
+            self.assertEqual(len(results[0][0]), shared)
+            self.assertEqual(len(results[1][0]), shared)
+            for rid, state in (("left", left), ("right", right)):
+                ranked = sorted(float(v) for v in state.weight[0].tolist())
+                ranked.reverse()
+                self.assertAlmostEqual(
+                    policy._pending[rid]["e"], float(sum(ranked[:shared]))
+                )
+
+    def test_policy_stages_sum_to_the_outer_sample(self):
+        ledger = ClearLedger(active_rids=["a"])
+        _step(ledger, ["a"], [8], 1, 1.0)
+        scheduler = SimpleNamespace(_clear_ledger=ledger)
+        owner = SimpleNamespace(_scheduler=scheduler)
+
+        @ledger_module.policy_timed(stage="final_k")
+        def inner(_owner):
+            return 7
+
+        @ledger_module.policy_timed(stage="grow")
+        def outer(_scheduler):
+            return inner(owner)
+
+        @ledger_module.policy_timed(stage="plan")
+        def planned(_scheduler):
+            return 1
+
+        @ledger_module.policy_timed(stage="recv")
+        def received(_scheduler):
+            return 1
+
+        with patch.object(
+            ledger_module.time,
+            "perf_counter",
+            side_effect=[2.0, 2.005, 3.0, 3.004, 4.0, 4.001],
+        ) as clock:
+            self.assertEqual(outer(scheduler), 7)
+            self.assertEqual(planned(scheduler), 1)
+            self.assertEqual(received(scheduler), 1)
+        self.assertEqual(clock.call_count, 6)
+        self.assertAlmostEqual(ledger.open.policy_grow_ms, 5.0)
+        self.assertEqual(ledger.open.policy_final_k_ms, 0.0)
+        self.assertAlmostEqual(ledger.open.policy_plan_ms, 4.0)
+        self.assertAlmostEqual(ledger.open.policy_recv_ms, 1.0)
+        staged = (
+            ledger.open.policy_recv_ms
+            + ledger.open.policy_plan_ms
+            + ledger.open.policy_grow_ms
+            + ledger.open.policy_final_k_ms
+        )
+        self.assertAlmostEqual(staged, ledger.open.policy_ms)
+        self.assertAlmostEqual(ledger.open.policy_ms, 10.0)
+
+        scheduler._clear_in_post_reply = True
+        with patch.object(ledger_module.time, "perf_counter") as clock:
+            self.assertEqual(outer(scheduler), 7)
+        clock.assert_not_called()
+        self.assertAlmostEqual(ledger.open.policy_ms, 10.0)
+        scheduler._clear_in_post_reply = False
+        with patch.dict(os.environ, {"SGLANG_CLEAR_LEDGER": "0"}), patch.object(
+            ledger_module.time, "perf_counter"
+        ) as clock:
+            self.assertEqual(outer(scheduler), 7)
+        clock.assert_not_called()
+
+    def test_recv_time_lands_on_the_round_opened_by_that_packet(self):
+        sched = SimpleNamespace(
+            server_args=SimpleNamespace(clear_tree_width=8),
+            tp_rank=0,
+        )
+
+        def packet(base, rpc):
+            return SimpleNamespace(
+                reqs=[
+                    SimpleNamespace(
+                        rid="a", base_committed_len=base, committed_ids=None
+                    )
+                ],
+                action="step",
+                session_id="s",
+                rpc_seq=rpc,
+            )
+
+        ticks = {"n": 10.0}
+
+        def clock():
+            ticks["n"] += 0.002
+            return ticks["n"]
+
+        with patch.object(ledger_module.time, "perf_counter", side_effect=clock):
+            note_packet(sched, packet(8, 1))
+            first = sched._clear_ledger.open
+            recv = first.policy_recv_ms
+            self.assertGreater(recv, 0.0)
+            self.assertAlmostEqual(
+                recv,
+                first.policy_recv_ms
+                + first.policy_plan_ms
+                + first.policy_grow_ms
+                + first.policy_final_k_ms,
+            )
+            first.t_send = 1.0
+            note_packet(sched, packet(9, 2))
+        closed = next(
+            record
+            for kind, record in sched._clear_ledger.pending_logs
+            if kind == "d_round"
+        )
+        opened = sched._clear_ledger.open
+        self.assertAlmostEqual(closed["policy_recv_ms"], recv)
+        self.assertAlmostEqual(closed["policy_ms"], recv)
+        self.assertGreater(opened.policy_recv_ms, 0.0)
+        self.assertIsNot(opened, first)
+        staged = (
+            closed["policy_recv_ms"]
+            + closed["policy_plan_ms"]
+            + closed["policy_grow_ms"]
+            + closed["policy_final_k_ms"]
+        )
+        self.assertAlmostEqual(staged, closed["policy_ms"])
 
 
 if __name__ == "__main__":

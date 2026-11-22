@@ -28,3 +28,4 @@
 | `2026-11-21-c` | schema 2 拟合在必需格满 4 条后写一次，FIT 握手驱动扫描；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 2，正式轮有 hold_ms 和 q_ms。01 的 flush 是 HTTP 400 | [记录](2026-11-21-c/run.md) |
 | `2026-11-22-a` | 现有拟合文件上不重扫，只开账本，RSTeller 并发 1 一轮（单一条件，不是重复） | 一轮跑完；已有拟合被安装，没有新扫描，正式轮写了 graph 报告 | [记录](2026-11-22-a/run.md) |
 | `2026-11-22-b` | 移开现有拟合后重扫 schema 2，只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 2，正式轮有 hold_ms 和 q_ms | [记录](2026-11-22-b/run.md) |
+| `2026-11-22-c` | 移开现有拟合后重扫 schema 2，并核对 policy_ms 分项；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 2，正式轮的 policy 分项之和等于 policy_ms | [记录](2026-11-22-c/run.md) |

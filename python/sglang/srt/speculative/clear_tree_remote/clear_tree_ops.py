@@ -589,7 +589,9 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
     keep = None
     if decider is not None:
         keep = int(decider.verify_k(state))
-        decider.note(state)
+        if getattr(decider, "_frozen_k", None) is None:
+            decider._frozen_k = keep
+        decider.note(state, keep)
     verify = finish(state, keep)
     return ClearTreeStep(
         is_final=True,

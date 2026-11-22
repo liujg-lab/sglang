@@ -462,18 +462,21 @@ def _wait_until(url: str, timeout_s: float, ready) -> None:
 
 
 def _model_ready(url: str, api_key: Optional[str] = None) -> bool:
-    _request(url + "/model_info", "GET", None, 5.0, api_key)
+    _request(url + "/health", "GET", None, 5.0, api_key)
     return True
 
 
 def _server_idle(url: str, api_key: Optional[str] = None) -> bool:
     body = _request(url + "/v1/loads", "GET", None, 5.0, api_key)
     loads = body.get("loads") if isinstance(body, dict) else None
-    if not isinstance(loads, list):
+    if not isinstance(loads, list) or not loads:
         return False
-    running = sum(int(item.get("num_running_reqs") or 0) for item in loads)
-    waiting = sum(int(item.get("num_waiting_reqs") or 0) for item in loads)
-    return running == 0 and waiting == 0
+    keys = ("num_running_reqs", "num_waiting_reqs")
+    return all(
+        isinstance(item, dict)
+        and all(type(item.get(key)) is int and item[key] == 0 for key in keys)
+        for item in loads
+    )
 
 
 def _steps(payload, *, verify_only: bool = False) -> int:

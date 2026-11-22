@@ -971,6 +971,7 @@ class RoundPlan:
         self._raw_gain: Dict[int, float] = {}
         self._score_cache: Dict[int, tuple] = {}
         self._frozen_k = None
+        self._verify_quotes = None
 
     @property
     def defer_finish(self) -> bool:
@@ -991,7 +992,7 @@ class RoundPlan:
         """Every tree in the round, including one that later stops growing."""
         self._all = list(states)
 
-    @policy_timed
+    @policy_timed(stage="grow")
     def begin_layer(self, states) -> None:
         """The layer was just written. Judge these trees together."""
         self._peers = list(states)
@@ -1035,7 +1036,7 @@ class RoundPlan:
                 _observe_gain(self._raw_gain[key], actual, FORGET)
             self._raw_gain[key] = _raw_marginal_for(ordered, latest, k)
 
-    @policy_timed
+    @policy_timed(stage="grow")
     def should_grow(self, state) -> bool:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import depth_rule
 
@@ -1058,7 +1059,7 @@ class RoundPlan:
             self._at = int(state.depth)
         return id(state) in self._keep_ids
 
-    @policy_timed
+    @policy_timed(stage="final_k")
     def verify_k(self, state) -> int:
         if self._frozen_k is not None:
             return int(self._frozen_k)
@@ -1068,14 +1069,15 @@ class RoundPlan:
             return int(self.k)
         return self._select(self._all or self._peers or [state])
 
-    @policy_timed
+    @policy_timed(stage="final_k")
     def freeze_k(self, states) -> int:
         """One verify count for every tree, chosen after growth has stopped."""
         chosen = self._select(list(states))
         self._frozen_k = int(chosen)
         return int(self._frozen_k)
 
-    def note(self, state) -> None:
+    def note(self, state, keep) -> None:
+        """Record path mass for the K already chosen for this cut."""
         rid = getattr(state, "rid", None)
         if rid is None:
             return
@@ -1091,7 +1093,7 @@ class RoundPlan:
         note_verified(
             key,
             prefix,
-            float(sum(ordered[: self.verify_k(state)])),
+            float(sum(ordered[: int(keep)])),
             int(state.depth),
         )
 
@@ -1100,7 +1102,7 @@ class RoundPlan:
         for k in VERIFY_KS:
             if int(k) > int(self.cover_k):
                 continue
-            spent = self._time(k)
+            spent = self._quoted(k)
             if spent is not None:
                 times[int(k)] = float(spent)
         kept = select_continuing(
@@ -1143,12 +1145,21 @@ class RoundPlan:
         return slope
 
     def _time(self, k: int) -> Optional[float]:
+        """Live H+Q. Replay after the reply reads this, not the round table."""
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
             smallest_bucket,
         )
 
         bucket = smallest_bucket(self.max_ell + int(k) + 1, self.buckets)
         return predict_verify_ms(self.batch, int(k), bucket)
+
+    def _quoted(self, k: int) -> Optional[float]:
+        """This round's H+Q. A plan without a table still reads the live price."""
+        table = self._verify_quotes
+        key = int(k)
+        if table is None:
+            return self._time(key)
+        return _remember_quote(table, self.batch, self.max_ell, key, self.buckets)
 
     def _actual_cover(self, states) -> int:
         """Smallest tier that holds the largest tree built in this round."""
@@ -1192,7 +1203,7 @@ class RoundPlan:
         for k in VERIFY_KS:
             if int(k) > cap:
                 continue
-            spent = self._time(k)
+            spent = self._quoted(k)
             if spent is None:
                 continue
             if rows is None:
@@ -1246,6 +1257,11 @@ def make_round(scheduler, reqs) -> RoundPlan:
     planned = _prefit_round(scheduler, reqs, max_ell, buckets, batch)
     if planned is not None:
         return planned
+    quotes: Dict[int, Optional[float]] = {}
+
+    def quoted(k: int) -> Optional[float]:
+        return _remember_quote(quotes, batch, max_ell, int(k), buckets)
+
     greedy = _requests_greedy(reqs)
     ledger_on = ledger_enabled()
     locked_env = locked_k_from_env()
@@ -1259,7 +1275,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
     served_flat = _covered_flat_k(
         batch, max_ell, buckets, _cover_for(served, max_depth, fitting)
     )
-    flat_ready = _time_for(batch, max_ell, served_flat, buckets) is not None
+    flat_ready = quoted(served_flat) is not None
     probe = None
     if (
         locked_env is None
@@ -1286,7 +1302,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
             return False
         cover_k = _cover_for(int(candidate), max_depth, fitting)
         flat = _covered_flat_k(batch, max_ell, buckets, cover_k)
-        return _time_for(batch, max_ell, flat, buckets) is not None
+        return quoted(flat) is not None
 
     width, kind = _cached_build_width(
         scheduler,
@@ -1299,7 +1315,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     cover = _cover_for(width, max_depth, fitting)
     flat_tier = _covered_flat_k(batch, max_ell, buckets, cover)
-    ready = _time_for(batch, max_ell, flat_tier, buckets) is not None
+    ready = quoted(flat_tier) is not None
     use_tau = (
         locked_env is not None
         or not ledger_on
@@ -1332,6 +1348,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     )
     plan.cover_k = int(cover)
     plan.flat_k = int(flat_tier)
+    if locked is None:
+        plan._verify_quotes = quotes
     plan.replay_kind = kind
     plan.replay_eligible = bool(eligible and not use_tau and kind != "probe_w")
     plan.fallback = False
@@ -1426,7 +1444,7 @@ def _bind_round(scheduler, plan, reqs) -> None:
         ledger.open.prefit = getattr(plan, "prefit", None)
 
 
-@policy_timed
+@policy_timed(stage="plan")
 def install_fallback_plan(scheduler, reqs) -> RoundPlan:
     """One degraded plan for every per-request rebuild of this packet."""
     token = getattr(scheduler, "_clear_build_token", None)
@@ -1438,7 +1456,7 @@ def install_fallback_plan(scheduler, reqs) -> RoundPlan:
     return plan
 
 
-@policy_timed
+@policy_timed(stage="plan")
 def attach_round(scheduler, reqs) -> RoundPlan:
     """Store the round plan where the grow loop can see it.
 
@@ -1489,6 +1507,14 @@ def _time_for(batch, max_ell, k, buckets) -> Optional[float]:
 
     bucket = smallest_bucket(int(max_ell) + int(k) + 1, buckets)
     return predict_verify_ms(batch, int(k), bucket)
+
+
+def _remember_quote(table, batch, max_ell, k, buckets) -> Optional[float]:
+    """Fill one K on this round's table, including a missing price."""
+    key = int(k)
+    if key not in table:
+        table[key] = _time_for(batch, max_ell, key, buckets)
+    return table[key]
 
 
 def _path_scores(state) -> list:

@@ -360,28 +360,36 @@ def on_target_info(scheduler, info) -> None:
         return
     parsed = parse_target_info(info)
     scheduler._clear_target_header = parsed
-    plan = draft_plan(scheduler)
-    fingerprint = plan.fingerprint
     pending = getattr(scheduler, "_clear_fit_pending", None)
-    prepared = _prepare_install(scheduler, pending, parsed) if pending else None
-    installed = bool(getattr(scheduler, "_clear_fit_installed", False))
-    same_plan = getattr(scheduler, "_clear_fit_plan_fp", None) == fingerprint
-    if prepared is not None:
-        if installed and same_plan:
-            scheduler._clear_fit_ready = True
-            return
-        if _install_prepared(scheduler, prepared):
-            scheduler._clear_fit_plan_fp = fingerprint
-            logger.info(
-                "[CLEAR] installed %d hold cells from the fit file",
-                len(prepared.get("h") or []),
-            )
-            return
+    rejection = None
+    if pending is not None:
+        plan = draft_plan(scheduler)
+        fingerprint = plan.fingerprint
+        prepared = _prepare_install(scheduler, pending, parsed, plan)
+        installed = bool(getattr(scheduler, "_clear_fit_installed", False))
+        same_plan = getattr(scheduler, "_clear_fit_plan_fp", None) == fingerprint
+        if prepared is not None:
+            if installed and same_plan:
+                scheduler._clear_fit_ready = True
+                scheduler._clear_fit_rejection = None
+                return
+            if _install_prepared(scheduler, prepared):
+                scheduler._clear_fit_plan_fp = fingerprint
+                scheduler._clear_fit_rejection = None
+                logger.info(
+                    "[CLEAR] installed %d hold cells from the fit file",
+                    len(prepared.get("h") or []),
+                )
+                return
+        rejection = (parsed, fingerprint)
     scheduler._clear_fit_ready = False
-    if installed:
-        scheduler._clear_fit_installed = False
-        scheduler._clear_fit_plan_fp = None
-    logger.info("[CLEAR] fit file does not cover this Target; prefit required")
+    scheduler._clear_fit_installed = False
+    scheduler._clear_fit_plan_fp = None
+    if rejection is not None and rejection != getattr(
+        scheduler, "_clear_fit_rejection", None
+    ):
+        logger.info("[CLEAR] fit file does not cover this Target; prefit required")
+    scheduler._clear_fit_rejection = rejection
 
 
 def _inputs_dict(inputs) -> dict:
@@ -439,7 +447,7 @@ def _parse_layer_row(row):
     return key, model
 
 
-def _prepare_install(scheduler, pending, target):
+def _prepare_install(scheduler, pending, target, plan):
     """Parse H and layer fits before any memory is replaced.
 
     A readable file that fails this check is a cache miss.
@@ -449,7 +457,6 @@ def _prepare_install(scheduler, pending, target):
         return None
     if not target_headers_match(pending.get("target"), target):
         return None
-    plan = draft_plan(scheduler)
     saved = (payload.get("plan") or {}).get("inputs") if isinstance(payload.get("plan"), dict) else None
     if not _inputs_cover(saved, plan.inputs):
         return None

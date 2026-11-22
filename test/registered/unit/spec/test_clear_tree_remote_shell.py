@@ -180,7 +180,8 @@ class ClearTreeRemoteShellTest(CustomTestCase):
             Path(__file__).resolve().parents[4]
             / ".cursor/skills/clear-tree-e2e-validation/scripts/accept_logs.py"
         )
-        report = runpy.run_path(str(script))["server_report"]
+        acceptance = runpy.run_path(str(script))
+        report = acceptance["server_report"]
         run = "run"
         group = ["v", 1, 128, 8]
 
@@ -190,9 +191,13 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         leader = event("fit_state", {"state": "ready", "reason": "prefit", "run": run})
         wrote = "[2026-11-21 15:04:56] [CLEAR] wrote fit file cells=90"
         installed = "[2026-11-21 15:04:56] [CLEAR] installed 90 hold cells from the fit file"
-        scan = '[2026-11-21 15:04:55] [CLEAR ledger d_round] {"prefit": null}'
-        tail = '[2026-11-21 15:11:18] [CLEAR ledger d_round] {"prefit": {"run": "run"}}'
-        serving = '[2026-11-21 15:11:19] [CLEAR ledger d_round] {"prefit": null}'
+        def draft_round(second, rids, prefit=None):
+            data = json.dumps({"rids": rids, "prefit": prefit})
+            return f"[2026-11-21 15:11:{second:02}] [CLEAR ledger d_round] {data}"
+
+        scan = '[2026-11-21 15:04:55] [CLEAR ledger d_round] {"rids": ["r1"], "prefit": null}'
+        tail = draft_round(18, ["r1"], prefit={"run": run})
+        serving = draft_round(19, ["r1"])
         missing = event(
             "prefit_commit", {"run": run, "seq": 1, "refill_groups": [group]}
         )
@@ -211,15 +216,27 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         next_ready = event("prefit_commit", {**committed, "seq": 2})
         follower = leader.replace("TP0", "TP1")
 
-        def read_report(target, draft):
+        def read_report(target, draft, client_ids=None):
             with tempfile.TemporaryDirectory() as directory:
                 target_log = Path(directory, "target.log")
                 draft_log = Path(directory, "draft.log")
                 target_log.write_text("\n".join(target), encoding="utf-8")
                 draft_log.write_text("\n".join(draft), encoding="utf-8")
                 with redirect_stdout(io.StringIO()) as output:
-                    target_fit = report(target_log, "target", 20.0)
-                    report(draft_log, "draft", 20.0, target_fit)
+                    trial_rids = {}
+                    for trial, rids in (client_ids or {"01": ["r1"]}).items():
+                        path = Path(directory, trial)
+                        path.mkdir()
+                        (path / "client.jsonl").write_text(
+                            "\n".join(
+                                json.dumps({"response_meta_info": {"id": rid}})
+                                for rid in rids
+                            ),
+                            encoding="utf-8",
+                        )
+                        trial_rids[trial] = acceptance["client_report"](path)
+                    target_fit = report(target_log, "target")
+                    report(draft_log, "draft", target_fit=target_fit, trial_rids=trial_rids)
                 return output.getvalue()
 
         draft = [scan, wrote, tail, serving]
@@ -230,9 +247,38 @@ class ClearTreeRemoteShellTest(CustomTestCase):
             "refill_groups=1 requested=1 executions=1 http_attempts=2 step_target_met=0",
             result,
         )
-        self.assertEqual(result.count("formal_segment 1 "), 2)
-        self.assertIn("rounds=1", result)
-        self.assertNotIn("formal_segment 2 ", result)
+        self.assertIn(
+            "formal_trial 01 2026-11-21 15:11:19 2026-11-21 15:11:19 rounds=1", result
+        )
+        self.assertIn("round_assignment assigned=1 unmatched=0", result)
+        self.assertNotIn("formal_trial 02 ", result)
+
+        close_trials = [
+            *draft,
+            draft_round(20, ["r2", "r2b"]),
+            draft_round(21, ["r3"]),
+            draft_round(22, ["r4"]),
+            draft_round(23, ["startup"]),
+            draft_round(24, ["r1", "r2"]),
+            draft_round(25, ["duplicate"]),
+            draft_round(26, ["r3", "warmup"]),
+            "[2026-11-21 15:11:27] [SR Draft round] reason=idle tp_rank=0 "
+            "counters={'opt_bonus_forwards': 2}",
+        ]
+        result = read_report(
+            [leader],
+            close_trials,
+            {"01": ["r1", "duplicate"], "02": ["r2", "r2b", "duplicate"], "03": ["r3"], "04": ["r4"]},
+        )
+        for trial in ("01", "02", "03", "04"):
+            self.assertIn(f"formal_trial {trial} ", result)
+        self.assertEqual(result.count("formal_trial "), 4)
+        self.assertIn(
+            "round_assignment assigned=4 unmatched=1 mixed_trial=1 ambiguous_id=1 mixed_untracked=1",
+            result,
+        )
+        self.assertIn("draft_windows_all 2026-11-21 15:11:27 2026-11-21 15:11:27 windows=1", result)
+        self.assertEqual(result.count("windows=1"), 1)
         self.assertIn("refill_groups=unobserved", read_report([leader], draft))
         self.assertIn("refill_groups=0", read_report([ready, leader], draft))
         reused = event("fit_state", {"state": "ready", "reason": "ready"})
