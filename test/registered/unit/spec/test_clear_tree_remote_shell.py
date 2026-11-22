@@ -628,6 +628,10 @@ class ClearTreeRemoteShellTest(CustomTestCase):
                 with patch.object(ledger, "note_packet"), patch.object(
                     ledger, "mark_send"
                 ), patch.object(
+                    ledger,
+                    "run_deferred_close",
+                    side_effect=lambda *_a: events.append("close"),
+                ), patch.object(
                     ledger, "mark_post", side_effect=lambda *_a: events.append("mark")
                 ), patch.object(
                     replay,
@@ -640,6 +644,9 @@ class ClearTreeRemoteShellTest(CustomTestCase):
                     with self.assertRaises(expected):
                         namespace[method.name](scheduler)
                 self.assertIn("drain", events)
+                # The previous round is accounted on every path, after drain.
+                self.assertIn("close", events)
+                self.assertLess(events.index("drain"), events.index("close"))
                 should_post = (
                     status in {"ok", "empty"}
                     and reason != "commit_incomplete"
@@ -649,7 +656,9 @@ class ClearTreeRemoteShellTest(CustomTestCase):
                 )
                 self.assertEqual("post" in events, should_post)
                 if should_post:
-                    self.assertEqual(events, ["send", "drain", "post", "mark"])
+                    self.assertEqual(
+                        events, ["send", "drain", "close", "post", "mark"]
+                    )
 
     def test_recv_packet_passes_local_queue_flag_before_tp1_return(self):
         import ast

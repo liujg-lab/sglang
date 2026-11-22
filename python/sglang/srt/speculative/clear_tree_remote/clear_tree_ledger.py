@@ -25,6 +25,10 @@ FORGET = 0.999
 RIDGE = 1e-6
 LAYER_MIN_SAMPLES = 4
 LAYER_SPAN_PAD = 128.0
+# Per-depth correction of the layer regression. Depth is the ``layer`` index
+# of the forward (1-based); deeper forwards share the last bucket.
+DEPTH_CAP = 8
+DEPTH_MIN_SAMPLES = 30
 # Intercept and prefix sum. The prefix prior is one token's 2 µs scaled by
 # 128, so a flat prefix cannot set the slope. The capture batch is the cell
 # key, not a feature.
@@ -159,15 +163,61 @@ def _layer_features(sum_ell: int) -> List[float]:
     return [1.0, float(sum_ell)]
 
 
+def layer_depth_enabled() -> bool:
+    """Depth correction in layer prices. ``SGLANG_CLEAR_LAYER_DEPTH=0`` keeps learning it but not using it."""
+    return os.environ.get("SGLANG_CLEAR_LAYER_DEPTH", "").strip() != "0"
+
+
+def _depth_key(depth) -> int:
+    return max(1, min(int(depth), DEPTH_CAP))
+
+
+def layer_depth_ratio(ledger, width: int, g: int, depth) -> tuple:
+    """``(ratio, source)`` for a forward at this depth.
+
+    The ratio is forgetting-weighted measured wall over the base regression,
+    taken over middle pre-reply graph layers. The cell ``(w, g, d)`` is used
+    once it has ``DEPTH_MIN_SAMPLES``; else the pooled ``(g, d)`` across
+    widths; else 1.
+    """
+    if ledger is None or depth is None:
+        return 1.0, "none"
+    d = _depth_key(depth)
+    for table, key, source in (
+        (ledger.layer_depth, (int(width), int(g), d), "cell"),
+        (ledger.layer_depth_pooled, (int(g), d), "pooled"),
+    ):
+        row = table.get(key)
+        if row is not None and row[2] >= DEPTH_MIN_SAMPLES and row[1] > 0.0:
+            return float(row[0]) / float(row[1]), source
+    return 1.0, "none"
+
+
+def _depth_factor(scheduler, width: int, g: int, depth) -> float:
+    if depth is None or not layer_depth_enabled():
+        return 1.0
+    ledger = bind_ledger(scheduler)
+    ratio, _source = layer_depth_ratio(ledger, width, g, depth)
+    return float(ratio)
+
+
+def layer_depth_factor(scheduler, width: int, active: int, depth) -> float:
+    """The multiplier ``predict_layer_ms`` applies at this depth, 1 when unused."""
+    if depth is None:
+        return 1.0
+    return _depth_factor(scheduler, width, layer_graph_bs(scheduler, active), depth)
+
+
 def predict_layer_ms(
-    scheduler, width: int, active: int, sum_ell: int
+    scheduler, width: int, active: int, sum_ell: int, depth=None
 ) -> Optional[float]:
     """Draft layer fit, or None when the prefix is outside the seen span.
 
     The cell is this width and the capture batch of ``active``. A missing
     cell, a prefix outside that cell, or a non-positive prediction is None.
     The served width then stays on the flat K, and a replay candidate with
-    this result does not pair.
+    this result does not pair. ``depth`` is the forward's layer index; with
+    it the base fit is scaled by ``layer_depth_ratio``.
     """
     g = layer_graph_bs(scheduler, active)
     model = _layer_model(scheduler, width, g)
@@ -179,13 +229,15 @@ def predict_layer_ms(
     pred = model.predict(features)
     if pred is None or float(pred) <= 0.0:
         return None
-    return float(pred)
+    return float(pred) * _depth_factor(scheduler, width, g, depth)
 
 
-def layer_sum_ell_slope(scheduler, width: int, active: int) -> Optional[float]:
+def layer_sum_ell_slope(
+    scheduler, width: int, active: int, depth=None
+) -> Optional[float]:
     """Prefix slope for this width and the capture batch of ``active``.
 
-    None until that cell can be solved.
+    None until that cell can be solved. ``depth`` scales it like the price.
     """
     g = layer_graph_bs(scheduler, active)
     model = _layer_model(scheduler, width, g)
@@ -194,7 +246,7 @@ def layer_sum_ell_slope(scheduler, width: int, active: int) -> Optional[float]:
     beta = model.coefficients()
     if beta is None or len(beta) < 2:
         return None
-    return float(beta[1])
+    return float(beta[1]) * _depth_factor(scheduler, width, g, depth)
 
 
 def _action_name(action) -> str:
@@ -388,6 +440,8 @@ class _Round:
         "prefit",
         "reply_bytes",
         "hold_ms",
+        "e_rows",
+        "tree_depth",
     )
 
     def __init__(
@@ -427,6 +481,9 @@ class _Round:
         self.prefit = None
         self.reply_bytes = None
         self.hold_ms = None
+        # rid -> (accept ratio, path mass) at the verified K, for diagnostics.
+        self.e_rows: Dict[str, tuple] = {}
+        self.tree_depth = 0
 
 
 def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
@@ -447,6 +504,41 @@ def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
     return tokens, ms
 
 
+def _round_expect(rnd: _Round, next_rids, next_prefixes) -> dict:
+    """Realized accepts against c_i times path mass, over requests that stayed.
+
+    ``accepted`` drops each request's bonus token, as ``settle_verified`` does.
+    Every field is None when the round noted no tree.
+    """
+    empty = {
+        "accepted": None,
+        "e_pred": None,
+        "e_mass": None,
+        "e_n": None,
+        "tree_depth": int(getattr(rnd, "tree_depth", 0) or 0) or None,
+    }
+    rows = getattr(rnd, "e_rows", None) or {}
+    if not rows:
+        return empty
+    found = {str(rid): int(prefix) for rid, prefix in zip(next_rids, next_prefixes)}
+    old = {str(rid): int(prefix) for rid, prefix in zip(rnd.rids, rnd.prefix_lens)}
+    accepted = 0
+    e_pred = 0.0
+    e_mass = 0.0
+    count = 0
+    for rid, (ratio, mass) in rows.items():
+        if rid not in found or rid not in old:
+            continue
+        accepted += max(int(found[rid]) - int(old[rid]) - 1, 0)
+        e_pred += float(ratio) * float(mass)
+        e_mass += float(mass)
+        count += 1
+    if count == 0:
+        return empty
+    empty.update(accepted=accepted, e_pred=e_pred, e_mass=e_mass, e_n=count)
+    return empty
+
+
 class ClearLedger:
     """One Draft process. Rank 0 constructs this; other ranks do not."""
 
@@ -462,6 +554,9 @@ class ClearLedger:
         self.active_rids = {str(rid) for rid in (active_rids or ())}
         self.open: Optional[_Round] = None
         self.layer_models: Dict[tuple, ForgettingRegressor] = {}
+        # [num, den, n]: forgetting sums of measured wall and base prediction.
+        self.layer_depth: Dict[tuple, list] = {}
+        self.layer_depth_pooled: Dict[tuple, list] = {}
         self.verify_model: Optional[ForgettingRegressor] = None
         self.verify_samples = 0
         self.pending_logs: List[tuple] = []
@@ -470,6 +565,8 @@ class ClearLedger:
         self._pending_rounds: Dict[tuple, dict] = {}
         self._pending_reports: Dict[tuple, dict] = {}
         self._pending_order: List[tuple] = []
+        # One closed round whose accounting waits until after the reply.
+        self.deferred: Optional[dict] = None
 
     def queue_log(self, kind: str, record: dict) -> None:
         self.pending_logs.append((kind, record))
@@ -487,9 +584,15 @@ class ClearLedger:
         """Drop the open round and both regressions. Theta lives outside."""
         self.open = None
         self.layer_models.clear()
+        self.reset_layer_depth()
         self.verify_model = None
         self.verify_samples = 0
         self._clear_pending()
+
+    def reset_layer_depth(self) -> None:
+        """Drop the depth ratios. They are relative to the regressions they saw."""
+        self.layer_depth.clear()
+        self.layer_depth_pooled.clear()
 
     def drop_open(self) -> None:
         """Drop the round that has not closed. Keep both regressions."""
@@ -513,6 +616,7 @@ class ClearLedger:
         reply_bytes: Optional[int] = None,
         verify=None,
         scheduler=None,
+        defer: bool = False,
     ) -> Optional[dict]:
         """Close the previous STEP when this packet is its next STEP.
 
@@ -520,6 +624,11 @@ class ClearLedger:
         open round and exclude it. They do not start a round. A residence
         value marks this session as able to split H, even when the value
         does not belong to the round being closed.
+
+        With ``defer``, a same-session close only detaches the round, its
+        accept rows, and the gain ratio, and returns None. ``run_deferred``
+        does the accounting after the reply. A session change still closes
+        here, so its pending reports clear after that close.
         """
         if type(hold_ns) is int:
             self.split_capable = True
@@ -527,7 +636,26 @@ class ClearLedger:
         name = _action_name(action)
         closed = None
         if self.open is not None and self.open.t_send is not None:
-            if name == "step":
+            if name == "step" and defer and str(self.open.session_id) == str(
+                session_id
+            ):
+                self.run_deferred()
+                self._drop_other_sessions(str(session_id))
+                self._defer_close(
+                    stamp,
+                    name,
+                    rids,
+                    prefix_lens,
+                    recv_queued,
+                    hold_ns=hold_ns,
+                    hold_rpc_seq=hold_rpc_seq,
+                    target_queued=target_queued,
+                    step_bytes=step_bytes,
+                    reply_bytes=reply_bytes,
+                    verify=verify,
+                    scheduler=scheduler,
+                )
+            elif name == "step":
                 closed_session = str(self.open.session_id)
                 self._drop_other_sessions(str(session_id))
                 closed = self._close(
@@ -572,6 +700,41 @@ class ClearLedger:
             )
         return closed
 
+    def _defer_close(
+        self,
+        t_recv: float,
+        next_action: str,
+        next_rids: Sequence[str],
+        next_prefixes: Sequence[int],
+        recv_queued: bool,
+        **kwargs,
+    ) -> None:
+        """Detach the closing round with everything its accounting reads later."""
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+            take_pending,
+        )
+
+        rnd = self.open
+        self.open = None
+        self.deferred = dict(
+            kwargs,
+            t_recv=float(t_recv),
+            next_action=next_action,
+            next_rids=list(next_rids),
+            next_prefixes=[int(value) for value in next_prefixes],
+            recv_queued=bool(recv_queued),
+            rnd=rnd,
+            pending=take_pending(),
+            gain=_gain_ratio(),
+        )
+
+    def run_deferred(self) -> Optional[dict]:
+        """Account the detached round, if any. Safe to call when none waits."""
+        args, self.deferred = self.deferred, None
+        if args is None:
+            return None
+        return self._close(**args)
+
     def _apply_gap(self, name: str, rids: Sequence[str]) -> None:
         if name == "prefill":
             self.active_rids.update(str(rid) for rid in rids)
@@ -586,6 +749,7 @@ class ClearLedger:
 
     def note_idle(self) -> None:
         """Flush generated rows even when no subsequent reply is sent."""
+        self.run_deferred()
         self.flush_logs()
 
     def mark_stop(self, now: Optional[float] = None) -> None:
@@ -634,9 +798,19 @@ class ClearLedger:
         reply_bytes: Optional[int] = None,
         verify=None,
         scheduler=None,
+        rnd: Optional[_Round] = None,
+        pending=None,
+        gain: Optional[float] = None,
     ) -> dict:
-        rnd = self.open
-        self.open = None
+        """Account one closed round.
+
+        A deferred close passes the detached ``rnd``, the accept rows taken at
+        receive (``pending``), and the gain ratio seen then (``gain``).
+        """
+        started = time.perf_counter()
+        if rnd is None:
+            rnd = self.open
+            self.open = None
         assert rnd is not None
         reasons = []
         gap = set(rnd.gap_actions)
@@ -648,7 +822,7 @@ class ClearLedger:
             reasons.append("new_rid")
         if rnd.idle_before:
             reasons.append("idle_start")
-        if _target_gap(next_rids, next_prefixes):
+        if _target_gap(next_rids, next_prefixes, pending):
             reasons.append("target_gap")
         if rnd.fallback:
             reasons.append("fallback")
@@ -737,6 +911,7 @@ class ClearLedger:
         self.merge_pending(scheduler)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
+        expect = _round_expect(rnd, next_rids, next_prefixes)
         prefit_round = prefit is not None
         price_kept = (
             price_tokens is not None
@@ -783,7 +958,7 @@ class ClearLedger:
             "verify_fit": fit_verify,
             "seed_ms": seed_ms,
             "layer_wall_ms": layer_wall_ms,
-            "gain_ratio": _gain_ratio(),
+            "gain_ratio": _gain_ratio() if gain is None else float(gain),
             "hold_ms": hold_ms,
             "q_ms": q_ms,
             "target_queued": target_queued if type(target_queued) is bool else None,
@@ -793,6 +968,7 @@ class ClearLedger:
             "q_pred_ms": q_pred_ms,
             "prefit": prefit,
         }
+        record.update(expect)
         self.queue_log("d_round", record)
         for sample in rnd.layers:
             self._finish_layer(rnd, sample, excluded, scheduler)
@@ -806,7 +982,10 @@ class ClearLedger:
             skip_accept=(
                 prefit_round or "target_gap" in reasons or "fallback" in reasons
             ),
+            pending=pending,
         )
+        record["close_ms"] = max(0.0, (time.perf_counter() - started) * 1000.0)
+        record["close_deferred"] = pending is not None
         return record
 
     def _split_hold(self, rnd: _Round, t_k_us, hold_ns, hold_rpc_seq):
@@ -829,6 +1008,11 @@ class ClearLedger:
             return None, None
         return candidate, t_k_ms - candidate
 
+    @staticmethod
+    def _round_ell(rnd: _Round) -> int:
+        """Largest committed prefix of the round, the x of the H curve."""
+        return int(max(rnd.prefix_lens)) if rnd.prefix_lens else 0
+
     def _predict_split(self, rnd: _Round):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
             predict_hold_ms,
@@ -837,7 +1021,7 @@ class ClearLedger:
 
         needed = (max(rnd.prefix_lens) if rnd.prefix_lens else 0) + int(rnd.k) + 1
         bucket = smallest_bucket(needed, runtime_kv_buckets())
-        hold = predict_hold_ms(rnd.b, int(rnd.k), bucket)
+        hold = predict_hold_ms(rnd.b, int(rnd.k), bucket, self._round_ell(rnd))
         if hold is None:
             return None, None
         return float(hold), float(predict_q_ms(rnd.b, int(rnd.k)))
@@ -886,7 +1070,9 @@ class ClearLedger:
                     and q_ms is not None
                     and not excluded
                 ):
-                    self._stash_unpaired(rnd, float(hold_ms), float(q_ms), prefit)
+                    self._stash_unpaired(
+                        rnd, float(hold_ms), float(q_ms), prefit, self._round_ell(rnd)
+                    )
                 return
             if verify.get("path") == "eager":
                 return
@@ -906,6 +1092,7 @@ class ClearLedger:
                 prefit=prefit,
                 path=str(verify.get("path") or "graph"),
                 keep=keep,
+                ell=self._round_ell(rnd),
             )
             return
         if int(rnd.k) not in VERIFY_KS:
@@ -915,16 +1102,17 @@ class ClearLedger:
         if bucket is None:
             return
         measured = float(t_k_us) / 1000.0
+        ell = self._round_ell(rnd)
         if keep:
             if prefit.get("group") == "v":
                 prefit_record_h(
-                    scheduler, rnd.b, int(rnd.k), int(bucket), measured, prefit
+                    scheduler, rnd.b, int(rnd.k), int(bucket), measured, prefit, ell=ell
                 )
             return
         if prefit is not None:
             return
-        observe_verify(rnd.b, int(rnd.k), int(bucket), measured)
-        note_online_h(scheduler, rnd.b, int(rnd.k), int(bucket), measured)
+        observe_verify(rnd.b, int(rnd.k), int(bucket), measured, ell)
+        note_online_h(scheduler, rnd.b, int(rnd.k), int(bucket), measured, ell=ell)
 
     def _write_hq(
         self,
@@ -939,8 +1127,12 @@ class ClearLedger:
         prefit,
         path,
         keep,
+        ell=None,
     ) -> None:
-        """Write one graph sample and log the b, K, and bucket that landed."""
+        """Write one graph sample and log the b, K, and bucket that landed.
+
+        ``ell`` is the round's largest committed prefix, kept beside H.
+        """
         from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
             note_online_h,
             prefit_record_h,
@@ -961,14 +1153,22 @@ class ClearLedger:
         if keep:
             if isinstance(prefit, dict) and prefit.get("group") == "v":
                 prefit_record_h(
-                    scheduler, int(batch), int(k), int(bucket), float(hold_ms), prefit
+                    scheduler,
+                    int(batch),
+                    int(k),
+                    int(bucket),
+                    float(hold_ms),
+                    prefit,
+                    ell=ell,
                 )
             return
         if prefit is not None:
             return
-        observe_verify(int(batch), int(k), int(bucket), float(hold_ms))
+        observe_verify(int(batch), int(k), int(bucket), float(hold_ms), ell)
         observe_q(int(batch), int(k), float(q_ms))
-        note_online_h(scheduler, int(batch), int(k), int(bucket), float(hold_ms))
+        note_online_h(
+            scheduler, int(batch), int(k), int(bucket), float(hold_ms), ell=ell
+        )
 
     def _pending_key(self, session, rpc) -> tuple:
         return (str(session), int(rpc))
@@ -994,12 +1194,15 @@ class ClearLedger:
                 self._pending_rounds.pop(key, None)
                 self._pending_reports.pop(key, None)
 
-    def _stash_unpaired(self, rnd: _Round, hold_ms: float, q_ms: float, prefit) -> None:
+    def _stash_unpaired(
+        self, rnd: _Round, hold_ms: float, q_ms: float, prefit, ell=None
+    ) -> None:
         key = self._pending_key(rnd.session_id, rnd.rpc_seq)
         self._pending_rounds[key] = {
             "hold_ms": float(hold_ms),
             "q_ms": float(q_ms),
             "prefit": None if prefit is None else dict(prefit),
+            "ell": None if ell is None else int(ell),
         }
         self._remember_pending(key)
 
@@ -1048,6 +1251,7 @@ class ClearLedger:
                 prefit=prefit,
                 path=str(report.get("path") or "graph"),
                 keep=keep,
+                ell=held.get("ell"),
             )
 
     def _assign_layer_walls(self, rnd: _Round) -> tuple:
@@ -1059,6 +1263,8 @@ class ClearLedger:
         """
         pre = [sample for sample in rnd.layers if not sample.get("post_reply")]
         for index, sample in enumerate(pre):
+            # The last one runs to the stop and carries the round's tail work.
+            sample["last"] = index + 1 == len(pre)
             t0 = sample.get("t0")
             if index + 1 < len(pre):
                 boundary = pre[index + 1].get("t0")
@@ -1088,6 +1294,7 @@ class ClearLedger:
         price_ms: Optional[float],
         price_kept: bool,
         skip_accept: bool = False,
+        pending=None,
     ) -> None:
         """Kept rounds update Θ_b. A mixed round is logged and left out.
 
@@ -1103,9 +1310,9 @@ class ClearLedger:
         )
 
         if skip_accept:
-            discard_pending()
+            discard_pending(pending)
         else:
-            settle_verified(next_rids, next_prefixes)
+            settle_verified(next_rids, next_prefixes, pending)
         if not price_kept or price_tokens is None or price_ms is None:
             return
         observe_price(rnd.b, price_tokens, price_ms)
@@ -1129,6 +1336,8 @@ class ClearLedger:
         fitted = False
         features = None
         measured = None
+        depth_ratio = None
+        depth_src = None
         if wall is not None:
             measured = int(wall) / 1000.0
         elif host is not None and gpu is not None:
@@ -1152,6 +1361,20 @@ class ClearLedger:
                 pred = model.predict(features)
                 if pred not in (None, 0.0) and measured is not None:
                     residual = measured / pred - 1.0
+            depth_ratio, depth_src = layer_depth_ratio(
+                self, sample["w"], sample["graph_bucket"], sample["layer"]
+            )
+            if (
+                not excluded
+                and prefit is None
+                and not sample.get("last")
+                and str(sample["path"]) == "graph"
+                # Host plus GPU, used without a wall, is not the same span.
+                and wall is not None
+                and measured is not None
+                and pred not in (None, 0.0)
+            ):
+                self._learn_depth(sample, float(measured), float(pred))
             if not excluded:
                 if keep:
                     from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
@@ -1199,8 +1422,24 @@ class ClearLedger:
             "pred_ms": pred,
             "residual": residual,
             "fit": fitted,
+            "last": bool(sample.get("last")),
+            "depth_ratio": depth_ratio,
+            "depth_src": depth_src,
         }
         self.queue_log("d_layer", sample_log)
+
+    def _learn_depth(self, sample: dict, measured: float, pred: float) -> None:
+        """One middle layer into its depth cell and the pooled depth row."""
+        d = _depth_key(sample["layer"])
+        g = int(sample["graph_bucket"])
+        for table, key in (
+            (self.layer_depth, (int(sample["w"]), g, d)),
+            (self.layer_depth_pooled, (g, d)),
+        ):
+            row = table.setdefault(key, [0.0, 0.0, 0])
+            row[0] = row[0] * FORGET + measured
+            row[1] = row[1] * FORGET + pred
+            row[2] += 1
 
 
 def _valid_verify_report(verify) -> Optional[dict]:
@@ -1273,13 +1512,15 @@ def merge_pending_verify(scheduler) -> None:
         merge(scheduler)
 
 
-def _target_gap(next_rids: Sequence[str], next_prefixes: Sequence[int]) -> bool:
+def _target_gap(
+    next_rids: Sequence[str], next_prefixes: Sequence[int], pending=None
+) -> bool:
     """True when a noted request grew by more than its tree depth plus one."""
     from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
         target_gap_open,
     )
 
-    return target_gap_open(next_rids, next_prefixes)
+    return target_gap_open(next_rids, next_prefixes, pending)
 
 
 def _gain_ratio() -> float:
@@ -1455,6 +1696,9 @@ def add_post_ms(scheduler, elapsed_ms: float) -> None:
 
 @policy_timed(stage="recv")
 def note_packet(scheduler, batch) -> None:
+    # A close left over from a packet that never reached its post step runs
+    # first, so every packet sees the same state order as before.
+    run_deferred_close(scheduler)
     # An interrupted reply must not freeze its abandoned trees later.
     scheduler._clear_replay_to_hold = []
     serial = int(getattr(scheduler, "_clear_build_serial", 0) or 0) + 1
@@ -1486,6 +1730,12 @@ def note_packet(scheduler, batch) -> None:
     hold_ns = getattr(batch, "target_residence_ns", None)
     hold_rpc = getattr(batch, "target_residence_rpc_seq", None)
 
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        defer_close_enabled,
+    )
+
+    defer = defer_close_enabled()
+
     def _run(ledger: ClearLedger) -> None:
         if isinstance(info, dict) or type(hold_ns) is int:
             ledger.split_capable = True
@@ -1505,9 +1755,34 @@ def note_packet(scheduler, batch) -> None:
             reply_bytes=getattr(server, "last_reply_bytes", None),
             verify=_batch_verify_report(batch),
             scheduler=scheduler,
+            defer=defer,
         )
 
     _quiet(scheduler, _run)
+
+
+def note_round_expect(scheduler, rid, ratio, mass, depth) -> None:
+    """Remember one request's c_i and verified path mass on the open round."""
+    if scheduler is None:
+        return
+
+    def _run(ledger: ClearLedger) -> None:
+        rnd = ledger.open
+        if rnd is None:
+            return
+        rnd.e_rows[str(rid)] = (float(ratio), float(mass))
+        rnd.tree_depth = max(int(rnd.tree_depth or 0), int(depth or 0))
+
+    _quiet(scheduler, _run)
+
+
+def run_deferred_close(scheduler) -> None:
+    """Account the round that ``note_packet`` detached. A no-op when none waits.
+
+    The Draft loop calls this after the reply is sent and before the post
+    step, so the Target never waits for it.
+    """
+    _quiet(scheduler, lambda ledger: ledger.run_deferred())
 
 
 def note_idle(scheduler) -> None:

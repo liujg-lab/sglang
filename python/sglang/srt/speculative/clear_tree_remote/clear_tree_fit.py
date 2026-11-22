@@ -42,7 +42,7 @@ _TARGET_KEYS = (
 )
 
 
-_FIT_SCHEMA = 2
+_FIT_SCHEMA = 3
 _CELL_SAMPLES = PREFIT_CELL_SAMPLES
 _QUERY_BACKOFF = (5.0, 10.0, 30.0)
 
@@ -55,6 +55,7 @@ class PrefitState:
         self.plan = plan
         self.counts = {}
         self.h = {}
+        self.h_ell = {}
         self.layers = {}
         self.online_h = []
         self.online_layers = []
@@ -302,6 +303,8 @@ def _install_layers(scheduler, rows) -> int:
         fresh[key] = model
         installed += 1
     ledger.layer_models = fresh
+    # Depth ratios were measured against the regressions just replaced.
+    ledger.reset_layer_depth()
     return installed
 
 
@@ -422,6 +425,9 @@ def _parse_h_row(row):
     samples = row.get("samples_ms")
     if not isinstance(samples, list) or not samples:
         raise ValueError("h samples")
+    ells = row.get("ells")
+    if not isinstance(ells, list) or len(ells) != len(samples):
+        raise ValueError("h ells")
     key = (int(row["b"]), int(row["k"]), int(row["bucket"]))
     values = [float(item) for item in samples]
     return key, {
@@ -429,6 +435,7 @@ def _parse_h_row(row):
         "k": key[1],
         "bucket": key[2],
         "samples_ms": values,
+        "ells": [None if item is None else int(item) for item in ells],
     }
 
 
@@ -497,6 +504,8 @@ def _install_prepared(scheduler, prepared) -> bool:
         return False
     replace_hold_cells(prepared.get("h") or [])
     ledger.layer_models = dict(prepared.get("layers") or {})
+    # Depth ratios were measured against the regressions just replaced.
+    ledger.reset_layer_depth()
     scheduler._clear_fit_installed = True
     scheduler._clear_fit_ready = True
     scheduler._clear_prefit = None
@@ -871,12 +880,20 @@ def _active_uncommitted(scheduler):
     return state
 
 
-def note_online_h(scheduler, batch, k, bucket, hold_ms) -> None:
+def note_online_h(scheduler, batch, k, bucket, hold_ms, ell=None) -> None:
     """Remember one ordinary H sample so commit can replay it after the snapshot."""
     state = None if scheduler is None else _active_uncommitted(scheduler)
     if state is None or hold_ms is None or bucket is None:
         return
-    state.online_h.append((int(batch), int(k), int(bucket), float(hold_ms)))
+    state.online_h.append(
+        (
+            int(batch),
+            int(k),
+            int(bucket),
+            float(hold_ms),
+            None if ell is None else int(ell),
+        )
+    )
 
 
 def note_online_layer(scheduler, width, path, graph, features, measured) -> None:
@@ -908,8 +925,8 @@ def replay_online_updates(scheduler) -> None:
     state = getattr(scheduler, "_clear_prefit", None)
     if state is None:
         return
-    for batch, k, bucket, hold_ms in list(getattr(state, "online_h", None) or []):
-        observe_verify(batch, k, bucket, hold_ms)
+    for batch, k, bucket, hold_ms, ell in list(getattr(state, "online_h", None) or []):
+        observe_verify(batch, k, bucket, hold_ms, ell)
     ledger = bind_ledger(scheduler)
     if ledger is not None:
         for width, path, graph, features, measured in list(
@@ -925,13 +942,14 @@ def replay_online_updates(scheduler) -> None:
     state.online_layers = []
 
 
-def prefit_record_h(scheduler, batch, k, bucket, hold_ms, owner=None) -> None:
-    """Keep one H sample from the run that opened this round."""
+def prefit_record_h(scheduler, batch, k, bucket, hold_ms, owner=None, ell=None) -> None:
+    """Keep one H sample, and its committed prefix, from the run that opened this round."""
     state = getattr(scheduler, "_clear_prefit", None)
     if state is None or hold_ms is None or not _sample_owner_ok(scheduler, owner):
         return
     key = (int(batch), int(k), int(bucket))
     state.h.setdefault(key, []).append(float(hold_ms))
+    state.h_ell.setdefault(key, []).append(None if ell is None else int(ell))
 
 
 def prefit_record_layer(scheduler, width, path, graph, features, measured, owner=None) -> None:
@@ -963,12 +981,16 @@ def _state_rows(state: PrefitState):
         if not samples:
             continue
         batch, k, bucket = key
+        ells = list(getattr(state, "h_ell", {}).get(key) or [])
+        if len(ells) != len(samples):
+            ells = [None] * len(samples)
         rows.append(
             {
                 "b": int(batch),
                 "k": int(k),
                 "bucket": int(bucket),
                 "samples_ms": [float(value) for value in samples],
+                "ells": [None if value is None else int(value) for value in ells],
             }
         )
     layers = []

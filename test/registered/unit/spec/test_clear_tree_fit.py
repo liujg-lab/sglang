@@ -321,6 +321,144 @@ class ClearTreeTargetResidenceTest(CustomTestCase):
 class ClearTreeHoldCurveTest(CustomTestCase):
     def setUp(self):
         reset_policy()
+        self._curve_env = os.environ.pop("SGLANG_CLEAR_H_CURVE", None)
+
+    def tearDown(self):
+        if self._curve_env is None:
+            os.environ.pop("SGLANG_CLEAR_H_CURVE", None)
+        else:
+            os.environ["SGLANG_CLEAR_H_CURVE"] = self._curve_env
+        reset_policy()
+
+    @staticmethod
+    def _row(batch, k, bucket, hold, ell, n=4):
+        return {
+            "b": batch,
+            "k": k,
+            "bucket": bucket,
+            "samples_ms": [float(hold)] * n,
+            "ells": [int(ell)] * n,
+        }
+
+    def _two_buckets(self):
+        policy.replace_hold_cells(
+            [
+                self._row(1, 16, 512, 40.0, 320),
+                self._row(1, 16, 4096, 48.0, 2560),
+            ]
+        )
+
+    def test_curve_interpolates_between_bucket_anchors(self):
+        self._two_buckets()
+        self.assertEqual(
+            policy._hold_anchors[(1, 16)], [(320.0, 40.0), (2560.0, 48.0)]
+        )
+        expected = 40.0 + 8.0 * (2200 - 320) / (2560 - 320)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), expected)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2560), 48.0)
+        # Without a prefix the bucket mean is unchanged.
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096), 48.0)
+
+    def test_switch_off_keeps_the_bucket_mean(self):
+        self._two_buckets()
+        os.environ["SGLANG_CLEAR_H_CURVE"] = "0"
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), 48.0)
+        self.assertAlmostEqual(policy.predict_verify_ms(1, 16, 4096, 2200), 48.0)
+
+    def test_curve_extrapolates_with_a_non_negative_end_slope(self):
+        policy.replace_hold_cells(
+            [
+                self._row(1, 8, 512, 37.0, 320),
+                self._row(1, 8, 4096, 42.0, 2560),
+                self._row(1, 4, 512, 40.0, 320),
+                self._row(1, 4, 4096, 38.0, 2560),
+                self._row(1, 2, 4096, 35.0, 2560),
+            ]
+        )
+        self.assertAlmostEqual(
+            policy.predict_hold_ms(1, 8, 4096, 3000), 42.0 + 5.0 * 440 / 2240
+        )
+        rising = policy._hold_anchors[(1, 8)]
+        self.assertAlmostEqual(
+            policy._interp_anchor(rising, 100), 37.0 - 5.0 * 220 / 2240
+        )
+        # A falling end segment does not extrapolate downward or upward.
+        falling = policy._hold_anchors[(1, 4)]
+        self.assertAlmostEqual(policy._interp_anchor(falling, 3000), 38.0)
+        self.assertAlmostEqual(policy._interp_anchor(falling, 100), 40.0)
+        # One anchor is a constant.
+        single = policy._hold_anchors[(1, 2)]
+        self.assertAlmostEqual(policy._interp_anchor(single, 500), 35.0)
+
+    def test_online_offset_moves_only_its_own_cell(self):
+        self._two_buckets()
+        base = policy.predict_hold_ms(1, 16, 4096, 2200)
+        for _ in range(16):
+            policy.observe_verify(1, 16, 4096, base - 1.0, 2200)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), base - 1.0)
+        # The other bucket still prices from the curve alone.
+        expected = 40.0 + 8.0 * (372 - 320) / (2560 - 320)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 512, 372), expected)
+        # Anchors do not move with online samples.
+        self.assertEqual(
+            policy._hold_anchors[(1, 16)], [(320.0, 40.0), (2560.0, 48.0)]
+        )
+
+    def test_offset_uses_the_spike_filter(self):
+        self._two_buckets()
+        base = policy.predict_hold_ms(1, 16, 4096, 2200)
+        for _ in range(15):
+            policy.observe_verify(1, 16, 4096, base, 2200)
+        policy.observe_verify(1, 16, 4096, 400.0, 2200)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), base)
+
+    def test_samples_without_prefix_do_not_move_the_offset(self):
+        self._two_buckets()
+        base = policy.predict_hold_ms(1, 16, 4096, 2200)
+        for _ in range(16):
+            policy.observe_verify(1, 16, 4096, base + 5.0)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), base)
+
+    def test_k_stays_monotone_at_the_queried_prefix(self):
+        policy.replace_hold_cells(
+            [
+                self._row(1, 8, 512, 40.0, 320),
+                self._row(1, 8, 4096, 50.0, 2560),
+                self._row(1, 16, 512, 41.0, 320),
+                self._row(1, 16, 4096, 45.0, 2560),
+            ]
+        )
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 8, 4096, 2560), 47.5)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2560), 47.5)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 8, 512, 320), 40.0)
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 512, 320), 41.0)
+
+    def test_a_cell_without_samples_is_not_priced(self):
+        self._two_buckets()
+        self.assertIsNone(policy.predict_hold_ms(1, 16, 1024, 700))
+
+    def test_rows_without_prefixes_give_no_curve(self):
+        policy.replace_hold_cells(
+            [
+                {"b": 1, "k": 16, "bucket": 512, "samples_ms": [40.0] * 4},
+                {
+                    "b": 1,
+                    "k": 16,
+                    "bucket": 4096,
+                    "samples_ms": [48.0] * 4,
+                    "ells": [None] * 4,
+                },
+            ]
+        )
+        self.assertEqual(policy._hold_anchors, {})
+        self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 4096, 2200), 48.0)
+
+    def test_external_reset_drops_prefixes_and_anchors(self):
+        self._two_buckets()
+        policy.observe_verify(1, 16, 4096, 47.0, 2200)
+        reset_policy()
+        self.assertEqual(policy._clock_ell, {})
+        self.assertEqual(policy._hold_anchors, {})
 
     def test_spikes_do_not_move_a_full_window(self):
         for _ in range(14):
@@ -863,8 +1001,10 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertTrue(status["ready"])
         self.assertTrue(status["written"])
         payload = json.loads(Path(self._path).read_text())
-        self.assertEqual(payload["schema"], 2)
+        self.assertEqual(payload["schema"], 3)
         self.assertNotIn("q", payload)
+        for row in payload["h"]:
+            self.assertEqual(len(row["ells"]), len(row["samples_ms"]))
         self.assertEqual(payload["run"], run)
         self.assertIn("plan", payload)
         self.assertIn("coverage", payload)
@@ -880,6 +1020,66 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertAlmostEqual(policy.predict_hold_ms(1, 16, 256), held)
         loaded = scheduler._clear_ledger.layer_models[(8, "graph", 1)]
         self.assertAlmostEqual(loaded.predict([1.0, 16.0]), layer)
+
+    def test_file_round_trip_keeps_prefixes_and_anchors(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        state, stale = fit._adopt_run(scheduler, run)
+        self.assertFalse(stale)
+        for cell in state.required_h:
+            for step in range(4):
+                fit.prefit_record_h(scheduler, *cell, 12.5, ell=100 + 2 * step)
+        for cell in state.required_layers:
+            for length, target in ((4.0, 1.0), (8.0, 1.4), (12.0, 1.8), (16.0, 2.2)):
+                fit.prefit_record_layer(
+                    scheduler, cell[0], cell[1], cell[2], [1.0, length], target
+                )
+        status = fit.commit_prefit(scheduler, run, 1)
+        self.assertTrue(status["ready"])
+        payload = json.loads(Path(self._path).read_text())
+        row = payload["h"][0]
+        self.assertEqual(row["ells"], [100, 102, 104, 106])
+        anchors = dict(policy._hold_anchors)
+        self.assertEqual(anchors[(1, 16)], [(103.0, 12.5)])
+
+        reset_policy()
+        scheduler._clear_ledger.layer_models = {}
+        scheduler._clear_fit_installed = False
+        scheduler._clear_fit_ready = False
+        fit.load_draft_part(scheduler)
+        fit.on_target_info(scheduler, scheduler._clear_target_header)
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertEqual(policy._hold_anchors, anchors)
+        self.assertEqual(policy._clock_ell[(1, 16, 256)], [100, 102, 104, 106])
+
+    def test_schema_three_needs_matching_ells(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        self._fill(scheduler, run)
+        fit.commit_prefit(scheduler, run, 1)
+        payload = json.loads(Path(self._path).read_text())
+        for broken in (None, [1]):
+            if broken is None:
+                payload["h"][0].pop("ells", None)
+            else:
+                payload["h"][0]["ells"] = broken
+            Path(self._path).write_text(json.dumps(payload))
+            reset_policy()
+            scheduler._clear_fit_installed = False
+            scheduler._clear_fit_ready = False
+            scheduler._clear_fit_pending = None
+            fit.load_draft_part(scheduler)
+            fit.on_target_info(scheduler, scheduler._clear_target_header)
+            self.assertFalse(scheduler._clear_fit_ready)
+
+    def test_online_samples_replayed_after_commit_keep_prefixes(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        self._fill(scheduler, run)
+        fit.note_online_h(scheduler, 1, 16, 256, 30.0, ell=150)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        self.assertEqual(policy._clock[(1, 16, 256)][-1], 30.0)
+        self.assertEqual(policy._clock_ell[(1, 16, 256)][-1], 150)
 
     def test_header_mismatch_refuses_the_file(self):
         scheduler = self._scheduler()
@@ -1239,8 +1439,8 @@ class ClearTreeFitFileTest(CustomTestCase):
         fit.on_target_info(scheduler, fit.target_info(scheduler))
         self.assertFalse(scheduler._clear_fit_ready)
 
-        payload["schema"] = 2
-        payload["header"]["schema"] = 2
+        payload["schema"] = fit._FIT_SCHEMA
+        payload["header"]["schema"] = fit._FIT_SCHEMA
         Path(self._path).write_text(json.dumps(payload))
         scheduler.max_running_requests = 4
         scheduler._clear_target_header = fit.target_info(scheduler)
@@ -1956,7 +2156,7 @@ class ClearTreeFitSyncTest(CustomTestCase):
             plan = prefit.build_plan(
                 prefit.PlanInputs(
                     batches=(1,),
-                    ks=(8, 16),
+                    ks=(8,),
                     widths=(4, 8),
                     buckets=(64,),
                     max_depth=8,
@@ -2019,8 +2219,9 @@ class ClearTreeFitSyncTest(CustomTestCase):
                 scheduler=scheduler,
             )
             self.assertEqual(policy._clock[(1, 8, 256)], [400.0])
+            self.assertEqual(policy._clock_ell[(1, 8, 256)], [32])
             self.assertEqual(scheduler._clear_prefit.h, {})
-            self.assertEqual(scheduler._clear_prefit.online_h, [(1, 8, 256, 400.0)])
+            self.assertEqual(scheduler._clear_prefit.online_h, [(1, 8, 256, 400.0, 32)])
             self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
             self.assertEqual(len(scheduler._clear_prefit.online_layers), 1)
             self.assertEqual(policy._q_raw, {})
@@ -2063,6 +2264,7 @@ class ClearTreeFitSyncTest(CustomTestCase):
             self.assertEqual(policy._clock[(1, 8, 256)], [400.0])
             self.assertEqual(policy._q_raw, {})
             self.assertEqual(scheduler._clear_prefit.h[(1, 8, 256)], [100.0])
+            self.assertEqual(scheduler._clear_prefit.h_ell[(1, 8, 256)], [32])
             self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 1)
             self.assertEqual(scheduler._clear_prefit.layers[(8, "graph", 1)].n, 1)
 
@@ -2089,6 +2291,7 @@ class ClearTreeFitSyncTest(CustomTestCase):
             )
             self.assertFalse(ordinary["excluded"])
             self.assertEqual(policy._clock[(1, 8, 256)], [400.0, 50.0])
+            self.assertEqual(policy._clock_ell[(1, 8, 256)], [32, 32])
             self.assertEqual(list(policy._q_raw[(1, 8)]), [350.0])
             case._fill(scheduler, run)
             status = fit.commit_prefit(scheduler, run, 1)
@@ -2096,6 +2299,10 @@ class ClearTreeFitSyncTest(CustomTestCase):
             self.assertEqual(
                 policy._clock[(1, 8, 256)],
                 [100.0, 12.5, 12.5, 12.5, 12.5, 400.0, 50.0],
+            )
+            self.assertEqual(
+                policy._clock_ell[(1, 8, 256)],
+                [32, None, None, None, None, 32, 32],
             )
             self.assertEqual(ledger.layer_models[(8, "graph", 1)].n, 2)
             self.assertEqual(list(policy._q_raw[(1, 8)]), [350.0])

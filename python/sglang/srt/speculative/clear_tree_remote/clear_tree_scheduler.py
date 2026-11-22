@@ -1424,7 +1424,13 @@ class ClearTreeSchedulerMixin:
                             flush_sr_round_metrics,
                         )
 
+                        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                            run_deferred_close,
+                        )
+
                         flush_sr_round_metrics(self, "session_reset")
+                        # A detached close belongs to the old session's state.
+                        run_deferred_close(self)
                         on_external_event(self, batch)
                     timing = False
                     try:
@@ -1543,6 +1549,16 @@ class ClearTreeSchedulerMixin:
                                     defer_drain=defer_drain,
                                     jobs=jobs,
                                 )
+                                # The previous round's accounting runs here,
+                                # after the reply, so the Target never waits for
+                                # it. It runs before the post step, which reads
+                                # the prices it updates, and also when the reply
+                                # failed.
+                                from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                                    run_deferred_close,
+                                )
+
+                                run_deferred_close(self)
                                 if reply_completed and sys.exc_info()[0] is None:
                                     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
                                         run_post_reply,

@@ -68,7 +68,17 @@ PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
 
 _clock: Dict[tuple, list] = {}
-_curve_cache: Dict[tuple, dict] = {}
+# Committed prefix of each H sample, parallel to ``_clock``. None is unknown.
+_clock_ell: Dict[tuple, list] = {}
+# (b, K) -> [(ell, H)] from the installed prefit cells, sorted by ell.
+_hold_anchors: Dict[tuple, list] = {}
+# H minus the curve at the sample's ell, parallel to ``_clock``. None when the
+# sample has no ell or its (b, K) has no anchors. Anchors only change together
+# with ``_clock``, so a residual stays valid while its sample is kept.
+_clock_res: Dict[tuple, list] = {}
+# (b, K, bucket) -> (offset, weight). It does not depend on the queried ell.
+_offset_cache: Dict[tuple, tuple] = {}
+_curve_cache: Dict[tuple, object] = {}
 _q_raw: Dict[tuple, deque] = {}
 _q_coefficients: Dict[int, tuple] = {}
 Q_RIDGE = (0.0, 1.0)
@@ -117,6 +127,10 @@ def on_external_event(scheduler, batch=None) -> None:
             on_target_info(scheduler, info)
         return
     _clock.clear()
+    _clock_ell.clear()
+    _hold_anchors.clear()
+    _clock_res.clear()
+    _offset_cache.clear()
     _curve_cache.clear()
     _q_raw.clear()
     _q_coefficients.clear()
@@ -149,6 +163,10 @@ def reset_policy(keep_fits: bool = False) -> None:
     global _bucket_warned
     if not keep_fits:
         _clock.clear()
+        _clock_ell.clear()
+        _hold_anchors.clear()
+        _clock_res.clear()
+        _offset_cache.clear()
         _q_raw.clear()
         _q_coefficients.clear()
     _curve_cache.clear()
@@ -372,20 +390,46 @@ def locked_k_from_env() -> Optional[int]:
     return int(raw)
 
 
-def observe_verify(batch: int, k: int, bucket: Optional[int], ms: float) -> None:
+def h_curve_enabled() -> bool:
+    """Prefix curve for H. ``SGLANG_CLEAR_H_CURVE=0`` keeps the bucket mean."""
+    raw = os.environ.get("SGLANG_CLEAR_H_CURVE", "").strip()
+    return raw != "0"
+
+
+def observe_verify(
+    batch: int,
+    k: int,
+    bucket: Optional[int],
+    ms: float,
+    ell: Optional[int] = None,
+) -> None:
     """One H sample. Eager and over-bucket rows are not recorded.
 
     Each cell keeps the latest ``VERIFY_WINDOW`` samples. One sample is enough
-    to use that cell. The name stays ``observe_verify`` so the Target device
-    fit can keep calling it; that process does not choose K.
+    to use that cell. ``ell`` is the round's largest committed prefix; the
+    Target device fit passes none. The name stays ``observe_verify`` so the
+    Target device fit can keep calling it; that process does not choose K.
     """
     if int(k) not in VERIFY_KS or bucket is None or ms is None:
         return
     key = (int(batch), int(k), int(bucket))
     rows = _clock.setdefault(key, [])
+    ells = _clock_ell.setdefault(key, [])
+    res = _clock_res.setdefault(key, [])
+    # A cell installed without prefixes gets placeholders, so all stay aligned.
+    if len(ells) < len(rows):
+        ells[:0] = [None] * (len(rows) - len(ells))
+    if len(res) < len(rows):
+        res[:0] = [None] * (len(rows) - len(res))
     rows.append(float(ms))
+    ells.append(None if ell is None else int(ell))
+    res.append(_residual(batch, k, ms, ell))
     if len(rows) > VERIFY_WINDOW:
         del rows[:-VERIFY_WINDOW]
+    for parallel in (ells, res):
+        if len(parallel) > len(rows):
+            del parallel[: len(parallel) - len(rows)]
+    _offset_cache.pop(key, None)
     _curve_cache.pop((int(batch), int(bucket)), None)
 
 
@@ -404,11 +448,17 @@ def _steady_verify_samples(rows: Sequence[float]) -> list:
     Two samples use the smaller one as the median, so one spike cannot hide
     inside the comparison. A single sample is kept as it is.
     """
-    kept = [float(value) for value in rows]
+    return [value for value, _tag in _steady_pairs(rows, [None] * len(rows))]
+
+
+def _steady_pairs(rows: Sequence[float], tags: Sequence) -> list:
+    """``_steady_verify_samples`` that keeps each value's tag beside it."""
+    kept = [(float(value), tag) for value, tag in zip(rows, tags)]
     if len(kept) < 2:
         return kept
-    center = min(kept) if len(kept) == 2 else _median(kept)
-    filtered = [value for value in kept if value <= center * 1.5]
+    values = [value for value, _tag in kept]
+    center = min(values) if len(values) == 2 else _median(values)
+    filtered = [pair for pair in kept if pair[0] <= center * 1.5]
     return filtered or kept
 
 
@@ -438,31 +488,154 @@ def _pava(points: Sequence[tuple]) -> Dict[int, float]:
     return fitted
 
 
-def _hold_curve(batch: int, bucket: int) -> Dict[int, float]:
-    """Robust H means for one (batch, bucket), forced non-decreasing in K."""
-    key = (int(batch), int(bucket))
-    cached = _curve_cache.get(key)
+def _interp_anchor(points: Sequence[tuple], ell: float) -> Optional[float]:
+    """H on the prefix curve through ``(ell, H)`` anchors sorted by ell.
+
+    Inside the anchors this is linear interpolation. Past either end it uses
+    that end's segment slope, floored at zero. One anchor is a constant.
+    """
+    if not points:
+        return None
+    if len(points) == 1:
+        return float(points[0][1])
+    x = float(ell)
+    if x <= float(points[0][0]):
+        (x0, y0), (x1, y1) = points[0], points[1]
+        slope = (float(y1) - float(y0)) / (float(x1) - float(x0))
+        return float(y0) - max(0.0, slope) * (float(x0) - x)
+    if x >= float(points[-1][0]):
+        (x0, y0), (x1, y1) = points[-2], points[-1]
+        slope = (float(y1) - float(y0)) / (float(x1) - float(x0))
+        return float(y1) + max(0.0, slope) * (x - float(x1))
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if float(x0) <= x <= float(x1):
+            return float(y0) + (float(y1) - float(y0)) * (x - float(x0)) / (
+                float(x1) - float(x0)
+            )
+    return None
+
+
+def _build_anchors(rows) -> Dict[tuple, list]:
+    """One ``(mean ell, steady H)`` anchor per installed cell, grouped by (b, K).
+
+    Rows without a full ``ells`` list give no anchor. Anchors that share a
+    prefix are averaged so interpolation never divides by zero.
+    """
+    grouped: Dict[tuple, Dict[float, list]] = {}
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        samples = row.get("samples_ms")
+        ells = row.get("ells")
+        if (
+            not isinstance(samples, list)
+            or not samples
+            or not isinstance(ells, list)
+            or len(ells) != len(samples)
+            or any(value is None for value in ells)
+        ):
+            continue
+        kept = _steady_pairs(samples, ells)
+        hold = sum(value for value, _ell in kept) / float(len(kept))
+        ell = sum(float(tag) for _value, tag in kept) / float(len(kept))
+        key = (int(row["b"]), int(row["k"]))
+        grouped.setdefault(key, {}).setdefault(round(ell, 6), []).append(hold)
+    anchors = {}
+    for key, by_ell in grouped.items():
+        anchors[key] = [
+            (float(ell), sum(values) / float(len(values)))
+            for ell, values in sorted(by_ell.items())
+        ]
+    return anchors
+
+
+def _residual(batch: int, k: int, ms: float, ell: Optional[int]) -> Optional[float]:
+    """H minus the (b, K) curve at ``ell``, or None without anchors or ell."""
+    if ell is None:
+        return None
+    anchors = _hold_anchors.get((int(batch), int(k)))
+    if not anchors:
+        return None
+    return float(ms) - _interp_anchor(anchors, ell)
+
+
+def _cell_offset(batch: int, k: int, bucket: int) -> tuple:
+    """Mean residual over this cell's steady samples that have one.
+
+    The spike filter runs on the raw H, as for the cell mean. Returns
+    ``(offset, weight)``. A cell with no such sample has offset 0 and weight
+    1, so the curve alone prices it. Cached until the cell gets a sample.
+    """
+    key = (int(batch), int(k), int(bucket))
+    cached = _offset_cache.get(key)
     if cached is not None:
         return cached
+    rows = _clock.get(key) or []
+    res = _clock_res.get(key) or []
+    if len(res) < len(rows):
+        res = [None] * (len(rows) - len(res)) + list(res)
+    kept = [
+        value
+        for _ms, value in _steady_pairs(rows, res[-len(rows) :] if rows else [])
+        if value is not None
+    ]
+    if kept:
+        found = (sum(kept) / float(len(kept)), float(len(kept)))
+    else:
+        found = (0.0, 1.0)
+    _offset_cache[key] = found
+    return found
+
+
+def _hold_curve(batch: int, bucket: int, ell: Optional[int] = None) -> Dict[int, float]:
+    """Robust H for one (batch, bucket), forced non-decreasing in K.
+
+    A K is priced only when its own cell has a sample. Without ``ell`` (or
+    with the curve switched off) each K is its cell's robust mean. With
+    ``ell``, a K that has prefit anchors is its prefix curve at ``ell`` plus
+    the cell's online offset; a K without anchors keeps its cell mean.
+    """
+    use_curve = ell is not None and h_curve_enabled() and bool(_hold_anchors)
+    tag = int(ell) if use_curve else None
+    key = (int(batch), int(bucket))
+    cached = _curve_cache.get(key)
+    if isinstance(cached, dict) and tag in cached:
+        return cached[tag]
     points = []
     for k in VERIFY_KS:
         rows = _clock.get((int(batch), int(k), int(bucket)))
         if not rows:
+            continue
+        anchors = _hold_anchors.get((int(batch), int(k))) if use_curve else None
+        if anchors:
+            offset, weight = _cell_offset(batch, k, bucket)
+            points.append((int(k), _interp_anchor(anchors, tag) + offset, weight))
             continue
         kept = _steady_verify_samples(rows)
         if not kept:
             continue
         points.append((int(k), sum(kept) / float(len(kept)), float(len(kept))))
     fitted = _pava(points)
-    _curve_cache[key] = fitted
+    entry = cached if isinstance(cached, dict) else {}
+    if tag is not None:
+        # One prefix per (batch, bucket): a round asks for one ell many times.
+        for old in [item for item in entry if item is not None]:
+            del entry[old]
+    entry[tag] = fitted
+    _curve_cache[key] = entry
     return fitted
 
 
-def predict_hold_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:
-    """Isotonic H for this cell, or None when the cell has no sample."""
+def predict_hold_ms(
+    batch: int, k: int, bucket: Optional[int], ell: Optional[int] = None
+) -> Optional[float]:
+    """Isotonic H for this cell, or None when the K has no price.
+
+    ``ell`` is the round's largest committed prefix.
+    """
     if bucket is None:
         return None
-    return _hold_curve(int(batch), int(bucket)).get(int(k))
+    return _hold_curve(int(batch), int(bucket), ell).get(int(k))
 
 
 def _fit_q_line(points: Sequence[tuple]) -> tuple:
@@ -520,23 +693,36 @@ def predict_q_ms(batch: int, k: int) -> float:
     return float(residual_median + slope * int(k))
 
 
-def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:
+def predict_verify_ms(
+    batch: int, k: int, bucket: Optional[int], ell: Optional[int] = None
+) -> Optional[float]:
     """H plus Q for this cell.
 
     A tier is usable only when its own ``(batch, K, bucket)`` H cell has a
     sample. An empty Q fit adds nothing, so a constant network delay that
-    has not been seen yet does not change the ranking.
+    has not been seen yet does not change the ranking. ``ell`` is the
+    round's largest committed prefix.
     """
-    hold = predict_hold_ms(batch, k, bucket)
+    hold = predict_hold_ms(batch, k, bucket, ell)
     if hold is None:
         return None
     return float(hold) + predict_q_ms(batch, k)
 
 
 def replace_hold_cells(rows) -> None:
-    """Install saved H samples. Later ``observe_verify`` calls extend them."""
+    """Install saved H samples and rebuild the prefix anchors from them.
+
+    Later ``observe_verify`` calls extend the cells. Anchors stay fixed
+    until the next install. Anchors are built first so each installed
+    sample gets its residual.
+    """
     _clock.clear()
+    _clock_ell.clear()
+    _clock_res.clear()
+    _offset_cache.clear()
     _curve_cache.clear()
+    _hold_anchors.clear()
+    _hold_anchors.update(_build_anchors(rows))
     for row in list(rows or []):
         if not isinstance(row, dict):
             continue
@@ -544,8 +730,25 @@ def replace_hold_cells(rows) -> None:
         if not isinstance(samples, list) or not samples:
             continue
         key = (int(row["b"]), int(row["k"]), int(row["bucket"]))
-        kept = [float(value) for value in samples][-VERIFY_WINDOW:]
-        _clock[key] = kept
+        ells = row.get("ells")
+        if not isinstance(ells, list) or len(ells) != len(samples):
+            ells = [None] * len(samples)
+        values = [float(value) for value in samples][-VERIFY_WINDOW:]
+        prefixes = [None if value is None else int(value) for value in ells][
+            -VERIFY_WINDOW:
+        ]
+        _clock[key] = values
+        _clock_ell[key] = prefixes
+        _clock_res[key] = [
+            _residual(key[0], key[1], value, prefix)
+            for value, prefix in zip(values, prefixes)
+        ]
+    logger.info(
+        "[CLEAR] hold anchors installed cells=%d curves=%d curve=%s",
+        len(_clock),
+        len(_hold_anchors),
+        "on" if h_curve_enabled() else "off",
+    )
 
 
 def export_hold_cells() -> list:
@@ -556,12 +759,19 @@ def export_hold_cells() -> list:
         if not samples:
             continue
         batch, k, bucket = key
+        ells = list(_clock_ell.get(key) or [])
+        if len(ells) < len(samples):
+            ells = [None] * (len(samples) - len(ells)) + ells
         rows.append(
             {
                 "b": int(batch),
                 "k": int(k),
                 "bucket": int(bucket),
                 "samples_ms": [float(value) for value in samples],
+                "ells": [
+                    None if value is None else int(value)
+                    for value in ells[-len(samples) :]
+                ],
             }
         )
     return rows
@@ -762,10 +972,34 @@ def note_verified(
     _pending[str(rid)] = item
 
 
-def target_gap_open(rids: Sequence[str], prefixes: Sequence[int]) -> bool:
-    """True when one noted request grew by more than its tree depth plus one."""
+def take_pending() -> Dict[str, dict]:
+    """Detach the unsettled accept rows so a later close settles exactly these.
+
+    The next round's ``note_verified`` then writes into an empty table.
+    """
+    taken = dict(_pending)
+    _pending.clear()
+    return taken
+
+
+def defer_close_enabled() -> bool:
+    """Close the previous round after the reply. ``SGLANG_CLEAR_DEFER_CLOSE=0`` keeps it at receive."""
+    raw = os.environ.get("SGLANG_CLEAR_DEFER_CLOSE", "").strip()
+    return raw != "0"
+
+
+def target_gap_open(
+    rids: Sequence[str],
+    prefixes: Sequence[int],
+    pending: Optional[Dict[str, dict]] = None,
+) -> bool:
+    """True when one noted request grew by more than its tree depth plus one.
+
+    ``pending`` is a table from ``take_pending``; None reads the live one.
+    """
+    table = _pending if pending is None else pending
     found = {str(rid): int(prefix) for rid, prefix in zip(rids, prefixes)}
-    for rid, item in _pending.items():
+    for rid, item in table.items():
         if rid not in found or "depth" not in item:
             continue
         growth = int(found[rid]) - int(item["prefix"])
@@ -774,16 +1008,24 @@ def target_gap_open(rids: Sequence[str], prefixes: Sequence[int]) -> bool:
     return False
 
 
-def discard_pending() -> None:
+def discard_pending(pending: Optional[Dict[str, dict]] = None) -> None:
     """Drop unsettled accept rows without writing them into c_i."""
-    _pending.clear()
+    (_pending if pending is None else pending).clear()
 
 
-def settle_verified(rids: Sequence[str], prefixes: Sequence[int]) -> None:
-    """Turn the pending path mass into an accept count. Missing requests drop."""
+def settle_verified(
+    rids: Sequence[str],
+    prefixes: Sequence[int],
+    pending: Optional[Dict[str, dict]] = None,
+) -> None:
+    """Turn the pending path mass into an accept count. Missing requests drop.
+
+    ``pending`` is a table from ``take_pending``; None settles the live one.
+    """
+    table = _pending if pending is None else pending
     found = {str(rid): int(prefix) for rid, prefix in zip(rids, prefixes)}
-    for rid in list(_pending):
-        item = _pending.pop(rid)
+    for rid in list(table):
+        item = table.pop(rid)
         if rid not in found:
             continue
         delta = int(found[rid]) - int(item["prefix"])
@@ -972,6 +1214,11 @@ class RoundPlan:
         self._score_cache: Dict[int, tuple] = {}
         self._frozen_k = None
         self._verify_quotes = None
+        # Layer index of the forward a stop decision is pricing.
+        self._cost_depth: Optional[int] = None
+        # (active, depth) -> depth multiplier. Ratios only move when a round
+        # closes, which is after this round's tree is built.
+        self._depth_factors: Dict[tuple, float] = {}
 
     @property
     def defer_finish(self) -> bool:
@@ -1055,6 +1302,8 @@ class RoundPlan:
                 for item in peers
                 if int(item.depth) < int(item.config.max_depth) - 1
             ]
+            # Growing forwards the layer just written, so its index is the depth.
+            self._cost_depth = int(state.depth)
             self._keep_ids = {id(item) for item in self._choose_keep(eligible)}
             self._at = int(state.depth)
         return id(state) in self._keep_ids
@@ -1090,11 +1339,14 @@ class RoundPlan:
         else:
             return
         _, ordered, _ = self._scores_for(state)
-        note_verified(
-            key,
-            prefix,
-            float(sum(ordered[: int(keep)])),
-            int(state.depth),
+        mass = float(sum(ordered[: int(keep)]))
+        note_verified(key, prefix, mass, int(state.depth))
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            note_round_expect,
+        )
+
+        note_round_expect(
+            self._scheduler, key, accept_ratio(key), mass, int(state.depth)
         )
 
     def _choose_keep(self, eligible) -> list:
@@ -1120,6 +1372,27 @@ class RoundPlan:
             return []
         return list(kept)
 
+    def _depth_factor(self, active: int) -> float:
+        """Depth multiplier for the forward being priced, once per (active, depth)."""
+        depth = self._cost_depth
+        if depth is None or self._scheduler is None:
+            return 1.0
+        cache = getattr(self, "_depth_factors", None)
+        if cache is None:
+            cache = self._depth_factors = {}
+        key = (int(active), int(depth))
+        found = cache.get(key)
+        if found is None:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                layer_depth_factor,
+            )
+
+            found = float(
+                layer_depth_factor(self._scheduler, self.width, int(active), int(depth))
+            )
+            cache[key] = found
+        return found
+
     def _layer_cost(self, active: int, sum_ell: int) -> Optional[float]:
         if self._scheduler is None:
             return None
@@ -1127,7 +1400,10 @@ class RoundPlan:
             predict_layer_ms,
         )
 
-        return predict_layer_ms(self._scheduler, self.width, int(active), int(sum_ell))
+        base = predict_layer_ms(self._scheduler, self.width, int(active), int(sum_ell))
+        if base is None:
+            return None
+        return float(base) * self._depth_factor(int(active))
 
     def _kappa(self):
         if self._scheduler is None:
@@ -1140,7 +1416,10 @@ class RoundPlan:
         width = self.width
 
         def slope(active: int):
-            return layer_sum_ell_slope(scheduler, width, int(active))
+            base = layer_sum_ell_slope(scheduler, width, int(active))
+            if base is None:
+                return None
+            return float(base) * self._depth_factor(int(active))
 
         return slope
 
@@ -1151,7 +1430,7 @@ class RoundPlan:
         )
 
         bucket = smallest_bucket(self.max_ell + int(k) + 1, self.buckets)
-        return predict_verify_ms(self.batch, int(k), bucket)
+        return predict_verify_ms(self.batch, int(k), bucket, int(self.max_ell))
 
     def _quoted(self, k: int) -> Optional[float]:
         """This round's H+Q. A plan without a table still reads the live price."""
@@ -1506,7 +1785,7 @@ def _time_for(batch, max_ell, k, buckets) -> Optional[float]:
     )
 
     bucket = smallest_bucket(int(max_ell) + int(k) + 1, buckets)
-    return predict_verify_ms(batch, int(k), bucket)
+    return predict_verify_ms(batch, int(k), bucket, int(max_ell))
 
 
 def _remember_quote(table, batch, max_ell, k, buckets) -> Optional[float]:

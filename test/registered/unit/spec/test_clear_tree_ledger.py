@@ -1497,6 +1497,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.mark_stop(1.0)
         ledger.mark_send(1.1)
         note_packet(sched, packet(1006, None, 2))
+        ledger_module.run_deferred_close(sched)
         closed = next(
             record
             for kind, record in ledger.pending_logs
@@ -1527,7 +1528,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
     def test_frozen_rows_omit_the_unforwarded_layer(self):
         state = SimpleNamespace(depth=3, prefix=10)
 
-        def predict(_scheduler, width, _active, _sum_ell):
+        def predict(_scheduler, width, _active, _sum_ell, depth=None):
             return 7.0 if int(width) == 8 else 5.0
 
         with patch(
@@ -1791,7 +1792,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         deep = SimpleNamespace(depth=3, prefix=10)
         shallow = SimpleNamespace(depth=2, prefix=4)
 
-        def predict(_scheduler, width, _active, _sum_ell):
+        def predict(_scheduler, width, _active, _sum_ell, depth=None):
             if int(width) != 8:
                 return None
             return 7.0
@@ -2260,6 +2261,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertFalse(record["excluded"])
         self.assertIsNone(record["hold_ms"])
         self.assertEqual(policy._clock[(4, 16, bucket)], [80.0])
+        self.assertEqual(policy._clock_ell[(4, 16, bucket)], [100])
 
         ledger.open.k = 16
         ledger.mark_stop(2.0)
@@ -2268,6 +2270,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         second = _step(ledger, ["a", "b", "c", "d"], [100, 100, 100, 100], 3, 2.08)
         self.assertFalse(second["excluded"])
         self.assertEqual(policy._clock[(4, 16, bucket)], [80.0, 80.0])
+        self.assertEqual(policy._clock_ell[(4, 16, bucket)], [100, 100])
 
         idle = ClearLedger(active_rids=[])
         _step(idle, ["a", "b", "c", "d"], [100, 100, 100, 100], 4, 3.0)
@@ -2896,6 +2899,7 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
         )
         self.assertEqual(policy._clock, {})
         self.assertIn(("sess", 1), ledger._pending_rounds)
+        self.assertEqual(ledger._pending_rounds[("sess", 1)]["ell"], 32)
         ledger.mark_stop(1.4)
         ledger.mark_send(1.5)
         self._close(
@@ -2914,6 +2918,7 @@ class TestHoldAndPrefitExclusions(CustomTestCase):
             },
         )
         self.assertEqual(policy._clock[(1, 8, 256)], [100.0])
+        self.assertEqual(policy._clock_ell[(1, 8, 256)], [32])
         self.assertTrue(policy._q_raw[(1, 8)])
         self.assertNotIn(("sess", 1), ledger._pending_rounds)
         self.assertIn(("sess", 2), ledger._pending_rounds)
@@ -2987,7 +2992,7 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
         prices = {8: 1.0, 16: 1.0}
         calls = []
 
-        def fake(_batch, k, _bucket):
+        def fake(_batch, k, _bucket, _ell=None):
             calls.append(int(k))
             return prices.get(int(k))
 
@@ -3079,9 +3084,9 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
         seen = []
         real = policy.predict_verify_ms
 
-        def spy(batch, k, bucket):
+        def spy(batch, k, bucket, ell=None):
             seen.append(int(k))
-            return real(batch, k, bucket)
+            return real(batch, k, bucket, ell)
 
         state = _score_state([0.4, 0.2, 0.1, 0.05])
         plan.bind_states([state])
@@ -3098,9 +3103,9 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
         seen = []
         real = policy.predict_verify_ms
 
-        def spy(batch, k, bucket):
+        def spy(batch, k, bucket, ell=None):
             seen.append(int(k))
-            return real(batch, k, bucket)
+            return real(batch, k, bucket, ell)
 
         with patch.object(policy, "predict_verify_ms", side_effect=spy):
             os.environ["SGLANG_CLEAR_LOCK_K"] = "32"
@@ -3130,7 +3135,7 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
     def test_cut_and_note_share_one_selected_k(self):
         prices = {8: 1.0, 16: 1.0}
 
-        def fake(_batch, k, _bucket):
+        def fake(_batch, k, _bucket, _ell=None):
             return prices.get(int(k))
 
         def counted(plan):
@@ -3289,6 +3294,7 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
             )
             first.t_send = 1.0
             note_packet(sched, packet(9, 2))
+            ledger_module.run_deferred_close(sched)
         closed = next(
             record
             for kind, record in sched._clear_ledger.pending_logs
@@ -3306,6 +3312,328 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
             + closed["policy_final_k_ms"]
         )
         self.assertAlmostEqual(staged, closed["policy_ms"])
+
+
+class TestDeferredClose(CustomTestCase):
+    """The previous round's accounting runs after the reply, with the same result."""
+
+    def setUp(self):
+        reset_policy()
+        self._env = {
+            name: os.environ.get(name)
+            for name in ("SGLANG_CLEAR_LEDGER", "SGLANG_CLEAR_DEFER_CLOSE")
+        }
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        os.environ.pop("SGLANG_CLEAR_DEFER_CLOSE", None)
+
+    def tearDown(self):
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        reset_policy()
+
+    @staticmethod
+    def _sched():
+        return SimpleNamespace(
+            server_args=SimpleNamespace(clear_tree_width=8),
+            tp_rank=0,
+        )
+
+    @staticmethod
+    def _packet(base, rpc, session="s"):
+        return SimpleNamespace(
+            reqs=[
+                SimpleNamespace(rid="a", base_committed_len=base, committed_ids=None)
+            ],
+            action="step",
+            session_id=session,
+            rpc_seq=rpc,
+        )
+
+    def _drive(self, deferred):
+        """Four STEP packets, each followed by one build and one reply."""
+        if deferred:
+            os.environ.pop("SGLANG_CLEAR_DEFER_CLOSE", None)
+        else:
+            os.environ["SGLANG_CLEAR_DEFER_CLOSE"] = "0"
+        reset_policy()
+        sched = self._sched()
+        now = {"t": 100.0}
+        with patch.object(ledger_module.time, "perf_counter", side_effect=lambda: now["t"]):
+            for rpc, base in enumerate((100, 103, 107, 110), start=1):
+                now["t"] = 100.0 + 0.07 * rpc
+                ledger_module.note_packet(sched, self._packet(base, rpc))
+                ledger = sched._clear_ledger
+                ledger.open.k = 16
+                # What RoundPlan.note writes while this round's tree is built.
+                note_verified("a", base, 2.5 + rpc, 8)
+                ledger.mark_stop(now["t"] + 0.020)
+                ledger.mark_send(now["t"] + 0.021)
+                # The Draft loop, after the reply and before the post step.
+                ledger_module.run_deferred_close(sched)
+        closed = [
+            dict(record)
+            for kind, record in sched._clear_ledger.pending_logs
+            if kind == "d_round"
+        ]
+        state = {
+            "clock": {key: list(rows) for key, rows in policy._clock.items()},
+            "sum_a": dict(policy._sum_a),
+            "sum_e": dict(policy._sum_e),
+            "price_ms": dict(policy._price_ms),
+            "price_tok": dict(policy._price_tok),
+            "pending": {key: dict(item) for key, item in policy._pending.items()},
+        }
+        return closed, state
+
+    def test_close_waits_for_the_post_step(self):
+        sched = self._sched()
+        ledger_module.note_packet(sched, self._packet(100, 1))
+        ledger = sched._clear_ledger
+        ledger.open.k = 16
+        note_verified("a", 100, 2.5, 8)
+        ledger.mark_stop()
+        ledger.mark_send()
+        ledger_module.note_packet(sched, self._packet(103, 2))
+        self.assertIsNotNone(ledger.deferred)
+        self.assertFalse([1 for kind, _ in ledger.pending_logs if kind == "d_round"])
+        self.assertEqual(policy._pending, {})
+        ledger_module.run_deferred_close(sched)
+        self.assertIsNone(ledger.deferred)
+        closed = [record for kind, record in ledger.pending_logs if kind == "d_round"]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["rpc_seq"], 1)
+        self.assertTrue(closed[0]["close_deferred"])
+        self.assertGreaterEqual(closed[0]["close_ms"], 0.0)
+        self.assertEqual(closed[0]["price_tokens"], 3)
+
+    def test_the_next_build_does_not_leak_into_the_settlement(self):
+        sched = self._sched()
+        ledger_module.note_packet(sched, self._packet(100, 1))
+        ledger = sched._clear_ledger
+        ledger.open.k = 16
+        note_verified("a", 100, 2.5, 8)
+        ledger.mark_stop()
+        ledger.mark_send()
+        ledger_module.note_packet(sched, self._packet(103, 2))
+        # Round 2 is built before round 1 is accounted.
+        note_verified("a", 103, 9.0, 8)
+        ledger_module.run_deferred_close(sched)
+        self.assertAlmostEqual(policy._sum_a["a"], 2.0)
+        self.assertAlmostEqual(policy._sum_e["a"], 2.5)
+        self.assertEqual(policy._pending["a"]["prefix"], 103)
+        self.assertAlmostEqual(policy._pending["a"]["e"], 9.0)
+
+    def test_deferred_and_receive_close_give_the_same_accounting(self):
+        sync_rounds, sync_state = self._drive(deferred=False)
+        late_rounds, late_state = self._drive(deferred=True)
+        self.assertEqual(len(sync_rounds), 3)
+        self.assertEqual(len(late_rounds), 3)
+        for sync, late in zip(sync_rounds, late_rounds):
+            self.assertFalse(sync.pop("close_deferred"))
+            self.assertTrue(late.pop("close_deferred"))
+            sync.pop("close_ms")
+            late.pop("close_ms")
+            self.assertEqual(sync, late)
+        self.assertEqual(sync_state, late_state)
+        self.assertTrue(sync_state["clock"])
+        self.assertTrue(sync_state["price_ms"])
+
+    def test_session_change_closes_at_receive(self):
+        sched = self._sched()
+        ledger_module.note_packet(sched, self._packet(100, 1, session="s"))
+        ledger = sched._clear_ledger
+        ledger.open.k = 16
+        ledger.mark_stop()
+        ledger.mark_send()
+        ledger_module.note_packet(sched, self._packet(103, 2, session="t"))
+        self.assertIsNone(ledger.deferred)
+        closed = [record for kind, record in ledger.pending_logs if kind == "d_round"]
+        self.assertEqual(len(closed), 1)
+        self.assertFalse(closed[0]["close_deferred"])
+
+
+class TestLayerDepthAndExpect(CustomTestCase):
+    """Per-depth layer correction and the accepted-versus-E diagnostics."""
+
+    def setUp(self):
+        reset_policy()
+        self._env = {
+            name: os.environ.get(name)
+            for name in ("SGLANG_CLEAR_LEDGER", "SGLANG_CLEAR_LAYER_DEPTH")
+        }
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        os.environ.pop("SGLANG_CLEAR_LAYER_DEPTH", None)
+
+    def tearDown(self):
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        reset_policy()
+
+    @staticmethod
+    def _fitted_ledger():
+        model = ForgettingRegressor(2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1)
+        for prefix in (100.0, 200.0, 300.0, 400.0):
+            model.update([1.0, prefix], 6.0)
+        ledger = ClearLedger()
+        ledger.layer_models[(8, "graph", 1)] = model
+        return ledger
+
+    @staticmethod
+    def _sample(layer, *, last=False, path="graph", wall_us=5400):
+        return {
+            "layer": layer,
+            "active": 1,
+            "graph_bucket": 1,
+            "w": 8,
+            "sum_ell": 200,
+            "host_us": 1000,
+            "gpu_us": 4000,
+            "wall_us": wall_us,
+            "path": path,
+            "post_reply": False,
+            "last": last,
+        }
+
+    def test_last_pre_reply_layer_is_marked(self):
+        ledger = ClearLedger()
+        rnd = SimpleNamespace(
+            layers=[
+                {"t0": 1.000},
+                {"t0": 1.006},
+                {"t0": 1.012},
+                {"t0": 1.030, "post_reply": True},
+            ],
+            t_stop=1.018,
+            t_open=0.990,
+        )
+        ledger._assign_layer_walls(rnd)
+        self.assertEqual([item.get("last") for item in rnd.layers[:3]], [False, False, True])
+        self.assertNotIn("last", rnd.layers[3])
+
+    def test_only_middle_graph_layers_teach_the_depth_ratio(self):
+        ledger = self._fitted_ledger()
+        rnd = SimpleNamespace(prefit=None, rpc_seq=1, session_id="s")
+        ledger._finish_layer(rnd, self._sample(3), False)
+        self.assertEqual(ledger.layer_depth[(8, 1, 3)][2], 1)
+        self.assertEqual(ledger.layer_depth_pooled[(1, 3)][2], 1)
+        for sample, excluded in (
+            (self._sample(3, last=True), False),
+            (self._sample(3, path="eager"), False),
+            # Without a wall the fallback host plus GPU is a different span.
+            (self._sample(3, wall_us=None), False),
+            (self._sample(3), True),
+        ):
+            ledger._finish_layer(rnd, sample, excluded)
+        self.assertEqual(ledger.layer_depth[(8, 1, 3)][2], 1)
+        logged = [record for kind, record in ledger.pending_logs if kind == "d_layer"]
+        self.assertEqual(len(logged), 5)
+        self.assertEqual(logged[0]["depth_src"], "none")
+        self.assertAlmostEqual(logged[0]["depth_ratio"], 1.0)
+        self.assertTrue(logged[1]["last"])
+
+    def test_depth_ratio_scales_prices_once_it_has_samples(self):
+        ledger = self._fitted_ledger()
+        sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
+        base = predict_layer_ms(sched, 8, 1, 200)
+        slope = layer_sum_ell_slope(sched, 8, 1)
+        for _ in range(ledger_module.DEPTH_MIN_SAMPLES - 1):
+            ledger._learn_depth({"layer": 4, "graph_bucket": 1, "w": 8}, 9.0, 10.0)
+        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base)
+        ledger._learn_depth({"layer": 4, "graph_bucket": 1, "w": 8}, 9.0, 10.0)
+        self.assertEqual(ledger_module.layer_depth_ratio(ledger, 8, 1, 4)[1], "cell")
+        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base * 0.9)
+        self.assertAlmostEqual(layer_sum_ell_slope(sched, 8, 1, depth=4), slope * 0.9)
+        # Without a depth the price is the base fit.
+        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200), base)
+        # Another width at the same capture batch borrows the pooled row.
+        ratio, source = ledger_module.layer_depth_ratio(ledger, 16, 1, 4)
+        self.assertEqual(source, "pooled")
+        self.assertAlmostEqual(ratio, 0.9)
+        # Deep forwards share the capped bucket.
+        self.assertEqual(ledger_module._depth_key(12), ledger_module.DEPTH_CAP)
+        os.environ["SGLANG_CLEAR_LAYER_DEPTH"] = "0"
+        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base)
+        # Installing fits replaces the regressions the ratios were measured on.
+        from sglang.srt.speculative.clear_tree_remote import clear_tree_fit
+
+        clear_tree_fit._install_layers(sched, [])
+        self.assertEqual(ledger.layer_depth, {})
+        self.assertEqual(ledger.layer_depth_pooled, {})
+
+    def test_round_records_accepts_against_expected_mass(self):
+        ledger = ClearLedger(active_rids=["a", "b"])
+        sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
+        _step(ledger, ["a", "b"], [100, 200], 1, 1.0)
+        ledger_module.note_round_expect(sched, "a", 0.5, 4.0, 3)
+        ledger_module.note_round_expect(sched, "b", 0.8, 2.0, 2)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.01)
+        # "b" finished, so only "a" is compared.
+        record = _step(ledger, ["a"], [104], 2, 1.08)
+        self.assertEqual(record["accepted"], 3)
+        self.assertAlmostEqual(record["e_pred"], 2.0)
+        self.assertAlmostEqual(record["e_mass"], 4.0)
+        self.assertEqual(record["e_n"], 1)
+        self.assertEqual(record["tree_depth"], 3)
+
+        ledger.mark_stop(1.1)
+        ledger.mark_send(1.11)
+        empty = _step(ledger, ["a"], [106], 3, 1.2)
+        self.assertIsNone(empty["e_pred"])
+        self.assertIsNone(empty["accepted"])
+
+    def test_stop_decision_and_replay_price_the_forwarded_depth(self):
+        state = SimpleNamespace(depth=3, config=SimpleNamespace(max_depth=8), prefix=100)
+        plan = policy.RoundPlan.__new__(policy.RoundPlan)
+        plan._scheduler = None
+        plan.fixed_depth = None
+        plan.use_tau = False
+        plan.theta_value = 1.0
+        plan.layer_ms = 1.0
+        plan._at = None
+        plan._peers = [state]
+        plan._keep_ids = set()
+        plan._cost_depth = None
+        plan.width = 8
+        with patch.object(policy.RoundPlan, "_choose_keep", return_value=[]):
+            plan.should_grow(state)
+        self.assertEqual(plan._cost_depth, 3)
+
+        seen = []
+        factors = []
+
+        def capture(*_args, **kwargs):
+            seen.append(kwargs.get("depth"))
+            return 2.0
+
+        def factor(_scheduler, _width, active, depth):
+            factors.append((active, depth))
+            return 0.5
+
+        plan._scheduler = SimpleNamespace()
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            side_effect=capture,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.layer_depth_factor",
+            side_effect=factor,
+        ):
+            # The stop decision prices the forward at the current depth, and
+            # reads that depth's multiplier once for the decision.
+            self.assertAlmostEqual(plan._layer_cost(1, 100), 1.0)
+            self.assertAlmostEqual(plan._layer_cost(1, 200), 1.0)
+            self.assertEqual(factors, [(1, 3)])
+            self.assertEqual(seen, [None, None])
+            seen.clear()
+            rows = replay._freeze_layer_rows(SimpleNamespace(), [state])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(set(seen)), [1, 2])
 
 
 if __name__ == "__main__":
