@@ -383,6 +383,51 @@ class ClearTreeHoldCurveTest(CustomTestCase):
 
         self.assertEqual(choice({8: base[0], 16: base[1]}), choice({8: shifted[0], 16: shifted[1]}))
 
+    def test_q_fits_on_observe_not_on_query(self):
+        with patch.object(policy, "_fit_q_line", wraps=policy._fit_q_line) as fit_q:
+            self.assertEqual(policy.predict_q_ms(1, 8), 0.0)
+            policy.observe_q(1, 0, 20.0)
+            policy.observe_q(1, 8, None)
+            fit_q.assert_not_called()
+
+            policy.observe_q(1, 8, 20.0)
+            fit_q.assert_called_once()
+            policy.observe_q(4, 8, 40.0)
+            self.assertEqual(fit_q.call_count, 2)
+            self.assertEqual(policy.predict_q_ms(1, 16), 20.0)
+
+            policy.observe_q(1, 16, 24.0)
+            self.assertEqual(fit_q.call_count, 3)
+            self.assertGreater(policy.predict_q_ms(1, 16), 20.0)
+            self.assertLess(policy.predict_q_ms(1, 8), policy.predict_q_ms(1, 16))
+            self.assertEqual(policy.predict_q_ms(4, 16), 40.0)
+            self.assertEqual(fit_q.call_count, 3)
+
+    def test_q_prediction_matches_window_after_eviction(self):
+        policy.observe_q(1, 8, 1.0)
+        for idx in range(policy.Q_RES_WINDOW):
+            policy.observe_q(1, 8, 5.0 + idx / 32.0)
+            policy.observe_q(1, 16, 7.0 + idx / 32.0)
+        policy.observe_q(1, 16, 100.0)
+
+        self.assertNotIn(1.0, policy._q_raw[(1, 8)])
+        kept = policy._q_kept(1)
+        _, slope = policy._fit_q_line(kept)
+        residuals = [ms - slope * float(k) for k, ms in kept]
+        for k in (2, 8, 16, 64):
+            self.assertEqual(
+                policy.predict_q_ms(1, k), policy._median(residuals) + slope * k
+            )
+
+    def test_q_prediction_follows_reset_policy(self):
+        policy.observe_q(1, 8, 20.0)
+        reset_policy(keep_fits=True)
+        self.assertEqual(policy.predict_q_ms(1, 8), 20.0)
+        self.assertEqual(list(policy._q_raw[(1, 8)]), [20.0])
+        reset_policy()
+        self.assertEqual(policy.predict_q_ms(1, 8), 0.0)
+        self.assertEqual(policy._q_raw, {})
+
     def test_q_outlier_stays_out_of_the_regression(self):
         policy.observe_q(1, 8, 20.0)
         policy.observe_q(1, 8, 20.0)
@@ -945,6 +990,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         header = fit.target_info(scheduler)
         scheduler._clear_target_header = header
         policy.observe_verify(1, 8, 256, 12.5)
+        policy.observe_q(1, 8, 3.0)
         model = _new_layer_model()
         scheduler._clear_ledger.layer_models[(8, "graph", 1)] = model
         scheduler._clear_ledger.open = object()
@@ -952,6 +998,7 @@ class ClearTreeFitFileTest(CustomTestCase):
             scheduler, SimpleNamespace(target_info=dict(header))
         )
         self.assertEqual(policy._clock[(1, 8, 256)], [12.5])
+        self.assertEqual(policy.predict_q_ms(1, 8), 3.0)
         self.assertIn((8, "graph", 1), scheduler._clear_ledger.layer_models)
         self.assertIsNone(scheduler._clear_ledger.open)
 
@@ -959,6 +1006,8 @@ class ClearTreeFitFileTest(CustomTestCase):
             scheduler, SimpleNamespace(target_info={"backend": "other", "tp": 2})
         )
         self.assertEqual(policy._clock, {})
+        self.assertEqual(policy._q_raw, {})
+        self.assertEqual(policy.predict_q_ms(1, 8), 0.0)
         self.assertEqual(scheduler._clear_ledger.layer_models, {})
 
     def test_auto_prefit_starts_from_the_handshake(self):

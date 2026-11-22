@@ -1,0 +1,18 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "fit_installed_without_new_scan": true,
+  "fit_unchanged_during_trial": true,
+  "fit_write_path_graph_only": true,
+  "formal_hold_invalid": 0,
+  "bonus_rank0_last_window": "idle",
+  "not_observed": [
+    "prefit_scan",
+    "refill_groups",
+    "graph_unsupported",
+    "wrote_fit_file"
+  ]
+}

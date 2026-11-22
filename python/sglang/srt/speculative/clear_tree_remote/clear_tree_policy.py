@@ -70,6 +70,7 @@ PRICE_PRIOR_N0 = 10.0
 _clock: Dict[tuple, list] = {}
 _curve_cache: Dict[tuple, dict] = {}
 _q_raw: Dict[tuple, deque] = {}
+_q_coefficients: Dict[int, tuple] = {}
 Q_RIDGE = (0.0, 1.0)
 Q_RES_WINDOW = 32
 _price_n: Dict[int, int] = {}
@@ -118,6 +119,7 @@ def on_external_event(scheduler, batch=None) -> None:
     _clock.clear()
     _curve_cache.clear()
     _q_raw.clear()
+    _q_coefficients.clear()
     _probe_rounds = 0
     _pending.clear()
     reset_replay_state()
@@ -141,13 +143,14 @@ def reset_gain_calibration() -> None:
 def reset_policy(keep_fits: bool = False) -> None:
     """Drop prices, accept ratios, probe counts, and replay.
 
-    ``keep_fits`` leaves the H table, the Q samples, and the layer regressions.
+    ``keep_fits`` leaves H, Q, and the layer regressions.
     """
     global _total_a, _total_e, _rounds, _probe_rounds
     global _bucket_warned
     if not keep_fits:
         _clock.clear()
         _q_raw.clear()
+        _q_coefficients.clear()
     _curve_cache.clear()
     _price_n.clear()
     _price_tok.clear()
@@ -491,26 +494,24 @@ def _q_kept(batch: int) -> list:
 
 
 def observe_q(batch: int, k: int, ms: float) -> None:
-    """Keep one raw Q sample for this ``(batch, K)``.
-
-    Prediction filters inside that K, then fits the batch line. A rejected
-    sample stays in the raw window and is left out of the fit.
-    """
-    if int(k) not in VERIFY_KS or ms is None:
+    k = int(k)
+    if k not in VERIFY_KS or ms is None:
         return
-    key = (int(batch), int(k))
-    window = _q_raw.setdefault(key, deque(maxlen=Q_RES_WINDOW))
+    batch = int(batch)
+    window = _q_raw.setdefault((batch, k), deque(maxlen=Q_RES_WINDOW))
     window.append(float(ms))
+    kept = _q_kept(batch)
+    _, slope = _fit_q_line(kept)
+    residuals = [sample_ms - slope * float(sample_k) for sample_k, sample_ms in kept]
+    _q_coefficients[batch] = (_median(residuals), slope)
 
 
 def predict_q_ms(batch: int, k: int) -> float:
-    """Median residual plus the current K slope. An empty batch predicts 0."""
-    kept = _q_kept(int(batch))
-    if not kept:
+    line = _q_coefficients.get(int(batch))
+    if line is None:
         return 0.0
-    _intercept, slope = _fit_q_line(kept)
-    residuals = [ms - slope * float(item_k) for item_k, ms in kept]
-    return float(_median(residuals) + slope * int(k))
+    residual_median, slope = line
+    return float(residual_median + slope * int(k))
 
 
 def predict_verify_ms(batch: int, k: int, bucket: Optional[int]) -> Optional[float]:

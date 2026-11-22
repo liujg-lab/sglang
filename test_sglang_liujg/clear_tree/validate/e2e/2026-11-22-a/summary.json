@@ -1,0 +1,48 @@
+{
+  "run_id": "2026-11-22-a",
+  "same_processes": true,
+  "draft_host_pid": 662445,
+  "target_host_pid": 2428004,
+  "fit": {
+    "installed_hold_cells": 90,
+    "prefit_started": false,
+    "wrote_fit_file": false,
+    "sha256_before": "12906fe1fbd48fb91496241917ad2feba57311e024822418e8349d3805ce0967",
+    "sha256_after": "12906fe1fbd48fb91496241917ad2feba57311e024822418e8349d3805ce0967",
+    "fit_write": 11895,
+    "fit_write_path": {"graph": 11895},
+    "refill_groups": 0,
+    "graph_unsupported": 0
+  },
+  "trials": {
+    "01": {
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "ok": 100,
+      "requests": 100,
+      "tokens": 46365,
+      "wall_s": 869.703,
+      "tok_s": 53.311,
+      "accept": 34505,
+      "draft": 96056,
+      "accept_rate": 0.359218,
+      "fallback": 0,
+      "client_concurrency": 1.0,
+      "rounds": 12097,
+      "with_hold_and_q": 11996,
+      "excluded": 101,
+      "exclude_reason": ["prefill", "finish", "new_rid"],
+      "hold_invalid": 0,
+      "prefit_set": 0,
+      "flush_http": 200,
+      "bonus_windows": 379,
+      "bonus_full": 378,
+      "bonus_idle": 1,
+      "bonus_tail": "flushed",
+      "bonus_forwards": 12097,
+      "bonus_requests": 12097,
+      "bonus_graph": 12097,
+      "bonus_eager": 0
+    }
+  }
+}
