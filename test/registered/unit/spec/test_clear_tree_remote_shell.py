@@ -19,6 +19,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_args import (
     apply_clear_tree_settings,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+    CLEAR_PROTOCOL_VERSION,
     ClearAction,
     ClearBatchRequest,
     ClearDraftRequest,
@@ -563,13 +564,13 @@ class ClearTreeRemoteShellTest(CustomTestCase):
                     action=ClearAction.STEP,
                     session_id="sess",
                     rpc_seq=1,
-                    protocol_version=1,
+                    protocol_version=CLEAR_PROTOCOL_VERSION,
                     reqs=[SimpleNamespace(rid="r")],
                 )
                 reply = SimpleNamespace(
                     session_id="sess",
                     rpc_seq=1,
-                    protocol_version=1,
+                    protocol_version=CLEAR_PROTOCOL_VERSION,
                     reqs=[SimpleNamespace(status=status, reason=reason)],
                 )
 

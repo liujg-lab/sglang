@@ -709,6 +709,9 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Original encoded image bytes, only set when the speculative
+        # algorithm asks the tokenizer to keep them.
+        self.source_image_bytes: Optional[List[bytes]] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -1306,6 +1309,7 @@ class Req(ReqDllmMixin):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
+        self.source_image_bytes = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False

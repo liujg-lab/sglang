@@ -254,9 +254,11 @@ class ClearTreeSchedulerMixin:
             return None
         batch_d, mm_d = packet
         batch = ClearBatchRequest.from_dict(batch_d)
-        mm = {
-            rid: SRMMPayload.from_pickleable(item) for rid, item in (mm_d or {}).items()
-        }
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_mm_source import (
+            payload_from_pickleable,
+        )
+
+        mm = {rid: payload_from_pickleable(item) for rid, item in (mm_d or {}).items()}
         return batch, mm
 
     def _clear_spec_shape_rejected(self, batch) -> bool:
@@ -312,8 +314,19 @@ class ClearTreeSchedulerMixin:
             mm_payload = None
             has_mm = False
             if requires_mm and _mm_features_alive(req):
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_mm_source import (
+                    source_payload,
+                )
+
                 has_mm = True
-                mm_payload = SRMMPayload.from_req(req)
+                # The original image bytes when the tokenizer kept them; the
+                # pixel tensors otherwise.
+                mm_payload = source_payload(req) or SRMMPayload.from_req(req)
+                if not isinstance(mm_payload, SRMMPayload):
+                    metrics.counts["mm_source_sent"] += 1
+                    metrics.counts["mm_source_bytes"] += sum(
+                        len(raw) for raw in mm_payload.images
+                    )
             note_commit_send(metrics, "snapshot", len(committed))
             req.sr_accepted_tree_candidate_indices = None
             return (
@@ -1119,7 +1132,22 @@ class ClearTreeSchedulerMixin:
         replies: List[Optional[object]] = [None] * n
         gpu_pairs = []
         vision_jobs = [] if batch.action == ClearAction.PREFILL else None
+        source_failed = self._clear_materialize_sources(mm_by_rid, metrics)
         for i, dreq in enumerate(batch.reqs):
+            if dreq.rid in source_failed:
+                from sglang.srt.speculative.standalone_remote.sr_protocol import (
+                    SRReplyStatus,
+                )
+
+                # Wrong or unreadable pixels must not reach the ViT. The Target
+                # serves this request without drafts.
+                self._sr_mark_degraded(
+                    dreq.rid, "image source " + source_failed[dreq.rid]
+                )
+                replies[i] = self._sr_v2_reply(
+                    dreq, SRReplyStatus.REJECT, reason="image_source"
+                )
+                continue
             reply, req = self._sr_prepare_v2(
                 dreq,
                 sr_action,
@@ -1160,6 +1188,35 @@ class ClearTreeSchedulerMixin:
                 )
             ),
         )
+
+    def _clear_materialize_sources(self, mm_by_rid, metrics) -> Dict[str, str]:
+        """Turn image-source payloads into pixel payloads with the Draft processor.
+
+        Replaces each entry in ``mm_by_rid`` in place. Returns ``{rid: reason}``
+        for the ones that failed; those entries are removed.
+        """
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_mm_source import (
+            ClearImageSourcePayload,
+            materialize,
+        )
+
+        failed: Dict[str, str] = {}
+        if not mm_by_rid:
+            return failed
+        for rid, payload in list(mm_by_rid.items()):
+            if not isinstance(payload, ClearImageSourcePayload):
+                continue
+            started = time.perf_counter()
+            done, reason = materialize(payload, getattr(self, "processor", None))
+            if metrics.active:
+                metrics.add_host("mm_source_decode", time.perf_counter() - started)
+            metrics.counts["mm_source_" + reason] += 1
+            if done is None:
+                failed[rid] = reason
+                del mm_by_rid[rid]
+            else:
+                mm_by_rid[rid] = done
+        return failed
 
     def _clear_apply_fit_ready(self, batch, reply):
         """Attach a commit result, or whether this Draft already has a covering fit."""

@@ -2033,6 +2033,7 @@ class Scheduler(
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
+            req.source_image_bytes = getattr(recv_req, "source_image_bytes", None)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(

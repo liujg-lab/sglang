@@ -759,6 +759,10 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
+    # Original encoded image bytes in request order. Filled only when the
+    # speculative algorithm asks for them (SpeculativeAlgorithm.keeps_source_image_bytes).
+    source_image_bytes: Optional[List[bytes]] = None
+
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 

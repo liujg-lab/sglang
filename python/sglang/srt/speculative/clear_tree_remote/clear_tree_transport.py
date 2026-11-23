@@ -143,7 +143,19 @@ def _unpack_request(frames: List[Any]) -> Tuple[ClearBatchRequest, Dict[str, Any
                 continue
             off = int(meta.get("_sr_buf_offset", 0))
             count = int(meta.get("_sr_buf_count", 0))
-            payload = _load_mm_payload().from_multipart(meta, bufs[off : off + count])
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_mm_source import (
+                ClearImageSourcePayload,
+                is_source_meta,
+            )
+
+            if is_source_meta(meta):
+                payload = ClearImageSourcePayload.from_multipart(
+                    meta, bufs[off : off + count]
+                )
+            else:
+                payload = _load_mm_payload().from_multipart(
+                    meta, bufs[off : off + count]
+                )
             mm_by_rid[payload.rid] = payload
     return batch, mm_by_rid
 

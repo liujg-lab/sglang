@@ -280,6 +280,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.num_reserved_tokens = 0
+        # Some remote speculative Targets ship the original image bytes to
+        # their Draft. Off for everything else.
+        self._keep_source_image_bytes = speculative_algorithm.keeps_source_image_bytes(
+            server_args
+        )
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
@@ -798,9 +803,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+        if (
+            getattr(self, "_keep_source_image_bytes", False)
+            and mm_inputs is not None
+            and getattr(obj, "image_data", None)
+            and not getattr(obj, "video_data", None)
+            and not getattr(obj, "audio_data", None)
+            and isinstance(tokenized_obj, TokenizedGenerateReqInput)
+        ):
+            from sglang.srt.managers.mm_source_bytes import (
+                collect_source_image_bytes,
+            )
+
+            try:
+                tokenized_obj.source_image_bytes = collect_source_image_bytes(
+                    obj.image_data
+                )
+            except Exception:
+                logger.debug("source image bytes unavailable", exc_info=True)
+                tokenized_obj.source_image_bytes = None
+        return tokenized_obj
 
     def _validate_rid_not_in_flight(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

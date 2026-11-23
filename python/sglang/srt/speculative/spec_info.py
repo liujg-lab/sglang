@@ -150,6 +150,21 @@ class SpeculativeAlgorithm(Enum):
             return True
         return self.skips_colocated_draft_worker(server_args)
 
+    def keeps_source_image_bytes(self, server_args) -> bool:
+        """The tokenizer keeps each request's original image bytes for the scheduler.
+
+        Only a ClearTree Target uses them: it ships the bytes to its remote
+        Draft instead of pixel tensors. ``SGLANG_CLEAR_MM_SOURCE=0`` turns it
+        off. Every other algorithm and role leaves the field empty.
+        """
+        if not self.is_clear_tree_remote():
+            return False
+        if getattr(server_args, "clear_tree_role", None) != "target":
+            return False
+        import os
+
+        return os.environ.get("SGLANG_CLEAR_MM_SOURCE", "").strip() != "0"
+
     def uses_draft_paused_reqs(self, server_args) -> bool:
         """Paused requests live on ``draft_paused_reqs`` rather than the SPECTRE lock."""
         if (

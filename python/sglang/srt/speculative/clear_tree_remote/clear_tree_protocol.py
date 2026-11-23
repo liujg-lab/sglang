@@ -14,12 +14,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-# Only a real int 1 is this protocol. Missing, bool, float, and str stay unsupported.
-CLEAR_PROTOCOL_VERSION = 1
+# Only a real int equal to the version is this protocol. Missing, bool, float, and str stay unsupported.
+# 2: PREFILL/snapshot may carry the original image bytes instead of pixels.
+CLEAR_PROTOCOL_VERSION = 2
 
 
 def supported_clear_protocol(version: Optional[int]) -> bool:
-    """Only a real integer 1. Float 1.0 and bool must not compare equal."""
+    """Only a real integer equal to the version. Float and bool must not compare equal."""
     return type(version) is int and version == CLEAR_PROTOCOL_VERSION
 
 
