@@ -30,3 +30,4 @@
 | `2026-11-22-b` | 移开现有拟合后重扫 schema 2，只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 2，正式轮有 hold_ms 和 q_ms | [记录](2026-11-22-b/run.md) |
 | `2026-11-22-c` | 移开现有拟合后重扫 schema 2，并核对 policy_ms 分项；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 2，正式轮的 policy 分项之和等于 policy_ms | [记录](2026-11-22-c/run.md) |
 | `2026-11-22-d` | 移开现有拟合后重扫 schema 3，并核对推迟关账、深度校正和 H 曲线；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 3，推迟关账为真，深度来源有 cell、pooled 和 none | [记录](2026-11-22-d/run.md) |
+| `2026-11-23-b` | 移开现有拟合后重扫当前代码，在线选宽用默认指标；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；默认选宽 ratio，预拟合写一次 schema 3 | [记录](2026-11-23-b/run.md) |
