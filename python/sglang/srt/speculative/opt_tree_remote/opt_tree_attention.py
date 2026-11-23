@@ -539,7 +539,11 @@ def capture_attention(model_runner, query_width: int, bs: int):
 
 def _attention_for(runner) -> Optional[OptTreeAttention]:
     scheduler = getattr(runner, "scheduler", None)
+    if scheduler is None:
+        return None
     worker = getattr(scheduler, "model_worker", None)
+    if worker is None:
+        return None
     model_runner = getattr(worker, "model_runner", None)
     if not model_supports(model_runner):
         return None

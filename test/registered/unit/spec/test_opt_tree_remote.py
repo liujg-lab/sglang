@@ -2957,7 +2957,7 @@ class OptTreeRemoteTest(CustomTestCase):
             "get_device_module",
             lambda _device: touched.append(1),
         ), patch.object(
-            forward, "_verify_batch_many", lambda *_args, **_kwargs: "batch"
+            forward, "_verify_batch_many", lambda *_args, **_kwargs: SimpleNamespace(spec_info=object())
         ), patch.object(
             forward, "_run_batch", lambda _scheduler, _batch: torch.zeros(2, 3)
         ):
@@ -3019,11 +3019,11 @@ class OptTreeRemoteTest(CustomTestCase):
         layer.prefix_len = 4
         layer.cached_len = 4
         layer._alloc_layer_slots = lambda n, start=None: torch.arange(n)
-        layer._verify_batch = lambda *_args, **_kwargs: "batch"
+        layer._verify_batch = lambda *_args, **_kwargs: SimpleNamespace(spec_info=object())
         layer._run = lambda _batch: torch.zeros(2, 4)
 
         def batch_many(*_args, **_kwargs):
-            return "batch"
+            return SimpleNamespace(spec_info=object())
 
         def run_batch(_scheduler, _batch):
             return torch.zeros(2, 3)
@@ -3109,7 +3109,7 @@ class OptTreeRemoteTest(CustomTestCase):
             with patch.object(forward.time, "perf_counter", clock), patch.object(
                 forward.torch, "get_device_module", lambda _device: device
             ), patch.object(
-                forward, "_verify_batch_many", lambda *_a, **_k: "batch"
+                forward, "_verify_batch_many", lambda *_a, **_k: SimpleNamespace(spec_info=object())
             ), patch.object(forward, "_run_batch", run_batch):
                 with self.assertRaisesRegex(RuntimeError, "replay failed"):
                     _forward_verify_batch(host, [runner], [_layer_timing_step()])
