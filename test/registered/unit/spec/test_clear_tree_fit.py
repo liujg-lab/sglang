@@ -931,9 +931,11 @@ class ClearTreeFitFileTest(CustomTestCase):
                 "SGLANG_CLEAR_FIT_PATH",
                 "SGLANG_CLEAR_AUTO_PREFIT",
                 "SGLANG_CLEAR_NPU_KV_BUCKETS",
+                "SGLANG_CLEAR_LAYER_SLOPE_PRIOR",
             )
         }
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        os.environ.pop("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", None)
         self._dir = tempfile.TemporaryDirectory()
         self._path = str(Path(self._dir.name) / "clear_tree_fit.json")
         os.environ["SGLANG_CLEAR_FIT_PATH"] = self._path
@@ -1080,6 +1082,40 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
         self.assertEqual(policy._clock[(1, 16, 256)][-1], 30.0)
         self.assertEqual(policy._clock_ell[(1, 16, 256)][-1], 150)
+
+    def test_commit_and_file_install_freeze_the_prefit_slope(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        self._fill(scheduler, run)
+        key = (8, "graph", 1)
+        prefit_slope = scheduler._clear_prefit.layers[key].coefficients()[1]
+        fit.note_online_layer(scheduler, 8, "graph", 1, [1.0, 20.0], 3.0)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        committed = scheduler._clear_ledger.layer_models[key]
+        self.assertEqual(committed.n, 5)
+        self.assertIsNotNone(committed.slope_prior)
+        self.assertAlmostEqual(committed.slope_prior[1], prefit_slope)
+        self.assertGreater(committed.slope_prior[2], 0.0)
+
+        reset_policy()
+        scheduler._clear_ledger.layer_models = {}
+        scheduler._clear_fit_installed = False
+        scheduler._clear_fit_ready = False
+        fit.load_draft_part(scheduler)
+        fit.on_target_info(scheduler, scheduler._clear_target_header)
+        self.assertTrue(scheduler._clear_fit_ready)
+        loaded = scheduler._clear_ledger.layer_models[key]
+        self.assertIsNotNone(loaded.slope_prior)
+        self.assertAlmostEqual(loaded.slope_prior[1], prefit_slope)
+
+    def test_slope_prior_switch_off_installs_plain_fits(self):
+        os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = "0"
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        self._fill(scheduler, run)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        for model in scheduler._clear_ledger.layer_models.values():
+            self.assertIsNone(model.slope_prior)
 
     def test_header_mismatch_refuses_the_file(self):
         scheduler = self._scheduler()

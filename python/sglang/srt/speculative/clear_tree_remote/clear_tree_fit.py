@@ -283,6 +283,17 @@ def _read_fit(path: str):
         return json.load(handle)
 
 
+def _attach_slope_priors(models) -> int:
+    """Freeze the installed prefit slopes before any online sample lands."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        attach_layer_slope_priors,
+    )
+
+    attached = attach_layer_slope_priors(models)
+    logger.info("[CLEAR] layer slope priors installed cells=%d", attached)
+    return attached
+
+
 def _install_layers(scheduler, rows) -> int:
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         _new_layer_model,
@@ -303,6 +314,7 @@ def _install_layers(scheduler, rows) -> int:
         fresh[key] = model
         installed += 1
     ledger.layer_models = fresh
+    _attach_slope_priors(fresh)
     # Depth ratios were measured against the regressions just replaced.
     ledger.reset_layer_depth()
     return installed
@@ -504,6 +516,7 @@ def _install_prepared(scheduler, prepared) -> bool:
         return False
     replace_hold_cells(prepared.get("h") or [])
     ledger.layer_models = dict(prepared.get("layers") or {})
+    _attach_slope_priors(ledger.layer_models)
     # Depth ratios were measured against the regressions just replaced.
     ledger.reset_layer_depth()
     scheduler._clear_fit_installed = True

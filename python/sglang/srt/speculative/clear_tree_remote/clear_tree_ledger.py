@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from functools import wraps
@@ -34,6 +35,8 @@ DEPTH_MIN_SAMPLES = 30
 # key, not a feature.
 LAYER_RIDGE = (0.0, LAYER_SPAN_PAD**2)
 _PREFIX_FEATURE = 1
+# Smallest centered prefix information, relative to Σx², that counts as spread.
+_SLOPE_PRIOR_REL_EPS = 1e-9
 VERIFY_MIN_SAMPLES = 6
 _DEFAULT_BUCKETS = (256, 512, 1024, 2048, 4096)
 _GAP_ACTIONS = ("prefill", "finish", "abort")
@@ -301,7 +304,21 @@ class ForgettingRegressor:
         self.n = 0
         self.xtx = [[0.0] * self.n_features for _ in range(self.n_features)]
         self.xty = [0.0] * self.n_features
+        # ``(index, target, precision)``. Never forgotten; added on top of the
+        # ridge. Not part of ``to_dict``.
+        self.slope_prior: Optional[tuple] = None
         self._coef: Optional[List[float]] = None
+        self._coef_n = -1
+
+    def set_slope_prior(self, index: int, target: float, precision: float) -> None:
+        """Pull weight ``index`` toward ``target`` with a fixed ``precision``.
+
+        The prior does not decay with ``FORGET`` and sits on top of the ridge.
+        When ``target`` is this fit's own solved weight, the solution does not
+        move at the moment the prior is set.
+        """
+        self.slope_prior = (int(index), float(target), float(precision))
+        self._coef = None
         self._coef_n = -1
 
     def update(self, features: Sequence[float], target: float) -> None:
@@ -334,6 +351,7 @@ class ForgettingRegressor:
         if self._coef is not None and self._coef_n == self.n:
             return self._coef
         system = [row[:] for row in self.xtx]
+        rhs = list(self.xty)
         if self.ridge is None:
             for index in range(1, self.n_features):
                 system[index][index] += RIDGE
@@ -342,7 +360,12 @@ class ForgettingRegressor:
                 if index >= self.n_features:
                     break
                 system[index][index] += float(value)
-        self._coef = _solve(system, self.xty)
+        prior = self.slope_prior
+        if prior is not None and 0 <= int(prior[0]) < self.n_features:
+            index = int(prior[0])
+            system[index][index] += float(prior[2])
+            rhs[index] += float(prior[2]) * float(prior[1])
+        self._coef = _solve(system, rhs)
         self._coef_n = self.n
         return self._coef
 
@@ -409,6 +432,61 @@ def _new_layer_model() -> ForgettingRegressor:
         ridge=LAYER_RIDGE,
         span_feature=_PREFIX_FEATURE,
     )
+
+
+def layer_slope_prior_enabled() -> bool:
+    """Prefit slope prior on layer fits. ``SGLANG_CLEAR_LAYER_SLOPE_PRIOR=0`` turns it off."""
+    return os.environ.get("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", "").strip() != "0"
+
+
+def _prefit_slope_prior(model) -> Optional[tuple]:
+    """``(slope, precision)`` from a fit's own matrices, or None.
+
+    The precision is the centered prefix information
+    ``xtx11 - xtx01**2 / xtx00``, so the prefit level does not enter it.
+    """
+    index = _PREFIX_FEATURE
+    if int(getattr(model, "n_features", 0)) <= index:
+        return None
+    beta = model.coefficients()
+    if beta is None or len(beta) <= index:
+        return None
+    xtx = model.xtx
+    weight = float(xtx[0][0])
+    if not math.isfinite(weight) or weight <= 0.0:
+        return None
+    second = float(xtx[index][index])
+    precision = second - float(xtx[0][index]) ** 2 / weight
+    slope = float(beta[index])
+    if not (math.isfinite(precision) and math.isfinite(slope)):
+        return None
+    # One repeated prefix leaves only rounding noise here.
+    if precision <= _SLOPE_PRIOR_REL_EPS * max(abs(second), 1.0):
+        return None
+    return slope, precision
+
+
+def attach_layer_slope_priors(models) -> int:
+    """Freeze each installed fit's prefix slope as a prior that is never forgotten.
+
+    Online samples keep moving the intercept and, with enough spread, the
+    slope. Returns how many cells got a prior; 0 when the switch is off.
+    """
+    if not layer_slope_prior_enabled():
+        return 0
+    attached = 0
+    for model in list((models or {}).values()):
+        if getattr(model, "slope_prior", None) is not None:
+            # Already frozen; solving again would read the prior back.
+            attached += 1
+            continue
+        found = _prefit_slope_prior(model)
+        if found is None:
+            continue
+        slope, precision = found
+        model.set_slope_prior(_PREFIX_FEATURE, slope, precision)
+        attached += 1
+    return attached
 
 
 class _Round:
@@ -983,6 +1061,7 @@ class ClearLedger:
                 prefit_round or "target_gap" in reasons or "fallback" in reasons
             ),
             pending=pending,
+            seed_ms=seed_ms,
         )
         record["close_ms"] = max(0.0, (time.perf_counter() - started) * 1000.0)
         record["close_deferred"] = pending is not None
@@ -1295,6 +1374,7 @@ class ClearLedger:
         price_kept: bool,
         skip_accept: bool = False,
         pending=None,
+        seed_ms: Optional[float] = None,
     ) -> None:
         """Kept rounds update Θ_b. A mixed round is logged and left out.
 
@@ -1306,6 +1386,7 @@ class ClearLedger:
         from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
             discard_pending,
             observe_price,
+            observe_seed,
             settle_verified,
         )
 
@@ -1316,6 +1397,8 @@ class ClearLedger:
         if not price_kept or price_tokens is None or price_ms is None:
             return
         observe_price(rnd.b, price_tokens, price_ms)
+        # The width pair adds this common overhead to both cycles.
+        observe_seed(rnd.b, seed_ms)
 
     def _verify(self) -> ForgettingRegressor:
         if self.verify_model is None:

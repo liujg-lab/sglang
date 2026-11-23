@@ -86,6 +86,9 @@ Q_RES_WINDOW = 32
 _price_n: Dict[int, int] = {}
 _price_tok: Dict[int, float] = {}
 _price_ms: Dict[int, float] = {}
+# Receive-to-first-layer time of clean rounds, per batch size.
+_seed_n: Dict[int, int] = {}
+_seed_ms: Dict[int, float] = {}
 _sum_a: Dict[str, float] = {}
 _sum_e: Dict[str, float] = {}
 _total_a = 0.0
@@ -173,6 +176,8 @@ def reset_policy(keep_fits: bool = False) -> None:
     _price_n.clear()
     _price_tok.clear()
     _price_ms.clear()
+    _seed_n.clear()
+    _seed_ms.clear()
     _sum_a.clear()
     _sum_e.clear()
     _pending.clear()
@@ -854,6 +859,27 @@ def observe_price(batch: int, tokens: float, ms: float) -> None:
 def theta(batch: int) -> Optional[float]:
     """Pure-decode tokens per millisecond, blended with the other-batch prior."""
     return _theta_from(_price_n, _price_tok, _price_ms, int(batch))
+
+
+def observe_seed(batch: int, ms: Optional[float]) -> None:
+    """One clean round's receive-to-first-layer time. Same step rule as Θ."""
+    if ms is None or float(ms) < 0.0:
+        return
+    key = int(batch)
+    if key < 1:
+        return
+    count = int(_seed_n.get(key, 0)) + 1
+    step = max(PRICE_EMA_FLOOR, 1.0 / float(count))
+    _seed_n[key] = count
+    _seed_ms[key] = (1.0 - step) * float(_seed_ms.get(key, 0.0)) + step * float(ms)
+
+
+def seed_estimate(batch: int) -> Optional[float]:
+    """Recent seed time for this batch size, or None before a clean round."""
+    key = int(batch)
+    if int(_seed_n.get(key, 0)) <= 0:
+        return None
+    return float(_seed_ms[key])
 
 
 def compare_price(rounds, gaps) -> Dict[int, dict]:

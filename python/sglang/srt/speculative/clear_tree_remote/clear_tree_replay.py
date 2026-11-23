@@ -22,6 +22,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     _prefix_mass,
     _tier_for_nodes,
     accept_ratio,
+    seed_estimate,
     select_k,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
@@ -405,6 +406,9 @@ def hold_replay(
             "k": k_actual,
             "flat_k": int(getattr(plan, "flat_k", flat_k(int(plan.batch)))),
             "layers": _freeze_layer_rows(scheduler, usable),
+            # Bonus tokens and seed time are the same for every width.
+            "bonus": len(reqs),
+            "seed_ms": float(seed_estimate(int(plan.batch)) or 0.0),
         }
     except Exception:
         import logging

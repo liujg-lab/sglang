@@ -1,6 +1,7 @@
 """CPU checks for the ClearTree block-wise paired width rule."""
 
 import math
+import os
 import unittest
 from unittest.mock import patch
 
@@ -77,11 +78,26 @@ class TestPairValues(CustomTestCase):
         unpriced = _frozen(verify_ms={}, flat_k=16)
         self.assertEqual(wpair.pair_values(unpriced, [4, 2]), {})
 
+    def test_spent_is_the_layer_schedule_plus_verify(self):
+        values = wpair.pair_values(_frozen(), [4, 2])
+        self.assertAlmostEqual(values[4][2], 9.0)
+        self.assertAlmostEqual(values[2][2], 6.5)
+
 
 class TestPairBlocks(CustomTestCase):
+    """Block rules on the older value gain; samples here carry no spent."""
+
     def setUp(self):
         reset_policy()
         assign_persistent_width(1, 8)
+        self._saved_metric = os.environ.get("SGLANG_CLEAR_WPAIR_METRIC")
+        os.environ["SGLANG_CLEAR_WPAIR_METRIC"] = "value"
+
+    def tearDown(self):
+        if self._saved_metric is None:
+            os.environ.pop("SGLANG_CLEAR_WPAIR_METRIC", None)
+        else:
+            os.environ["SGLANG_CLEAR_WPAIR_METRIC"] = self._saved_metric
 
     def _observe(self, built, values):
         frozen = _frozen(width=built)
@@ -283,6 +299,99 @@ class TestPairBlocks(CustomTestCase):
         self._observe(4, {4: (3.0, 1.0), 2: (0.0, 100.0)})
         self.assertEqual(len(wpair._blocks[1]["up"]), 2)
         self.assertEqual(len(wpair._blocks[1]["down"]), 1)
+
+
+class TestPairRatio(CustomTestCase):
+    """Paired throughput ratio: (E + B) / (spent + s), other width over served."""
+
+    _VALUES = {
+        8: (0.0, 10.0, 50.0),
+        16: (0.2, 10.3, 51.0),
+        4: (-1.0, 9.0, 49.0),
+    }
+
+    def setUp(self):
+        reset_policy()
+        assign_persistent_width(1, 8)
+        self._saved_metric = os.environ.pop("SGLANG_CLEAR_WPAIR_METRIC", None)
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_CLEAR_WPAIR_METRIC", None)
+        if self._saved_metric is not None:
+            os.environ["SGLANG_CLEAR_WPAIR_METRIC"] = self._saved_metric
+
+    def _observe(self, values):
+        frozen = _frozen(width=16, bonus=4, seed_ms=10.0)
+        with patch.object(wpair, "pair_values", return_value=values):
+            return wpair.observe_pair(frozen)
+
+    def test_default_metric_is_ratio(self):
+        self.assertEqual(wpair.wpair_metric(), "ratio")
+        os.environ["SGLANG_CLEAR_WPAIR_METRIC"] = "value"
+        self.assertEqual(wpair.wpair_metric(), "value")
+
+    def test_sample_adds_bonus_and_seed(self):
+        sample = wpair._sample(self._VALUES, 16, 8, 4.0, 10.0)
+        expected = (0.2, 10.0, 14.3, 61.0, 14.0, 60.0)
+        for got, want in zip(sample, expected):
+            self.assertAlmostEqual(got, want)
+        bare = wpair._sample({16: (0.2, 10.3), 8: (0.0, 10.0)}, 16, 8, 4.0, 10.0)
+        self.assertAlmostEqual(bare[0], 0.2)
+        self.assertAlmostEqual(bare[1], 10.0)
+        self.assertEqual(bare[2:], (None, None, None, None))
+        self.assertIsNone(wpair._sample({8: (0.0, 10.0, 50.0)}, 16, 8))
+
+    def test_ratio_matches_the_hand_calc(self):
+        same = [(0.0, 0.0, 14.3, 61.0, 14.0, 60.0)] * 15
+        gain, se = wpair._ratio_gs(same)
+        self.assertAlmostEqual(gain, (14.3 / 61.0) / (14.0 / 60.0) - 1.0)
+        self.assertAlmostEqual(se, wpair.SIG_FLOOR / math.sqrt(15))
+        rows = [
+            (0.0, 0.0, 10.0, 20.0, 9.0, 20.0),
+            (0.0, 0.0, 14.0, 30.0, 12.0, 30.0),
+            (0.0, 0.0, None, None, None, None),
+            (0.0, 0.0),
+        ]
+        gain, se = wpair._ratio_gs(rows)
+        ratio = 12.0 / 10.5
+        self.assertAlmostEqual(gain, ratio - 1.0)
+        self.assertAlmostEqual(se, ratio / 42.0)
+        self.assertEqual(wpair._ratio_gs(rows[1:]), (None, None))
+
+    def test_value_switches_where_ratio_stays(self):
+        os.environ["SGLANG_CLEAR_WPAIR_METRIC"] = "value"
+        last = None
+        for _ in range(15):
+            last = self._observe(self._VALUES)
+        self.assertEqual(last["decision"], "up")
+        self.assertEqual(last["metric"], "value")
+        self.assertAlmostEqual(last["g_up"], 0.02)
+        self.assertAlmostEqual(last["r_up"], (14.3 / 61.0) / (14.0 / 60.0) - 1.0)
+        self.assertEqual(persistent_width(1), 16)
+
+        reset_policy()
+        assign_persistent_width(1, 8)
+        os.environ.pop("SGLANG_CLEAR_WPAIR_METRIC", None)
+        for _ in range(29):
+            self.assertIsNone(self._observe(self._VALUES))
+        last = self._observe(self._VALUES)
+        self.assertEqual(last["decision"], "stay")
+        self.assertEqual(last["metric"], "ratio")
+        self.assertEqual(last["n_up"], 30)
+        self.assertAlmostEqual(last["r_up"], (14.3 / 61.0) / (14.0 / 60.0) - 1.0)
+        self.assertLess(last["r_dn"], 0.0)
+        self.assertIsNotNone(last["rse_up"])
+        self.assertEqual(persistent_width(1), 8)
+        self.assertAlmostEqual(wpair._blocks[1]["p"], 0.10)
+
+    def test_ratio_without_spent_never_clears(self):
+        values = {16: (3.0, 1.0), 8: (0.0, 100.0), 4: (-1.0, 1.0)}
+        last = None
+        for _ in range(30):
+            last = self._observe(values)
+        self.assertEqual(last["decision"], "stay")
+        self.assertIsNone(last["r_up"])
+        self.assertIsNotNone(last["g_up"])
 
 
 if __name__ == "__main__":

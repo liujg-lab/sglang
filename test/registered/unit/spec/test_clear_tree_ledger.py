@@ -52,6 +52,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
     reset_gain_calibration,
     reset_policy,
     select_continuing,
+    seed_estimate,
     settle_verified,
     theta,
     truncate_columns,
@@ -91,6 +92,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     LAYER_RIDGE,
     VERIFY_MIN_SAMPLES,
     ClearLedger,
+    attach_layer_slope_priors,
     predict_layer_ms,
     note_packet,
     push_verify_sample,
@@ -3059,6 +3061,10 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
             self.assertEqual(frozen["k"], keep)
             self.assertEqual(frozen["verify_ms"][16], 100.0)
             self.assertEqual(frozen["verify_ms"][8], 1.0)
+            self.assertEqual(frozen["bonus"], 1)
+            self.assertEqual(
+                frozen["seed_ms"], float(policy.seed_estimate(plan.batch) or 0.0)
+            )
             fresh = _value_plan()
             fresh.cover_k = 32
             fresh._verify_quotes = {}
@@ -3634,6 +3640,128 @@ class TestLayerDepthAndExpect(CustomTestCase):
             rows = replay._freeze_layer_rows(SimpleNamespace(), [state])
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(set(seen)), [1, 2])
+
+
+class TestLayerSlopePrior(CustomTestCase):
+    """The prefit prefix slope stays as a prior that FORGET does not erase."""
+
+    _A = 7.6
+    _B = 0.000236
+
+    def setUp(self):
+        self._saved = os.environ.pop("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", None)
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", None)
+        if self._saved is not None:
+            os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = self._saved
+
+    def _line(self, prefix):
+        return self._A + self._B * float(prefix)
+
+    def _prefit(self):
+        model = ForgettingRegressor(
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+        )
+        for prefix in range(200, 10001, 200):
+            model.update([1.0, float(prefix)], self._line(prefix))
+        return model
+
+    def test_slope_survives_a_narrow_shifted_online_stream(self):
+        with_prior = self._prefit()
+        without = self._prefit()
+        self.assertEqual(attach_layer_slope_priors({(4, "graph", 4): with_prior}), 1)
+        self.assertIsNone(without.slope_prior)
+        prior_slope = with_prior.slope_prior[1]
+        self.assertAlmostEqual(prior_slope, self._B, delta=self._B * 0.01)
+        for step in range(5000):
+            prefix = 900.0 if step % 2 == 0 else 903.0
+            target = 1.1 * self._line(prefix)
+            with_prior.update([1.0, prefix], target)
+            without.update([1.0, prefix], target)
+        self.assertEqual(with_prior.slope_prior[1], prior_slope)
+        kept = with_prior.coefficients()[1]
+        drifted = without.coefficients()[1]
+        self.assertLess(abs(kept - prior_slope) / prior_slope, 0.02)
+        self.assertGreater(abs(drifted - prior_slope) / prior_slope, 0.2)
+        online = 1.1 * self._line(900.0)
+        self.assertLess(abs(with_prior.predict([1.0, 900.0]) / online - 1.0), 0.01)
+        far = 1.1 * self._line(9200.0)
+        self.assertLess(
+            abs(with_prior.predict([1.0, 9200.0]) - far),
+            abs(without.predict([1.0, 9200.0]) - far),
+        )
+
+    def test_attach_does_not_move_the_solution_and_is_idempotent(self):
+        model = self._prefit()
+        before = list(model.coefficients())
+        xty = list(model.xty)
+        self.assertEqual(attach_layer_slope_priors({"cell": model}), 1)
+        self.assertIsNone(model._coef)
+        after = model.coefficients()
+        for old, new in zip(before, after):
+            self.assertAlmostEqual(old, new, delta=abs(old) * 1e-9 + 1e-12)
+        self.assertEqual(model.xty, xty)
+        prior = model.slope_prior
+        self.assertEqual(attach_layer_slope_priors({"cell": model}), 1)
+        self.assertEqual(model.slope_prior, prior)
+        model.update([1.0, 5000.0], 9.0)
+        self.assertEqual(model.slope_prior, prior)
+
+    def test_degenerate_cells_get_no_prior(self):
+        flat = ForgettingRegressor(
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+        )
+        for target in (5.8, 6.2, 5.7, 6.3):
+            flat.update([1.0, 900.0], target)
+        short = ForgettingRegressor(
+            2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
+        )
+        short.update([1.0, 100.0], 1.0)
+        short.update([1.0, 900.0], 2.0)
+        spread = self._prefit()
+        count = attach_layer_slope_priors({"flat": flat, "short": short, "ok": spread})
+        self.assertEqual(count, 1)
+        self.assertIsNone(flat.slope_prior)
+        self.assertIsNone(short.slope_prior)
+        self.assertIsNotNone(spread.slope_prior)
+
+    def test_switch_off_keeps_the_old_fit(self):
+        os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = "0"
+        model = self._prefit()
+        self.assertEqual(attach_layer_slope_priors({"cell": model}), 0)
+        self.assertIsNone(model.slope_prior)
+        reference = self._prefit()
+        for prefix in (900.0, 903.0) * 50:
+            model.update([1.0, prefix], 1.1 * self._line(prefix))
+            reference.update([1.0, prefix], 1.1 * self._line(prefix))
+        self.assertEqual(model.coefficients(), reference.coefficients())
+
+
+class TestSeedEstimate(CustomTestCase):
+    """Clean rounds feed a per-batch seed EMA for the width pair."""
+
+    def setUp(self):
+        reset_policy()
+
+    def tearDown(self):
+        reset_policy()
+
+    def test_kept_rounds_update_and_reset_clears(self):
+        ledger = ClearLedger()
+        rnd = SimpleNamespace(b=2)
+        self.assertIsNone(seed_estimate(2))
+        ledger._note_price(rnd, [], [], 3.0, 70.0, True, seed_ms=5.0)
+        self.assertAlmostEqual(seed_estimate(2), 5.0)
+        ledger._note_price(rnd, [], [], 3.0, 70.0, False, seed_ms=50.0)
+        self.assertAlmostEqual(seed_estimate(2), 5.0)
+        ledger._note_price(rnd, [], [], 3.0, 70.0, True, seed_ms=None)
+        self.assertAlmostEqual(seed_estimate(2), 5.0)
+        ledger._note_price(rnd, [], [], 3.0, 70.0, True, seed_ms=7.0)
+        self.assertAlmostEqual(seed_estimate(2), 6.0)
+        self.assertIsNone(seed_estimate(1))
+        reset_policy(keep_fits=True)
+        self.assertIsNone(seed_estimate(2))
 
 
 if __name__ == "__main__":
