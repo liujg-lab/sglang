@@ -21,15 +21,20 @@ VERIFY_KS = [2, 4, 8, 16, 32, 64]
 TARGET_CAPACITY = 65
 DRAFT_CAPACITY = 64
 
-_persistent_w: Dict[int, int] = {}
+# Keyed by (batch bucket, KV bucket). A None KV bucket is the batch-only key.
+_persistent_w: Dict[tuple, int] = {}
 
 
 def reset_persistent_widths() -> None:
     _persistent_w.clear()
 
 
-def assign_persistent_width(bucket: int, width: int) -> None:
-    _persistent_w[int(bucket)] = int(width)
+def _width_key(bucket: int, kv: Optional[int]) -> tuple:
+    return (int(bucket), None if kv is None else int(kv))
+
+
+def assign_persistent_width(bucket: int, width: int, kv: Optional[int] = None) -> None:
+    _persistent_w[_width_key(bucket, kv)] = int(width)
 
 
 def flat_width(batch_size: int) -> int:
@@ -132,11 +137,14 @@ def batch_bucket(batch_size: int) -> int:
     return 5
 
 
-def persistent_width(batch_size: int) -> int:
-    """Width served after a replay switch, or the flat table before one."""
-    bucket = batch_bucket(batch_size)
-    if bucket in _persistent_w:
-        return int(_persistent_w[bucket])
+def persistent_width(batch_size: int, kv: Optional[int] = None) -> int:
+    """Width served after a replay switch, or the flat table before one.
+
+    ``kv`` is the round's KV bucket. None reads the batch-only key.
+    """
+    key = _width_key(batch_bucket(batch_size), kv)
+    if key in _persistent_w:
+        return int(_persistent_w[key])
     return flat_width(batch_size)
 
 

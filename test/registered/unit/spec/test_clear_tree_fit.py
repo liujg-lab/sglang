@@ -625,6 +625,12 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         self.assertEqual(plan.replay_kind, "prefit")
         self.assertFalse(plan.replay_eligible)
         self.assertFalse(plan.fallback)
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+            width_kv_bucket,
+        )
+
+        # A prefit plan keys its width like every other round.
+        self.assertEqual(plan.width_kv, width_kv_bucket(plan.max_ell, plan.buckets))
         state = SimpleNamespace(depth=6, config=SimpleNamespace(max_depth=8))
         self.assertTrue(plan.should_grow(state))
         state.depth = 7

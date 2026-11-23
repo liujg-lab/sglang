@@ -1572,10 +1572,18 @@ def make_round(scheduler, reqs) -> RoundPlan:
     locked_env = locked_k_from_env()
     fitting = fitting_ks(max_ell, buckets)
     max_depth = _round_max_depth(scheduler)
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        round_tag,
+        width_kv_bucket,
+        wpair_rule,
+    )
+
+    # Width state is keyed by batch bucket and the KV bucket of max_ell.
+    width_kv = width_kv_bucket(max_ell, buckets)
     # A K-probe round is not eligible, so its tree stays on the served width.
     # Only the served width's covering tier bounds K probes. A superset build
     # needs the wider width's own layer sample and flat-tier verify time.
-    served = persistent_width(batch)
+    served = persistent_width(batch, width_kv)
     probe_cover = _cover_for(served, max_depth, fitting)
     served_flat = _covered_flat_k(
         batch, max_ell, buckets, _cover_for(served, max_depth, fitting)
@@ -1598,9 +1606,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
 
     sum_ell = sum(drafts)
 
-    def superset_ready(candidate):
-        if layer_sample_count(scheduler, int(candidate), batch) < LAYER_MIN_SAMPLES:
-            return True
+    def wider_priced(candidate):
+        """Theta, this prefix sum's layer time and the flat-tier verify time."""
         if price is None:
             return False
         if predict_layer_ms(scheduler, int(candidate), batch, sum_ell) is None:
@@ -1609,6 +1616,12 @@ def make_round(scheduler, reqs) -> RoundPlan:
         flat = _covered_flat_k(batch, max_ell, buckets, cover_k)
         return quoted(flat) is not None
 
+    def superset_ready(candidate):
+        # Fewer than four layer samples still builds, to fill the fit.
+        if layer_sample_count(scheduler, int(candidate), batch) < LAYER_MIN_SAMPLES:
+            return True
+        return wider_priced(candidate)
+
     width, kind = _cached_build_width(
         scheduler,
         batch,
@@ -1616,6 +1629,7 @@ def make_round(scheduler, reqs) -> RoundPlan:
         eligible=eligible,
         sum_ell=sum_ell,
         ready=superset_ready,
+        kv=width_kv,
     )
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     cover = _cover_for(width, max_depth, fitting)
@@ -1657,6 +1671,18 @@ def make_round(scheduler, reqs) -> RoundPlan:
         plan._verify_quotes = quotes
     plan.replay_kind = kind
     plan.replay_eligible = bool(eligible and not use_tau and kind != "probe_w")
+    plan.width_kv = width_kv
+    # Only the default rule on an eligible round uses these. An ordinary
+    # round's down sample counts only when the wider width is priced too; the
+    # widest tier has no wider width.
+    plan.wider_priced = False
+    plan.wpair_tag = None
+    if plan.replay_eligible and wpair_rule() == "simple":
+        next_wider = _next_wider(served)
+        plan.wider_priced = bool(
+            next_wider is None or wider_priced(int(next_wider))
+        )
+        plan.wpair_tag = round_tag(batch_bucket(batch), width_kv)
     plan.fallback = False
     return plan
 
@@ -1691,6 +1717,11 @@ def _prefit_round(scheduler, reqs, max_ell, buckets, batch) -> Optional[RoundPla
     )
     plan.cover_k = int(max(VERIFY_KS))
     plan.flat_k = int(flat_k(batch))
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        width_kv_bucket,
+    )
+
+    plan.width_kv = width_kv_bucket(max_ell, buckets)
     plan.fixed_depth = None if depth is None else int(depth)
     plan.prefit = info
     plan.replay_kind = "prefit"
@@ -1715,8 +1746,13 @@ def make_fallback_round(scheduler, reqs) -> RoundPlan:
     max_ell = max(prefixes) if prefixes else 0
     buckets = runtime_kv_buckets()
     chosen = _flat_locked_k(batch, max_ell, buckets)
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_wpair import (
+        width_kv_bucket,
+    )
+
+    width_kv = width_kv_bucket(max_ell, buckets)
     plan = RoundPlan(
-        width=persistent_width(batch),
+        width=persistent_width(batch, width_kv),
         k=chosen,
         use_tau=True,
         locked_k=chosen,
@@ -1733,6 +1769,7 @@ def make_fallback_round(scheduler, reqs) -> RoundPlan:
     plan.flat_k = _covered_flat_k(batch, max_ell, buckets, plan.cover_k)
     plan.replay_kind = "ordinary"
     plan.replay_eligible = False
+    plan.width_kv = width_kv
     plan.fallback = True
     return plan
 

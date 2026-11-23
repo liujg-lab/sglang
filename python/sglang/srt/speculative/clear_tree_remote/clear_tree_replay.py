@@ -92,6 +92,7 @@ def choose_build_width(
     scheduler=None,
     sum_ell: int = 0,
     ready=None,
+    kv=None,
 ) -> tuple:
     """Flat or switched width, plus a narrow timing probe and a wider build.
 
@@ -104,8 +105,10 @@ def choose_build_width(
     probe. Those rounds are ``probe_w`` and take the slot ahead of a superset
     build. A missing ``ready`` does not spend a superset round. The departure
     does not happen while the ledger is off, or on a K-probe or locked round.
+    ``kv`` is the round's width-state KV bucket; the narrow timing probe stays
+    per batch bucket because it only fills layer samples.
     """
-    base = persistent_width(batch_size)
+    base = persistent_width(batch_size, kv)
     if not ledger_on or not eligible:
         return base, "ordinary"
     bucket = batch_bucket(batch_size)
@@ -146,7 +149,7 @@ def choose_build_width(
         superset_due,
     )
 
-    if superset_due(bucket, base, ready):
+    if superset_due(bucket, base, ready, kv=kv):
         nxt = _next_wider(base)
         if nxt is not None:
             _mark_width_ran(bucket, nxt)
@@ -163,6 +166,7 @@ def _cached_build_width(
     eligible: bool,
     sum_ell: int = 0,
     ready=None,
+    kv=None,
 ):
     """One width per packet. A fallback expand must not take a second departure."""
     token = (
@@ -180,6 +184,7 @@ def _cached_build_width(
         scheduler=scheduler,
         sum_ell=sum_ell,
         ready=ready,
+        kv=kv,
     )
     if token is not None and scheduler is not None:
         scheduler._clear_build_cache = (token, chosen)
@@ -348,7 +353,7 @@ def queue_hold_replay(scheduler, reqs, states, plan) -> None:
             list(states),
             plan,
             getattr(scheduler, "_clear_build_token", None),
-            int(persistent_width(int(plan.batch))),
+            int(persistent_width(int(plan.batch), getattr(plan, "width_kv", None))),
             getattr(scheduler, "_clear_replay_packet", None),
         )
     )
@@ -361,8 +366,9 @@ def hold_replay(
     try:
         if token is None:
             token = getattr(scheduler, "_clear_build_token", None)
+        width_kv = getattr(plan, "width_kv", None)
         if served is None:
-            served = persistent_width(int(plan.batch))
+            served = persistent_width(int(plan.batch), width_kv)
         if packet is None:
             packet = getattr(scheduler, "_clear_replay_packet", None)
         trees = {}
@@ -409,6 +415,11 @@ def hold_replay(
             # Bonus tokens and seed time are the same for every width.
             "bonus": len(reqs),
             "seed_ms": float(seed_estimate(int(plan.batch)) or 0.0),
+            # Width-state key, whether the wider width was priced on this
+            # round, and the block's (epoch, round index) at build time.
+            "kv": None if width_kv is None else int(width_kv),
+            "wider_priced": bool(getattr(plan, "wider_priced", False)),
+            "tag": getattr(plan, "wpair_tag", None),
         }
     except Exception:
         import logging
@@ -473,7 +484,7 @@ def run_post_reply(scheduler) -> None:
                         isinstance(frozen, dict)
                         and frozen.get("eligible")
                         and int(frozen["served"])
-                        == persistent_width(int(frozen["batch"]))
+                        == persistent_width(int(frozen["batch"]), frozen.get("kv"))
                     ):
                         record = observe_pair(frozen)
                         if record is not None:

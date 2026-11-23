@@ -4,6 +4,7 @@ The ledger must not change width or tau. These tests stay on the pure
 accounting object.
 """
 
+import contextlib
 import os
 import unittest
 from types import SimpleNamespace
@@ -70,6 +71,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import (
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
     assign_persistent_width,
+    batch_bucket,
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_args import (
     apply_clear_tree_settings,
@@ -154,6 +156,16 @@ def _pin_verify_ks(test, ks=(8, 16, 32)):
 
     install_candidates(None, ks)
     test.addCleanup(lambda: install_candidates(None, None))
+
+
+
+@contextlib.contextmanager
+def _default_width_env():
+    """The default width rule and KV buckets, whatever the shell exports."""
+    with patch.dict(os.environ):
+        for name in ("SGLANG_CLEAR_WPAIR_RULE", "SGLANG_NPU_TREE_GRAPH_KV_BUCKETS"):
+            os.environ.pop(name, None)
+        yield
 
 
 class ClearTreeLedgerTest(CustomTestCase):
@@ -1325,6 +1337,51 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(chosen[:4], [(32, "probe_w")] * 4)
         self.assertTrue(all(item == (64, "ordinary") for item in chosen[4:]))
 
+    def test_build_width_reads_the_kv_keyed_width(self):
+        reset_policy()
+        assign_persistent_width(1, 16, kv=512)
+        self.assertEqual(
+            choose_build_width(1, ledger_on=False, eligible=True, kv=512),
+            (16, "ordinary"),
+        )
+        self.assertEqual(
+            choose_build_width(1, ledger_on=False, eligible=True, kv=4096),
+            (8, "ordinary"),
+        )
+        self.assertEqual(
+            choose_build_width(1, ledger_on=False, eligible=True), (8, "ordinary")
+        )
+
+    def test_make_round_keys_the_served_width_by_kv_bucket(self):
+        reset_policy()
+        assign_persistent_width(1, 16, kv=256)
+        short = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        long = SimpleNamespace(rid="b", origin_input_ids=[1] * 300, output_ids=[])
+        with _default_width_env(), patch.object(
+            ledger_module, "ledger_enabled", return_value=False
+        ):
+            near = make_round(SimpleNamespace(), [short])
+            far = make_round(SimpleNamespace(), [long])
+        self.assertEqual((near.width_kv, near.width), (256, 16))
+        self.assertEqual((far.width_kv, far.width), (512, 8))
+        # Not eligible, so no pricing flag and no block tag.
+        self.assertFalse(near.wider_priced)
+        self.assertIsNone(near.wpair_tag)
+
+    def test_legacy_make_round_reads_the_batch_only_width(self):
+        reset_policy()
+        assign_persistent_width(1, 16)
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        with _default_width_env(), patch.object(
+            ledger_module, "ledger_enabled", return_value=False
+        ):
+            os.environ["SGLANG_CLEAR_WPAIR_RULE"] = "legacy"
+            plan = make_round(SimpleNamespace(), [req])
+        self.assertIsNone(plan.width_kv)
+        self.assertEqual(plan.width, 16)
+        self.assertFalse(plan.wider_priced)
+        self.assertIsNone(plan.wpair_tag)
+
     def test_wider_batch_builds_a_superset_only_while_the_ledger_is_on(self):
         reset_policy()
         self.assertEqual(
@@ -1343,6 +1400,10 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(hot[8], (8, "superset"))
 
     def test_probe_cover_follows_served_width_at_depth_eight(self):
+        with _default_width_env():
+            self._probe_cover_at_depth_eight()
+
+    def _probe_cover_at_depth_eight(self):
         for batch, width, expected in (
             (4, 4, [4, 16, 2, 32]),
             (1, 8, [8, 32, 4, 64, 2]),
@@ -1350,7 +1411,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ):
             with self.subTest(batch=batch, width=width):
                 reset_policy()
-                assign_persistent_width(batch, width)
+                # Ten-token prefixes key the width state at KV bucket 256.
+                assign_persistent_width(batch_bucket(batch), width, kv=256)
                 scheduler = SimpleNamespace(
                     server_args=SimpleNamespace(clear_tree_max_depth=8)
                 )
@@ -1409,15 +1471,22 @@ class TestFlatWidthOnlineK(CustomTestCase):
             return_value=1.0,
         ):
             eligible = []
-            for _ in range(9):
-                plan = make_round(sched, reqs)
-                eligible.append((plan.width, plan.replay_kind, plan.replay_eligible))
+            tags = []
+            with _default_width_env():
+                for _ in range(9):
+                    plan = make_round(sched, reqs)
+                    eligible.append(
+                        (plan.width, plan.replay_kind, plan.replay_eligible)
+                    )
+                    tags.append(plan.wpair_tag)
         self.assertEqual(
             eligible,
             [(2, "probe_w", False)] * 4
             + [(4, "ordinary", True)] * 4
             + [(8, "superset", True)],
         )
+        # Only rounds that reach superset_due are numbered in the block.
+        self.assertEqual(tags, [None] * 4 + [(0, index) for index in range(5)])
 
         reset_policy()
         warm = SimpleNamespace(
@@ -2157,7 +2226,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         from sglang.srt.speculative.clear_tree_remote import clear_tree_wpair as wpair
 
         wpair.superset_due(1, 64, None)
-        self.assertGreater(wpair._blocks[1]["virt"], 0.0)
+        self.assertGreater(wpair._blocks[(1, None)]["virt"], 0.0)
         ledger = ClearLedger()
         fitted = ForgettingRegressor(
             2, LAYER_MIN_SAMPLES, ridge=LAYER_RIDGE, span_feature=1
@@ -3065,6 +3134,10 @@ class TestRoundQuoteAndPolicySplit(CustomTestCase):
             self.assertEqual(
                 frozen["seed_ms"], float(policy.seed_estimate(plan.batch) or 0.0)
             )
+            # A plan made outside make_round carries no width key or tag.
+            self.assertIsNone(frozen["kv"])
+            self.assertFalse(frozen["wider_priced"])
+            self.assertIsNone(frozen["tag"])
             fresh = _value_plan()
             fresh.cover_k = 32
             fresh._verify_quotes = {}
