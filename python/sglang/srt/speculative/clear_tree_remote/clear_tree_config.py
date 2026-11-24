@@ -60,7 +60,8 @@ def opt_draft_lookahead_enabled() -> bool:
     """Draft layer lookahead. Default off.
 
     The hot path overlaps the next layer's launch with host tree updates.
-    It is only taken for CUDA, page size 1, batch size 1, and Triton.
+    It is only taken for CUDA, page size 1, and Triton. One request uses
+    ``grow_lookahead``; several use ``grow_lookahead_many``.
     """
     return _env_flag("SGLANG_CLEAR_DRAFT_LOOKAHEAD")
 

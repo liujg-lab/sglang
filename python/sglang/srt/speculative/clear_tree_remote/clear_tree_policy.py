@@ -1250,8 +1250,8 @@ class RoundPlan:
     def defer_finish(self) -> bool:
         """Cut every window after the round, so one K is used for all of them.
 
-        A single request is cut where it stops. Lookahead only grows one tree,
-        and that path reads the window immediately.
+        A single request is cut where it stops, and single-request lookahead
+        reads the window immediately. Group lookahead also defers and cuts once.
         """
         return (
             self.batch > 1
@@ -1894,6 +1894,46 @@ def _observe_gain(predicted: float, actual: float, forget: float) -> None:
     global _gain_pred, _gain_actual
     _gain_pred = _gain_pred * float(forget) + float(predicted)
     _gain_actual = _gain_actual * float(forget) + float(actual)
+
+
+_ROUND_LEARNING_FIELDS = ("_raw_gain", "_frozen_k", "_cost_depth", "_verify_quotes")
+_ROUND_SCRATCH_FIELDS = (
+    ("_score_cache", dict),
+    ("_peers", list),
+    ("_keep_ids", set),
+    ("_at", lambda: None),
+)
+
+
+def snapshot_round_learning(plan):
+    """What a lookahead attempt can change before it is abandoned.
+
+    The gain calibration is global and survives the round; the plan's
+    per-layer notes are keyed by ``id(state)`` and must not leak into the
+    rebuilt trees, which can reuse those ids.
+    """
+    fields = None
+    if plan is not None:
+        fields = {}
+        for name in _ROUND_LEARNING_FIELDS:
+            value = getattr(plan, name, None)
+            fields[name] = dict(value) if isinstance(value, dict) else value
+    return {"gain": (_gain_pred, _gain_actual), "plan": fields}
+
+
+def restore_round_learning(plan, snapshot) -> None:
+    """Undo an abandoned attempt: gain calibration and the plan's in-round state."""
+    global _gain_pred, _gain_actual
+    if not isinstance(snapshot, dict):
+        return
+    _gain_pred, _gain_actual = snapshot["gain"]
+    fields = snapshot.get("plan")
+    if plan is None or fields is None:
+        return
+    for name, value in fields.items():
+        setattr(plan, name, dict(value) if isinstance(value, dict) else value)
+    for name, empty in _ROUND_SCRATCH_FIELDS:
+        setattr(plan, name, empty())
 
 
 def gain_ratio() -> float:

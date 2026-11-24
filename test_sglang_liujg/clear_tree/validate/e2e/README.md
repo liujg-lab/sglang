@@ -32,3 +32,5 @@
 | `2026-11-22-d` | 移开现有拟合后重扫 schema 3，并核对推迟关账、深度校正和 H 曲线；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；预拟合写一次 schema 3，推迟关账为真，深度来源有 cell、pooled 和 none | [记录](2026-11-22-d/run.md) |
 | `2026-11-23-b` | 移开现有拟合后重扫当前代码，在线选宽用默认指标；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；默认选宽 ratio，预拟合写一次 schema 3 | [记录](2026-11-23-b/run.md) |
 | `2026-11-23-c` | 移开现有拟合后重扫当前代码，在线选宽用默认指标；只开账本，RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；默认选宽 ratio，预拟合写一次 schema 3 | [记录](2026-11-23-c/run.md) |
+| `2026-11-24-a` | 移开现有拟合后重扫，Draft lookahead 开、Target 关；RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；并发 4 的批量 lookahead 没有留住 | [记录](2026-11-24-a/run.md) |
+| `2026-11-24-b` | 移开现有拟合后重扫，Draft lookahead 开、Target 关；RSTeller 与 WaterCaption 各跑并发 1 和 4，四轮不重启（不同负载，不是重复） | 四轮都跑完；并发 4 的批量 lookahead 留在 grow_lookahead_many | [记录](2026-11-24-b/run.md) |

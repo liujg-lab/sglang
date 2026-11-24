@@ -39,10 +39,12 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import (
     _layer_positions,
     expand_from_topk,
     expand_on_device,
+    expand_on_device_many,
     host_topk_rows,
     mirror_layer,
     seed_from_topk,
     seed_on_device,
+    seed_on_device_many,
     step_after_layer,
 )
 
@@ -380,6 +382,17 @@ def take_cached_tail_logits(req, logical_len: int):
     return row
 
 
+def _rollback_failed_ingest(scheduler, req, start: int) -> None:
+    """Undo an ingest that raised. A poisoned device keeps its slots.
+
+    ``_clear_rollback`` refuses on a poisoned device; calling it here would
+    replace the ingest error the caller is about to re-raise.
+    """
+    if getattr(scheduler, "_sr_device_poisoned", False):
+        return
+    scheduler._clear_rollback(req, start)
+
+
 def clear_prefill_tail_logits(req) -> None:
     if getattr(req, "opt_prefill_tail_logits", None) is not None:
         req.opt_prefill_tail_logits = None
@@ -490,12 +503,31 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
         get_sr_round_metrics,
     )
 
+    if getattr(scheduler, "_sr_device_poisoned", False):
+        # Same guard as ``_clear_expand_one``: no lease consume, rollback or
+        # tree growth on a poisoned device.
+        for req in reqs:
+            clear_prefill_tail_logits(req)
+        get_sr_round_metrics(scheduler, "Draft").counts[
+            "opt_expand_skipped_poisoned"
+        ] += len(reqs)
+        return [([], None, None)] * len(reqs)
+
     windows = [None] * len(reqs)
     batch_failed = False
     try:
         windows = list(grow_batch(scheduler, reqs))
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
+        if isinstance(exc, LookaheadUnsettled) or getattr(
+            scheduler, "_sr_device_poisoned", False
+        ):
+            # Quarantined slots are still mapped on these requests. A
+            # per-request rebuild would roll them back and grow on a
+            # poisoned device; send empty drafts instead.
+            logger.warning("[OPT] batch tree expand failed, no rebuild: %s", exc)
+            get_sr_round_metrics(scheduler, "Draft").counts["opt_batch_unsettled"] += 1
+            return [([], None, None)] * len(reqs)
         logger.warning("[OPT] batch tree expand failed, falling back: %s", exc)
         batch_failed = True
     if batch_failed or any(window is None for window in windows):
@@ -1071,6 +1103,33 @@ def _cut_deferred(plan, states, pending, results) -> None:
         pending.remove(index)
 
 
+def _round_states(scheduler, config: ClearTreeConfig, count: int):
+    """One tree per request, bound to this round's plan, rid and prefix."""
+    states = [ClearTreeState.create(config) for _ in range(int(count))]
+    plan = (
+        getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
+    )
+    rids = (
+        list(getattr(scheduler, "_clear_round_rids", None) or [])
+        if scheduler is not None
+        else []
+    )
+    prefixes = (
+        list(getattr(scheduler, "_clear_round_prefixes", None) or [])
+        if scheduler is not None
+        else []
+    )
+    for index, state in enumerate(states):
+        state.decider = plan
+        if index < len(rids):
+            state.rid = rids[index]
+        if index < len(prefixes):
+            state.prefix = prefixes[index]
+    if plan is not None and hasattr(plan, "bind_states"):
+        plan.bind_states(states)
+    return states, plan
+
+
 def grow_active_layers(
     config: ClearTreeConfig,
     tail_logits,
@@ -1093,28 +1152,7 @@ def grow_active_layers(
     ``topk_out[i]`` collects that tail's host id tensors, root first.
     """
     tails = list(tail_logits)
-    states = [ClearTreeState.create(config) for _ in tails]
-    plan = (
-        getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
-    )
-    rids = (
-        list(getattr(scheduler, "_clear_round_rids", None) or [])
-        if scheduler is not None
-        else []
-    )
-    prefixes = (
-        list(getattr(scheduler, "_clear_round_prefixes", None) or [])
-        if scheduler is not None
-        else []
-    )
-    for index, state in enumerate(states):
-        state.decider = plan
-        if index < len(rids):
-            state.rid = rids[index]
-        if index < len(prefixes):
-            state.prefix = prefixes[index]
-    if plan is not None and hasattr(plan, "bind_states"):
-        plan.bind_states(states)
+    states, plan = _round_states(scheduler, config, len(tails))
     if states_out is not None:
         states_out.extend(states)
     steps = [None] * len(tails)
@@ -1350,7 +1388,7 @@ class OptLayerForward:
             batch = self._extend_batch(tokens, start, out_cache_loc)
             logits = _row_logits(self._run(batch), n, tail=True)
         except Exception:
-            self.scheduler._clear_rollback(self.req, start)
+            _rollback_failed_ingest(self.scheduler, self.req, start)
             raise
         self.req.kv_committed_len = end
         self.req.kv_allocated_len = end
@@ -1471,18 +1509,24 @@ class OptLayerForward:
         scheduler = self.scheduler
         self._la_seq.fill_(self.cached_len)
         out_cache_loc = alloc_token_slots(scheduler.tree_cache, n)
-        if int(out_cache_loc.numel()) != n:
-            raise RuntimeError(
-                f"OPT layer allocated {int(out_cache_loc.numel())} slots for {n} tokens"
+        try:
+            if int(out_cache_loc.numel()) != n:
+                raise RuntimeError(
+                    f"OPT layer allocated {int(out_cache_loc.numel())} slots for {n} tokens"
+                )
+            assign_req_to_token_pool_func(
+                self._la_pool,
+                scheduler.req_to_token_pool.req_to_token,
+                self._la_seq,
+                self._la_seq + n,
+                out_cache_loc,
+                1,
             )
-        assign_req_to_token_pool_func(
-            self._la_pool,
-            scheduler.req_to_token_pool.req_to_token,
-            self._la_seq,
-            self._la_seq + n,
-            out_cache_loc,
-            1,
-        )
+        except BaseException as exc:
+            _free_unrecorded_slots(scheduler, out_cache_loc, exc)
+            raise
+        # The map is written: cover it by rollback before anything else can fail.
+        self.req.kv_allocated_len = int(self.cached_len) + n
         self.layer_slots.append(out_cache_loc.detach().reshape(-1).clone())
         return out_cache_loc
 
@@ -1523,18 +1567,25 @@ class OptLayerForward:
                 last,
                 n,
             )
-        if int(out_cache_loc.numel()) != n:
-            raise RuntimeError(
-                f"OPT layer allocated {int(out_cache_loc.numel())} slots for {n} tokens"
+        try:
+            if int(out_cache_loc.numel()) != n:
+                raise RuntimeError(
+                    f"OPT layer allocated {int(out_cache_loc.numel())} slots for {n} tokens"
+                )
+            assign_req_to_token_pool_func(
+                pool_index,
+                scheduler.req_to_token_pool.req_to_token,
+                seq,
+                seq + n,
+                out_cache_loc,
+                1,
             )
-        assign_req_to_token_pool_func(
-            pool_index,
-            scheduler.req_to_token_pool.req_to_token,
-            seq,
-            seq + n,
-            out_cache_loc,
-            1,
-        )
+        except BaseException as exc:
+            if page == 1:
+                _free_unrecorded_slots(scheduler, out_cache_loc, exc)
+            raise
+        # The map is written: cover it by rollback before anything else can fail.
+        self.req.kv_allocated_len = base + n
         if start is None:
             # Ingest passes start= and must not become part of the tree lease.
             # Stay on the allocator device; publish copies every layer once.
@@ -1901,7 +1952,7 @@ def _extend_span_batch(scheduler, runners, ends, phases=None) -> List[torch.Tens
         phases.lap("opt_ingest_forward")
     except Exception:
         for runner, start, _end in prepared:
-            scheduler._clear_rollback(runner.req, start)
+            _rollback_failed_ingest(scheduler, runner.req, start)
         raise
     for runner, _start, end in prepared:
         runner.req.kv_committed_len = end
@@ -2204,7 +2255,7 @@ def _decode_append_batch(scheduler, runners, phases=None) -> List[torch.Tensor]:
         rows = [logits[i].clone() for i in range(len(runners))]
     except Exception:
         for runner, start, _end in prepared:
-            scheduler._clear_rollback(runner.req, start)
+            _rollback_failed_ingest(scheduler, runner.req, start)
         raise
     for runner, _start, end in prepared:
         runner.req.kv_committed_len = end
@@ -3293,15 +3344,26 @@ def _drop_unfinished_layer(scheduler, job: OptDeferredTree) -> None:
         return
     if len(runner.layer_slots) < depth:
         return
-    runner.layer_slots.pop()
+    if getattr(scheduler, "_sr_device_poisoned", False):
+        # Already isolated: the slots stay mapped and poisoned cleanup owns
+        # them. Do not try a rollback that would only be refused.
+        return
+    popped = runner.layer_slots.pop()
     cached = int(runner.cached_len)
     try:
         scheduler._clear_rollback(job.req, cached)
-    except Exception:
+    except Exception as exc:
+        # A partial free arrives as a device-context error and poisons here,
+        # so the later publish does not roll the same span back again.
+        runner.layer_slots.append(popped)
+        _reraise_device_context(scheduler, exc)
         logger.warning(
             "[OPT] rollback of unfinished layer failed for %s",
             getattr(job.req, "rid", None),
             exc_info=True,
+        )
+        _quarantine_lookahead(
+            scheduler, [runner], exc, counter="opt_deferred_unsettled"
         )
         return
     job.req.kv_committed_len = int(job.keep)
@@ -3310,6 +3372,15 @@ def _drop_unfinished_layer(scheduler, job: OptDeferredTree) -> None:
 
 class LookaheadFallback(RuntimeError):
     """Leave the overlapped path and grow this tree the original way."""
+
+
+class LookaheadUnsettled(RuntimeError):
+    """A failed lookahead could not prove its slots were rolled back.
+
+    Not a ``LookaheadFallback``: the round must not be rebuilt on slots whose
+    owner is unknown. The slots stay on the request and in quarantine, and
+    the device is treated as poisoned.
+    """
 
 
 class _PinnedLayer:
@@ -3423,6 +3494,25 @@ def _lookahead_backend_is_triton(scheduler) -> bool:
     return "triton" in type(backend).__name__.lower()
 
 
+def lookahead_mode(scheduler) -> bool:
+    """Whether this process runs Draft lookahead. Cached; it does not change.
+
+    The ledger tags layer samples with it, so ordinary layers in a lookahead
+    process stay out of the lookahead layer model.
+    """
+    cached = getattr(scheduler, "_opt_la_mode", None)
+    if not isinstance(cached, bool):
+        try:
+            cached = bool(lookahead_supported(scheduler))
+        except Exception:
+            cached = False
+        try:
+            scheduler._opt_la_mode = cached
+        except Exception:
+            pass
+    return bool(cached)
+
+
 def lookahead_supported(scheduler) -> bool:
     """CUDA page-1 Triton only. Anything else keeps ``grow_active_layers``."""
     if not opt_draft_lookahead_enabled():
@@ -3446,18 +3536,34 @@ def _lookahead_kv_need(scheduler, ingest_slots: int = 0) -> int:
     takes ``(max_depth - 1) * n`` slots. Before K is known, reserve the
     largest configured candidate set. Narrow singleton graphs may need one
     padded tail while earlier real guesses remain allocated. This is an
-    admission estimate, not a reservation; every group rechecks free space.
+    estimate, not a reservation; every group rechecks free space. Admission
+    reserves only ``_lookahead_tree_need``; the bonus part is not evicted for.
     """
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import BONUS_NTPBS
+    return _lookahead_tree_need(scheduler, ingest_slots) + _lookahead_bonus_slots(
+        scheduler
+    )
 
+
+def _lookahead_tree_need(scheduler, ingest_slots: int = 0) -> int:
+    """Ingest plus every lookahead layer; the part admission reserves."""
     n = _round_width(scheduler)
     depth = int(scheduler.server_args.clear_tree_max_depth)
-    bonus_slots = 0
-    if bonus_prediction_enabled():
-        maximum = max(BONUS_NTPBS)
-        width, _expected = _bonus_width(scheduler, 1, maximum)
-        bonus_slots = ((maximum + width - 1) // width) * width
-    return int(ingest_slots) + (depth - 1) * n + bonus_slots
+    return int(ingest_slots) + (depth - 1) * n
+
+
+def _lookahead_bonus_slots(scheduler) -> int:
+    """Largest bonus group one request can take; 0 when bonus is off.
+
+    Not part of the admission reservation: ``_run_bonus_group`` uses free
+    slots only and skips the bonus when they do not fit.
+    """
+    if not bonus_prediction_enabled():
+        return 0
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import BONUS_NTPBS
+
+    maximum = max(BONUS_NTPBS)
+    width, _expected = _bonus_width(scheduler, 1, maximum)
+    return ((maximum + width - 1) // width) * width
 
 
 def _lookahead_ingest_slots(runner) -> int:
@@ -3468,13 +3574,112 @@ def _lookahead_ingest_slots(runner) -> int:
 
 
 def _lookahead_would_evict(scheduler, ingest_slots: int = 0) -> bool:
-    """True when the free list cannot cover ingest plus the lookahead tree.
+    """True when the free list alone cannot cover ingest, the tree and a bonus.
 
-    ``available_size`` is ``len`` of the device free list and does not sync.
-    A short radix free list would evict, and that eviction can sync. A short
-    chunk-cache free list fails the alloc and still resets the step. Either
-    case falls back before ingest is queued.
+    A pure check (``available_size`` is ``len`` of the device free list) kept
+    for tests and diagnostics. Admission does not call it; it reserves with
+    ``_lookahead_reserve_kv``.
     """
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return False
+    if getattr(tree, "token_to_kv_pool_allocator", None) is None:
+        return True
+    try:
+        need = _lookahead_kv_need(scheduler, ingest_slots)
+    except Exception:
+        return True
+    return _lookahead_short_of(scheduler, need)
+
+
+# Admission evicts this many times the round's need, so a full radix cache
+# does not evict again on every round.
+_LOOKAHEAD_EVICT_FACTOR = 2
+
+
+def _plain_radix_eviction(tree) -> bool:
+    """True when evicting from ``tree`` cannot synchronize.
+
+    Exactly ``RadixCache`` over ``TokenToKVPoolAllocator``: ``evict`` pops a
+    host heap and ``free`` concatenates device index tensors. Subclasses
+    (HiRadix, LMCache, Mamba, SWA) and wrappers may write back or sync, so
+    they keep falling back on a short free list.
+    """
+    try:
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+    except Exception:
+        return False
+    allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+    return type(tree) is RadixCache and type(allocator) is TokenToKVPoolAllocator
+
+
+def _lookahead_reserve_kv(scheduler, need: int) -> None:
+    """Make the free list cover ``need`` before ingest, or raise ``LookaheadFallback``.
+
+    ``need`` is ingest plus the tree (``_lookahead_tree_need``), never the
+    bonus: bonus keeps its free-slots-only rule.
+
+    Finished requests stay in the radix cache, so a long run fills the pool
+    and the free list holds only what the last rollback returned. Layer
+    allocations go through ``alloc_token_slots``, which evicts on demand
+    without syncing, so a short free list was never a reason to give up
+    lookahead. Admission instead evicts ``_LOOKAHEAD_EVICT_FACTOR * need``
+    tokens once, with the same ``evict_from_tree_cache``, so layers do not
+    evict a little at a time inside the overlapped loop. Eviction only
+    removes unlocked leaves, so running requests keep their prefixes. Other
+    caches, or free plus evictable below ``need``, fall back with the sizes
+    in the reason.
+    """
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return
+    allocator = getattr(tree, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        raise LookaheadFallback("kv allocator missing")
+    need = int(need)
+    try:
+        free = int(allocator.available_size())
+    except Exception:
+        raise LookaheadFallback("kv free size unknown")
+    if free >= need:
+        return
+    plain = _plain_radix_eviction(tree)
+    evictable = 0
+    if plain:
+        try:
+            evictable = int(tree.evictable_size())
+        except Exception:
+            evictable = 0
+    if not plain or free + evictable < need:
+        raise LookaheadFallback(
+            f"kv short need={need} free={free} evictable={evictable}"
+            + ("" if plain else " cache=not-plain-radix")
+        )
+    try:
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(tree, _LOOKAHEAD_EVICT_FACTOR * need)
+        after = int(allocator.available_size())
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        logger.warning("[OPT] lookahead eviction failed", exc_info=True)
+        raise LookaheadFallback("kv evict failed") from exc
+    if after > free:
+        _opt_draft_count(scheduler, "opt_lookahead_kv_evictions")
+        _opt_draft_count(scheduler, "opt_lookahead_kv_evicted_tokens", after - free)
+    if after < need:
+        try:
+            left = int(tree.evictable_size())
+        except Exception:
+            left = -1
+        raise LookaheadFallback(
+            f"kv short after evict need={need} free={after} evictable={left}"
+        )
+
+
+def _lookahead_short_of(scheduler, need: int) -> bool:
+    """True when the free list holds fewer than ``need`` slots. Does not sync."""
     tree = getattr(scheduler, "tree_cache", None)
     if tree is None:
         return False
@@ -3483,18 +3688,22 @@ def _lookahead_would_evict(scheduler, ingest_slots: int = 0) -> bool:
         return True
     try:
         available = allocator.available_size()
-        need = _lookahead_kv_need(scheduler, ingest_slots)
     except Exception:
         return True
     return int(available) < int(need)
 
 
-def _lookahead_forward_template(scheduler, batch):
+def _lookahead_forward_template(scheduler, batch, raise_errors: bool = False):
     """One ``ForwardBatch`` for every later layer, or None when replay cannot run.
 
     ``init_new`` may synchronize while copying a pageable M-RoPE delta. That
     happens here, before the layer loop. Later layers copy this object and
     do not call ``init_new`` again.
+
+    An exception from ``init_new`` or ``can_run`` gives None, so the caller
+    sees the same result as a missing graph. ``raise_errors=True`` re-raises
+    it instead; the group cache stores a miss for every request of that
+    size and must not store one caused by a single request.
     """
     worker = getattr(scheduler, "model_worker", None)
     model_runner = getattr(worker, "model_runner", None)
@@ -3508,6 +3717,8 @@ def _lookahead_forward_template(scheduler, batch):
             batch.get_model_worker_batch(), model_runner
         )
     except Exception:
+        if raise_errors:
+            raise
         logger.warning("[OPT] lookahead graph check failed", exc_info=True)
         return None
     if not forward_batch.forward_mode.is_cuda_graph():
@@ -3517,6 +3728,8 @@ def _lookahead_forward_template(scheduler, batch):
     try:
         ready = bool(graph_runner.can_run(forward_batch))
     except Exception:
+        if raise_errors:
+            raise
         logger.warning("[OPT] lookahead can_run failed", exc_info=True)
         return None
     if not ready:
@@ -3546,9 +3759,39 @@ def _mrope_delta_from_template(forward_batch):
     return (rows[0, :1] - pos[:1]).to(dtype=torch.int64).reshape(1, 1)
 
 
+def _request_mrope_delta(req) -> Optional[int]:
+    """This request's target-verify M-RoPE delta as a host int.
+
+    Same value ``_compute_spec_mrope_positions`` adds. 0 for a request
+    without multimodal inputs. None when it has multimodal inputs but no
+    delta: harmless without M-RoPE, but admission falls back when the
+    template uses M-RoPE, since the reference would fail there. The
+    scheduler leaves the delta on the host; one on the device, or one that
+    is not a single value, raises ``LookaheadFallback``.
+    """
+    mm = getattr(req, "multimodal_inputs", None)
+    if mm is None:
+        return 0
+    delta = getattr(mm, "mrope_position_delta", None)
+    if delta is None:
+        return None
+    device = getattr(delta, "device", None)
+    if getattr(delta, "is_cuda", False) or getattr(device, "type", "cpu") != "cpu":
+        raise LookaheadFallback("mrope delta on device")
+    if not torch.is_tensor(delta):
+        return int(delta)
+    if int(delta.numel()) != 1:
+        raise LookaheadFallback(f"mrope delta shape {tuple(delta.shape)}")
+    return int(delta.reshape(-1)[0])
+
+
 def _lookahead_mrope_positions(positions, delta) -> torch.Tensor:
-    """Target-verify M-RoPE: one device delta added to every position, three rows."""
-    seq_positions = positions.detach().reshape(1, -1)
+    """Target-verify M-RoPE: each request's device delta added to its positions.
+
+    ``delta`` is ``[rows, 1]``; positions are ``rows`` equal segments.
+    """
+    rows = int(delta.shape[0]) if delta.dim() == 2 else 1
+    seq_positions = positions.detach().reshape(rows, -1)
     return (seq_positions + delta).flatten().unsqueeze(0).repeat(3, 1)
 
 
@@ -3627,7 +3870,10 @@ def _lookahead_batch(scheduler, req):
 
 
 def drop_lookahead_request(scheduler, rid) -> None:
-    """Drop a finished request's cached decode batch."""
+    """Drop a finished request's cached decode batch.
+
+    Group templates hold no request, so they stay.
+    """
     batches = getattr(scheduler, "_opt_la_batches", None)
     if batches is not None:
         batches.pop(rid, None)
@@ -3666,32 +3912,16 @@ def prepare_lookahead_runtime(scheduler, runner):
 
 
 def _reset_lookahead_runner(scheduler, runner) -> None:
-    """Wait for queued lookahead kernels, then free every uncommitted tree slot."""
-    from sglang.srt.speculative.standalone_remote.sr_align import (
-        is_device_context_error,
-    )
+    """``_settle_lookahead_rollback`` for one runner."""
+    _settle_lookahead_rollback(scheduler, [runner])
 
-    try:
-        torch.get_device_module(scheduler.device).synchronize()
-    except Exception as exc:
-        if is_device_context_error(exc):
-            _reraise_device_context(scheduler, exc)
-        logger.warning("[OPT] lookahead reset sync failed", exc_info=True)
-    keep = int(runner.prefix_len)
-    end = int(getattr(runner.req, "kv_allocated_len", keep) or keep)
-    try:
-        scheduler._clear_rollback(runner.req, keep)
-    except Exception:
-        logger.warning(
-            "[OPT] lookahead rollback failed for %s",
-            getattr(runner.req, "rid", None),
-            exc_info=True,
-        )
+
+def _forget_lookahead_tree(runner, keep: int) -> None:
+    """Drop the tree's bookkeeping. Only after its slots were rolled back."""
     runner.layer_slots.clear()
     runner.cached_len = keep
     runner.req.kv_allocated_len = keep
     runner.req.kv_committed_len = keep
-    _clear_req_to_token_span(scheduler, runner.req, keep, end)
     runner.lookahead_inflight = False
     runner._lookahead_queued = False
     runner._lookahead_bonus = None
@@ -3699,6 +3929,145 @@ def _reset_lookahead_runner(scheduler, runner) -> None:
     runner._last_logits = None
     runner._la_forward_template = None
     runner._la_mrope_delta = None
+
+
+def _settle_lookahead_rollback(scheduler, runners) -> None:
+    """Wait for queued lookahead kernels once, then roll every tree back.
+
+    A runner's slots and lengths are cleared only after its rollback
+    succeeded. An ordinary sync failure, or a rollback that raised, leaves
+    those runners' slots on the request, quarantines them and raises
+    ``LookaheadUnsettled`` so the caller does not rebuild on top of them.
+    ``_clear_rollback`` raises here only when ``local_rollback`` refused
+    without freeing; a rollback that freed part of the span raises
+    ``SRTransferUnresolved``, which is a device-context error. Device-context
+    errors poison and re-raise, and the remaining runners are left as they
+    are: a poisoned device never returns their slots. A device already
+    poisoned must not return slots, so nothing is rolled back.
+    """
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    runners = [runner for runner in runners if runner is not None]
+    if not runners:
+        return
+    if getattr(scheduler, "_sr_device_poisoned", False):
+        _quarantine_lookahead(scheduler, runners, None)
+        raise LookaheadUnsettled("device poisoned before lookahead rollback")
+    try:
+        torch.get_device_module(scheduler.device).synchronize()
+    except Exception as exc:
+        if is_device_context_error(exc):
+            _reraise_device_context(scheduler, exc)
+        logger.warning("[OPT] lookahead reset sync failed", exc_info=True)
+        _quarantine_lookahead(scheduler, runners, exc)
+        raise LookaheadUnsettled(f"lookahead sync failed: {exc}") from exc
+    failed = []
+    error = None
+    for runner in runners:
+        keep = int(runner.prefix_len)
+        end = int(getattr(runner.req, "kv_allocated_len", keep) or keep)
+        try:
+            scheduler._clear_rollback(runner.req, keep)
+        except Exception as exc:
+            if is_device_context_error(exc):
+                _reraise_device_context(scheduler, exc)
+            logger.warning(
+                "[OPT] lookahead rollback failed for %s",
+                getattr(runner.req, "rid", None),
+                exc_info=True,
+            )
+            failed.append(runner)
+            error = exc
+            continue
+        _forget_lookahead_tree(runner, keep)
+        _clear_req_to_token_span(scheduler, runner.req, keep, end)
+    if failed:
+        _quarantine_lookahead(scheduler, failed, error)
+        raise LookaheadUnsettled(
+            f"lookahead rollback failed for {len(failed)} requests: {error}"
+        ) from error
+
+
+class _UnsettledLookahead:
+    """Quarantine owner for lookahead slots whose release is unconfirmed."""
+
+    def __init__(self, entries, error):
+        self.entries = entries
+        self.error = error
+
+
+def _quarantine_lookahead(
+    scheduler, runners, exc, counter: str = "opt_lookahead_unsettled"
+) -> None:
+    """Keep these runners' slots, poison the device and record the owner.
+
+    Same rule as ``_quarantine_bonus_batch``: the record carries a
+    ``release_error`` so no later quarantine poll frees it. Slots stay mapped
+    on each request up to ``kv_allocated_len``; poisoned cleanup owns them.
+    """
+    from sglang.srt.speculative.standalone_remote.drafter.sr_resource_quarantine import (
+        quarantine,
+    )
+
+    scheduler._sr_device_poisoned = True
+    clear = getattr(scheduler, "_sr_clear_stamps_after_poison", None)
+    if callable(clear):
+        clear()
+    entries = []
+    for runner in runners:
+        req = getattr(runner, "req", None)
+        entries.append(
+            (
+                req,
+                int(getattr(req, "kv_allocated_len", 0) or 0),
+                list(getattr(runner, "layer_slots", []) or []),
+            )
+        )
+        runner.lookahead_inflight = False
+        runner._lookahead_queued = False
+    try:
+        record = quarantine(scheduler).retain(_UnsettledLookahead(entries, exc))
+        record.release_error = RuntimeError("ClearTree lookahead rollback unresolved")
+    except Exception:
+        logger.warning("[OPT] lookahead quarantine failed", exc_info=True)
+    _opt_draft_count(scheduler, counter, len(runners))
+
+
+def _confirm_lookahead_done(scheduler, runner) -> bool:
+    """Wait for a queued last layer and its bonus copy. True once completion is known.
+
+    An ordinary wait error is confirmed with a device sync. If that fails
+    too, completion is unknown: the device is poisoned, and the caller must
+    neither publish nor recycle the slots. A device-context error poisons and
+    re-raises. ``bonus.ready`` is cleared either way.
+    """
+    if runner is None:
+        return True
+    bonus = getattr(runner, "_lookahead_bonus", None)
+    try:
+        _await_lookahead_event(scheduler, getattr(runner, "_lookahead_launch_event", None))
+        if bonus is not None:
+            _await_lookahead_event(scheduler, getattr(bonus, "event", None))
+            bonus.ready = False
+        return True
+    except Exception as exc:
+        if bonus is not None:
+            bonus.ready = False
+        _reraise_device_context(scheduler, exc)
+        logger.warning("[OPT] lookahead wait failed: %s", exc)
+    if getattr(scheduler, "_sr_device_poisoned", False):
+        return False
+    try:
+        torch.get_device_module(scheduler.device).synchronize()
+        return True
+    except Exception:
+        scheduler._sr_device_poisoned = True
+        clear = getattr(scheduler, "_sr_clear_stamps_after_poison", None)
+        if callable(clear):
+            clear()
+        return False
 
 
 def _await_lookahead_event(scheduler, event) -> None:
@@ -3735,13 +4104,16 @@ def _private_seed_logits(runner, tail_logits) -> torch.Tensor:
 
 
 def _admit_lookahead(scheduler, runner, batch) -> None:
-    """KV-budget check, then reuse or build the layer template.
+    """Reuse or build the layer template, then reserve KV for the tree.
 
     Call this before ingest is queued. ``prefix_len`` and ``cached_len`` are
-    already the committed length, and ingest does not change them. The budget
-    includes the slots ingest still has to allocate. ``available_size`` is the
-    free-list length and does not sync. A short list raises
-    ``LookaheadFallback`` and leaves a cached template in place.
+    already the committed length, and ingest does not change them. The
+    reservation covers the slots ingest still has to allocate plus the tree,
+    not the bonus. It runs after the template so a graph miss does not evict.
+    ``_lookahead_reserve_kv`` evicts from a plain radix cache when the free
+    list is short; when even that is not enough it raises
+    ``LookaheadFallback``, clears the runner's template and leaves the stored
+    one in place.
 
     A template and its M-RoPE delta stay on ``_opt_la_batches[rid]`` until the
     KV pool index changes or the request is dropped. A hit skips ``init_new``
@@ -3749,11 +4121,14 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     ``opt_lookahead_eager_layers``.
     """
     n = _round_width(scheduler)
-    if _lookahead_would_evict(scheduler, _lookahead_ingest_slots(runner)):
-        raise LookaheadFallback("kv evict")
+    try:
+        need = _lookahead_tree_need(scheduler, _lookahead_ingest_slots(runner))
+    except Exception as exc:
+        raise LookaheadFallback("kv need unknown") from exc
     cached = _load_layer_admit(scheduler, runner.req)
     if cached is not None:
         runner._la_forward_template, runner._la_mrope_delta = cached
+        _reserve_lookahead_runner(scheduler, runner, need)
         return
     device = scheduler.req_to_token_pool.device
     from sglang.srt.model_executor.forward_batch_info import (
@@ -3795,6 +4170,17 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     runner._la_forward_template = template
     runner._la_mrope_delta = delta
     _store_layer_admit(scheduler, runner.req, template, delta)
+    _reserve_lookahead_runner(scheduler, runner, need)
+
+
+def _reserve_lookahead_runner(scheduler, runner, need: int) -> None:
+    """``_lookahead_reserve_kv``; a fallback also clears the runner's template."""
+    try:
+        _lookahead_reserve_kv(scheduler, need)
+    except LookaheadFallback:
+        runner._la_forward_template = None
+        runner._la_mrope_delta = None
+        raise
 
 
 def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runtime):
@@ -3843,6 +4229,11 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
                 mirror_layer(state, cpu_scores, cpu_tokens, _cpu_parents, seed=False)
                 if predict_bonus:
                     runner.bonus_ids.append(cpu_ids.contiguous())
+            # Same hook as ``_commit_prob_rows``: the plan sees the written
+            # layer and updates the next-layer gain calibration.
+            decider = getattr(state, "decider", None)
+            if decider is not None and hasattr(decider, "begin_layer"):
+                decider.begin_layer([state])
             step = step_after_layer(state)
             if step.is_final:
                 if predict_bonus:
@@ -3879,6 +4270,609 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
         raise LookaheadFallback(str(exc)) from exc
 
 
+def _free_unrecorded_slots(scheduler, slots, exc) -> None:
+    """Return slots that were allocated but never reached ``req_to_token``.
+
+    Rollback only frees what ``kv_allocated_len`` covers, so these would leak.
+    A dead device context keeps them for the poisoned-device cleanup.
+    """
+    if slots is None or getattr(scheduler, "_sr_device_poisoned", False):
+        return
+    from sglang.srt.speculative.standalone_remote.sr_align import (
+        is_device_context_error,
+    )
+
+    if is_device_context_error(exc):
+        return
+    try:
+        scheduler.token_to_kv_pool_allocator.free(slots)
+    except Exception:
+        logger.warning("[OPT] freeing unrecorded layer slots failed", exc_info=True)
+
+
+def _small_to_device(values, device, dtype=torch.int64) -> torch.Tensor:
+    """A small host list on ``device`` without a blocking copy.
+
+    CUDA targets go through pinned memory with ``non_blocking``; PyTorch's
+    pinned allocator keeps the block until the copy finishes. Other devices
+    copy directly.
+    """
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.tensor(values, dtype=dtype, pin_memory=True).to(
+            device, non_blocking=True
+        )
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
+class _PinnedLayerMany:
+    """``_PinnedLayer`` for up to ``max_bs`` trees that share a depth.
+
+    Two alternate per width. Row ``i`` is the ``i``-th tree launched in that
+    layer; ``rows`` is how many are filled.
+    """
+
+    def __init__(self, max_bs: int, width: int, pin_memory: bool = True):
+        b = int(max_bs)
+        n = int(width)
+        pin = {"device": "cpu", "pin_memory": bool(pin_memory)}
+        self.scores = torch.empty(b, n, dtype=torch.float32, **pin)
+        self.tokens = torch.empty(b, n, dtype=torch.long, **pin)
+        self.parents = torch.empty(b, n, dtype=torch.long, **pin)
+        predict = bonus_prediction_enabled()
+        self.seed_ids = (
+            torch.empty(b, n + 1, dtype=torch.long, **pin) if predict else None
+        )
+        self.ids = torch.empty(b, n, n + 1, dtype=torch.long, **pin) if predict else None
+        self.event = torch.cuda.Event()
+        self.kind = "seed"
+        self.rows = 0
+        self.ready = False
+
+    def copy_seed(self, scores: torch.Tensor, ids: torch.Tensor) -> None:
+        """``scores`` and ``ids`` are the ``[m, n + 1]`` root top-k rows."""
+        m = int(scores.shape[0])
+        n = int(self.scores.shape[1])
+        self.scores[:m].copy_(scores[:, :n].float(), non_blocking=True)
+        self.tokens[:m].copy_(ids[:, :n].to(dtype=torch.long), non_blocking=True)
+        if self.seed_ids is not None:
+            self.seed_ids[:m].copy_(ids.to(dtype=torch.long), non_blocking=True)
+        self.kind = "seed"
+        self.rows = m
+        self.event.record()
+        self.ready = True
+
+    def copy_expand(self, top_scores, tokens, parents, vocab_ids) -> None:
+        """``[m, n]`` choices and the ``[m, n, n + 1]`` child ids they came from."""
+        m = int(top_scores.shape[0])
+        self.scores[:m].copy_(top_scores.float(), non_blocking=True)
+        self.tokens[:m].copy_(tokens.to(dtype=torch.long), non_blocking=True)
+        self.parents[:m].copy_(parents.to(dtype=torch.long), non_blocking=True)
+        if self.ids is not None:
+            self.ids[:m].copy_(vocab_ids.to(dtype=torch.long), non_blocking=True)
+        self.kind = "expand"
+        self.rows = m
+        self.event.record()
+        self.ready = True
+
+    def clone_cpu(self):
+        if not self.ready:
+            raise RuntimeError("lookahead pinned group was read before a copy")
+        self.event.synchronize()
+        self.ready = False
+        m = self.rows
+        if self.kind == "seed":
+            ids = self.seed_ids[:m].clone() if self.seed_ids is not None else None
+        else:
+            ids = self.ids[:m].clone() if self.ids is not None else None
+        return (
+            self.scores[:m].clone(),
+            self.tokens[:m].clone(),
+            self.parents[:m].clone(),
+            ids,
+            self.kind,
+        )
+
+
+def _lookahead_group_cache(scheduler, width: int, max_bs: int):
+    """Pinned group slots and per-row bonus buffers for one width.
+
+    Grows when a larger batch shows up; allocates nothing on a hit.
+    """
+    cache = getattr(scheduler, "_opt_la_group_cache", None)
+    if cache is None:
+        cache = {}
+        scheduler._opt_la_group_cache = cache
+    width = int(width)
+    max_bs = int(max_bs)
+    hit = cache.get(width)
+    if hit is not None and hit["max_bs"] >= max_bs:
+        return hit
+    hit = {
+        "max_bs": max_bs,
+        "slots": (_PinnedLayerMany(max_bs, width), _PinnedLayerMany(max_bs, width)),
+        "bonus": (
+            [_PinnedBonus(width) for _ in range(max_bs)]
+            if bonus_prediction_enabled()
+            else None
+        ),
+    }
+    cache[width] = hit
+    return hit
+
+
+# Request-bound ``ForwardBatch`` fields. A template that carries any of
+# them cannot be replayed for other requests of the same size.
+# ``out_cache_loc_swa`` is derived from the admission placeholder slots, so a
+# hybrid-SWA model would read stale slots in an eager layer.
+_GROUP_REQUEST_FIELDS = (
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "encoder_lens",
+    "input_embeds",
+    "token_type_ids",
+    "ngram_embedding_info",
+    "out_cache_loc_swa",
+)
+
+
+def _group_template_shareable(scheduler, template) -> bool:
+    """False when a group template would carry one request's state to another."""
+    server_args = getattr(scheduler, "server_args", None)
+    if bool(getattr(server_args, "enable_lora", False)):
+        return False
+    return all(
+        getattr(template, name, None) is None for name in _GROUP_REQUEST_FIELDS
+    )
+
+
+def _lookahead_group_template(scheduler, runners, width: int):
+    """The ``ForwardBatch`` template for ``len(runners)`` trees of ``width``.
+
+    Keyed by ``(width, request count)``. ``runners`` only supply shapes for
+    the first build: each layer sets its own pools, M-RoPE positions,
+    ``mm_inputs`` and ``rids`` (``_refresh_group_forward``). Only admission
+    calls this; layers use ``_cached_group_template``. Building calls
+    ``init_new`` and may synchronize.
+
+    A size without a captured graph is cached as a miss. So is a template
+    with request-bound fields (LoRA, encoder, mamba, input embeddings, token
+    types, ngram embeddings, SWA slots). A build that raised, including in
+    ``init_new`` or ``can_run``, is not cached and is retried at the next
+    admission.
+    """
+    cache = getattr(scheduler, "_opt_la_group_templates", None)
+    if cache is None:
+        cache = {}
+        scheduler._opt_la_group_templates = cache
+    key = (int(width), len(runners))
+    if key in cache:
+        return cache[key]
+    template = None
+    failed = False
+    try:
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+
+        n = int(width)
+        m = len(runners)
+        device = scheduler.req_to_token_pool.device
+        cached = [int(runner.cached_len) for runner in runners]
+        prefixes = [int(runner.prefix_len) for runner in runners]
+        batch = scheduler._sr_make_decode_batch([runner.req for runner in runners])
+        _keep_raw_logits(batch)
+        mask = torch.ones(
+            sum(n * (length + n) for length in cached), dtype=torch.bool, device=device
+        )
+        positions = torch.tensor(
+            [prefix for prefix in prefixes for _ in range(n)],
+            dtype=torch.long,
+            device=device,
+        )
+        dummy = torch.zeros(m * n, dtype=torch.long, device=device)
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.global_forward_mode = ForwardMode.TARGET_VERIFY
+        batch.input_ids = dummy
+        batch.output_ids = None
+        batch.seq_lens = torch.tensor(cached, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(cached, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(cached, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(cached)
+        batch.out_cache_loc = dummy
+        batch.extend_lens = [n] * m
+        batch.prefix_lens = list(cached)
+        batch.extend_num_tokens = n * m
+        batch.extend_logprob_start_lens = list(cached)
+        batch.spec_info = ClearLayerSpec(
+            custom_mask=mask,
+            positions=positions,
+            draft_token_num=n,
+            num_tokens_per_req=n,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        template = _lookahead_forward_template(scheduler, batch, raise_errors=True)
+    except Exception as exc:
+        _reraise_device_context(scheduler, exc)
+        logger.warning("[OPT] lookahead group template failed", exc_info=True)
+        template = None
+        failed = True
+    if failed:
+        _opt_draft_count(scheduler, "opt_lookahead_group_template_errors")
+        return None
+    if template is not None:
+        if _group_template_shareable(scheduler, template):
+            # Do not keep the first group's image features or ids alive.
+            template.mm_inputs = None
+            template.rids = None
+        else:
+            _opt_draft_count(scheduler, "opt_lookahead_group_template_unshared")
+            template = None
+    cache[key] = template
+    if template is None:
+        _opt_draft_count(scheduler, "opt_lookahead_group_template_misses")
+    else:
+        _opt_draft_count(scheduler, "opt_lookahead_group_templates")
+    return template
+
+
+def _cached_group_template(scheduler, width: int, count: int):
+    """The group template admission built, or None. Never builds one."""
+    cache = getattr(scheduler, "_opt_la_group_templates", None)
+    if not cache:
+        return None
+    return cache.get((int(width), int(count)))
+
+
+def _admit_lookahead_many(scheduler, runners, width: int) -> None:
+    """KV budget, per-request M-RoPE deltas and every group size, before ingest.
+
+    The KV reservation is every tree's ingest plus layers together, not the
+    bonus. It runs last, so a graph miss or a missing M-RoPE delta does not
+    evict; ``_lookahead_reserve_kv`` evicts from a plain radix cache to
+    cover it.
+
+    Templates for ``1 .. len(runners)`` trees are built here so no layer
+    builds one. Only a miss at the full size falls back; a smaller size
+    without a template runs that layer through ``_verify_batch_many``.
+    """
+    try:
+        need = sum(
+            _lookahead_tree_need(scheduler, _lookahead_ingest_slots(runner))
+            for runner in runners
+        )
+    except Exception as exc:
+        raise LookaheadFallback("kv need unknown") from exc
+    for runner in runners:
+        runner._la_group_delta = _request_mrope_delta(runner.req)
+    template = None
+    for m in range(1, len(runners) + 1):
+        template = _lookahead_group_template(scheduler, runners[:m], width)
+    if template is None:
+        raise LookaheadFallback("cuda graph miss")
+    if getattr(template, "mrope_positions", None) is not None and any(
+        runner._la_group_delta is None for runner in runners
+    ):
+        raise LookaheadFallback("mrope delta missing")
+    _lookahead_reserve_kv(scheduler, need)
+
+
+def _refresh_group_forward(template, source, pools, deltas, reqs):
+    """``_refresh_lookahead_forward`` plus this layer's requests.
+
+    The template is shared by every group of the same size, so the copy
+    gets these requests' pool rows, ``mm_inputs`` and ``rids``, and M-RoPE
+    positions from their host deltas (``deltas`` is ``[m]`` on device).
+    """
+    fb = _refresh_lookahead_forward(template, source, None)
+    fb.req_pool_indices = pools
+    fb.mm_inputs = [getattr(req, "multimodal_inputs", None) for req in reqs]
+    fb.rids = [req.rid for req in reqs]
+    if getattr(template, "mrope_positions", None) is not None:
+        fb.mrope_positions = _lookahead_mrope_positions(
+            fb.positions, deltas.reshape(-1, 1)
+        )
+    return fb
+
+
+def _launch_layer_many(scheduler, runners, tokens_dev, anc_dev, depth: int, width: int, event):
+    """Queue one layer for every tree in ``runners``. Returns ``[m * n, vocab]``.
+
+    ``tokens_dev`` is ``[m, n]`` and ``anc_dev`` is ``[m, n, depth * n]``, both
+    on device. Lengths, pool rows and M-RoPE deltas go through one pinned
+    copy, so nothing here synchronizes once the group template exists.
+    """
+    from sglang.srt.mem_cache.common import alloc_token_slots
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    n = int(width)
+    m = len(runners)
+    depth = int(depth)
+    _require_layer_width(n)
+    if tuple(tokens_dev.shape) != (m, n):
+        raise RuntimeError(f"OPT group tokens {tuple(tokens_dev.shape)} != [{m}, {n}]")
+    if tuple(anc_dev.shape) != (m, n, depth * n):
+        raise RuntimeError(
+            f"OPT group ancestor mask {tuple(anc_dev.shape)} != [{m}, {n}, {depth * n}]"
+        )
+    for runner in runners:
+        if runner.cached_len + n != runner.prefix_len + depth * n:
+            raise RuntimeError(
+                f"OPT cache length {runner.cached_len} is not layer {depth} "
+                f"after prefix {runner.prefix_len}"
+            )
+    timing = _begin_layer_timing(scheduler)
+    device = scheduler.req_to_token_pool.device
+    cached = [int(runner.cached_len) for runner in runners]
+    prefixes = [int(runner.prefix_len) for runner in runners]
+    pools = [int(runner.req.req_pool_idx) for runner in runners]
+    template = _cached_group_template(scheduler, n, m)
+    mrope = template is not None and getattr(template, "mrope_positions", None) is not None
+    deltas = []
+    for runner in runners:
+        if hasattr(runner, "_la_group_delta"):
+            delta = runner._la_group_delta
+        else:
+            delta = _request_mrope_delta(runner.req)
+        if delta is None and mrope:
+            raise RuntimeError(f"OPT lookahead request {runner.req.rid} has no M-RoPE delta")
+        deltas.append(0 if delta is None else int(delta))
+    staged = _small_to_device([cached, prefixes, pools, deltas], device)
+    seq_dev = staged[0]
+    positions = (staged[1] + (depth - 1)).repeat_interleave(n)
+    pool_dev = staged[2]
+    ancestors = [anc_dev[i] for i in range(m)]
+    if _cascade_on(runners[0]):
+        mask = anc_dev.reshape(-1).to(dtype=torch.bool)
+    else:
+        # Committed prefix of ones, then this tree's ancestor columns.
+        mask = torch.cat(
+            [
+                layer_attention_mask(prefix, ancestor, device)
+                for prefix, ancestor in zip(prefixes, ancestors)
+            ]
+        )
+    out_cache_loc = alloc_token_slots(scheduler.tree_cache, m * n)
+    try:
+        if int(out_cache_loc.numel()) != m * n:
+            raise RuntimeError(
+                f"OPT group layer allocated {int(out_cache_loc.numel())} slots for {m * n}"
+            )
+        assign_req_to_token_pool_func(
+            pool_dev,
+            scheduler.req_to_token_pool.req_to_token,
+            seq_dev,
+            seq_dev + n,
+            out_cache_loc,
+            m,
+        )
+    except BaseException as exc:
+        _free_unrecorded_slots(scheduler, out_cache_loc, exc)
+        raise
+    # Cover every row by rollback first; a later copy failure then leaks nothing.
+    for runner in runners:
+        runner.req.kv_allocated_len = runner.cached_len + n
+    for i, runner in enumerate(runners):
+        runner.layer_slots.append(out_cache_loc[i * n : (i + 1) * n].clone())
+    spec = ClearLayerSpec(
+        custom_mask=mask,
+        positions=positions,
+        draft_token_num=n,
+        num_tokens_per_req=n,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+    )
+    bind_cascade(spec, runners, ancestors, n, cached_lens=cached)
+    _close_layer_host(timing)
+    _mark_layer_launch(timing)
+    if template is not None:
+        from types import SimpleNamespace
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            remember_layer_path,
+        )
+
+        source = SimpleNamespace(
+            input_ids=tokens_dev.reshape(-1).to(dtype=torch.int64),
+            seq_lens=seq_dev,
+            seq_lens_cpu=torch.tensor(cached, dtype=torch.int64),
+            orig_seq_lens=seq_dev.to(dtype=torch.int32),
+            seq_lens_sum=sum(cached),
+            out_cache_loc=out_cache_loc,
+            spec_info=spec,
+        )
+        forward_batch = _refresh_group_forward(
+            template, source, pool_dev, staged[3], [runner.req for runner in runners]
+        )
+        out = scheduler.model_worker.model_runner.forward(forward_batch)
+        remember_layer_path(scheduler, out)
+        if not bool(getattr(out, "can_run_graph", True)):
+            _opt_draft_count(scheduler, "opt_lookahead_eager_layers")
+        logits = getattr(getattr(out, "logits_output", None), "next_token_logits", None)
+        if logits is None:
+            raise RuntimeError("OPT lookahead group forward returned no logits")
+    else:
+        _opt_draft_count(scheduler, "opt_lookahead_template_fallbacks")
+        batch = _verify_batch_many(
+            scheduler,
+            runners,
+            [tokens_dev[i] for i in range(m)],
+            positions,
+            mask,
+            out_cache_loc,
+            cached,
+        )
+        bind_cascade(batch.spec_info, runners, ancestors, n, cached_lens=cached)
+        logits = _run_batch(scheduler, batch)
+    event.record()
+    _queue_ledger_layer(scheduler, timing, runners, depth, n)
+    _finish_layer_timing(scheduler, timing)
+    for runner in runners:
+        runner.cached_len += n
+    _opt_draft_count(scheduler, "opt_lookahead_layers")
+    flat = _flatten_logits(logits)
+    if int(flat.shape[0]) != m * n:
+        raise RuntimeError(f"OPT group layer logits rows {int(flat.shape[0])} != {m * n}")
+    return flat
+
+
+def _reset_lookahead_group(scheduler, runners) -> None:
+    """One sync for the batch, then per-request rollback (``_settle_lookahead_rollback``)."""
+    for runner in runners:
+        runner.bonus_ids = []
+    _settle_lookahead_rollback(scheduler, runners)
+
+
+def grow_lookahead_many(scheduler, runners, config: ClearTreeConfig, tails, states_out):
+    """Grow every tree with the next layer already queued.
+
+    Same decisions as ``grow_active_layers``: each written layer is mirrored on
+    the host, the round plan judges all trees together, and stopped trees are
+    cut to one K at the end. Layer ``d`` is launched for every live tree before
+    that judgment, so a tree that stops at ``d`` already has its last layer
+    queued, as in ``grow_lookahead``. ``states_out`` receives the trees in
+    request order. Returns ``(windows, launched)``. Any failure resets every
+    runner and raises ``LookaheadFallback``; the caller then clears
+    ``states_out`` and grows from each runner's ``_lookahead_tail``.
+    """
+    n = int(config.width)
+    count = len(runners)
+    predict_bonus = bonus_prediction_enabled()
+    results: List[Optional[tuple]] = [None] * count
+    pending: List[int] = []
+    launched = 0
+    try:
+        # Setup sits inside the try: a pinned-memory or plan failure here must
+        # also fall back instead of failing the whole batch expand.
+        cache = _lookahead_group_cache(scheduler, n, count)
+        slots = cache["slots"]
+        bonuses = cache["bonus"]
+        states, plan = _round_states(scheduler, config, count)
+        states_out.extend(states)
+        for runner in runners:
+            runner.bonus_ids = []
+            runner.lookahead_inflight = False
+            runner.lookahead_dropped = False
+            runner._lookahead_satisfied = False
+            runner._lookahead_bonus = None
+            runner._lookahead_launch_event = None
+            runner._last_logits = None
+        rows = torch.stack(
+            [_flatten_logits(tail.detach())[-1] for tail in tails], dim=0
+        ).clone()
+        for index, runner in enumerate(runners):
+            runner._lookahead_tail = rows[index]
+        scores, ids = _vocab_topk(rows, n + 1)
+        weight, tokens, anc = seed_on_device_many(scores, ids, n)
+        turn = 0
+        slot = slots[turn]
+        turn ^= 1
+        slot.copy_seed(scores, ids)
+        active = list(range(count))
+        event = torch.cuda.Event()
+        logits = _launch_layer_many(
+            scheduler, [runners[i] for i in active], tokens, anc, 1, n, event
+        )
+        launched += 1
+        guard = 0
+        while True:
+            guard += 1
+            if guard > int(config.max_depth) + 1:
+                raise RuntimeError(
+                    f"OPT group lookahead did not finish within max_depth {config.max_depth}"
+                )
+            cpu_scores, cpu_tokens, cpu_parents, cpu_ids, kind = slot.clone_cpu()
+            touched = []
+            for row, index in enumerate(active):
+                state = states[index]
+                if kind == "seed":
+                    mirror_layer(state, cpu_scores[row], cpu_tokens[row], None, seed=True)
+                else:
+                    mirror_layer(
+                        state, cpu_scores[row], cpu_tokens[row], cpu_parents[row], seed=False
+                    )
+                if predict_bonus and cpu_ids is not None:
+                    runners[index].bonus_ids.append(cpu_ids[row].contiguous())
+                touched.append(state)
+            if plan is not None and hasattr(plan, "begin_layer"):
+                plan.begin_layer(touched)
+            layer_rows = logits.reshape(len(active), n, -1)
+            keep_rows = []
+            keep = []
+            for row, index in enumerate(active):
+                step = step_after_layer(states[index])
+                if not step.is_final:
+                    keep_rows.append(row)
+                    keep.append(index)
+                    continue
+                if step.verify is None:
+                    pending.append(index)
+                else:
+                    results[index] = _verify_window(step)
+                runner = runners[index]
+                if predict_bonus and bonuses is not None:
+                    # Queued before the next launch can overwrite this view.
+                    _scores, final_ids = _vocab_topk(layer_rows[row], n + 1)
+                    del _scores
+                    bonuses[index].copy(final_ids)
+                    runner._lookahead_bonus = bonuses[index]
+                runner._lookahead_launch_event = event
+                runner.lookahead_inflight = True
+            if not keep:
+                break
+            select = _begin_select_timing(scheduler)
+            if len(keep_rows) == len(active):
+                chosen = layer_rows
+                prev_weight = weight
+                prev_anc = anc
+            else:
+                picked = _small_to_device(keep_rows, layer_rows.device)
+                chosen = layer_rows.index_select(0, picked)
+                prev_weight = weight.index_select(0, picked)
+                prev_anc = anc.index_select(0, picked)
+            child_scores, child_ids = _vocab_topk(chosen.reshape(-1, chosen.shape[-1]), n + 1)
+            child_scores = child_scores.reshape(len(keep), n, n + 1)
+            child_ids = child_ids.reshape(len(keep), n, n + 1)
+            weight, tokens, parents, anc = expand_on_device_many(
+                prev_weight, prev_anc, child_scores, child_ids, n
+            )
+            slot = slots[turn]
+            turn ^= 1
+            slot.copy_expand(weight, tokens, parents, child_ids)
+            _finish_select_timing(scheduler, select)
+            active = keep
+            depth = int(states[active[0]].depth) + 1
+            event = torch.cuda.Event()
+            logits = _launch_layer_many(
+                scheduler, [runners[i] for i in active], tokens, anc, depth, n, event
+            )
+            launched += 1
+        # Same order as ``grow_active_layers``: T_K starts at the last stop,
+        # so the K cut is not charged to the last layer's wall.
+        if scheduler is not None:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                mark_stop,
+            )
+
+            mark_stop(scheduler)
+        _cut_deferred(plan, states, pending, results)
+        if any(window is None for window in results):
+            raise RuntimeError("OPT group lookahead finished without every window")
+        return results, launched
+    except LookaheadFallback:
+        scheduler._opt_select_events = []
+        _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
+        _reset_lookahead_group(scheduler, runners)
+        raise
+    except Exception as exc:
+        scheduler._opt_select_events = []
+        _reraise_device_context(scheduler, exc)
+        _opt_draft_count(scheduler, "opt_lookahead_fallbacks")
+        _reset_lookahead_group(scheduler, runners)
+        raise LookaheadFallback(str(exc)) from exc
+
+
 def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
     """Install the speculative last layer, or roll the lookahead tree back to ``keep``."""
     runner = job.runner
@@ -3897,19 +4891,16 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
         runner.lookahead_inflight = False
         return
     if drop:
+        runner.lookahead_dropped = True
+        if not _confirm_lookahead_done(scheduler, runner):
+            # Completion unknown: neither recycle nor clear the tree's slots.
+            _quarantine_lookahead(scheduler, [runner], None)
+            return
+        # ``keep`` is the committed prefix. Rollback frees the whole tree,
+        # and local_rollback then sets ``kv_allocated_len`` to ``keep``.
+        end = int(getattr(job.req, "kv_allocated_len", job.keep) or job.keep)
         try:
-            _await_lookahead_event(
-                scheduler, getattr(runner, "_lookahead_launch_event", None)
-            )
-            bonus = getattr(runner, "_lookahead_bonus", None)
-            if bonus is not None:
-                _await_lookahead_event(scheduler, getattr(bonus, "event", None))
-                bonus.ready = False
-            # ``keep`` is the committed prefix. Rollback frees the whole tree,
-            # and local_rollback then sets ``kv_allocated_len`` to ``keep``.
-            end = int(getattr(job.req, "kv_allocated_len", job.keep) or job.keep)
             scheduler._clear_rollback(job.req, int(job.keep))
-            _clear_req_to_token_span(scheduler, job.req, int(job.keep), end)
         except Exception as exc:
             _reraise_device_context(scheduler, exc)
             logger.warning(
@@ -3917,6 +4908,10 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
                 getattr(job.req, "rid", None),
                 exc_info=True,
             )
+            # Release is unconfirmed: keep the slots and lengths on the request.
+            _quarantine_lookahead(scheduler, [runner], exc)
+            return
+        _clear_req_to_token_span(scheduler, job.req, int(job.keep), end)
         runner.layer_slots.clear()
         runner.cached_len = int(runner.prefix_len)
         job.req.kv_allocated_len = int(job.keep)
@@ -3933,21 +4928,10 @@ def _settle_lookahead_job(scheduler, job: OptDeferredTree) -> None:
         else:
             # With prediction off there is no bonus D2H event to wait on.
             # Settle the queued final layer before publishing its KV slots.
-            try:
-                _await_lookahead_event(
-                    scheduler, getattr(runner, "_lookahead_launch_event", None)
-                )
-            except Exception:
-                if getattr(scheduler, "_sr_device_poisoned", False):
-                    raise
-                try:
-                    torch.get_device_module(scheduler.device).synchronize()
-                except Exception:
-                    # Completion is unknown. Neither publish nor recycle these
-                    # slots; let the existing poisoned-device cleanup own them.
-                    scheduler._sr_device_poisoned = True
-                    scheduler._sr_clear_stamps_after_poison()
-                    raise
+            # Unknown completion poisons the device; poisoned cleanup then
+            # owns the slots and publish keeps them.
+            if not _confirm_lookahead_done(scheduler, runner):
+                raise RuntimeError("lookahead final layer completion unknown")
     except Exception as exc:
         _reraise_device_context(scheduler, exc)
         # A failed bonus-copy event is not proof that the queued final
@@ -4057,6 +5041,7 @@ def finish_opt_expand_req(
     A returned job is not paused and its slots stay on the request until
     ``commit_deferred_expands`` queues it.
     """
+    wait_error = None
     if (
         runner is not None
         and getattr(runner, "lookahead_inflight", False)
@@ -4065,18 +5050,16 @@ def finish_opt_expand_req(
         )
     ):
         # This publish frees slots before the reply. The extra layer is still
-        # queued, so wait for it first. The bonus copy is queued after that
-        # event; drop it here so a later clone_cpu cannot read the old ids.
-        # The deferred path waits after the reply.
-        _await_lookahead_event(
-            scheduler, getattr(runner, "_lookahead_launch_event", None)
-        )
-        bonus = getattr(runner, "_lookahead_bonus", None)
-        if bonus is not None:
-            _await_lookahead_event(scheduler, getattr(bonus, "event", None))
-            bonus.ready = False
-        runner.lookahead_inflight = False
-        runner.lookahead_dropped = True
+        # queued, so wait for it first. The deferred path waits after the reply.
+        # A failed wait still publishes or rolls back below: unknown completion
+        # poisons the device, and publish then keeps the slots.
+        try:
+            if not _retire_lookahead_before_publish(scheduler, runner):
+                wait_error = LookaheadUnsettled(
+                    "lookahead final layer completion unknown before publish"
+                )
+        except Exception as exc:
+            wait_error = exc
     if (
         runner is not None
         and _deferrable_state(state)
@@ -4098,11 +5081,35 @@ def finish_opt_expand_req(
         scheduler._sr_pause_req(req)
     if publish_error is not None:
         raise publish_error
+    if wait_error is not None:
+        raise wait_error
     return None
 
 
+def _retire_lookahead_before_publish(scheduler, runner) -> bool:
+    """Wait out a queued lookahead last layer before its slots are published.
+
+    Shared by an immediate publish and by cancelling deferred jobs. Returns
+    whether completion is known (``_confirm_lookahead_done``); when it is
+    not, the device is poisoned and publish keeps the slots. The runner no
+    longer counts as in flight either way.
+    """
+    if runner is None or not getattr(runner, "lookahead_inflight", False):
+        return True
+    try:
+        return _confirm_lookahead_done(scheduler, runner)
+    finally:
+        runner.lookahead_inflight = False
+        runner.lookahead_dropped = True
+
+
 def commit_deferred_expands(scheduler, jobs, *, keep: bool) -> Optional[BaseException]:
-    """Queue jobs after a clean expand, or publish them when expand is failing."""
+    """Queue jobs after a clean expand, or publish them when expand is failing.
+
+    A failing expand can still hold a lookahead last layer in flight (the
+    tree finished, then something later raised). That layer is waited out
+    before its slots are published or rolled back.
+    """
     if keep:
         bucket = getattr(scheduler, "_opt_deferred", None)
         if isinstance(bucket, list):
@@ -4111,6 +5118,7 @@ def commit_deferred_expands(scheduler, jobs, *, keep: bool) -> Optional[BaseExce
     error = None
     for job in jobs:
         try:
+            _retire_lookahead_before_publish(scheduler, job.runner)
             _publish_or_rollback(
                 scheduler, job.req, job.runner, job.keep, job.window, True
             )
@@ -4217,9 +5225,33 @@ def grow_batch(scheduler, reqs):
         runners = [
             OptLayerForward(scheduler, req, keep) for req, keep in zip(reqs, committed)
         ]
+        scheduler._opt_lookahead_active = False
+        scheduler._opt_defer_layer_drain = False
+        if len(runners) > 1 and lookahead_supported(scheduler):
+            t_admit = time.perf_counter()
+            try:
+                # Before ingest: the budget counts the slots ingest will take.
+                _admit_lookahead_many(scheduler, runners, int(plan.width))
+                scheduler._opt_lookahead_active = True
+            except LookaheadFallback as exc:
+                logger.info("[OPT] group lookahead admit fell back: %s", exc)
+                metrics.counts["opt_lookahead_fallbacks"] += 1
+            except Exception as exc:
+                # Admission has not allocated KV, so the layer-by-layer path
+                # can still grow this step.
+                _reraise_device_context(scheduler, exc)
+                logger.info("[OPT] group lookahead admit fell back: %s", exc)
+                metrics.counts["opt_lookahead_fallbacks"] += 1
+            finally:
+                if metrics.active:
+                    metrics.counts["opt_lookahead_admit_us"] += int(
+                        (time.perf_counter() - t_admit) * 1e6
+                    )
 
         def _sync():
-            if metrics.active:
+            # Lookahead times layers with events; a sync here would also wait
+            # out the ingest forward the seed overlaps with.
+            if metrics.active and not scheduler._opt_lookahead_active:
                 torch.get_device_module(scheduler.device).synchronize()
 
         phases = OptPhaseClock()
@@ -4246,16 +5278,74 @@ def grow_batch(scheduler, reqs):
 
         t1 = time.perf_counter()
         topk_out = [[] for _ in runners] if bonus_prediction_enabled() else None
-        windows = grow_active_layers(
-            config,
-            tail_logits,
-            forward_active,
-            scheduler,
-            states_out=states,
-            topk_out=topk_out,
-        )
-        for index, runner in enumerate(runners):
-            runner.bonus_ids = topk_out[index] if topk_out is not None else []
+        windows = None
+        seed_tails = tail_logits
+        if scheduler._opt_lookahead_active:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                restore_round_learning,
+                snapshot_round_learning,
+            )
+
+            round_plan = getattr(scheduler, "_clear_round_plan", None)
+            learning = snapshot_round_learning(round_plan)
+            try:
+                windows, launched = grow_lookahead_many(
+                    scheduler, runners, config, tail_logits, states
+                )
+                layers += launched
+                metrics.counts["opt_layer_forwards_critical"] += critical_layer_forwards(
+                    launched
+                )
+                # The last layers are still queued; read their events after the reply.
+                scheduler._opt_defer_layer_drain = True
+            except LookaheadFallback as exc:
+                logger.info(
+                    "[OPT] group lookahead fell back for %d requests: %s",
+                    len(runners),
+                    exc,
+                )
+                # The failed attempt already queued layer samples and policy
+                # notes; keep this round out of the fits, undo its gain
+                # observations, and skip its width replay.
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                    mark_round_fallback,
+                )
+
+                mark_round_fallback(scheduler)
+                restore_round_learning(round_plan, learning)
+                scheduler._clear_round_retried = True
+                windows = None
+                states.clear()
+                scheduler._opt_lookahead_active = False
+                # Graph replays may have overwritten the ingest views.
+                seed_tails = [
+                    saved if saved is not None else tail
+                    for saved, tail in zip(
+                        [getattr(runner, "_lookahead_tail", None) for runner in runners],
+                        tail_logits,
+                    )
+                ]
+            except LookaheadUnsettled:
+                # Slots are quarantined; the round fails without a rebuild.
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                    mark_round_fallback,
+                )
+
+                mark_round_fallback(scheduler)
+                restore_round_learning(round_plan, learning)
+                scheduler._clear_round_retried = True
+                raise
+        if windows is None:
+            windows = grow_active_layers(
+                config,
+                seed_tails,
+                forward_active,
+                scheduler,
+                states_out=states,
+                topk_out=topk_out,
+            )
+            for index, runner in enumerate(runners):
+                runner.bonus_ids = topk_out[index] if topk_out is not None else []
         metrics.add_host("opt_grow", time.perf_counter() - t1)
         metrics.counts["opt_layer_forwards"] += layers
         metrics.counts["opt_rounds"] += 1
@@ -4274,7 +5364,9 @@ def grow_batch(scheduler, reqs):
         mark_stop(scheduler)
         return windows
     finally:
-        drain_opt_layer_gpu_us(scheduler, metrics)
+        scheduler._opt_lookahead_active = False
+        if not getattr(scheduler, "_opt_defer_layer_drain", False):
+            drain_opt_layer_gpu_us(scheduler, metrics)
         finish_start = time.perf_counter()
         try:
             pending = sys.exc_info()[1]

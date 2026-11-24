@@ -2650,6 +2650,29 @@ class TestPacketWidthPair(CustomTestCase):
             observe.assert_not_called()
 
 
+    def test_retried_round_is_not_observed(self):
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_wpair.observe_pair",
+            return_value=None,
+        ) as observe:
+            self.scheduler._clear_round_retried = True
+            replay.queue_hold_replay(
+                self.scheduler, [self.req], [self.state], self.plan
+            )
+            replay.run_post_reply(self.scheduler)
+            observe.assert_not_called()
+            # The plan itself was not degraded.
+            self.assertFalse(getattr(self.scheduler, "_clear_plan_fallback", False))
+
+            self.scheduler._clear_replay_post_done = None
+            self.scheduler._clear_round_retried = False
+            replay.queue_hold_replay(
+                self.scheduler, [self.req], [self.state], self.plan
+            )
+            replay.run_post_reply(self.scheduler)
+            observe.assert_called_once()
+
+
 def _rows_state(rows, rid, prefix):
     weight = torch.tensor(rows, dtype=torch.float32)
     return SimpleNamespace(
@@ -3713,6 +3736,69 @@ class TestLayerDepthAndExpect(CustomTestCase):
             rows = replay._freeze_layer_rows(SimpleNamespace(), [state])
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(set(seen)), [1, 2])
+
+
+class TestLookaheadLayerFilter(CustomTestCase):
+    """A lookahead process fits only lookahead layers that finished before stop."""
+
+    setUp = TestLayerDepthAndExpect.setUp
+    tearDown = TestLayerDepthAndExpect.tearDown
+
+    def _finish(self, *, prefit=None, **flags):
+        ledger = TestLayerDepthAndExpect._fitted_ledger()
+        model = ledger.layer_models[(8, "graph", 1)]
+        before = model.n
+        sample = TestLayerDepthAndExpect._sample(3, last=flags.pop("last", False))
+        sample.update(flags)
+        rnd = SimpleNamespace(prefit=prefit, rpc_seq=1, session_id="s")
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_fit.note_online_layer"
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_fit.prefit_record_layer"
+        ) as record:
+            ledger._finish_layer(rnd, sample, False)
+        logged = [item for kind, item in ledger.pending_logs if kind == "d_layer"][-1]
+        return model.n - before, logged, record, ledger
+
+    def test_ordinary_layer_in_a_lookahead_process_is_logged_only(self):
+        grew, logged, _record, ledger = self._finish(lookahead_mode=True, lookahead=False)
+        self.assertEqual(grew, 0)
+        self.assertFalse(logged["fit"])
+        self.assertTrue(logged["lookahead_mode"])
+        self.assertFalse(logged["lookahead"])
+        self.assertIsNotNone(logged["pred_ms"])
+        self.assertNotIn((8, 1, 3), ledger.layer_depth)
+
+    def test_last_lookahead_layer_is_not_a_full_layer(self):
+        grew, logged, _record, _ledger = self._finish(
+            lookahead_mode=True, lookahead=True, last=True
+        )
+        self.assertEqual(grew, 0)
+        self.assertFalse(logged["fit"])
+
+    def test_middle_lookahead_layer_and_ordinary_process_still_fit(self):
+        for flags in (
+            dict(lookahead_mode=True, lookahead=True),
+            dict(lookahead_mode=False, lookahead=False),
+            dict(),
+        ):
+            with self.subTest(**flags):
+                grew, logged, _record, _ledger = self._finish(**flags)
+                self.assertEqual(grew, 1)
+                self.assertTrue(logged["fit"])
+
+    def test_prefit_follows_the_same_rule(self):
+        prefit = {"phase": "keep"}
+        _grew, logged, record, _ledger = self._finish(
+            prefit=prefit, lookahead_mode=True, lookahead=False
+        )
+        record.assert_not_called()
+        self.assertFalse(logged["fit"])
+        _grew, logged, record, _ledger = self._finish(
+            prefit=prefit, lookahead_mode=True, lookahead=True
+        )
+        record.assert_called_once()
+        self.assertTrue(logged["fit"])
 
 
 class TestLayerSlopePrior(CustomTestCase):

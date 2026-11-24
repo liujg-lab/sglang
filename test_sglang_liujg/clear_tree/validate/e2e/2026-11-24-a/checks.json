@@ -1,0 +1,29 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "flush_both_tp_http_200": true,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "prefit_rank0_once": true,
+  "fit_schema": 3,
+  "fit_lookahead_true": true,
+  "fit_written_once": true,
+  "fit_unchanged_after_write": true,
+  "h_curve_on": true,
+  "formal_hold_invalid": 0,
+  "same_processes": true,
+  "draft_window_tail": "flushed",
+  "conc1_active1_lookahead": true,
+  "conc4_active_gt1_lookahead": true,
+  "conc4_group_templates_gt_0": false,
+  "conc4_failure_counts_zero": false,
+  "conc4_group_fallback_logs_zero": false,
+  "batch_path_stayed": false,
+  "not_observed": [
+    "stashed_fit_file",
+    "installed_hold_cells_from_old_file",
+    "second_wrote_fit_file",
+    "curve_off",
+    "eager_on_captured_shape"
+  ]
+}

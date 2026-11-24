@@ -454,7 +454,10 @@ def run_post_reply(scheduler) -> None:
         queued = getattr(scheduler, "_clear_replay_to_hold", None) or []
         scheduler._clear_replay_to_hold = None
         try:
-            if not getattr(scheduler, "_clear_plan_fallback", False):
+            # A lookahead retry keeps its W/K plan but is not a clean sample.
+            if not getattr(scheduler, "_clear_plan_fallback", False) and not getattr(
+                scheduler, "_clear_round_retried", False
+            ):
                 matched = [
                     item
                     for item in queued

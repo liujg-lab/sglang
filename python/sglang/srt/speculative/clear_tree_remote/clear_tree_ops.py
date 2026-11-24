@@ -294,6 +294,94 @@ def expand_on_device(
     return top_scores.to(dtype=torch.float32), tokens, parent_cols.to(dtype=torch.long), anc_new
 
 
+def seed_on_device_many(
+    scores: torch.Tensor, ids: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``seed_on_device`` for ``b`` trees at once.
+
+    ``scores`` and ids are ``[b, K]`` root top-k rows with ``K >= n``. Returns
+    ``[b, n]`` weights, ``[b, n]`` tokens and ``[b, n, n]`` identity masks.
+    Row ``i`` equals ``seed_on_device(scores[i], ids[i], n)``.
+    """
+    n = int(n)
+    if scores.dim() != 2 or ids.dim() != 2:
+        raise ValueError(
+            f"seed_on_device_many expects [b, K] scores and ids, "
+            f"got {tuple(scores.shape)} and {tuple(ids.shape)}"
+        )
+    if int(scores.shape[1]) < n or int(ids.shape[1]) < n:
+        raise ValueError(f"seed top-k {int(ids.shape[1])} is shorter than width {n}")
+    rows = int(scores.shape[0])
+    top_scores = scores[:, :n].to(dtype=torch.float32)
+    tokens = ids[:, :n].to(dtype=torch.long)
+    anc = (
+        torch.eye(n, dtype=torch.int8, device=tokens.device)
+        .unsqueeze(0)
+        .repeat(rows, 1, 1)
+    )
+    return top_scores, tokens, anc
+
+
+def expand_on_device_many(
+    weight_prev: torch.Tensor,
+    anc: torch.Tensor,
+    scores: torch.Tensor,
+    ids: torch.Tensor,
+    n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``expand_on_device`` for ``b`` trees that share a depth.
+
+    ``weight_prev`` is ``[b, n]``, ``anc`` is ``[b, n, cols]``, and ``scores``
+    and ``ids`` are ``[b, n, K]`` with ``K >= n``. Each row runs its own top-k
+    over its ``n * n`` path scores. Returns ``[b, n]`` weights, tokens and
+    parent columns, and ``[b, n, cols + n]`` ancestor masks.
+    """
+    n = int(n)
+    if scores.dim() != 3 or ids.dim() != 3:
+        raise ValueError(
+            f"expand_on_device_many expects [b, N, K] scores and ids, "
+            f"got {tuple(scores.shape)} and {tuple(ids.shape)}"
+        )
+    rows = int(scores.shape[0])
+    if int(scores.shape[1]) != n or int(ids.shape[1]) != n:
+        raise ValueError(
+            f"expand_on_device_many row width {int(scores.shape[1])} != width {n}"
+        )
+    if int(scores.shape[2]) < n or int(ids.shape[2]) < n:
+        raise ValueError(
+            f"expand_on_device_many needs at least {n} children, "
+            f"got {int(scores.shape[2])}"
+        )
+    if weight_prev.dim() != 2 or tuple(weight_prev.shape[:1]) != (rows,):
+        raise ValueError(
+            f"expand_on_device_many weight {tuple(weight_prev.shape)} != [{rows}, {n}]"
+        )
+    if anc.dim() != 3 or int(anc.shape[0]) != rows or int(anc.shape[1]) != n:
+        raise ValueError(
+            f"expand_on_device_many ancestor mask {tuple(anc.shape)} != "
+            f"[{rows}, {n}, cols]"
+        )
+    cols = int(anc.shape[2])
+    child_scores = scores[:, :, :n]
+    child_ids = ids[:, :, :n]
+    path_scores = child_scores * weight_prev[:, :n].unsqueeze(2)
+    flat_scores = path_scores.reshape(rows, n * n)
+    flat_ids = child_ids.reshape(rows, n * n)
+    top_scores, top_index = torch.topk(flat_scores, k=n, dim=-1)
+    parent_cols = torch.div(top_index, n, rounding_mode="floor").to(dtype=torch.long)
+    tokens = torch.gather(flat_ids, 1, top_index).to(dtype=torch.long)
+    parent_rows = torch.gather(
+        anc, 1, parent_cols.unsqueeze(-1).expand(rows, n, cols)
+    )
+    eye = (
+        torch.eye(n, dtype=anc.dtype, device=anc.device)
+        .unsqueeze(0)
+        .expand(rows, n, n)
+    )
+    anc_new = torch.cat([parent_rows, eye], dim=2)
+    return top_scores.to(dtype=torch.float32), tokens, parent_cols, anc_new
+
+
 def mirror_layer(
     state: ClearTreeState,
     top_scores: torch.Tensor,

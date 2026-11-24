@@ -1427,6 +1427,14 @@ class ClearLedger:
             measured = (int(host) + int(gpu)) / 1000.0
         if measured is not None:
             features = [1.0, float(sample["sum_ell"])]
+        # A lookahead process fits only lookahead layers: an ordinary layer
+        # after a failed admission is a different cost. The last lookahead
+        # layer is still queued at ``t_stop``, so its wall is not a layer.
+        lookahead = bool(sample.get("lookahead"))
+        lookahead_mode = bool(sample.get("lookahead_mode"))
+        fit_ok = not (lookahead_mode and not lookahead) and not (
+            lookahead and sample.get("last")
+        )
         model = None
         if features is not None and not post_reply:
             key = (
@@ -1449,6 +1457,7 @@ class ClearLedger:
             )
             if (
                 not excluded
+                and fit_ok
                 and prefit is None
                 and not sample.get("last")
                 and str(sample["path"]) == "graph"
@@ -1458,7 +1467,7 @@ class ClearLedger:
                 and pred not in (None, 0.0)
             ):
                 self._learn_depth(sample, float(measured), float(pred))
-            if not excluded:
+            if not excluded and fit_ok:
                 if keep:
                     from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
                         prefit_record_layer,
@@ -1508,6 +1517,8 @@ class ClearLedger:
             "last": bool(sample.get("last")),
             "depth_ratio": depth_ratio,
             "depth_src": depth_src,
+            "lookahead": lookahead,
+            "lookahead_mode": lookahead_mode,
         }
         self.queue_log("d_layer", sample_log)
 
@@ -1792,6 +1803,7 @@ def note_packet(scheduler, batch) -> None:
         int(getattr(batch, "rpc_seq", 0) or 0),
     )
     scheduler._clear_plan_fallback = False
+    scheduler._clear_round_retried = False
     reqs = list(getattr(batch, "reqs", None) or [])
     rids = [str(getattr(req, "rid", "")) for req in reqs]
     # Snapshot packets also carry output-only ``committed_ids``. The prefix
@@ -1944,6 +1956,14 @@ def queue_layer_sample(
         prefix = [int(getattr(runner, "prefix_len", 0) or 0) for runner in runners]
         path = str(getattr(scheduler, "_clear_layer_path", "unknown") or "unknown")
         scheduler._clear_layer_path = "unknown"
+        try:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+                lookahead_mode,
+            )
+
+            mode = bool(lookahead_mode(scheduler))
+        except Exception:
+            mode = False
         sample = {
             "layer": int(layer),
             "active": len(prefix),
@@ -1954,6 +1974,8 @@ def queue_layer_sample(
             "gpu_us": None,
             "path": path,
             "post_reply": bool(getattr(scheduler, "_clear_layer_post_reply", False)),
+            "lookahead": bool(getattr(scheduler, "_opt_lookahead_active", False)),
+            "lookahead_mode": mode,
             "t0": None if t0 is None else float(t0),
         }
         return ledger.queue_layer(sample)

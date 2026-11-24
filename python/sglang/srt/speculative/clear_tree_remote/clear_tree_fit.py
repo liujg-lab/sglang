@@ -162,23 +162,38 @@ def draft_header(scheduler) -> dict:
         cascade = False
     capture = getattr(scheduler, "_clear_layer_capture_bs", ()) or ()
     attention = getattr(args, "attention_backend", None)
+    draft = {
+        "device": device,
+        "tp": int(getattr(scheduler, "tp_size", 1) or 1),
+        "model": str(getattr(args, "model_path", "") or ""),
+        "page_size": int(getattr(args, "page_size", 1) or 1),
+        "capture_bs": [int(item) for item in capture],
+        "cascade": cascade,
+        "bonus": bool(bonus_prediction_enabled()),
+        "attention_backend": None if attention is None else str(attention),
+        "disable_cuda_graph": bool(getattr(args, "disable_cuda_graph", False)),
+    }
+    # Lookahead layers overlap host work, so their wall clock is shorter. A
+    # file measured without it must not be reused with it. The key is present
+    # only when lookahead can actually run here (switch on, CUDA, page 1,
+    # Triton), so files written without it still match.
+    try:
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
+            lookahead_supported,
+        )
+
+        lookahead = bool(lookahead_supported(scheduler))
+    except Exception:
+        lookahead = False
+    if lookahead:
+        draft["lookahead"] = True
     return {
         "schema": _FIT_SCHEMA,
         "ks": [int(k) for k in VERIFY_KS],
         "widths": [int(width) for width in widths],
         "buckets": [int(bucket) for bucket in runtime_kv_buckets()],
         "max_depth": int(getattr(args, "clear_tree_max_depth", 0) or 0),
-        "draft": {
-            "device": device,
-            "tp": int(getattr(scheduler, "tp_size", 1) or 1),
-            "model": str(getattr(args, "model_path", "") or ""),
-            "page_size": int(getattr(args, "page_size", 1) or 1),
-            "capture_bs": [int(item) for item in capture],
-            "cascade": cascade,
-            "bonus": bool(bonus_prediction_enabled()),
-            "attention_backend": None if attention is None else str(attention),
-            "disable_cuda_graph": bool(getattr(args, "disable_cuda_graph", False)),
-        },
+        "draft": draft,
     }
 
 

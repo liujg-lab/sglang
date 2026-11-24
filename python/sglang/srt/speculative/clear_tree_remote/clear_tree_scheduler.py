@@ -26,6 +26,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_config import (
 )
 from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     LookaheadFallback,
+    LookaheadUnsettled,
     OptLayerForward,
     _admit_lookahead,
     _reraise_device_context,
@@ -741,6 +742,11 @@ class ClearTreeSchedulerMixin:
         allocated = int(getattr(req, "kv_allocated_len", 0) or 0)
         if allocated <= int(keep_len):
             return
+        if getattr(self, "_sr_device_poisoned", False):
+            # Poisoned slots stay owned until teardown; never return them here.
+            raise RuntimeError(
+                f"OPT draft {req.rid}: device poisoned, KV rollback refused"
+            )
         if not kv.rollback(req, int(keep_len), allocated):
             raise RuntimeError(
                 f"OPT draft {req.rid} could not roll KV back to {keep_len} "
@@ -856,6 +862,12 @@ class ClearTreeSchedulerMixin:
         )
 
         metrics = get_sr_round_metrics(self, "Draft")
+        if getattr(self, "_sr_device_poisoned", False):
+            # Slots of a quarantined tree may still be mapped on this request;
+            # neither roll them back nor grow on a poisoned device.
+            clear_prefill_tail_logits(req)
+            metrics.counts["opt_expand_skipped_poisoned"] += 1
+            return [], None, None
         resume_start = time.perf_counter()
         self._sr_resume_req(req)
         self._sr_isolate_need({req.rid})
@@ -950,6 +962,13 @@ class ClearTreeSchedulerMixin:
             seed_logits = tail_logits
             lookahead_launched = None
             if lookahead_runtime is not None:
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+                    restore_round_learning,
+                    snapshot_round_learning,
+                )
+
+                round_plan = getattr(self, "_clear_round_plan", None)
+                learning = snapshot_round_learning(round_plan)
                 try:
                     windows, state, launched = grow_lookahead(
                         self, runner, config, tail_logits, lookahead_runtime
@@ -960,11 +979,31 @@ class ClearTreeSchedulerMixin:
                     self._opt_defer_layer_drain = True
                 except LookaheadFallback:
                     logger.info("[OPT] lookahead fell back for %s", req.rid)
+                    # The failed attempt already queued layer samples and
+                    # policy notes; keep this round out of the fits.
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                        mark_round_fallback,
+                    )
+
+                    mark_round_fallback(self)
+                    # Undo the attempt's gain observations; skip its width replay.
+                    restore_round_learning(round_plan, learning)
+                    self._clear_round_retried = True
                     windows = None
                     tree_states.clear()
                     saved = getattr(runner, "_lookahead_tail", None)
                     if saved is not None:
                         seed_logits = saved
+                except LookaheadUnsettled:
+                    # Slots are quarantined; the round fails without a rebuild.
+                    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                        mark_round_fallback,
+                    )
+
+                    mark_round_fallback(self)
+                    restore_round_learning(round_plan, learning)
+                    self._clear_round_retried = True
+                    raise
             if windows is None:
                 self._opt_lookahead_active = False
                 self._opt_defer_layer_drain = False
@@ -1009,6 +1048,9 @@ class ClearTreeSchedulerMixin:
         finally:
             import sys
 
+            # Layers forwarded after this (another request's expand, or the
+            # post-reply final layers) are not lookahead layers.
+            self._opt_lookahead_active = False
             if not getattr(self, "_opt_defer_layer_drain", False):
                 drain_opt_layer_gpu_us(self, metrics)
             finish_start = time.perf_counter()
