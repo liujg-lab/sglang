@@ -52,6 +52,7 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRDraftRequest,
     SRPendingEntry,
     SRReplyStatus,
+    SR_PROTOCOL_VERSION,
 )
 from sglang.srt.speculative.standalone_remote.drafter.sr_draft_state import (
     SRDraftState,
@@ -94,6 +95,19 @@ class TestSpecAlgorithmIsolation(CustomTestCase):
         self.assertTrue(SpeculativeAlgorithm.EAGLE.supports_spec_v2())
         self.assertTrue(SpeculativeAlgorithm.STANDALONE.supports_spec_v2())
         self.assertFalse(SpeculativeAlgorithm.SPECTRE.supports_spec_v2())
+
+    def test_sr_and_opt_only_keep_source_images_on_the_target(self):
+        for algorithm, role_name in (
+            (SpeculativeAlgorithm.STANDALONE_REMOTE, "standalone_remote_role"),
+            (SpeculativeAlgorithm.OPT_TREE_REMOTE, "opt_tree_role"),
+        ):
+            with self.subTest(algorithm=algorithm):
+                self.assertTrue(
+                    algorithm.keeps_source_image_bytes(SimpleNamespace(**{role_name: "target"}))
+                )
+                self.assertFalse(
+                    algorithm.keeps_source_image_bytes(SimpleNamespace(**{role_name: "draft"}))
+                )
 
     def test_from_string(self):
         self.assertEqual(
@@ -979,130 +993,127 @@ class TestMMPayloadMultipart(CustomTestCase):
         out = _to_cpu_contiguous_tensor(fake)
         self.assertTrue(torch.equal(out, real))
 
-    def test_pack_request_with_mm_frames(self):
+    def _image_request(self, rid="r1"):
+        import io
+
         if torch is None:
             self.skipTest("torch not available")
         try:
+            from PIL import Image
+
             from sglang.srt.managers.schedule_batch import (
                 Modality,
                 MultimodalDataItem,
-                MultimodalInputFormat,
-            )
-            from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
-                SRMMPayload,
-                serialize_mm_item,
+                MultimodalInputs,
             )
         except ImportError as e:
             self.skipTest(str(e))
 
+        images = []
+        for color in ((255, 0, 0), (0, 0, 255)):
+            buf = io.BytesIO()
+            Image.new("RGB", (2, 1), color=color).save(buf, format="PNG")
+            images.append(buf.getvalue())
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
             hash=1,
             pad_value=7,
-            offsets=[0, 1],
-            format=MultimodalInputFormat.NORMAL,
-            feature=torch.ones(2, 2),
+            offsets=[(0, 0), (2, 2)],
+            feature=torch.ones(64, 2),
+            model_specific_data={"image_grid_thw": torch.tensor([[1, 2, 2]] * 2)},
         )
-        payload = SRMMPayload(
-            rid="r1",
-            mm_items=[serialize_mm_item(item)],
+        return SimpleNamespace(
+            rid=rid,
+            origin_input_ids=[7, 11, 7],
+            multimodal_inputs=MultimodalInputs(mm_items=[item], im_token_id=11),
+            source_image_bytes=images,
         )
-        batch = SRBatchRequest(
-            session_id="s",
-            rpc_seq=1,
-            action=SRAction.PREFILL,
-            reqs=[
-                SRDraftRequest(
-                    rid="r1",
-                    padded_input_ids=[7, 7],
-                    has_mm=True,
-                    num_draft_tokens=2,
+
+    def test_pack_request_with_image_frames(self):
+        req = self._image_request()
+        from sglang.srt.speculative.standalone_remote.sr_image_payload import SRImagePayload
+
+        req.multimodal_inputs.release_features()
+        payload = SRImagePayload.from_req(req)
+        meta, buffers = payload.to_multipart()
+        self.assertEqual(meta["_sr_image_offset"], 1)
+        self.assertIsNone(meta["mm_items"][0]["feature"])
+        self.assertIsNone(meta["mm_items"][0]["precomputed_embeddings"])
+        self.assertEqual([bytes(f) for f in buffers[-2:]], req.source_image_bytes)
+        for action in (SRAction.PREFILL, SRAction.STEP):
+            with self.subTest(action=action):
+                batch = SRBatchRequest(
+                    session_id="s",
+                    rpc_seq=1,
+                    action=action,
+                    reqs=[
+                        SRDraftRequest(rid="text", commit_mode="snapshot"),
+                        SRDraftRequest(
+                            rid=req.rid,
+                            padded_input_ids=req.origin_input_ids,
+                            has_mm=True,
+                            requires_mm=True,
+                            commit_mode="snapshot",
+                        ),
+                    ],
                 )
-            ],
-        )
-        frames = _pack_request(batch, {"r1": payload})
-        restored, mm = _unpack_request(frames)
-        self.assertEqual(restored.reqs[0].rid, "r1")
-        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
-        self.assertIn("r1", mm)
-        self.assertFalse(hasattr(mm["r1"], "padded_input_ids"))
-        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
-        self.assertTrue(torch.equal(got, torch.ones(2, 2)))
-
-    def test_unpack_keeps_buffer_frames_as_views(self):
-        if torch is None:
-            self.skipTest("torch not available")
-        try:
-            from sglang.srt.managers.schedule_batch import (
-                Modality,
-                MultimodalDataItem,
-                MultimodalInputFormat,
-            )
-            from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
-                SRMMPayload,
-                serialize_mm_item,
-            )
-        except ImportError as e:
-            self.skipTest(str(e))
-
-        feature = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-        item = MultimodalDataItem(
-            modality=Modality.IMAGE,
-            hash=3,
-            pad_value=7,
-            offsets=[0, 1],
-            format=MultimodalInputFormat.NORMAL,
-            feature=feature,
-        )
-        payload = SRMMPayload(
-            rid="r1",
-            mm_items=[serialize_mm_item(item)],
-            im_token_id=11,
-        )
-        batch = SRBatchRequest(
-            session_id="s",
-            rpc_seq=1,
-            action=SRAction.PREFILL,
-            reqs=[
-                SRDraftRequest(
-                    rid="r1",
-                    padded_input_ids=[7, 7],
-                    has_mm=True,
-                    num_draft_tokens=2,
+                frames = _pack_request(batch, {req.rid: payload})
+                restored, mm = _unpack_request([memoryview(f) for f in frames])
+                self.assertEqual(restored.reqs[1].padded_input_ids, [7, 11, 7])
+                self.assertEqual(list(mm), [req.rid])
+                restored_payload = SRImagePayload.from_pickleable(
+                    mm[req.rid].to_pickleable()
                 )
-            ],
-        )
-        frames = _pack_request(batch, {"r1": payload})
-        views = [
-            frame if isinstance(frame, memoryview) else memoryview(frame)
-            for frame in frames
-        ]
+                self.assertEqual(restored_payload.images, req.source_image_bytes)
+                item = restored_payload.meta.to_multimodal_inputs().mm_items[0]
+                self.assertEqual(item.offsets, [(0, 0), (2, 2)])
+                self.assertIsNone(item.feature)
+                self.assertEqual(_unpack_request(frames[:-1])[1], {})
 
-        def _refuse_copy(*_args, **_kwargs):
-            raise AssertionError("unpack copied a frame")
+                batch.protocol_version = 2
+                old_frames = [_CTRL_FRAME, pickle.dumps(batch.to_dict()), *frames[2:]]
+                old_batch, old_mm = _unpack_request(old_frames)
+                self.assertEqual(old_batch.protocol_version, 2)
+                self.assertEqual(old_mm, {})
+                batch.protocol_version = SR_PROTOCOL_VERSION
+                batch.reqs[1].commit_mode = "delta"
+                batch.reqs[1].has_mm = False
+                self.assertEqual(len(_pack_request(batch)), 2)
 
-        with patch(
-            "sglang.srt.speculative.standalone_remote.sr_transport._as_bytes",
-            side_effect=_refuse_copy,
-        ):
-            restored, mm = _unpack_request(views)
-        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
-        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
-        self.assertTrue(torch.equal(got, feature))
+    def test_reconstruct_checks_grid_and_observes_image_order(self):
+        req = self._image_request()
+        from sglang.srt.speculative.standalone_remote.sr_image_payload import SRImagePayload
 
-        try:
-            import zmq
-        except ImportError:
-            return
-        wrapped = [zmq.Frame(bytes(view)) for view in views]
-        with patch(
-            "sglang.srt.speculative.standalone_remote.sr_transport._as_bytes",
-            side_effect=_refuse_copy,
-        ):
-            restored, mm = _unpack_request(wrapped)
-        self.assertEqual(restored.reqs[0].padded_input_ids, [7, 7])
-        got = mm["r1"].to_multimodal_inputs().mm_items[0].feature
-        self.assertTrue(torch.equal(got, feature))
+        class Processor:
+            patch_size = 2
+            merge_size = 2
+
+            def __call__(self, *, images, do_resize, return_tensors):
+                self.args = (
+                    [image.size for image in images],
+                    [image.getpixel((0, 0)) for image in images],
+                    do_resize,
+                    return_tensors,
+                )
+                return {
+                    "image_grid_thw": self.grid,
+                    "pixel_values": torch.ones(8, 4),
+                }
+
+        processor = Processor()
+        processor.grid = torch.tensor([[1, 2, 2]] * 2)
+        payload = SRImagePayload.from_req(req)
+        item = payload.materialize(SimpleNamespace(image_processor=processor))
+        item = item.to_multimodal_inputs().mm_items[0]
+        self.assertEqual(processor.args, ([(4, 4)] * 2, [(255, 0, 0), (0, 0, 255)], False, "pt"))
+        self.assertEqual(item.pad_value, 7)
+        self.assertNotEqual(item.hash, 1)
+        self.assertEqual(tuple(item.feature.shape), (8, 4))
+        processor.grid = torch.tensor([[1, 2, 4]] * 2)
+        with self.assertRaisesRegex(ValueError, "image grid mismatch"):
+            SRImagePayload.from_req(req).materialize(
+                SimpleNamespace(image_processor=processor)
+            )
 
     def test_unpack_rejects_bare_pickle_and_keeps_router_identity(self):
         batch = SRBatchRequest(session_id="s", rpc_seq=1, action=SRAction.STEP)
@@ -1678,24 +1689,26 @@ class TestTargetPrefillOverlap(CustomTestCase):
             self.skipTest(str(e))
         return SchedulerStandaloneRemoteTargetMixin
 
-    def _make_mixin(self, order, req, *, is_extend):
-        mixin_cls = self._import_mixin()
-        mixin = mixin_cls()
+    def _make_mixin(self, order, req, *, is_extend, mixin_cls=None):
+        mixin = (mixin_cls or self._import_mixin())()
         mixin.tp_size = 1
         mixin.tp_rank = 0
         mixin.sr_session_id = "sess"
         mixin.sr_rpc_seq = 0
+        mixin.sr_breaker = None
+        mixin.sr_speculation_stopped = False
         mixin._engine_paused = False
         mixin.current_scheduler_metrics_enabled = False
         mixin.last_batch = None
         mixin.cur_batch = None
 
-        server_args = MagicMock()
-        server_args.speculative_num_steps = 4
-        server_args.speculative_num_draft_tokens = 5
-        server_args.speculative_eagle_topk = 1
-        server_args.standalone_remote_max_batch_size = 32
-        mixin.server_args = server_args
+        mixin.server_args = SimpleNamespace(
+            speculative_algorithm="STANDALONE_REMOTE",
+            speculative_num_steps=4,
+            speculative_num_draft_tokens=5,
+            speculative_eagle_topk=1,
+            standalone_remote_max_batch_size=32,
+        )
 
         running = MagicMock()
         running.batch_size.return_value = 1
@@ -1790,6 +1803,56 @@ class TestTargetPrefillOverlap(CustomTestCase):
         with self.assertRaises(mixin.recv_requests.StopLoop):
             mixin.event_loop_normal_standalone_remote_target()
         self.assertEqual(order, ["send", "gpu", "recv"])
+
+    def test_prefill_receives_reply_before_flushing_finished_requests(self):
+        sr_mixin = self._import_mixin()
+        from sglang.srt.speculative.opt_tree_remote.opt_tree_scheduler import (
+            OptTreeSchedulerMixin,
+        )
+
+        class OptTarget(OptTreeSchedulerMixin, sr_mixin):
+            pass
+
+        for target_cls in (sr_mixin, OptTarget):
+            with self.subTest(target=target_cls.__name__):
+                order = []
+                short = self._make_req()
+                short.rid = "short"
+                long = self._make_req()
+                mixin, client = self._make_mixin(
+                    order, long, is_extend=True, mixin_cls=target_cls
+                )
+                mixin.get_next_batch_to_run().reqs = [short, long]
+                if target_cls is OptTarget:
+                    mixin.spec_algorithm = SpeculativeAlgorithm.OPT_TREE_REMOTE
+                    mixin.server_args.speculative_algorithm = "OPT_TREE_REMOTE"
+                    mixin.server_args.opt_tree_role = "target"
+                    mixin.server_args.opt_tree_width = 4
+                    mixin.server_args.opt_tree_max_depth = 4
+                    mixin._init_opt_tree_target = lambda: None
+                    run_loop = mixin.event_loop_normal_opt_tree_target
+                else:
+                    mixin.server_args.speculative_algorithm = "STANDALONE_REMOTE"
+                    run_loop = mixin.event_loop_normal_standalone_remote_target
+
+                def process_result(_batch, _result):
+                    order.append("process")
+                    short.finished.return_value = True
+                    mixin.notify_sr_draft_finished(short)
+                    mixin._sr_flush_finish_notifications()
+
+                mixin.process_batch_result = process_result
+                with self.assertRaises(mixin.recv_requests.StopLoop):
+                    run_loop()
+
+                self.assertEqual(order, ["send", "gpu", "process", "recv", "send"])
+                prefill, finish = (call.args[0] for call in client.send_batch.call_args_list)
+                self.assertEqual(prefill.action, SRAction.PREFILL)
+                self.assertEqual([req.rid for req in prefill.reqs], ["short", long.rid])
+                self.assertEqual(finish.action, SRAction.FINISH)
+                self.assertEqual([req.rid for req in finish.reqs], ["short"])
+                self.assertEqual(long.cur_drafts, [11, 12])
+                self.assertFalse(mixin._sr_hold_finish_flush)
 
     def test_step_send_overlaps_process(self):
         order = []
@@ -3740,7 +3803,7 @@ class TestStandaloneRemoteTree(CustomTestCase):
         self.assertEqual([r.rid for r in reply.reqs], ["a", "b"])
         self.assertEqual(reply.reqs[0].draft_tokens, [10, 11])
         self.assertEqual(reply.reqs[1].draft_tokens, [10, 11])
-        self.assertEqual(reply.protocol_version, 2)
+        self.assertEqual(reply.protocol_version, SR_PROTOCOL_VERSION)
 
     def test_new_session_batch_wipes_once(self):
         try:
@@ -4852,7 +4915,7 @@ class TestSRDraftBusyReject(CustomTestCase):
         self.assertEqual(len(reply.reqs), 1)
         self.assertEqual(reply.reqs[0].status, SRReplyStatus.REJECT)
         self.assertEqual(reply.reqs[0].draft_tokens, [])
-        self.assertEqual(reply.protocol_version, 2)
+        self.assertEqual(reply.protocol_version, SR_PROTOCOL_VERSION)
         self.assertNotEqual(reply.reqs[0].reason, "protocol_mismatch")
 
     def test_busy_still_handles_finish(self):
@@ -6825,7 +6888,7 @@ class TestOwnedFromInts(CustomTestCase):
         self.assertEqual(third.tolist(), [7, 8, 9])
 
 
-class TestSRV2StopAndVersion(CustomTestCase):
+class TestSRStopAndVersion(CustomTestCase):
     def _draft(self):
         try:
             from sglang.srt.speculative.standalone_remote.drafter.sr_draft_scheduler_mixin import (
@@ -6895,7 +6958,7 @@ class TestSRV2StopAndVersion(CustomTestCase):
                 "rpc_seq": 0,
                 "action": "step",
                 "reqs": [{"rid": "a", "step_id": 1, "base_committed_len": 1}],
-                "protocol_version": 2.5,
+                "protocol_version": 2,
             }
         )
         packets = [(bad, {})]
@@ -6907,9 +6970,29 @@ class TestSRV2StopAndVersion(CustomTestCase):
         self.assertEqual(aligns, [])
         self.assertEqual(gpus, [])
         self.assertEqual(mixin.sr_state.session_id, "1")
-        self.assertEqual(sent[0].protocol_version, 2)
+        self.assertEqual(sent[0].protocol_version, SR_PROTOCOL_VERSION)
         self.assertEqual(sent[0].reqs[0].reason, "protocol_mismatch")
         self.assertEqual(mixin.sr_handled_rpc, 0)
+
+    def test_missing_snapshot_image_rejects_without_ack(self):
+        mixin = self._draft()
+        req = SRDraftRequest(
+            rid="vl",
+            base_committed_len=1,
+            committed_ids=[],
+            padded_input_ids=[7],
+            sampling_params={"temperature": 0},
+            has_mm=True,
+            requires_mm=True,
+            commit_mode="snapshot",
+            commit_version=1,
+        )
+        reply, live = mixin._sr_prepare_v2(req, SRAction.PREFILL, "s", None)
+        self.assertIsNone(live)
+        self.assertEqual(reply.status, SRReplyStatus.REJECT)
+        self.assertEqual(reply.reason, "sr_image_source_invalid")
+        self.assertIsNone(reply.ack_commit_version)
+        self.assertIsNone(mixin.sr_state.get(req.rid))
 
     def test_stopped_session_blocks_prefill_and_step_only(self):
         mixin, _inflight = self._target()
@@ -6986,7 +7069,7 @@ class TestSRV2StopAndVersion(CustomTestCase):
         busy = SRBatchReply(
             session_id="s",
             rpc_seq=1,
-            protocol_version=2,
+            protocol_version=SR_PROTOCOL_VERSION,
             reqs=[
                 SRDraftReply(
                     rid="a",
@@ -7121,7 +7204,7 @@ class TestSRV2StopAndVersion(CustomTestCase):
                     session_id="s",
                     rpc_seq=rpc,
                     action=action,
-                    protocol_version=2,
+                    protocol_version=SR_PROTOCOL_VERSION,
                     spec_shape=shape,
                     reqs=[SRDraftRequest(rid="a", step_id=1, base_committed_len=1)],
                 ),
@@ -7167,7 +7250,7 @@ class TestSRV2StopAndVersion(CustomTestCase):
         reply = SRBatchReply(
             session_id="s",
             rpc_seq=1,
-            protocol_version=2,
+            protocol_version=SR_PROTOCOL_VERSION,
             reqs=[
                 SRDraftReply(
                     rid="a",

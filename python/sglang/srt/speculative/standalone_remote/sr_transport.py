@@ -1,8 +1,8 @@
 """pyzmq DEALER/ROUTER transport for STANDALONE_REMOTE sync RPC.
 
 Draft binds ROUTER (server); Target connects DEALER (client). Control is a
-pickled SRBatchRequest/Reply. Vision tensors, when present, follow as
-multipart frames on the same RPC so the two channels cannot race.
+pickled SRBatchRequest/Reply. Image metadata and encoded images follow as
+multipart frames on the same RPC.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
+    SR_PROTOCOL_VERSION,
     SRAction,
     SRBatchReply,
     SRBatchRequest,
@@ -91,12 +92,6 @@ def _ctrl_offset(frames: List[Any]) -> int:
     raise ValueError("STANDALONE_REMOTE frame missing SRCTRL")
 
 
-def _load_mm_payload():
-    from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
-
-    return SRMMPayload
-
-
 def sr_endpoint(addr: str, port: str, *, bind: bool) -> Tuple[str, str]:
     """Return (zmq_url, transport). transport is 'ipc' or 'tcp'."""
     addr = addr or "127.0.0.1"
@@ -139,18 +134,41 @@ def _unpack_request(frames: List[Any]) -> Tuple[SRBatchRequest, Dict[str, Any]]:
     batch = SRBatchRequest.from_dict(pickle.loads(_frame_view(frames[offset + 1])))
     mm_by_rid: Dict[str, Any] = {}
     rest_at = offset + 2
-    if rest_at < len(frames) and _is_magic(frames[rest_at], _MM_FRAME):
-        metas = pickle.loads(_frame_view(frames[rest_at + 1]))
-        # Tensor frames stay as memoryview/ZMQ buffers. from_multipart clones
-        # them before this list is dropped, so the ZMQ frame can be released.
+    if (
+        batch.protocol_version == SR_PROTOCOL_VERSION
+        and batch.action in (SRAction.PREFILL, SRAction.STEP)
+        and rest_at + 1 < len(frames)
+        and _is_magic(frames[rest_at], _MM_FRAME)
+    ):
+        from sglang.srt.speculative.standalone_remote.sr_image_payload import (
+            SRImagePayload,
+        )
+
+        try:
+            metas = pickle.loads(_frame_view(frames[rest_at + 1]))
+        except (pickle.UnpicklingError, EOFError):
+            return batch, mm_by_rid
+        if not isinstance(metas, list):
+            return batch, mm_by_rid
         bufs = frames[rest_at + 2 :]
-        for meta in metas:
-            if not meta:
+        for req, meta in zip(batch.reqs, metas):
+            if not req.has_mm or req.commit_mode != "snapshot":
                 continue
-            off = int(meta.get("_sr_buf_offset", 0))
-            n = int(meta.get("_sr_buf_count", 0))
-            payload = _load_mm_payload().from_multipart(meta, bufs[off : off + n])
-            mm_by_rid[payload.rid] = payload
+            try:
+                off = meta["_sr_buf_offset"]
+                n = meta["_sr_buf_count"]
+                if (
+                    meta["rid"] != req.rid
+                    or type(off) is not int
+                    or type(n) is not int
+                    or not (0 <= off < off + n <= len(bufs))
+                ):
+                    raise ValueError("invalid multimodal frame range")
+                mm_by_rid[req.rid] = SRImagePayload.from_multipart(
+                    meta, bufs[off : off + n]
+                )
+            except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
+                logger.warning("[SR] Invalid image payload for rid=%s", req.rid)
     return batch, mm_by_rid
 
 

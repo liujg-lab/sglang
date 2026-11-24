@@ -96,6 +96,7 @@ from sglang.srt.speculative.standalone_remote.sr_commit import (
     route_snapshot_recovery,
     supported_protocol,
 )
+from sglang.srt.speculative.standalone_remote.sr_image_payload import SRImagePayload
 from sglang.srt.speculative.standalone_remote.sr_kv_copy import KVMoveSubmittedError
 from sglang.srt.speculative.standalone_remote.sr_kv_rollbacker import SRKVRollbacker
 from sglang.srt.speculative.standalone_remote.sr_mm_payload import (
@@ -1071,6 +1072,9 @@ class StandaloneRemoteDraftSchedulerMixin:
         defer_vision = vision_jobs is not None and mm is not None
         if mm is not None:
             mm_inputs = mm.to_multimodal_inputs()
+            image_cache_key = getattr(mm_inputs, "sr_image_cache_key", None)
+            if image_cache_key is not None:
+                req.extra_key = image_cache_key
             req.extend_image_inputs(mm_inputs)
             self._maybe_compute_mrope_positions(req)
             if defer_vision:
@@ -2733,12 +2737,38 @@ class StandaloneRemoteDraftSchedulerMixin:
             state.pending_commit = pending
         req.sr_pending_wire_request = dreq
 
+    def _sr_restore_image_payload(self, rid, mm, metrics):
+        reconstructed = None
+        if mm is not None:
+            started = time.perf_counter()
+            try:
+                reconstructed = mm.materialize(getattr(self, "processor", None))
+            except Exception as exc:
+                logger.warning(
+                    "[SR] Image reconstruction failed for rid=%s (%s)",
+                    rid,
+                    type(exc).__name__,
+                )
+            if metrics.active:
+                metrics.add_host("mm_source_decode", time.perf_counter() - started)
+        if getattr(self, "tp_size", 1) > 1:
+            valid = torch.tensor(int(reconstructed is not None), device="cpu")
+            torch.distributed.all_reduce(
+                valid, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            if not valid.item():
+                reconstructed = None
+        metrics.counts[
+            "mm_source_ok" if reconstructed is not None else "mm_source_error"
+        ] += 1
+        return reconstructed
+
     def _sr_prepare_v2(
         self,
         dreq: SRDraftRequest,
         action: SRAction,
         session_id: str,
-        mm: Optional[SRMMPayload],
+        mm: Optional[SRMMPayload | SRImagePayload],
         vision_jobs: Optional[List[Tuple[Req, SRDraftRequest]]] = None,
     ) -> Tuple[Optional[SRDraftReply], Optional[Req]]:
         """Returns (early_reply, live_req)."""
@@ -2871,6 +2901,17 @@ class StandaloneRemoteDraftSchedulerMixin:
                 self._sr_v2_reply(dreq, SRReplyStatus.REJECT, reason="untrusted_kv"),
                 None,
             )
+        if isinstance(dreq, SRDraftRequest) and dreq.commit_mode == "snapshot" and (
+            isinstance(mm, SRImagePayload) or (dreq.requires_mm and mm is None)
+        ):
+            mm = self._sr_restore_image_payload(dreq.rid, mm, metrics)
+            if mm is None:
+                return (
+                    self._sr_v2_reply(
+                        dreq, SRReplyStatus.REJECT, reason="sr_image_source_invalid"
+                    ),
+                    None,
+                )
         if not self._sr_mm_can_restore(req, dreq, mm) and (
             req is None or route == RecoveryRoute.REPREFILL
         ):
@@ -3161,7 +3202,7 @@ class StandaloneRemoteDraftSchedulerMixin:
         batch_d, mm_d = packet
         batch = SRBatchRequest.from_dict(batch_d)
         mm = {
-            rid: SRMMPayload.from_pickleable(d) for rid, d in (mm_d or {}).items()
+            rid: SRImagePayload.from_pickleable(d) for rid, d in (mm_d or {}).items()
         }
         return batch, mm
 

@@ -24,7 +24,7 @@ from sglang.srt.speculative.standalone_remote.sr_commit import (
     status_advances_cursor,
 )
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
-from sglang.srt.speculative.standalone_remote.sr_mm_payload import SRMMPayload
+from sglang.srt.speculative.standalone_remote.sr_image_payload import SRImagePayload
 from sglang.srt.speculative.standalone_remote.sr_protocol import (
     SRAction,
     SRBatchReply,
@@ -298,7 +298,7 @@ class SchedulerStandaloneRemoteTargetMixin:
 
     def _build_sr_request(
         self, req: Req, action: SRAction, include_full_context: bool
-    ) -> Tuple[SRDraftRequest, Optional[SRMMPayload]]:
+    ) -> Tuple[SRDraftRequest, Optional[SRImagePayload]]:
         self._sr_ensure_cursor(req)
         metrics = get_sr_round_metrics(self, "Target")
         num_draft = (
@@ -328,11 +328,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         requires_mm = isinstance(mm_items, list) and len(mm_items) > 0
         if snapshot:
             committed = list(req.output_ids or [])
-            mm_payload = None
-            has_mm = False
-            if requires_mm and _mm_features_alive(req):
-                has_mm = True
-                mm_payload = SRMMPayload.from_req(req)
+            mm_payload = SRImagePayload.from_req(req) if requires_mm else None
             note_commit_send(metrics, "snapshot", len(committed))
             req.sr_accepted_tree_candidate_indices = None
             return (
@@ -344,7 +340,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                     num_draft_tokens=num_draft,
                     padded_input_ids=list(req.origin_input_ids),
                     sampling_params=req.sampling_params,
-                    has_mm=has_mm,
+                    has_mm=mm_payload is not None,
                     commit_mode="snapshot",
                     commit_version=version,
                     requires_mm=requires_mm,
@@ -392,11 +388,25 @@ class SchedulerStandaloneRemoteTargetMixin:
 
         pending: Dict[str, SRPendingEntry] = {}
         draft_reqs: List[SRDraftRequest] = []
-        mm_by_rid: Dict[str, SRMMPayload] = {}
+        mm_by_rid: Dict[str, SRImagePayload] = {}
         for req in reqs:
             if _is_health_check(req):
                 continue
+            if action in (SRAction.PREFILL, SRAction.STEP) and getattr(
+                req, "sr_stop_spec", False
+            ) is True:
+                continue
             dreq, mm = self._build_sr_request(req, action, include_full_context)
+            if dreq.commit_mode == "snapshot" and dreq.requires_mm and mm is None:
+                note_commit_result(
+                    get_sr_round_metrics(self, "Target"), "image_source_unavailable"
+                )
+                req.sr_stop_spec = True
+                req.source_image_bytes = None
+                _clear_draft(req)
+                continue
+            if action in (SRAction.FINISH, SRAction.ABORT):
+                req.source_image_bytes = None
             draft_reqs.append(dreq)
             pending[req.rid] = SRPendingEntry(
                 step_id=dreq.step_id,
@@ -565,11 +575,14 @@ class SchedulerStandaloneRemoteTargetMixin:
                 continue
             if item.status == SRReplyStatus.REJECT and item.reason in (
                 "unrecoverable_mm",
+                "sr_image_source_invalid",
                 "completion_unknown",
                 "untrusted_kv",
                 "degraded",
             ):
                 req.sr_stop_spec = True
+                if item.reason == "sr_image_source_invalid":
+                    req.source_image_bytes = None
                 _clear_draft(req)
                 continue
             if item.status == SRReplyStatus.REJECT:
@@ -649,8 +662,7 @@ class SchedulerStandaloneRemoteTargetMixin:
         pending.append(req)
 
     def _sr_flush_finish_notifications(self) -> None:
-        # An inflight STEP reply sits on the DEALER until recv. send_batch
-        # drains that socket, so FINISH must wait until the reply is taken.
+        # Sending FINISH drains the DEALER, so preserve any outstanding reply.
         if getattr(self, "_sr_hold_finish_flush", False):
             return
         pending = getattr(self, "_sr_finish_pending", None) or []
@@ -773,6 +785,31 @@ class SchedulerStandaloneRemoteTargetMixin:
             return
         self._sr_shift_prefill_replies(reqs, replies)
 
+    def _sr_run_prefill(self, batch) -> None:
+        live = [req for req in self._sr_select_reqs(batch) if not req.finished()]
+        inflight = (
+            self._sr_send(SRAction.PREFILL, live, include_full_context=True)
+            if live
+            else None
+        )
+        batch.draft_num_tokens = self.server_args.speculative_num_draft_tokens
+        self._sr_hold_finish_flush = inflight is not None
+        try:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        finally:
+            try:
+                if inflight is not None:
+                    replies, pending = self._sr_recv(inflight)
+                    still = [req for req in live if not req.finished()]
+                    self._sr_apply_commit_acks(still, replies, pending)
+                    self._sr_note_draft_prompt_lens(still, replies)
+                    self._sr_maybe_align_chain_replies(still, replies, prefill=True)
+                    self._sr_attach_replies(still, replies)
+            finally:
+                self._sr_hold_finish_flush = False
+                self._sr_flush_finish_notifications()
+
     @DynamicGradMode()
     def event_loop_normal_standalone_remote_target(self):
         self._init_sr_target()
@@ -791,34 +828,7 @@ class SchedulerStandaloneRemoteTargetMixin:
                 ) or getattr(batch, "is_extend_in_batch", False)
 
                 if is_extend:
-                    live = [
-                        r
-                        for r in self._sr_select_reqs(batch)
-                        if not r.finished()
-                    ]
-                    inflight = (
-                        self._sr_send(
-                            SRAction.PREFILL, live, include_full_context=True
-                        )
-                        if live
-                        else None
-                    )
-                    batch.draft_num_tokens = (
-                        self.server_args.speculative_num_draft_tokens
-                    )
-                    try:
-                        result = self.run_batch(batch)
-                        self.process_batch_result(batch, result)
-                    finally:
-                        if inflight is not None:
-                            replies, pending = self._sr_recv(inflight)
-                            still = [r for r in live if not r.finished()]
-                            self._sr_apply_commit_acks(still, replies, pending)
-                            self._sr_note_draft_prompt_lens(still, replies)
-                            self._sr_maybe_align_chain_replies(
-                                still, replies, prefill=True
-                            )
-                            self._sr_attach_replies(still, replies)
+                    self._sr_run_prefill(batch)
                 elif skip_reason := self._sr_skip_draft_rpc(batch):
                     get_sr_round_metrics(self, "Target").note_skip(
                         skip_reason, batch.batch_size()

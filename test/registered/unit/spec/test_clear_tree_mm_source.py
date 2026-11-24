@@ -110,33 +110,30 @@ def _batch(rid="r1"):
 
 
 class TestSourceSwitch(CustomTestCase):
-    def test_only_clear_target_keeps_bytes(self):
+    def test_clear_source_switch_is_local_to_clear_tree(self):
         clear = SpeculativeAlgorithm.CLEAR_TREE_REMOTE
-        with patch.dict(os.environ, {}, clear=False):
+        target = SimpleNamespace(
+            clear_tree_role="target",
+            opt_tree_role="target",
+            standalone_remote_role="target",
+            spectre_role="target",
+        )
+        with patch.dict(os.environ):
             os.environ.pop("SGLANG_CLEAR_MM_SOURCE", None)
-            self.assertTrue(
-                clear.keeps_source_image_bytes(SimpleNamespace(clear_tree_role="target"))
-            )
+            self.assertTrue(clear.keeps_source_image_bytes(target))
             self.assertFalse(
                 clear.keeps_source_image_bytes(SimpleNamespace(clear_tree_role="draft"))
             )
-            for algo in (
-                SpeculativeAlgorithm.OPT_TREE_REMOTE,
-                SpeculativeAlgorithm.STANDALONE_REMOTE,
-                SpeculativeAlgorithm.SPECTRE,
-                SpeculativeAlgorithm.NONE,
-            ):
-                args = SimpleNamespace(
-                    clear_tree_role="target",
-                    opt_tree_role="target",
-                    standalone_remote_role="target",
-                    spectre_role="target",
-                )
-                self.assertFalse(algo.keeps_source_image_bytes(args), algo)
         with patch.dict(os.environ, {"SGLANG_CLEAR_MM_SOURCE": "0"}):
-            self.assertFalse(
-                clear.keeps_source_image_bytes(SimpleNamespace(clear_tree_role="target"))
+            self.assertFalse(clear.keeps_source_image_bytes(target))
+            self.assertTrue(
+                SpeculativeAlgorithm.OPT_TREE_REMOTE.keeps_source_image_bytes(target)
             )
+            self.assertTrue(
+                SpeculativeAlgorithm.STANDALONE_REMOTE.keeps_source_image_bytes(target)
+            )
+            self.assertFalse(SpeculativeAlgorithm.SPECTRE.keeps_source_image_bytes(target))
+            self.assertFalse(SpeculativeAlgorithm.NONE.keeps_source_image_bytes(target))
 
     def test_protocol_version_two(self):
         self.assertEqual(CLEAR_PROTOCOL_VERSION, 2)

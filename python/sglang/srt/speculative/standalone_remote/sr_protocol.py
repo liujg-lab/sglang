@@ -13,8 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-# Only a real int 2 is the v2 protocol. Missing, bool, float, and str stay unsupported.
-SR_PROTOCOL_VERSION = 2
+SR_PROTOCOL_VERSION = 3
 
 
 def parse_protocol_version(value: Any) -> Optional[int]:
@@ -277,11 +276,8 @@ class SRBatchRequest:
     rpc_seq: int
     action: SRAction
     reqs: List[SRDraftRequest] = field(default_factory=list)
-    # Local batches default to v2. from_dict passes an explicit value so a
-    # missing or non-int wire field stays unsupported instead of becoming 2.
     protocol_version: Optional[int] = SR_PROTOCOL_VERSION
-    # (topk, num_steps, num_draft_tokens). v2 Target always sends this.
-    # Draft rejects PREFILL/STEP when it is missing.
+    # Draft rejects PREFILL/STEP without (topk, num_steps, num_draft_tokens).
     spec_shape: Optional[Tuple[int, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:

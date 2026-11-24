@@ -60,10 +60,10 @@ sequenceDiagram
 | 系列 / 能力 | 当前代码适配范围 | 验证边界与限制 |
 | --- | --- | --- |
 | 普通文本 causal LM | 普通自回归 Draft，加 EAGLE 风格 Target 验证；Qwen3 文本模型可作为配对示例 | 需要逐个确认模型、attention backend、采样和图能力；不宣称全部文本架构开箱即用 |
-| Qwen3-VL dense | `Qwen3VLForConditionalGeneration`，纯文本、图像/视频数据及 M-RoPE 路径 | 2026-09-18 提供的 Qwen3-VL-2B 日志显示 NPU 两端树图 replay 和接受统计正常；不等于所有输入模态、尺寸及数值对照均通过 |
+| Qwen3-VL dense | `Qwen3VLForConditionalGeneration`，纯文本、原图及 M-RoPE 路径 | 历史张量协议的 NPU 日志不证明新版原图路径的精度或性能 |
 | Qwen3-VL MoE | `Qwen3VLMoeForConditionalGeneration` 在 SR VL 校验范围内 | 不能用 dense 2B 日志代替 MoE、其他尺寸或并行配置的验证 |
 | 其他 VLM | 可能进入通用多模态路径，校验会提示超出 Qwen3-VL 已适配架构 | 不宣称开箱即用；需要核对 processor、视觉编码、占位符及位置编码 |
-| 音频 | payload 存在音频相关字段 | 字段存在不代表完整音频生成/投机路径已验证 |
+| 视频／音频／混合模态 | 使用 Target 生成，不进入远程投机 | 不发送张量回退 |
 | Hybrid Mamba / GDN / Lightning | Target 有相应状态更新接入 | 仍需验证对应模型、Draft、状态回滚及 backend，不能套用普通 MHA 树 attention 结论 |
 | CUDA / NPU | 两端各自有前向、验证及图接入；协议可连接同构或异构两端 | CUDA、跨设备类型及跨机部署需要独立验收；CPU 单测不证明硬件数值或性能 |
 | 特殊 attention / KV 格式 | MLA、SWA、ALiBi、量化/NZ 等保留各自能力判断和原分派 | 不满足共享 prefix 条件时使用已有 fallback；不能推断所有组合都支持树图 |
@@ -71,11 +71,10 @@ sequenceDiagram
 Qwen3-VL 多模态前提：
 
 - Target processor 已生成 padded prompt；Draft 复用这份 `input_ids` 和 `pad_value`，不再次 pad。
-- 两端视觉几何（`patch_size`、`spatial_merge_size`、`temporal_patch_size`）及图像/视频 resize 设置必须兼容。
+- 两端视觉几何（`patch_size`、`spatial_merge_size`、`temporal_patch_size`）必须兼容。
 - Draft 不使用 `--skip-tokenizer-init`，需要 processor 和正确的三轴 M-RoPE。
 - Draft 上下文容量必须容纳 Target pad 后的 prompt 及后续生成、投机所需空间。
-- 常规视觉输入由 Draft 使用本地视觉编码路径处理；payload 也有 `precomputed_embeddings` 字段。
-  已有本地视觉结果可在恢复中复用，但不传 Target 合并后的 `mm_input_embeds`。
+- Draft 解码原图，按 Target 的 grid 缩放并重建像素张量，核对 grid 后才走视觉编码和可选的 VisionZip；同一个 grid 不保证像素逐值相同。
 - TP rank 0 收发 SR RPC，随后在本侧 TP 组广播；不是每个 rank 建一套跨端 socket。
 
 <a id="timing"></a>
@@ -138,7 +137,7 @@ sequenceDiagram
     Draft->>Draft: 释放该请求状态与 KV
 ```
 
-协议版本 2 的正常 STEP 只发送已确认版本、新增 token 和可选候选路径。版本或基长度对不上时，Target 只为失败请求补发一次完整 snapshot。本地前缀 stamp 仍有效时，Draft 只追加本轮 delta，提交准备、确认和 lease 前置检查不扫描整段历史。stamp 无效、chain 上还有未接受草稿，或协议需要恢复时，仍重建完整历史并走现有对齐。KV 状态不可信时不能停在 token 相同的对齐分支，可恢复的故障走 re-prefill。
+协议版本 3 的正常 STEP 只发送已确认版本、新增 token 和可选候选路径。版本或基长度对不上时，Target 只为失败请求补发一次完整 snapshot。本地前缀 stamp 仍有效时，Draft 只追加本轮 delta，提交准备、确认和 lease 前置检查不扫描整段历史。stamp 无效、chain 上还有未接受草稿，或协议需要恢复时，仍重建完整历史并走现有对齐。KV 状态不可信时不能停在 token 相同的对齐分支，可恢复的故障走 re-prefill。
 
 稳态通常是“验证已有窗口 → 提交 → 请求下一窗”。刚开始或草稿失效时，
 同一调度轮还可能在验证前额外请求一次。因此 `rounds` 与通信 `calls` 不必一一对应。
@@ -467,9 +466,9 @@ Target → Draft：SRCTRL | pickle(batch request) | [SRMM | pickle(mm metas) | b
 Draft  → Target：SRCTRL | pickle(batch reply)
 ```
 
-ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer 与控制帧同一次 RPC 收发，
-无需额外 mm 端口。纯文本请求没有 `SRMM`。不传模型权重、跨端 KV、Target 语言模型 logits/hidden；
-多模态 item 可包含视觉 feature / precomputed embeddings，不能将其混同为语言模型 hidden 传输。
+ROUTER 收发时还有路由 identity；上图只列应用帧。首个带图 PREFILL 和后续 STEP 全量快照发送原图编码字节和 Target 对齐元数据，不传像素张量、预计算 embedding、模型权重、跨端 KV 或 Target logits/hidden。纯文本和普通 STEP 增量没有 `SRMM`。
+
+原图支持 bytes、base64/data URI、本地路径和 `file://`。如果任一张取不到原始字节，或请求是 HTTP(S) 图片、仅有解码像素／预计算 embedding、其他模态，或 Draft 重建失败，只有该请求由 Target 不投机生成；不改发张量。
 
 ### 批次与请求字段
 
@@ -482,7 +481,7 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | request `rid` | 单个生成请求的身份 |
 | request `step_id` | 该请求的投机步骤身份 |
 | request `base_committed_len` | `len(origin_input_ids) + len(output_ids)`，包含 prompt 的完整已提交长度 |
-| batch `protocol_version` | 只有整数 2 合法。本地构造默认写出 2。入站缺失、`None`、浮点、字符串或 bool 都不支持，且不会被转换成 2。session/rpc 仍可识别时回 `protocol_mismatch`；该回复自身携带版本 2，只表示拒绝包由 v2 发出。匹配后的非 2 或 `protocol_mismatch` 停止该 session 的 PREFILL/STEP，FINISH/ABORT 仍发送。旧 session/rpc 仍先按 stale 丢弃，不停止当前会话。版本为 2 之后还要核对请求身份、status，再分别推进 ACK 和安装草稿 |
+| batch `protocol_version` | 只接受整数 3。Target 与 Draft 必须配套升级；有效会话中的版本不匹配回 `protocol_mismatch`，停止该会话的 PREFILL/STEP，不重试旧协议。旧 session/rpc 仍先按 stale 丢弃 |
 | request `commit_mode` | `snapshot` 带完整输出历史；`delta` 只带自上次 ACK 以来的新增 token。FINISH/ABORT 不带提交内容 |
 | request `committed_ids` | 仅 snapshot：不含 prompt 的完整 `output_ids`。delta 不带这个字段 |
 | request `delta_ids` | 仅 delta：从 `base_output_len` 起新增的已提交输出，允许空列表。正常包不随历史变长。stamp 有效时 Draft 原地追加；否则再重建完整历史并对齐 |
@@ -504,11 +503,10 @@ ROUTER 收发时还有路由 identity；上图只列应用帧。视觉 buffer �
 | reply item `parent_list/top_scores_index` | 树拓扑与候选选择索引，Target 据此重建树；不是分数或完整 logits |
 | reply item `draft_prompt_len` | 可选，只出现在实际压缩过的 PREFILL 回复里，是 Draft 本地 prompt 长度 |
 | reply item `prompt_compaction` | 可选。为 `True` 时表示这次 PREFILL 缩短了 Draft 视觉 prompt。Target 只记入 `draft_prompt_tokens`、`target_prompt_tokens`、`prompt_compaction_reqs`，验证逻辑不变 |
-| mm `rid/mm_items` | 请求身份、图像/视频等 item 列表。已 pad 的 prompt 只在控制请求的 `padded_input_ids` 里，不在 MM meta 中重复 |
-| mm item | modality、format、hash、pad_value、offsets、feature、precomputed_embeddings、model_specific_data |
-| mm 特殊 token | image/video/audio/slice 等标记 ID；音频字段存在不证明完整音频路径可用 |
+| mm `rid/mm_items` | 请求身份和图像元数据。已 pad 的 prompt 只在控制请求的 `padded_input_ids` 里 |
+| mm item | `hash`、`pad_value`、`offsets`、`image_grid_thw` 和必要的图片 token ID；原图按请求顺序放在独立帧中 |
 
-新 Target 收到旧 Draft 缺少驻留字段的回复仍可处理；旧 Target 忽略新增可选字段。
+同一协议版本内，缺少可选的 Draft 驻留耗时字段不影响回包使用。
 采样参数是已有子结构的序列化内容，不在 SR 中重新定义另一套用户采样 API。
 
 ### SR 专用参数

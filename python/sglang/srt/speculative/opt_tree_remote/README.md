@@ -14,6 +14,10 @@
 
 `max_depth` 与参考实现的 `Tree.max_depth` 相同，容量里仍留着那个参考实现会填上再丢掉的槽。这里在造出该层之前就停止，所以一条草稿链最长仍是 `max_depth - 1`。
 
+## 原图传输
+
+OPT 与 SR 共用 RPC v3，两端必须配套升级。首个带图 PREFILL 和 STEP 全量快照只传原图编码字节及 Target 的 grid、占位等对齐元数据；普通 STEP 增量不带图。Draft 按 Target 的 grid 重建像素，不接收或回退到 Target 的像素张量。支持 Qwen-VL 普通图片的 bytes、base64/data URI、本地路径和 `file://`；取不到原图、不支持该输入或重建失败时，仅该请求由 Target 不投机生成。OPT 的树宽、停止条件和验证规则不变。
+
 ## 注意力和父指针
 
 默认草稿 mask 只让每个节点看到自己和祖先。`ancestor_mask(state, leak=True)` 才会复现参考实现里 `kv_cache_mask` 从不清零的结果。后续草稿前向应使用 `ancestor_mask`。

@@ -151,12 +151,11 @@ class SpeculativeAlgorithm(Enum):
         return self.skips_colocated_draft_worker(server_args)
 
     def keeps_source_image_bytes(self, server_args) -> bool:
-        """The tokenizer keeps each request's original image bytes for the scheduler.
-
-        Only a ClearTree Target uses them: it ships the bytes to its remote
-        Draft instead of pixel tensors. ``SGLANG_CLEAR_MM_SOURCE=0`` turns it
-        off. Every other algorithm and role leaves the field empty.
-        """
+        """Whether the Target needs the encoded images for remote snapshots."""
+        if self.is_standalone_remote():
+            return getattr(server_args, "standalone_remote_role", None) == "target"
+        if self.is_opt_tree_remote():
+            return getattr(server_args, "opt_tree_role", None) == "target"
         if not self.is_clear_tree_remote():
             return False
         if getattr(server_args, "clear_tree_role", None) != "target":

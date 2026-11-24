@@ -2,8 +2,7 @@
 
 The wire delta is the suffix appended since the last ACK. A trusted delta whose
 local prefix stamp matches appends in place. Every other legal commit still
-rebuilds history and uses the existing align path. Only integer protocol
-version 2 may be installed. A missing or non-int version is unsupported.
+rebuilds history and uses the existing align path.
 """
 
 from __future__ import annotations
@@ -113,7 +112,6 @@ class CommittedPrefixView:
 
 
 def supported_protocol(version: Optional[int]) -> bool:
-    """Only a real integer 2. Float 2.0 and bool must not compare equal."""
     return type(version) is int and version == SR_PROTOCOL_VERSION
 
 

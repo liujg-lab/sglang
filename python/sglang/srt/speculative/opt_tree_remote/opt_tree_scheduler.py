@@ -688,30 +688,7 @@ class OptTreeSchedulerMixin:
                 ) or getattr(batch, "is_extend_in_batch", False)
 
                 if is_extend:
-                    live = [
-                        r for r in self._sr_select_reqs(batch) if not r.finished()
-                    ]
-                    inflight = (
-                        self._sr_send(
-                            SRAction.PREFILL, live, include_full_context=True
-                        )
-                        if live
-                        else None
-                    )
-                    batch.draft_num_tokens = self.server_args.speculative_num_draft_tokens
-                    try:
-                        result = self.run_batch(batch)
-                        self.process_batch_result(batch, result)
-                    finally:
-                        if inflight is not None:
-                            replies, pending = self._sr_recv(inflight)
-                            still = [r for r in live if not r.finished()]
-                            self._sr_apply_commit_acks(still, replies, pending)
-                            self._sr_note_draft_prompt_lens(still, replies)
-                            self._sr_maybe_align_chain_replies(
-                                still, replies, prefill=True
-                            )
-                            self._sr_attach_replies(still, replies)
+                    self._sr_run_prefill(batch)
                 elif skip_reason := self._sr_skip_draft_rpc(batch):
                     get_sr_round_metrics(self, "Target").note_skip(
                         skip_reason, batch.batch_size()
