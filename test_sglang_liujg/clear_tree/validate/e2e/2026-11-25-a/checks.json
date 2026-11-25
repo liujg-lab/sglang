@@ -1,0 +1,22 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "formal_hold_invalid": 0,
+  "fit_reused_both_blocks": true,
+  "fit_sha256_unchanged": true,
+  "fit_schema_observed_by_install": 3,
+  "installed_hold_cells": 90,
+  "h_curve_on": true,
+  "prefit_started": false,
+  "wrote_fit_file": false,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "half_life_1000_env": true,
+  "half_life_0_env": true,
+  "accept_per_request_unset": true,
+  "flush_http_200_trials": ["01", "02", "03", "04", "05", "06", "07"],
+  "flush_http_400_trials": ["08"],
+  "draft_window_tail": "flushed",
+  "same_processes_within_block": true,
+  "restart_between_blocks": true
+}

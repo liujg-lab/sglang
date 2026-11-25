@@ -1,0 +1,39 @@
+{
+  "run_id": "2026-11-25-a",
+  "fit_sha256": "34e56789f083d9f6b75010e4f3f14948f4b2b5cac2db6aab327fdf0ce29f3dcb",
+  "fit_reused": true,
+  "installed_hold_cells": 90,
+  "curve": "on",
+  "blocks": [
+    {
+      "half_life": 1000,
+      "draft_host_pid": 2862830,
+      "target_host_pid": 246322,
+      "unmatched_rounds": 322,
+      "formal_hold_invalid": 0,
+      "flush_http_200": 4,
+      "flush_http_other": 0,
+      "draft_windows": {"windows": 720, "full": 715, "idle": 5, "last": "idle", "tail": "flushed"}
+    },
+    {
+      "half_life": 0,
+      "draft_host_pid": 3009304,
+      "target_host_pid": 657993,
+      "unmatched_rounds": 312,
+      "formal_hold_invalid": 0,
+      "flush_http_200": 3,
+      "flush_http_other": 1,
+      "draft_windows": {"windows": 728, "full": 723, "idle": 5, "last": "idle", "tail": "flushed"}
+    }
+  ],
+  "trials": [
+    {"trial": "01", "half_life": 1000, "dataset": "RSTeller", "concurrency": 1, "ok": 100, "tokens": 45727, "wall_s": 774.135, "tok_s": 59.069, "accept": 35082, "draft": 86400, "accept_rate": 0.406042, "fallback": 0, "client_concurrency": 1.0, "e_accepted": 34568.0, "e_pred": 34560.461366, "e_mass": 36907.507471, "e_pred_over_accepted": 0.999782, "flush": "http_200"},
+    {"trial": "02", "half_life": 1000, "dataset": "RSTeller", "concurrency": 4, "ok": 100, "tokens": 45776, "wall_s": 285.511, "tok_s": 160.330, "accept": 33149, "draft": 102264, "accept_rate": 0.324151, "fallback": 0, "client_concurrency": 3.932, "e_accepted": 32692.0, "e_pred": 32614.569152, "e_mass": 34682.563537, "e_pred_over_accepted": 0.997632, "flush": "http_200"},
+    {"trial": "03", "half_life": 1000, "dataset": "WaterCaption", "concurrency": 1, "ok": 100, "tokens": 29721, "wall_s": 583.853, "tok_s": 50.905, "accept": 23389, "draft": 51840, "accept_rate": 0.451177, "fallback": 0, "client_concurrency": 1.0, "e_accepted": 22872.0, "e_pred": 22922.093813, "e_mass": 23347.541977, "e_pred_over_accepted": 1.002190, "flush": "http_200"},
+    {"trial": "04", "half_life": 1000, "dataset": "WaterCaption", "concurrency": 4, "ok": 100, "tokens": 29849, "wall_s": 264.030, "tok_s": 113.052, "accept": 21924, "draft": 64400, "accept_rate": 0.340435, "fallback": 0, "client_concurrency": 3.971, "e_accepted": 21479.0, "e_pred": 21477.860271, "e_mass": 22114.142283, "e_pred_over_accepted": 0.999947, "flush": "http_200"},
+    {"trial": "05", "half_life": 0, "dataset": "RSTeller", "concurrency": 1, "ok": 100, "tokens": 45849, "wall_s": 770.238, "tok_s": 59.526, "accept": 35210, "draft": 86304, "accept_rate": 0.407976, "fallback": 0, "client_concurrency": 1.0, "e_accepted": 34686.0, "e_pred": 34590.456107, "e_mass": 36986.542267, "e_pred_over_accepted": 0.997245, "flush": "http_200"},
+    {"trial": "06", "half_life": 0, "dataset": "RSTeller", "concurrency": 4, "ok": 100, "tokens": 46274, "wall_s": 287.595, "tok_s": 160.900, "accept": 33205, "draft": 105488, "accept_rate": 0.314775, "fallback": 0, "client_concurrency": 3.953, "e_accepted": 32762.0, "e_pred": 32679.171276, "e_mass": 34909.794908, "e_pred_over_accepted": 0.997472, "flush": "http_200"},
+    {"trial": "07", "half_life": 0, "dataset": "WaterCaption", "concurrency": 1, "ok": 100, "tokens": 29635, "wall_s": 586.208, "tok_s": 50.554, "accept": 23165, "draft": 53032, "accept_rate": 0.436812, "fallback": 0, "client_concurrency": 1.0, "e_accepted": 22657.0, "e_pred": 21825.727087, "e_mass": 23135.702538, "e_pred_over_accepted": 0.963311, "flush": "http_200"},
+    {"trial": "08", "half_life": 0, "dataset": "WaterCaption", "concurrency": 4, "ok": 100, "tokens": 29756, "wall_s": 265.917, "tok_s": 111.900, "accept": 21701, "draft": 65416, "accept_rate": 0.331738, "fallback": 0, "client_concurrency": 3.974, "e_accepted": 21250.0, "e_pred": 20900.929468, "e_mass": 21990.572823, "e_pred_over_accepted": 0.983573, "flush": "http_400"}
+  ]
+}
