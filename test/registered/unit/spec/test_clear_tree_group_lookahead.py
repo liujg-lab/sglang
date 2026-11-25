@@ -71,6 +71,7 @@ class _Plan:
         self._frozen_k = None
         self.begin_calls = []
         self.noted = []
+        self.verified = []
 
     @property
     def defer_finish(self):
@@ -92,8 +93,9 @@ class _Plan:
         self._frozen_k = self.k
         return self.k
 
-    def note(self, state, keep):
+    def note(self, state, keep, verify=None):
         self.noted.append((state.rid, int(keep)))
+        self.verified.append(verify)
 
 
 def _scheduler(plan, rids, prefixes):
@@ -173,6 +175,19 @@ class TestDeviceOpsMany(CustomTestCase):
 
 
 class TestGroupLookahead(CustomTestCase):
+    def _assert_noted_windows(self, plan, windows):
+        """Every cut hands its verify window to ``note``, in the order noted."""
+        self.assertEqual(len(plan.verified), len(plan.noted))
+        self.assertTrue(all(item is not None for item in plan.verified))
+        got = sorted(
+            [int(t) for t, parent in zip(v.tokens.tolist(), v.parents.tolist()) if parent != -2]
+            for v in plan.verified
+        )
+        want = sorted(
+            [int(t) for t, parent in zip(w[0], w[1]) if parent != -2] for w in windows
+        )
+        self.assertEqual(got, want)
+
     def _run_pair(self, stops, k, prefixes, bonus, defer=True):
         n = 2
         rids = [f"r{i}" for i in range(len(prefixes))]
@@ -246,6 +261,8 @@ class TestGroupLookahead(CustomTestCase):
                 self.assertEqual(r["windows"], r["ref_windows"])
                 self.assertEqual(r["plan"].noted, r["ref_plan"].noted)
                 self.assertEqual(r["plan"].begin_calls, r["ref_plan"].begin_calls)
+                self._assert_noted_windows(r["plan"], r["windows"])
+                self._assert_noted_windows(r["ref_plan"], r["ref_windows"])
                 for got, want in zip(r["states"], r["ref_states"]):
                     self.assertEqual(int(got.depth), int(want.depth))
                     d = int(got.depth)
@@ -275,6 +292,8 @@ class TestGroupLookahead(CustomTestCase):
         r = self._run_pair([2, 3], k=3, prefixes=[5, 9], bonus=True, defer=False)
         self.assertEqual(r["windows"], r["ref_windows"])
         self.assertEqual(r["plan"].noted, r["ref_plan"].noted)
+        self._assert_noted_windows(r["plan"], r["windows"])
+        self._assert_noted_windows(r["ref_plan"], r["ref_windows"])
 
     def test_failure_resets_every_runner_and_keeps_private_tails(self):
         n = 2

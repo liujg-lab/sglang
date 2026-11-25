@@ -838,7 +838,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
             def verify_k(self, state):
                 return width
 
-            def note(self, state, keep):
+            def note(self, state, keep, verify=None):
                 return None
 
         def forward_active(steps, indices):
@@ -4084,6 +4084,261 @@ class TestSeedEstimate(CustomTestCase):
         reset_policy(keep_fits=True)
         self.assertIsNone(seed_estimate(2))
 
+
+class _NoteDecider:
+    """Stops at once and cuts to a fixed K; records what ``note`` received."""
+
+    use_tau = False
+    defer_finish = False
+    _frozen_k = None
+
+    def __init__(self, keep):
+        self.keep = int(keep)
+        self.got = None
+
+    def should_grow(self, state):
+        return False
+
+    def verify_k(self, state):
+        return self.keep
+
+    def note(self, state, keep, verify=None):
+        self.got = (int(keep), verify)
+
+
+class TestAcceptPathDiagnostics(unittest.TestCase):
+    """``d_round`` ranks of the accepted path, per-request depth and mass."""
+
+    def setUp(self):
+        reset_policy()
+        self.addCleanup(reset_policy)
+        env = patch.dict(os.environ, {"SGLANG_CLEAR_LEDGER": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("SGLANG_CLEAR_LOCK_K", None)
+
+    @staticmethod
+    def _tree(rid="a"):
+        # W=2, depth 3. Flat scores 0.6 0.3 | 0.5 0.3 | 0.3 0.2 with three
+        # ties at 0.3: verify order is 0, 2, 1, 3, 4, 5 (depth, then column).
+        state = ClearTreeState.create(ClearTreeConfig(width=2, tau=0.0, max_depth=4))
+        state.weight[:3] = torch.tensor([[0.6, 0.3], [0.5, 0.3], [0.3, 0.2]])
+        state.tokens[:3] = torch.tensor([[10, 11], [20, 21], [30, 31]])
+        state.parents[:3] = torch.tensor([[0, 0], [0, 0], [0, 1]])
+        state.depth = 3
+        state.rid = rid
+        state.prefix = 100
+        return state
+
+    @staticmethod
+    def _shallow_tree(rid="a"):
+        # The review case: W=2, depth 2. a=0.6 b=0.3 | a->c=0.5 a->d=0.1.
+        state = ClearTreeState.create(ClearTreeConfig(width=2, tau=0.0, max_depth=4))
+        state.weight[:2] = torch.tensor([[0.6, 0.3], [0.5, 0.1]])
+        state.tokens[:2] = torch.tensor([[10, 11], [20, 21]])
+        state.parents[:2] = torch.tensor([[0, 0], [0, 0]])
+        state.depth = 2
+        state.rid = rid
+        state.prefix = 100
+        return state
+
+    @staticmethod
+    def _plan(sched, **attrs):
+        plan = RoundPlan.__new__(RoundPlan)
+        plan._scheduler = sched
+        plan._score_cache = {}
+        plan._all = []
+        plan.width = 2
+        plan.cover_k = 64
+        plan.theta_value = 0.05
+        plan.use_tau = False
+        plan.locked_k = None
+        plan.prefit = None
+        plan.fallback = False
+        plan.k_probe = False
+        plan._verify_quotes = {4: 38.0, 8: 40.0, 16: 45.0, 32: None}
+        for name, value in attrs.items():
+            setattr(plan, name, value)
+        return plan
+
+    def _noted_round(self, rids=("a",), keep=5, tree=None, **attrs):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import finish
+
+        tree = self._tree if tree is None else tree
+        ledger = ClearLedger(active_rids=list(rids))
+        sched = SimpleNamespace(
+            _clear_ledger=ledger,
+            tp_rank=0,
+            _clear_target_prefix={rid: 100 for rid in rids},
+        )
+        _step(ledger, list(rids), [100] * len(rids), 1, 1.0)
+        plan = self._plan(sched, **attrs)
+        for rid in rids:
+            state = tree(rid)
+            verify = finish(state, keep)
+            plan.note(state, keep, verify=verify)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.01)
+        return ledger, plan
+
+    @staticmethod
+    def _close(ledger, grown, tail, **kwargs):
+        return ledger.on_packet(
+            "step", ["a"], "sess", 2, [100 + grown], 8, now=1.08,
+            next_tails=None if tail is None else {"a": tail}, **kwargs,
+        )
+
+    def test_ranks_follow_the_verify_window_order(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ops import finish
+
+        state = self._tree()
+        verify = finish(state, 5)
+        scores = [float(x) for x in state.weight[:3].reshape(-1).tolist()]
+        ranks = ledger_module._node_ranks(scores, 2)
+        self.assertEqual([ranks[i] for i in range(6)], [1, 3, 2, 4, 5, 6])
+        window = {
+            int(d) * 2 + int(c)
+            for d, c, p in zip(
+                verify.depths.tolist(), verify.cols.tolist(), verify.parents.tolist()
+            )
+            if p != -2
+        }
+        self.assertEqual(window, {i for i, rank in ranks.items() if rank <= 5})
+        # ``finish`` keeps its host copy of the whole tree.
+        self.assertEqual(state.host_tree[0], [[10, 11], [20, 21], [30, 31]])
+
+    def test_round_records_accepted_path_ranks_and_mass_per_tier(self):
+        ledger, _ = self._noted_round()
+        # Committed 10 -> 20 -> 30 plus the bonus 99: three accepts.
+        record = self._close(ledger, 4, [7, 10, 20, 30, 99])
+        self.assertEqual(record["accepted"], 3)
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["depth"], 3)
+        self.assertEqual(row["accepted"], 3)
+        self.assertEqual(row["ranks"], [1, 2, 5])
+        self.assertTrue(row["path_ok"])
+        # The path reached the last layer: there is no next node.
+        self.assertIsNone(row["next_rank"])
+        self.assertIsNone(row["next_rank_short"])
+        mass = row["mass_k"]
+        self.assertAlmostEqual(mass["2"], 1.1, places=5)
+        self.assertAlmostEqual(mass["4"], 1.7, places=5)
+        self.assertAlmostEqual(mass["8"], 2.2, places=5)
+        # Value round: quotes already on the table, up to the actual cover
+        # (6 nodes -> tier 8). The unpriced tier 32 is not filled in.
+        self.assertEqual(record["k_mode"], "value")
+        self.assertEqual(record["k_cover"], 8)
+        self.assertEqual(record["verify_quotes"], {"4": 38.0, "8": 40.0})
+        self.assertAlmostEqual(record["theta"], 0.05)
+
+    def test_diagnostics_do_not_fill_the_quote_table(self):
+        ledger, plan = self._noted_round()
+        self._close(ledger, 4, [10, 20, 30, 99])
+        self.assertEqual(plan._verify_quotes, {4: 38.0, 8: 40.0, 16: 45.0, 32: None})
+
+    def test_dropping_a_layer_can_admit_a_shallow_node(self):
+        # K=2 keeps {a, c}. The Target's token is b (rank 3): nothing is
+        # accepted, but without the last layer b ranks 2 and enters the window.
+        ledger, _ = self._noted_round(keep=2, tree=self._shallow_tree)
+        record = self._close(ledger, 1, [11])
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["accepted"], 0)
+        self.assertEqual(row["ranks"], [])
+        self.assertEqual(row["next_rank"], 3)
+        self.assertEqual(row["next_rank_short"], 2)
+
+    def test_next_node_on_the_last_layer_has_no_short_rank(self):
+        # K=1 keeps {a}. The Target goes a -> d (rank 4, last layer).
+        ledger, _ = self._noted_round(keep=1, tree=self._shallow_tree)
+        record = self._close(ledger, 2, [10, 21])
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["ranks"], [1])
+        self.assertEqual(row["next_rank"], 4)
+        self.assertIsNone(row["next_rank_short"])
+
+    def test_unmatched_or_short_tail_keeps_depth_and_accepts(self):
+        ledger, _ = self._noted_round()
+        row = self._close(ledger, 4, [10, 77, 30, 99])["e_rid"]["a"]
+        self.assertIsNone(row["ranks"])
+        self.assertFalse(row["path_ok"])
+        self.assertIsNone(row["next_rank"])
+        self.assertEqual((row["depth"], row["accepted"]), (3, 3))
+
+        ledger, _ = self._noted_round()
+        self.assertIsNone(self._close(ledger, 4, None)["e_rid"]["a"]["ranks"])
+
+    def test_fixed_k_rounds_log_no_quotes(self):
+        for attrs, mode in (
+            ({"use_tau": True, "locked_k": 8}, "tau"),
+            ({"use_tau": True, "locked_k": 8, "k_probe": True}, "probe"),
+            ({"locked_k": 8, "fallback": True}, "fallback"),
+            ({"locked_k": 8, "prefit": {"phase": "keep"}}, "prefit"),
+        ):
+            with self.subTest(mode=mode):
+                ledger, _ = self._noted_round(**attrs)
+                record = self._close(ledger, 4, [10, 20, 30, 99])
+                self.assertEqual(record["k_mode"], mode)
+                self.assertIsNone(record["verify_quotes"])
+                self.assertIsNone(record["k_cover"])
+                self.assertEqual(record["e_rid"]["a"]["ranks"], [1, 2, 5])
+        with patch.dict(os.environ, {"SGLANG_CLEAR_LOCK_K": "8"}):
+            ledger, _ = self._noted_round(use_tau=True, locked_k=8)
+            self.assertEqual(self._close(ledger, 4, None)["k_mode"], "locked")
+
+    def test_ledger_off_builds_no_detail(self):
+        os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+        ledger, _ = self._noted_round()
+        record = self._close(ledger, 4, [10, 20, 30, 99])
+        self.assertEqual(record["accepted"], 3)
+        self.assertIsNone(record["e_rid"])
+        self.assertIsNone(record["k_mode"])
+        self.assertIsNone(record["verify_quotes"])
+
+    def test_departed_request_and_unnoted_round(self):
+        ledger, _ = self._noted_round(rids=("a", "b"))
+        record = self._close(ledger, 2, [10, 99])
+        self.assertEqual(set(record["e_rid"]), {"a"})
+        self.assertEqual(record["e_rid"]["a"]["ranks"], [1])
+        ledger.mark_stop(1.1)
+        ledger.mark_send(1.11)
+        empty = _step(ledger, ["a"], [104], 3, 1.2)
+        self.assertIsNone(empty["e_rid"])
+        self.assertIsNone(empty["k_mode"])
+        self.assertIsNone(empty["verify_quotes"])
+        self.assertIsNone(empty["theta"])
+
+    def test_deferred_close_matches_the_receive_close(self):
+        tail = [10, 20, 30, 99]
+        sync = self._close(self._noted_round()[0], 4, tail)
+        ledger, _ = self._noted_round()
+        self.assertIsNone(self._close(ledger, 4, tail, defer=True))
+        deferred = ledger.run_deferred()
+        self.assertEqual(deferred["e_rid"], sync["e_rid"])
+        self.assertEqual(deferred["verify_quotes"], sync["verify_quotes"])
+        self.assertEqual(deferred["k_mode"], sync["k_mode"])
+
+    def test_commit_tail_reads_delta_or_snapshot(self):
+        tail = ledger_module._commit_tail
+        self.assertEqual(
+            tail(SimpleNamespace(commit_mode="delta", delta_ids=[1, 2, 3])), [1, 2, 3]
+        )
+        long = SimpleNamespace(commit_mode="snapshot", committed_ids=list(range(100)))
+        self.assertEqual(tail(long), list(range(100))[-ledger_module.COMMIT_TAIL :])
+        as_tuple = SimpleNamespace(commit_mode="snapshot", committed_ids=tuple(range(70)))
+        self.assertEqual(tail(as_tuple), list(range(70))[-ledger_module.COMMIT_TAIL :])
+        self.assertEqual(tail(SimpleNamespace(commit_mode="delta", delta_ids=[])), [])
+        self.assertIsNone(tail(SimpleNamespace(commit_mode="delta", delta_ids=None)))
+        self.assertIsNone(tail(SimpleNamespace(commit_mode=None)))
+
+    def test_step_after_layer_hands_the_window_to_note(self):
+        state = self._tree()
+        decider = _NoteDecider(5)
+        state.decider = decider
+        step = step_after_layer(state)
+        self.assertTrue(step.is_final)
+        keep, verify = decider.got
+        self.assertEqual(keep, 5)
+        self.assertIs(verify, step.verify)
 
 if __name__ == "__main__":
     unittest.main()

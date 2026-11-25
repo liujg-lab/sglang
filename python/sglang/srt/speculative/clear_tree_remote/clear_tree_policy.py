@@ -1404,8 +1404,13 @@ class RoundPlan:
         self._frozen_k = int(chosen)
         return int(self._frozen_k)
 
-    def note(self, state, keep) -> None:
-        """Record path mass for the K already chosen for this cut."""
+    def note(self, state, keep, verify=None) -> None:
+        """Record path mass for the K already chosen for this cut.
+
+        ``verify`` is the window ``finish`` cut. It only feeds the ``d_round``
+        diagnostics (accepted-path ranks, mass per tier, the K quotes); the
+        ranks and sums are computed when the round closes, not here.
+        """
         rid = getattr(state, "rid", None)
         if rid is None:
             return
@@ -1417,7 +1422,7 @@ class RoundPlan:
             prefix = int(state.prefix)
         else:
             return
-        _, ordered, _ = self._scores_for(state)
+        scores, ordered, _ = self._scores_for(state)
         mass = float(sum(ordered[: int(keep)]))
         note_verified(key, prefix, mass, int(state.depth))
         from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
@@ -1425,8 +1430,69 @@ class RoundPlan:
         )
 
         note_round_expect(
-            self._scheduler, key, accept_ratio(key), mass, int(state.depth)
+            self._scheduler,
+            key,
+            accept_ratio(key),
+            mass,
+            int(state.depth),
+            detail=self._expect_detail(state, scores, ordered, verify),
         )
+
+    def _k_mode(self) -> str:
+        """How this round's K was set. Only ``value`` chose K from J."""
+        if getattr(self, "prefit", None) is not None:
+            return "prefit"
+        if getattr(self, "fallback", False):
+            return "fallback"
+        if getattr(self, "k_probe", False):
+            return "probe"
+        if locked_k_from_env() is not None:
+            return "locked"
+        if self.use_tau or self.locked_k is not None or self.theta_value is None:
+            return "tau"
+        return "value"
+
+    def _expect_detail(self, state, scores, ordered, verify) -> Optional[dict]:
+        """References for the post-close diagnostics, or None with the ledger off.
+
+        Nothing is sorted or summed here. The K quotes are the entries the
+        decisions already put on this round's table; missing tiers are not
+        priced, so the table is not touched.
+        """
+        if verify is None:
+            return None
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            ledger_enabled,
+        )
+
+        if not ledger_enabled():
+            return None
+        try:
+            mode = self._k_mode()
+            quotes = None
+            cover = None
+            if mode == "value":
+                table = self._verify_quotes or {}
+                cover = int(self._actual_cover(self._all or [state]))
+                quotes = {
+                    int(k): float(v)
+                    for k, v in table.items()
+                    if v is not None and int(k) <= cover
+                }
+            return {
+                "scores": scores,
+                "ordered": ordered,
+                "width": int(getattr(getattr(state, "config", None), "width", 0) or 0),
+                "depth": int(getattr(state, "depth", 0) or 0),
+                "verify": verify,
+                "tree": getattr(state, "host_tree", None),
+                "k_mode": mode,
+                "k_cover": cover,
+                "quotes": quotes,
+                "theta": self.theta_value,
+            }
+        except Exception:
+            return None
 
     def _choose_keep(self, eligible) -> list:
         times = {}
@@ -1720,6 +1786,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     )
     plan.cover_k = int(cover)
     plan.flat_k = int(flat_tier)
+    # Diagnostics only: a K probe fixes K, so its round is not a J choice.
+    plan.k_probe = probe is not None
     if locked is None:
         plan._verify_quotes = quotes
     plan.replay_kind = kind

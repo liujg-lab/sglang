@@ -520,6 +520,7 @@ class _Round:
         "reply_bytes",
         "hold_ms",
         "e_rows",
+        "e_detail",
         "tree_depth",
     )
 
@@ -564,6 +565,9 @@ class _Round:
         self.hold_ms = None
         # rid -> (accept ratio, path mass) at the verified K, for diagnostics.
         self.e_rows: Dict[str, tuple] = {}
+        # rid -> references from ``RoundPlan.note`` for the accepted-path
+        # ranks and per-tier mass, computed at close.
+        self.e_detail: Dict[str, dict] = {}
         self.tree_depth = 0
 
 
@@ -585,38 +589,230 @@ def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
     return tokens, ms
 
 
-def _round_expect(rnd: _Round, next_rids, next_prefixes) -> dict:
+# A tail this long covers the deepest verify window plus the bonus token.
+COMMIT_TAIL = 66
+
+
+def _commit_tail(req) -> Optional[List[int]]:
+    """The last committed token ids of one STEP request, or None.
+
+    A delta ends at ``base_committed_len`` (the Target sends
+    ``output_ids[acked:]``); a snapshot's ``committed_ids`` is the whole
+    output, which ends there too. Only the tail is kept.
+    """
+    mode = getattr(req, "commit_mode", None)
+    if mode == "delta":
+        ids = getattr(req, "delta_ids", None)
+    elif mode == "snapshot":
+        ids = getattr(req, "committed_ids", None)
+    else:
+        return None
+    if not isinstance(ids, (list, tuple)):
+        return None
+    try:
+        return [int(token) for token in ids[-COMMIT_TAIL:]]
+    except (TypeError, ValueError):
+        return None
+
+
+def _node_ranks(scores: Sequence[float], width: int) -> Dict[int, int]:
+    """1-based rank of each flat node in the verify order.
+
+    Same key as ``_ranked_verify_indices``: score desc, depth asc, column asc.
+    """
+    order = sorted(
+        range(len(scores)),
+        key=lambda index: (-float(scores[index]), index // width, index % width),
+    )
+    return {index: rank for rank, index in enumerate(order, start=1)}
+
+
+def _window_of(detail: dict):
+    """The verify window as host lists, padding stripped, or None."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
+        strip_verify_padding,
+    )
+
+    verify = detail.get("verify")
+    if verify is None:
+        return None
+    window = strip_verify_padding(
+        verify.tokens.tolist(), verify.parents.tolist(), verify.cols.tolist()
+    )
+    if window is None:
+        return None
+    tokens, parents, cols = window
+    depths = [int(x) for x in verify.depths.tolist()[: len(tokens)]]
+    return tokens, parents, depths, cols
+
+
+def _accept_walk(detail: dict, path: Sequence[int], bonus: Optional[int]) -> dict:
+    """Ranks of the accepted window path, then one step into the whole tree.
+
+    ``ranks`` is None when a committed token has no matching window child.
+    ``next_rank`` is the whole-tree rank of the child of the last accepted
+    node that carries the bonus token (the Target's own next token), and
+    ``next_rank_short`` its rank in the tree without the last layer. Both
+    are None when no such node exists. The node is outside the window, or
+    the Target would have accepted it.
+    """
+    out = {"ranks": None, "next_rank": None, "next_rank_short": None}
+    window = _window_of(detail)
+    width = int(detail["width"])
+    if window is None or width <= 0:
+        return out
+    tokens, parents, depths, cols = window
+    scores = detail["scores"]
+    ranks_of = _node_ranks(scores, width)
+    ranks: List[int] = []
+    parent = -1
+    last_col = None
+    for token in path:
+        child = None
+        for index, (node_parent, node_token) in enumerate(zip(parents, tokens)):
+            if int(node_parent) == parent and int(node_token) == int(token):
+                child = index
+                break
+        if child is None or int(depths[child]) != len(ranks):
+            return out
+        flat = int(depths[child]) * width + int(cols[child])
+        if flat not in ranks_of:
+            return out
+        ranks.append(int(ranks_of[flat]))
+        parent = child
+        last_col = int(cols[child])
+    out["ranks"] = ranks
+    tree = detail.get("tree")
+    depth = int(detail["depth"])
+    row = len(ranks)
+    if bonus is None or tree is None or row >= depth:
+        return out
+    tree_tokens, tree_parents = tree
+    if row >= len(tree_tokens):
+        return out
+    for col in range(width):
+        if int(tree_tokens[row][col]) != int(bonus):
+            continue
+        if row > 0 and int(tree_parents[row][col]) != int(last_col):
+            continue
+        flat = row * width + col
+        out["next_rank"] = int(ranks_of[flat])
+        if row < depth - 1:
+            short = _node_ranks(scores[: (depth - 1) * width], width)
+            out["next_rank_short"] = int(short[flat])
+        break
+    return out
+
+
+def _rid_detail(detail: dict, accepted: int, tail) -> dict:
+    """Per-request depth, accepts, accepted-path ranks and mass per tier."""
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        VERIFY_KS,
+    )
+
+    ordered = detail["ordered"]
+    mass_k = {}
+    running = 0.0
+    prefix = []
+    for value in ordered:
+        running += float(value)
+        prefix.append(running)
+    for k in VERIFY_KS:
+        mass_k[str(int(k))] = prefix[min(int(k), len(prefix)) - 1] if prefix else 0.0
+    walk = {"ranks": None, "next_rank": None, "next_rank_short": None}
+    grown = int(accepted) + 1
+    if tail is not None and len(tail) >= grown:
+        committed = list(tail)[-grown:]
+        try:
+            walk = _accept_walk(detail, committed[: int(accepted)], committed[-1])
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            pass
+    if walk["ranks"] is None:
+        walk["next_rank"] = None
+        walk["next_rank_short"] = None
+    return {
+        "depth": int(detail["depth"]),
+        "accepted": int(accepted),
+        "ranks": walk["ranks"],
+        "path_ok": walk["ranks"] is not None,
+        "next_rank": walk["next_rank"],
+        "next_rank_short": walk["next_rank_short"],
+        "mass_k": mass_k,
+    }
+
+
+def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dict:
     """Realized accepts against c_i times path mass, over requests that stayed.
 
     ``accepted`` drops each request's bonus token, as ``settle_verified`` does.
-    Every field is None when the round noted no tree.
+    Every field is None when the round noted no tree. ``e_rid``,
+    ``verify_quotes`` and ``theta`` are diagnostics for judging K and the
+    stop afterwards; nothing reads them back.
     """
     empty = {
         "accepted": None,
         "e_pred": None,
         "e_mass": None,
         "e_n": None,
+        "e_rid": None,
+        "k_mode": None,
+        "k_cover": None,
+        "verify_quotes": None,
+        "theta": None,
         "tree_depth": int(getattr(rnd, "tree_depth", 0) or 0) or None,
     }
     rows = getattr(rnd, "e_rows", None) or {}
     if not rows:
         return empty
+    details = getattr(rnd, "e_detail", None) or {}
+    tails = next_tails or {}
     found = {str(rid): int(prefix) for rid, prefix in zip(next_rids, next_prefixes)}
     old = {str(rid): int(prefix) for rid, prefix in zip(rnd.rids, rnd.prefix_lens)}
     accepted = 0
     e_pred = 0.0
     e_mass = 0.0
     count = 0
+    per_rid = {}
+    round_detail = None
     for rid, (ratio, mass) in rows.items():
         if rid not in found or rid not in old:
             continue
-        accepted += max(int(found[rid]) - int(old[rid]) - 1, 0)
+        taken = max(int(found[rid]) - int(old[rid]) - 1, 0)
+        accepted += taken
         e_pred += float(ratio) * float(mass)
         e_mass += float(mass)
         count += 1
+        detail = details.get(rid)
+        if detail is not None:
+            try:
+                per_rid[rid] = _rid_detail(detail, taken, tails.get(rid))
+            except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+                pass
+            if round_detail is None:
+                round_detail = detail
     if count == 0:
         return empty
-    empty.update(accepted=accepted, e_pred=e_pred, e_mass=e_mass, e_n=count)
+    empty.update(
+        accepted=accepted,
+        e_pred=e_pred,
+        e_mass=e_mass,
+        e_n=count,
+        e_rid=per_rid or None,
+    )
+    if round_detail is not None:
+        quotes = round_detail.get("quotes")
+        theta_value = round_detail.get("theta")
+        cover = round_detail.get("k_cover")
+        empty.update(
+            k_mode=round_detail.get("k_mode"),
+            k_cover=None if cover is None else int(cover),
+            verify_quotes=(
+                None
+                if quotes is None
+                else {str(int(k)): float(v) for k, v in sorted(quotes.items())}
+            ),
+            theta=None if theta_value is None else float(theta_value),
+        )
     return empty
 
 
@@ -698,6 +894,7 @@ class ClearLedger:
         verify=None,
         scheduler=None,
         defer: bool = False,
+        next_tails: Optional[Dict[str, List[int]]] = None,
     ) -> Optional[dict]:
         """Close the previous STEP when this packet is its next STEP.
 
@@ -735,6 +932,7 @@ class ClearLedger:
                     reply_bytes=reply_bytes,
                     verify=verify,
                     scheduler=scheduler,
+                    next_tails=next_tails,
                 )
             elif name == "step":
                 closed_session = str(self.open.session_id)
@@ -752,6 +950,7 @@ class ClearLedger:
                     reply_bytes=reply_bytes,
                     verify=verify,
                     scheduler=scheduler,
+                    next_tails=next_tails,
                 )
                 if closed_session != str(session_id):
                     self._clear_pending()
@@ -882,6 +1081,7 @@ class ClearLedger:
         rnd: Optional[_Round] = None,
         pending=None,
         gain: Optional[float] = None,
+        next_tails: Optional[Dict[str, List[int]]] = None,
     ) -> dict:
         """Account one closed round.
 
@@ -1000,7 +1200,7 @@ class ClearLedger:
         self.merge_pending(scheduler)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
-        expect = _round_expect(rnd, next_rids, next_prefixes)
+        expect = _round_expect(rnd, next_rids, next_prefixes, next_tails)
         prefit_round = prefit is not None
         price_kept = (
             price_tokens is not None
@@ -1829,6 +2029,12 @@ def note_packet(scheduler, batch) -> None:
         if rid:
             stored[rid] = int(length)
     scheduler._clear_target_prefix = stored
+    tails = {}
+    if ledger_enabled():
+        for rid, req in zip(rids, reqs):
+            tail = _commit_tail(req)
+            if rid and tail is not None:
+                tails[rid] = tail
     info = getattr(batch, "target_info", None)
     if isinstance(info, dict):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
@@ -1866,13 +2072,18 @@ def note_packet(scheduler, batch) -> None:
             verify=_batch_verify_report(batch),
             scheduler=scheduler,
             defer=defer,
+            next_tails=tails,
         )
 
     _quiet(scheduler, _run)
 
 
-def note_round_expect(scheduler, rid, ratio, mass, depth) -> None:
-    """Remember one request's c_i and verified path mass on the open round."""
+def note_round_expect(scheduler, rid, ratio, mass, depth, detail=None) -> None:
+    """Remember one request's c_i and verified path mass on the open round.
+
+    ``detail`` holds references for the close-time diagnostics (window,
+    scores, K quotes); it is never read by a decision.
+    """
     if scheduler is None:
         return
 
@@ -1881,6 +2092,10 @@ def note_round_expect(scheduler, rid, ratio, mass, depth) -> None:
         if rnd is None:
             return
         rnd.e_rows[str(rid)] = (float(ratio), float(mass))
+        if detail is not None:
+            rnd.e_detail[str(rid)] = detail
+        else:
+            rnd.e_detail.pop(str(rid), None)
         rnd.tree_depth = max(int(rnd.tree_depth or 0), int(depth or 0))
 
     _quiet(scheduler, _run)

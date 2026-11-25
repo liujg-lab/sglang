@@ -609,6 +609,8 @@ def finish(state: ClearTreeState, keep: Optional[int] = None) -> OptVerifySet:
     token_rows, parent_rows = torch.stack(
         [state.tokens[:layer_count], state.parents[:layer_count]], dim=0
     ).tolist()
+    # Host copy of the whole tree for the d_round diagnostics: no extra sync.
+    state.host_tree = (token_rows, parent_rows)
     tokens = []
     depths = []
     cols = []
@@ -679,8 +681,9 @@ def step_after_layer(state: ClearTreeState) -> ClearTreeStep:
         keep = int(decider.verify_k(state))
         if getattr(decider, "_frozen_k", None) is None:
             decider._frozen_k = keep
-        decider.note(state, keep)
     verify = finish(state, keep)
+    if decider is not None:
+        decider.note(state, keep, verify=verify)
     return ClearTreeStep(
         is_final=True,
         tokens=verify.tokens,
