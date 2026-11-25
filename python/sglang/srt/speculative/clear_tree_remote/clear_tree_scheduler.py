@@ -31,6 +31,7 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     _admit_lookahead,
     _reraise_device_context,
     clear_prefill_tail_logits,
+    count_row_capped,
     critical_layer_forwards,
     drain_opt_layer_gpu_us,
     drop_lookahead_request,
@@ -39,10 +40,12 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_forward import (
     grow_lookahead,
     ingest_tail_logits,
     lookahead_supported,
+    note_forwarded_layers,
     opt_other_seconds,
     prepare_lookahead_runtime,
     produce_opt_windows,
     release_uncommitted,
+    row_max_depths,
 )
 from sglang.srt.speculative.standalone_remote.sr_circuit_breaker import SRRpcBreaker
 from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
@@ -1014,6 +1017,7 @@ class ClearTreeSchedulerMixin:
                     self,
                     states_out=tree_states,
                     topk_out=topk_out,
+                    depth_caps=row_max_depths(self, [runner], config),
                 )
                 runner.bonus_ids = topk_out[0] if topk_out is not None else []
             if not windows or windows[0] is None:
@@ -1025,6 +1029,8 @@ class ClearTreeSchedulerMixin:
                 queue_hold_replay,
             )
 
+            count_row_capped(self, tree_states)
+            note_forwarded_layers(tree_states, [runner], config.width)
             queue_hold_replay(self, [req], tree_states, plan)
             metrics.counts["opt_layer_forwards"] += layers
             if lookahead_launched is not None:

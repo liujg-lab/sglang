@@ -306,6 +306,18 @@ def _layers_of(state) -> list:
     return layers
 
 
+def _forwarded_layers(state) -> int:
+    """Layers forwarded for this tree before the reply.
+
+    ``note_forwarded_layers`` stamps the real count. Without it, the ordinary
+    path's count: every written layer but the last, which is only verified.
+    """
+    forwarded = getattr(state, "forwarded_layers", None)
+    if forwarded is None:
+        return max(int(getattr(state, "depth", 0) or 0) - 1, 0)
+    return max(int(forwarded), 0)
+
+
 def _freeze_layer_rows(scheduler, states) -> list:
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         predict_layer_ms,
@@ -313,14 +325,14 @@ def _freeze_layer_rows(scheduler, states) -> list:
 
     depth = max((int(getattr(state, "depth", 0) or 0) for state in states), default=0)
     rows = []
-    # The last written layer is verified and not forwarded.
+    # Rows are the forwards before the deepest tree's stop. Lookahead also
+    # launches that tree's last layer, but off the critical path.
     for layer in range(max(int(depth) - 1, 0)):
-        # Row i is the forward of layer i. A tree whose last written layer is
-        # i was verified there and did not forward it.
+        # Row i is the forward of layer i + 1, priced at the trees actually in
+        # it: lookahead includes trees that stop at that layer, the ordinary
+        # path does not.
         active_states = [
-            state
-            for state in states
-            if int(getattr(state, "depth", 0) or 0) > layer + 1
+            state for state in states if _forwarded_layers(state) > layer
         ]
         pred = {}
         active = len(active_states)
@@ -386,6 +398,10 @@ def hold_replay(
             usable.append(state)
         if not trees:
             return None
+        # A row-capped tree stopped for lack of req_to_token columns, not by
+        # the value rule; another width would have a different cap, so this
+        # round cannot price the widths against each other.
+        row_capped = any(getattr(state, "row_capped", False) for state in states)
         verify = {}
         for k in VERIFY_KS:
             try:
@@ -405,7 +421,9 @@ def hold_replay(
             "trees": trees,
             "width": int(plan.width),
             "kind": str(getattr(plan, "replay_kind", "ordinary")),
-            "eligible": bool(getattr(plan, "replay_eligible", False)),
+            "eligible": bool(getattr(plan, "replay_eligible", False))
+            and not row_capped,
+            "row_capped": bool(row_capped),
             "batch": int(plan.batch),
             "theta": plan.theta_value,
             "verify_ms": verify,

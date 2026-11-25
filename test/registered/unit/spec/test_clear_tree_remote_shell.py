@@ -2120,6 +2120,33 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             self.forward.forward_deferred_final_layers(host, jobs)
         self.assertEqual(events, ["layer", "bonus", "publish", "publish"])
 
+    def test_deferred_final_layer_skips_a_full_row(self):
+        from sglang.srt.speculative.standalone_remote.sr_round_metrics import (
+            get_sr_round_metrics,
+        )
+
+        host, _pool, _freed = self._host()
+        fits = self._job(host)
+        full = self._job(host)
+        full.req.rid = "full"
+        # 16-column row: [15, 17) does not fit, [5, 7) does.
+        full.runner.cached_len = 15
+        groups = []
+
+        def fitting(_host, runners, _steps, **_kwargs):
+            groups.append(list(runners))
+            return [], 1
+
+        with _bonus_prediction("0"), patch.object(
+            self.forward, "_forward_verify_fitting", side_effect=fitting
+        ), patch.object(self.forward, "_publish_or_rollback") as publish:
+            self.forward.forward_deferred_final_layers(host, [fits, full])
+        self.assertEqual(groups, [[fits.runner]])
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual(
+            get_sr_round_metrics(host, "Draft").counts["opt_row_final_skipped"], 1
+        )
+
     def test_bonus_prediction_flag_defaults_on_and_accepts_explicit_values(self):
         for value, expected in (
             (None, True),

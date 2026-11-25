@@ -515,6 +515,7 @@ class _Round:
         "bonus_hit_rids",
         "layers",
         "fallback",
+        "row_short_rids",
         "prefit",
         "reply_bytes",
         "hold_ms",
@@ -556,6 +557,8 @@ class _Round:
         self.bonus_hit_rids: List[str] = []
         self.layers: List[dict] = []
         self.fallback = False
+        # Rids past their Draft req_to_token row: in the Target batch, not drafted.
+        self.row_short_rids: set = set()
         self.prefit = None
         self.reply_bytes = None
         self.hold_ms = None
@@ -895,7 +898,8 @@ class ClearLedger:
         for name in _GAP_ACTIONS:
             if name in gap:
                 reasons.append(name)
-        known = set(rnd.rids)
+        # A row-short rid left this round's rids but stays in later packets.
+        known = set(rnd.rids) | set(rnd.row_short_rids)
         if any(str(rid) not in known for rid in next_rids):
             reasons.append("new_rid")
         if rnd.idle_before:
@@ -904,6 +908,9 @@ class ClearLedger:
             reasons.append("target_gap")
         if rnd.fallback:
             reasons.append("fallback")
+        if rnd.row_short_rids and not rnd.rids:
+            # Nothing was drafted this round.
+            reasons.append("row_short")
         report = _take_verify_report(rnd, verify)
         incoming = _valid_verify_report(verify)
         if incoming is not None and report is None:
@@ -956,9 +963,13 @@ class ClearLedger:
             over_bucket = bucket is None
         elif t_k_us is not None:
             features = _cuda_features(rnd.b, sum(rnd.prefix_lens), rnd.k)
+        # Target verified the row-short requests too, so its batch is not
+        # this round's b: keep T_K, H, Q and the Θ price out of the fits.
+        target_mixed = bool(rnd.row_short_rids)
         fit_verify = (
             features is not None
             and not excluded
+            and not target_mixed
             and not draft_floor
             and not over_bucket
         )
@@ -980,7 +991,7 @@ class ClearLedger:
         self._observe_round_verify(
             rnd,
             t_k_us,
-            excluded,
+            excluded or target_mixed,
             hold_ms=hold_ms,
             q_ms=q_ms,
             verify=report,
@@ -995,6 +1006,9 @@ class ClearLedger:
             price_tokens is not None
             and price_ms is not None
             and not excluded
+            # price_ms includes the Target verifying the row-short requests,
+            # which b no longer counts.
+            and not target_mixed
             and not over_bucket
             and not prefit_round
         )
@@ -1023,6 +1037,7 @@ class ClearLedger:
             "post_ms": rnd.post_ms,
             "excluded": excluded,
             "exclude_reason": reasons,
+            "row_short_rids": sorted(rnd.row_short_rids),
             "gap_rpc": list(rnd.gap_rpcs),
             "price_tokens": price_tokens,
             "price_ms": price_ms,
@@ -1894,6 +1909,35 @@ def mark_round_fallback(scheduler) -> None:
     def _run(ledger: ClearLedger) -> None:
         if ledger.open is not None:
             ledger.open.fallback = True
+
+    _quiet(scheduler, _run)
+
+
+def mark_round_row_short(scheduler, rids) -> None:
+    """Take row-short requests out of the open STEP round.
+
+    Their committed length is past the Draft ``req_to_token`` row, so they
+    get empty drafts and the plan did not count them. They leave the round's
+    rids, prefix lengths and b, so price, accept and layer accounting match
+    the trees that were grown. The Target still verified them, so the round
+    writes no T_K, H or Q (``row_short_rids`` on ``d_round``). A round with
+    only row-short requests is excluded as ``row_short``.
+    """
+    drop = {str(rid) for rid in rids}
+
+    def _run(ledger: ClearLedger) -> None:
+        rnd = ledger.open
+        if rnd is None or not drop:
+            return
+        kept = [
+            (rid, prefix)
+            for rid, prefix in zip(rnd.rids, rnd.prefix_lens)
+            if str(rid) not in drop
+        ]
+        rnd.row_short_rids |= {str(rid) for rid in rnd.rids if str(rid) in drop}
+        rnd.rids = [rid for rid, _prefix in kept]
+        rnd.prefix_lens = [prefix for _rid, prefix in kept]
+        rnd.b = len(rnd.rids)
 
     _quiet(scheduler, _run)
 

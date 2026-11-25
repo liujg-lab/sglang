@@ -1883,6 +1883,36 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertIn(16, rows[0]["pred"])
         self.assertIsNone(rows[0]["pred"][16])
 
+    def test_frozen_rows_price_the_trees_each_lookahead_layer_launched(self):
+        # Lookahead launched layer 2 for both trees before the shallow one
+        # stopped there, so row 1 holds both.
+        deep = SimpleNamespace(depth=3, prefix=10, forwarded_layers=3)
+        shallow = SimpleNamespace(depth=2, prefix=4, forwarded_layers=2)
+        seen = []
+
+        def predict(_scheduler, width, active, sum_ell, depth=None):
+            seen.append((int(width), int(active), int(sum_ell), depth))
+            return 7.0
+
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            side_effect=predict,
+        ):
+            rows = _freeze_layer_rows(SimpleNamespace(), [deep, shallow])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["active"] for row in rows], [2, 2])
+        self.assertEqual([row["sum_ell"] for row in rows], [14, 14])
+        self.assertIn((8, 2, 14, 2), seen)
+        # Ordinary stamps (depth - 1) give the same rows as no stamp.
+        deep.forwarded_layers, shallow.forwarded_layers = 2, 1
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=7.0,
+        ):
+            rows = _freeze_layer_rows(SimpleNamespace(), [deep, shallow])
+        self.assertEqual([row["active"] for row in rows], [2, 1])
+        self.assertEqual([row["sum_ell"] for row in rows], [14, 10])
+
     def test_tau_round_stays_out_of_replay(self):
         reset_policy()
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
@@ -2483,6 +2513,75 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.mark_stop(1.5)
         ledger.mark_stop(9.0)
         self.assertEqual(ledger.open.t_stop, 1.5)
+
+    def _row_short_round(self, short):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            mark_round_row_short,
+        )
+
+        ledger = ClearLedger(active_rids=["a", "b"])
+        sched = SimpleNamespace(_clear_ledger=ledger)
+        _step(ledger, ["a", "b"], [32, 40], 1, 1.0)
+        with patch.dict(os.environ, {"SGLANG_CLEAR_LEDGER": "1"}):
+            mark_round_row_short(sched, short)
+        return ledger
+
+    def test_row_short_rids_leave_the_round_but_not_its_fits(self):
+        ledger = self._row_short_round(["b"])
+        rnd = ledger.open
+        self.assertEqual((rnd.rids, rnd.prefix_lens, rnd.b), (["a"], [32], 1))
+        self.assertEqual(rnd.row_short_rids, {"b"})
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.0)
+        ledger.mark_post(1.01)
+        with patch.object(
+            ledger, "_observe_round_verify", wraps=ledger._observe_round_verify
+        ) as observe, patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_policy.observe_price"
+        ) as price:
+            # "b" is still in the next packet; it is not a new request.
+            record = _step(ledger, ["a", "b"], [34, 41], 2, 1.08)
+        self.assertNotIn("new_rid", record["exclude_reason"])
+        self.assertNotIn("row_short", record["exclude_reason"])
+        self.assertFalse(record["excluded"])
+        self.assertEqual(record["b"], 1)
+        self.assertEqual(record["rids"], ["a"])
+        self.assertEqual(record["row_short_rids"], ["b"])
+        # Price counts only the drafted request: 32 -> 34.
+        self.assertEqual(record["price_tokens"], 2)
+        # The Target batch still held "b": no T_K, H, Q or Θ from this round,
+        # since the round's time covers verifying "b" while b is 1.
+        self.assertIs(observe.call_args.args[2], True)
+        self.assertFalse(record["price_kept"])
+        price.assert_not_called()
+        self.assertEqual(ledger.open.row_short_rids, set())
+
+    def test_round_without_row_short_requests_keeps_its_price(self):
+        # Control for the case above: the same round with nothing dropped.
+        ledger = self._row_short_round([])
+        self.assertEqual(ledger.open.b, 2)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.0)
+        ledger.mark_post(1.01)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_policy.observe_price"
+        ) as price:
+            record = _step(ledger, ["a", "b"], [34, 41], 2, 1.08)
+        self.assertEqual(record["row_short_rids"], [])
+        self.assertTrue(record["price_kept"])
+        price.assert_called_once()
+        self.assertEqual(price.call_args.args[:2], (2, 3))
+
+    def test_round_with_only_row_short_requests_is_excluded(self):
+        ledger = self._row_short_round(["a", "b"])
+        self.assertEqual(ledger.open.b, 0)
+        ledger.mark_stop(1.0)
+        ledger.mark_send(1.0)
+        ledger.mark_post(1.01)
+        record = _step(ledger, ["a", "b"], [33, 41], 2, 1.08)
+        self.assertIn("row_short", record["exclude_reason"])
+        self.assertNotIn("new_rid", record["exclude_reason"])
+        self.assertTrue(record["excluded"])
 
     def test_fallback_round_stays_out_of_the_fits(self):
         saved = os.environ.get("SGLANG_CLEAR_LEDGER")

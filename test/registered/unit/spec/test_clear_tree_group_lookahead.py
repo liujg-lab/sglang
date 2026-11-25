@@ -1203,6 +1203,23 @@ class TestLaunchLayerMany(CustomTestCase):
         for r in c["runners"]:
             self.assertEqual(r.layer_slots, [])
 
+    def test_short_row_raises_before_allocation(self):
+        import sglang.srt.mem_cache.common as mem_common
+
+        with ExitStack() as stack:
+            c = self._setup(stack, cascade=True)
+            # Rows start at 12 and 22; a 23-column row cannot take [22, 24).
+            c["host"].req_to_token_pool.req_to_token = torch.zeros(8, 23, dtype=torch.long)
+            cached = [r.cached_len for r in c["runners"]]
+            with self.assertRaises(forward.RowOverflow):
+                forward._launch_layer_many(
+                    c["host"], c["runners"], c["tokens"], c["anc"], c["depth"], self.N, _Event()
+                )
+            mem_common.alloc_token_slots.assert_not_called()
+            c["assign"].assert_not_called()
+            c["model_forward"].assert_not_called()
+        self.assertEqual([r.cached_len for r in c["runners"]], cached)
+        self.assertEqual([r.layer_slots for r in c["runners"]], [[], []])
 
     def test_delta_read_from_request_when_not_admitted(self):
         with ExitStack() as stack:
@@ -1882,6 +1899,431 @@ class TestSingleLookaheadCallsBeginLayer(CustomTestCase):
         with patch.object(forward, "_opt_draft_count"):
             forward.grow_lookahead(host, runner, config, torch.zeros(4), (object(), (slot, slot), Mock()))
         self.assertEqual(plan.begin_calls, [[("r", 1)]])
+
+
+class _RowPlan(_Plan):
+    """``_Plan`` plus the per-tree ``max_depth`` stop the real plan applies."""
+
+    def should_grow(self, state):
+        return super().should_grow(state) and int(state.depth) < int(
+            state.config.max_depth
+        ) - 1
+
+
+def _row_host(plan, rids, prefixes, row):
+    host = _scheduler(plan, rids, prefixes)
+    host.req_to_token_pool = SimpleNamespace(
+        device="cpu", req_to_token=torch.zeros(len(rids), row, dtype=torch.long)
+    )
+    return host
+
+
+class TestRowCapacity(CustomTestCase):
+    """Tree layers stay inside each request's ``req_to_token`` row."""
+
+    N = 2
+    ROW = 16
+
+    def _tails(self, count):
+        return [
+            torch.randn(VOCAB, generator=torch.Generator().manual_seed(i))
+            for i in range(count)
+        ]
+
+    def test_row_max_depths(self):
+        config = ClearTreeConfig(width=4, tau=0.0, max_depth=8)
+        host = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 20))
+        )
+        runners = _runners([2, 10, 17, 20])
+        with patch.object(forward, "_opt_draft_count") as count:
+            caps = forward.row_max_depths(host, runners, config)
+            # Room for 4, 2, 0, 0 layers: max_depth is room + 1, at least 2.
+            self.assertEqual(caps, [5, 3, 2, 2])
+            wide = SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 64))
+            )
+            self.assertIsNone(forward.row_max_depths(wide, _runners([0]), config))
+            # No pool: nothing is read from the runner.
+            self.assertIsNone(
+                forward.row_max_depths(SimpleNamespace(), [object()], config)
+            )
+        # Asking again after a lookahead fallback must not count twice.
+        count.assert_not_called()
+        self.assertEqual(forward.row_layer_cap(host, 9, 4), 2)
+        self.assertIsNone(forward.row_layer_cap(SimpleNamespace(), 9, 4))
+
+    def test_lookahead_stops_the_long_prefix_tree_inside_its_row(self):
+        n, row = self.N, self.ROW
+        rids, prefixes = ["a", "b"], [10, 2]
+        config = ClearTreeConfig(width=n, tau=0.0, max_depth=6)
+        plan = _RowPlan({"a": 5, "b": 5}, 4)
+        host = _row_host(plan, rids, prefixes, row)
+        runners = _runners(prefixes)
+        ends = []
+
+        def launch(scheduler, group, tokens_dev, anc_dev, depth, width, event):
+            ends.extend(r.cached_len + int(width) for r in group)
+            return _fake_launch(scheduler, group, tokens_dev, anc_dev, depth, width, event)
+
+        states = []
+        with ExitStack() as stack:
+            _quiet_patches(stack)
+            stack.enter_context(
+                patch.object(
+                    forward, "_lookahead_group_cache", return_value=_cpu_cache(2, n, True)
+                )
+            )
+            stack.enter_context(
+                patch.object(forward, "_launch_layer_many", side_effect=launch)
+            )
+            windows, launched = forward.grow_lookahead_many(
+                host, runners, config, self._tails(2), states
+            )
+        # a: (16 - 10) // 2 = 3 layers fit; b: 7 layers fit, so no cap.
+        self.assertEqual([int(s.depth) for s in states], [3, 5])
+        self.assertEqual([s.config.max_depth for s in states], [4, 6])
+        self.assertEqual(launched, 5)
+        self.assertLessEqual(max(ends), row)
+        self.assertEqual(runners[0].cached_len, 10 + 3 * n)
+        self.assertTrue(all(window is not None for window in windows))
+
+    def test_ordinary_path_stops_the_same_tree_and_its_final_layer_fits(self):
+        n, row = self.N, self.ROW
+        rids, prefixes = ["a", "b"], [10, 2]
+        config = ClearTreeConfig(width=n, tau=0.0, max_depth=6)
+        plan = _RowPlan({"a": 5, "b": 5}, 4)
+        host = _row_host(plan, rids, prefixes, row)
+        ends = []
+
+        def forward_active(steps, indices):
+            out = []
+            for step, index in zip(steps, indices):
+                depth = int(step.positions.reshape(-1)[0])
+                ends.append(prefixes[index] + depth * n)
+                out.append(_layer_logits(step.tokens, depth))
+            return out
+
+        states = []
+        with ExitStack() as stack:
+            _quiet_patches(stack)
+            caps = forward.row_max_depths(host, _runners(prefixes), config)
+            windows = forward.grow_active_layers(
+                config,
+                self._tails(2),
+                forward_active,
+                host,
+                states_out=states,
+                depth_caps=caps,
+            )
+        self.assertEqual(caps, [4, None])
+        self.assertEqual([int(s.depth) for s in states], [3, 5])
+        self.assertLessEqual(max(ends), row)
+        # The deferred post-reply forward of each last layer also fits.
+        for prefix, state in zip(prefixes, states):
+            self.assertLessEqual(prefix + int(state.depth) * n, row)
+        self.assertTrue(all(window is not None for window in windows))
+
+    def test_admission_leaves_lookahead_when_layer_one_does_not_fit(self):
+        host = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 16))
+        )
+        runners = _runners([10, 15])
+        for rid, runner in zip(("a", "b"), runners):
+            runner.req = SimpleNamespace(rid=rid)
+        with patch.object(forward, "_opt_draft_count") as count, patch.object(
+            forward,
+            "_lookahead_group_template",
+            side_effect=AssertionError("must not build a template"),
+        ), patch.object(
+            forward,
+            "_lookahead_reserve_kv",
+            side_effect=AssertionError("must not evict"),
+        ):
+            with self.assertRaises(forward.LookaheadFallback) as ctx:
+                forward._admit_lookahead_many(host, runners, 2)
+            self.assertIn("row short rid=b", str(ctx.exception))
+            count.assert_called_once_with(host, "opt_lookahead_row_short")
+            # 14 + 2 == 16 still fits.
+            forward._admit_lookahead_rows(host, _runners([10, 14]), 2)
+
+    def test_layer_allocators_stop_before_a_short_row(self):
+        import sglang.srt.mem_cache.common as mem_common
+
+        runner = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(
+                    device="cpu", req_to_token=torch.zeros(2, 12, dtype=torch.long)
+                ),
+                tree_cache=SimpleNamespace(page_size=1),
+            ),
+            cached_len=11,
+            req=SimpleNamespace(rid="r", req_pool_idx=0, kv_allocated_len=11),
+            layer_slots=[],
+            _la_seq=torch.zeros(1, dtype=torch.long),
+            _la_pool=torch.tensor([0]),
+        )
+        with patch.object(forward, "_opt_draft_count") as count, patch.object(
+            mem_common, "alloc_token_slots"
+        ) as alloc:
+            with self.assertRaises(forward.RowOverflow):
+                forward.OptLayerForward._alloc_layer_slots(runner, 2)
+            # Ingest spans pass ``start``.
+            with self.assertRaises(forward.RowOverflow):
+                forward.OptLayerForward._alloc_layer_slots(runner, 4, start=10)
+            with self.assertRaises(forward.RowOverflow):
+                forward.OptLayerForward._alloc_lookahead_slots(runner, 2)
+        alloc.assert_not_called()
+        self.assertEqual(count.call_count, 3)
+        self.assertEqual(runner.req.kv_allocated_len, 11)
+        self.assertEqual(runner.layer_slots, [])
+
+    def test_require_row_room_checks_every_row_first(self):
+        host = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 16))
+        )
+        runners = _runners([4, 15])
+        for rid, runner in zip(("a", "b"), runners):
+            runner.req = SimpleNamespace(rid=rid)
+        with patch.object(forward, "_opt_draft_count"):
+            with self.assertRaises(forward.RowOverflow) as ctx:
+                forward._require_row_room(host, runners, 2)
+            forward._require_row_room(host, runners[:1], 2)
+            forward._require_row_room(SimpleNamespace(), runners, 2)
+        self.assertIn("[15, 17)", str(ctx.exception))
+
+    def test_requests_past_the_row_get_empty_drafts(self):
+        host = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 8))
+        )
+        long_req = SimpleNamespace(rid="long", origin_input_ids=list(range(7)), output_ids=[1, 2])
+        short_req = SimpleNamespace(rid="short", origin_input_ids=[1, 2, 3], output_ids=[4])
+        pairs = [("d0", long_req), ("d1", short_req)]
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
+        step = SRAction.STEP
+        with patch.object(forward, "_opt_draft_count") as count, patch.object(
+            forward, "_produce_fitting_windows", return_value=["window"]
+        ) as fitting, patch.object(forward, "_drop_row_short") as drop:
+            got = forward.produce_opt_windows(host, step, pairs)
+            # A PREFILL frees the same way but must not touch the ledger round.
+            forward.produce_opt_windows(host, SRAction.PREFILL, pairs)
+        self.assertEqual(got, [([], None, None), "window"])
+        self.assertEqual(
+            fitting.call_args_list[0], ((host, step, [("d1", short_req)]),)
+        )
+        self.assertEqual(count.call_args_list[0], ((host, "opt_row_short_empty", 1),))
+        self.assertEqual(
+            drop.call_args_list,
+            [
+                ((host, [long_req], 8), {"step": True}),
+                ((host, [long_req], 8), {"step": False}),
+            ],
+        )
+        with patch.object(
+            forward, "_produce_fitting_windows", return_value=["a", "b"]
+        ) as fitting:
+            wide = SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 64))
+            )
+            self.assertEqual(forward.produce_opt_windows(wide, step, pairs), ["a", "b"])
+            fitting.assert_called_once_with(wide, step, pairs)
+
+    def test_missing_fitting_windows_become_empty_drafts(self):
+        from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
+        host = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(3, 8))
+        )
+        long_req = SimpleNamespace(rid="long", origin_input_ids=list(range(9)), output_ids=[])
+        fit_a = SimpleNamespace(rid="a", origin_input_ids=[1, 2], output_ids=[])
+        fit_b = SimpleNamespace(rid="b", origin_input_ids=[1, 2, 3], output_ids=[])
+        pairs = [("d0", fit_a), ("d1", long_req), ("d2", fit_b)]
+        with patch.object(forward, "_opt_draft_count"), patch.object(
+            forward, "_drop_row_short"
+        ), patch.object(
+            forward, "_produce_fitting_windows", return_value=["wa"]
+        ), self.assertLogs(forward.logger, level="WARNING") as logs:
+            got = forward.produce_opt_windows(host, SRAction.STEP, pairs)
+        # Only one window for two fitting requests: no StopIteration, and the
+        # missing one gets an empty draft like the caller's zip used to give.
+        self.assertEqual(got, ["wa", ([], None, None), ([], None, None)])
+        self.assertTrue(any("got no window" in line for line in logs.output))
+
+
+class TestRowShortCleanup(CustomTestCase):
+    def test_short_request_frees_its_lease_and_warns_once(self):
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_lease as lease,
+            clear_tree_ledger as ledger,
+        )
+
+        host = SimpleNamespace(_opt_la_batches={"long": {}, "other": {}})
+        req = SimpleNamespace(
+            rid="long",
+            origin_input_ids=list(range(7)),
+            output_ids=[1, 2],
+            opt_prefill_tail_logits=torch.zeros(1),
+        )
+        with patch.object(
+            lease, "opt_kv_release_allowed", return_value=True
+        ), patch.object(lease, "release_clear_tree_lease") as free_lease, patch.object(
+            lease, "release_opt_bonus_guesses"
+        ) as free_bonus, patch.object(
+            ledger, "mark_round_row_short"
+        ) as mark, patch.object(
+            forward, "_opt_draft_count"
+        ) as count, self.assertLogs(forward.logger, level="WARNING") as logs:
+            # PREFILL first: it frees and warns but leaves the ledger alone.
+            forward._drop_row_short(host, [req], 8, step=False)
+            mark.assert_not_called()
+            count.assert_not_called()
+            forward._drop_row_short(host, [req], 8, step=True)
+            forward._drop_row_short(host, [req], 8, step=True)
+        self.assertEqual(free_lease.call_args_list, [((host, req),)] * 3)
+        self.assertEqual(free_bonus.call_args_list, [((host, req),)] * 3)
+        self.assertEqual(mark.call_args_list, [((host, ["long"]),)] * 2)
+        self.assertEqual(count.call_args_list, [((host, "opt_row_short_rounds"),)] * 2)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIsNone(req.opt_prefill_tail_logits)
+        # Its lookahead decode batch is gone; other requests keep theirs.
+        self.assertEqual(set(host._opt_la_batches), {"other"})
+
+    def test_release_waits_for_a_clean_device(self):
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_lease as lease,
+            clear_tree_ledger as ledger,
+        )
+
+        req = SimpleNamespace(rid="long", origin_input_ids=[1] * 9, output_ids=[])
+        with patch.object(
+            lease, "opt_kv_release_allowed", return_value=False
+        ), patch.object(lease, "release_clear_tree_lease") as free_lease, patch.object(
+            lease, "release_opt_bonus_guesses"
+        ) as free_bonus, patch.object(ledger, "mark_round_row_short"), patch.object(
+            forward, "_opt_draft_count"
+        ):
+            host = SimpleNamespace(_opt_la_batches={"long": {}})
+            forward._drop_row_short(host, [req], 8, step=True)
+        free_lease.assert_not_called()
+        free_bonus.assert_not_called()
+        # The decode batch is host state, not KV: it goes even then.
+        self.assertEqual(host._opt_la_batches, {})
+
+
+class TestRowCappedCounting(CustomTestCase):
+    def test_capped_trees_are_stamped_and_counted_once(self):
+        config = ClearTreeConfig(width=2, tau=0.0, max_depth=6)
+        states, _plan = forward._round_states(None, config, 3, [4, None, 6])
+        self.assertEqual([s.config.max_depth for s in states], [4, 6, 6])
+        self.assertEqual(
+            [getattr(s, "row_capped", False) for s in states], [True, False, False]
+        )
+        host = SimpleNamespace()
+        with patch.object(forward, "_opt_draft_count") as count:
+            forward.count_row_capped(host, states)
+            forward.count_row_capped(host, states[1:])
+        count.assert_called_once_with(host, "opt_row_depth_capped", 1)
+
+    def test_partial_batch_counts_only_the_trees_it_keeps(self):
+        # Two capped trees; the second layer forward failed, so request 1 is
+        # rebuilt by ``_clear_expand_one``, which counts its own tree.
+        config = ClearTreeConfig(width=2, tau=0.0, max_depth=6)
+        states, _plan = forward._round_states(None, config, 2, [3, 4])
+        rebuilt, _plan = forward._round_states(None, config, 1, [4])
+        host = SimpleNamespace()
+        with patch.object(forward, "_opt_draft_count") as count:
+            forward.count_row_capped(host, states, [("window",), None])
+            forward.count_row_capped(host, rebuilt)
+            forward.count_row_capped(host, states, [None, None])
+        self.assertEqual(
+            count.call_args_list,
+            [((host, "opt_row_depth_capped", 1),)] * 2,
+        )
+
+    def test_row_capped_round_is_not_a_width_pair_sample(self):
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_replay as replay,
+        )
+
+        config = ClearTreeConfig(width=2, tau=0.0, max_depth=6)
+        r = TestGroupLookahead._run_pair(
+            self, [2, 3], k=4, prefixes=[10, 11], bonus=False
+        )
+        plan = SimpleNamespace(
+            width=2,
+            batch=2,
+            replay_eligible=True,
+            theta_value=None,
+            locked_k=4,
+            _frozen_k=4,
+            _time=lambda k: 1.0,
+            flat_k=4,
+        )
+        reqs = [SimpleNamespace(rid="r0"), SimpleNamespace(rid="r1")]
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            clean = replay.hold_replay(
+                SimpleNamespace(), reqs, r["states"], plan, token=1, served=2
+            )
+            forward._apply_depth_cap(r["states"][0], config, 3)
+            capped = replay.hold_replay(
+                SimpleNamespace(), reqs, r["states"], plan, token=1, served=2
+            )
+        self.assertTrue(clean["eligible"])
+        self.assertFalse(clean["row_capped"])
+        self.assertFalse(capped["eligible"])
+        self.assertTrue(capped["row_capped"])
+
+
+class TestReplayRowsMatchLaunches(CustomTestCase):
+    """The width replay prices each layer at the trees really launched."""
+
+    def _rows(self, states):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
+            _freeze_layer_rows,
+        )
+
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            return _freeze_layer_rows(SimpleNamespace(), states)
+
+    def test_lookahead_rows_follow_the_launch_sizes(self):
+        stops = [1, 3, 2]
+        r = TestGroupLookahead._run_pair(
+            self, stops, k=4, prefixes=[10, 11, 12], bonus=False
+        )
+        launches = [len(call.args[1]) for call in r["launch"].call_args_list]
+        # Layer d is launched for every tree with depth >= d.
+        self.assertEqual(launches, [3, 2, 1])
+        forward.note_forwarded_layers(r["states"], r["runners"], 2)
+        self.assertEqual([s.forwarded_layers for s in r["states"]], stops)
+        rows = self._rows(r["states"])
+        # The deepest tree's last launch is off the critical path.
+        self.assertEqual([row["active"] for row in rows], launches[:-1])
+        self.assertEqual([row["sum_ell"] for row in rows], [33, 23])
+        # Layer-by-layer forwards only trees that keep growing.
+        ordinary = self._rows(r["ref_states"])
+        self.assertEqual([row["active"] for row in ordinary], [2, 1])
+        self.assertEqual([row["sum_ell"] for row in ordinary], [23, 11])
+
+    def test_ordinary_stamps_keep_the_old_rows(self):
+        stops = [1, 3, 2]
+        r = TestGroupLookahead._run_pair(
+            self, stops, k=4, prefixes=[10, 11, 12], bonus=False
+        )
+        runners = [
+            SimpleNamespace(prefix_len=p, cached_len=p + (d - 1) * 2)
+            for p, d in zip([10, 11, 12], stops)
+        ]
+        forward.note_forwarded_layers(r["ref_states"], runners, 2)
+        self.assertEqual([s.forwarded_layers for s in r["ref_states"]], [0, 2, 1])
+        rows = self._rows(r["ref_states"])
+        self.assertEqual([row["active"] for row in rows], [2, 1])
 
 
 class TestDraftHeaderLookahead(CustomTestCase):

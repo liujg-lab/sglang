@@ -20,7 +20,7 @@ import logging
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
@@ -478,7 +478,107 @@ def produce_opt_windows(scheduler, action, pairs) -> list:
     A short committed tail is written by the seed extend. Grammar replay
     still runs first: that forward clears the grammar, and the replay keeps
     constraints aligned with the committed tokens.
+
+    A request whose committed length is past its ``req_to_token`` row gets
+    an empty draft and is not materialized: its prefix map would spill into
+    the next row. The committed length only grows, so it stays empty.
     """
+    if not pairs:
+        return []
+    row = _req_row_width(scheduler)
+    short = set()
+    if row is not None:
+        short = {
+            index
+            for index, (_dreq, req) in enumerate(pairs)
+            if _committed_len(req) > row
+        }
+    if not short:
+        return _produce_fitting_windows(scheduler, action, pairs)
+    from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
+
+    _opt_draft_count(scheduler, "opt_row_short_empty", len(short))
+    _drop_row_short(
+        scheduler,
+        [pairs[index][1] for index in sorted(short)],
+        row,
+        step=action == SRAction.STEP,
+    )
+    fitting = [pair for index, pair in enumerate(pairs) if index not in short]
+    produced = list(_produce_fitting_windows(scheduler, action, fitting))
+    if len(produced) < len(fitting):
+        # Without row-short requests the caller's zip would have left these
+        # replies empty; keep that instead of failing the whole packet.
+        logger.warning(
+            "[OPT] %d of %d fitting draft requests got no window; sending empty drafts",
+            len(fitting) - len(produced),
+            len(fitting),
+        )
+        produced.extend([([], None, None)] * (len(fitting) - len(produced)))
+    produced_iter = iter(produced)
+    return [
+        ([], None, None) if index in short else next(produced_iter)
+        for index in range(len(pairs))
+    ]
+
+
+# Rids already warned about; a long request stays short for every later STEP.
+_ROW_SHORT_WARNED_MAX = 4096
+
+
+def _drop_row_short(scheduler, reqs, row: int, step: bool) -> None:
+    """Free what a row-short request still holds; on STEP, fix the ledger round.
+
+    Such a request never reaches ``consume_clear_tree_lease`` again, so the
+    tree lease and bonus guesses of its last grown round are freed here, the
+    same way a misaligned lease is. Its committed prefix KV stays until the
+    request finishes. Its cached lookahead decode batch is dropped too; that
+    is host state, not KV, so it does not wait for a clean device. On STEP
+    the open ledger round is this packet's round,
+    so these rids leave it (``mark_round_row_short``) and the round is
+    counted in ``opt_row_short_rounds``. A PREFILL only adds a gap to the
+    previous round and does not touch it.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_lease import (
+        opt_kv_release_allowed,
+        release_clear_tree_lease,
+        release_opt_bonus_guesses,
+    )
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        mark_round_row_short,
+    )
+
+    release = opt_kv_release_allowed(scheduler)
+    warned = getattr(scheduler, "_clear_row_short_warned", None)
+    if not isinstance(warned, set) or len(warned) > _ROW_SHORT_WARNED_MAX:
+        warned = set()
+        scheduler._clear_row_short_warned = warned
+    for req in reqs:
+        clear_prefill_tail_logits(req)
+        if release:
+            release_clear_tree_lease(scheduler, req)
+            release_opt_bonus_guesses(scheduler, req)
+        rid = getattr(req, "rid", None)
+        drop_lookahead_request(scheduler, rid)
+        if rid in warned:
+            continue
+        warned.add(rid)
+        logger.warning(
+            "[OPT] draft %s committed length %d exceeds req_to_token width %d; "
+            "it gets no Draft KV and no drafts",
+            rid,
+            _committed_len(req),
+            row,
+        )
+    if step:
+        _opt_draft_count(scheduler, "opt_row_short_rounds")
+        mark_round_row_short(
+            scheduler, [str(getattr(req, "rid", "")) for req in reqs]
+        )
+
+
+def _produce_fitting_windows(scheduler, action, pairs) -> list:
+    """``produce_opt_windows`` for requests whose committed length fits a row."""
     from sglang.srt.speculative.standalone_remote.sr_protocol import SRAction
 
     if not pairs:
@@ -1103,9 +1203,115 @@ def _cut_deferred(plan, states, pending, results) -> None:
         pending.remove(index)
 
 
-def _round_states(scheduler, config: ClearTreeConfig, count: int):
-    """One tree per request, bound to this round's plan, rid and prefix."""
+class RowOverflow(RuntimeError):
+    """A layer would write past its request's ``req_to_token`` row."""
+
+
+def _req_row_width(scheduler) -> Optional[int]:
+    """Columns in one ``req_to_token`` row, or None when there is no pool."""
+    pool = getattr(getattr(scheduler, "req_to_token_pool", None), "req_to_token", None)
+    shape = getattr(pool, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    return int(shape[1])
+
+
+def row_layer_cap(scheduler, cached_len: int, width: int) -> Optional[int]:
+    """Whole ``width``-token layers that still fit after ``cached_len``.
+
+    The map write (``assign_req_to_token_pool``) has no column bound: a column
+    past the row lands in the next request's row. None when there is no pool.
+    """
+    row = _req_row_width(scheduler)
+    if row is None:
+        return None
+    return max((row - int(cached_len)) // max(int(width), 1), 0)
+
+
+def _require_row_room(scheduler, runners, width: int, starts=None) -> None:
+    """Raise ``RowOverflow`` before any slot is allocated for a short row."""
+    row = _req_row_width(scheduler)
+    if row is None:
+        return
+    if starts is None:
+        starts = [int(runner.cached_len) for runner in runners]
+    for runner, start in zip(runners, starts):
+        if int(start) + int(width) > row:
+            _opt_draft_count(scheduler, "opt_row_overflow_blocked")
+            raise RowOverflow(
+                f"OPT draft {getattr(runner.req, 'rid', None)} columns "
+                f"[{int(start)}, {int(start) + int(width)}) exceed req_to_token "
+                f"width {row}"
+            )
+
+
+def row_max_depths(scheduler, runners, config: ClearTreeConfig) -> Optional[list]:
+    """Per tree ``max_depth`` so every layer this round writes fits its row.
+
+    A tree with final depth D writes at most D layers: lookahead launches
+    layer d before judging d, and the ordinary path forwards the last layer
+    after the reply when KV reuse defers it. ``max_depth`` M stops growth at
+    depth M - 1, so M = cap + 1 keeps D <= cap. M is at least 2 (a seed-only
+    tree); with cap 0 that tree writes nothing before the reply, admission
+    keeps it off lookahead and the deferred forward skips it. None entries
+    leave the round's config. Returns None when no tree is capped. Nothing
+    is counted here: a lookahead fallback asks again for the same round, so
+    ``count_row_capped`` counts the trees the round finally kept.
+    """
+    if _req_row_width(scheduler) is None:
+        return None
+    caps = []
+    for runner in runners:
+        cap = row_layer_cap(scheduler, int(runner.prefix_len), int(config.width))
+        if cap is None or cap + 1 >= int(config.max_depth):
+            caps.append(None)
+            continue
+        caps.append(max(cap + 1, 2))
+    if all(cap is None for cap in caps):
+        return None
+    return caps
+
+
+def _apply_depth_cap(state, config: ClearTreeConfig, cap) -> None:
+    """Give one tree a lower ``max_depth``; its tensors keep the round's size.
+
+    ``row_capped`` marks the tree for ``count_row_capped`` and for the width
+    replay, which must not compare widths on a tree the row cut short.
+    """
+    if cap is None or int(cap) >= int(config.max_depth):
+        return
+    state.config = replace(config, max_depth=int(cap))
+    state.row_capped = True
+
+
+def count_row_capped(scheduler, states, windows=None) -> None:
+    """Count this round's row-capped trees once, after growth is final.
+
+    With ``windows``, only trees whose window survived count: a request whose
+    window is None is rebuilt by ``_clear_expand_one``, which counts its own
+    tree.
+    """
+    if windows is not None:
+        states = [
+            state
+            for index, state in enumerate(states)
+            if index < len(windows) and windows[index] is not None
+        ]
+    capped = sum(1 for state in states if getattr(state, "row_capped", False))
+    if capped:
+        _opt_draft_count(scheduler, "opt_row_depth_capped", capped)
+
+
+def _round_states(scheduler, config: ClearTreeConfig, count: int, depth_caps=None):
+    """One tree per request, bound to this round's plan, rid and prefix.
+
+    ``depth_caps[i]``, when not None, is tree ``i``'s ``max_depth``
+    (``row_max_depths``).
+    """
     states = [ClearTreeState.create(config) for _ in range(int(count))]
+    for index, state in enumerate(states):
+        if depth_caps is not None and index < len(depth_caps):
+            _apply_depth_cap(state, config, depth_caps[index])
     plan = (
         getattr(scheduler, "_clear_round_plan", None) if scheduler is not None else None
     )
@@ -1137,6 +1343,7 @@ def grow_active_layers(
     scheduler=None,
     states_out=None,
     topk_out=None,
+    depth_caps=None,
 ):
     """Grow one tree per tail. Requests still at one depth share a forward.
 
@@ -1150,9 +1357,10 @@ def grow_active_layers(
     ``states_out``, when given, receives each tree in tail order before any
     forward. The last layer is present and is not forwarded.
     ``topk_out[i]`` collects that tail's host id tensors, root first.
+    ``depth_caps`` lowers single trees' ``max_depth`` (``row_max_depths``).
     """
     tails = list(tail_logits)
-    states, plan = _round_states(scheduler, config, len(tails))
+    states, plan = _round_states(scheduler, config, len(tails), depth_caps)
     if states_out is not None:
         states_out.extend(states)
     steps = [None] * len(tails)
@@ -1507,6 +1715,7 @@ class OptLayerForward:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         scheduler = self.scheduler
+        _require_row_room(scheduler, [self], n)
         self._la_seq.fill_(self.cached_len)
         out_cache_loc = alloc_token_slots(scheduler.tree_cache, n)
         try:
@@ -1543,6 +1752,7 @@ class OptLayerForward:
         page = int(getattr(tree_cache, "page_size", 1) or 1)
         device = scheduler.req_to_token_pool.device
         base = self.cached_len if start is None else int(start)
+        _require_row_room(scheduler, [self], n, starts=[base])
         seq = torch.tensor([base], dtype=torch.int64, device=device)
         pool_index = torch.tensor(
             [int(self.req.req_pool_idx)], dtype=torch.int64, device=device
@@ -2146,6 +2356,8 @@ def _forward_verify_batch(scheduler, runners, steps) -> torch.Tensor:
         device,
         model_runner=_model_runner_of(scheduler),
     )
+    # Every row first: a later short row must not leave earlier ones allocated.
+    _require_row_room(scheduler, runners, width)
     locs = []
     cached = []
     for runner in runners:
@@ -2369,6 +2581,23 @@ def ingest_tail_logits(scheduler, runners, phases=None) -> List[torch.Tensor]:
         ):
             logits[id(runner)] = row
     return [logits[id(runner)] for runner in runners]
+
+
+def note_forwarded_layers(states, runners, width: int) -> None:
+    """Stamp each tree with the layers forwarded for it before the reply.
+
+    The width replay prices each layer row with the trees that were really
+    in that forward. Lookahead launches layer d before judging d, so a tree
+    that stops at d was in layer d's forward; the ordinary path forwards
+    only trees that keep growing. ``cached_len`` counts both: every forward
+    advanced it by ``width``. A deferred post-reply layer is not counted yet.
+    """
+    step = max(int(width), 1)
+    for state, runner in zip(states, runners):
+        if state is None or runner is None:
+            continue
+        written = int(runner.cached_len) - int(runner.prefix_len)
+        state.forwarded_layers = max(written // step, 0)
 
 
 def _committed_len(req) -> int:
@@ -4121,6 +4350,7 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     ``opt_lookahead_eager_layers``.
     """
     n = _round_width(scheduler)
+    _admit_lookahead_rows(scheduler, [runner], n)
     try:
         need = _lookahead_tree_need(scheduler, _lookahead_ingest_slots(runner))
     except Exception as exc:
@@ -4173,6 +4403,26 @@ def _admit_lookahead(scheduler, runner, batch) -> None:
     _reserve_lookahead_runner(scheduler, runner, need)
 
 
+def _admit_lookahead_rows(scheduler, runners, width: int) -> None:
+    """Lookahead launches layer 1 before any stop; it must fit every row.
+
+    Deeper layers are kept inside the row by ``row_max_depths``. A row with
+    no room for one layer leaves lookahead; the ordinary path then sends a
+    seed-only tree that writes no layer.
+    """
+    if _req_row_width(scheduler) is None:
+        return
+    for runner in runners:
+        cap = row_layer_cap(scheduler, int(runner.prefix_len), int(width))
+        if cap is not None and cap < 1:
+            _opt_draft_count(scheduler, "opt_lookahead_row_short")
+            raise LookaheadFallback(
+                f"row short rid={getattr(runner.req, 'rid', None)} "
+                f"prefix={int(runner.prefix_len)} width={int(width)} "
+                f"row={_req_row_width(scheduler)}"
+            )
+
+
 def _reserve_lookahead_runner(scheduler, runner, need: int) -> None:
     """``_lookahead_reserve_kv``; a fallback also clears the runner's template."""
     try:
@@ -4192,6 +4442,9 @@ def grow_lookahead(scheduler, runner, config: ClearTreeConfig, tail_logits, runt
     batch, slots, bonus = runtime
     predict_bonus = bonus_prediction_enabled()
     state = ClearTreeState.create(config)
+    caps = row_max_depths(scheduler, [runner], config)
+    if caps is not None:
+        _apply_depth_cap(state, config, caps[0])
     state.decider = getattr(scheduler, "_clear_round_plan", None)
     rids = list(getattr(scheduler, "_clear_round_rids", None) or [])
     prefixes = list(getattr(scheduler, "_clear_round_prefixes", None) or [])
@@ -4533,10 +4786,14 @@ def _admit_lookahead_many(scheduler, runners, width: int) -> None:
     evict; ``_lookahead_reserve_kv`` evicts from a plain radix cache to
     cover it.
 
+    Every row must also hold layer 1 (``_admit_lookahead_rows``); deeper
+    layers stay inside the row through ``row_max_depths``.
+
     Templates for ``1 .. len(runners)`` trees are built here so no layer
     builds one. Only a miss at the full size falls back; a smaller size
     without a template runs that layer through ``_verify_batch_many``.
     """
+    _admit_lookahead_rows(scheduler, runners, width)
     try:
         need = sum(
             _lookahead_tree_need(scheduler, _lookahead_ingest_slots(runner))
@@ -4634,6 +4891,7 @@ def _launch_layer_many(scheduler, runners, tokens_dev, anc_dev, depth: int, widt
                 for prefix, ancestor in zip(prefixes, ancestors)
             ]
         )
+    _require_row_room(scheduler, runners, n, starts=cached)
     out_cache_loc = alloc_token_slots(scheduler.tree_cache, m * n)
     try:
         if int(out_cache_loc.numel()) != m * n:
@@ -4748,7 +5006,9 @@ def grow_lookahead_many(scheduler, runners, config: ClearTreeConfig, tails, stat
         cache = _lookahead_group_cache(scheduler, n, count)
         slots = cache["slots"]
         bonuses = cache["bonus"]
-        states, plan = _round_states(scheduler, config, count)
+        states, plan = _round_states(
+            scheduler, config, count, row_max_depths(scheduler, runners, config)
+        )
         states_out.extend(states)
         for runner in runners:
             runner.bonus_ids = []
@@ -4996,6 +5256,15 @@ def forward_deferred_final_layers(scheduler, jobs) -> None:
                 skipped.append(job)
                 continue
             if getattr(runner, "_lookahead_satisfied", False):
+                continue
+            room = row_layer_cap(
+                scheduler, int(runner.cached_len), int(job.state.config.width)
+            )
+            if room is not None and room < 1:
+                # Only a seed-only tree on a full row gets here
+                # (``row_max_depths``); with no layer slots it rolls back.
+                _opt_draft_count(scheduler, "opt_row_final_skipped")
+                skipped.append(job)
                 continue
             by_depth.setdefault(int(job.state.depth), []).append(job)
         for group in by_depth.values():
@@ -5343,6 +5612,7 @@ def grow_batch(scheduler, reqs):
                 scheduler,
                 states_out=states,
                 topk_out=topk_out,
+                depth_caps=row_max_depths(scheduler, runners, config),
             )
             for index, runner in enumerate(runners):
                 runner.bonus_ids = topk_out[index] if topk_out is not None else []
@@ -5360,6 +5630,8 @@ def grow_batch(scheduler, reqs):
                 queue_hold_replay,
             )
 
+            count_row_capped(scheduler, states, windows)
+            note_forwarded_layers(states, runners, config.width)
             queue_hold_replay(scheduler, reqs, states, plan)
         mark_stop(scheduler)
         return windows
