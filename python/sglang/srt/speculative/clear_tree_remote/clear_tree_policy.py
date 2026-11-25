@@ -64,6 +64,8 @@ EXPLORE_EVERY = 20
 PROBE_RUNS = 2
 VERIFY_WINDOW = 16
 CALIBRATE_LAMBDA = 3.0
+# Half-life of the pooled accept ratio, in units of verified path mass.
+ACCEPT_HALF_LIFE = 1000.0
 PRICE_EMA_FLOOR = 0.05
 PRICE_PRIOR_N0 = 10.0
 
@@ -958,8 +960,37 @@ def compare_price(rounds, gaps) -> Dict[int, dict]:
     return report
 
 
+def accept_half_life() -> float:
+    """Path mass after which an old accept weighs half. 0 keeps every round.
+
+    ``SGLANG_CLEAR_ACCEPT_HALF_LIFE`` overrides the default; a value that is
+    not a number keeps the default, and a value at or below 0 turns
+    forgetting off.
+    """
+    raw = os.environ.get("SGLANG_CLEAR_ACCEPT_HALF_LIFE", "").strip()
+    if not raw:
+        return ACCEPT_HALF_LIFE
+    try:
+        value = float(raw)
+    except ValueError:
+        return ACCEPT_HALF_LIFE
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return value
+
+
+def per_request_accept_enabled() -> bool:
+    """``SGLANG_CLEAR_ACCEPT_PER_REQUEST=1`` shrinks each request toward the pool."""
+    return os.environ.get("SGLANG_CLEAR_ACCEPT_PER_REQUEST", "").strip() == "1"
+
+
 def observe_accept(rid: str, accepted: float, expected: float) -> None:
-    """One settled round. ``expected`` is the path mass of the verified nodes."""
+    """One settled round. ``expected`` is the path mass of the verified nodes.
+
+    The pooled totals forget by path mass, so a batch round ages the pool as
+    much as its mass says. The request totals never forget; they only feed
+    the per-request switch.
+    """
     global _total_a, _total_e
     key = str(rid)
     taken = max(float(accepted), 0.0)
@@ -968,16 +999,38 @@ def observe_accept(rid: str, accepted: float, expected: float) -> None:
         return
     _sum_a[key] = _sum_a.get(key, 0.0) + taken
     _sum_e[key] = _sum_e.get(key, 0.0) + mass
+    half_life = accept_half_life()
+    if half_life > 0 and mass > 0:
+        keep = 0.5 ** (mass / half_life)
+        _total_a *= keep
+        _total_e *= keep
     _total_a += taken
     _total_e += mass
 
 
+def pooled_accept_ratio() -> float:
+    """Accepts over path mass across all requests, with a prior of 1.
+
+    The prior weighs ``CALIBRATE_LAMBDA`` units of mass, so one early round
+    with no accept does not drive the ratio to 0.
+    """
+    return (_total_a + CALIBRATE_LAMBDA) / (_total_e + CALIBRATE_LAMBDA)
+
+
 def accept_ratio(rid: str) -> float:
-    """Shrink the request ratio toward the pooled ratio. Empty data stays 1."""
+    """The accept ratio a request's path mass is scaled by.
+
+    By default every request uses the pooled ratio. Measured per-request
+    ratios differed by little more than sampling noise, and shrinking toward
+    them predicted accepts worse than the pool. The per-request switch
+    restores the shrink toward the pool.
+    """
+    pooled = pooled_accept_ratio()
+    if not per_request_accept_enabled():
+        return pooled
     key = str(rid)
     taken = _sum_a.get(key, 0.0)
     mass = _sum_e.get(key, 0.0)
-    pooled = (_total_a / _total_e) if _total_e > 0 else 1.0
     return (taken + CALIBRATE_LAMBDA * pooled) / (mass + CALIBRATE_LAMBDA)
 
 

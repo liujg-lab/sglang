@@ -132,6 +132,8 @@ _LEDGER_ENV = (
     "SGLANG_CLEAR_LEDGER",
     "SGLANG_CLEAR_TARGET_BACKEND",
     "SGLANG_CLEAR_NPU_KV_BUCKETS",
+    "SGLANG_CLEAR_ACCEPT_HALF_LIFE",
+    "SGLANG_CLEAR_ACCEPT_PER_REQUEST",
 )
 
 
@@ -172,6 +174,8 @@ class ClearTreeLedgerTest(CustomTestCase):
     def setUp(self):
         self._saved = {name: os.environ.get(name) for name in _LEDGER_ENV}
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        os.environ.pop("SGLANG_CLEAR_ACCEPT_HALF_LIFE", None)
+        os.environ.pop("SGLANG_CLEAR_ACCEPT_PER_REQUEST", None)
         reset_target_verify_model()
         reset_policy()
         reset_gain_calibration()
@@ -1189,10 +1193,69 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.replay_kind, "probe_w")
         self.assertFalse(plan.replay_eligible)
 
-    def test_accept_ratio_shrinks_toward_the_pool(self):
+    def test_accept_ratio_is_the_pool_for_every_request(self):
         self.assertEqual(accept_ratio("a"), 1.0)
         observe_accept("a", 1.0, 4.0)
-        self.assertAlmostEqual(accept_ratio("a"), 1.75 / 7.0)
+        # Prior of 1 with weight 3: (1 + 3) / (4 + 3).
+        self.assertAlmostEqual(accept_ratio("a"), 4.0 / 7.0)
+        self.assertAlmostEqual(accept_ratio("b"), 4.0 / 7.0)
+        self.assertAlmostEqual(policy.pooled_accept_ratio(), 4.0 / 7.0)
+
+    def test_first_round_without_accepts_keeps_the_pool_above_zero(self):
+        observe_accept("a", 0.0, 0.5)
+        self.assertAlmostEqual(accept_ratio("a"), 3.0 / 3.5)
+
+    def test_per_request_switch_shrinks_toward_the_pool(self):
+        os.environ["SGLANG_CLEAR_ACCEPT_PER_REQUEST"] = "1"
+        observe_accept("a", 1.0, 4.0)
+        pooled = 4.0 / 7.0
+        self.assertAlmostEqual(accept_ratio("a"), (1.0 + 3.0 * pooled) / 7.0)
+        self.assertAlmostEqual(accept_ratio("b"), pooled)
+        os.environ["SGLANG_CLEAR_ACCEPT_PER_REQUEST"] = "0"
+        self.assertAlmostEqual(accept_ratio("a"), pooled)
+
+    def test_pool_forgets_by_path_mass(self):
+        os.environ["SGLANG_CLEAR_ACCEPT_HALF_LIFE"] = "4"
+        observe_accept("a", 4.0, 4.0)
+        observe_accept("b", 0.0, 4.0)
+        # The old (4, 4) halves before (0, 4) is added: (2 + 3) / (6 + 3).
+        self.assertAlmostEqual(policy.pooled_accept_ratio(), 5.0 / 9.0)
+        # Request totals do not forget; they only feed the per-request switch.
+        self.assertAlmostEqual(policy._sum_a["a"], 4.0)
+        self.assertAlmostEqual(policy._sum_e["a"], 4.0)
+
+    def test_pool_ages_by_mass_not_by_round_count(self):
+        os.environ["SGLANG_CLEAR_ACCEPT_HALF_LIFE"] = "8"
+        observe_accept("a", 8.0, 8.0)
+        observe_accept("b", 0.0, 4.0)
+        observe_accept("b", 0.0, 4.0)
+        two_rounds = (policy._total_a, policy._total_e)
+        reset_policy()
+        observe_accept("a", 8.0, 8.0)
+        observe_accept("c", 0.0, 8.0)
+        self.assertAlmostEqual(policy._total_a, two_rounds[0])
+        self.assertAlmostEqual(policy._total_a, 4.0)
+        self.assertGreater(policy._total_e, 0.0)
+
+    def test_zero_half_life_keeps_every_round(self):
+        os.environ["SGLANG_CLEAR_ACCEPT_HALF_LIFE"] = "0"
+        observe_accept("a", 4.0, 4.0)
+        observe_accept("b", 0.0, 4.0)
+        self.assertAlmostEqual(policy.pooled_accept_ratio(), 7.0 / 11.0)
+
+    def test_accept_half_life_parsing(self):
+        self.assertEqual(policy.accept_half_life(), policy.ACCEPT_HALF_LIFE)
+        self.assertEqual(policy.ACCEPT_HALF_LIFE, 1000.0)
+        for raw, want in (
+            ("250", 250.0),
+            ("0", 0.0),
+            ("-5", 0.0),
+            ("inf", 0.0),
+            ("abc", policy.ACCEPT_HALF_LIFE),
+            ("  ", policy.ACCEPT_HALF_LIFE),
+        ):
+            os.environ["SGLANG_CLEAR_ACCEPT_HALF_LIFE"] = raw
+            self.assertEqual(policy.accept_half_life(), want, raw)
 
     def test_pad_parent_is_not_linked(self):
         layout = build_tree_from_parents(
