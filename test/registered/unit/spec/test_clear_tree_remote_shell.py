@@ -6,6 +6,7 @@ OPT or STANDALONE_REMOTE, and OPT must not pick up ClearTree fields.
 
 import ast
 import os
+from collections import Counter
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
@@ -1053,6 +1054,87 @@ class ClearTreeRpdTest(CustomTestCase):
                         )
                     self.assertGreater(plan.pre_lengths[0], 0)
                     self.assertEqual(plan.pre_lengths[2], 0)
+
+    def test_timed_workspace_matches_the_shared_one(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            clear_rpd_workspace,
+            rpd_valid_masks,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDWorkspace,
+            verify_sr_rpd_host,
+        )
+
+        for k, tau in ((8, 0.3), (16, 0.0)):
+            with self.subTest(k=k, tau=tau):
+                owner, context, plain, logits, _parents, width = self._rpd_round(
+                    k, tau, seed=k + 1
+                )
+                self.assertIsNone(plain.prepare(logits, context))
+                want = verify_sr_rpd_host(logits, context, plain, tau, width)
+                want_masks = rpd_valid_masks(owner, plain, tau)
+
+                owner, context, _w, logits, _parents, width = self._rpd_round(
+                    k, tau, seed=k + 1
+                )
+                timed = clear_rpd_workspace()
+                self.assertIsInstance(timed, SRRPDWorkspace)
+                metrics = SimpleNamespace(counts=Counter())
+                self.assertIsNone(timed.prepare(logits, context, metrics))
+                got = verify_sr_rpd_host(logits, context, timed, tau, width)
+                self.assertEqual(got.rows, want.rows)
+                self.assertEqual(got.tokens, want.tokens)
+                self.assertEqual(got.pre_lengths, want.pre_lengths)
+                self.assertEqual(rpd_valid_masks(owner, timed, tau), want_masks)
+                self.assertEqual(metrics.counts["rpd_host_plan_hit"], 1)
+                stamps = timed.clear_stamps
+                self.assertLessEqual(stamps["stats_start"], stamps["stats_end"])
+                self.assertLessEqual(stamps["stats_end"], stamps["plan"])
+
+    def test_rpd_timing_reads_this_verify_only(self):
+        import time
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            clear_rpd_workspace,
+            rpd_timing,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            verify_sr_rpd_host,
+        )
+
+        owner, context, _w, logits, _parents, width = self._rpd_round(
+            8, 0.3, seed=5
+        )
+        self.assertIsInstance(owner.build_us, int)
+        self.assertGreaterEqual(owner.build_us, 0)
+        spec = SimpleNamespace(sr_rpd_input=context)
+        workspace = clear_rpd_workspace()
+        since = time.perf_counter_ns()
+        workspace.prepare(logits, context)
+        verify_sr_rpd_host(logits, context, workspace, 0.3, width)
+        timing = rpd_timing(owner, workspace, spec, since, mask_us=12)
+        self.assertEqual(timing["rpd_build_us"], owner.build_us)
+        for name in ("rpd_stats_us", "rpd_select_us"):
+            self.assertIsInstance(timing[name], int)
+            self.assertGreaterEqual(timing[name], 0)
+        self.assertEqual(timing["rpd_mask_us"], 12)
+
+        # Stamps from an earlier verify (device fallback this time) are not
+        # this verify's; another context's build is not either.
+        later = rpd_timing(
+            owner, workspace, SimpleNamespace(), time.perf_counter_ns()
+        )
+        self.assertEqual(
+            later,
+            {
+                "rpd_build_us": None,
+                "rpd_stats_us": None,
+                "rpd_select_us": None,
+                "rpd_mask_us": None,
+            },
+        )
+        self.assertIsNone(rpd_timing(None, None, spec, since)["rpd_build_us"])
+        self.assertIsNone(rpd_timing(owner, object(), spec, since)["rpd_stats_us"])
 
     def test_rpd_masks_only_on_tp_rank_zero(self):
         namespace = _source_methods(

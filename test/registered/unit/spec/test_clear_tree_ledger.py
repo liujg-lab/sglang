@@ -93,7 +93,9 @@ from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     LAYER_MIN_SAMPLES,
     LAYER_RIDGE,
     VERIFY_MIN_SAMPLES,
+    VERIFY_TIMING_FIELDS,
     ClearLedger,
+    VerifyWallTimer,
     attach_layer_slope_priors,
     predict_layer_ms,
     note_packet,
@@ -656,6 +658,86 @@ class ClearTreeLedgerTest(CustomTestCase):
                 kv_bucket=256,
             )
         )
+
+    def test_target_verify_timing_fields(self):
+        plain = target_verify_record(
+            rank=0, batch_size=1, k=4, seq_lens=[30], ran_graph=True, kv_bucket=256
+        )
+        for name in VERIFY_TIMING_FIELDS:
+            self.assertIn(name, plain)
+            self.assertIsNone(plain[name])
+        timed = target_verify_record(
+            rank=0,
+            batch_size=4,
+            k=16,
+            seq_lens=[30, 40, 50, 60],
+            ran_graph=True,
+            kv_bucket=256,
+            timing={
+                "verify_wall_us": 47000,
+                "accept_ready_us": 45500.7,
+                "rpd_build_us": 0,
+                "rpd_stats_us": -1,
+                "rpd_select_us": float("nan"),
+                "rpd_mask_us": True,
+                "extra_us": 5,
+            },
+        )
+        self.assertEqual(timed["verify_wall_us"], 47000)
+        self.assertEqual(timed["accept_ready_us"], 45500)
+        self.assertEqual(timed["rpd_build_us"], 0)
+        self.assertIsNone(timed["rpd_stats_us"])
+        self.assertIsNone(timed["rpd_select_us"])
+        self.assertIsNone(timed["rpd_mask_us"])
+        self.assertNotIn("extra_us", timed)
+        self.assertIsNone(
+            target_verify_record(
+                rank=0,
+                batch_size=1,
+                k=4,
+                seq_lens=[30],
+                ran_graph=True,
+                kv_bucket=256,
+                timing="bad",
+            )["verify_wall_us"]
+        )
+
+    def test_verify_wall_timer_stamps_the_accept_ready_hook(self):
+        calls = []
+
+        def hook(batch):
+            calls.append(batch)
+            return "sent"
+
+        batch = SimpleNamespace(sr_accept_ready_hook=hook)
+        timer = VerifyWallTimer(batch)
+        self.assertIsNot(batch.sr_accept_ready_hook, hook)
+        self.assertEqual(batch.sr_accept_ready_hook(batch), "sent")
+        first = timer.ready
+        batch.sr_accept_ready_hook(batch)
+        self.assertEqual(calls, [batch, batch])
+        self.assertEqual(timer.ready, first)
+        timer.stop()
+        self.assertIs(batch.sr_accept_ready_hook, hook)
+        fields = timer.fields()
+        self.assertGreaterEqual(fields["accept_ready_us"], 0)
+        self.assertGreaterEqual(fields["verify_wall_us"], fields["accept_ready_us"])
+
+        # No hook: nothing is installed and accept_ready_us stays null.
+        bare = SimpleNamespace()
+        timer = VerifyWallTimer(bare)
+        timer.stop()
+        self.assertFalse(hasattr(bare, "sr_accept_ready_hook"))
+        self.assertIsNone(timer.fields()["accept_ready_us"])
+        self.assertIsNotNone(timer.fields()["verify_wall_us"])
+
+        # A hook the scheduler replaced during verify is left alone.
+        batch = SimpleNamespace(sr_accept_ready_hook=hook)
+        timer = VerifyWallTimer(batch)
+        batch.sr_accept_ready_hook = None
+        timer.stop()
+        self.assertIsNone(batch.sr_accept_ready_hook)
+        self.assertIsNone(timer.fields()["accept_ready_us"])
 
     def test_verify_host_us_reads_the_existing_counter(self):
         metrics = SimpleNamespace(_round_host={"verify_forward": 0.00125})

@@ -2584,6 +2584,7 @@ def target_verify_record(
     device_us: Optional[int] = None,
     verify_id: Optional[int] = None,
     rpc_seq: Optional[int] = None,
+    timing: Optional[dict] = None,
 ) -> Optional[dict]:
     """One Target verify line. ``kv_bucket`` comes from ``select_tree_kv_bucket``.
 
@@ -2593,6 +2594,8 @@ def target_verify_record(
     the next ``poll`` emits ``t_verify_device`` and fits there.
     A ready graph sample updates the Target verify model. Eager and
     over-bucket rows are logged only.
+    ``timing`` holds the host wall stages in ``VERIFY_TIMING_FIELDS``; each
+    missing or invalid one is null. They are logged only.
     """
     if not ledger_enabled() or int(rank) != 0:
         return None
@@ -2631,8 +2634,96 @@ def target_verify_record(
         "verify_residual": residual,
         "verify_fit": fitted,
     }
+    record.update(_verify_timing_fields(timing))
     _emit("t_verify", record)
     return record
+
+
+# Host wall stages of one Target verify, in microseconds (``t_verify``).
+# verify_wall_us: the whole ClearTree verify call, forward included.
+# accept_ready_us: verify start to the accept-ready hook that sends the
+#   next STEP, so the part of this verify inside the Draft's H.
+# rpd_build_us: RPD topology build and edge upload, done while the verify
+#   input was built, before verify starts.
+# rpd_stats_us: RPD edge statistics, D2H copies and the wait for the forward.
+# rpd_select_us: RPD host path selection after the statistics.
+# rpd_mask_us: acceptable-slot masks, after the next STEP was sent.
+VERIFY_TIMING_FIELDS = (
+    "verify_wall_us",
+    "accept_ready_us",
+    "rpd_build_us",
+    "rpd_stats_us",
+    "rpd_select_us",
+    "rpd_mask_us",
+)
+
+
+def _verify_timing_fields(timing) -> dict:
+    out = {}
+    source = timing if isinstance(timing, dict) else {}
+    for name in VERIFY_TIMING_FIELDS:
+        value = source.get(name)
+        valid = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and value >= 0
+        )
+        out[name] = int(value) if valid else None
+    return out
+
+
+class VerifyWallTimer:
+    """Wall stamps of one Target verify. Never raises.
+
+    The batch's ``sr_accept_ready_hook`` is wrapped so the moment accept is
+    ready (just before the next STEP is sent) is stamped once; ``stop``
+    restores the hook the scheduler installed.
+    """
+
+    def __init__(self, batch) -> None:
+        self.batch = batch
+        self.start = time.perf_counter_ns()
+        self.ready: Optional[int] = None
+        self.end: Optional[int] = None
+        self._hook = None
+        self._stamped = None
+        try:
+            hook = getattr(batch, "sr_accept_ready_hook", None)
+            if hook is not None:
+
+                def stamped(*args, **kwargs):
+                    if self.ready is None:
+                        self.ready = time.perf_counter_ns()
+                    return hook(*args, **kwargs)
+
+                batch.sr_accept_ready_hook = stamped
+                self._hook, self._stamped = hook, stamped
+        except Exception:
+            self._hook = self._stamped = None
+
+    def stop(self) -> None:
+        if self.end is None:
+            self.end = time.perf_counter_ns()
+        try:
+            if (
+                self._stamped is not None
+                and getattr(self.batch, "sr_accept_ready_hook", None)
+                is self._stamped
+            ):
+                self.batch.sr_accept_ready_hook = self._hook
+        except Exception:
+            pass
+
+    def fields(self) -> dict:
+        return {
+            "verify_wall_us": (
+                None if self.end is None else (self.end - self.start) // 1000
+            ),
+            "accept_ready_us": (
+                None if self.ready is None else (self.ready - self.start) // 1000
+            ),
+        }
 
 
 def read_verify_host_us(metrics) -> Optional[int]:

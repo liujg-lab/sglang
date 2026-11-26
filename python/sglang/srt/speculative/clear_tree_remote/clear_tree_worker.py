@@ -9,6 +9,7 @@ an unlinked pad. The mask comes from ``build_tree_from_parents``.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 import torch
@@ -53,6 +54,13 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             nccl_port,
             target_worker,
         )
+        if getattr(self, "_rpd_workspace", None) is not None:
+            # Same shared workspace, plus host stage stamps for ``t_verify``.
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+                clear_rpd_workspace,
+            )
+
+            self._rpd_workspace = clear_rpd_workspace()
 
     def construct_draft_input(
         self,
@@ -223,6 +231,13 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
         metrics = getattr(batch, "sr_round_metrics", None)
         frozen = self._freeze_verify_shape(batch, spec_info)
         seq_lens = list(frozen["seq_lens"])
+        timer = None
+        if enabled:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+                VerifyWallTimer,
+            )
+
+            timer = VerifyWallTimer(batch)
         if enabled and metrics is not None:
             from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
                 install_clear_device_emit,
@@ -235,13 +250,19 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             result = super().verify(batch, spec_info)
             ok = True
         finally:
+            if timer is not None:
+                timer.stop()
             if enabled and metrics is not None:
                 metrics._clear_ledger_device = False
                 if not ok:
                     metrics._clear_device_open.clear()
+        mask_us = None
         if ok:
             # No metrics means no report is stored, so the masks would be lost.
+            mask_started = time.perf_counter_ns()
             masks = self._rpd_masks() if metrics is not None else None
+            if masks is not None:
+                mask_us = (time.perf_counter_ns() - mask_started) // 1000
             self._store_verify_report(
                 batch, spec_info, result, metrics, frozen, rpd=masks
             )
@@ -292,6 +313,21 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                 push_verify_sample(
                     metrics, int(size), int(k), bucket, int(device_us), ran_graph
                 )
+            timing = timer.fields()
+            if getattr(self.server_args, "speculative_verify_mode", None) == "rpd":
+                from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+                    rpd_timing,
+                )
+
+                timing.update(
+                    rpd_timing(
+                        getattr(self, "_clear_rpd_owner", None),
+                        getattr(self, "_rpd_workspace", None),
+                        spec_info,
+                        timer.start,
+                        mask_us,
+                    )
+                )
             target_verify_record(
                 rank=int(getattr(self, "tp_rank", 0) or 0),
                 batch_size=int(size),
@@ -303,6 +339,7 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                 device_us=device_us,
                 verify_id=verify_id,
                 rpc_seq=None if rpc_seq is None else int(rpc_seq),
+                timing=timing,
             )
         except Exception:
             logger.warning("[CLEAR ledger] target verify log failed", exc_info=True)
