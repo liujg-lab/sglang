@@ -1,0 +1,92 @@
+{
+  "run_id": "2026-11-26-e",
+  "verify_mode": "rpd",
+  "rpd_tau": 0.2,
+  "reuse_fit_file": true,
+  "greedy_fit": "ABSENT",
+  "rpd_fit_sha256_before": "0d872ad58e3e08860966c3247bed6b2188be7da5c40a8608826711d9f44e0feb",
+  "rpd_fit_sha256_after": "0d872ad58e3e08860966c3247bed6b2188be7da5c40a8608826711d9f44e0feb",
+  "fit_state": "ready",
+  "fit_reason": "ready",
+  "prefit_started": false,
+  "rpd_fit_cells": 90,
+  "reference_26d": {
+    "01": {"tok_s": 59.553, "accept_rate": 0.419254},
+    "02": {"tok_s": 159.523, "accept_rate": 0.334098},
+    "median_rpd_build_us": 875
+  },
+  "timing": {
+    "post_ready_t_verify": 13874,
+    "path": "graph",
+    "fallback": 0,
+    "nulls": 0,
+    "median_us": {
+      "verify_wall_us": 43391,
+      "accept_ready_us": 41228,
+      "rpd_build_us": 173,
+      "rpd_stats_us": 33281,
+      "rpd_select_us": 64,
+      "rpd_mask_us": 67
+    },
+    "median_rpd_build_us_by_bk": {
+      "1,8": {"n": 162, "us": 138, "ref_26d_us": 441},
+      "1,16": {"n": 2632, "us": 149, "ref_26d_us": 585},
+      "1,32": {"n": 7673, "us": 173, "ref_26d_us": 875},
+      "1,64": {"n": 339, "us": 217, "ref_26d_us": 1374},
+      "4,8": {"n": 952, "us": 197, "ref_26d_us": 898},
+      "4,16": {"n": 1975, "us": 241, "ref_26d_us": 1471}
+    }
+  },
+  "trials": [
+    {
+      "trial": "01",
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "ok": 100,
+      "tokens": 46022,
+      "wall_s": 764.234,
+      "tok_s": 60.219776,
+      "accept": 35600,
+      "draft": 84496,
+      "accept_rate": 0.421322,
+      "fallback": 0,
+      "client_concurrency": 1.0,
+      "rounds": 10562,
+      "scored": 10462,
+      "left_flat": 7988,
+      "k_mode": {"value": 10462},
+      "accepted": 35083,
+      "e_pred": 35029.462217,
+      "e_pred_over_accepted": 0.998474,
+      "d_rpd_rounds": 10362,
+      "accept_k_rows": 10362,
+      "rpd_ok_false": 0,
+      "scored_missing_d_rpd": 100
+    },
+    {
+      "trial": "02",
+      "dataset": "RSTeller",
+      "concurrency": 4,
+      "ok": 100,
+      "tokens": 45152,
+      "wall_s": 278.918,
+      "tok_s": 161.882704,
+      "accept": 33124,
+      "draft": 97392,
+      "accept_rate": 0.340110,
+      "fallback": 0,
+      "client_concurrency": 3.924,
+      "rounds": 3134,
+      "scored": 2940,
+      "left_flat": 2109,
+      "k_mode": {"value": 2921, "probe": 16, "tau": 3},
+      "accepted": 31332,
+      "e_pred": 31303.982891,
+      "e_pred_over_accepted": 0.999106,
+      "d_rpd_rounds": 2939,
+      "accept_k_rows": 11403,
+      "rpd_ok_false": 0,
+      "scored_missing_d_rpd": 1
+    }
+  ]
+}
