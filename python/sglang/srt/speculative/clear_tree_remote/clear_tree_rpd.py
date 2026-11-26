@@ -4,6 +4,11 @@ The topology is built here from ClearTree parent pointers. Its width is this
 round's verify length K + 1, not the build width W. Selection, statistics, and
 the verify postprocess stay in the shared RPD path. This module does not change
 standalone-remote packets or message fields.
+
+``build_clear_rpd_input`` returns the same ``SRRPDHostInput`` as the shared
+``build_sr_rpd_input`` but links siblings in Python lists and makes each tensor
+once. The shared builder writes two tensor scalars per edge; on the NPU host
+that was about 17 us per verified token inside the Draft's H (run 2026-11-26-d).
 """
 
 from __future__ import annotations
@@ -59,10 +64,7 @@ def attach_clear_rpd_input(
     """
     if getattr(server_args, "speculative_verify_mode", None) != "rpd":
         return owner
-    from sglang.srt.speculative.standalone_remote.sr_rpd import (
-        build_sr_rpd_input,
-        rpd_batch_key,
-    )
+    from sglang.srt.speculative.standalone_remote.sr_rpd import rpd_batch_key
 
     started = time.perf_counter_ns()
     if owner is None:
@@ -75,23 +77,19 @@ def attach_clear_rpd_input(
     bs = len(roots)
     owner.rids = [str(getattr(req, "rid", "")) for req in list(batch.reqs)[:bs]]
     owner.no_draft = [bool(flag) for flag in no_draft]
-    tokens = torch.tensor(token_rows, dtype=torch.int64).reshape(
-        bs, int(num_verify) - 1
-    )
-    context = build_sr_rpd_input(
-        torch.tensor(list(roots), dtype=torch.int64),
-        tokens,
-        torch.tensor(parent_rows, dtype=torch.int64).reshape(bs, int(num_verify) - 1),
-        torch.zeros_like(tokens),
-        topk=int(tree_topk),
-        steps=int(max_depth),
-        width=int(num_verify),
-        vocab=int(batch.sampling_info.vocab_size),
-        owner=owner,
-        generation=owner.generation,
-        batch_key=rpd_batch_key(list(batch.reqs)[:bs]),
-        parent_slots=opt_parent_slots(parent_rows, no_draft),
-    )
+    context = None
+    # The shared builder declines topk <= 1 and steps < 1 the same way.
+    if int(tree_topk) > 1 and int(max_depth) >= 1:
+        context = build_clear_rpd_input(
+            roots,
+            token_rows,
+            opt_parent_slots(parent_rows, no_draft),
+            width=int(num_verify),
+            vocab=int(batch.sampling_info.vocab_size),
+            owner=owner,
+            generation=owner.generation,
+            batch_key=rpd_batch_key(list(batch.reqs)[:bs]),
+        )
     if context is None:
         raise RuntimeError(
             f"ClearTree RPD verify input was declined (K+1={int(num_verify)}, "
@@ -102,6 +100,111 @@ def attach_clear_rpd_input(
     spec_info.sr_rpd_input = context
     owner.build_us = (time.perf_counter_ns() - started) // 1000
     return owner
+
+
+def build_clear_rpd_input(
+    roots: Sequence[int],
+    token_rows: Sequence[Sequence[int]],
+    parent_slots: Sequence[Sequence[int]],
+    *,
+    width: int,
+    vocab: int,
+    owner,
+    generation: int,
+    batch_key=(),
+):
+    """``build_sr_rpd_input`` for ClearTree rows, without per-edge tensor writes.
+
+    ``width`` is K + 1. ``token_rows`` are the K draft tokens per request and
+    ``parent_slots`` the K + 1 verify-slot parents from ``opt_parent_slots``.
+    The result equals the shared builder's for the same rows: tree
+    ``[cand, retrieve, next_token, next_sibling]``, edges in (row, slot) order,
+    the edge index, and a topology whose children keep ``build_tree_efficient``
+    sibling order. None declines: a row of the wrong length, a parent slot
+    past the row (the shared builder would raise there), or an empty width
+    or vocabulary.
+    """
+    from sglang.srt.speculative.rpd_verify import _RPDHostTopology
+    from sglang.srt.speculative.standalone_remote.sr_rpd import SRRPDHostInput
+
+    width = int(width)
+    bs = len(roots)
+    if (
+        width < 1
+        or int(vocab) < 1
+        or len(token_rows) != bs
+        or len(parent_slots) != bs
+    ):
+        return None
+    cand_rows: List[List[int]] = []
+    next_rows: List[List[int]] = []
+    sibling_rows: List[List[int]] = []
+    batch_children: list = []
+    edge_of: List[List[int]] = []
+    edges: list = []
+    parent_index: List[int] = []
+    child_tokens: List[int] = []
+    for b in range(bs):
+        tokens, slots = token_rows[b], parent_slots[b]
+        if len(tokens) != width - 1 or len(slots) != width:
+            return None
+        row = [int(roots[b])] + [int(token) for token in tokens]
+        slots = [int(slot) for slot in slots]
+        # Negative slots are unlinked, as in the shared builder.
+        if any(slot >= width for slot in slots):
+            return None
+        nxt = [-1] * width
+        sibling = [-1] * width
+        children: List[List[int]] = [[] for _ in range(width)]
+        for i in range(width - 1, 0, -1):
+            pos = slots[i]
+            if pos < 0:
+                continue
+            children[pos].append(i)
+            sibling[i] = nxt[pos]
+            nxt[pos] = i
+        # Reverse insertion prepends, so append order is opposite sibling order.
+        for kids in children:
+            kids.reverse()
+        row_edges = [-1] * width
+        for v, parent in enumerate(slots):
+            if parent < 0:
+                continue
+            row_edges[v] = len(edges)
+            edges.append((b, v, parent))
+            parent_index.append(b * width + parent)
+            child_tokens.append(row[v])
+        cand_rows.append(row)
+        next_rows.append(nxt)
+        sibling_rows.append(sibling)
+        batch_children.append(children)
+        edge_of.append(row_edges)
+    retrieve = [[b * width + v for v in range(width)] for b in range(bs)]
+    shape = (4, bs, width)
+    tree = torch.tensor(
+        [cand_rows, retrieve, next_rows, sibling_rows], dtype=torch.int64
+    ).reshape(shape)
+    if edges:
+        index = torch.tensor([parent_index, child_tokens], dtype=torch.int64)
+    else:
+        index = torch.empty((2, 0), dtype=torch.int64)
+    topology = _RPDHostTopology(
+        cand_rows,
+        retrieve,
+        batch_children,
+        edge_of,
+        tuple(edges),
+    )
+    return SRRPDHostInput(
+        tree,
+        edges,
+        index,
+        int(vocab),
+        owner,
+        generation,
+        batch_key,
+        topology,
+    )
 
 
 # The shared host plan counts this once, right after ``_rpd_select_host``.

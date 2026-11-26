@@ -1055,6 +1055,142 @@ class ClearTreeRpdTest(CustomTestCase):
                     self.assertGreater(plan.pre_lengths[0], 0)
                     self.assertEqual(plan.pre_lengths[2], 0)
 
+    @staticmethod
+    def _random_rows(gen, bs, k, vocab):
+        """ClearTree verify rows: parents before children, -2 pads at the tail."""
+        import torch
+
+        roots, token_rows, parent_rows, no_draft = [], [], [], []
+        for row in range(bs):
+            missing = row == bs - 1 and bs > 1
+            filled = int(torch.randint(1, k + 1, (1,), generator=gen))
+            parents = []
+            for index in range(k):
+                if missing:
+                    parents.append(-1)
+                elif index >= filled:
+                    parents.append(-2)
+                else:
+                    parents.append(int(torch.randint(-1, index, (1,), generator=gen)))
+            tokens = [int(t) for t in torch.randint(0, vocab, (k,), generator=gen)]
+            roots.append(int(torch.randint(0, vocab, (1,), generator=gen)))
+            token_rows.append([0] * k if missing else tokens)
+            parent_rows.append(parents)
+            no_draft.append(missing)
+        return roots, token_rows, parent_rows, no_draft
+
+    def test_clear_builder_matches_shared_builder(self):
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
+            opt_parent_slots,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            ClearRpdOwner,
+            build_clear_rpd_input,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            build_sr_rpd_input,
+        )
+
+        vocab = 50
+        gen = torch.Generator().manual_seed(11)
+        for k in (2, 4, 8, 16, 32, 64):
+            for bs in (1, 2, 4):
+                with self.subTest(k=k, bs=bs):
+                    roots, token_rows, parent_rows, no_draft = self._random_rows(
+                        gen, bs, k, vocab
+                    )
+                    slots = opt_parent_slots(parent_rows, no_draft)
+                    owner = ClearRpdOwner()
+                    key = (("r", bs, k),)
+                    tokens = torch.tensor(token_rows, dtype=torch.int64)
+                    want = build_sr_rpd_input(
+                        torch.tensor(roots, dtype=torch.int64),
+                        tokens,
+                        torch.tensor(parent_rows, dtype=torch.int64),
+                        torch.zeros_like(tokens),
+                        topk=2,
+                        steps=10,
+                        width=k + 1,
+                        vocab=vocab,
+                        owner=owner,
+                        generation=7,
+                        batch_key=key,
+                        parent_slots=slots,
+                    )
+                    got = build_clear_rpd_input(
+                        roots,
+                        token_rows,
+                        slots,
+                        width=k + 1,
+                        vocab=vocab,
+                        owner=owner,
+                        generation=7,
+                        batch_key=key,
+                    )
+                    self.assertIsNotNone(want)
+                    self.assertIsNotNone(got)
+                    self.assertEqual(got.tree.dtype, torch.int64)
+                    self.assertEqual(tuple(got.tree.shape), tuple(want.tree.shape))
+                    self.assertTrue(torch.equal(got.tree, want.tree))
+                    self.assertEqual(list(got.edges), list(want.edges))
+                    self.assertTrue(torch.equal(got.edge_index_cpu, want.edge_index_cpu))
+                    self.assertEqual(got.edge_index_cpu.dtype, torch.int64)
+                    self.assertEqual(got.topology, want.topology)
+                    self.assertEqual(
+                        (got.vocab, got.generation, got.batch_key),
+                        (want.vocab, want.generation, want.batch_key),
+                    )
+                    self.assertIs(got.owner, owner)
+                    self.assertIsNone(got.edge_index)
+                    self.assertFalse(got.consumed)
+
+    def test_clear_builder_declines_bad_rows(self):
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            ClearRpdOwner,
+            attach_clear_rpd_input,
+            build_clear_rpd_input,
+        )
+
+        owner = ClearRpdOwner()
+        good = dict(width=3, vocab=8, owner=owner, generation=1)
+        self.assertIsNotNone(
+            build_clear_rpd_input([1], [[2, 3]], [[-1, 0, 1]], **good)
+        )
+        for roots, tokens, slots, extra in (
+            ([1], [[2]], [[-1, 0, 1]], {}),
+            ([1], [[2, 3]], [[-1, 0]], {}),
+            ([1], [[2, 3]], [[-1, 0, 3]], {}),
+            ([1, 2], [[2, 3]], [[-1, 0, 1]], {}),
+            ([1], [[2, 3]], [[-1, 0, 1]], {"vocab": 0}),
+            ([1], [[2, 3]], [[-1, 0, 1]], {"width": 0}),
+        ):
+            with self.subTest(tokens=tokens, slots=slots, extra=extra):
+                self.assertIsNone(
+                    build_clear_rpd_input(roots, tokens, slots, **{**good, **extra})
+                )
+
+        for topk, depth, tokens in ((1, 10, [[2, 3]]), (2, 0, [[2, 3]]), (2, 10, [[2]])):
+            with self.subTest(topk=topk, depth=depth, tokens=tokens):
+                with self.assertRaises(RuntimeError):
+                    attach_clear_rpd_input(
+                        None,
+                        _args(speculative_verify_mode="rpd"),
+                        SimpleNamespace(),
+                        _rpd_batch(1),
+                        [1],
+                        tokens,
+                        [[-1, 0]],
+                        [False],
+                        torch.device("cpu"),
+                        num_verify=3,
+                        tree_topk=topk,
+                        max_depth=depth,
+                    )
+
     def test_timed_workspace_matches_the_shared_one(self):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
             clear_rpd_workspace,
