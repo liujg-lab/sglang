@@ -2190,7 +2190,10 @@ def note_round_expect(scheduler, rid, ratio, mass, depth, detail=None) -> None:
     """Remember one request's c_i and verified path mass on the open round.
 
     ``detail`` holds references for the close-time diagnostics (window,
-    scores, K quotes); it is never read by a decision.
+    scores, K quotes); it is never read by a decision. A ledger that is
+    already bound still records the accept row when the switch is off; the
+    caller omits ``detail``. This does not call ``bind_ledger`` while the
+    switch is off, because that would pin ``_clear_ledger`` to False.
     """
     if scheduler is None:
         return
@@ -2206,6 +2209,15 @@ def note_round_expect(scheduler, rid, ratio, mass, depth, detail=None) -> None:
             rnd.e_detail.pop(str(rid), None)
         rnd.tree_depth = max(int(rnd.tree_depth or 0), int(depth or 0))
 
+    existing = getattr(scheduler, "_clear_ledger", None)
+    if isinstance(existing, ClearLedger):
+        try:
+            _run(existing)
+        except Exception:
+            logger.warning("[CLEAR ledger] update failed", exc_info=True)
+        return
+    if not ledger_enabled():
+        return
     _quiet(scheduler, _run)
 
 

@@ -2860,7 +2860,10 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
             with self.subTest(value=value), _bonus_prediction(value):
                 host, _pool, _freed = self._host()
                 runner = SimpleNamespace(
-                    bonus_ids=[], _last_logits=torch.zeros(2, 4), launch_layer=Mock()
+                    bonus_ids=[],
+                    prefix_len=3,
+                    _last_logits=torch.zeros(2, 4),
+                    launch_layer=Mock(),
                 )
                 slot = Mock()
                 slot.clone_cpu.return_value = (
@@ -3441,12 +3444,18 @@ class ClearTreeBonusPredictionTest(CustomTestCase):
 
                     def make_runner(_host, req, keep):
                         runner = SimpleNamespace(
-                            req=req, prefix_len=keep, bonus_ids=[], forward_layer=Mock()
+                            req=req,
+                            prefix_len=keep,
+                            cached_len=keep,
+                            bonus_ids=[],
+                            forward_layer=Mock(),
                         )
                         runners.append(runner)
                         return runner
 
-                    def grow(_config, _tails, _forward, _host, *, states_out, topk_out):
+                    def grow(
+                        _config, _tails, _forward, _host, *, states_out, topk_out, depth_caps=None
+                    ):
                         self.assertEqual(
                             topk_out, [[] for _ in reqs] if enabled else None
                         )
