@@ -592,6 +592,11 @@ def _round_price(rnd: _Round, t_recv: float, next_rids, next_prefixes):
 # A tail this long covers the deepest verify window plus the bonus token.
 COMMIT_TAIL = 66
 
+# Closed rounds kept for a verify report that arrives after their close. The
+# report normally rides on the STEP after next, one close later; a few spare
+# rounds cover FINISH/PREFILL gaps between them.
+LATE_RPD_ROUNDS = 8
+
 
 def _commit_tail(req) -> Optional[List[int]]:
     """The last committed token ids of one STEP request, or None.
@@ -805,24 +810,31 @@ def _rid_detail(detail: dict, accepted: int, tail, mask=None) -> dict:
         "mass_k": mass_k,
     }
     if mask is not None:
-        # A bad window must not drop the row's other diagnostics.
-        try:
-            rpd = _rpd_accepts(detail, mask)
-        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
-            rpd = None
-        if rpd is None:
-            out.update(accept_k=None, rpd_valid=None, rpd_ok=False)
-        else:
-            out.update(
-                accept_k=rpd["accept_k"],
-                rpd_valid=rpd["rpd_valid"],
-                rpd_ok=int(rpd["rpd_full"]) == int(accepted),
-            )
+        out.update(_mask_fields(detail, accepted, mask))
     return out
 
 
+def _mask_fields(detail: dict, accepted: int, mask) -> dict:
+    """``accept_k``, ``rpd_valid`` and ``rpd_ok`` of one request's mask.
+
+    A bad window gives ``accept_k=None`` and ``rpd_ok=False`` instead of
+    raising, so it never drops the row's other diagnostics.
+    """
+    try:
+        rpd = _rpd_accepts(detail, mask)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        rpd = None
+    if rpd is None:
+        return {"accept_k": None, "rpd_valid": None, "rpd_ok": False}
+    return {
+        "accept_k": rpd["accept_k"],
+        "rpd_valid": rpd["rpd_valid"],
+        "rpd_ok": int(rpd["rpd_full"]) == int(accepted),
+    }
+
+
 def _round_expect(
-    rnd: _Round, next_rids, next_prefixes, next_tails=None, rpd=None
+    rnd: _Round, next_rids, next_prefixes, next_tails=None, rpd=None, late=None
 ) -> dict:
     """Realized accepts against c_i times path mass, over requests that stayed.
 
@@ -831,7 +843,9 @@ def _round_expect(
     ``verify_quotes`` and ``theta`` are diagnostics for judging K and the
     stop afterwards; nothing reads them back. ``rpd`` is the matched report's
     ``rid -> hex`` masks; ``rpd_masks`` counts the rids whose mask gave
-    per-tier accepts.
+    per-tier accepts. When ``late`` is a dict, it receives
+    ``rid -> (detail, accepted, mass_k)`` for every row with a tree, so masks
+    that arrive after this close can still be priced.
     """
     empty = {
         "accepted": None,
@@ -877,6 +891,8 @@ def _round_expect(
                 per_rid[rid] = row
                 if row.get("accept_k") is not None:
                     used_masks += 1
+                if late is not None:
+                    late[rid] = (detail, taken, row["mass_k"])
             except (KeyError, TypeError, ValueError, IndexError, AttributeError):
                 pass
             if round_detail is None:
@@ -934,6 +950,8 @@ class ClearLedger:
         self._pending_rounds: Dict[tuple, dict] = {}
         self._pending_reports: Dict[tuple, dict] = {}
         self._pending_order: List[tuple] = []
+        # Closed rounds whose RPD masks have not arrived, oldest first.
+        self._pending_rpd: Dict[tuple, dict] = {}
         # One closed round whose accounting waits until after the reply.
         self.deferred: Optional[dict] = None
 
@@ -1207,6 +1225,7 @@ class ClearLedger:
         incoming = _valid_verify_report(verify)
         if incoming is not None and report is None:
             self._park_report(str(rnd.session_id), incoming)
+            self._settle_rpd(str(rnd.session_id), incoming)
         if report is not None and report["fallback"]:
             reasons.append("target_fallback")
         prefit = rnd.prefit if isinstance(rnd.prefit, dict) else None
@@ -1292,13 +1311,17 @@ class ClearLedger:
         self.merge_pending(scheduler)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
+        late = {} if report is None else None
         expect = _round_expect(
             rnd,
             next_rids,
             next_prefixes,
             next_tails,
             rpd=None if report is None else report.get("rpd"),
+            late=late,
         )
+        if late:
+            self._stash_rpd(rnd, late, excluded, expect)
         prefit_round = prefit is not None
         price_kept = (
             price_tokens is not None
@@ -1578,6 +1601,7 @@ class ClearLedger:
         self._pending_rounds.clear()
         self._pending_reports.clear()
         self._pending_order.clear()
+        self._pending_rpd.clear()
 
     def _drop_other_sessions(self, session: str) -> None:
         for key in list(self._pending_order):
@@ -1585,6 +1609,72 @@ class ClearLedger:
                 self._pending_order.remove(key)
                 self._pending_rounds.pop(key, None)
                 self._pending_reports.pop(key, None)
+        for key in list(self._pending_rpd):
+            if key[0] != str(session):
+                self._pending_rpd.pop(key, None)
+
+    def _stash_rpd(self, rnd: _Round, late: dict, excluded: bool, expect: dict) -> None:
+        """Keep a closed round's trees until its verify report arrives.
+
+        The Target sends the next STEP from inside verify, before it stores
+        this verify's report, so the report (and its RPD masks) rides on the
+        STEP after next and the round is already closed. ``_settle_rpd``
+        prices the masks then. Only the newest ``LATE_RPD_ROUNDS`` wait.
+        """
+        key = self._pending_key(rnd.session_id, rnd.rpc_seq)
+        self._pending_rpd.pop(key, None)
+        self._pending_rpd[key] = {
+            "b": rnd.b,
+            "k": rnd.k,
+            "w": rnd.w,
+            "excluded": bool(excluded),
+            "e_pred": expect.get("e_pred"),
+            "e_mass": expect.get("e_mass"),
+            "rows": late,
+        }
+        while len(self._pending_rpd) > LATE_RPD_ROUNDS:
+            self._pending_rpd.pop(next(iter(self._pending_rpd)))
+
+    def _settle_rpd(self, session: str, report: dict) -> None:
+        """Log ``d_rpd`` for the closed round a late report names. Never raises."""
+        masks = report.get("rpd")
+        if not masks:
+            return
+        held = self._pending_rpd.pop(self._pending_key(session, report["rpc_seq"]), None)
+        if held is None:
+            return
+        try:
+            rows = {}
+            used = 0
+            for rid, (detail, taken, mass_k) in held["rows"].items():
+                mask = masks.get(rid)
+                if mask is None:
+                    continue
+                row = {
+                    "depth": int(detail["depth"]),
+                    "accepted": int(taken),
+                    "mass_k": mass_k,
+                }
+                row.update(_mask_fields(detail, taken, mask))
+                used += int(row["accept_k"] is not None)
+                rows[rid] = row
+            self.queue_log(
+                "d_rpd",
+                {
+                    "session_id": str(session),
+                    "rpc_seq": int(report["rpc_seq"]),
+                    "b": held["b"],
+                    "k": held["k"],
+                    "w": held["w"],
+                    "excluded": held["excluded"],
+                    "e_pred": held["e_pred"],
+                    "e_mass": held["e_mass"],
+                    "rpd_masks": used,
+                    "e_rid": rows or None,
+                },
+            )
+        except Exception:
+            logger.warning("[CLEAR ledger] late RPD masks failed", exc_info=True)
 
     def _stash_unpaired(
         self, rnd: _Round, hold_ms: float, q_ms: float, prefit, ell=None

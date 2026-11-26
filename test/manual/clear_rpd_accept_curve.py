@@ -1,8 +1,11 @@
 """RPD accepts per K tier against path mass, from ClearTree Draft logs.
 
-Reads ``[CLEAR ledger d_round]`` lines. Each request row with ``accept_k``
-(only when the Target verified with RPD and sent masks) gives the exact RPD
-accepts A(K') of the top-K' window and its path mass ``mass_k``.
+Reads ``[CLEAR ledger d_round]`` and ``[CLEAR ledger d_rpd]`` lines. Each
+request row with ``accept_k`` (only when the Target verified with RPD and sent
+masks) gives the exact RPD accepts A(K') of the top-K' window and its path
+mass ``mass_k``. The masks normally arrive one close after their round, so
+they are on ``d_rpd``; ``d_round`` carries them only when the report matched
+at close. Both have the same round fields.
 
 Two tables per batch bucket:
 
@@ -33,7 +36,7 @@ import random
 import sys
 from collections import defaultdict
 
-MARK = "[CLEAR ledger d_round] "
+MARKS = ("[CLEAR ledger d_round] ", "[CLEAR ledger d_rpd] ")
 BUCKETS = ("1", "2-4", ">=5")
 
 
@@ -49,13 +52,15 @@ def read_rounds(paths):
     for path in paths:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                at = line.find(MARK)
-                if at < 0:
-                    continue
-                try:
-                    yield json.loads(line[at + len(MARK) :])
-                except ValueError:
-                    continue
+                for kind, mark in zip(("round", "late"), MARKS):
+                    at = line.find(mark)
+                    if at < 0:
+                        continue
+                    try:
+                        yield kind, json.loads(line[at + len(mark) :])
+                    except ValueError:
+                        pass
+                    break
 
 
 def collect(paths):
@@ -63,13 +68,15 @@ def collect(paths):
     rounds = defaultdict(list)
     served = defaultdict(lambda: [0.0, 0.0])
     stats = defaultdict(int)
-    for record in read_rounds(paths):
-        stats["rounds"] += 1
+    for kind, record in read_rounds(paths):
+        # ``late`` counts d_rpd records; a round's d_round has no masks then.
+        stats["rounds" if kind == "round" else "late"] += 1
         if record.get("excluded"):
             stats["excluded"] += 1
             continue
         if record.get("rpd_masks") is None:
-            stats["no_masks"] += 1
+            if kind == "round":
+                stats["no_masks"] += 1
             continue
         rows = []
         for row in (record.get("e_rid") or {}).values():
@@ -179,7 +186,7 @@ def main(argv=None):
 
     rounds, served, stats = collect(args.logs)
     rng = random.Random(args.seed)
-    keys = ("rounds", "excluded", "no_masks", "rids", "rpd_not_ok")
+    keys = ("rounds", "late", "excluded", "no_masks", "rids", "rpd_not_ok")
     print(" ".join(f"{key}={stats.get(key, 0)}" for key in keys))
     if not rounds:
         print("no RPD rows with accept_k; is the Target on --speculative-verify-mode rpd?")

@@ -4526,5 +4526,172 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
         self.assertEqual(keep, 5)
         self.assertIs(verify, step.verify)
 
+    # On the wire the Target sends STEP r+1 from inside verify, before it
+    # stores the report of round r, so that report reaches the Draft on
+    # STEP r+2: one close after round r.
+    def _late_packet(self, ledger, verify, defer=False):
+        ledger.mark_stop(1.1)
+        ledger.mark_send(1.11)
+        return ledger.on_packet(
+            "step", ["a"], "sess", 3, [108], 8, now=1.2, verify=verify, defer=defer
+        )
+
+    @staticmethod
+    def _late_logs(ledger):
+        return [record for kind, record in ledger.pending_logs if kind == "d_rpd"]
+
+    def test_late_rpd_masks_are_priced_on_the_next_close(self):
+        tail = [7, 10, 20, 30, 99]
+        fresh, _ = self._noted_round()
+        inline = self._close(fresh, 4, tail, verify=self._rpd_verify(8, {"a": "1f"}))
+        # A report matched at close stays on d_round and is not kept for later.
+        self.assertEqual(inline["rpd_masks"], 1)
+        self.assertEqual(fresh._pending_rpd, {})
+        self.assertEqual(self._late_logs(fresh), [])
+
+        ledger, _ = self._noted_round()
+        first = self._close(ledger, 4, tail)
+        self.assertIsNone(first["rpd_masks"])
+        self.assertNotIn("accept_k", first["e_rid"]["a"])
+        self.assertEqual(list(ledger._pending_rpd), [("sess", 1)])
+
+        second = self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}))
+        self.assertIsNone(second["rpd_masks"])
+        [late] = self._late_logs(ledger)
+        self.assertEqual((late["session_id"], late["rpc_seq"]), ("sess", 1))
+        self.assertEqual(late["b"], 1)
+        self.assertEqual(late["excluded"], first["excluded"])
+        self.assertEqual(late["e_pred"], first["e_pred"])
+        self.assertEqual(late["e_mass"], first["e_mass"])
+        self.assertEqual(late["rpd_masks"], 1)
+        row = late["e_rid"]["a"]
+        want = inline["e_rid"]["a"]
+        for key in ("depth", "accepted", "mass_k", "accept_k", "rpd_valid", "rpd_ok"):
+            self.assertEqual(row[key], want[key], key)
+        self.assertEqual(
+            row["accept_k"],
+            {"2": 2, "4": 2, "8": None, "16": None, "32": None, "64": None},
+        )
+        # Settled once; the next round had no tree, so nothing else waits.
+        self.assertEqual(ledger._pending_rpd, {})
+
+    def test_late_rpd_masks_with_deferred_close(self):
+        ledger, _ = self._noted_round()
+        self.assertIsNone(self._close(ledger, 4, [7, 10, 20, 30, 99], defer=True))
+        self.assertIsNone(
+            self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}), defer=True)
+        )
+        # Round 1 closed first and is waiting; round 2's close brings its masks.
+        self.assertEqual(list(ledger._pending_rpd), [("sess", 1)])
+        self.assertEqual(self._late_logs(ledger), [])
+        ledger.run_deferred()
+        [late] = self._late_logs(ledger)
+        self.assertEqual(late["rpc_seq"], 1)
+        self.assertTrue(late["e_rid"]["a"]["rpd_ok"])
+        self.assertEqual(late["e_rid"]["a"]["accept_k"]["4"], 2)
+
+    def test_late_report_without_masks_or_for_another_round(self):
+        ledger, _ = self._noted_round()
+        self._close(ledger, 4, [7, 10, 20, 30, 99])
+        greedy = {"rpc_seq": 1, "fallback": False, "b": 1, "k": 8, "bucket": None}
+        self._late_packet(ledger, greedy)
+        self.assertEqual(self._late_logs(ledger), [])
+        self.assertIn(("sess", 1), ledger._pending_rpd)
+
+        ledger, _ = self._noted_round()
+        self._close(ledger, 4, [7, 10, 20, 30, 99])
+        other = dict(self._rpd_verify(8, {"a": "1f"}), rpc_seq=7)
+        self._late_packet(ledger, other)
+        self.assertEqual(self._late_logs(ledger), [])
+        self.assertIn(("sess", 1), ledger._pending_rpd)
+
+        # Masks for other requests only: the round is settled with no rows.
+        ledger, _ = self._noted_round()
+        self._close(ledger, 4, [7, 10, 20, 30, 99])
+        self._late_packet(ledger, self._rpd_verify(8, {"z": "1f"}))
+        [late] = self._late_logs(ledger)
+        self.assertEqual(late["rpd_masks"], 0)
+        self.assertIsNone(late["e_rid"])
+        self.assertEqual(ledger._pending_rpd, {})
+
+    def test_late_rpd_bad_window_never_raises(self):
+        ledger, _ = self._noted_round()
+        self._close(ledger, 4, [7, 10, 20, 30, 99])
+        with patch.object(ledger_module, "_rpd_accepts", side_effect=KeyError("tokens")):
+            self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}))
+        [late] = self._late_logs(ledger)
+        self.assertEqual(late["rpd_masks"], 0)
+        row = late["e_rid"]["a"]
+        self.assertIsNone(row["accept_k"])
+        self.assertFalse(row["rpd_ok"])
+        self.assertEqual((row["depth"], row["accepted"]), (3, 3))
+
+        ledger, _ = self._noted_round()
+        self._close(ledger, 4, [7, 10, 20, 30, 99])
+        with patch.object(
+            ledger_module, "_mask_fields", side_effect=RuntimeError("boom")
+        ), self.assertLogs(ledger_module.logger, level="WARNING"):
+            record = self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}))
+        self.assertIsNotNone(record)
+        self.assertEqual(self._late_logs(ledger), [])
+        self.assertEqual(ledger._pending_rpd, {})
+
+    def test_late_rpd_rounds_are_bounded_and_per_session(self):
+        ledger = ClearLedger()
+        limit = ledger_module.LATE_RPD_ROUNDS
+        for rpc in range(limit + 2):
+            rnd = SimpleNamespace(session_id="sess", rpc_seq=rpc, b=1, k=8, w=2)
+            ledger._stash_rpd(rnd, {"a": None}, False, {})
+        self.assertEqual(
+            list(ledger._pending_rpd), [("sess", rpc) for rpc in range(2, limit + 2)]
+        )
+        ledger._stash_rpd(
+            SimpleNamespace(session_id="old", rpc_seq=1, b=1, k=8, w=2),
+            {"a": None},
+            False,
+            {},
+        )
+        ledger._drop_other_sessions("sess")
+        self.assertNotIn(("old", 1), ledger._pending_rpd)
+        self.assertEqual(len(ledger._pending_rpd), limit - 1)
+        ledger._clear_pending()
+        self.assertEqual(ledger._pending_rpd, {})
+
+    def test_accept_curve_reads_late_rpd_records(self):
+        import importlib.util
+        import json
+        import tempfile
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[4]
+        spec = importlib.util.spec_from_file_location(
+            "clear_rpd_accept_curve", root / "test/manual/clear_rpd_accept_curve.py"
+        )
+        curve = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(curve)
+
+        ledger, _ = self._noted_round()
+        first = self._close(ledger, 4, [7, 10, 20, 30, 99])
+        self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}))
+        [late] = self._late_logs(ledger)
+        # This test is about reading d_rpd, not about the exclusion rules.
+        first = dict(first, excluded=False)
+        late = dict(late, excluded=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "draft.log"
+            path.write_text(
+                "[x] [CLEAR ledger d_round] " + json.dumps(first) + "\n"
+                "[x] [CLEAR ledger d_rpd] " + json.dumps(late) + "\n"
+            )
+            rounds, _served, stats = curve.collect([str(path)])
+        self.assertEqual(
+            (stats["rounds"], stats["late"], stats["no_masks"], stats["rids"]),
+            (1, 1, 1, 1),
+        )
+        [[row]] = rounds["1"]
+        mass = late["e_rid"]["a"]["mass_k"]
+        self.assertEqual(row, {2: (2.0, mass["2"]), 4: (2.0, mass["4"])})
+
+
 if __name__ == "__main__":
     unittest.main()
