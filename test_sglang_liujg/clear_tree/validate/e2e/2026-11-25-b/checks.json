@@ -1,0 +1,21 @@
+{
+  "requests_100": true,
+  "fallback_zero": true,
+  "formal_hold_invalid": 0,
+  "fit_reused": true,
+  "fit_sha256_unchanged": true,
+  "installed_hold_cells": 90,
+  "h_curve_on": true,
+  "prefit_started": false,
+  "wrote_fit_file": false,
+  "target_capture_bs_1_2_4": true,
+  "draft_missing_shape": "bs=4 ntpb=65",
+  "half_life_1000_env": true,
+  "accept_per_request_unset": true,
+  "flush_http_200": 8,
+  "flush_http_other": 0,
+  "draft_window_tail": "flushed",
+  "same_process": true,
+  "path_ok_on_scored_rounds": true,
+  "earlier_client_excluded": true
+}

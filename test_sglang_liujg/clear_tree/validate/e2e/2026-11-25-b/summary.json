@@ -1,0 +1,23 @@
+{
+  "run_id": "2026-11-25-b",
+  "fit_sha256": "34e56789f083d9f6b75010e4f3f14948f4b2b5cac2db6aab327fdf0ce29f3dcb",
+  "fit_reused": true,
+  "installed_hold_cells": 90,
+  "curve": "on",
+  "half_life": 1000,
+  "draft_host_pid": 1620684,
+  "target_host_pid": 192768,
+  "unmatched_rounds": 23231,
+  "formal_hold_invalid": 0,
+  "flush_http_200": 8,
+  "flush_http_other": 0,
+  "draft_windows": {"windows": 1437, "full": 1434, "idle": 3, "last": "idle", "tail": "flushed"},
+  "bonus": {"opt_bonus_forwards": 45831, "opt_bonus_graph": 45831, "opt_bonus_eager": 0},
+  "lookahead": {"opt_lookahead_layers": 226857, "opt_lookahead_fallbacks": 0, "opt_lookahead_group_templates": 12},
+  "trials": [
+    {"trial": "01", "dataset": "RSTeller", "concurrency": 1, "ok": 100, "tokens": 46059, "wall_s": 779.629, "tok_s": 59.078, "accept": 35342, "draft": 86952, "accept_rate": 0.406569, "fallback": 0, "client_concurrency": 1.0, "rounds": 10869, "scored": 10769, "e_accepted": 34853.0, "e_pred": 34860.035630, "e_mass": 37209.564173, "e_pred_over_accepted": 1.000202, "path_ok_rounds": 10769, "path_ok_rows": 10769, "ranks_rows": 10769, "next_rank_rows": 1203},
+    {"trial": "02", "dataset": "RSTeller", "concurrency": 4, "ok": 100, "tokens": 45515, "wall_s": 284.051, "tok_s": 160.235, "accept": 32855, "draft": 102208, "accept_rate": 0.321452, "fallback": 0, "client_concurrency": 3.921, "rounds": 3294, "scored": 3293, "e_accepted": 32413.0, "e_pred": 32355.534214, "e_mass": 34385.650071, "e_pred_over_accepted": 0.998227, "path_ok_rounds": 3293, "path_ok_rows": 12580, "ranks_rows": 12580, "next_rank_rows": 1770},
+    {"trial": "03", "dataset": "WaterCaption", "concurrency": 1, "ok": 100, "tokens": 29418, "wall_s": 580.557, "tok_s": 50.672, "accept": 23131, "draft": 51632, "accept_rate": 0.447998, "fallback": 0, "client_concurrency": 1.0, "rounds": 6454, "scored": 6354, "e_accepted": 22626.0, "e_pred": 22658.767781, "e_mass": 23181.889432, "e_pred_over_accepted": 1.001448, "path_ok_rounds": 6354, "path_ok_rows": 6354, "ranks_rows": 6354, "next_rank_rows": 1130},
+    {"trial": "04", "dataset": "WaterCaption", "concurrency": 4, "ok": 100, "tokens": 29932, "wall_s": 267.365, "tok_s": 111.952, "accept": 22074, "draft": 64016, "accept_rate": 0.344819, "fallback": 0, "client_concurrency": 3.969, "rounds": 2049, "scored": 2049, "e_accepted": 21603.0, "e_pred": 21636.715167, "e_mass": 22136.159994, "e_pred_over_accepted": 1.001561, "path_ok_rounds": 2049, "path_ok_rows": 7806, "ranks_rows": 7806, "next_rank_rows": 1479}
+  ]
+}
