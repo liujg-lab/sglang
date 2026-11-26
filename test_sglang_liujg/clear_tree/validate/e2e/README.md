@@ -37,3 +37,4 @@
 | `2026-11-25-a` | 池化接受比按路径质量遗忘与不遗忘各一块；每块 RSTeller 与 WaterCaption 的并发 1 和 4 不重启，两块之间重启（两条件对照，不是重复） | 八轮都跑完；遗忘时 WaterCaption 的 e_pred 贴近 accepted，不遗忘时偏低。08 的 flush 是 HTTP 400 | [记录](2026-11-25-a/run.md) |
 | `2026-11-25-b` | 当前代码上半衰期 1000，账本和 Draft lookahead 开；同一对进程先 RSTeller 再 WaterCaption，各跑并发 1 和 4（不同负载，不是重复） | 四轮都跑完；WaterCaption 的 e_pred 贴近 accepted，打分轮都有 path_ok。同目录另有更早输出，没有并进 | [记录](2026-11-25-b/run.md) |
 | `2026-11-26-a` | Target RPD、不重拟合；同一对进程上 RSTeller 并发 1 和并发 4（同一负载的不同并发，不是重复） | 两轮都跑完；W/K 留在平表，Draft 没有 RPD 掩码 | [记录](2026-11-26-a/run.md) |
+| `2026-11-26-b` | 当前代码的晚到 RPD 掩码；同一对进程上 RSTeller 并发 1 和并发 4，不重拟合（同一负载的不同并发，不是重复） | 两轮都跑完；晚到掩码写入 d_rpd 并带 accept_k，并发 1 仍有打分轮没有对上 | [记录](2026-11-26-b/run.md) |
