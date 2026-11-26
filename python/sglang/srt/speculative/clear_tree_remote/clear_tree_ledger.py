@@ -704,8 +704,71 @@ def _accept_walk(detail: dict, path: Sequence[int], bonus: Optional[int]) -> dic
     return out
 
 
-def _rid_detail(detail: dict, accepted: int, tail) -> dict:
-    """Per-request depth, accepts, accepted-path ranks and mass per tier."""
+def _rpd_accepts(detail: dict, mask) -> Optional[dict]:
+    """RPD accepts for every K tier from the Target's acceptable-slot mask.
+
+    Bit ``j`` of ``mask`` is window node ``j`` (Target slot ``j + 1``). A node
+    is accepted when it and every ancestor are acceptable, so the accepts of
+    the top-K' window are the deepest reachable node of rank <= K', plus one.
+    The window is the top ``n`` ranks and closed under ancestors, so this is
+    exact for K' <= n. Past ``n`` it is exact only when the window is the
+    whole tree: the window is the top ``min(K, depth * width)`` nodes, so it
+    is whole when ``n`` covers every flat score. That includes a tree of
+    exactly K nodes. Otherwise it is None.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
+        VERIFY_KS,
+    )
+
+    window = _window_of(detail)
+    width = int(detail["width"])
+    if window is None or width <= 0:
+        return None
+    try:
+        bits = int(str(mask), 16)
+    except ValueError:
+        return None
+    tokens, parents, depths, cols = window
+    n = len(tokens)
+    ranks_of = _node_ranks(detail["scores"], width)
+    reach = [False] * n
+    reached = []
+    valid = 0
+    for j in range(n):
+        ok = bool((bits >> j) & 1)
+        valid += int(ok)
+        parent = int(parents[j])
+        if parent >= j:
+            return None
+        reach[j] = ok and (parent < 0 or reach[parent])
+        if reach[j]:
+            flat = int(depths[j]) * width + int(cols[j])
+            if flat not in ranks_of:
+                return None
+            reached.append((int(ranks_of[flat]), int(depths[j]) + 1))
+
+    def accepts(limit: int) -> int:
+        return max((length for rank, length in reached if rank <= limit), default=0)
+
+    whole = n >= len(detail["scores"])
+    accept_k = {}
+    for tier in VERIFY_KS:
+        tier = int(tier)
+        if tier <= n:
+            accept_k[str(tier)] = accepts(tier)
+        elif whole:
+            accept_k[str(tier)] = accepts(n)
+        else:
+            accept_k[str(tier)] = None
+    return {"accept_k": accept_k, "rpd_valid": valid, "rpd_full": accepts(n)}
+
+
+def _rid_detail(detail: dict, accepted: int, tail, mask=None) -> dict:
+    """Per-request depth, accepts, accepted-path ranks and mass per tier.
+
+    With an RPD ``mask``, also the RPD accepts per K tier; ``rpd_ok`` says
+    the whole-window value matches the realized accepts.
+    """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         VERIFY_KS,
     )
@@ -717,8 +780,10 @@ def _rid_detail(detail: dict, accepted: int, tail) -> dict:
     for value in ordered:
         running += float(value)
         prefix.append(running)
-    for k in VERIFY_KS:
-        mass_k[str(int(k))] = prefix[min(int(k), len(prefix)) - 1] if prefix else 0.0
+    for tier in VERIFY_KS:
+        mass_k[str(int(tier))] = (
+            prefix[min(int(tier), len(prefix)) - 1] if prefix else 0.0
+        )
     walk = {"ranks": None, "next_rank": None, "next_rank_short": None}
     grown = int(accepted) + 1
     if tail is not None and len(tail) >= grown:
@@ -730,7 +795,7 @@ def _rid_detail(detail: dict, accepted: int, tail) -> dict:
     if walk["ranks"] is None:
         walk["next_rank"] = None
         walk["next_rank_short"] = None
-    return {
+    out = {
         "depth": int(detail["depth"]),
         "accepted": int(accepted),
         "ranks": walk["ranks"],
@@ -739,15 +804,34 @@ def _rid_detail(detail: dict, accepted: int, tail) -> dict:
         "next_rank_short": walk["next_rank_short"],
         "mass_k": mass_k,
     }
+    if mask is not None:
+        # A bad window must not drop the row's other diagnostics.
+        try:
+            rpd = _rpd_accepts(detail, mask)
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            rpd = None
+        if rpd is None:
+            out.update(accept_k=None, rpd_valid=None, rpd_ok=False)
+        else:
+            out.update(
+                accept_k=rpd["accept_k"],
+                rpd_valid=rpd["rpd_valid"],
+                rpd_ok=int(rpd["rpd_full"]) == int(accepted),
+            )
+    return out
 
 
-def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dict:
+def _round_expect(
+    rnd: _Round, next_rids, next_prefixes, next_tails=None, rpd=None
+) -> dict:
     """Realized accepts against c_i times path mass, over requests that stayed.
 
     ``accepted`` drops each request's bonus token, as ``settle_verified`` does.
     Every field is None when the round noted no tree. ``e_rid``,
     ``verify_quotes`` and ``theta`` are diagnostics for judging K and the
-    stop afterwards; nothing reads them back.
+    stop afterwards; nothing reads them back. ``rpd`` is the matched report's
+    ``rid -> hex`` masks; ``rpd_masks`` counts the rids whose mask gave
+    per-tier accepts.
     """
     empty = {
         "accepted": None,
@@ -759,6 +843,7 @@ def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dic
         "k_cover": None,
         "verify_quotes": None,
         "theta": None,
+        "rpd_masks": None,
         "tree_depth": int(getattr(rnd, "tree_depth", 0) or 0) or None,
     }
     rows = getattr(rnd, "e_rows", None) or {}
@@ -774,6 +859,8 @@ def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dic
     count = 0
     per_rid = {}
     round_detail = None
+    masks = rpd if isinstance(rpd, dict) else {}
+    used_masks = 0
     for rid, (ratio, mass) in rows.items():
         if rid not in found or rid not in old:
             continue
@@ -784,8 +871,12 @@ def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dic
         count += 1
         detail = details.get(rid)
         if detail is not None:
+            mask = masks.get(rid)
             try:
-                per_rid[rid] = _rid_detail(detail, taken, tails.get(rid))
+                row = _rid_detail(detail, taken, tails.get(rid), mask=mask)
+                per_rid[rid] = row
+                if row.get("accept_k") is not None:
+                    used_masks += 1
             except (KeyError, TypeError, ValueError, IndexError, AttributeError):
                 pass
             if round_detail is None:
@@ -798,6 +889,7 @@ def _round_expect(rnd: _Round, next_rids, next_prefixes, next_tails=None) -> dic
         e_mass=e_mass,
         e_n=count,
         e_rid=per_rid or None,
+        rpd_masks=used_masks if masks else None,
     )
     if round_detail is not None:
         quotes = round_detail.get("quotes")
@@ -1200,7 +1292,13 @@ class ClearLedger:
         self.merge_pending(scheduler)
         seed_ms, layer_wall_ms = self._assign_layer_walls(rnd)
         price_tokens, price_ms = _round_price(rnd, t_recv, next_rids, next_prefixes)
-        expect = _round_expect(rnd, next_rids, next_prefixes, next_tails)
+        expect = _round_expect(
+            rnd,
+            next_rids,
+            next_prefixes,
+            next_tails,
+            rpd=None if report is None else report.get("rpd"),
+        )
         prefit_round = prefit is not None
         price_kept = (
             price_tokens is not None
@@ -1779,7 +1877,7 @@ def _valid_verify_report(verify) -> Optional[dict]:
         bucket = None
     else:
         return None
-    return {
+    out = {
         "fallback": False,
         "path": "eager" if path == "eager" else "graph",
         "rpc_seq": int(rpc),
@@ -1787,6 +1885,15 @@ def _valid_verify_report(verify) -> Optional[dict]:
         "k": int(k),
         "bucket": bucket,
     }
+    # RPD acceptable-slot masks ride along only on a verify that used drafts.
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+        parse_rpd_masks,
+    )
+
+    masks = parse_rpd_masks(verify.get("rpd"))
+    if masks:
+        out["rpd"] = masks
+    return out
 
 
 def _take_verify_report(rnd: _Round, verify) -> Optional[dict]:
@@ -1809,6 +1916,7 @@ def _batch_verify_report(batch) -> Optional[dict]:
             "k": getattr(batch, "target_verify_k", None),
             "bucket": getattr(batch, "target_verify_bucket", None),
             "path": getattr(batch, "target_verify_path", None),
+            "rpd": getattr(batch, "target_verify_rpd", None),
         }
     )
 
@@ -2248,11 +2356,12 @@ def remember_layer_gpu(sample, gpu_us: Optional[int]) -> None:
         sample["gpu_us"] = None if gpu_us is None else int(gpu_us)
 
 
-def complete_verify_report(frozen, ran_graph: bool) -> dict:
+def complete_verify_report(frozen, ran_graph: bool, rpd=None) -> dict:
     """Build the verify report from the shape frozen before accept.
 
     The bucket is ``pre-verify length + K + 1``. Eager is not fallback.
-    ``K <= 0`` means the verify did not use a draft.
+    ``K <= 0`` means the verify did not use a draft. ``rpd`` is the
+    ``rid -> hex`` acceptable-slot masks of an RPD host-plan verify.
     """
     from sglang.srt.speculative.tree_attn_fallback import (
         select_tree_kv_bucket,
@@ -2269,7 +2378,7 @@ def complete_verify_report(frozen, ran_graph: bool) -> dict:
         chosen = select_tree_kv_bucket(max_ell + k + 1, runtime_kv_buckets())
         bucket = None if chosen is None else int(chosen)
     rpc = frozen.get("rpc_seq")
-    return {
+    report = {
         "session": frozen.get("session"),
         "rpc_seq": rpc if type(rpc) is int else None,
         "b": int(frozen.get("b") or 0),
@@ -2278,6 +2387,9 @@ def complete_verify_report(frozen, ran_graph: bool) -> dict:
         "path": path,
         "fallback": path == "fallback",
     }
+    if path != "fallback" and isinstance(rpd, dict) and rpd:
+        report["rpd"] = dict(rpd)
+    return report
 
 
 def runtime_kv_buckets() -> tuple:

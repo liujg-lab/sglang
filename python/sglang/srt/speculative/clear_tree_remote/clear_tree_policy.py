@@ -1686,7 +1686,8 @@ def make_round(scheduler, reqs) -> RoundPlan:
     def quoted(k: int) -> Optional[float]:
         return _remember_quote(quotes, batch, max_ell, int(k), buckets)
 
-    greedy = _requests_greedy(reqs)
+    target_rpd = _target_rpd(scheduler)
+    greedy = _requests_greedy(reqs) and not target_rpd
     ledger_on = ledger_enabled()
     locked_env = locked_k_from_env()
     fitting = fitting_ks(max_ell, buckets)
@@ -1750,6 +1751,11 @@ def make_round(scheduler, reqs) -> RoundPlan:
         ready=superset_ready,
         kv=width_kv,
     )
+    if target_rpd:
+        # An ineligible round serves the persistent width, which replay may
+        # have switched under a greedy Target. RPD stays on the flat table;
+        # the persistent width is kept for a later greedy Target.
+        width, kind = flat_width(batch), "ordinary"
     layer_ms = predict_layer_ms(scheduler, width, batch, sum(drafts))
     cover = _cover_for(width, max_depth, fitting)
     flat_tier = _covered_flat_k(batch, max_ell, buckets, cover)
@@ -1872,8 +1878,15 @@ def make_fallback_round(scheduler, reqs) -> RoundPlan:
     )
 
     width_kv = width_kv_bucket(max_ell, buckets)
+    # Same rule as make_round: an RPD Target stays on the flat width, not the
+    # width replay may have switched under a greedy Target.
+    width = (
+        flat_width(batch)
+        if _target_rpd(scheduler)
+        else persistent_width(batch, width_kv)
+    )
     plan = RoundPlan(
-        width=persistent_width(batch, width_kv),
+        width=width,
         k=chosen,
         use_tau=True,
         locked_k=chosen,
@@ -2079,6 +2092,25 @@ def _mark_fallback(scheduler) -> None:
     )
 
     mark_round_fallback(scheduler)
+
+
+_rpd_logged = False
+
+
+def _target_rpd(scheduler) -> bool:
+    """True when the Target header says it verifies with RPD.
+
+    RPD accepts paths greedy would reject, so replay and K probes, which
+    assume greedy acceptance, stay off and W and K use the flat table. A
+    header without ``verify_mode`` (an older Target) counts as not RPD.
+    """
+    global _rpd_logged
+    header = getattr(scheduler, "_clear_target_header", None)
+    rpd = isinstance(header, dict) and header.get("verify_mode") == "rpd"
+    if rpd and not _rpd_logged:
+        _rpd_logged = True
+        logger.info("[CLEAR] target verifies with RPD; W/K use the flat table")
+    return rpd
 
 
 def _requests_greedy(reqs) -> bool:

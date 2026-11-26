@@ -1193,6 +1193,63 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.replay_kind, "probe_w")
         self.assertFalse(plan.replay_eligible)
 
+    def test_target_rpd_keeps_the_flat_table(self):
+        # Same ready sample as above. Only the Target header differs.
+        reset_policy()
+        sched = SimpleNamespace(
+            _clear_ledger=False, _clear_target_header={"verify_mode": "rpd"}
+        )
+        req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
+        for k in (2, 4, 8, 16, 32, 64):
+            observe_verify(1, k, 256, 10.0)
+            observe_verify(1, k, 256, 10.0)
+        for _ in range(3):
+            observe_verify(1, 8, 256, 10.0)
+        observe_price(1, 2.0, 1.0)
+        # Replay switched batch bucket 1 to W=4 under an earlier greedy Target.
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_width as width_mod,
+        )
+
+        self.addCleanup(width_mod.reset_persistent_widths)
+        for kv in (None, -1, *ledger_module.runtime_kv_buckets()):
+            width_mod.assign_persistent_width(1, 4, kv)
+        self.assertNotEqual(policy.flat_width(1), 4)
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
+            return_value=1.0,
+        ):
+            plan = make_round(sched, [req])
+        self.assertTrue(plan.use_tau)
+        self.assertFalse(plan.replay_eligible)
+        self.assertEqual(plan.width, policy.flat_width(1))
+        # The batch-build fallback plan follows the same rule.
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
+            return_value=True,
+        ):
+            fallback = policy.make_fallback_round(sched, [req])
+            greedy_fallback = policy.make_fallback_round(
+                SimpleNamespace(_clear_ledger=False), [req]
+            )
+        self.assertTrue(fallback.fallback)
+        self.assertEqual(fallback.width, policy.flat_width(1))
+        self.assertEqual(greedy_fallback.width, 4)
+        # The switched width is kept for a later greedy Target.
+        self.assertEqual(width_mod.persistent_width(1, None), 4)
+        self.assertEqual(policy._probe_rounds, 0)
+        # A header without verify_mode (older Target) is not RPD.
+        self.assertFalse(policy._target_rpd(SimpleNamespace(_clear_target_header={})))
+        self.assertFalse(policy._target_rpd(SimpleNamespace()))
+        self.assertFalse(
+            policy._target_rpd(
+                SimpleNamespace(_clear_target_header={"verify_mode": "greedy"})
+            )
+        )
+
     def test_accept_ratio_is_the_pool_for_every_request(self):
         self.assertEqual(accept_ratio("a"), 1.0)
         observe_accept("a", 1.0, 4.0)
@@ -4263,6 +4320,135 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
         self.assertFalse(row["path_ok"])
         self.assertIsNone(row["next_rank"])
         self.assertEqual((row["depth"], row["accepted"]), (3, 3))
+
+    # Window slots for keep=5 are flats 0, 1, 2, 3, 4 with ranks 1, 3, 2, 4, 5:
+    # j0=10 (depth 0), j1=11 (depth 0), j2=20 and j3=21 under j0, j4=30 under j2.
+    @staticmethod
+    def _rpd_verify(k, masks, fallback=False):
+        return {
+            "rpc_seq": 1,
+            "fallback": fallback,
+            "b": 1,
+            "k": k,
+            "bucket": None,
+            "rpd": masks,
+        }
+
+    def test_rpd_accepts_follow_ranks(self):
+        ledger, _ = self._noted_round()
+        # The Target batch K (8) is above this request's own K (5): another
+        # row was longer and this one was padded. The window is not the whole
+        # 6-node tree, so tiers past 5 stay unknown.
+        record = self._close(
+            ledger, 4, [7, 10, 20, 30, 99], verify=self._rpd_verify(8, {"a": "1f"})
+        )
+        row = record["e_rid"]["a"]
+        self.assertEqual(record["rpd_masks"], 1)
+        self.assertEqual(row["rpd_valid"], 5)
+        self.assertTrue(row["rpd_ok"])
+        # Rank <= 2 keeps j0 and j2; rank <= 4 adds two depth-0/1 nodes; the
+        # depth-2 node is rank 5. Tiers past the 5-node window are unknown.
+        self.assertEqual(
+            row["accept_k"],
+            {"2": 2, "4": 2, "8": None, "16": None, "32": None, "64": None},
+        )
+
+    def test_rpd_accepts_need_every_ancestor(self):
+        # j2 is not acceptable: j4 below it is unreachable, j3 still counts.
+        ledger, _ = self._noted_round()
+        record = self._close(
+            ledger, 3, None, verify=self._rpd_verify(5, {"a": format(0b11011, "x")})
+        )
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["accept_k"]["2"], 1)
+        self.assertEqual(row["accept_k"]["4"], 2)
+        self.assertEqual(row["rpd_valid"], 4)
+        self.assertTrue(row["rpd_ok"])
+
+    def test_rpd_whole_tree_window_fills_larger_tiers(self):
+        # keep=8 over a 6-node tree: the window is the whole tree.
+        ledger, _ = self._noted_round(keep=8)
+        record = self._close(
+            ledger, 4, None, verify=self._rpd_verify(8, {"a": "3f"})
+        )
+        row = record["e_rid"]["a"]
+        self.assertEqual(
+            row["accept_k"], {"2": 2, "4": 2, "8": 3, "16": 3, "32": 3, "64": 3}
+        )
+
+    def test_rpd_tree_of_exactly_k_nodes_is_whole(self):
+        # keep=6 over the 6-node tree: no padding, but the window is the
+        # whole tree, so larger tiers are exact too.
+        ledger, _ = self._noted_round(keep=6)
+        record = self._close(
+            ledger, 4, None, verify=self._rpd_verify(6, {"a": "3f"})
+        )
+        row = record["e_rid"]["a"]
+        self.assertEqual(
+            row["accept_k"], {"2": 2, "4": 2, "8": 3, "16": 3, "32": 3, "64": 3}
+        )
+
+    def test_rpd_greedy_mask_matches_rank_count(self):
+        # Only the greedy path 10 -> 20 -> 30 (j0, j2, j4) is acceptable, as
+        # at tau 0. A(K') is then the number of accepted ranks <= K'.
+        ledger, _ = self._noted_round()
+        record = self._close(
+            ledger,
+            4,
+            [7, 10, 20, 30, 99],
+            verify=self._rpd_verify(5, {"a": format(0b10101, "x")}),
+        )
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["ranks"], [1, 2, 5])
+        for tier in (2, 4):
+            self.assertEqual(
+                row["accept_k"][str(tier)],
+                sum(1 for rank in row["ranks"] if rank <= tier),
+            )
+        self.assertTrue(row["rpd_ok"])
+
+    def test_rpd_mismatch_and_missing_masks(self):
+        ledger, _ = self._noted_round()
+        # Every node acceptable, but only one token was committed.
+        record = self._close(
+            ledger, 2, None, verify=self._rpd_verify(5, {"a": "1f"})
+        )
+        self.assertFalse(record["e_rid"]["a"]["rpd_ok"])
+        # A mask whose window cannot be priced is not counted as used.
+        ledger, _ = self._noted_round()
+        with patch.object(ledger_module, "_rpd_accepts", return_value=None):
+            record = self._close(
+                ledger, 4, None, verify=self._rpd_verify(5, {"a": "1f"})
+            )
+        self.assertEqual(record["rpd_masks"], 0)
+        self.assertIsNone(record["e_rid"]["a"]["accept_k"])
+        self.assertFalse(record["e_rid"]["a"]["rpd_ok"])
+        # A failure inside it keeps the row's other diagnostics.
+        ledger, _ = self._noted_round()
+        with patch.object(ledger_module, "_rpd_accepts", side_effect=KeyError("tokens")):
+            record = self._close(
+                ledger, 4, [7, 10, 20, 30, 99], verify=self._rpd_verify(5, {"a": "1f"})
+            )
+        row = record["e_rid"]["a"]
+        self.assertEqual(row["ranks"], [1, 2, 5])
+        self.assertIn("mass_k", row)
+        self.assertIsNone(row["accept_k"])
+        self.assertFalse(row["rpd_ok"])
+        self.assertEqual(record["rpd_masks"], 0)
+        ledger, _ = self._noted_round()
+        record = self._close(ledger, 4, [7, 10, 20, 30, 99])
+        self.assertIsNone(record["rpd_masks"])
+        self.assertNotIn("accept_k", record["e_rid"]["a"])
+        self.assertNotIn(
+            "rpd",
+            ledger_module._valid_verify_report(
+                {"rpc_seq": 1, "fallback": True, "rpd": {"a": "1"}}
+            ),
+        )
+        self.assertNotIn(
+            "rpd",
+            ledger_module._valid_verify_report(self._rpd_verify(5, {"a": "zz"})),
+        )
 
         ledger, _ = self._noted_round()
         self.assertIsNone(self._close(ledger, 4, None)["e_rid"]["a"]["ranks"])

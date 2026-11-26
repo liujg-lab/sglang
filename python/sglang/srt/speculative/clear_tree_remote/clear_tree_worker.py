@@ -164,22 +164,42 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
-        self._opt_rpd_owner = self._attach_rpd_input(
-            spec_info, batch, roots, token_rows, parent_rows, no_draft, device
+        self._clear_rpd_owner = self._attach_rpd_input(
+            spec_info,
+            batch,
+            roots,
+            token_rows,
+            parent_rows,
+            no_draft,
+            device,
+            num_verify=num_verify,
+            tree_topk=tree_topk,
+            max_depth=max_depth,
         )
         if not wrote_mask or not wrote_pos:
             self._maybe_update_graph_verify_buffers(spec_info)
         return spec_info
 
     def _attach_rpd_input(
-        self, spec_info, batch, roots, token_rows, parent_rows, no_draft, device
+        self,
+        spec_info,
+        batch,
+        roots,
+        token_rows,
+        parent_rows,
+        no_draft,
+        device,
+        *,
+        num_verify,
+        tree_topk,
+        max_depth,
     ):
         from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
-            attach_opt_rpd_input,
+            attach_clear_rpd_input,
         )
 
-        return attach_opt_rpd_input(
-            getattr(self, "_opt_rpd_owner", None),
+        return attach_clear_rpd_input(
+            getattr(self, "_clear_rpd_owner", None),
             self.server_args,
             spec_info,
             batch,
@@ -188,6 +208,9 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             parent_rows,
             no_draft,
             device,
+            num_verify=num_verify,
+            tree_topk=tree_topk,
+            max_depth=max_depth,
         )
 
     def verify(self, batch, spec_info):
@@ -217,7 +240,11 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                 if not ok:
                     metrics._clear_device_open.clear()
         if ok:
-            self._store_verify_report(batch, spec_info, result, metrics, frozen)
+            # No metrics means no report is stored, so the masks would be lost.
+            masks = self._rpd_masks() if metrics is not None else None
+            self._store_verify_report(
+                batch, spec_info, result, metrics, frozen, rpd=masks
+            )
         if not enabled:
             return result
         try:
@@ -321,7 +348,33 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
             "seq_lens": [int(item) for item in seq_lens],
         }
 
-    def _store_verify_report(self, batch, spec_info, result, metrics, frozen) -> None:
+    def _rpd_masks(self):
+        """Acceptable-slot masks of this RPD verify, or None. Never raises.
+
+        Only tp rank 0 sends the verify report, so other ranks skip the work.
+        """
+        args = self.server_args
+        if getattr(args, "speculative_verify_mode", None) != "rpd":
+            return None
+        if int(getattr(self, "tp_rank", 0) or 0) != 0:
+            return None
+        try:
+            from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+                rpd_valid_masks,
+            )
+
+            return rpd_valid_masks(
+                getattr(self, "_clear_rpd_owner", None),
+                getattr(self, "_rpd_workspace", None),
+                float(getattr(args, "speculative_rpd_tau", 0.2)),
+            )
+        except Exception:
+            logger.warning("[CLEAR] RPD acceptable-slot masks failed", exc_info=True)
+            return None
+
+    def _store_verify_report(
+        self, batch, spec_info, result, metrics, frozen, rpd=None
+    ) -> None:
         """Remember the frozen shape so a later STEP can name this verify.
 
         ``fallback`` is only a verify that did not use draft tokens. Eager
@@ -344,7 +397,9 @@ class ClearTreeRemoteWorker(StandaloneRemoteWorker):
                 if isinstance(result, (tuple, list)) and len(result) > 3
                 else False
             )
-            metrics._clear_verify_report = complete_verify_report(frozen, ran_graph)
+            metrics._clear_verify_report = complete_verify_report(
+                frozen, ran_graph, rpd=rpd
+            )
         except Exception:
             logger.warning("[CLEAR] verify report failed", exc_info=True)
 

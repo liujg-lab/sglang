@@ -48,6 +48,16 @@ Target 的 tokenizer 在 `SpeculativeAlgorithm.keeps_source_image_bytes` 为真�
 
 计数：Target 的 `mm_source_sent`、`mm_source_bytes`；Draft 的 `mm_source_ok`、`mm_source_mismatch`、`mm_source_error`，以及 `host_mean_ms` 里的 `mm_source_decode`。这条路径只经过 ClearTree 自己的 `_pack_request` / `_unpack_request`，不改 `SRMMPayload` 和 STANDALONE_REMOTE 的传输。
 
+## RPD 验证
+
+只在 Target 上用 `--speculative-verify-mode rpd` 和 `--speculative-rpd-tau` 打开；Draft 传 `rpd` 拒绝启动。Target 每轮按本轮的验证数 K 建 RPD 的 host 拓扑，宽度是 K+1，不是建树宽度 W，也不读 `--clear-tree-width`。拓扑由 `clear_tree_rpd.py` 从父指针建出，没有草稿的请求整行没有边。选路、统计和验证后处理走共享的 RPD 路径，不改 STANDALONE_REMOTE 的报文。建拓扑被拒时直接报错，不退回 greedy。
+
+Target 头的 `target_info` 带 `verify_mode`。只有 `rpd` 进入拟合文件的 Target 身份：RPD 每次验证多一次统计回传、一次事件等待和主机选路，H 和 greedy 不同。greedy 和 `auto` 的头没有这一键，所以加这一项之前写的文件照常匹配它们；RPD Target 写出的文件头会带 `verify_mode: "rpd"`，只匹配 RPD Target（目前 RPD 下不预拟合，不会写出这种文件）。同理，Target 在 RPD 和非 RPD 之间切换算换了 Target 头，会话推进时走头不一致的清理。Draft 看到 `verify_mode` 为 `rpd` 时，把每一轮都当非贪心：不取 K 探测、不做宽度回放和配对，K 走平表，停层用 τ；W 直接取平表宽度（批建树失败后的回退轮也一样），不用回放在 greedy 下换过的服务宽度，那个宽度保留给之后的 greedy Target。RPD 下不自动预拟合：平表不读 H 和层耗时，扫描只会白占轮次。Draft 账本开着时，FIT 握手对带 `verify_mode: "rpd"` 的 Target 头回 `rpd_flat`，Target 把拟合状态记为 `disabled`（原因 `rpd_flat`），不启动扫描，与 `graph_unsupported` 同样处理；旧 Target 不认识 `rpd_flat`，会每 5 秒重试一次 FIT 查询，无害。以后在 RPD 下打开在线 W 和 K 时再去掉这条，让 RPD Target 单独预拟合。日志打一次 `[CLEAR] target verifies with RPD; W/K use the flat table`。旧 Target 不带这一项，按非 RPD 处理。协议版本不变。
+
+诊断（只记录，不参与决策）：Target 每次走主机选路的 RPD 验证后，只在 tp rank 0（发报告的那个 rank）上从 SR 的 RPD 工作区读本轮边统计，按 `_rpd_select_host` 同一规则（差值不超过 `rpd_gap_max(τ)`，τ=0 时是 token 等于父节点 argmax）给每个请求出一个可接受槽位掩码：槽位 v 可接受时置第 v−1 位，十六进制。没有草稿的请求不出；这一轮走了设备回退 `verify_tree_rpd`、或工作区已不是本轮时整份不出。掩码作为验证报告的 `rpd`，随之后的 STEP 以 `target_verify_rpd`（`rid → hex`）发给 Draft，非法项整份丢弃，协议版本不变。Draft 关账时，若匹配上的报告带掩码，`e_rid` 每个请求另记 `accept_k`、`rpd_valid` 和 `rpd_ok`：`accept_k[K′]` 是名次前 K′ 的窗口里 RPD 的接受数，等于从根起全程可接受、名次不超过 K′ 的节点的最大深度加 1。窗口按名次截取且祖先闭合，所以 K′ 不超过窗口长度时是精确值；超过时只有窗口已是整棵树才补上，否则为 null。「整棵树」指窗口覆盖了这棵树的全部 深度×W 个节点（窗口取的是前 min(K, 深度×W) 个），树恰好 K 个节点也算；不用 Target 整批的 K，Target 会把较短的行补到整批最大的 K。`rpd_valid` 是可接受槽位数，`rpd_ok` 表示整窗口的值等于实际接受数，为假说明槽位没对上，这一行不要用。`d_round` 的 `rpd_masks` 是本轮掩码算出了 `accept_k` 的请求数，没有掩码时为 null；晚到、被暂存的报告不补算。`test/manual/clear_rpd_accept_curve.py <draft.log>` 按 b 档和 K′ 汇总 r(K′) = ΣA/Σmass_k，与本轮服务用的 c（Σe_pred/Σe_mass，默认池化时就是 P）对比。大档只在整棵树窗口的浅树上有值，所以全量表各档不可比；结论只看「匹配集」：从小档起逐个加档，只要同时有这些档的请求不少于 `--min-n`（默认 30）且不少于全部请求的 `--min-share`（默认一半），就在这同一批请求上比较 r(K′)，各档之差小于 5% 时一个池化 c 足以吸收 RPD，否则需要按 K 分档的 c_K。
+
+已知边界：头不一致的清理不清池化接受比 P 和 Θ。Target 在 RPD 和 greedy 之间切换时要重启 Draft，否则 RPD 期间结算的接受比会带进之后的在线选 K。CPU 测试只覆盖拓扑宽度、τ=0 与 greedy 一致和 Draft 回平表，不代表 CUDA/NPU 实机验证通过。
+
 ## 账本
 
 在线 K 和在线 W 由 Draft 的 `SGLANG_CLEAR_LEDGER=1` 打开。Target 的账本只记自己的日志，不参与选 K。默认关闭。只在 tp rank 0 输出。Draft `tp_size > 1` 直接拒绝启动：账本和样本只在 rank 0，其他 rank 会另走一套 τ。

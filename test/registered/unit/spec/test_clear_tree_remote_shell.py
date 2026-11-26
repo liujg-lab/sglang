@@ -711,6 +711,434 @@ class ClearTreeRemoteShellTest(CustomTestCase):
         self.assertEqual(static_disable_reason(opt), "opt_tree")
 
 
+def _link_children(layout):
+    nxt = layout.retrive_next_token
+    sib = layout.retrive_next_sibling
+    batch, width = nxt.shape
+    children = []
+    for row in range(int(batch)):
+        kids = [[] for _ in range(int(width))]
+        for parent in range(int(width)):
+            child = int(nxt[row, parent])
+            while child != -1:
+                kids[parent].append(child)
+                child = int(sib[row, child])
+        children.append(kids)
+    return children
+
+
+def _rpd_batch(bs, vocab=64):
+    reqs = [SimpleNamespace(output_ids=[1], sr_step_id=None) for _ in range(bs)]
+    return SimpleNamespace(sampling_info=SimpleNamespace(vocab_size=vocab), reqs=reqs)
+
+
+class ClearTreeRpdTest(CustomTestCase):
+    """The RPD topology width is this round's K + 1, not the build width W."""
+
+    def test_rpd_width_follows_verify_k(self):
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
+            build_tree_from_parents,
+            opt_parent_slots,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            attach_clear_rpd_input,
+        )
+
+        device = torch.device("cpu")
+        # Flat table: one request is W=8 with K=16; a batch is W=4 with K=8.
+        for width, k in ((4, 8), (8, 16)):
+            with self.subTest(width=width, k=k):
+                server_args = _args(
+                    speculative_verify_mode="rpd", clear_tree_width=width
+                )
+                parents = [-1] + [index - 1 for index in range(1, k)]
+                parents[k // 2] = -1
+                parent_rows = [parents, [-1] * k]
+                token_rows = [[10 + index for index in range(k)], [0] * k]
+                no_draft = [False, True]
+                spec = SimpleNamespace()
+                owner = attach_clear_rpd_input(
+                    None,
+                    server_args,
+                    spec,
+                    _rpd_batch(2),
+                    [1, 2],
+                    token_rows,
+                    parent_rows,
+                    no_draft,
+                    device,
+                    num_verify=k + 1,
+                    tree_topk=2,
+                    max_depth=10,
+                )
+                context = spec.sr_rpd_input
+                self.assertIs(context, owner.rpd_input)
+                self.assertTrue(context.current())
+                self.assertEqual(tuple(context.tree.shape), (4, 2, k + 1))
+                slots = opt_parent_slots(parent_rows, no_draft)
+                for row, slot, parent in context.edges:
+                    self.assertEqual(parent, slots[row][slot])
+                self.assertTrue(all(row == 0 for row, _s, _p in context.edges))
+                self.assertEqual(len(context.edges), k)
+                layout = build_tree_from_parents(
+                    torch.tensor([parents], dtype=torch.long),
+                    torch.tensor([3], dtype=torch.long),
+                )
+                self.assertEqual(
+                    context.topology.children[0], _link_children(layout)[0]
+                )
+                self.assertEqual(
+                    context.topology.children[1], [[] for _ in range(k + 1)]
+                )
+
+    def test_rpd_off_leaves_spec_info(self):
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            attach_clear_rpd_input,
+        )
+
+        for mode in ("auto", "greedy", None):
+            spec = SimpleNamespace()
+            owner = attach_clear_rpd_input(
+                None,
+                _args(speculative_verify_mode=mode),
+                spec,
+                _rpd_batch(1),
+                [1],
+                [[2, 3]],
+                [[-1, 0]],
+                [False],
+                torch.device("cpu"),
+                num_verify=3,
+                tree_topk=2,
+                max_depth=10,
+            )
+            self.assertIsNone(owner)
+            self.assertFalse(hasattr(spec, "sr_rpd_input"))
+
+    def test_rpd_tau0_matches_greedy_when_k_differs_from_w(self):
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_layout import (
+            build_tree_from_parents,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            attach_clear_rpd_input,
+        )
+        from sglang.srt.speculative.rpd_verify import _rpd_select_host
+        from sglang.srt.speculative.tree_verify import verify_tree_greedy_ref
+
+        k = 8
+        width = k + 1
+        vocab = 64
+        gen = torch.Generator().manual_seed(7)
+        parent_rows = [[-1, 0, 1, 2, -1, 4, 5, 6]]
+        token_rows = [[2, 3, 4, 5, 6, 7, 8, 9]]
+        roots = [1]
+        for _ in range(5):
+            parents = [-1]
+            for index in range(1, k):
+                parents.append(
+                    int(torch.randint(-1, index, (1,), generator=gen).item())
+                )
+            parent_rows.append(parents)
+            token_rows.append([20 + index for index in range(k)])
+            roots.append(8)
+        bs = len(parent_rows)
+        layout = build_tree_from_parents(
+            torch.tensor(parent_rows, dtype=torch.long),
+            torch.ones(bs, dtype=torch.long),
+        )
+        candidates = torch.tensor(
+            [[root, *tokens] for root, tokens in zip(roots, token_rows)],
+            dtype=torch.long,
+        )
+        logits = torch.randn(bs * width, vocab, generator=gen)
+        for row, token in ((0, 2), (1, 3), (2, 4), (3, 0)):
+            logits[row].fill_(-1)
+            logits[row, token] = 10
+        star = logits.argmax(dim=-1).reshape(bs, width)
+        predicts = torch.zeros(bs * width, dtype=torch.int32)
+        accept_index = torch.full((bs, width), -1, dtype=torch.int32)
+        accept_length = torch.empty(bs, dtype=torch.int32)
+        verify_tree_greedy_ref(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            retrive_index=layout.retrive_index,
+            retrive_next_token=layout.retrive_next_token,
+            retrive_next_sibling=layout.retrive_next_sibling,
+            target_predict=star,
+        )
+        spec = SimpleNamespace()
+        # Build width W=4 differs from K=8; the adapter must not read it.
+        attach_clear_rpd_input(
+            None,
+            _args(speculative_verify_mode="rpd", clear_tree_width=4),
+            spec,
+            _rpd_batch(bs, vocab),
+            roots,
+            token_rows,
+            parent_rows,
+            [False] * bs,
+            torch.device("cpu"),
+            num_verify=width,
+            tree_topk=2,
+            max_depth=10,
+        )
+        context = spec.sr_rpd_input
+        edge_count = len(context.edges)
+        accept, _lengths, _folded = _rpd_select_host(
+            context.topology,
+            star.tolist(),
+            [[0.0] * edge_count, [0.0] * edge_count],
+            0.0,
+            True,
+            width,
+            bs * width,
+            bs * width + 1,
+        )
+        self.assertEqual(accept, accept_index.tolist())
+        self.assertEqual(accept[0][:4], [0, 1, 2, 3])
+
+    def test_target_info_carries_verify_mode(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            _TARGET_KEYS,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+            parse_target_info,
+        )
+
+        batch = ClearBatchRequest(
+            session_id="s",
+            rpc_seq=1,
+            action=ClearAction.PREFILL,
+            target_info={"tp": 2, "verify_mode": "rpd"},
+        )
+        back = ClearBatchRequest.from_dict(batch.to_dict())
+        self.assertEqual(back.target_info, {"tp": 2, "verify_mode": "rpd"})
+        self.assertEqual(parse_target_info({"tp": 2}), {"tp": 2})
+        # Only RPD joins the fit identity: greedy/auto headers match files
+        # written before verify_mode existed, and RPD files stay apart.
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            _target_identity,
+            target_headers_match,
+        )
+
+        self.assertNotIn("verify_mode", _TARGET_KEYS)
+        old_file = {"tp": 2, "page_size": 128}
+        self.assertTrue(
+            target_headers_match({**old_file, "verify_mode": "auto"}, old_file)
+        )
+        self.assertTrue(
+            target_headers_match({**old_file, "verify_mode": "greedy"}, old_file)
+        )
+        self.assertFalse(
+            target_headers_match({**old_file, "verify_mode": "rpd"}, old_file)
+        )
+        rpd_live = {**old_file, "verify_mode": "rpd", "prefit_batches": [1]}
+        written = _target_identity(rpd_live)
+        self.assertEqual(written, {**old_file, "verify_mode": "rpd"})
+        self.assertTrue(target_headers_match(rpd_live, written))
+        self.assertFalse(
+            target_headers_match({**old_file, "verify_mode": "auto"}, written)
+        )
+        self.assertEqual(_target_identity({**old_file, "verify_mode": "auto"}), old_file)
+
+    @staticmethod
+    def _rpd_round(k, tau, seed):
+        """One CPU RPD verify through the shared host plan."""
+        import torch
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            attach_clear_rpd_input,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            SRRPDWorkspace,
+        )
+
+        gen = torch.Generator().manual_seed(seed)
+        vocab = 8
+        width = k + 1
+        bs = 3
+        parent_rows, token_rows = [], []
+        for row in range(bs):
+            parents = [-1]
+            for index in range(1, k):
+                parents.append(int(torch.randint(-1, index, (1,), generator=gen)))
+            if row == 0:
+                parents[:3] = [-1, 0, 1]
+            parent_rows.append(parents)
+            token_rows.append(
+                [int(t) for t in torch.randint(0, vocab, (k,), generator=gen)]
+            )
+        no_draft = [False, False, True]
+        token_rows[2] = [0] * k
+        parent_rows[2] = [-1] * k
+        roots = [1, 2, 3]
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(vocab_size=vocab),
+            reqs=[
+                SimpleNamespace(rid=f"r{row}", output_ids=[1], sr_step_id=None)
+                for row in range(bs)
+            ],
+        )
+        spec = SimpleNamespace()
+        owner = attach_clear_rpd_input(
+            None,
+            _args(speculative_verify_mode="rpd", clear_tree_width=4),
+            spec,
+            batch,
+            roots,
+            token_rows,
+            parent_rows,
+            no_draft,
+            torch.device("cpu"),
+            num_verify=width,
+            tree_topk=2,
+            max_depth=10,
+        )
+        logits = torch.randn(bs * width, vocab, generator=gen)
+        # Row 0 follows its first three slots, so some path is accepted.
+        for slot in range(3):
+            logits[slot, token_rows[0][slot]] += 6.0
+        workspace = SRRPDWorkspace()
+        return owner, spec.sr_rpd_input, workspace, logits, parent_rows, width
+
+    @staticmethod
+    def _longest_from_mask(mask_hex, parents):
+        bits = int(mask_hex, 16)
+        reach = [False] * len(parents)
+        best = 0
+        for j, parent in enumerate(parents):
+            ok = bool((bits >> j) & 1) and (parent < 0 or reach[parent])
+            reach[j] = ok
+            if ok:
+                depth, up = 1, parent
+                while up >= 0:
+                    depth, up = depth + 1, parents[up]
+                best = max(best, depth)
+        return best
+
+    def test_rpd_masks_match_shared_selection(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            rpd_valid_masks,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            verify_sr_rpd_host,
+        )
+
+        for k in (8, 16):
+            for tau in (0.0, 0.3):
+                with self.subTest(k=k, tau=tau):
+                    owner, context, workspace, logits, parents, width = (
+                        self._rpd_round(k, tau, seed=k)
+                    )
+                    self.assertIsNone(rpd_valid_masks(owner, workspace, tau))
+                    self.assertIsNone(workspace.prepare(logits, context))
+                    plan = verify_sr_rpd_host(
+                        logits, context, workspace, tau, width
+                    )
+                    masks = rpd_valid_masks(owner, workspace, tau)
+                    self.assertEqual(set(masks), {"r0", "r1"})
+                    for row, rid in enumerate(("r0", "r1")):
+                        self.assertEqual(
+                            self._longest_from_mask(masks[rid], parents[row]),
+                            plan.pre_lengths[row],
+                        )
+                    self.assertGreater(plan.pre_lengths[0], 0)
+                    self.assertEqual(plan.pre_lengths[2], 0)
+
+    def test_rpd_masks_only_on_tp_rank_zero(self):
+        namespace = _source_methods(
+            "python/sglang/srt/speculative/clear_tree_remote/clear_tree_worker.py",
+            "ClearTreeRemoteWorker",
+            ["_rpd_masks"],
+            {"logger": Mock()},
+        )
+        build = namespace["_rpd_masks"]
+        target = "sglang.srt.speculative.clear_tree_remote.clear_tree_rpd.rpd_valid_masks"
+        with patch(target, return_value={"r0": "1"}) as masks:
+            for rank, mode, expected in (
+                (0, "rpd", {"r0": "1"}),
+                (1, "rpd", None),
+                (0, "auto", None),
+            ):
+                worker = SimpleNamespace(
+                    server_args=SimpleNamespace(
+                        speculative_verify_mode=mode, speculative_rpd_tau=0.2
+                    ),
+                    tp_rank=rank,
+                    _clear_rpd_owner=object(),
+                    _rpd_workspace=object(),
+                )
+                self.assertEqual(build(worker), expected)
+            self.assertEqual(masks.call_count, 1)
+
+    def test_rpd_masks_none_when_stale_or_unresolved(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_rpd import (
+            rpd_valid_masks,
+        )
+        from sglang.srt.speculative.standalone_remote.sr_rpd import (
+            verify_sr_rpd_host,
+        )
+
+        owner, context, workspace, logits, _parents, width = self._rpd_round(
+            8, 0.3, seed=3
+        )
+        workspace.prepare(logits, context)
+        verify_sr_rpd_host(logits, context, workspace, 0.3, width)
+        self.assertIsNotNone(rpd_valid_masks(owner, workspace, 0.3))
+        self.assertIsNone(rpd_valid_masks(None, workspace, 0.3))
+        self.assertIsNone(rpd_valid_masks(owner, None, 0.3))
+        edge_index = workspace.edge_index
+        workspace.edge_index = edge_index.clone()
+        self.assertIsNone(rpd_valid_masks(owner, workspace, 0.3))
+        workspace.edge_index = edge_index
+        workspace.unresolved = True
+        self.assertIsNone(rpd_valid_masks(owner, workspace, 0.3))
+
+    def test_verify_rpd_wire_roundtrip(self):
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+            complete_verify_report,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+            attach_verify_report,
+            parse_rpd_masks,
+        )
+
+        frozen = {"session": "s", "rpc_seq": 4, "b": 1, "k": 8, "seq_lens": [10]}
+        report = complete_verify_report(frozen, True, rpd={"r0": "1f"})
+        self.assertEqual(report["rpd"], {"r0": "1f"})
+        self.assertNotIn(
+            "rpd", complete_verify_report({**frozen, "k": 0}, False, rpd={"r0": "1"})
+        )
+        self.assertNotIn("rpd", complete_verify_report(frozen, True))
+        batch = ClearBatchRequest(session_id="s", rpc_seq=5, action=ClearAction.STEP)
+        self.assertTrue(attach_verify_report(batch, report, "s"))
+        back = ClearBatchRequest.from_dict(batch.to_dict())
+        self.assertEqual(back.target_verify_rpd, {"r0": "1f"})
+        self.assertEqual(back.target_verify_k, 8)
+        for bad in (
+            {"r0": "xyz"},
+            {"r0": "1" * 17},
+            {"r0": ""},
+            {"r0": 31},
+            {1: "1f"},
+            {"r0": "1f", "r1": "ABC"},
+            [],
+            {},
+        ):
+            self.assertIsNone(parse_rpd_masks(bad))
+        plain = ClearBatchRequest(session_id="s", rpc_seq=6, action=ClearAction.STEP)
+        self.assertNotIn("target_verify_rpd", plain.to_dict())
+        self.assertIsNone(ClearBatchRequest.from_dict(plain.to_dict()).target_verify_rpd)
+
+
 class _DraftSocket:
     def __init__(self, *responses):
         self.recv_multipart = Mock(side_effect=responses)

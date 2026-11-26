@@ -60,6 +60,7 @@ _TARGET_INFO_KEYS = (
     "cuda_graph_bs",
     "prefit_batches",
     "rpc_batch_limit",
+    "verify_mode",
 )
 
 
@@ -197,6 +198,25 @@ def _refill_group_row(item) -> list:
 
 
 _VERIFY_PATHS = ("graph", "eager", "fallback")
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def parse_rpd_masks(value: Any) -> Optional[Dict[str, str]]:
+    """Keep ``rid -> hex`` acceptable-slot masks, or None.
+
+    A mask is 1 to 16 lowercase hex digits (K is at most 64). One bad entry
+    drops the whole map; a partial map would silently bias the Draft's sums.
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+    out: Dict[str, str] = {}
+    for rid, mask in value.items():
+        if type(rid) is not str or type(mask) is not str:
+            return None
+        if not 1 <= len(mask) <= 16 or not set(mask) <= _HEX_DIGITS:
+            return None
+        out[rid] = mask
+    return out
 
 
 def attach_verify_report(batch, report, session_id) -> bool:
@@ -215,6 +235,7 @@ def attach_verify_report(batch, report, session_id) -> bool:
     batch.target_verify_fallback = fallback if type(fallback) is bool else None
     path = report.get("path")
     batch.target_verify_path = path if path in _VERIFY_PATHS else None
+    batch.target_verify_rpd = parse_rpd_masks(report.get("rpd"))
     return True
 
 
@@ -397,6 +418,8 @@ class ClearBatchRequest:
     target_verify_bucket: Optional[int] = None
     target_verify_fallback: Optional[bool] = None
     target_verify_path: Optional[str] = None
+    # rid -> hex acceptable-slot masks of an RPD verify; diagnostics only.
+    target_verify_rpd: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -434,6 +457,9 @@ class ClearBatchRequest:
             result["target_verify_fallback"] = self.target_verify_fallback
         if self.target_verify_path in ("graph", "eager", "fallback"):
             result["target_verify_path"] = self.target_verify_path
+        masks = parse_rpd_masks(self.target_verify_rpd)
+        if masks:
+            result["target_verify_rpd"] = masks
         return result
 
     @classmethod
@@ -488,6 +514,7 @@ class ClearBatchRequest:
             target_verify_path=(
                 verify_path if verify_path in ("graph", "eager", "fallback") else None
             ),
+            target_verify_rpd=parse_rpd_masks(data.get("target_verify_rpd")),
         )
 
 

@@ -2487,6 +2487,38 @@ class ClearTreeVerifyFreezeTest(CustomTestCase):
             else:
                 os.environ["SGLANG_CLEAR_LEDGER"] = saved
 
+    def test_rpd_target_handshake_does_not_scan(self):
+        # Under RPD the Draft serves the flat table and reads no fit.
+        saved = os.environ.get("SGLANG_CLEAR_LEDGER")
+        os.environ["SGLANG_CLEAR_LEDGER"] = "1"
+        try:
+            draft = ClearTreeFitFileTest()._scheduler()
+            draft.sr_session_id = "sess"
+            header = dict(fit.target_info(draft))
+            header["verify_mode"] = "rpd"
+            fit.on_target_info(draft, header)
+            status = fit.fit_handshake_status(draft)
+            self.assertEqual(status["state"], "rpd_flat")
+            self.assertFalse(status["ready"])
+            fit.apply_fit_query(draft, SimpleNamespace(fit_status=dict(status)), 0.0)
+            self.assertEqual(draft._clear_fit_state, "disabled")
+            self.assertFalse(hasattr(draft, "_clear_prefit_thread"))
+            follower = ClearTreeFitFileTest()._scheduler()
+            fit.mirror_fit_reply(follower, SimpleNamespace(fit_status=dict(status)))
+            self.assertEqual(follower._clear_fit_state, "disabled")
+            # A greedy or auto Target still gets the normal handshake.
+            for mode in ("auto", "greedy"):
+                header["verify_mode"] = mode
+                fit.on_target_info(draft, header)
+                self.assertEqual(
+                    fit.fit_handshake_status(draft)["state"], "need_prefit"
+                )
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_CLEAR_LEDGER", None)
+            else:
+                os.environ["SGLANG_CLEAR_LEDGER"] = saved
+
     def test_commit_merges_a_late_graph_report(self):
         case = ClearTreeFitFileTest()
         case.setUp()

@@ -240,6 +240,10 @@ def target_info(scheduler) -> dict:
         "cuda_graph_bs": None if graph_bs is None else [int(item) for item in graph_bs],
         "prefit_batches": prefit_batches_for(scheduler),
         "rpc_batch_limit": rpc_batch_limit_for(scheduler),
+        # The Draft reads it to keep W and K on the flat table while the
+        # Target verifies with RPD. Only "rpd" joins the fit identity
+        # (_target_identity); other modes leave the identity unchanged.
+        "verify_mode": str(getattr(args, "speculative_verify_mode", "auto") or "auto"),
     }
     return parse_target_info(raw) or {}
 
@@ -254,10 +258,25 @@ def prefit_batches_for(scheduler) -> list:
     return [batch for batch in (1, 2, 4) if batch <= limit] or [1]
 
 
+def _target_identity(info: dict) -> dict:
+    """The Target keys a fit file is bound to.
+
+    RPD adds host work to every verify, so its H is not a greedy Target's H.
+    Only ``verify_mode == "rpd"`` joins the identity; greedy and auto headers
+    have no such key, so files written before this field still match them.
+    """
+    out = {key: info[key] for key in _TARGET_KEYS if key in info}
+    if info.get("verify_mode") == "rpd":
+        out["verify_mode"] = "rpd"
+    return out
+
+
 def _norm_target(info) -> Optional[dict]:
     if not isinstance(info, dict) or not info:
         return None
     out = {}
+    if info.get("verify_mode") == "rpd":
+        out["verify_mode"] = "rpd"
     for key in _TARGET_KEYS:
         if key not in info:
             continue
@@ -1057,7 +1076,7 @@ def _materialize_state(scheduler, state: PrefitState) -> dict:
     if not isinstance(target, dict) or not target:
         raise RuntimeError("target header is unknown")
     header = draft_header(scheduler)
-    header["target"] = {key: target[key] for key in _TARGET_KEYS if key in target}
+    header["target"] = _target_identity(target)
     rows, layers = _state_rows(state)
     payload = {
         "schema": _FIT_SCHEMA,
@@ -1548,6 +1567,11 @@ def fit_handshake_status(scheduler) -> dict:
             "ready": False,
             "reason": "graph_unsupported",
         }
+    if isinstance(header, dict) and header.get("verify_mode") == "rpd":
+        # Under an RPD Target W and K stay on the flat table, so no fitted H
+        # or layer cost is read. A scan would only cost rounds. Lift this when
+        # online W/K run under RPD; its fit identity is already separate.
+        return {"state": "rpd_flat", "ready": False, "reason": "rpd_flat"}
     if getattr(scheduler, "_clear_fit_ready", None) is True:
         return {"state": "ready", "ready": True, "reason": "ready"}
     plan = draft_plan(scheduler)
@@ -1674,6 +1698,11 @@ def note_joint_batches(scheduler, status) -> None:
         scheduler._clear_joint_batches = tuple(int(item) for item in batches)
 
 
+# Draft answers that mean "do not scan, serve now". An older Target does not
+# know ``rpd_flat`` and retries the query every 5 s, which is harmless.
+_FIT_DISABLED_STATES = ("ledger_off", "graph_unsupported", "rpd_flat")
+
+
 def apply_fit_query(scheduler, reply, now: float) -> None:
     """Move the handshake after one FIT reply, or a timeout when reply is None."""
     _ensure_fit_runtime(scheduler)
@@ -1698,11 +1727,8 @@ def apply_fit_query(scheduler, reply, now: float) -> None:
     if name == "need_prefit":
         start_prefit_driver(scheduler)
         return
-    if name == "ledger_off":
-        set_fit_state(scheduler, "disabled", reason="ledger_off")
-        return
-    if name == "graph_unsupported":
-        set_fit_state(scheduler, "disabled", reason="graph_unsupported")
+    if name in _FIT_DISABLED_STATES:
+        set_fit_state(scheduler, "disabled", reason=str(name))
         return
     set_fit_state(scheduler, "retry", reason=str(name or "unknown"))
     scheduler._clear_fit_next_at = float(now) + 5.0
@@ -1761,11 +1787,8 @@ def mirror_fit_reply(scheduler, reply) -> None:
     if name == "need_prefit":
         set_fit_state(scheduler, "prefitting", reason="need_prefit")
         return
-    if name == "ledger_off":
-        set_fit_state(scheduler, "disabled", reason="ledger_off")
-        return
-    if name == "graph_unsupported":
-        set_fit_state(scheduler, "disabled", reason="graph_unsupported")
+    if name in _FIT_DISABLED_STATES:
+        set_fit_state(scheduler, "disabled", reason=str(name))
         return
     set_fit_state(scheduler, "retry", reason=str(name or "unknown"))
 
