@@ -68,11 +68,32 @@ class PrefitState:
         self.fingerprint = None
 
 
-def fit_path() -> str:
+FIT_MODES = ("greedy", "rpd")
+
+
+def _fit_mode(info) -> str:
+    """``rpd`` for a Target header that verifies with RPD, else ``greedy``.
+
+    Same rule as ``_target_identity``: ``auto``, ``greedy`` and a header
+    without ``verify_mode`` share the greedy file.
+    """
+    if isinstance(info, dict) and info.get("verify_mode") == "rpd":
+        return "rpd"
+    return "greedy"
+
+
+def fit_path(mode: str = "greedy") -> str:
+    """Fit file of one verify mode. RPD inserts ``.rpd`` before the extension.
+
+    An RPD Target's H is not a greedy Target's H, so each keeps its own file
+    and switching modes does not overwrite the other one.
+    """
     override = os.environ.get("SGLANG_CLEAR_FIT_PATH", "").strip()
-    if override:
-        return override
-    return os.path.join(os.path.dirname(__file__), "clear_tree_fit.json")
+    base = override or os.path.join(os.path.dirname(__file__), "clear_tree_fit.json")
+    if mode != "rpd":
+        return base
+    root, ext = os.path.splitext(base)
+    return root + ".rpd" + ext
 
 
 def parse_rid(rid) -> Optional[dict]:
@@ -240,9 +261,8 @@ def target_info(scheduler) -> dict:
         "cuda_graph_bs": None if graph_bs is None else [int(item) for item in graph_bs],
         "prefit_batches": prefit_batches_for(scheduler),
         "rpc_batch_limit": rpc_batch_limit_for(scheduler),
-        # The Draft reads it to keep W and K on the flat table while the
-        # Target verifies with RPD. Only "rpd" joins the fit identity
-        # (_target_identity); other modes leave the identity unchanged.
+        # Only "rpd" joins the fit identity (_target_identity) and picks the
+        # RPD fit file (fit_path); other modes leave both unchanged.
         "verify_mode": str(getattr(args, "speculative_verify_mode", "auto") or "auto"),
     }
     return parse_target_info(raw) or {}
@@ -362,33 +382,39 @@ def load_draft_part(scheduler) -> None:
     )
 
     scheduler._clear_fit_pending = None
+    scheduler._clear_fit_files = {}
     if not ledger_enabled():
         scheduler._clear_fit_ready = None
         return
     if bind_ledger(scheduler) is None:
         scheduler._clear_fit_ready = None
         return
-    path = fit_path()
-    if not os.path.isfile(path):
-        logger.info("[CLEAR] no fit file at %s", path)
-        return
-    try:
-        payload = _read_fit(path)
-    except Exception:
-        logger.warning("[CLEAR] fit file is unreadable", exc_info=True)
-        return
-    header = payload.get("header") if isinstance(payload, dict) else None
     live = draft_header(scheduler)
-    if not _draft_matches(header, live):
-        logger.info("[CLEAR] fit file does not match this Draft; prefit required")
-        return
-    scheduler._clear_fit_pending = {
-        "payload": payload,
-        "h": list(payload.get("h") or []),
-        "layers": list(payload.get("layers") or []),
-        "target": header.get("target"),
-    }
-    logger.info("[CLEAR] stashed fit file for the Target header check")
+    # The Target's verify mode is not known yet; keep each mode's file and
+    # let ``on_target_info`` pick one.
+    for mode in FIT_MODES:
+        path = fit_path(mode)
+        if not os.path.isfile(path):
+            logger.info("[CLEAR] no fit file at %s", path)
+            continue
+        try:
+            payload = _read_fit(path)
+        except Exception:
+            logger.warning("[CLEAR] fit file %s is unreadable", path, exc_info=True)
+            continue
+        header = payload.get("header") if isinstance(payload, dict) else None
+        if not _draft_matches(header, live):
+            logger.info(
+                "[CLEAR] fit file %s does not match this Draft; prefit required", path
+            )
+            continue
+        scheduler._clear_fit_files[mode] = {
+            "payload": payload,
+            "h": list(payload.get("h") or []),
+            "layers": list(payload.get("layers") or []),
+            "target": header.get("target"),
+        }
+        logger.info("[CLEAR] stashed fit file %s for the Target header check", path)
 
 
 def on_target_info(scheduler, info) -> None:
@@ -409,6 +435,16 @@ def on_target_info(scheduler, info) -> None:
         return
     parsed = parse_target_info(info)
     scheduler._clear_target_header = parsed
+    mode = _fit_mode(parsed)
+    if mode == "rpd" and not getattr(scheduler, "_clear_rpd_logged", False):
+        scheduler._clear_rpd_logged = True
+        logger.info(
+            "[CLEAR] target verifies with RPD; W/K run online on fit file %s",
+            fit_path("rpd"),
+        )
+    files = getattr(scheduler, "_clear_fit_files", None)
+    if isinstance(files, dict):
+        scheduler._clear_fit_pending = files.get(mode)
     pending = getattr(scheduler, "_clear_fit_pending", None)
     rejection = None
     if pending is not None:
@@ -1050,7 +1086,7 @@ def _state_rows(state: PrefitState):
 
 def _store_fit(written: dict) -> None:
     payload = written["payload"]
-    path = fit_path()
+    path = fit_path(_fit_mode(written.get("target")))
     tmp = path + ".tmp"
     directory = os.path.dirname(path)
     if directory:
@@ -1115,6 +1151,10 @@ def _install_written(scheduler, written) -> None:
         "layers": list(written["layers"]),
         "target": written["target"],
     }
+    files = getattr(scheduler, "_clear_fit_files", None)
+    if not isinstance(files, dict):
+        files = scheduler._clear_fit_files = {}
+    files[_fit_mode(written["target"])] = scheduler._clear_fit_pending
 
 
 def _active_state(scheduler, run: str, session=None):
@@ -1567,11 +1607,6 @@ def fit_handshake_status(scheduler) -> dict:
             "ready": False,
             "reason": "graph_unsupported",
         }
-    if isinstance(header, dict) and header.get("verify_mode") == "rpd":
-        # Under an RPD Target W and K stay on the flat table, so no fitted H
-        # or layer cost is read. A scan would only cost rounds. Lift this when
-        # online W/K run under RPD; its fit identity is already separate.
-        return {"state": "rpd_flat", "ready": False, "reason": "rpd_flat"}
     if getattr(scheduler, "_clear_fit_ready", None) is True:
         return {"state": "ready", "ready": True, "reason": "ready"}
     plan = draft_plan(scheduler)
@@ -1698,8 +1733,9 @@ def note_joint_batches(scheduler, status) -> None:
         scheduler._clear_joint_batches = tuple(int(item) for item in batches)
 
 
-# Draft answers that mean "do not scan, serve now". An older Target does not
-# know ``rpd_flat`` and retries the query every 5 s, which is harmless.
+# Draft answers that mean "do not scan, serve now". This Draft no longer sends
+# ``rpd_flat``; it stays here so a Target paired with an older Draft (the two
+# ends are synced separately) settles on disabled instead of retrying forever.
 _FIT_DISABLED_STATES = ("ledger_off", "graph_unsupported", "rpd_flat")
 
 

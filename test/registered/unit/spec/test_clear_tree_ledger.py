@@ -1193,12 +1193,18 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(plan.replay_kind, "probe_w")
         self.assertFalse(plan.replay_eligible)
 
-    def test_target_rpd_keeps_the_flat_table(self):
-        # Same ready sample as above. Only the Target header differs.
-        reset_policy()
-        sched = SimpleNamespace(
-            _clear_ledger=False, _clear_target_header={"verify_mode": "rpd"}
+    def _ready_round_under(self, header):
+        """Same ready sample as above; replay switched b=1 to W=4 earlier."""
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_width as width_mod,
         )
+
+        reset_policy()
+        width_mod.reset_persistent_widths()
+        self.addCleanup(width_mod.reset_persistent_widths)
+        sched = SimpleNamespace(_clear_ledger=False)
+        if header is not None:
+            sched._clear_target_header = header
         req = SimpleNamespace(rid="a", origin_input_ids=[1] * 10, output_ids=[])
         for k in (2, 4, 8, 16, 32, 64):
             observe_verify(1, k, 256, 10.0)
@@ -1206,15 +1212,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         for _ in range(3):
             observe_verify(1, 8, 256, 10.0)
         observe_price(1, 2.0, 1.0)
-        # Replay switched batch bucket 1 to W=4 under an earlier greedy Target.
-        from sglang.srt.speculative.clear_tree_remote import (
-            clear_tree_width as width_mod,
-        )
-
-        self.addCleanup(width_mod.reset_persistent_widths)
         for kv in (None, -1, *ledger_module.runtime_kv_buckets()):
             width_mod.assign_persistent_width(1, 4, kv)
-        self.assertNotEqual(policy.flat_width(1), 4)
         with patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
             return_value=True,
@@ -1223,32 +1222,68 @@ class TestFlatWidthOnlineK(CustomTestCase):
             return_value=1.0,
         ):
             plan = make_round(sched, [req])
-        self.assertTrue(plan.use_tau)
-        self.assertFalse(plan.replay_eligible)
-        self.assertEqual(plan.width, policy.flat_width(1))
-        # The batch-build fallback plan follows the same rule.
-        with patch(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.ledger_enabled",
-            return_value=True,
-        ):
             fallback = policy.make_fallback_round(sched, [req])
-            greedy_fallback = policy.make_fallback_round(
-                SimpleNamespace(_clear_ledger=False), [req]
-            )
-        self.assertTrue(fallback.fallback)
-        self.assertEqual(fallback.width, policy.flat_width(1))
-        self.assertEqual(greedy_fallback.width, 4)
-        # The switched width is kept for a later greedy Target.
-        self.assertEqual(width_mod.persistent_width(1, None), 4)
-        self.assertEqual(policy._probe_rounds, 0)
-        # A header without verify_mode (older Target) is not RPD.
-        self.assertFalse(policy._target_rpd(SimpleNamespace(_clear_target_header={})))
-        self.assertFalse(policy._target_rpd(SimpleNamespace()))
-        self.assertFalse(
-            policy._target_rpd(
-                SimpleNamespace(_clear_target_header={"verify_mode": "greedy"})
-            )
+        return plan, fallback
+
+    def test_target_rpd_runs_online_w_and_k(self):
+        # The pooled c absorbs RPD (2026-11-26-b), and replay, pairing and K
+        # probes price accepts by c times path mass, so an RPD Target gets
+        # the same plan as a greedy one.
+        self.assertNotEqual(policy.flat_width(1), 4)
+        fields = ("width", "k", "use_tau", "locked_k", "replay_kind", "replay_eligible")
+        greedy, greedy_fallback = self._ready_round_under(None)
+        for header in ({"verify_mode": "rpd"}, {"verify_mode": "greedy"}):
+            with self.subTest(header=header):
+                plan, fallback = self._ready_round_under(header)
+                self.assertFalse(plan.use_tau)
+                self.assertIsNone(plan.locked_k)
+                self.assertEqual(
+                    {name: getattr(plan, name) for name in fields},
+                    {name: getattr(greedy, name) for name in fields},
+                )
+                # The batch-build fallback serves the switched width too.
+                self.assertTrue(fallback.fallback)
+                self.assertEqual(fallback.width, 4)
+                self.assertEqual(fallback.width, greedy_fallback.width)
+        self.assertFalse(hasattr(policy, "_target_rpd"))
+
+    def test_verify_mode_change_drops_pooled_state(self):
+        from sglang.srt.speculative.clear_tree_remote import (
+            clear_tree_width as width_mod,
         )
+
+        self.addCleanup(width_mod.reset_persistent_widths)
+        greedy = {"tp": 2, "model": "m"}
+        cases = (
+            # (previous header, next header, dropped)
+            (greedy, dict(greedy, verify_mode="rpd"), True),
+            (dict(greedy, verify_mode="rpd"), dict(greedy, verify_mode="auto"), True),
+            # Another Target in the same mode keeps the pooled state.
+            (greedy, dict(greedy, tp=4), False),
+            (dict(greedy, verify_mode="rpd"), dict(greedy, tp=4, verify_mode="rpd"), False),
+            # The same header, and the first header ever, keep it too.
+            (greedy, dict(greedy), False),
+            (None, dict(greedy, verify_mode="rpd"), False),
+        )
+        for before, after, dropped in cases:
+            with self.subTest(before=before, after=after):
+                reset_policy()
+                observe_accept("a", 1.0, 4.0)
+                observe_price(1, 2.0, 1.0)
+                for kv in (None, -1, *ledger_module.runtime_kv_buckets()):
+                    width_mod.assign_persistent_width(1, 4, kv)
+                sched = SimpleNamespace(_clear_ledger=None)
+                if before is not None:
+                    sched._clear_target_header = dict(before)
+                on_external_event(sched, SimpleNamespace(target_info=dict(after)))
+                if dropped:
+                    self.assertEqual(accept_ratio("a"), 1.0)
+                    self.assertIsNone(theta(1))
+                    self.assertEqual(persistent_width(1, None), policy.flat_width(1))
+                else:
+                    self.assertAlmostEqual(accept_ratio("a"), 4.0 / 7.0)
+                    self.assertIsNotNone(theta(1))
+                    self.assertEqual(persistent_width(1, None), 4)
 
     def test_accept_ratio_is_the_pool_for_every_request(self):
         self.assertEqual(accept_ratio("a"), 1.0)

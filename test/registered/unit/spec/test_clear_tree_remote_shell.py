@@ -747,7 +747,8 @@ class ClearTreeRpdTest(CustomTestCase):
         )
 
         device = torch.device("cpu")
-        # Flat table: one request is W=8 with K=16; a batch is W=4 with K=8.
+        # Flat-table shapes (W=8 with K=16, W=4 with K=8). Online K reuses the
+        # same adapter: the topology width is K + 1, never W.
         for width, k in ((4, 8), (8, 16)):
             with self.subTest(width=width, k=k):
                 server_args = _args(

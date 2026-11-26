@@ -986,12 +986,12 @@ class ClearTreeFitFileTest(CustomTestCase):
         scheduler._clear_prefit_seen = []
         return fit.draft_plan(scheduler).fingerprint + "1"
 
-    def _fill(self, scheduler, run):
+    def _fill(self, scheduler, run, hold=12.5):
         state, stale = fit._adopt_run(scheduler, run)
         self.assertFalse(stale)
         for cell in state.required_h:
             for _ in range(4):
-                fit.prefit_record_h(scheduler, *cell, 12.5)
+                fit.prefit_record_h(scheduler, *cell, hold)
         for cell in state.required_layers:
             for length, target in ((4.0, 1.0), (8.0, 1.4), (12.0, 1.8), (16.0, 2.2)):
                 fit.prefit_record_layer(
@@ -1059,6 +1059,91 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertTrue(scheduler._clear_fit_ready)
         self.assertEqual(policy._hold_anchors, anchors)
         self.assertEqual(policy._clock_ell[(1, 16, 256)], [100, 102, 104, 106])
+
+    def test_fit_path_per_verify_mode(self):
+        rpd_path = str(Path(self._dir.name) / "clear_tree_fit.rpd.json")
+        self.assertEqual(fit.fit_path(), self._path)
+        self.assertEqual(fit.fit_path("greedy"), self._path)
+        self.assertEqual(fit.fit_path("rpd"), rpd_path)
+        os.environ["SGLANG_CLEAR_FIT_PATH"] = "/x/fit"
+        self.assertEqual(fit.fit_path("rpd"), "/x/fit.rpd")
+        os.environ.pop("SGLANG_CLEAR_FIT_PATH")
+        default = fit.fit_path()
+        self.assertEqual(os.path.basename(default), "clear_tree_fit.json")
+        self.assertEqual(
+            fit.fit_path("rpd"),
+            os.path.join(os.path.dirname(default), "clear_tree_fit.rpd.json"),
+        )
+        os.environ["SGLANG_CLEAR_FIT_PATH"] = self._path
+        self.assertEqual(fit._fit_mode({"verify_mode": "rpd"}), "rpd")
+        for info in ({"verify_mode": "auto"}, {"verify_mode": "greedy"}, {}, None):
+            self.assertEqual(fit._fit_mode(info), "greedy")
+
+    def _commit_mode(self, mode, hold):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        if mode == "rpd":
+            scheduler._clear_target_header = dict(
+                scheduler._clear_target_header, verify_mode="rpd"
+            )
+        self._fill(scheduler, run, hold=hold)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        return scheduler
+
+    def test_rpd_prefit_writes_its_own_file(self):
+        rpd_path = Path(fit.fit_path("rpd"))
+        self._commit_mode("greedy", 12.5)
+        greedy_bytes = Path(self._path).read_bytes()
+        self.assertFalse(rpd_path.exists())
+        reset_policy()
+        scheduler = self._commit_mode("rpd", 13.5)
+        # The greedy file is untouched; the RPD file carries the RPD identity.
+        self.assertEqual(Path(self._path).read_bytes(), greedy_bytes)
+        payload = json.loads(rpd_path.read_text())
+        self.assertEqual(payload["header"]["target"]["verify_mode"], "rpd")
+        self.assertNotIn(
+            "verify_mode", json.loads(greedy_bytes)["header"]["target"]
+        )
+        self.assertIs(
+            scheduler._clear_fit_files["rpd"], scheduler._clear_fit_pending
+        )
+
+    def test_each_verify_mode_installs_its_own_file(self):
+        self._commit_mode("greedy", 12.5)
+        reset_policy()
+        self._commit_mode("rpd", 13.5)
+        reset_policy()
+        scheduler = self._scheduler()
+        self._tiny(scheduler, ks=[16], capture=(1,))
+        greedy = dict(scheduler._clear_target_header)
+        rpd = dict(greedy, verify_mode="rpd")
+        fit.load_draft_part(scheduler)
+        self.assertEqual(set(scheduler._clear_fit_files), {"greedy", "rpd"})
+        fit.on_target_info(scheduler, greedy)
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertEqual(policy.predict_hold_ms(1, 16, 256), 12.5)
+        # A mode switch is a header change: the policy drops the fits first.
+        reset_policy()
+        scheduler._clear_fit_installed = False
+        fit.on_target_info(scheduler, rpd)
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertEqual(policy.predict_hold_ms(1, 16, 256), 13.5)
+        reset_policy()
+        scheduler._clear_fit_installed = False
+        fit.on_target_info(scheduler, greedy)
+        self.assertEqual(policy.predict_hold_ms(1, 16, 256), 12.5)
+
+        # Only the greedy file: an RPD Target has to prefit.
+        os.remove(fit.fit_path("rpd"))
+        reset_policy()
+        fresh = self._scheduler()
+        self._tiny(fresh, ks=[16], capture=(1,))
+        fit.load_draft_part(fresh)
+        self.assertEqual(set(fresh._clear_fit_files), {"greedy"})
+        fit.on_target_info(fresh, rpd)
+        self.assertFalse(fresh._clear_fit_ready)
+        self.assertIsNone(fresh._clear_fit_pending)
+        self.assertEqual(fit.fit_handshake_status(fresh)["state"], "need_prefit")
 
     def test_schema_three_needs_matching_ells(self):
         scheduler = self._scheduler()
@@ -1296,7 +1381,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         reset_policy()
         scheduler._clear_fit_installed = False
         fit.load_draft_part(scheduler)
-        self.assertIsNotNone(scheduler._clear_fit_pending)
+        self.assertIn("greedy", scheduler._clear_fit_files)
         fit.on_target_info(scheduler, fit.target_info(scheduler))
         self.assertFalse(scheduler._clear_fit_ready)
 
@@ -2487,32 +2572,42 @@ class ClearTreeVerifyFreezeTest(CustomTestCase):
             else:
                 os.environ["SGLANG_CLEAR_LEDGER"] = saved
 
-    def test_rpd_target_handshake_does_not_scan(self):
-        # Under RPD the Draft serves the flat table and reads no fit.
+    def test_rpd_target_handshake_prefits(self):
+        # An RPD Target runs online W/K, so it needs its own H and is scanned
+        # like a greedy one.
         saved = os.environ.get("SGLANG_CLEAR_LEDGER")
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
         try:
             draft = ClearTreeFitFileTest()._scheduler()
             draft.sr_session_id = "sess"
             header = dict(fit.target_info(draft))
+            for mode in ("rpd", "auto", "greedy"):
+                header["verify_mode"] = mode
+                fit.on_target_info(draft, header)
+                status = fit.fit_handshake_status(draft)
+                self.assertEqual(status["state"], "need_prefit", mode)
+                self.assertFalse(status["ready"])
             header["verify_mode"] = "rpd"
             fit.on_target_info(draft, header)
             status = fit.fit_handshake_status(draft)
-            self.assertEqual(status["state"], "rpd_flat")
-            self.assertFalse(status["ready"])
-            fit.apply_fit_query(draft, SimpleNamespace(fit_status=dict(status)), 0.0)
-            self.assertEqual(draft._clear_fit_state, "disabled")
-            self.assertFalse(hasattr(draft, "_clear_prefit_thread"))
-            follower = ClearTreeFitFileTest()._scheduler()
-            fit.mirror_fit_reply(follower, SimpleNamespace(fit_status=dict(status)))
-            self.assertEqual(follower._clear_fit_state, "disabled")
-            # A greedy or auto Target still gets the normal handshake.
-            for mode in ("auto", "greedy"):
-                header["verify_mode"] = mode
-                fit.on_target_info(draft, header)
-                self.assertEqual(
-                    fit.fit_handshake_status(draft)["state"], "need_prefit"
+            with patch.object(fit, "start_prefit_driver") as start:
+                fit.apply_fit_query(
+                    draft, SimpleNamespace(fit_status=dict(status)), 0.0
                 )
+            start.assert_called_once_with(draft)
+            # An older Draft still answers ``rpd_flat``: settle on disabled
+            # (it serves the flat table) instead of retrying forever.
+            self.assertIn("rpd_flat", fit._FIT_DISABLED_STATES)
+            target = ClearTreeFitFileTest()._scheduler()
+            fit.apply_fit_query(
+                target,
+                SimpleNamespace(
+                    fit_status={"state": "rpd_flat", "ready": False, "reason": "rpd_flat"}
+                ),
+                0.0,
+            )
+            self.assertEqual(target._clear_fit_state, "disabled")
+            self.assertEqual(target._clear_fit_reason, "rpd_flat")
         finally:
             if saved is None:
                 os.environ.pop("SGLANG_CLEAR_LEDGER", None)
