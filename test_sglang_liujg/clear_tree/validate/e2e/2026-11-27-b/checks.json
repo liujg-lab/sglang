@@ -1,0 +1,94 @@
+{
+  "issues": [],
+  "trials": {
+    "01": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "02": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "03": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "04": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "05": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "06": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "07": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    },
+    "08": {
+      "requests": true,
+      "metrics": true,
+      "valid_timing": true,
+      "flush_client": true,
+      "spec": true,
+      "ledger": true
+    }
+  },
+  "modes": {
+    "greedy": {
+      "cleanup": true,
+      "prefit": true,
+      "capture": true,
+      "flush": true,
+      "graph_verify": true,
+      "mask_evidence": true,
+      "timing": true,
+      "parse": true,
+      "greedy_fit_retained": true
+    },
+    "rpd": {
+      "cleanup": true,
+      "prefit": true,
+      "capture": true,
+      "flush": true,
+      "graph_verify": true,
+      "mask_evidence": true,
+      "timing": true,
+      "parse": true,
+      "greedy_fit_retained": true
+    }
+  },
+  "passed": true
+}

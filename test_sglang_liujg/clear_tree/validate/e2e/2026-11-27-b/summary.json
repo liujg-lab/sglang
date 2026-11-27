@@ -1,0 +1,1602 @@
+{
+  "run_id": "2026-11-27-b",
+  "commit": "786b437c3",
+  "trials": {
+    "01": {
+      "id": "01",
+      "mode": "greedy",
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 45952,
+      "wall_s": 780.92,
+      "tok_s": 58.843406409652765,
+      "total_accepted": 35287,
+      "total_draft": 86528,
+      "accept_ratio": 0.40781018860946744,
+      "fallback": 0,
+      "actual_client_concurrency": 0.9998761001133141,
+      "metrics": {
+        "Avg BLEU": 0.5613,
+        "Avg ROUGE-1": 0.797,
+        "Avg ROUGE-2": 0.595,
+        "Avg ROUGE-L": 0.6398
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "02": {
+      "id": "02",
+      "mode": "greedy",
+      "dataset": "RSTeller",
+      "concurrency": 4,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 46428,
+      "wall_s": 289.041,
+      "tok_s": 160.6275122764558,
+      "total_accepted": 33659,
+      "total_draft": 103208,
+      "accept_ratio": 0.32612781954887216,
+      "fallback": 0,
+      "actual_client_concurrency": 3.9319777650753807,
+      "metrics": {
+        "Avg BLEU": 0.5312,
+        "Avg ROUGE-1": 0.7832,
+        "Avg ROUGE-2": 0.5685,
+        "Avg ROUGE-L": 0.618
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "03": {
+      "id": "03",
+      "mode": "greedy",
+      "dataset": "WaterCaption",
+      "concurrency": 1,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 29261,
+      "wall_s": 578.198,
+      "tok_s": 50.60725999040587,
+      "total_accepted": 23009,
+      "total_draft": 51192,
+      "accept_ratio": 0.44946476011876857,
+      "fallback": 0,
+      "actual_client_concurrency": 0.9997819074188994,
+      "metrics": {
+        "Avg BLEU": 0.6287,
+        "Avg ROUGE-1": 0.8282,
+        "Avg ROUGE-2": 0.6706,
+        "Avg ROUGE-L": 0.7171
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "04": {
+      "id": "04",
+      "mode": "greedy",
+      "dataset": "WaterCaption",
+      "concurrency": 4,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 30107,
+      "wall_s": 260.773,
+      "tok_s": 115.45300517758403,
+      "total_accepted": 21988,
+      "total_draft": 66000,
+      "accept_ratio": 0.33315151515151514,
+      "fallback": 0,
+      "actual_client_concurrency": 3.982658479927874,
+      "metrics": {
+        "Avg BLEU": 0.6651,
+        "Avg ROUGE-1": 0.8457,
+        "Avg ROUGE-2": 0.7025,
+        "Avg ROUGE-L": 0.746
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "05": {
+      "id": "05",
+      "mode": "rpd",
+      "rpd_tau": 0.4,
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 43746,
+      "wall_s": 680.495,
+      "tok_s": 64.28553232739459,
+      "total_accepted": 34550,
+      "total_draft": 74752,
+      "accept_ratio": 0.4621949914383562,
+      "fallback": 0,
+      "actual_client_concurrency": 0.9998695410645008,
+      "metrics": {
+        "Avg BLEU": 0.2892,
+        "Avg ROUGE-1": 0.687,
+        "Avg ROUGE-2": 0.3602,
+        "Avg ROUGE-L": 0.4154
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "06": {
+      "id": "06",
+      "mode": "rpd",
+      "rpd_tau": 0.4,
+      "dataset": "RSTeller",
+      "concurrency": 4,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 44034,
+      "wall_s": 254.843,
+      "tok_s": 172.7884747352477,
+      "total_accepted": 33103,
+      "total_draft": 88512,
+      "accept_ratio": 0.3739944866232827,
+      "fallback": 0,
+      "actual_client_concurrency": 3.9172265390123613,
+      "metrics": {
+        "Avg BLEU": 0.3032,
+        "Avg ROUGE-1": 0.6929,
+        "Avg ROUGE-2": 0.3704,
+        "Avg ROUGE-L": 0.4229
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "07": {
+      "id": "07",
+      "mode": "rpd",
+      "rpd_tau": 0.4,
+      "dataset": "WaterCaption",
+      "concurrency": 1,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 28937,
+      "wall_s": 530.102,
+      "tok_s": 54.587558612278784,
+      "total_accepted": 23377,
+      "total_draft": 45752,
+      "accept_ratio": 0.5109503409687008,
+      "fallback": 0,
+      "actual_client_concurrency": 0.9997691784669532,
+      "metrics": {
+        "Avg BLEU": 0.3582,
+        "Avg ROUGE-1": 0.7218,
+        "Avg ROUGE-2": 0.4337,
+        "Avg ROUGE-L": 0.4894
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    },
+    "08": {
+      "id": "08",
+      "mode": "rpd",
+      "rpd_tau": 0.4,
+      "dataset": "WaterCaption",
+      "concurrency": 4,
+      "requests": 100,
+      "ok": 100,
+      "output_tokens": 28796,
+      "wall_s": 243.071,
+      "tok_s": 118.4673447352107,
+      "total_accepted": 21939,
+      "total_draft": 55888,
+      "accept_ratio": 0.3925529630689951,
+      "fallback": 0,
+      "actual_client_concurrency": 3.958793352502844,
+      "metrics": {
+        "Avg BLEU": 0.3863,
+        "Avg ROUGE-1": 0.7366,
+        "Avg ROUGE-2": 0.4589,
+        "Avg ROUGE-L": 0.5124
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "flush_client_ok": true,
+      "counts_ok": true,
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "timing_consistent": true,
+      "response_ids_unique": true
+    }
+  },
+  "modes": {
+    "greedy": {
+      "draft_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          8
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          32
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          64
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          4
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          8
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          16
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          64
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          16
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          32
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          64
+        ]
+      ],
+      "target_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          65
+        ]
+      ],
+      "flush_tp": {
+        "1": 4,
+        "0": 4
+      },
+      "flush_http": {
+        "200": 4
+      },
+      "target_fit": {
+        "states": {
+          "0": {
+            "state": "ready",
+            "run": "01795754302277649119_e57d09bb_9345c853_11795754305588485136",
+            "reason": "prefit",
+            "session": "01795754302277649119_e57d09bb"
+          },
+          "1": {
+            "state": "ready",
+            "run": "01795754302277649119_e57d09bb_9345c853_11795754305588485136",
+            "reason": "prefit",
+            "session": "01795754302277649119_e57d09bb"
+          }
+        },
+        "commits": [
+          {
+            "run": "01795754302277649119_e57d09bb_9345c853_11795754305588485136",
+            "seq": 1,
+            "ready": true,
+            "reason": "ready",
+            "missing_h": [],
+            "missing_layers": [],
+            "refill_groups": []
+          }
+        ],
+        "refills": [],
+        "started": true,
+        "written": false,
+        "installed": false,
+        "legacy_finished": false,
+        "driver": "ready"
+      },
+      "draft_fit": {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": false,
+        "written": true,
+        "installed": false,
+        "legacy_finished": false,
+        "driver": null
+      },
+      "target_verify_paths": {
+        "graph": 22950
+      },
+      "target_timing_invalid": 0,
+      "target_timing": {
+        "verify_wall_us": {
+          "n": 22950,
+          "median_us": 43925.0
+        },
+        "accept_ready_us": {
+          "n": 22950,
+          "median_us": 41455.0
+        },
+        "rpd_build_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_stats_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_select_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_mask_us": {
+          "n": 0,
+          "median_us": null
+        }
+      },
+      "late_rpd_rows": 0,
+      "round_assignment": {
+        "unmatched": 317,
+        "assigned": 22632
+      },
+      "parse_errors": {
+        "draft": 0,
+        "target": 0
+      },
+      "bonus_windows": {
+        "reasons": {
+          "full": 759,
+          "idle": 5
+        },
+        "tail": "flushed",
+        "opt_bonus_forwards": 24372,
+        "opt_bonus_requests": 41526,
+        "opt_bonus_graph": 24372,
+        "opt_bonus_eager": 0
+      },
+      "cleanup": true,
+      "fit_sha256": "10368175fe0186f2d78b4ac967353feb5ae1c700db43c44fc47dfae866b0fae2",
+      "fit_file": {
+        "name": "clear_tree_fit.json",
+        "schema": 3,
+        "cells": 90,
+        "target_mode": null,
+        "draft_lookahead": true
+      },
+      "trials": {
+        "01": {
+          "counts": {
+            "rounds": 10816,
+            "scored": 10716,
+            "excluded": 100,
+            "hold_invalid": 0,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 10716,
+            "c_present": 10716,
+            "c_null": 0,
+            "mass_d_present": 10716,
+            "mass_d_null": 0,
+            "gain_last_present": 10716,
+            "gain_last_null": 60,
+            "gain_next_present": 10716,
+            "gain_next_null": 0,
+            "depth_cap_present": 10716,
+            "depth_cap_null": 0,
+            "depth_capped": 2172,
+            "path_ok": 10716,
+            "mass_k_comparable": 10716,
+            "mass_and_prediction_comparable": 10716
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 10716
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 10716,
+              "observed": 9938,
+              "expected": 9440.248716079692,
+              "observed_over_expected": 1.0527265010584395
+            },
+            "2": {
+              "rows": 10656,
+              "observed": 8477,
+              "expected": 8156.978331843396,
+              "observed_over_expected": 1.0392328697144255
+            },
+            "3": {
+              "rows": 10095,
+              "observed": 6524,
+              "expected": 6425.5498681167355,
+              "observed_over_expected": 1.0153216664571805
+            },
+            "4": {
+              "rows": 8609,
+              "observed": 4563,
+              "expected": 4692.483464592693,
+              "observed_over_expected": 0.9724061969382065
+            },
+            "5": {
+              "rows": 6887,
+              "observed": 2958,
+              "expected": 3221.608831521356,
+              "observed_over_expected": 0.9181747861682913
+            },
+            "6": {
+              "rows": 3927,
+              "observed": 1540,
+              "expected": 1836.1358848685402,
+              "observed_over_expected": 0.838717881770639
+            },
+            "7": {
+              "rows": 2172,
+              "observed": 767,
+              "expected": 1016.8198879423787,
+              "observed_over_expected": 0.7543125474778917
+            }
+          }
+        },
+        "02": {
+          "counts": {
+            "rounds": 3318,
+            "scored": 3123,
+            "excluded": 195,
+            "hold_invalid": 0,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 12130,
+            "c_present": 12130,
+            "c_null": 0,
+            "mass_d_present": 12130,
+            "mass_d_null": 0,
+            "gain_last_present": 12130,
+            "gain_last_null": 24,
+            "gain_next_present": 12130,
+            "gain_next_null": 0,
+            "depth_cap_present": 12130,
+            "depth_cap_null": 0,
+            "depth_capped": 446,
+            "path_ok": 12130,
+            "mass_k_comparable": 12130,
+            "mass_and_prediction_comparable": 3123
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 3115,
+            "tau": 6,
+            "probe": 2
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 12130,
+              "observed": 10683,
+              "expected": 10265.685985484308,
+              "observed_over_expected": 1.0406513519998346
+            },
+            "2": {
+              "rows": 12106,
+              "observed": 8534,
+              "expected": 8303.06867928256,
+              "observed_over_expected": 1.0278127677413593
+            },
+            "3": {
+              "rows": 12008,
+              "observed": 6127,
+              "expected": 6156.008855294323,
+              "observed_over_expected": 0.9952877170945953
+            },
+            "4": {
+              "rows": 9295,
+              "observed": 3763,
+              "expected": 3945.1869278229556,
+              "observed_over_expected": 0.9538204573937665
+            },
+            "5": {
+              "rows": 7004,
+              "observed": 2121,
+              "expected": 2304.31426103384,
+              "observed_over_expected": 0.9204473694696507
+            },
+            "6": {
+              "rows": 2186,
+              "observed": 586,
+              "expected": 737.3251295126254,
+              "observed_over_expected": 0.7947647198561484
+            },
+            "7": {
+              "rows": 446,
+              "observed": 132,
+              "expected": 172.49792314667673,
+              "observed_over_expected": 0.7652266044256026
+            }
+          }
+        },
+        "03": {
+          "counts": {
+            "rounds": 6399,
+            "scored": 6299,
+            "excluded": 100,
+            "hold_invalid": 0,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 6299,
+            "c_present": 6299,
+            "c_null": 0,
+            "mass_d_present": 6299,
+            "mass_d_null": 0,
+            "gain_last_present": 6299,
+            "gain_last_null": 9,
+            "gain_next_present": 6299,
+            "gain_next_null": 0,
+            "depth_cap_present": 6299,
+            "depth_cap_null": 0,
+            "depth_capped": 1502,
+            "path_ok": 6299,
+            "mass_k_comparable": 6299,
+            "mass_and_prediction_comparable": 6299
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 6299
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 6299,
+              "observed": 5921,
+              "expected": 5795.976677601072,
+              "observed_over_expected": 1.0215707083298124
+            },
+            "2": {
+              "rows": 6290,
+              "observed": 5242,
+              "expected": 5104.160439500865,
+              "observed_over_expected": 1.0270053345957546
+            },
+            "3": {
+              "rows": 6061,
+              "observed": 4268,
+              "expected": 4179.023192036426,
+              "observed_over_expected": 1.0212912931742348
+            },
+            "4": {
+              "rows": 5127,
+              "observed": 3096,
+              "expected": 3108.8491415374847,
+              "observed_over_expected": 0.9958669137830438
+            },
+            "5": {
+              "rows": 4368,
+              "observed": 2145,
+              "expected": 2241.9427667439477,
+              "observed_over_expected": 0.9567594819181129
+            },
+            "6": {
+              "rows": 2876,
+              "observed": 1217,
+              "expected": 1370.1212957915852,
+              "observed_over_expected": 0.8882425254888695
+            },
+            "7": {
+              "rows": 1502,
+              "observed": 579,
+              "expected": 701.3650423679635,
+              "observed_over_expected": 0.8255330177922298
+            }
+          }
+        },
+        "04": {
+          "counts": {
+            "rounds": 2099,
+            "scored": 1911,
+            "excluded": 188,
+            "hold_invalid": 0,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 7506,
+            "c_present": 7506,
+            "c_null": 0,
+            "mass_d_present": 7506,
+            "mass_d_null": 0,
+            "gain_last_present": 7506,
+            "gain_last_null": 37,
+            "gain_next_present": 7506,
+            "gain_next_null": 0,
+            "depth_cap_present": 7506,
+            "depth_cap_null": 0,
+            "depth_capped": 213,
+            "path_ok": 7506,
+            "mass_k_comparable": 7506,
+            "mass_and_prediction_comparable": 1911
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 1894,
+            "tau": 3,
+            "probe": 14
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 7506,
+              "observed": 6735,
+              "expected": 6578.061359407978,
+              "observed_over_expected": 1.0238578863919485
+            },
+            "2": {
+              "rows": 7469,
+              "observed": 5501,
+              "expected": 5386.346488751131,
+              "observed_over_expected": 1.0212859517092545
+            },
+            "3": {
+              "rows": 7322,
+              "observed": 4053,
+              "expected": 4013.2083907066985,
+              "observed_over_expected": 1.0099151614916
+            },
+            "4": {
+              "rows": 5447,
+              "observed": 2411,
+              "expected": 2497.0712679578805,
+              "observed_over_expected": 0.9655311127630449
+            },
+            "5": {
+              "rows": 2936,
+              "observed": 1099,
+              "expected": 1193.7090484821883,
+              "observed_over_expected": 0.9206598554290832
+            },
+            "6": {
+              "rows": 1009,
+              "observed": 336,
+              "expected": 395.8361166669421,
+              "observed_over_expected": 0.8488361366042594
+            },
+            "7": {
+              "rows": 213,
+              "observed": 67,
+              "expected": 88.35237319717147,
+              "observed_over_expected": 0.7583271119438922
+            }
+          }
+        }
+      }
+    },
+    "rpd": {
+      "draft_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          8
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          32
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          64
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          4
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          8
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          16
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          64
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          16
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          32
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          64
+        ]
+      ],
+      "target_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          65
+        ]
+      ],
+      "flush_tp": {
+        "0": 4,
+        "1": 4
+      },
+      "flush_http": {
+        "200": 4
+      },
+      "target_fit": {
+        "states": {
+          "0": {
+            "state": "ready",
+            "run": "01795757740572155851_48f04ddf_9345c853_11795757743895658441",
+            "reason": "prefit",
+            "session": "01795757740572155851_48f04ddf"
+          },
+          "1": {
+            "state": "ready",
+            "run": "01795757740572155851_48f04ddf_9345c853_11795757743895658441",
+            "reason": "prefit",
+            "session": "01795757740572155851_48f04ddf"
+          }
+        },
+        "commits": [
+          {
+            "run": "01795757740572155851_48f04ddf_9345c853_11795757743895658441",
+            "seq": 1,
+            "ready": true,
+            "reason": "ready",
+            "missing_h": [],
+            "missing_layers": [],
+            "refill_groups": []
+          }
+        ],
+        "refills": [],
+        "started": true,
+        "written": false,
+        "installed": false,
+        "legacy_finished": false,
+        "driver": "ready"
+      },
+      "draft_fit": {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": false,
+        "written": true,
+        "installed": false,
+        "legacy_finished": false,
+        "driver": null
+      },
+      "target_verify_paths": {
+        "graph": 19993
+      },
+      "target_timing_invalid": 0,
+      "target_timing": {
+        "verify_wall_us": {
+          "n": 19993,
+          "median_us": 43769
+        },
+        "accept_ready_us": {
+          "n": 19993,
+          "median_us": 41550
+        },
+        "rpd_build_us": {
+          "n": 19993,
+          "median_us": 174
+        },
+        "rpd_stats_us": {
+          "n": 19993,
+          "median_us": 33716
+        },
+        "rpd_select_us": {
+          "n": 19993,
+          "median_us": 64
+        },
+        "rpd_mask_us": {
+          "n": 19993,
+          "median_us": 67
+        }
+      },
+      "late_rpd_rows": 19203,
+      "round_assignment": {
+        "unmatched": 267,
+        "assigned": 19725
+      },
+      "parse_errors": {
+        "draft": 0,
+        "target": 0
+      },
+      "bonus_windows": {
+        "reasons": {
+          "full": 664,
+          "idle": 5
+        },
+        "tail": "flushed",
+        "opt_bonus_forwards": 21302,
+        "opt_bonus_requests": 36000,
+        "opt_bonus_graph": 21302,
+        "opt_bonus_eager": 0
+      },
+      "cleanup": true,
+      "fit_sha256": "b9c185514890849e26d13a0d6956b5db3904e76cf0dd62210559cec25bbb3dd0",
+      "fit_file": {
+        "name": "clear_tree_fit.rpd.json",
+        "schema": 3,
+        "cells": 90,
+        "target_mode": "rpd",
+        "draft_lookahead": true
+      },
+      "trials": {
+        "05": {
+          "counts": {
+            "rounds": 9344,
+            "scored": 9244,
+            "excluded": 100,
+            "hold_invalid": 0,
+            "rpd_scored_late_matched": 9144,
+            "rpd_late_mask_rows": 9144,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 9244,
+            "c_present": 9244,
+            "c_null": 0,
+            "mass_d_present": 9244,
+            "mass_d_null": 0,
+            "gain_last_present": 9244,
+            "gain_last_null": 32,
+            "gain_next_present": 9244,
+            "gain_next_null": 0,
+            "depth_cap_present": 9244,
+            "depth_cap_null": 0,
+            "depth_capped": 1986,
+            "path_ok": 9244,
+            "mass_k_comparable": 9244,
+            "mass_and_prediction_comparable": 9244,
+            "rpd_scored_late_unmatched": 100
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 9244
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 9244,
+              "observed": 8776,
+              "expected": 9096.753650066184,
+              "observed_over_expected": 0.9647397673494378
+            },
+            "2": {
+              "rows": 9212,
+              "observed": 7885,
+              "expected": 7899.746053722621,
+              "observed_over_expected": 0.9981333509175688
+            },
+            "3": {
+              "rows": 8755,
+              "observed": 6478,
+              "expected": 6250.319510424772,
+              "observed_over_expected": 1.0364270161222136
+            },
+            "4": {
+              "rows": 7667,
+              "observed": 4877,
+              "expected": 4643.751996022456,
+              "observed_over_expected": 1.0502283507339172
+            },
+            "5": {
+              "rows": 6190,
+              "observed": 3347,
+              "expected": 3223.511141389695,
+              "observed_over_expected": 1.0383088046523914
+            },
+            "6": {
+              "rows": 3567,
+              "observed": 1788,
+              "expected": 1854.799266459138,
+              "observed_over_expected": 0.9639857165855691
+            },
+            "7": {
+              "rows": 1986,
+              "observed": 881,
+              "expected": 1037.4271335120695,
+              "observed_over_expected": 0.8492162693079883
+            }
+          }
+        },
+        "06": {
+          "counts": {
+            "rounds": 2862,
+            "scored": 2670,
+            "excluded": 192,
+            "hold_invalid": 0,
+            "rpd_scored_late_matched": 2669,
+            "rpd_late_mask_rows": 10305,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 10306,
+            "c_present": 10306,
+            "c_null": 0,
+            "mass_d_present": 10306,
+            "mass_d_null": 0,
+            "gain_last_present": 10306,
+            "gain_last_null": 20,
+            "gain_next_present": 10306,
+            "gain_next_null": 0,
+            "depth_cap_present": 10306,
+            "depth_cap_null": 0,
+            "depth_capped": 497,
+            "path_ok": 10306,
+            "mass_k_comparable": 10306,
+            "mass_and_prediction_comparable": 2670,
+            "rpd_scored_late_unmatched": 1
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 2644,
+            "tau": 6,
+            "probe": 20
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 10306,
+              "observed": 9426,
+              "expected": 9774.586211302685,
+              "observed_over_expected": 0.9643374968753559
+            },
+            "2": {
+              "rows": 10286,
+              "observed": 7886,
+              "expected": 7922.7398339646525,
+              "observed_over_expected": 0.9953627362838359
+            },
+            "3": {
+              "rows": 10216,
+              "observed": 6178,
+              "expected": 5940.828491367508,
+              "observed_over_expected": 1.0399222951777047
+            },
+            "4": {
+              "rows": 8420,
+              "observed": 4199,
+              "expected": 3962.8917710053215,
+              "observed_over_expected": 1.0595797822999293
+            },
+            "5": {
+              "rows": 6579,
+              "observed": 2521,
+              "expected": 2415.161593309145,
+              "observed_over_expected": 1.0438224949353556
+            },
+            "6": {
+              "rows": 2361,
+              "observed": 834,
+              "expected": 874.5462517266017,
+              "observed_over_expected": 0.9536373843618312
+            },
+            "7": {
+              "rows": 497,
+              "observed": 180,
+              "expected": 215.30195861798418,
+              "observed_over_expected": 0.8360351255298083
+            }
+          }
+        },
+        "07": {
+          "counts": {
+            "rounds": 5719,
+            "scored": 5619,
+            "excluded": 100,
+            "hold_invalid": 0,
+            "rpd_scored_late_matched": 5519,
+            "rpd_late_mask_rows": 5519,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 5619,
+            "c_present": 5619,
+            "c_null": 0,
+            "mass_d_present": 5619,
+            "mass_d_null": 0,
+            "gain_last_present": 5619,
+            "gain_last_null": 8,
+            "gain_next_present": 5619,
+            "gain_next_null": 0,
+            "depth_cap_present": 5619,
+            "depth_cap_null": 0,
+            "depth_capped": 1438,
+            "path_ok": 5619,
+            "mass_k_comparable": 5619,
+            "mass_and_prediction_comparable": 5619,
+            "rpd_scored_late_unmatched": 100
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 5619
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 5619,
+              "observed": 5391,
+              "expected": 5791.355342711475,
+              "observed_over_expected": 0.9308701816725287
+            },
+            "2": {
+              "rows": 5611,
+              "observed": 4939,
+              "expected": 5126.579755356855,
+              "observed_over_expected": 0.9634103507000259
+            },
+            "3": {
+              "rows": 5452,
+              "observed": 4255,
+              "expected": 4242.283755718619,
+              "observed_over_expected": 1.0029974996991275
+            },
+            "4": {
+              "rows": 4713,
+              "observed": 3387,
+              "expected": 3198.4215370826732,
+              "observed_over_expected": 1.0589598527682915
+            },
+            "5": {
+              "rows": 4057,
+              "observed": 2553,
+              "expected": 2324.61256960277,
+              "observed_over_expected": 1.098247524505237
+            },
+            "6": {
+              "rows": 2699,
+              "observed": 1533,
+              "expected": 1435.8858230154217,
+              "observed_over_expected": 1.0676336345327475
+            },
+            "7": {
+              "rows": 1438,
+              "observed": 797,
+              "expected": 750.2251734746634,
+              "observed_over_expected": 1.0623477166311273
+            }
+          }
+        },
+        "08": {
+          "counts": {
+            "rounds": 1800,
+            "scored": 1613,
+            "excluded": 187,
+            "hold_invalid": 0,
+            "rpd_scored_late_matched": 1612,
+            "rpd_late_mask_rows": 6241,
+            "rpd_ok_false": 0,
+            "diagnostic_rows": 6242,
+            "c_present": 6242,
+            "c_null": 0,
+            "mass_d_present": 6242,
+            "mass_d_null": 0,
+            "gain_last_present": 6242,
+            "gain_last_null": 35,
+            "gain_next_present": 6242,
+            "gain_next_null": 0,
+            "depth_cap_present": 6242,
+            "depth_cap_null": 0,
+            "depth_capped": 320,
+            "path_ok": 6242,
+            "mass_k_comparable": 6242,
+            "mass_and_prediction_comparable": 1613,
+            "rpd_scored_late_unmatched": 1
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 1612,
+            "tau": 1
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 6242,
+              "observed": 5793,
+              "expected": 6158.970425799394,
+              "observed_over_expected": 0.9405792850918108
+            },
+            "2": {
+              "rows": 6207,
+              "observed": 5016,
+              "expected": 5098.348601491825,
+              "observed_over_expected": 0.9838479853127875
+            },
+            "3": {
+              "rows": 6114,
+              "observed": 4020,
+              "expected": 3873.235883106483,
+              "observed_over_expected": 1.0378918613074004
+            },
+            "4": {
+              "rows": 4774,
+              "observed": 2760,
+              "expected": 2576.393958571607,
+              "observed_over_expected": 1.0712647383827072
+            },
+            "5": {
+              "rows": 3415,
+              "observed": 1641,
+              "expected": 1527.720124944198,
+              "observed_over_expected": 1.07414962544919
+            },
+            "6": {
+              "rows": 1342,
+              "observed": 593,
+              "expected": 581.7839817071894,
+              "observed_over_expected": 1.0192786646684535
+            },
+            "7": {
+              "rows": 320,
+              "observed": 139,
+              "expected": 141.0432729833459,
+              "observed_over_expected": 0.9855131482691332
+            }
+          }
+        }
+      }
+    }
+  },
+  "issues": []
+}
