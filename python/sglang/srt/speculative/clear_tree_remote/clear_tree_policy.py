@@ -1464,7 +1464,7 @@ class RoundPlan:
             accept_ratio(key),
             mass,
             int(state.depth),
-            detail=self._expect_detail(state, scores, ordered, verify),
+            detail=self._expect_detail(state, scores, ordered, verify, keep=keep),
         )
 
     def _k_mode(self) -> str:
@@ -1481,12 +1481,17 @@ class RoundPlan:
             return "tau"
         return "value"
 
-    def _expect_detail(self, state, scores, ordered, verify) -> Optional[dict]:
+    def _expect_detail(
+        self, state, scores, ordered, verify, keep=None
+    ) -> Optional[dict]:
         """References for the post-close diagnostics, or None with the ledger off.
 
         Nothing is sorted or summed here. The K quotes are the entries the
         decisions already put on this round's table; missing tiers are not
-        priced, so the table is not touched.
+        priced, so the table is not touched. ``keep`` is this tree's verify
+        tier and ``gain_ratio`` the value its last stop decision read; the
+        close prices the last and the next layer with them (``gain_last``,
+        ``gain_next``). ``depth_cap`` is the depth no decision grows past.
         """
         if verify is None:
             return None
@@ -1508,11 +1513,16 @@ class RoundPlan:
                     for k, v in table.items()
                     if v is not None and int(k) <= cover
                 }
+            config = getattr(state, "config", None)
+            max_depth = getattr(config, "max_depth", None)
             return {
                 "scores": scores,
                 "ordered": ordered,
-                "width": int(getattr(getattr(state, "config", None), "width", 0) or 0),
+                "width": int(getattr(config, "width", 0) or 0),
                 "depth": int(getattr(state, "depth", 0) or 0),
+                "keep": None if keep is None else int(keep),
+                "gain_ratio": float(gain_ratio()),
+                "depth_cap": None if max_depth is None else int(max_depth) - 1,
                 "verify": verify,
                 "tree": getattr(state, "host_tree", None),
                 "k_mode": mode,

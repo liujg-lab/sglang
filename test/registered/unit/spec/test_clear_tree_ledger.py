@@ -4419,6 +4419,74 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
         self.assertEqual(record["verify_quotes"], {"4": 38.0, "8": 40.0})
         self.assertAlmostEqual(record["theta"], 0.05)
 
+    def test_window_mass_per_depth_and_layer_gains(self):
+        # keep=5 keeps flats 0..4: depth 1 holds 0.6+0.3, depth 2 0.5+0.3,
+        # depth 3 only 0.3. The per-depth sums add up to the K=5 mass.
+        ledger, _ = self._noted_round()
+        row = self._close(ledger, 4, [7, 10, 20, 30, 99])["e_rid"]["a"]
+        for got, want in zip(row["mass_d"], [0.9, 0.8, 0.3]):
+            self.assertAlmostEqual(got, want, places=5)
+        self.assertEqual(len(row["mass_d"]), row["depth"])
+        self.assertAlmostEqual(sum(row["mass_d"]), 2.0, places=5)
+        # No accepts or gain observations yet: c = 1 and gain_ratio = 1.
+        self.assertAlmostEqual(row["c"], 1.0)
+        # Next layer at K=5: theta_5 = 0.3, newest layer 0.3 0.2 -> 0.
+        self.assertAlmostEqual(row["gain_next"], 0.0, places=6)
+        # Last layer: the depth-2 tree has only 4 nodes, so theta_5 = 0 and
+        # its newest layer 0.5 0.3 is the whole bound.
+        self.assertAlmostEqual(row["gain_last"], 0.8, places=5)
+        self.assertEqual(row["depth_cap"], 3)
+
+    def test_layer_gains_use_c_and_the_gain_ratio(self):
+        observe_accept("a", 1.0, 4.0)
+        policy._observe_gain(10.0, 4.0, 1.0)
+        c = accept_ratio("a")
+        scale = policy.gain_ratio()
+        self.assertAlmostEqual(c, 4.0 / 7.0)
+        self.assertAlmostEqual(scale, 7.0 / 13.0)
+        # K=2 on a=0.6 b=0.3 | c=0.5 d=0.1. Next layer: theta_2 = 0.5, newest
+        # layer 0.5 0.1 -> 0. Last layer: theta_2 = 0.3 on the depth-1 tree,
+        # newest layer 0.6 0.3 -> 0.3.
+        ledger, _ = self._noted_round(keep=2, tree=self._shallow_tree)
+        row = self._close(ledger, 1, [11])["e_rid"]["a"]
+        self.assertAlmostEqual(row["c"], c)
+        self.assertAlmostEqual(row["gain_last"], 0.3 * c * scale, places=6)
+        self.assertAlmostEqual(row["gain_next"], 0.0, places=6)
+        for got, want in zip(row["mass_d"], [0.6, 0.5]):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_depth_one_tree_has_no_last_layer_gain(self):
+        def seed_only(rid="a"):
+            state = ClearTreeState.create(
+                ClearTreeConfig(width=2, tau=0.0, max_depth=4)
+            )
+            state.weight[:1] = torch.tensor([[0.6, 0.3]])
+            state.tokens[:1] = torch.tensor([[10, 11]])
+            state.parents[:1] = torch.tensor([[0, 0]])
+            state.depth = 1
+            state.rid = rid
+            state.prefix = 100
+            return state
+
+        ledger, _ = self._noted_round(keep=2, tree=seed_only)
+        row = self._close(ledger, 2, [10, 99])["e_rid"]["a"]
+        self.assertEqual(row["depth"], 1)
+        self.assertIsNone(row["gain_last"])
+        # theta_2 = 0.3 and the newest layer is the seed layer: 0.3 + 0.
+        self.assertAlmostEqual(row["gain_next"], 0.3, places=6)
+        for got, want in zip(row["mass_d"], [0.9]):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_layer_gain_helpers_decline_missing_inputs(self):
+        detail = {"width": 2, "depth": 2, "scores": [0.6, 0.3, 0.5, 0.1]}
+        empty = {"gain_last": None, "gain_next": None}
+        self.assertEqual(ledger_module._layer_gains(detail, 1.0), empty)
+        with_keep = dict(detail, keep=2, gain_ratio=1.0)
+        self.assertEqual(ledger_module._layer_gains(with_keep, None), empty)
+        short = dict(with_keep, scores=[0.6, 0.3])
+        self.assertEqual(ledger_module._layer_gains(short, 1.0), empty)
+        self.assertIsNone(ledger_module._window_mass_by_depth(detail))
+
     def test_diagnostics_do_not_fill_the_quote_table(self):
         ledger, plan = self._noted_round()
         self._close(ledger, 4, [10, 20, 30, 99])

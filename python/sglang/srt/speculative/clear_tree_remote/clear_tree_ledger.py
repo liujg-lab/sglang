@@ -768,11 +768,73 @@ def _rpd_accepts(detail: dict, mask) -> Optional[dict]:
     return {"accept_k": accept_k, "rpd_valid": valid, "rpd_full": accepts(n)}
 
 
-def _rid_detail(detail: dict, accepted: int, tail, mask=None) -> dict:
+def _window_mass_by_depth(detail: dict) -> Optional[List[float]]:
+    """Path mass of the verify window per depth (index 0 is depth 1), or None."""
+    window = _window_of(detail)
+    width = int(detail["width"])
+    depth = int(detail["depth"])
+    if window is None or width <= 0 or depth <= 0:
+        return None
+    _, _, depths, cols = window
+    scores = detail["scores"]
+    out = [0.0] * depth
+    for node_depth, col in zip(depths, cols):
+        node_depth = int(node_depth)
+        flat = node_depth * width + int(col)
+        if not (0 <= node_depth < depth) or not (0 <= flat < len(scores)):
+            return None
+        out[node_depth] += float(scores[flat])
+    return out
+
+
+def _layer_gains(detail: dict, ratio: Optional[float]) -> dict:
+    """Predicted accepts of the last grown layer and of one more layer.
+
+    Same formula as the stop rule: c times ``gain_ratio`` times the raw bound
+    ``sum(max(0, s - theta_K))`` over the newest layer, at this tree's verify
+    tier K. ``gain_last`` uses the tree without its last layer, so it is the
+    prediction behind growing that layer (None at depth 1, whose layer no
+    decision grows). ``gain_next`` uses the whole tree, so it is the value
+    the stop rule turned down, unless the tree sits at ``depth_cap``.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
+        _raw_marginal_for,
+    )
+
+    out = {"gain_last": None, "gain_next": None}
+    keep = detail.get("keep")
+    scale = detail.get("gain_ratio")
+    width = int(detail["width"])
+    depth = int(detail["depth"])
+    scores = [float(value) for value in detail["scores"]]
+    if keep is None or scale is None or ratio is None or width <= 0 or depth <= 0:
+        return out
+    if len(scores) < depth * width:
+        return out
+    factor = float(ratio) * float(scale)
+    k = int(keep)
+    whole = scores[: depth * width]
+    out["gain_next"] = factor * _raw_marginal_for(
+        sorted(whole, reverse=True), whole[-width:], k
+    )
+    if depth >= 2:
+        short = scores[: (depth - 1) * width]
+        out["gain_last"] = factor * _raw_marginal_for(
+            sorted(short, reverse=True), short[-width:], k
+        )
+    return out
+
+
+def _rid_detail(
+    detail: dict, accepted: int, tail, mask=None, ratio: Optional[float] = None
+) -> dict:
     """Per-request depth, accepts, accepted-path ranks and mass per tier.
 
     With an RPD ``mask``, also the RPD accepts per K tier; ``rpd_ok`` says
-    the whole-window value matches the realized accepts.
+    the whole-window value matches the realized accepts. ``ratio`` is the
+    request's c_i; it prices ``gain_last`` and ``gain_next``. ``mass_d`` is
+    the verify window's path mass per depth, for a per-depth accept ratio
+    ``sum(A >= j) / sum(c * mass_d[j-1])``. All of these only log.
     """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         VERIFY_KS,
@@ -808,7 +870,17 @@ def _rid_detail(detail: dict, accepted: int, tail, mask=None) -> dict:
         "next_rank": walk["next_rank"],
         "next_rank_short": walk["next_rank_short"],
         "mass_k": mass_k,
+        "c": None if ratio is None else float(ratio),
+        "mass_d": None,
+        "gain_last": None,
+        "gain_next": None,
+        "depth_cap": detail.get("depth_cap"),
     }
+    try:
+        out["mass_d"] = _window_mass_by_depth(detail)
+        out.update(_layer_gains(detail, ratio))
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        pass
     if mask is not None:
         out.update(_mask_fields(detail, accepted, mask))
     return out
@@ -887,7 +959,9 @@ def _round_expect(
         if detail is not None:
             mask = masks.get(rid)
             try:
-                row = _rid_detail(detail, taken, tails.get(rid), mask=mask)
+                row = _rid_detail(
+                    detail, taken, tails.get(rid), mask=mask, ratio=ratio
+                )
                 per_rid[rid] = row
                 if row.get("accept_k") is not None:
                     used_masks += 1
