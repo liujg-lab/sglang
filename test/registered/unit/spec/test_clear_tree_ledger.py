@@ -4695,10 +4695,13 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
     def test_deferred_close_matches_the_receive_close(self):
         tail = [10, 20, 30, 99]
         sync = self._close(self._noted_round()[0], 4, tail)
+        # The synchronous close updates the shared accept statistics.
+        reset_policy()
         ledger, _ = self._noted_round()
         self.assertIsNone(self._close(ledger, 4, tail, defer=True))
         deferred = ledger.run_deferred()
         self.assertEqual(deferred["e_rid"], sync["e_rid"])
+        self.assertEqual(sync["e_rid"]["a"]["c"], 1.0)
         self.assertEqual(deferred["verify_quotes"], sync["verify_quotes"])
         self.assertEqual(deferred["k_mode"], sync["k_mode"])
 
