@@ -235,7 +235,7 @@ class ClearTreeLedgerTest(CustomTestCase):
         _step(ledger, ["a"], [8], 1, 1.0)
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -468,7 +468,7 @@ class ClearTreeLedgerTest(CustomTestCase):
         ledger.note_bonus_hit("a")
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -1850,7 +1850,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
     def test_frozen_rows_omit_the_unforwarded_layer(self):
         state = SimpleNamespace(depth=3, prefix=10)
 
-        def predict(_scheduler, width, _active, _sum_ell, depth=None):
+        def predict(_scheduler, width, _active, _sum_ell):
             return 7.0 if int(width) == 8 else 5.0
 
         with patch(
@@ -2114,7 +2114,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         deep = SimpleNamespace(depth=3, prefix=10)
         shallow = SimpleNamespace(depth=2, prefix=4)
 
-        def predict(_scheduler, width, _active, _sum_ell, depth=None):
+        def predict(_scheduler, width, _active, _sum_ell):
             if int(width) != 8:
                 return None
             return 7.0
@@ -2141,8 +2141,8 @@ class TestFlatWidthOnlineK(CustomTestCase):
         shallow = SimpleNamespace(depth=2, prefix=4, forwarded_layers=2)
         seen = []
 
-        def predict(_scheduler, width, active, sum_ell, depth=None):
-            seen.append((int(width), int(active), int(sum_ell), depth))
+        def predict(_scheduler, width, active, sum_ell):
+            seen.append((int(width), int(active), int(sum_ell)))
             return 7.0
 
         with patch(
@@ -2153,7 +2153,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["active"] for row in rows], [2, 2])
         self.assertEqual([row["sum_ell"] for row in rows], [14, 14])
-        self.assertIn((8, 2, 14, 2), seen)
+        self.assertIn((8, 2, 14), seen)
         # Ordinary stamps (depth - 1) give the same rows as no stamp.
         deep.forwarded_layers, shallow.forwarded_layers = 2, 1
         with patch(
@@ -2552,7 +2552,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.note_idle()
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2639,7 +2639,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger = ClearLedger(active_rids=["a"])
         _step(ledger, ["a"], [16], 1, 0.0)
         samples = []
-        for t0, layer in ((0.0, 0), (0.012, 1), (0.025, 2)):
+        for t0, layer in ((0.0, 2), (0.012, 3), (0.025, 4)):
             sample = {
                 "layer": layer,
                 "active": 1,
@@ -2672,7 +2672,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         _step(ledger, ["a"], [16], 1, 0.0)
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2685,7 +2685,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         )
         ledger.queue_layer(
             {
-                "layer": 1,
+                "layer": 3,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2716,7 +2716,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.open.prefit = {"phase": "keep", "group": "w", "run": "abcd12341"}
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2729,7 +2729,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         )
         ledger.queue_layer(
             {
-                "layer": 1,
+                "layer": 3,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2858,7 +2858,7 @@ class TestFlatWidthOnlineK(CustomTestCase):
         ledger.open.k = 16
         ledger.queue_layer(
             {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -3908,16 +3908,12 @@ class TestDeferredClose(CustomTestCase):
 
 
 class TestLayerDepthAndExpect(CustomTestCase):
-    """Per-depth layer correction and the accepted-versus-E diagnostics."""
+    """One layer price for every depth, and the accepted-versus-E diagnostics."""
 
     def setUp(self):
         reset_policy()
-        self._env = {
-            name: os.environ.get(name)
-            for name in ("SGLANG_CLEAR_LEDGER", "SGLANG_CLEAR_LAYER_DEPTH")
-        }
+        self._env = {name: os.environ.get(name) for name in ("SGLANG_CLEAR_LEDGER",)}
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
-        os.environ.pop("SGLANG_CLEAR_LAYER_DEPTH", None)
 
     def tearDown(self):
         for name, value in self._env.items():
@@ -3968,55 +3964,54 @@ class TestLayerDepthAndExpect(CustomTestCase):
         self.assertEqual([item.get("last") for item in rnd.layers[:3]], [False, False, True])
         self.assertNotIn("last", rnd.layers[3])
 
-    def test_only_middle_graph_layers_teach_the_depth_ratio(self):
+    def test_first_forward_is_priced_and_logged_but_not_fitted(self):
         ledger = self._fitted_ledger()
+        model = ledger.layer_models[(8, "graph", 1)]
         rnd = SimpleNamespace(prefit=None, rpc_seq=1, session_id="s")
-        ledger._finish_layer(rnd, self._sample(3), False)
-        self.assertEqual(ledger.layer_depth[(8, 1, 3)][2], 1)
-        self.assertEqual(ledger.layer_depth_pooled[(1, 3)][2], 1)
-        for sample, excluded in (
-            (self._sample(3, last=True), False),
-            (self._sample(3, path="eager"), False),
-            # Without a wall the fallback host plus GPU is a different span.
-            (self._sample(3, wall_us=None), False),
-            (self._sample(3), True),
-        ):
-            ledger._finish_layer(rnd, sample, excluded)
-        self.assertEqual(ledger.layer_depth[(8, 1, 3)][2], 1)
-        logged = [record for kind, record in ledger.pending_logs if kind == "d_layer"]
-        self.assertEqual(len(logged), 5)
-        self.assertEqual(logged[0]["depth_src"], "none")
-        self.assertAlmostEqual(logged[0]["depth_ratio"], 1.0)
-        self.assertTrue(logged[1]["last"])
+        before = model.n
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_fit.note_online_layer"
+        ) as online:
+            ledger._finish_layer(rnd, self._sample(1), False)
+            self.assertEqual(model.n, before)
+            online.assert_not_called()
+            ledger._finish_layer(rnd, self._sample(2), False)
+            self.assertEqual(model.n, before + 1)
+            online.assert_called_once()
+        first, second = [record for kind, record in ledger.pending_logs if kind == "d_layer"]
+        self.assertFalse(first["fit"])
+        self.assertIsNotNone(first["pred_ms"])
+        self.assertIsNotNone(first["residual"])
+        self.assertTrue(second["fit"])
+        for record in (first, second):
+            self.assertNotIn("depth_ratio", record)
+            self.assertNotIn("depth_src", record)
 
-    def test_depth_ratio_scales_prices_once_it_has_samples(self):
+    def test_first_forward_stays_out_of_the_prefit_record(self):
+        ledger = self._fitted_ledger()
+        rnd = SimpleNamespace(prefit={"phase": "keep"}, rpc_seq=1, session_id="s")
+        with patch(
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_fit.prefit_record_layer"
+        ) as record:
+            ledger._finish_layer(rnd, self._sample(1), False)
+            record.assert_not_called()
+            ledger._finish_layer(rnd, self._sample(ledger_module.LAYER_FIT_MIN_INDEX), False)
+            record.assert_called_once()
+
+    def test_layer_price_is_the_same_at_every_depth(self):
         ledger = self._fitted_ledger()
         sched = SimpleNamespace(_clear_ledger=ledger, tp_rank=0)
         base = predict_layer_ms(sched, 8, 1, 200)
-        slope = layer_sum_ell_slope(sched, 8, 1)
-        for _ in range(ledger_module.DEPTH_MIN_SAMPLES - 1):
-            ledger._learn_depth({"layer": 4, "graph_bucket": 1, "w": 8}, 9.0, 10.0)
-        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base)
-        ledger._learn_depth({"layer": 4, "graph_bucket": 1, "w": 8}, 9.0, 10.0)
-        self.assertEqual(ledger_module.layer_depth_ratio(ledger, 8, 1, 4)[1], "cell")
-        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base * 0.9)
-        self.assertAlmostEqual(layer_sum_ell_slope(sched, 8, 1, depth=4), slope * 0.9)
-        # Without a depth the price is the base fit.
-        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200), base)
-        # Another width at the same capture batch borrows the pooled row.
-        ratio, source = ledger_module.layer_depth_ratio(ledger, 16, 1, 4)
-        self.assertEqual(source, "pooled")
-        self.assertAlmostEqual(ratio, 0.9)
-        # Deep forwards share the capped bucket.
-        self.assertEqual(ledger_module._depth_key(12), ledger_module.DEPTH_CAP)
-        os.environ["SGLANG_CLEAR_LAYER_DEPTH"] = "0"
-        self.assertAlmostEqual(predict_layer_ms(sched, 8, 1, 200, depth=4), base)
-        # Installing fits replaces the regressions the ratios were measured on.
+        self.assertIsNotNone(base)
+        model = ledger.layer_models[(8, "graph", 1)]
+        self.assertAlmostEqual(base, model.predict([1.0, 200.0]))
+        self.assertAlmostEqual(layer_sum_ell_slope(sched, 8, 1), model.coefficients()[1])
+        self.assertFalse(hasattr(ledger, "layer_depth"))
+        self.assertFalse(hasattr(ledger_module, "layer_depth_ratio"))
+        # Installing fits no longer has depth state to clear.
         from sglang.srt.speculative.clear_tree_remote import clear_tree_fit
 
-        clear_tree_fit._install_layers(sched, [])
-        self.assertEqual(ledger.layer_depth, {})
-        self.assertEqual(ledger.layer_depth_pooled, {})
+        self.assertEqual(clear_tree_fit._install_layers(sched, []), 0)
 
     def test_round_records_accepts_against_expected_mass(self):
         ledger = ClearLedger(active_rids=["a", "b"])
@@ -4040,52 +4035,37 @@ class TestLayerDepthAndExpect(CustomTestCase):
         self.assertIsNone(empty["e_pred"])
         self.assertIsNone(empty["accepted"])
 
-    def test_stop_decision_and_replay_price_the_forwarded_depth(self):
+    def test_stop_decision_and_replay_use_the_one_layer_price(self):
         state = SimpleNamespace(depth=3, config=SimpleNamespace(max_depth=8), prefix=100)
         plan = policy.RoundPlan.__new__(policy.RoundPlan)
-        plan._scheduler = None
-        plan.fixed_depth = None
-        plan.use_tau = False
-        plan.theta_value = 1.0
-        plan.layer_ms = 1.0
-        plan._at = None
-        plan._peers = [state]
-        plan._keep_ids = set()
-        plan._cost_depth = None
+        plan._scheduler = SimpleNamespace()
         plan.width = 8
-        with patch.object(policy.RoundPlan, "_choose_keep", return_value=[]):
-            plan.should_grow(state)
-        self.assertEqual(plan._cost_depth, 3)
+        calls = []
 
-        seen = []
-        factors = []
-
-        def capture(*_args, **kwargs):
-            seen.append(kwargs.get("depth"))
+        def capture(*args, **kwargs):
+            calls.append((args[1:], kwargs))
             return 2.0
 
-        def factor(_scheduler, _width, active, depth):
-            factors.append((active, depth))
-            return 0.5
+        def slope(*args, **kwargs):
+            calls.append((args[1:], kwargs))
+            return 0.25
 
-        plan._scheduler = SimpleNamespace()
         with patch(
             "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.predict_layer_ms",
             side_effect=capture,
         ), patch(
-            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.layer_depth_factor",
-            side_effect=factor,
+            "sglang.srt.speculative.clear_tree_remote.clear_tree_ledger.layer_sum_ell_slope",
+            side_effect=slope,
         ):
-            # The stop decision prices the forward at the current depth, and
-            # reads that depth's multiplier once for the decision.
-            self.assertAlmostEqual(plan._layer_cost(1, 100), 1.0)
-            self.assertAlmostEqual(plan._layer_cost(1, 200), 1.0)
-            self.assertEqual(factors, [(1, 3)])
-            self.assertEqual(seen, [None, None])
-            seen.clear()
+            self.assertAlmostEqual(plan._layer_cost(1, 100), 2.0)
+            self.assertAlmostEqual(plan._kappa()(2), 0.25)
             rows = replay._freeze_layer_rows(SimpleNamespace(), [state])
         self.assertEqual(len(rows), 2)
-        self.assertEqual(sorted(set(seen)), [1, 2])
+        self.assertEqual(calls[0], ((8, 1, 100), {}))
+        self.assertEqual(calls[1], ((8, 2), {}))
+        # No call passes a depth.
+        self.assertTrue(all(not kwargs for _args, kwargs in calls))
+        self.assertFalse(hasattr(plan, "_depth_factor"))
 
 
 class TestLookaheadLayerFilter(CustomTestCase):
@@ -4117,7 +4097,6 @@ class TestLookaheadLayerFilter(CustomTestCase):
         self.assertTrue(logged["lookahead_mode"])
         self.assertFalse(logged["lookahead"])
         self.assertIsNotNone(logged["pred_ms"])
-        self.assertNotIn((8, 1, 3), ledger.layer_depth)
 
     def test_last_lookahead_layer_is_not_a_full_layer(self):
         grew, logged, _record, _ledger = self._finish(

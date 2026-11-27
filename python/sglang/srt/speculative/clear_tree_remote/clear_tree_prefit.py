@@ -26,6 +26,21 @@ PREFIT_CELL_SAMPLES = 4
 _VERIFY_TAIL_ROUNDS = 2
 _VERIFY_ROUNDS = PREFIT_VERIFY_WARMUP_ROUNDS + PREFIT_CELL_SAMPLES + _VERIFY_TAIL_ROUNDS
 _VERIFY_BUDGET_VERSION = 1
+# Layer fits need this many samples per (W, path, graph) cell. Only forwards
+# from layer index 2 on are fitted, and the last forward of a lookahead tree is
+# not, so a width sweep keeps ``depth - 2`` samples per round.
+PREFIT_LAYER_SAMPLES = 50
+PREFIT_WIDTH_MIN_DEPTH = 4
+# Each width holds this many consecutive rounds of a width group; the first is
+# warmup. ``prefit_plan`` on the Draft cycles widths with the same number.
+PREFIT_WIDTH_ROUNDS_PER_WIDTH = 4
+# A width group plans 20% over the cell target, so a few excluded keep rounds
+# do not force a refill of every width group of that batch.
+PREFIT_WIDTH_SAMPLE_TARGET = PREFIT_LAYER_SAMPLES + PREFIT_LAYER_SAMPLES // 5
+# Verify rounds after warmup; each keeps ``depth - 2`` layer samples.
+PREFIT_VERIFY_KEEP_ROUNDS = _VERIFY_ROUNDS - PREFIT_VERIFY_WARMUP_ROUNDS
+_DEFAULT_WIDTH_ROUNDS = 20
+_LAYER_SAMPLE_VERSION = 1
 
 
 @dataclass
@@ -90,10 +105,16 @@ def depth_for(k: int, width: int, max_depth: int) -> int:
 
 
 def depth_for_width(k: int, width: int, max_depth: int) -> int:
-    """Width-sweep depth. A usable sweep is at least two layers."""
+    """Width-sweep depth: at least ``PREFIT_WIDTH_MIN_DEPTH`` layers.
+
+    Layers 2 to depth - 1 are fitted, so four layers keep two samples a round.
+    """
     if int(width) <= 0:
         return 0
-    return min(max(2, math.ceil(int(k) / float(width))), int(max_depth) - 1)
+    return min(
+        max(PREFIT_WIDTH_MIN_DEPTH, math.ceil(int(k) / float(width))),
+        int(max_depth) - 1,
+    )
 
 
 def max_new_for_verify(bucket: int, prefix: int, k: int) -> int:
@@ -101,8 +122,44 @@ def max_new_for_verify(bucket: int, prefix: int, k: int) -> int:
     return int(bucket) - int(prefix) - int(k) - 4
 
 
-def max_new_for_width(d_max: int) -> int:
-    return 20 * (int(d_max) + 1)
+def width_rounds(depths: Sequence[int], n_buckets: int) -> int:
+    """Rounds one width group runs so every width reaches the layer target.
+
+    Each width keeps ``PREFIT_WIDTH_ROUNDS_PER_WIDTH - 1`` rounds a cycle and
+    at least ``min(depths) - 2`` fitted layers a round. The planned total is
+    ``PREFIT_WIDTH_SAMPLE_TARGET`` (the cell target plus 20%), split over the
+    buckets, one width group each. Shallower sweeps keep nothing and run the
+    old 20 rounds.
+    """
+    widths = [int(depth) for depth in depths]
+    if not widths:
+        return _DEFAULT_WIDTH_ROUNDS
+    per_round = min(widths) - 2
+    if per_round < 1:
+        return _DEFAULT_WIDTH_ROUNDS
+    per_bucket = math.ceil(
+        PREFIT_WIDTH_SAMPLE_TARGET / float(max(int(n_buckets), 1))
+    )
+    keep = PREFIT_WIDTH_ROUNDS_PER_WIDTH - 1
+    cycles = math.ceil(per_bucket / float(keep * per_round))
+    return int(cycles * PREFIT_WIDTH_ROUNDS_PER_WIDTH * len(widths))
+
+
+def width_keep_rounds(rounds: int, n_widths: int) -> int:
+    """Keep rounds every width gets in a width group of ``rounds`` rounds.
+
+    Only full cycles count, so this is a lower bound for every width.
+    """
+    if int(n_widths) <= 0:
+        return 0
+    per_width = PREFIT_WIDTH_ROUNDS_PER_WIDTH
+    cycles = int(rounds) // (per_width * int(n_widths))
+    return int(cycles * (per_width - 1))
+
+
+def max_new_for_width(d_max: int, rounds: int = _DEFAULT_WIDTH_ROUNDS) -> int:
+    """Token budget that lasts ``rounds`` rounds even if every round commits ``d_max + 1``."""
+    return int(rounds) * (int(d_max) + 1)
 
 
 def _ordered(values, center: int, *, include_center: bool) -> list:
@@ -130,6 +187,11 @@ def _fingerprint(inputs: PlanInputs) -> str:
         "max_depth": int(inputs.max_depth),
         "widths": [int(item) for item in inputs.widths],
         "verify_budget_version": _VERIFY_BUDGET_VERSION,
+        "layer_sample_version": _LAYER_SAMPLE_VERSION,
+        "layer_samples": PREFIT_LAYER_SAMPLES,
+        "width_sample_target": PREFIT_WIDTH_SAMPLE_TARGET,
+        "width_min_depth": PREFIT_WIDTH_MIN_DEPTH,
+        "width_rounds_per_width": PREFIT_WIDTH_ROUNDS_PER_WIDTH,
     }
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:8]
@@ -277,14 +339,16 @@ def build_plan(inputs: PlanInputs) -> PrefitPlan:
                 for width in others
             ]
             d_max = max(depths) if depths else 0
+            rounds = width_rounds(depths, len(canonical.buckets))
             groups.append(
                 {
                     "kind": "w",
                     "b": batch,
                     "prefix": int(prefix),
                     "bucket": int(bucket),
-                    "max_new": int(max_new_for_width(max(d_max, 0))),
+                    "max_new": int(max_new_for_width(max(d_max, 0), rounds)),
                     "depth": int(d_max),
+                    "rounds": int(rounds),
                     "produces_h": [],
                     "produces_layers": [],
                 }
@@ -526,7 +590,12 @@ def _post_payload(
 def _run_group(cfg: PrefitConfig, group: dict, rng: random.Random, run: str, n0: int) -> dict:
     """One batched generate. ``n0`` is the first rid counter for this try."""
     is_verify = group["kind"] == "v"
-    need = _VERIFY_ROUNDS if is_verify else 20 if group["kind"] == "w" else 0
+    if is_verify:
+        need = _VERIFY_ROUNDS
+    elif group["kind"] == "w":
+        need = int(group.get("rounds") or _DEFAULT_WIDTH_ROUNDS)
+    else:
+        need = 0
     size = int(group["b"])
     attempts = 0
     steps = 0

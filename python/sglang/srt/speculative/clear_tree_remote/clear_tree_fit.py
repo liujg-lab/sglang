@@ -20,7 +20,9 @@ from typing import Optional
 
 from sglang.srt.speculative.clear_tree_remote.clear_tree_prefit import (
     PREFIT_CELL_SAMPLES,
+    PREFIT_LAYER_SAMPLES,
     PREFIT_VERIFY_WARMUP_ROUNDS,
+    PREFIT_WIDTH_ROUNDS_PER_WIDTH,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,8 +44,13 @@ _TARGET_KEYS = (
 )
 
 
-_FIT_SCHEMA = 3
+# Schema 4: layer cells hold forwards from layer index 2 on only.
+_FIT_SCHEMA = 4
 _CELL_SAMPLES = PREFIT_CELL_SAMPLES
+_LAYER_CELL_SAMPLES = PREFIT_LAYER_SAMPLES
+# A layer cell is produced only by a tree this deep: layer 2 is fitted and is
+# not the last forward.
+_LAYER_FIT_MIN_DEPTH = 3
 _QUERY_BACKOFF = (5.0, 10.0, 30.0)
 
 
@@ -400,8 +407,6 @@ def _install_layers(scheduler, rows) -> int:
         installed += 1
     ledger.layer_models = fresh
     _attach_slope_priors(fresh)
-    # Depth ratios were measured against the regressions just replaced.
-    ledger.reset_layer_depth()
     return installed
 
 
@@ -567,6 +572,7 @@ def _parse_layer_row(row):
     model = _new_layer_model()
     model.from_dict(row)
     key = (int(row["w"]), str(row["path"]), int(row["g"]))
+    # Any row with enough samples to be used online must solve, required or not.
     if model.n >= _CELL_SAMPLES and model.coefficients() is None:
         raise ValueError("layer regression does not solve")
     return key, model
@@ -604,7 +610,7 @@ def _prepare_install(scheduler, pending, target, plan):
             return None
     for cell in required_layers:
         model = models.get(tuple(cell))
-        if model is None or int(model.n) < _CELL_SAMPLES or model.coefficients() is None:
+        if model is None or int(model.n) < _LAYER_CELL_SAMPLES or model.coefficients() is None:
             return None
     return {"h": h_rows, "layers": models}
 
@@ -623,8 +629,6 @@ def _install_prepared(scheduler, prepared) -> bool:
     replace_hold_cells(prepared.get("h") or [])
     ledger.layer_models = dict(prepared.get("layers") or {})
     _attach_slope_priors(ledger.layer_models)
-    # Depth ratios were measured against the regressions just replaced.
-    ledger.reset_layer_depth()
     scheduler._clear_fit_installed = True
     scheduler._clear_fit_ready = True
     scheduler._clear_prefit = None
@@ -725,14 +729,24 @@ def layer_requirements(scheduler, plan):
     """Layer cells the surviving scan groups can actually sample.
 
     A cell is required only when a kept ``v`` or ``w`` group produces it and
-    that ``(W, g)`` was captured. Cells with no such group are skipped.
+    that ``(W, g)`` was captured. Cells with no such group are skipped. A
+    group produces a cell only with trees at least ``_LAYER_FIT_MIN_DEPTH``
+    deep: layer 2 is the first fitted forward and the last is never fitted.
+
+    A produced cell whose planned yield over all groups stays below
+    ``_LAYER_CELL_SAMPLES`` is skipped as ``low_yield``: refills could never
+    fill it. A ``v`` group plans ``PREFIT_VERIFY_KEEP_ROUNDS`` keep rounds and
+    a ``w`` group ``width_keep_rounds`` per width, each round ``depth - 2``
+    samples. The samples are still recorded and written.
     """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         layer_graph_bs,
     )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_prefit import (
+        PREFIT_VERIFY_KEEP_ROUNDS,
         depth_for,
         depth_for_width,
+        width_keep_rounds,
     )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_width import (
         LAYER_WIDTHS,
@@ -748,9 +762,12 @@ def layer_requirements(scheduler, plan):
             except (TypeError, ValueError):
                 continue
     allowed = {int(item) for item in LAYER_WIDTHS}
-    required = []
+    produced_order = []
     produced_keys = set()
+    planned = {}
     b_to_g = {}
+    # Layer 1 and the last forward of every tree are not fitted.
+    unfitted = _LAYER_FIT_MIN_DEPTH - 1
 
     def _graph(batch: int) -> int:
         if int(batch) not in b_to_g:
@@ -766,30 +783,54 @@ def layer_requirements(scheduler, plan):
         flat = int(flat_width(batch))
         produced = []
         if group.get("kind") == "w":
-            if int(group.get("depth") or 0) >= 2:
+            if int(group.get("depth") or 0) >= _LAYER_FIT_MIN_DEPTH:
+                rotation = _ordered_away(plan.inputs.widths, flat)
+                keep = width_keep_rounds(
+                    int(group.get("rounds") or 0), len(rotation)
+                )
                 for width in plan.inputs.widths:
                     width = int(width)
                     if width == flat or width not in allowed or (width, graph) not in pairs:
                         continue
-                    if (
-                        depth_for_width(flat_k(batch), width, plan.inputs.max_depth)
-                        < 2
-                    ):
+                    depth = depth_for_width(flat_k(batch), width, plan.inputs.max_depth)
+                    if depth < _LAYER_FIT_MIN_DEPTH:
                         continue
-                    produced.append((width, "graph", graph))
-        elif (
-            flat in allowed
-            and (flat, graph) in pairs
-            and int(group.get("k") or 0) > flat
-            and depth_for(int(group.get("k") or 0), flat, plan.inputs.max_depth) >= 2
-        ):
-            produced.append((flat, "graph", graph))
+                    key = (width, "graph", graph)
+                    produced.append(key)
+                    planned[key] = planned.get(key, 0) + keep * (
+                        depth - unfitted
+                    )
+        else:
+            k = int(group.get("k") or 0)
+            depth = depth_for(k, flat, plan.inputs.max_depth)
+            if (
+                flat in allowed
+                and (flat, graph) in pairs
+                and k > flat
+                and depth >= _LAYER_FIT_MIN_DEPTH
+            ):
+                key = (flat, "graph", graph)
+                produced.append(key)
+                planned[key] = planned.get(key, 0) + PREFIT_VERIFY_KEEP_ROUNDS * (
+                    depth - unfitted
+                )
         group["produces_layers"] = produced
         for key in produced:
             if key not in produced_keys:
                 produced_keys.add(key)
-                required.append(key)
+                produced_order.append(key)
+    required = []
     skipped = []
+    for key in produced_order:
+        if int(planned.get(key, 0)) >= _LAYER_CELL_SAMPLES:
+            required.append(key)
+        else:
+            skipped.append((key, "low_yield"))
+            logger.info(
+                "[CLEAR] skip prefit layer cell %s reason=low_yield planned=%s",
+                list(key),
+                int(planned.get(key, 0)),
+            )
     seen = set()
     for batch in plan.inputs.batches:
         graph = _graph(int(batch))
@@ -823,7 +864,7 @@ def _missing(state: PrefitState):
     missing_layers = []
     for cell in state.required_layers:
         model = state.layers.get(tuple(cell))
-        if model is None or int(model.n) < _CELL_SAMPLES:
+        if model is None or int(model.n) < _LAYER_CELL_SAMPLES:
             missing_layers.append([cell[0], cell[1], cell[2]])
     return missing_h, missing_layers
 
@@ -1489,13 +1530,14 @@ def prefit_plan(scheduler, reqs, batch, max_ell, buckets) -> Optional[dict]:
     width_order = _ordered_away(widths, flat_width(size))
     if not width_order:
         return mixed
-    chosen = int(width_order[(index // 4) % len(width_order)])
+    per_width = PREFIT_WIDTH_ROUNDS_PER_WIDTH
+    chosen = int(width_order[(index // per_width) % len(width_order)])
     k = int(flat_k(size))
     depth = depth_for_width(k, chosen, max_depth)
     return _stamp_prefit(
         {
             "group": "w",
-            "phase": "warmup" if index % 4 == 0 else "keep",
+            "phase": "warmup" if index % per_width == 0 else "keep",
             "use_tau": False,
             "width": chosen,
             "k": k,

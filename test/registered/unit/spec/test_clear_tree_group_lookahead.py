@@ -1552,7 +1552,6 @@ class TestRoundLearningSnapshot(CustomTestCase):
         plan = SimpleNamespace(
             _raw_gain={1: 0.5},
             _frozen_k=None,
-            _cost_depth=None,
             _verify_quotes=None,
             _score_cache={},
             _peers=[],
@@ -1565,7 +1564,6 @@ class TestRoundLearningSnapshot(CustomTestCase):
         plan._raw_gain[99] = 7.0
         plan._raw_gain[1] = 0.9
         plan._frozen_k = 16
-        plan._cost_depth = 3
         plan._score_cache[99] = ("state", 2, ())
         plan._peers = ["state"]
         plan._keep_ids = {99}
@@ -1574,7 +1572,6 @@ class TestRoundLearningSnapshot(CustomTestCase):
         self.assertEqual((policy._gain_pred, policy._gain_actual), (2.0, 1.0))
         self.assertEqual(plan._raw_gain, {1: 0.5})
         self.assertIsNone(plan._frozen_k)
-        self.assertIsNone(plan._cost_depth)
         self.assertEqual(plan._score_cache, {})
         self.assertEqual(plan._peers, [])
         self.assertEqual(plan._keep_ids, set())
@@ -1582,7 +1579,7 @@ class TestRoundLearningSnapshot(CustomTestCase):
 
     def test_snapshot_does_not_alias_the_plan(self):
         policy = self.policy
-        plan = SimpleNamespace(_raw_gain={1: 0.5}, _frozen_k=None, _cost_depth=None, _verify_quotes=None)
+        plan = SimpleNamespace(_raw_gain={1: 0.5}, _frozen_k=None, _verify_quotes=None)
         snapshot = policy.snapshot_round_learning(plan)
         plan._raw_gain[2] = 1.0
         policy.restore_round_learning(plan, snapshot)

@@ -26,10 +26,10 @@ FORGET = 0.999
 RIDGE = 1e-6
 LAYER_MIN_SAMPLES = 4
 LAYER_SPAN_PAD = 128.0
-# Per-depth correction of the layer regression. Depth is the ``layer`` index
-# of the forward (1-based); deeper forwards share the last bucket.
-DEPTH_CAP = 8
-DEPTH_MIN_SAMPLES = 30
+# The regression fits forwards from this ``layer`` index (1-based) on. The
+# first forward's extra time is the ingest after a missed bonus guess, which
+# does not depend on the width; it is priced by the same regression.
+LAYER_FIT_MIN_INDEX = 2
 # Intercept and prefix sum. The prefix prior is one token's 2 µs scaled by
 # 128, so a flat prefix cannot set the slope. The capture batch is the cell
 # key, not a feature.
@@ -166,61 +166,16 @@ def _layer_features(sum_ell: int) -> List[float]:
     return [1.0, float(sum_ell)]
 
 
-def layer_depth_enabled() -> bool:
-    """Depth correction in layer prices. ``SGLANG_CLEAR_LAYER_DEPTH=0`` keeps learning it but not using it."""
-    return os.environ.get("SGLANG_CLEAR_LAYER_DEPTH", "").strip() != "0"
-
-
-def _depth_key(depth) -> int:
-    return max(1, min(int(depth), DEPTH_CAP))
-
-
-def layer_depth_ratio(ledger, width: int, g: int, depth) -> tuple:
-    """``(ratio, source)`` for a forward at this depth.
-
-    The ratio is forgetting-weighted measured wall over the base regression,
-    taken over middle pre-reply graph layers. The cell ``(w, g, d)`` is used
-    once it has ``DEPTH_MIN_SAMPLES``; else the pooled ``(g, d)`` across
-    widths; else 1.
-    """
-    if ledger is None or depth is None:
-        return 1.0, "none"
-    d = _depth_key(depth)
-    for table, key, source in (
-        (ledger.layer_depth, (int(width), int(g), d), "cell"),
-        (ledger.layer_depth_pooled, (int(g), d), "pooled"),
-    ):
-        row = table.get(key)
-        if row is not None and row[2] >= DEPTH_MIN_SAMPLES and row[1] > 0.0:
-            return float(row[0]) / float(row[1]), source
-    return 1.0, "none"
-
-
-def _depth_factor(scheduler, width: int, g: int, depth) -> float:
-    if depth is None or not layer_depth_enabled():
-        return 1.0
-    ledger = bind_ledger(scheduler)
-    ratio, _source = layer_depth_ratio(ledger, width, g, depth)
-    return float(ratio)
-
-
-def layer_depth_factor(scheduler, width: int, active: int, depth) -> float:
-    """The multiplier ``predict_layer_ms`` applies at this depth, 1 when unused."""
-    if depth is None:
-        return 1.0
-    return _depth_factor(scheduler, width, layer_graph_bs(scheduler, active), depth)
-
-
 def predict_layer_ms(
-    scheduler, width: int, active: int, sum_ell: int, depth=None
+    scheduler, width: int, active: int, sum_ell: int
 ) -> Optional[float]:
     """Draft layer fit, or None when the prefix is outside the seen span.
 
     The cell is this width and the capture batch of ``active``. A missing
     cell, a prefix outside that cell, or a non-positive prediction is None.
     The served width then stays on the flat K, and a replay candidate with
-    this result does not pair. ``depth`` is the forward's layer index; with
-    it the base fit is scaled by ``layer_depth_ratio``.
+    this result does not pair. Every forward depth, the first included, uses
+    this one fit.
     """
     g = layer_graph_bs(scheduler, active)
     model = _layer_model(scheduler, width, g)
@@ -232,15 +187,13 @@ def predict_layer_ms(
     pred = model.predict(features)
     if pred is None or float(pred) <= 0.0:
         return None
-    return float(pred) * _depth_factor(scheduler, width, g, depth)
+    return float(pred)
 
 
-def layer_sum_ell_slope(
-    scheduler, width: int, active: int, depth=None
-) -> Optional[float]:
+def layer_sum_ell_slope(scheduler, width: int, active: int) -> Optional[float]:
     """Prefix slope for this width and the capture batch of ``active``.
 
-    None until that cell can be solved. ``depth`` scales it like the price.
+    None until that cell can be solved.
     """
     g = layer_graph_bs(scheduler, active)
     model = _layer_model(scheduler, width, g)
@@ -249,7 +202,7 @@ def layer_sum_ell_slope(
     beta = model.coefficients()
     if beta is None or len(beta) < 2:
         return None
-    return float(beta[1]) * _depth_factor(scheduler, width, g, depth)
+    return float(beta[1])
 
 
 def _action_name(action) -> str:
@@ -1013,9 +966,6 @@ class ClearLedger:
         self.active_rids = {str(rid) for rid in (active_rids or ())}
         self.open: Optional[_Round] = None
         self.layer_models: Dict[tuple, ForgettingRegressor] = {}
-        # [num, den, n]: forgetting sums of measured wall and base prediction.
-        self.layer_depth: Dict[tuple, list] = {}
-        self.layer_depth_pooled: Dict[tuple, list] = {}
         self.verify_model: Optional[ForgettingRegressor] = None
         self.verify_samples = 0
         self.pending_logs: List[tuple] = []
@@ -1048,15 +998,9 @@ class ClearLedger:
         """Drop the open round and both regressions. Theta lives outside."""
         self.open = None
         self.layer_models.clear()
-        self.reset_layer_depth()
         self.verify_model = None
         self.verify_samples = 0
         self._clear_pending()
-
-    def reset_layer_depth(self) -> None:
-        """Drop the depth ratios. They are relative to the regressions they saw."""
-        self.layer_depth.clear()
-        self.layer_depth_pooled.clear()
 
     def drop_open(self) -> None:
         """Drop the round that has not closed. Keep both regressions."""
@@ -1901,8 +1845,6 @@ class ClearLedger:
         fitted = False
         features = None
         measured = None
-        depth_ratio = None
-        depth_src = None
         if wall is not None:
             measured = int(wall) / 1000.0
         elif host is not None and gpu is not None:
@@ -1917,6 +1859,9 @@ class ClearLedger:
         fit_ok = not (lookahead_mode and not lookahead) and not (
             lookahead and sample.get("last")
         )
+        # The first forward is priced by the same fit but does not train it.
+        layer_index = sample.get("layer")
+        fit_layer = layer_index is not None and int(layer_index) >= LAYER_FIT_MIN_INDEX
         model = None
         if features is not None and not post_reply:
             key = (
@@ -1934,22 +1879,7 @@ class ClearLedger:
                 pred = model.predict(features)
                 if pred not in (None, 0.0) and measured is not None:
                     residual = measured / pred - 1.0
-            depth_ratio, depth_src = layer_depth_ratio(
-                self, sample["w"], sample["graph_bucket"], sample["layer"]
-            )
-            if (
-                not excluded
-                and fit_ok
-                and prefit is None
-                and not sample.get("last")
-                and str(sample["path"]) == "graph"
-                # Host plus GPU, used without a wall, is not the same span.
-                and wall is not None
-                and measured is not None
-                and pred not in (None, 0.0)
-            ):
-                self._learn_depth(sample, float(measured), float(pred))
-            if not excluded and fit_ok:
+            if not excluded and fit_ok and fit_layer:
                 if keep:
                     from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
                         prefit_record_layer,
@@ -1997,25 +1927,10 @@ class ClearLedger:
             "residual": residual,
             "fit": fitted,
             "last": bool(sample.get("last")),
-            "depth_ratio": depth_ratio,
-            "depth_src": depth_src,
             "lookahead": lookahead,
             "lookahead_mode": lookahead_mode,
         }
         self.queue_log("d_layer", sample_log)
-
-    def _learn_depth(self, sample: dict, measured: float, pred: float) -> None:
-        """One middle layer into its depth cell and the pooled depth row."""
-        d = _depth_key(sample["layer"])
-        g = int(sample["graph_bucket"])
-        for table, key in (
-            (self.layer_depth, (int(sample["w"]), g, d)),
-            (self.layer_depth_pooled, (g, d)),
-        ):
-            row = table.setdefault(key, [0.0, 0.0, 0])
-            row[0] = row[0] * FORGET + measured
-            row[1] = row[1] * FORGET + pred
-            row[2] += 1
 
 
 def _valid_verify_report(verify) -> Optional[dict]:

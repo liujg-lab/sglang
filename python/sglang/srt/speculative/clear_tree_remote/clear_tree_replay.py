@@ -339,9 +339,8 @@ def _freeze_layer_rows(scheduler, states) -> list:
         sum_ell = sum(int(getattr(state, "prefix", 0) or 0) for state in active_states)
         for width in CANDIDATE_WIDTHS:
             try:
-                # Row ``layer`` is the forward with layer index ``layer + 1``.
                 pred[int(width)] = predict_layer_ms(
-                    scheduler, int(width), active, sum_ell, depth=layer + 1
+                    scheduler, int(width), active, sum_ell
                 )
             except Exception:
                 pred[int(width)] = None

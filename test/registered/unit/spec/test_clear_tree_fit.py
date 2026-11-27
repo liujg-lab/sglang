@@ -58,6 +58,12 @@ except Exception:
 register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 
+
+def _layer_points(count=None):
+    """Prefit layer samples on one line, enough to fill a layer cell."""
+    total = fit._LAYER_CELL_SAMPLES if count is None else int(count)
+    return [(4.0 * step, 0.6 + 0.4 * step) for step in range(1, total + 1)]
+
 class _Sock:
     def __init__(self, *responses):
         self.recv_multipart = Mock(side_effect=list(responses))
@@ -716,7 +722,33 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         )
         self.assertEqual(roomy["max_new"], 8 * (roomy["depth"] + 1))
         width_groups = [item for item in groups if item["kind"] == "w" and item["b"] == 1]
-        self.assertEqual(width_groups[0]["max_new"], 160)
+        # Five other widths, two cycles of four rounds: each width keeps at
+        # least 2 x 3 rounds x 2 fitted layers in each of the five buckets.
+        self.assertEqual(width_groups[0]["rounds"], 40)
+        self.assertEqual(width_groups[0]["depth"], 7)
+        self.assertEqual(width_groups[0]["max_new"], 320)
+        wide = [item for item in groups if item["kind"] == "w" and item["b"] == 4]
+        self.assertEqual(wide[0]["rounds"], 40)
+        self.assertEqual(wide[0]["max_new"], 200)
+        self.assertGreaterEqual(
+            2 * 3 * (prefit.PREFIT_WIDTH_MIN_DEPTH - 2) * len(cfg.buckets),
+            prefit.PREFIT_WIDTH_SAMPLE_TARGET,
+        )
+        self.assertEqual(prefit.width_keep_rounds(40, 5), 6)
+        # The layer sample rule is part of the plan identity on both roles.
+        for name, delta in (
+            ("_LAYER_SAMPLE_VERSION", 1),
+            ("PREFIT_LAYER_SAMPLES", 10),
+            ("PREFIT_WIDTH_SAMPLE_TARGET", 10),
+            ("PREFIT_WIDTH_MIN_DEPTH", 1),
+            ("PREFIT_WIDTH_ROUNDS_PER_WIDTH", 1),
+        ):
+            value = getattr(prefit, name)
+            with patch.object(prefit, name, value + delta):
+                self.assertNotEqual(
+                    prefit._fingerprint(plan.inputs), plan.fingerprint, name
+                )
+        self.assertEqual(prefit._fingerprint(plan.inputs), plan.fingerprint)
 
     def test_verify_group_moves_prefix_down_to_fit_budget(self):
         plan = prefit.build_plan(prefit.PlanInputs((1,), (8,), (8,), (52,), 8))
@@ -724,6 +756,31 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         self.assertEqual(plan.required_h, [(1, 8, 52)])
         self.assertEqual((group["prefix"], group["max_new"]), (24, 16))
         self.assertEqual(prefit.recorded_span(24, 8, 16), (33, 49))
+
+    def test_width_group_retries_until_it_has_its_planned_rounds(self):
+        cfg = prefit.PrefitConfig(
+            url="http://127.0.0.1:9",
+            buckets=(256,),
+            max_depth=8,
+            ks=(8,),
+            widths=(4, 8),
+            batches=(1,),
+            token_range=(1, 2),
+        )
+        group = next(g for g in prefit.plan_from_config(cfg).groups if g["kind"] == "w")
+        # One other width at depth four over one bucket: the 60-sample plan
+        # (50 plus 20%) needs ceil(60 / (3 x 2)) = 10 cycles of four rounds.
+        self.assertEqual(prefit.PREFIT_WIDTH_SAMPLE_TARGET, 60)
+        self.assertEqual(group["rounds"], 40)
+        self.assertEqual(group["max_new"], 40 * (group["depth"] + 1))
+        responses = [
+            [{"meta_info": {"spec_verify_ct": 39}}],
+            [{"meta_info": {"spec_verify_ct": 40}}],
+        ]
+        with patch.object(prefit, "_request", side_effect=responses):
+            result = prefit._run_group(cfg, group, random.Random(0), "run", 0)
+        self.assertEqual((result["steps"], result["retries"]), (40, 2))
+        self.assertTrue(result["step_target_met"])
 
     def test_verify_group_retries_until_every_request_has_eight_verifies(self):
         cfg = prefit.PrefitConfig(
@@ -945,8 +1002,15 @@ class ClearTreeFitFileTest(CustomTestCase):
         self._dir = tempfile.TemporaryDirectory()
         self._path = str(Path(self._dir.name) / "clear_tree_fit.json")
         os.environ["SGLANG_CLEAR_FIT_PATH"] = self._path
+        # Keep the file tests independent of the low_yield rule: with few
+        # buckets the flat cell's planned yield (6 keep rounds x 2 layers a
+        # K=32 group) can fall below the cell target. Lift the estimate; the
+        # low_yield tests patch it back.
+        self._keep_patch = patch.object(prefit, "PREFIT_VERIFY_KEEP_ROUNDS", 25)
+        self._keep_patch.start()
 
     def tearDown(self):
+        self._keep_patch.stop()
         self._dir.cleanup()
         for name, value in self._saved.items():
             if value is None:
@@ -993,7 +1057,7 @@ class ClearTreeFitFileTest(CustomTestCase):
             for _ in range(4):
                 fit.prefit_record_h(scheduler, *cell, hold)
         for cell in state.required_layers:
-            for length, target in ((4.0, 1.0), (8.0, 1.4), (12.0, 1.8), (16.0, 2.2)):
+            for length, target in _layer_points():
                 fit.prefit_record_layer(
                     scheduler, cell[0], cell[1], cell[2], [1.0, length], target
                 )
@@ -1001,7 +1065,7 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_file_round_trip_keeps_h_and_layers(self):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         model = scheduler._clear_prefit.layers[(8, "graph", 1)]
         layer = model.predict([1.0, 16.0])
@@ -1009,7 +1073,8 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertTrue(status["ready"])
         self.assertTrue(status["written"])
         payload = json.loads(Path(self._path).read_text())
-        self.assertEqual(payload["schema"], 3)
+        self.assertEqual(payload["schema"], fit._FIT_SCHEMA)
+        self.assertEqual(fit._FIT_SCHEMA, 4)
         self.assertNotIn("q", payload)
         for row in payload["h"]:
             self.assertEqual(len(row["ells"]), len(row["samples_ms"]))
@@ -1031,14 +1096,14 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_file_round_trip_keeps_prefixes_and_anchors(self):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         state, stale = fit._adopt_run(scheduler, run)
         self.assertFalse(stale)
         for cell in state.required_h:
             for step in range(4):
                 fit.prefit_record_h(scheduler, *cell, 12.5, ell=100 + 2 * step)
         for cell in state.required_layers:
-            for length, target in ((4.0, 1.0), (8.0, 1.4), (12.0, 1.8), (16.0, 2.2)):
+            for length, target in _layer_points():
                 fit.prefit_record_layer(
                     scheduler, cell[0], cell[1], cell[2], [1.0, length], target
                 )
@@ -1081,7 +1146,7 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_target_info_rpd_tau_and_verify_regime(self):
         scheduler = self._scheduler()
-        self._tiny(scheduler, ks=[16], capture=(1,))
+        self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self.assertIsNone(fit.target_info(scheduler)["rpd_tau"])
         scheduler.server_args.speculative_verify_mode = "rpd"
         scheduler.server_args.speculative_rpd_tau = 0.4
@@ -1116,7 +1181,7 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def _commit_mode(self, mode, hold):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         if mode == "rpd":
             scheduler._clear_target_header = dict(
                 scheduler._clear_target_header, verify_mode="rpd"
@@ -1149,7 +1214,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         self._commit_mode("rpd", 13.5)
         reset_policy()
         scheduler = self._scheduler()
-        self._tiny(scheduler, ks=[16], capture=(1,))
+        self._tiny(scheduler, ks=[16, 32], capture=(1,))
         greedy = dict(scheduler._clear_target_header)
         rpd = dict(greedy, verify_mode="rpd")
         fit.load_draft_part(scheduler)
@@ -1185,7 +1250,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         os.remove(fit.fit_path("rpd"))
         reset_policy()
         fresh = self._scheduler()
-        self._tiny(fresh, ks=[16], capture=(1,))
+        self._tiny(fresh, ks=[16, 32], capture=(1,))
         fit.load_draft_part(fresh)
         self.assertEqual(set(fresh._clear_fit_files), {"greedy"})
         fit.on_target_info(fresh, rpd)
@@ -1193,9 +1258,89 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertIsNone(fresh._clear_fit_pending)
         self.assertEqual(fit.fit_handshake_status(fresh)["state"], "need_prefit")
 
-    def test_schema_three_needs_matching_ells(self):
+    def test_schema_three_file_is_a_cache_miss(self):
+        # Schema 3 layer cells still hold first forwards.
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        self._fill(scheduler, run)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        payload = json.loads(Path(self._path).read_text())
+        payload["schema"] = 3
+        payload["header"]["schema"] = 3
+        Path(self._path).write_text(json.dumps(payload))
+        reset_policy()
+        scheduler._clear_ledger.layer_models = {}
+        scheduler._clear_fit_installed = False
+        scheduler._clear_fit_ready = False
+        scheduler._clear_fit_pending = None
+        fit.load_draft_part(scheduler)
+        fit.on_target_info(scheduler, scheduler._clear_target_header)
+        self.assertFalse(scheduler._clear_fit_ready)
+
+    def test_flat_layer_cell_needs_a_tree_three_deep(self):
+        # K=16 at the flat width 8 is two layers: layer 2 is the last forward,
+        # so no fitted sample; K=32 is four layers deep.
         scheduler = self._scheduler()
         run = self._tiny(scheduler, ks=[16], capture=(1,))
+        state, _stale = fit._adopt_run(scheduler, run)
+        self.assertEqual(state.required_layers, [])
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        state, _stale = fit._adopt_run(scheduler, run)
+        self.assertEqual([tuple(cell) for cell in state.required_layers], [(8, "graph", 1)])
+
+    def test_low_yield_flat_cell_is_skipped_and_prefit_still_commits(self):
+        # One bucket, K=32 only: 6 keep rounds x 2 fitted layers = 12 planned
+        # samples, so refills could never reach the cell target.
+        real_keep = prefit._VERIFY_ROUNDS - prefit.PREFIT_VERIFY_WARMUP_ROUNDS
+        with patch.object(
+            prefit, "PREFIT_VERIFY_KEEP_ROUNDS", real_keep
+        ), patch.dict(os.environ, {"SGLANG_NPU_TREE_GRAPH_KV_BUCKETS": "256"}):
+            scheduler = self._scheduler()
+            run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+            self.assertEqual(fit.draft_plan(scheduler).inputs.buckets, (256,))
+            required, skipped = fit.layer_requirements(
+                scheduler, fit.draft_plan(scheduler)
+            )
+            self.assertEqual(required, [])
+            self.assertIn(((8, "graph", 1), "low_yield"), skipped)
+            state = self._fill(scheduler, run)
+            self.assertEqual(state.required_layers, [])
+            # A skipped cell is not required, but its samples are still kept.
+            fit.prefit_record_layer(scheduler, 8, "graph", 1, [1.0, 16.0], 2.0)
+            self.assertEqual(state.layers[(8, "graph", 1)].n, 1)
+            self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+
+    def test_flat_cell_yield_adds_up_over_verify_groups(self):
+        # K=32 (depth 4) and K=64 (depth 7) at the flat width 8 over five
+        # buckets plan well over the target; one bucket of K=32 does not.
+        real_keep = prefit._VERIFY_ROUNDS - prefit.PREFIT_VERIFY_WARMUP_ROUNDS
+        buckets = "256,512,1024,2048,4096"
+        with patch.object(
+            prefit, "PREFIT_VERIFY_KEEP_ROUNDS", real_keep
+        ), patch.dict(os.environ, {"SGLANG_NPU_TREE_GRAPH_KV_BUCKETS": buckets}):
+            scheduler = self._scheduler()
+            self._tiny(scheduler, ks=[16, 32, 64], capture=(1,))
+            plan = fit.draft_plan(scheduler)
+            self.assertEqual(len(plan.inputs.buckets), 5)
+            required, _skipped = fit.layer_requirements(scheduler, plan)
+            self.assertIn((8, "graph", 1), required)
+
+    def test_unsolvable_optional_layer_row_is_still_rejected(self):
+        model = _new_layer_model()
+        for step in range(1, 21):
+            model.update([1.0, 4.0 * step], 0.6 + 0.4 * step)
+        row = dict(model.to_dict(), w=16, path="graph", g=1)
+        key, parsed = fit._parse_layer_row(row)
+        self.assertEqual((key, parsed.n), ((16, "graph", 1), 20))
+        row["xtx"] = [[0.0, 0.0], [0.0, 0.0]]
+        self.assertLess(row["n"], fit._LAYER_CELL_SAMPLES)
+        with self.assertRaises(ValueError):
+            fit._parse_layer_row(row)
+
+    def test_fit_file_needs_matching_ells(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         fit.commit_prefit(scheduler, run, 1)
         payload = json.loads(Path(self._path).read_text())
@@ -1215,7 +1360,7 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_online_samples_replayed_after_commit_keep_prefixes(self):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         fit.note_online_h(scheduler, 1, 16, 256, 30.0, ell=150)
         self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
@@ -1224,14 +1369,14 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_commit_and_file_install_freeze_the_prefit_slope(self):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         key = (8, "graph", 1)
         prefit_slope = scheduler._clear_prefit.layers[key].coefficients()[1]
         fit.note_online_layer(scheduler, 8, "graph", 1, [1.0, 20.0], 3.0)
         self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
         committed = scheduler._clear_ledger.layer_models[key]
-        self.assertEqual(committed.n, 5)
+        self.assertEqual(committed.n, fit._LAYER_CELL_SAMPLES + 1)
         self.assertIsNotNone(committed.slope_prior)
         self.assertAlmostEqual(committed.slope_prior[1], prefit_slope)
         self.assertGreater(committed.slope_prior[2], 0.0)
@@ -1250,7 +1395,7 @@ class ClearTreeFitFileTest(CustomTestCase):
     def test_slope_prior_switch_off_installs_plain_fits(self):
         os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = "0"
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
         for model in scheduler._clear_ledger.layer_models.values():
@@ -1329,7 +1474,7 @@ class ClearTreeFitFileTest(CustomTestCase):
 
     def test_missing_cell_does_not_write(self):
         scheduler = self._scheduler()
-        run = self._tiny(scheduler, ks=[16], capture=(1,))
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         state, _stale = fit._adopt_run(scheduler, run)
         for cell in state.required_h:
             for _ in range(3):
@@ -1344,12 +1489,12 @@ class ClearTreeFitFileTest(CustomTestCase):
             fit.prefit_record_h(scheduler, *cell, 12.5)
         self._fill_layers = None
         for cell in state.required_layers:
-            for length, target in ((4.0, 1.0), (8.0, 1.4), (12.0, 1.8), (16.0, 2.2)):
+            for length, target in _layer_points():
                 fit.prefit_record_layer(
                     scheduler, cell[0], cell[1], cell[2], [1.0, length], target
                 )
         layer_key = state.required_layers[0]
-        state.layers[layer_key].n = 3
+        state.layers[layer_key].n = fit._LAYER_CELL_SAMPLES - 1
         short = fit.commit_prefit(scheduler, run, 2)
         self.assertEqual(short["reason"], "missing")
         self.assertTrue(short["missing_layers"])
@@ -1828,8 +1973,10 @@ class ClearTreeFitFileTest(CustomTestCase):
         )
         self.assertEqual(scheduler._clear_fit_state, "disabled")
 
-    def test_width_sixty_four_is_two_layers_and_skips_uncaptured(self):
-        self.assertEqual(prefit.depth_for_width(16, 64, 8), 2)
+    def test_width_sixty_four_is_four_layers_and_skips_uncaptured(self):
+        self.assertEqual(prefit.depth_for_width(16, 64, 8), prefit.PREFIT_WIDTH_MIN_DEPTH)
+        self.assertEqual(prefit.depth_for_width(16, 64, 8), 4)
+        self.assertEqual(prefit.depth_for_width(16, 2, 8), 7)
         self.assertLess(prefit.depth_for_width(16, 64, 2), 2)
         scheduler = SimpleNamespace(
             server_args=_args(),
@@ -1845,7 +1992,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         for _ in range(17):
             info = fit.prefit_plan(scheduler, reqs, 1, 0, (256,))
         self.assertEqual(info["width"], 64)
-        self.assertEqual(info["depth"], 2)
+        self.assertEqual(info["depth"], 4)
         plan = fit.draft_plan(scheduler)
         required, skipped = fit.layer_requirements(scheduler, plan)
         self.assertEqual(required, [])
@@ -2042,7 +2189,7 @@ class ClearTreeFitSyncTest(CustomTestCase):
         case.setUp()
         try:
             scheduler = case._scheduler()
-            run = case._tiny(scheduler, ks=[16], capture=(1,))
+            run = case._tiny(scheduler, ks=[16, 32], capture=(1,))
             case._fill(scheduler, run)
             self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
             payload = json.loads(Path(case._path).read_text())
@@ -2369,7 +2516,7 @@ class ClearTreeFitSyncTest(CustomTestCase):
             ledger = scheduler._clear_ledger
             ledger.active_rids = {"user"}
             layer = {
-                "layer": 0,
+                "layer": 2,
                 "active": 1,
                 "graph_bucket": 1,
                 "w": 8,
@@ -2568,7 +2715,7 @@ class ClearTreeVerifyFreezeTest(CustomTestCase):
         case.setUp()
         try:
             scheduler = case._scheduler()
-            run = case._tiny(scheduler, ks=[16], capture=(1,))
+            run = case._tiny(scheduler, ks=[16, 32], capture=(1,))
             fingerprint = fit.draft_plan(scheduler).fingerprint
             self.assertEqual(
                 fit.begin_prefit(scheduler, run, fingerprint, "sess", 0)["reason"],

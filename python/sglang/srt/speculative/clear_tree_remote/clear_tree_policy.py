@@ -1322,11 +1322,6 @@ class RoundPlan:
         self._score_cache: Dict[int, tuple] = {}
         self._frozen_k = None
         self._verify_quotes = None
-        # Layer index of the forward a stop decision is pricing.
-        self._cost_depth: Optional[int] = None
-        # (active, depth) -> depth multiplier. Ratios only move when a round
-        # closes, which is after this round's tree is built.
-        self._depth_factors: Dict[tuple, float] = {}
 
     @property
     def defer_finish(self) -> bool:
@@ -1410,8 +1405,6 @@ class RoundPlan:
                 for item in peers
                 if int(item.depth) < int(item.config.max_depth) - 1
             ]
-            # Growing forwards the layer just written, so its index is the depth.
-            self._cost_depth = int(state.depth)
             self._keep_ids = {id(item) for item in self._choose_keep(eligible)}
             self._at = int(state.depth)
         return id(state) in self._keep_ids
@@ -1556,27 +1549,6 @@ class RoundPlan:
             return []
         return list(kept)
 
-    def _depth_factor(self, active: int) -> float:
-        """Depth multiplier for the forward being priced, once per (active, depth)."""
-        depth = self._cost_depth
-        if depth is None or self._scheduler is None:
-            return 1.0
-        cache = getattr(self, "_depth_factors", None)
-        if cache is None:
-            cache = self._depth_factors = {}
-        key = (int(active), int(depth))
-        found = cache.get(key)
-        if found is None:
-            from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-                layer_depth_factor,
-            )
-
-            found = float(
-                layer_depth_factor(self._scheduler, self.width, int(active), int(depth))
-            )
-            cache[key] = found
-        return found
-
     def _layer_cost(self, active: int, sum_ell: int) -> Optional[float]:
         if self._scheduler is None:
             return None
@@ -1587,7 +1559,7 @@ class RoundPlan:
         base = predict_layer_ms(self._scheduler, self.width, int(active), int(sum_ell))
         if base is None:
             return None
-        return float(base) * self._depth_factor(int(active))
+        return float(base)
 
     def _kappa(self):
         if self._scheduler is None:
@@ -1603,7 +1575,7 @@ class RoundPlan:
             base = layer_sum_ell_slope(scheduler, width, int(active))
             if base is None:
                 return None
-            return float(base) * self._depth_factor(int(active))
+            return float(base)
 
         return slope
 
@@ -2057,7 +2029,7 @@ def _observe_gain(predicted: float, actual: float, forget: float) -> None:
     _gain_actual = _gain_actual * float(forget) + float(actual)
 
 
-_ROUND_LEARNING_FIELDS = ("_raw_gain", "_frozen_k", "_cost_depth", "_verify_quotes")
+_ROUND_LEARNING_FIELDS = ("_raw_gain", "_frozen_k", "_verify_quotes")
 _ROUND_SCRATCH_FIELDS = (
     ("_score_cache", dict),
     ("_peers", list),
