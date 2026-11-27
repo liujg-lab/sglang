@@ -1336,28 +1336,42 @@ class TestFlatWidthOnlineK(CustomTestCase):
 
         self.addCleanup(width_mod.reset_persistent_widths)
         greedy = {"tp": 2, "model": "m"}
+        rpd = dict(greedy, verify_mode="rpd")
+        rpd2 = dict(rpd, rpd_tau=0.2)
+        rpd4 = dict(rpd, rpd_tau=0.4)
         cases = (
-            # (previous header, next header, dropped)
-            (greedy, dict(greedy, verify_mode="rpd"), True),
-            (dict(greedy, verify_mode="rpd"), dict(greedy, verify_mode="auto"), True),
+            # (previous header, next header, dropped, H kept)
+            (greedy, rpd, True, False),
+            (rpd, dict(greedy, verify_mode="auto"), True, False),
             # Another Target in the same mode keeps the pooled state.
-            (greedy, dict(greedy, tp=4), False),
-            (dict(greedy, verify_mode="rpd"), dict(greedy, tp=4, verify_mode="rpd"), False),
+            (greedy, dict(greedy, tp=4), False, False),
+            (rpd, dict(rpd, tp=4), False, False),
             # The same header, and the first header ever, keep it too.
-            (greedy, dict(greedy), False),
-            (None, dict(greedy, verify_mode="rpd"), False),
+            (greedy, dict(greedy), False, True),
+            (None, rpd, False, False),
+            # Another tau drops the pooled state; tau is not in the fit
+            # identity, so the header still matches and H stays.
+            (rpd2, rpd4, True, True),
+            (rpd4, dict(rpd4), False, True),
+            (rpd4, dict(rpd4, tp=4), False, False),
+            # An older RPD Target without tau counts as another regime once.
+            (rpd, rpd4, True, True),
+            # A greedy header's null tau is not a regime.
+            (dict(greedy, rpd_tau=None), greedy, False, True),
         )
-        for before, after, dropped in cases:
+        for before, after, dropped, h_kept in cases:
             with self.subTest(before=before, after=after):
                 reset_policy()
                 observe_accept("a", 1.0, 4.0)
                 observe_price(1, 2.0, 1.0)
                 for kv in (None, -1, *ledger_module.runtime_kv_buckets()):
                     width_mod.assign_persistent_width(1, 4, kv)
+                policy._clock[(1, 16, 256)] = [12.5]
                 sched = SimpleNamespace(_clear_ledger=None)
                 if before is not None:
                     sched._clear_target_header = dict(before)
                 on_external_event(sched, SimpleNamespace(target_info=dict(after)))
+                self.assertEqual((1, 16, 256) in policy._clock, h_kept)
                 if dropped:
                     self.assertEqual(accept_ratio("a"), 1.0)
                     self.assertIsNone(theta(1))
@@ -4691,6 +4705,21 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
         )
         # Settled once; the next round had no tree, so nothing else waits.
         self.assertEqual(ledger._pending_rpd, {})
+
+    def test_late_rpd_record_carries_tau(self):
+        tail = [7, 10, 20, 30, 99]
+        for tau in (None, 0.4):
+            with self.subTest(tau=tau):
+                ledger, _ = self._noted_round()
+                self.assertIsNone(ledger.rpd_tau)
+                ledger.rpd_tau = tau
+                self._close(ledger, 4, tail)
+                # A tau change after the close does not rewrite the round.
+                ledger.rpd_tau = 0.9
+                self._late_packet(ledger, self._rpd_verify(8, {"a": "1f"}))
+                [late] = self._late_logs(ledger)
+                self.assertIn("tau", late)
+                self.assertEqual(late["tau"], tau)
 
     def test_late_rpd_masks_with_deferred_close(self):
         ledger, _ = self._noted_round()

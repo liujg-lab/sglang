@@ -8,6 +8,7 @@ the batch request: each item is ``[batch, k, kv_bucket, device_us]``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,7 +62,24 @@ _TARGET_INFO_KEYS = (
     "prefit_batches",
     "rpc_batch_limit",
     "verify_mode",
+    "rpd_tau",
 )
+
+# Keys whose value is a real number. ``rpd_tau`` keeps the server_args range
+# [0, 1); anything else (bool, string, nan, inf, out of range) is dropped.
+_TARGET_INFO_FLOAT_KEYS = ("rpd_tau",)
+
+
+def _target_info_float(value: Any) -> Tuple[bool, Optional[float]]:
+    """(keep, value) for a real-number header key. None is kept as None."""
+    if value is None:
+        return True, None
+    if type(value) is not float and type(value) is not int:
+        return False, None
+    number = float(value)
+    if not math.isfinite(number) or not (0.0 <= number < 1.0):
+        return False, None
+    return True, number
 
 
 def _target_info_value(value: Any) -> bool:
@@ -72,7 +90,10 @@ def _target_info_value(value: Any) -> bool:
 
 
 def parse_target_info(value: Any) -> Optional[dict]:
-    """Keep the Target header keys whose values are strings, ints, bools, None, or int lists."""
+    """Keep the Target header keys whose values are strings, ints, bools, None, or int lists.
+
+    ``rpd_tau`` is the one real-number key; see ``_TARGET_INFO_FLOAT_KEYS``.
+    """
     if not isinstance(value, dict):
         return None
     kept = {}
@@ -80,6 +101,11 @@ def parse_target_info(value: Any) -> Optional[dict]:
         if key not in value:
             continue
         item = value[key]
+        if key in _TARGET_INFO_FLOAT_KEYS:
+            keep, number = _target_info_float(item)
+            if keep:
+                kept[key] = number
+            continue
         if _target_info_value(item):
             kept[key] = item
     return kept

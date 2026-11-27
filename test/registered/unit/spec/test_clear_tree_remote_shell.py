@@ -951,6 +951,50 @@ class ClearTreeRpdTest(CustomTestCase):
         )
         self.assertEqual(_target_identity({**old_file, "verify_mode": "auto"}), old_file)
 
+    def test_target_info_carries_rpd_tau(self):
+        import math
+
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
+            _target_identity,
+            target_headers_match,
+        )
+        from sglang.srt.speculative.clear_tree_remote.clear_tree_protocol import (
+            parse_target_info,
+        )
+
+        header = {"tp": 2, "verify_mode": "rpd", "rpd_tau": 0.4}
+        batch = ClearBatchRequest(
+            session_id="s",
+            rpc_seq=1,
+            action=ClearAction.PREFILL,
+            target_info=dict(header),
+        )
+        back = ClearBatchRequest.from_dict(batch.to_dict())
+        self.assertEqual(back.target_info, header)
+        self.assertIs(type(back.target_info["rpd_tau"]), float)
+
+        # A real number in [0, 1), or None, is kept; an int becomes a float.
+        kept = parse_target_info({"rpd_tau": 0})
+        self.assertEqual(kept, {"rpd_tau": 0.0})
+        self.assertIs(type(kept["rpd_tau"]), float)
+        self.assertEqual(parse_target_info({"rpd_tau": None}), {"rpd_tau": None})
+        self.assertEqual(parse_target_info({"rpd_tau": 0.999}), {"rpd_tau": 0.999})
+        for bad in (True, False, "0.4", math.nan, math.inf, 1.0, -0.1, [1]):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    parse_target_info({"tp": 2, "rpd_tau": bad}), {"tp": 2}
+                )
+        # Other keys still reject floats.
+        self.assertEqual(parse_target_info({"tp": 2.0, "rpd_tau": 0.2}), {"rpd_tau": 0.2})
+
+        # tau stays out of the fit identity: files are shared across tau.
+        base = {"tp": 2, "page_size": 128, "verify_mode": "rpd"}
+        self.assertTrue(
+            target_headers_match({**base, "rpd_tau": 0.2}, {**base, "rpd_tau": 0.4})
+        )
+        self.assertTrue(target_headers_match({**base, "rpd_tau": 0.4}, base))
+        self.assertEqual(_target_identity({**base, "rpd_tau": 0.4}), base)
+
     @staticmethod
     def _rpd_round(k, tau, seed):
         """One CPU RPD verify through the shared host plan."""

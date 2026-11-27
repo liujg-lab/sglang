@@ -952,6 +952,9 @@ class ClearLedger:
         self._pending_order: List[tuple] = []
         # Closed rounds whose RPD masks have not arrived, oldest first.
         self._pending_rpd: Dict[tuple, dict] = {}
+        # RPD tau of the current Target header (on_target_info); None for
+        # greedy or an older Target. Copied into each late d_rpd record.
+        self.rpd_tau: Optional[float] = None
         # One closed round whose accounting waits until after the reply.
         self.deferred: Optional[dict] = None
 
@@ -1630,6 +1633,7 @@ class ClearLedger:
             "excluded": bool(excluded),
             "e_pred": expect.get("e_pred"),
             "e_mass": expect.get("e_mass"),
+            "tau": self.rpd_tau,
             "rows": late,
         }
         while len(self._pending_rpd) > LATE_RPD_ROUNDS:
@@ -1669,6 +1673,7 @@ class ClearLedger:
                     "excluded": held["excluded"],
                     "e_pred": held["e_pred"],
                     "e_mass": held["e_mass"],
+                    "tau": held.get("tau"),
                     "rpd_masks": used,
                     "e_rid": rows or None,
                 },

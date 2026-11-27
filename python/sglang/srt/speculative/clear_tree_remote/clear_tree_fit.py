@@ -82,6 +82,30 @@ def _fit_mode(info) -> str:
     return "greedy"
 
 
+def verify_regime(info) -> tuple:
+    """``("greedy", None)`` or ``("rpd", tau)`` for a Target header.
+
+    The Draft's online state (pooled P, Θ, served widths, replay) is learned
+    under one regime; a change of mode or of tau resets it. The fit identity
+    uses only the mode (``_fit_mode``). An RPD header without ``rpd_tau``
+    gives ``("rpd", None)``.
+    """
+    if _fit_mode(info) != "rpd":
+        return ("greedy", None)
+    tau = info.get("rpd_tau")
+    if type(tau) is not float and type(tau) is not int:
+        tau = None
+    return ("rpd", None if tau is None else float(tau))
+
+
+def regime_label(regime) -> str:
+    """``greedy``, ``rpd(tau=0.4)``, or ``rpd(tau=?)`` for logs."""
+    mode, tau = regime
+    if mode != "rpd":
+        return str(mode)
+    return "rpd(tau=%s)" % ("?" if tau is None else "%g" % tau)
+
+
 def fit_path(mode: str = "greedy") -> str:
     """Fit file of one verify mode. RPD inserts ``.rpd`` before the extension.
 
@@ -231,6 +255,7 @@ def target_info(scheduler) -> dict:
     )
 
     args = scheduler.server_args
+    mode = str(getattr(args, "speculative_verify_mode", "auto") or "auto")
     device = getattr(args, "device", None) or getattr(scheduler, "device", None)
     attention = getattr(args, "attention_backend", None)
     graph_bs = getattr(args, "cuda_graph_bs", None)
@@ -263,7 +288,13 @@ def target_info(scheduler) -> dict:
         "rpc_batch_limit": rpc_batch_limit_for(scheduler),
         # Only "rpd" joins the fit identity (_target_identity) and picks the
         # RPD fit file (fit_path); other modes leave both unchanged.
-        "verify_mode": str(getattr(args, "speculative_verify_mode", "auto") or "auto"),
+        "verify_mode": mode,
+        # Not part of the fit identity: H does not depend on tau, so one
+        # .rpd.json serves every tau. A tau change only resets the Draft's
+        # online state (verify_regime).
+        "rpd_tau": None
+        if mode != "rpd" or getattr(args, "speculative_rpd_tau", None) is None
+        else float(getattr(args, "speculative_rpd_tau")),
     }
     return parse_target_info(raw) or {}
 
@@ -436,10 +467,15 @@ def on_target_info(scheduler, info) -> None:
     parsed = parse_target_info(info)
     scheduler._clear_target_header = parsed
     mode = _fit_mode(parsed)
-    if mode == "rpd" and not getattr(scheduler, "_clear_rpd_logged", False):
-        scheduler._clear_rpd_logged = True
+    regime = verify_regime(parsed)
+    ledger = getattr(scheduler, "_clear_ledger", None)
+    if ledger:  # bind_ledger stores False when the ledger cannot start
+        ledger.rpd_tau = regime[1]
+    if mode == "rpd" and getattr(scheduler, "_clear_rpd_logged", None) != regime:
+        scheduler._clear_rpd_logged = regime
         logger.info(
-            "[CLEAR] target verifies with RPD; W/K run online on fit file %s",
+            "[CLEAR] target verifies with RPD (tau=%s); W/K run online on fit file %s",
+            "?" if regime[1] is None else "%g" % regime[1],
             fit_path("rpd"),
         )
     files = getattr(scheduler, "_clear_fit_files", None)

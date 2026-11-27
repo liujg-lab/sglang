@@ -110,16 +110,19 @@ def on_external_event(scheduler, batch=None) -> None:
     clears those fits and then tries the file for the new header. Neither
     path writes the file. A missing batch keeps the full clear.
 
-    A new header whose verify mode differs from the previous one (greedy and
-    RPD) also drops the pooled accept ratio, Θ, c_i, the served widths and
-    replay, as if the Draft restarted: those were learned under the other
-    mode. Within one mode they stay pooled.
+    A new header whose verify regime differs from the previous one (greedy
+    vs RPD, or another RPD tau) also drops the pooled accept ratio, Θ, c_i,
+    the served widths and replay, as if the Draft restarted: those were
+    learned under the other regime. Within one regime they stay pooled.
+    tau is not part of the fit identity, so a tau-only change keeps H, Q,
+    the layer fit and the installed file.
     """
     global _probe_rounds
     from sglang.srt.speculative.clear_tree_remote.clear_tree_fit import (
-        _fit_mode,
         on_target_info,
+        regime_label,
         target_headers_match,
+        verify_regime,
     )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_replay import (
         reset_replay_state,
@@ -128,12 +131,30 @@ def on_external_event(scheduler, batch=None) -> None:
     info = getattr(batch, "target_info", None) if batch is not None else None
     current = getattr(scheduler, "_clear_target_header", None)
     ledger = getattr(scheduler, "_clear_ledger", None)
+    regime_changed = (
+        isinstance(info, dict)
+        and isinstance(current, dict)
+        and verify_regime(info) != verify_regime(current)
+    )
+
+    def _drop_regime_state() -> None:
+        reset_policy(keep_fits=True)
+        logger.info(
+            "[CLEAR] target verify changed %s -> %s; dropped P, theta, "
+            "served widths and replay",
+            regime_label(verify_regime(current)),
+            regime_label(verify_regime(info)),
+        )
+
     if target_headers_match(info, current):
         _pending.clear()
         reset_replay_state()
         if ledger:
             ledger.drop_open()
         scheduler._clear_replay_to_hold = []
+        if regime_changed:
+            # Only tau changed: same fit identity, so H and the file stay.
+            _drop_regime_state()
         if isinstance(info, dict):
             on_target_info(scheduler, info)
         return
@@ -154,18 +175,8 @@ def on_external_event(scheduler, batch=None) -> None:
     scheduler._clear_replay_to_hold = []
     scheduler._clear_fit_installed = False
     scheduler._clear_prefit = None
-    if (
-        isinstance(info, dict)
-        and isinstance(current, dict)
-        and _fit_mode(info) != _fit_mode(current)
-    ):
-        reset_policy(keep_fits=True)
-        logger.info(
-            "[CLEAR] target verify mode changed %s -> %s; dropped P, theta, "
-            "served widths and replay",
-            _fit_mode(current),
-            _fit_mode(info),
-        )
+    if regime_changed:
+        _drop_regime_state()
     if isinstance(info, dict):
         on_target_info(scheduler, info)
 

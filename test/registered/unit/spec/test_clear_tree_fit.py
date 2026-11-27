@@ -1079,6 +1079,41 @@ class ClearTreeFitFileTest(CustomTestCase):
         for info in ({"verify_mode": "auto"}, {"verify_mode": "greedy"}, {}, None):
             self.assertEqual(fit._fit_mode(info), "greedy")
 
+    def test_target_info_rpd_tau_and_verify_regime(self):
+        scheduler = self._scheduler()
+        self._tiny(scheduler, ks=[16], capture=(1,))
+        self.assertIsNone(fit.target_info(scheduler)["rpd_tau"])
+        scheduler.server_args.speculative_verify_mode = "rpd"
+        scheduler.server_args.speculative_rpd_tau = 0.4
+        info = fit.target_info(scheduler)
+        self.assertEqual(info["verify_mode"], "rpd")
+        self.assertEqual(info["rpd_tau"], 0.4)
+        # The written fit identity carries the mode but not tau.
+        self.assertNotIn("rpd_tau", fit._target_identity(info))
+        self.assertTrue(
+            fit.target_headers_match(info, dict(info, rpd_tau=0.2))
+        )
+        for mode in ("greedy", "auto"):
+            scheduler.server_args.speculative_verify_mode = mode
+            self.assertIsNone(fit.target_info(scheduler)["rpd_tau"])
+
+        cases = (
+            (None, ("greedy", None), "greedy"),
+            ({}, ("greedy", None), "greedy"),
+            ({"verify_mode": "auto"}, ("greedy", None), "greedy"),
+            ({"verify_mode": "greedy", "rpd_tau": 0.4}, ("greedy", None), "greedy"),
+            ({"verify_mode": "rpd"}, ("rpd", None), "rpd(tau=?)"),
+            ({"verify_mode": "rpd", "rpd_tau": None}, ("rpd", None), "rpd(tau=?)"),
+            ({"verify_mode": "rpd", "rpd_tau": 0.4}, ("rpd", 0.4), "rpd(tau=0.4)"),
+            ({"verify_mode": "rpd", "rpd_tau": 0}, ("rpd", 0.0), "rpd(tau=0)"),
+            ({"verify_mode": "rpd", "rpd_tau": True}, ("rpd", None), "rpd(tau=?)"),
+            ({"verify_mode": "rpd", "rpd_tau": "0.4"}, ("rpd", None), "rpd(tau=?)"),
+        )
+        for header, regime, label in cases:
+            with self.subTest(header=header):
+                self.assertEqual(fit.verify_regime(header), regime)
+                self.assertEqual(fit.regime_label(regime), label)
+
     def _commit_mode(self, mode, hold):
         scheduler = self._scheduler()
         run = self._tiny(scheduler, ks=[16], capture=(1,))
@@ -1132,6 +1167,19 @@ class ClearTreeFitFileTest(CustomTestCase):
         scheduler._clear_fit_installed = False
         fit.on_target_info(scheduler, greedy)
         self.assertEqual(policy.predict_hold_ms(1, 16, 256), 12.5)
+        self.assertIsNone(scheduler._clear_ledger.rpd_tau)
+
+        # tau is not in the fit identity: an RPD Target with another tau
+        # installs the same RPD file, and the ledger learns the tau.
+        reset_policy()
+        scheduler._clear_fit_installed = False
+        fit.on_target_info(scheduler, dict(rpd, rpd_tau=0.4))
+        self.assertTrue(scheduler._clear_fit_ready)
+        self.assertEqual(policy.predict_hold_ms(1, 16, 256), 13.5)
+        self.assertEqual(scheduler._clear_ledger.rpd_tau, 0.4)
+        self.assertEqual(scheduler._clear_rpd_logged, ("rpd", 0.4))
+        fit.on_target_info(scheduler, greedy)
+        self.assertIsNone(scheduler._clear_ledger.rpd_tau)
 
         # Only the greedy file: an RPD Target has to prefit.
         os.remove(fit.fit_path("rpd"))
