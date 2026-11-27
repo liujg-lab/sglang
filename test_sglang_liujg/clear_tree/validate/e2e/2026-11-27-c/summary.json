@@ -1,0 +1,2026 @@
+{
+  "run_id": "2026-11-27-c",
+  "commit": "4b5de83245a134624fdd88acd610c7175ad06f64",
+  "issues": [
+    "trial 03: client JSONL: expected one artifact, found []",
+    "trial 03: client stdout: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/03/client.stdout'",
+    "trial 03: client exit: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/03/exit-code.txt'",
+    "trial 03: client manifest: expected one artifact, found []",
+    "trial 03: client CSV: expected one artifact, found []",
+    "trial 03: trial flush: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/03/target-flush.txt'",
+    "trial 04: client JSONL: expected one artifact, found []",
+    "trial 04: client stdout: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/04/client.stdout'",
+    "trial 04: client exit: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/04/exit-code.txt'",
+    "trial 04: client manifest: expected one artifact, found []",
+    "trial 04: client CSV: expected one artifact, found []",
+    "trial 04: trial flush: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/04/target-flush.txt'",
+    "rpd/draft.log: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/draft.log'",
+    "rpd/target.log: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/target.log'",
+    "rpd fit: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/clear_tree_fit.rpd.json'",
+    "rpd draft-captures.txt: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/draft-captures.txt'",
+    "rpd parse-target.txt: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/parse-target.txt'",
+    "rpd target-captures.txt: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/target-captures.txt'",
+    "rpd fit checksum: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/clear_tree_fit.rpd.json.sha256'",
+    "rpd fit coverage receipt: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/fit-coverage.json'",
+    "rpd block completion: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/block-complete.txt'",
+    "rpd draft identity: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/draft-identity.json'",
+    "rpd draft cleanup: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/draft-cleanup.json'",
+    "rpd draft precheck: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/precheck-draft.txt'",
+    "rpd draft postcheck: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/postcheck-draft.txt'",
+    "rpd target identity: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/target-identity.json'",
+    "rpd target cleanup: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/target-cleanup.json'",
+    "rpd target precheck: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/precheck-target.txt'",
+    "rpd target postcheck: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/postcheck-target.txt'",
+    "rpd retained greedy fit digest: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/greedy-fit-during-rpd.json'",
+    "rpd retained greedy fit receipt: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/greedy-fit-during-rpd.json.sha256'",
+    "rpd post-cleanup greedy fit digest: [Errno 2] No such file or directory: '/home/liujg/workspace/sglang/test_sglang_liujg/clear_tree/validate/e2e/2026-11-27-c/raw/rpd/greedy-fit-after-rpd.sha256'"
+  ],
+  "trials": {
+    "01": {
+      "id": "01",
+      "mode": "greedy",
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "requests": 100,
+      "ok": 100,
+      "exit_code": 0,
+      "output_tokens": 45692,
+      "wall_s": 778.545,
+      "tok_s": 58.688940239752974,
+      "total_accepted": 35047,
+      "total_draft": 86384,
+      "accept_ratio": 0.40571170587145766,
+      "fallback": 0,
+      "actual_client_concurrency": 0.9998726475820937,
+      "metrics": {
+        "Avg BLEU": 0.56,
+        "Avg ROUGE-1": 0.7996,
+        "Avg ROUGE-2": 0.5962,
+        "Avg ROUGE-L": 0.6419
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "response_ids_unique": true,
+      "target_flush_cumulative": {
+        "tp": {
+          "0": 1,
+          "1": 1
+        },
+        "http": {
+          "200": 1
+        }
+      },
+      "ordered_items_sha256": "ce372701c6d0df02656c4535cfe876521844894656f9818f014fd95d1954ef39",
+      "target_config": {
+        "speculative_algorithm": "CLEAR_TREE_REMOTE",
+        "device": "npu",
+        "tp_size": 2,
+        "page_size": 128,
+        "disable_cuda_graph": false,
+        "cuda_graph_bs": [
+          1,
+          2,
+          4
+        ],
+        "attention_backend": "ascend",
+        "speculative_verify_mode": "greedy",
+        "speculative_num_steps": 8,
+        "speculative_num_draft_tokens": 65
+      }
+    },
+    "02": {
+      "id": "02",
+      "mode": "greedy",
+      "dataset": "RSTeller",
+      "concurrency": 4,
+      "requests": 100,
+      "ok": 100,
+      "exit_code": 0,
+      "output_tokens": 45887,
+      "wall_s": 285.381,
+      "tok_s": 160.7922965189047,
+      "total_accepted": 33199,
+      "total_draft": 102440,
+      "accept_ratio": 0.32408238969152675,
+      "fallback": 0,
+      "actual_client_concurrency": 3.916035347786121,
+      "metrics": {
+        "Avg BLEU": 0.5371,
+        "Avg ROUGE-1": 0.7874,
+        "Avg ROUGE-2": 0.5735,
+        "Avg ROUGE-L": 0.6238
+      },
+      "metrics_scored": [
+        100,
+        100
+      ],
+      "metric_coverage": {
+        "completion_tokens": 100,
+        "spec_accept_token_num": 100,
+        "spec_draft_token_num": 100,
+        "spec_fallback_ct": 100
+      },
+      "response_ids_unique": true,
+      "target_flush_cumulative": {
+        "tp": {
+          "0": 2,
+          "1": 2
+        },
+        "http": {
+          "200": 2
+        }
+      },
+      "ordered_items_sha256": "ce372701c6d0df02656c4535cfe876521844894656f9818f014fd95d1954ef39",
+      "target_config": {
+        "speculative_algorithm": "CLEAR_TREE_REMOTE",
+        "device": "npu",
+        "tp_size": 2,
+        "page_size": 128,
+        "disable_cuda_graph": false,
+        "cuda_graph_bs": [
+          1,
+          2,
+          4
+        ],
+        "attention_backend": "ascend",
+        "speculative_verify_mode": "greedy",
+        "speculative_num_steps": 8,
+        "speculative_num_draft_tokens": 65
+      }
+    },
+    "03": {
+      "id": "03",
+      "mode": "rpd",
+      "dataset": "RSTeller",
+      "concurrency": 1,
+      "rpd_tau": 0.4,
+      "requests": 0,
+      "ok": 0,
+      "exit_code": null,
+      "output_tokens": null,
+      "wall_s": null,
+      "tok_s": null,
+      "total_accepted": null,
+      "total_draft": null,
+      "accept_ratio": null,
+      "fallback": null,
+      "actual_client_concurrency": null,
+      "metrics": {
+        "Avg BLEU": null,
+        "Avg ROUGE-1": null,
+        "Avg ROUGE-2": null,
+        "Avg ROUGE-L": null
+      },
+      "metrics_scored": null,
+      "metric_coverage": {
+        "completion_tokens": 0,
+        "spec_accept_token_num": 0,
+        "spec_draft_token_num": 0,
+        "spec_fallback_ct": 0
+      },
+      "response_ids_unique": true,
+      "target_flush_cumulative": null,
+      "ordered_items_sha256": null,
+      "target_config": {
+        "speculative_algorithm": null,
+        "device": null,
+        "tp_size": null,
+        "page_size": null,
+        "disable_cuda_graph": null,
+        "cuda_graph_bs": null,
+        "attention_backend": null,
+        "speculative_verify_mode": null,
+        "speculative_num_steps": null,
+        "speculative_num_draft_tokens": null,
+        "speculative_rpd_tau": null
+      }
+    },
+    "04": {
+      "id": "04",
+      "mode": "rpd",
+      "dataset": "RSTeller",
+      "concurrency": 4,
+      "rpd_tau": 0.4,
+      "requests": 0,
+      "ok": 0,
+      "exit_code": null,
+      "output_tokens": null,
+      "wall_s": null,
+      "tok_s": null,
+      "total_accepted": null,
+      "total_draft": null,
+      "accept_ratio": null,
+      "fallback": null,
+      "actual_client_concurrency": null,
+      "metrics": {
+        "Avg BLEU": null,
+        "Avg ROUGE-1": null,
+        "Avg ROUGE-2": null,
+        "Avg ROUGE-L": null
+      },
+      "metrics_scored": null,
+      "metric_coverage": {
+        "completion_tokens": 0,
+        "spec_accept_token_num": 0,
+        "spec_draft_token_num": 0,
+        "spec_fallback_ct": 0
+      },
+      "response_ids_unique": true,
+      "target_flush_cumulative": null,
+      "ordered_items_sha256": null,
+      "target_config": {
+        "speculative_algorithm": null,
+        "device": null,
+        "tp_size": null,
+        "page_size": null,
+        "disable_cuda_graph": null,
+        "cuda_graph_bs": null,
+        "attention_backend": null,
+        "speculative_verify_mode": null,
+        "speculative_num_steps": null,
+        "speculative_num_draft_tokens": null,
+        "speculative_rpd_tau": null
+      }
+    }
+  },
+  "modes": {
+    "greedy": {
+      "draft_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          8
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          32
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          64
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          4
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          8
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          16
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          64
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          16
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          32
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          64
+        ]
+      ],
+      "target_captures": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          9
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          1,
+          33
+        ],
+        [
+          1,
+          65
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          2,
+          9
+        ],
+        [
+          2,
+          17
+        ],
+        [
+          2,
+          33
+        ],
+        [
+          2,
+          65
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          3
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          4,
+          17
+        ],
+        [
+          4,
+          33
+        ],
+        [
+          4,
+          65
+        ]
+      ],
+      "missing_capture_shapes": {
+        "draft": [],
+        "target": []
+      },
+      "allowed_missing_draft_shape": [
+        4,
+        65
+      ],
+      "flush_tp": {
+        "0": 2,
+        "1": 2
+      },
+      "flush_http": {
+        "200": 2
+      },
+      "draft_fit": {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": 0,
+        "driver": [],
+        "writes": [
+          [
+            9650,
+            "clear_tree_fit.json",
+            90
+          ]
+        ],
+        "absent": [
+          [
+            94,
+            "clear_tree_fit.json"
+          ],
+          [
+            95,
+            "clear_tree_fit.rpd.json"
+          ]
+        ],
+        "rpd_ack": [],
+        "flat": 0
+      },
+      "target_fit": {
+        "states": {
+          "0": {
+            "state": "ready",
+            "run": "01795773182231954605_70575bea_7a093a1e_11795773185560568958",
+            "reason": "prefit",
+            "session": "01795773182231954605_70575bea"
+          },
+          "1": {
+            "state": "ready",
+            "run": "01795773182231954605_70575bea_7a093a1e_11795773185560568958",
+            "reason": "prefit",
+            "session": "01795773182231954605_70575bea"
+          }
+        },
+        "commits": [
+          {
+            "run": "01795773182231954605_70575bea_7a093a1e_11795773185560568958",
+            "seq": 1,
+            "ready": true,
+            "reason": "ready",
+            "missing_h": [],
+            "missing_layers": [],
+            "refill_groups": []
+          }
+        ],
+        "refills": [],
+        "started": 1,
+        "driver": [
+          "ready"
+        ],
+        "writes": [],
+        "absent": [],
+        "rpd_ack": [],
+        "flat": 0
+      },
+      "fit_file": {
+        "name": "clear_tree_fit.json",
+        "sha256": "9b2dc602d0923568ac3ade58a7bc8d3d4d33eeae7c761b1757c5b43d1501f838",
+        "schema": 4,
+        "cells": 90,
+        "layer_cells": 18,
+        "run": "01795773182231954605_70575bea_7a093a1e_11795773185560568958",
+        "plan": {
+          "inputs": {
+            "batches": [
+              1,
+              2,
+              4
+            ],
+            "ks": [
+              2,
+              4,
+              8,
+              16,
+              32,
+              64
+            ],
+            "widths": [
+              2,
+              4,
+              8,
+              16,
+              32,
+              64
+            ],
+            "buckets": [
+              256,
+              512,
+              1024,
+              2048,
+              4096
+            ],
+            "max_depth": 8
+          },
+          "fingerprint": "7a093a1e"
+        },
+        "target_mode": null,
+        "draft_lookahead": true,
+        "required_h": 90,
+        "required_layers": 18,
+        "skipped": [],
+        "missing_h": [],
+        "missing_layers": [],
+        "h_null_ells": 0,
+        "h_min_samples": 4,
+        "layer_min_samples": 60,
+        "layer_samples_by_cell": [
+          [
+            2,
+            "graph",
+            1,
+            240
+          ],
+          [
+            2,
+            "graph",
+            2,
+            66
+          ],
+          [
+            2,
+            "graph",
+            4,
+            60
+          ],
+          [
+            4,
+            "graph",
+            1,
+            96
+          ],
+          [
+            4,
+            "graph",
+            2,
+            413
+          ],
+          [
+            4,
+            "graph",
+            4,
+            399
+          ],
+          [
+            8,
+            "graph",
+            1,
+            275
+          ],
+          [
+            8,
+            "graph",
+            2,
+            60
+          ],
+          [
+            8,
+            "graph",
+            4,
+            60
+          ],
+          [
+            16,
+            "graph",
+            1,
+            96
+          ],
+          [
+            16,
+            "graph",
+            2,
+            60
+          ],
+          [
+            16,
+            "graph",
+            4,
+            60
+          ],
+          [
+            32,
+            "graph",
+            1,
+            96
+          ],
+          [
+            32,
+            "graph",
+            2,
+            60
+          ],
+          [
+            32,
+            "graph",
+            4,
+            60
+          ],
+          [
+            64,
+            "graph",
+            1,
+            66
+          ],
+          [
+            64,
+            "graph",
+            2,
+            60
+          ],
+          [
+            64,
+            "graph",
+            4,
+            60
+          ]
+        ],
+        "violations": {}
+      },
+      "fit_sha256": "9b2dc602d0923568ac3ade58a7bc8d3d4d33eeae7c761b1757c5b43d1501f838",
+      "extra_fit_files": [],
+      "target_verify_paths": {
+        "graph": 14308
+      },
+      "target_timing": {
+        "verify_wall_us": {
+          "n": 14308,
+          "median_us": 43454.0
+        },
+        "accept_ready_us": {
+          "n": 14308,
+          "median_us": 40961.5
+        },
+        "rpd_build_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_stats_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_select_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_mask_us": {
+          "n": 0,
+          "median_us": null
+        }
+      },
+      "target_timing_invalid": 0,
+      "late_rpd_rows": 0,
+      "late_rpd_duplicate_keys": 0,
+      "round_assignment": {
+        "unmatched": 200,
+        "assigned": 14107
+      },
+      "formal_sessions": [
+        "01795773182231954605_70575bea"
+      ],
+      "duplicate_round_keys": 0,
+      "unjoined_layer_rows": 5,
+      "unjoined_late_rpd_rows": 0,
+      "parse_errors": {
+        "draft": 0,
+        "target": 0
+      },
+      "logs_present": {
+        "draft": true,
+        "target": true
+      },
+      "bonus_windows": {
+        "reasons": {
+          "full": 501,
+          "idle": 3
+        },
+        "tail": "flushed",
+        "opt_bonus_forwards": 16076,
+        "opt_bonus_requests": 27397,
+        "opt_bonus_graph": 16076,
+        "opt_bonus_eager": 0
+      },
+      "launch": {
+        "parsed": {
+          "draft": {
+            "role": "draft",
+            "capacity": "64",
+            "widths": "2,4,8,16,32,64",
+            "ks": "2,4,8,16,32,64",
+            "depth": "8",
+            "steps": "8",
+            "cuda_graph_bs": "1,2,4",
+            "page": "1",
+            "attention_backend": "triton",
+            "mm_attention_backend": "triton_attn"
+          },
+          "target": {
+            "role": "target",
+            "capacity": "65",
+            "widths": "2,4,8,16,32,64",
+            "ks": "2,4,8,16,32,64",
+            "depth": "8",
+            "steps": "8",
+            "cuda_graph_bs": "1,2,4",
+            "page": "128",
+            "attention_backend": "ascend",
+            "mm_attention_backend": "ascend_attn"
+          }
+        },
+        "capture_records": {
+          "draft": [
+            [
+              1,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              1,
+              8
+            ],
+            [
+              1,
+              9
+            ],
+            [
+              1,
+              16
+            ],
+            [
+              1,
+              17
+            ],
+            [
+              1,
+              32
+            ],
+            [
+              1,
+              33
+            ],
+            [
+              1,
+              64
+            ],
+            [
+              1,
+              65
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              2,
+              9
+            ],
+            [
+              2,
+              16
+            ],
+            [
+              2,
+              17
+            ],
+            [
+              2,
+              32
+            ],
+            [
+              2,
+              33
+            ],
+            [
+              2,
+              64
+            ],
+            [
+              2,
+              65
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              4,
+              4
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              4,
+              8
+            ],
+            [
+              4,
+              9
+            ],
+            [
+              4,
+              16
+            ],
+            [
+              4,
+              17
+            ],
+            [
+              4,
+              32
+            ],
+            [
+              4,
+              33
+            ],
+            [
+              4,
+              64
+            ]
+          ],
+          "target": [
+            [
+              1,
+              1
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              1,
+              9
+            ],
+            [
+              1,
+              17
+            ],
+            [
+              1,
+              33
+            ],
+            [
+              1,
+              65
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              2,
+              9
+            ],
+            [
+              2,
+              17
+            ],
+            [
+              2,
+              33
+            ],
+            [
+              2,
+              65
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              4,
+              9
+            ],
+            [
+              4,
+              17
+            ],
+            [
+              4,
+              33
+            ],
+            [
+              4,
+              65
+            ]
+          ]
+        },
+        "fit_checksum": "9b2dc602d0923568ac3ade58a7bc8d3d4d33eeae7c761b1757c5b43d1501f838",
+        "fit_receipt": {
+          "schema": 4,
+          "fingerprint": "7a093a1e",
+          "run": "01795773182231954605_70575bea_7a093a1e_11795773185560568958",
+          "required_h": 90,
+          "min_h_samples": 4,
+          "required_layers": 18,
+          "min_layer_samples": 60,
+          "skipped": [],
+          "low_yield": [],
+          "session": "01795773182231954605_70575bea",
+          "sha256": "9b2dc602d0923568ac3ade58a7bc8d3d4d33eeae7c761b1757c5b43d1501f838",
+          "draft_health": 200,
+          "target_health": 200,
+          "draft_captures": 38,
+          "target_captures": 21,
+          "draft_capacity_skip": [
+            4,
+            65
+          ]
+        }
+      },
+      "cleanup": {
+        "roles": {
+          "draft": {
+            "live_session_members": [],
+            "term_attempts": 5,
+            "term_receipts_valid": true,
+            "precheck_matches": true,
+            "postcheck_matches": true
+          },
+          "target": {
+            "live_session_members": [],
+            "term_attempts": 2,
+            "term_receipts_valid": true,
+            "precheck_matches": true,
+            "postcheck_matches": true
+          }
+        },
+        "errors": "",
+        "passed": true
+      },
+      "greedy_fit_retention": {},
+      "trials": {
+        "01": {
+          "counts": {
+            "rounds": 10798,
+            "hold_invalid": 0,
+            "scored": 10698,
+            "diagnostic_rows": 10698,
+            "c_present": 10698,
+            "c_null": 0,
+            "mass_d_present": 10698,
+            "mass_d_null": 0,
+            "gain_last_present": 10698,
+            "gain_last_null": 60,
+            "gain_next_present": 10698,
+            "gain_next_null": 0,
+            "depth_cap_present": 10698,
+            "depth_cap_null": 0,
+            "depth_capped": 2148,
+            "path_ok": 10698,
+            "mass_k_comparable": 10698,
+            "mass_k_not_equal_round_k": 0,
+            "mass_and_prediction_comparable": 10698,
+            "rpd_inline_mask_rows": 0,
+            "rpd_ok_false": 0,
+            "excluded": 100,
+            "unique_rids": 100
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 10698
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 10698,
+              "observed": 9922,
+              "expected": 9368.512657800773,
+              "observed_over_expected": 1.059079531876211
+            },
+            "2": {
+              "rows": 10638,
+              "observed": 8472,
+              "expected": 8103.57349718804,
+              "observed_over_expected": 1.0454646956604767
+            },
+            "3": {
+              "rows": 10130,
+              "observed": 6488,
+              "expected": 6382.000927673882,
+              "observed_over_expected": 1.016609065640602
+            },
+            "4": {
+              "rows": 8566,
+              "observed": 4500,
+              "expected": 4647.766637577596,
+              "observed_over_expected": 0.9682069585028452
+            },
+            "5": {
+              "rows": 6773,
+              "observed": 2902,
+              "expected": 3190.3541324354837,
+              "observed_over_expected": 0.9096168887635815
+            },
+            "6": {
+              "rows": 3948,
+              "observed": 1523,
+              "expected": 1834.0645263089878,
+              "observed_over_expected": 0.8303960837544806
+            },
+            "7": {
+              "rows": 2148,
+              "observed": 730,
+              "expected": 1002.2430815191168,
+              "observed_over_expected": 0.728366215203528
+            }
+          },
+          "layers": {
+            "counts": {
+              "matched_rounds": 10798,
+              "rows": 53569,
+              "fitted_layer_ge_2": 31565
+            },
+            "by_layer": {
+              "1": {
+                "rows": 10798,
+                "fitted": 0,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "2": {
+                "rows": 10738,
+                "fitted": 10130,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "3": {
+                "rows": 10229,
+                "fitted": 8566,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "4": {
+                "rows": 8664,
+                "fitted": 6773,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "5": {
+                "rows": 6869,
+                "fitted": 3948,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "6": {
+                "rows": 4037,
+                "fitted": 2148,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "7": {
+                "rows": 2234,
+                "fitted": 0,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              }
+            },
+            "paths": {
+              "graph": 53569
+            },
+            "violations": {}
+          }
+        },
+        "02": {
+          "counts": {
+            "rounds": 3309,
+            "hold_invalid": 0,
+            "scored": 3119,
+            "diagnostic_rows": 12048,
+            "c_present": 12048,
+            "c_null": 0,
+            "mass_d_present": 12048,
+            "mass_d_null": 0,
+            "gain_last_present": 12048,
+            "gain_last_null": 14,
+            "gain_next_present": 12048,
+            "gain_next_null": 0,
+            "depth_cap_present": 12048,
+            "depth_cap_null": 0,
+            "depth_capped": 571,
+            "path_ok": 12048,
+            "mass_k_comparable": 12048,
+            "mass_k_not_equal_round_k": 0,
+            "mass_and_prediction_comparable": 3119,
+            "rpd_inline_mask_rows": 0,
+            "rpd_ok_false": 0,
+            "excluded": 190,
+            "unique_rids": 100
+          },
+          "violations": {},
+          "k_modes": {
+            "value": 3109,
+            "tau": 3,
+            "probe": 7
+          },
+          "depth_calibration": {
+            "1": {
+              "rows": 12048,
+              "observed": 10599,
+              "expected": 10168.084101682909,
+              "observed_over_expected": 1.0423792618164684
+            },
+            "2": {
+              "rows": 12034,
+              "observed": 8445,
+              "expected": 8212.429477182517,
+              "observed_over_expected": 1.028319332721658
+            },
+            "3": {
+              "rows": 11925,
+              "observed": 6080,
+              "expected": 6069.686579014167,
+              "observed_over_expected": 1.001699168622889
+            },
+            "4": {
+              "rows": 8942,
+              "observed": 3696,
+              "expected": 3830.730030251968,
+              "observed_over_expected": 0.964829150269536
+            },
+            "5": {
+              "rows": 6718,
+              "observed": 1995,
+              "expected": 2247.039878982777,
+              "observed_over_expected": 0.8878347103047971
+            },
+            "6": {
+              "rows": 2396,
+              "observed": 640,
+              "expected": 795.4823271930162,
+              "observed_over_expected": 0.8045433294015972
+            },
+            "7": {
+              "rows": 571,
+              "observed": 146,
+              "expected": 212.26927249490294,
+              "observed_over_expected": 0.6878056267117314
+            }
+          },
+          "layers": {
+            "counts": {
+              "matched_rounds": 3309,
+              "rows": 15379,
+              "fitted_layer_ge_2": 8348
+            },
+            "by_layer": {
+              "1": {
+                "rows": 3309,
+                "fitted": 0,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "2": {
+                "rows": 3307,
+                "fitted": 3092,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "3": {
+                "rows": 3279,
+                "fitted": 2459,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "4": {
+                "rows": 2595,
+                "fitted": 1849,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "5": {
+                "rows": 1909,
+                "fitted": 735,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "6": {
+                "rows": 757,
+                "fitted": 213,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              },
+              "7": {
+                "rows": 223,
+                "fitted": 0,
+                "pred_ms_null": 0,
+                "residual_null": 0
+              }
+            },
+            "paths": {
+              "graph": 15379
+            },
+            "violations": {}
+          }
+        }
+      }
+    },
+    "rpd": {
+      "draft_captures": [],
+      "target_captures": [],
+      "missing_capture_shapes": {
+        "draft": [
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            1,
+            4
+          ],
+          [
+            1,
+            5
+          ],
+          [
+            1,
+            8
+          ],
+          [
+            1,
+            9
+          ],
+          [
+            1,
+            16
+          ],
+          [
+            1,
+            17
+          ],
+          [
+            1,
+            32
+          ],
+          [
+            1,
+            33
+          ],
+          [
+            1,
+            64
+          ],
+          [
+            1,
+            65
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            2,
+            2
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            2,
+            4
+          ],
+          [
+            2,
+            5
+          ],
+          [
+            2,
+            8
+          ],
+          [
+            2,
+            9
+          ],
+          [
+            2,
+            16
+          ],
+          [
+            2,
+            17
+          ],
+          [
+            2,
+            32
+          ],
+          [
+            2,
+            33
+          ],
+          [
+            2,
+            64
+          ],
+          [
+            2,
+            65
+          ],
+          [
+            4,
+            1
+          ],
+          [
+            4,
+            2
+          ],
+          [
+            4,
+            3
+          ],
+          [
+            4,
+            4
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            4,
+            8
+          ],
+          [
+            4,
+            9
+          ],
+          [
+            4,
+            16
+          ],
+          [
+            4,
+            17
+          ],
+          [
+            4,
+            32
+          ],
+          [
+            4,
+            33
+          ],
+          [
+            4,
+            64
+          ]
+        ],
+        "target": [
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            1,
+            5
+          ],
+          [
+            1,
+            9
+          ],
+          [
+            1,
+            17
+          ],
+          [
+            1,
+            33
+          ],
+          [
+            1,
+            65
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            2,
+            5
+          ],
+          [
+            2,
+            9
+          ],
+          [
+            2,
+            17
+          ],
+          [
+            2,
+            33
+          ],
+          [
+            2,
+            65
+          ],
+          [
+            4,
+            1
+          ],
+          [
+            4,
+            3
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            4,
+            9
+          ],
+          [
+            4,
+            17
+          ],
+          [
+            4,
+            33
+          ],
+          [
+            4,
+            65
+          ]
+        ]
+      },
+      "allowed_missing_draft_shape": [
+        4,
+        65
+      ],
+      "flush_tp": {},
+      "flush_http": {},
+      "draft_fit": {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": 0,
+        "driver": [],
+        "writes": [],
+        "absent": [],
+        "rpd_ack": [],
+        "flat": 0
+      },
+      "target_fit": {
+        "states": {},
+        "commits": [],
+        "refills": [],
+        "started": 0,
+        "driver": [],
+        "writes": [],
+        "absent": [],
+        "rpd_ack": [],
+        "flat": 0
+      },
+      "fit_file": {},
+      "fit_sha256": null,
+      "extra_fit_files": [],
+      "target_verify_paths": {},
+      "target_timing": {
+        "verify_wall_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "accept_ready_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_build_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_stats_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_select_us": {
+          "n": 0,
+          "median_us": null
+        },
+        "rpd_mask_us": {
+          "n": 0,
+          "median_us": null
+        }
+      },
+      "target_timing_invalid": 0,
+      "late_rpd_rows": 0,
+      "late_rpd_duplicate_keys": 0,
+      "round_assignment": {},
+      "formal_sessions": [],
+      "duplicate_round_keys": 0,
+      "unjoined_layer_rows": 0,
+      "unjoined_late_rpd_rows": 0,
+      "parse_errors": {
+        "draft": 0,
+        "target": 0
+      },
+      "logs_present": {
+        "draft": false,
+        "target": false
+      },
+      "bonus_windows": {
+        "reasons": {},
+        "tail": "missing",
+        "opt_bonus_forwards": null,
+        "opt_bonus_requests": null,
+        "opt_bonus_graph": null,
+        "opt_bonus_eager": null
+      },
+      "launch": {
+        "parsed": {
+          "draft": {
+            "role": "draft",
+            "capacity": "64",
+            "widths": "2,4,8,16,32,64",
+            "ks": "2,4,8,16,32,64",
+            "depth": "8",
+            "steps": "8",
+            "cuda_graph_bs": "1,2,4",
+            "page": "1",
+            "attention_backend": "triton",
+            "mm_attention_backend": "triton_attn"
+          },
+          "target": {}
+        },
+        "capture_records": {
+          "draft": [],
+          "target": []
+        },
+        "fit_checksum": null,
+        "fit_receipt": {}
+      },
+      "cleanup": {
+        "roles": {
+          "draft": {
+            "live_session_members": null,
+            "term_attempts": null,
+            "term_receipts_valid": false,
+            "precheck_matches": false,
+            "postcheck_matches": false
+          },
+          "target": {
+            "live_session_members": null,
+            "term_attempts": null,
+            "term_receipts_valid": false,
+            "precheck_matches": false,
+            "postcheck_matches": false
+          }
+        },
+        "errors": "",
+        "passed": false
+      },
+      "greedy_fit_retention": {
+        "before": "9b2dc602d0923568ac3ade58a7bc8d3d4d33eeae7c761b1757c5b43d1501f838",
+        "during": null,
+        "during_receipt": null,
+        "after": null
+      },
+      "trials": {
+        "03": {
+          "counts": {
+            "unique_rids": 0
+          },
+          "violations": {},
+          "k_modes": {},
+          "depth_calibration": {},
+          "layers": {
+            "counts": {},
+            "by_layer": {},
+            "paths": {},
+            "violations": {}
+          }
+        },
+        "04": {
+          "counts": {
+            "unique_rids": 0
+          },
+          "violations": {},
+          "k_modes": {},
+          "depth_calibration": {},
+          "layers": {
+            "counts": {},
+            "by_layer": {},
+            "paths": {},
+            "violations": {}
+          }
+        }
+      }
+    }
+  },
+  "plan_mismatches": [],
+  "extra_trial_dirs": [],
+  "sync": {
+    "manifest_sha256": {
+      "head": "feda51ae0b47e966e36cb7e791e106e835419aa8714e9d60aa195b088b8e6d6e",
+      "draft": "feda51ae0b47e966e36cb7e791e106e835419aa8714e9d60aa195b088b8e6d6e",
+      "npu": "feda51ae0b47e966e36cb7e791e106e835419aa8714e9d60aa195b088b8e6d6e"
+    },
+    "old_fit_backups": {
+      "draft": {
+        "clear_tree_fit.bak.json": true,
+        "clear_tree_fit.bak2.json": true,
+        "clear_tree_fit.json": true,
+        "clear_tree_fit.rpd.json": true
+      },
+      "npu": {
+        "clear_tree_fit.json": true,
+        "clear_tree_fit.rpd.json": true,
+        "clear_tree_fit.bak.json": true,
+        "clear_tree_fit.bak2.json": true
+      }
+    },
+    "npu_pre_sync_sha256": "7c9b9a60ce2bfe9686ca8dc8e1ff88a200a7a21f8bd826ce4805ecee88a8d30b",
+    "data_identity": {
+      "file_sha256": "f9a74112455c63c67e566e68d7b7c520769c67bcb27a7f960054ca6e1beabbbc",
+      "selected_rows_sha256": "f2e81b66f70da0fbe01270d2f116308a7233cddcb87247036677f01281780573",
+      "ordered_image_sha256": [
+        "13d96e725ed32742939d21b713573f718490e057af504f31660155e3d9f8a53f",
+        "953827e93c4ec5d2c865cf90e69a2346b87820773ab4b0d1eda60c1268da9236",
+        "59fdbc44dbb9a04638a12f812f7b8bb529afd8a781b7bca2a4f18216333b441c",
+        "e83ed7db9a202da6e94abbba758ea632a1d5dee6659958fceebfba20a1e01b88",
+        "0bf3a98a8b3c6d8d7349fcf76eb34a48437e2c768708d062b15c4f6d91e7d2c8",
+        "b18c873fb3b1d1d6401fbaeb4da6c6b70f26c06d349e7d13f770d12a44ca8375",
+        "d587249676891a4d3b487253af0b5de8d6f064bfc7c66c213a4e4f656113bd42",
+        "4d9441f63416263738acc41edcbdb3fa3ccfb498f719e79d1c07857d9903a6b9",
+        "560e7e3ef3c82d710ca67b5ee778943346a9113c38aa2b18b5c02e65b543a2fc",
+        "ee10e0c10114c8025c752955857e052f6131e522841e9a426feaafe2996bcfe8",
+        "652934a2c5f3678c10affd49103be6464e2343cdc3ab7286580063162d53b425",
+        "0c1a9fbd0a126b2f6421eb82738d2aa75a97535afd512d3aac03d3dd81d19e42",
+        "205fdf2579596a1fda4f6b22bc01af56c71a0904e1b7a0c37e67e5e97282458a",
+        "e931ff1113a4bf4c7ac43b5905a9e2aace2af349ba4f543f66357ae9dc9c2b04",
+        "036f2edcb54039ce5b87e48d6dbf47544aa36eeb8d17f632ed582e7507eed768",
+        "2a3582d5de897fa177a7c862da9cec97d22539136c0190f4305c995b5f6758f0",
+        "b68a6943a8757de0d8ac9e786b8bdf371c089d9136d5e314b7f673e3ac5eba13",
+        "5b76c411824b08b25e0db3c04058db92dbf4a741619e9ffa8bada6498b28d48a",
+        "30c3499517dc434cb2ee67aefc16969c3e5b2f45b1bfd5d5b45ede2ec9863f04",
+        "d1e09c9af1bdbba71353ddd343adea1d71edb00576981839b1c27d6b94217087",
+        "9eac4f629fb910a7180353dded5a6384e0cf23d2370ef27e1ae6f0e6e7f87fe5",
+        "daeae7f39e34179c91dd51211659b04e141d01c66ca54b7c3f35b0640c77aa21",
+        "8fcf63164f6031b5b8acf4d00ed3b59fb7985d46bb2ffdddc5ccd0c0ee772d65",
+        "59104375bfa86369c3161eec68ab6059a73af9ea515c4e6444547003aa1dcdd5",
+        "7e6ea289bd8d25b167427693a5171a19767c955b47414f746518fb4d76c2aa0c",
+        "b7bf01e04dee77fb9ac55b00878ea6a884e6974e34783ebe4b6df7aab00a65b9",
+        "044865599413b7a3c07dd8148c6b83709816d95b70197243c2a93ded2993b248",
+        "32929e4869170d5f989b978e96424dc65a1582811ce86f88d943450f66e48427",
+        "e0435d00c5669c98d688e945a57f063d406bbaed655f39bb10db72f0c2bca0ae",
+        "60e388b553e8e048480fe1d9a7edecf462572faee9667fd58c01ab791af2bdc3",
+        "3fc6170c1e320ae170595cd989151bed2b1a22def5d83550efa046d42f442ec2",
+        "57821c913f4c50a271be6c5baf1c5f8636d4e0871977dc6923809af2659a77c5",
+        "17e7630baf9f5c3c709fb134fdb3d782d37a6d8a020d7d015d51d18c1181cc75",
+        "a1438b1c1a6228f02bac93294112042d1095c07d6a29f382e2881c2ed0d58469",
+        "383056a874c7c563ddeab107d1ac3485a3d5738e6ed6a2a2b89aeef30a068588",
+        "d8b96f015cfc1520650934d8b3c7d9abe9222e1002a380613a0586930b3352ee",
+        "ad0245b1a9e881c8e4a32c98131b0e30efb4d86ec0aaa17cf6819f783a8cc1b0",
+        "d690ef83bd967f3f9e2d94ee0e33438da34cd2fd339527be3e8a7de92392348d",
+        "27f620e3589c633b1f19cf7f7ae198a749ee45caa715c7453d9c53fbd82e2ead",
+        "28939daea2121259dec18fb7361a711ec4ca0927071ea644a6090688fb60c6ed",
+        "37119f421d1eba555e10ee9fe0eae8c1ac2edc40d57a74fbc481b1fb636bc3f1",
+        "3635cf891c66c3f8c14fcfb17a09f13f89a3ad1c5e526cbe8b94393643a9b2d9",
+        "4756322f02133e38515df84892ed7e3b41a07d006e8d1ee3007ef12884f68206",
+        "d4ca17eae428ca72b7feca974a55c71efcf2c8a9ccc283892d3841a3ee99d635",
+        "dd3f18430c255a50b27a6632d08d052e4e4470e17bb6f3c8b877630a762a0f38",
+        "731047e98960b819e25237aa0a40a4e00172c18fb620fa663a1371fb344b9b95",
+        "a2e383961b3163b47c678ee94450d2456b859a3aa24e6cae477c3fa4f27bd067",
+        "bcb966b0ce8e28b559c626b06bef95f290d821a040a339bd5f6f6e5501e60237",
+        "ae0cc433f21b714bd09ef6b026e7d591970bb5a77410777ba0e21c79c1e69eee",
+        "1db2e084cff65cd2be16adfe215f8dadd299f208cac2115c6af0d4919a4a73fc",
+        "30f3a412393b64755ddb9d1d471bc1fe36a7278058bd56c839c2289e50f006f9",
+        "488420d5e7ed469e4e964c121047c89eef7fbf80cc1dd7eb79c7d5c16739a300",
+        "0403f26eb59ac1a2c1d6ba80cabbaf5161eb31e88a9f6b158dd82872c8a0ac51",
+        "a57f0273647153de96a272b9945359d5aab42a2abbfe4adeff3309d5d4e35ce3",
+        "4e4a0f3400fe169690f4ad2ab28b2b9474dc1adc807bcaac8ab16ed08063028e",
+        "459bf43eac48ed257f05b2cac823aee78877ee78d81767a1ba807d4d2d258fb0",
+        "57761450b1a5b45445a34b672cdf88c66998bb7606276f179353684fe100ec35",
+        "f8777fd20664e966d2cfe26fac773aa603ae994fd85b757516aa73a9f54dc8f5",
+        "3ab8fb7343d8a5e4f1b452610b7729b07bbf4977d616d18672d31359726dbcf0",
+        "e5da07bd55de818c743f93d6be87fcab2fae1d4506f7264782714b53aef8f43d",
+        "20eed673125afc4718ca1d40f65a0e483a2d75bb94354ad7095143d1cefb38b4",
+        "677e9c09e387b78844ecec01ad930189ec1762775ad8019369ecc96b91e11139",
+        "e5485ec51b3939b9f4cc5ef4dff9db01ed8af748ff42b57278cfd7a222623140",
+        "6eb0786a3cc5e6a3b708bf7aa95820e63ced45b31f21a5e45fe2e9e6ff125835",
+        "b68ba4cca73568657620e44f710029684e0f1aa928a84d8f116bb5c80eaea935",
+        "48c58423cb75fea23b00b3eecf0f75ad7ec4bbf60179cb2d3fc3fe6bf2f3a36c",
+        "e7b6a0f7b9c4719f3f378fc40f2f4a86fdbc2999089a5a03e74a21b49bd72b7a",
+        "94b7eaa543cfbebeb71ca0d013aad1a3eedd415af4394b7f09c872886edf8f18",
+        "0fa78d00dc8a82adbf2b7213960da2251cd815e32996fc4b6abdc76c82350c28",
+        "244889b40b31e41792ee777260e56471571251c1f7d7673225443b2847355198",
+        "b45610c78c69f9bbd52915cec4612cf80b02bcd9941b60d430ec607ae78da9c1",
+        "bfdf1cd182a5b372ceff12f7a6218010d8b3600623d283536c879447c9f80689",
+        "699e9d2da63f82cd9f0137034de10224e57fbf1b7ee33b6189b0c220aaf674e8",
+        "2631c387327c2e067dec0e6d82c7aa955e1514290a8b08b015a93674f55a4947",
+        "7b5c780a2b7c9219203b34578a8aa435839745224d3eae29a987e049f76961a9",
+        "f5e7ebb4a7398ca279a3ace8e50b5c9d23917952146e178b16c1fe1ffa581ba1",
+        "72884ab03f2a6ab5029fc79310969f220699fa2eab685bd16dd359cbd7a064fb",
+        "d7cd287b5b0a97f105fae3d6a8b6c1b466df8788e4b50f55089c6462b84ddaa9",
+        "6fbdfd3457ed145656dad5ca41ebf91752ec2ea8b6c14665ee2886ccd6569ee7",
+        "3a03bf59d1b15aa61ed1831309bf9d1caf2449a6078a55f23cc293234d784f13",
+        "d6c3da9fdbf04aaabd3083d1f0f8ace75e841518b589426a6704f0a609a3ee4e",
+        "eb8cf0228bcfc450cb95ba93288bf1fa4d91852a63ed28342c41a28b22f1a604",
+        "ab95f95a018c35442f960c411d4b5ee1911a45d00e1c08660f1847edde63ce37",
+        "fbe597c3c7b616b98fb3bc609164fb8b6e5fdefbae84828d870377065fe48d7f",
+        "f3b5c8bad144aee87e9f918fbbb2ef2ec902a3b3b34ef6939bd1730308a5b1bb",
+        "8943753bdb0b53067e7305906eeeb75d96303e414155aea284560d122f08de9f",
+        "187ba128046dbfcdc20cd6bd5a7d1c0306a88ae1e45ac9318bb2ecbc6149b455",
+        "22a1f0f9d5078e46bfc5b68a7c5ca45b62f0c8e5f159ba37352a700e561b1303",
+        "14b50efd7b571f9e93465b57d3a9365f246775e6b5ad20096c3bddf0f04362fd",
+        "6b81df4c9aba03fd6dc9525bda17ab62485c3e134fe4d761ad5a209e113f93fd",
+        "e0977aba57af61f32639c093678a245436cd92668e252af24ecae756f4f14779",
+        "b065dc618af8e83ff04712de03398eb5dbe229907930191f9199fe60cd12073d",
+        "6e544bf83fb11c7bc231032309f7da6bd7b195dfe8360104863bb0cdcce6c600",
+        "54420d3d137e1f2dfa8fe255692bce3341c28d2324a15f6b344c8f762192df4d",
+        "3af449a438c2b1a7ecb6466cc80b8ec32d8baf1fdbb66f39034fd2f5128c3a86",
+        "060bfaef029a78483012d22d1bd1261197035b04929bc8ab694d8d38751163c8",
+        "88bfcaac5def9801509e0f279b47380fd66e7ba971da7ce409fd6b0e85891b47",
+        "8ea41b51ea2c31c553d1aa7aab7292c25ef2ec7b8ee0dbfa678c208da04c2b60",
+        "f3834bbf7543e4a124626f6c2e81b4d48e1f02500bcb8cba5fe1a2fee6ac7c8f",
+        "d293579f661d634f02824287eb65155c87242274c736fe25a094df3036054fea"
+      ],
+      "available": 100,
+      "selected": 100
+    },
+    "rpd_data_identity": {
+      "file_sha256": "f9a74112455c63c67e566e68d7b7c520769c67bcb27a7f960054ca6e1beabbbc",
+      "selected_rows_sha256": "f2e81b66f70da0fbe01270d2f116308a7233cddcb87247036677f01281780573",
+      "ordered_image_sha256": [
+        "13d96e725ed32742939d21b713573f718490e057af504f31660155e3d9f8a53f",
+        "953827e93c4ec5d2c865cf90e69a2346b87820773ab4b0d1eda60c1268da9236",
+        "59fdbc44dbb9a04638a12f812f7b8bb529afd8a781b7bca2a4f18216333b441c",
+        "e83ed7db9a202da6e94abbba758ea632a1d5dee6659958fceebfba20a1e01b88",
+        "0bf3a98a8b3c6d8d7349fcf76eb34a48437e2c768708d062b15c4f6d91e7d2c8",
+        "b18c873fb3b1d1d6401fbaeb4da6c6b70f26c06d349e7d13f770d12a44ca8375",
+        "d587249676891a4d3b487253af0b5de8d6f064bfc7c66c213a4e4f656113bd42",
+        "4d9441f63416263738acc41edcbdb3fa3ccfb498f719e79d1c07857d9903a6b9",
+        "560e7e3ef3c82d710ca67b5ee778943346a9113c38aa2b18b5c02e65b543a2fc",
+        "ee10e0c10114c8025c752955857e052f6131e522841e9a426feaafe2996bcfe8",
+        "652934a2c5f3678c10affd49103be6464e2343cdc3ab7286580063162d53b425",
+        "0c1a9fbd0a126b2f6421eb82738d2aa75a97535afd512d3aac03d3dd81d19e42",
+        "205fdf2579596a1fda4f6b22bc01af56c71a0904e1b7a0c37e67e5e97282458a",
+        "e931ff1113a4bf4c7ac43b5905a9e2aace2af349ba4f543f66357ae9dc9c2b04",
+        "036f2edcb54039ce5b87e48d6dbf47544aa36eeb8d17f632ed582e7507eed768",
+        "2a3582d5de897fa177a7c862da9cec97d22539136c0190f4305c995b5f6758f0",
+        "b68a6943a8757de0d8ac9e786b8bdf371c089d9136d5e314b7f673e3ac5eba13",
+        "5b76c411824b08b25e0db3c04058db92dbf4a741619e9ffa8bada6498b28d48a",
+        "30c3499517dc434cb2ee67aefc16969c3e5b2f45b1bfd5d5b45ede2ec9863f04",
+        "d1e09c9af1bdbba71353ddd343adea1d71edb00576981839b1c27d6b94217087",
+        "9eac4f629fb910a7180353dded5a6384e0cf23d2370ef27e1ae6f0e6e7f87fe5",
+        "daeae7f39e34179c91dd51211659b04e141d01c66ca54b7c3f35b0640c77aa21",
+        "8fcf63164f6031b5b8acf4d00ed3b59fb7985d46bb2ffdddc5ccd0c0ee772d65",
+        "59104375bfa86369c3161eec68ab6059a73af9ea515c4e6444547003aa1dcdd5",
+        "7e6ea289bd8d25b167427693a5171a19767c955b47414f746518fb4d76c2aa0c",
+        "b7bf01e04dee77fb9ac55b00878ea6a884e6974e34783ebe4b6df7aab00a65b9",
+        "044865599413b7a3c07dd8148c6b83709816d95b70197243c2a93ded2993b248",
+        "32929e4869170d5f989b978e96424dc65a1582811ce86f88d943450f66e48427",
+        "e0435d00c5669c98d688e945a57f063d406bbaed655f39bb10db72f0c2bca0ae",
+        "60e388b553e8e048480fe1d9a7edecf462572faee9667fd58c01ab791af2bdc3",
+        "3fc6170c1e320ae170595cd989151bed2b1a22def5d83550efa046d42f442ec2",
+        "57821c913f4c50a271be6c5baf1c5f8636d4e0871977dc6923809af2659a77c5",
+        "17e7630baf9f5c3c709fb134fdb3d782d37a6d8a020d7d015d51d18c1181cc75",
+        "a1438b1c1a6228f02bac93294112042d1095c07d6a29f382e2881c2ed0d58469",
+        "383056a874c7c563ddeab107d1ac3485a3d5738e6ed6a2a2b89aeef30a068588",
+        "d8b96f015cfc1520650934d8b3c7d9abe9222e1002a380613a0586930b3352ee",
+        "ad0245b1a9e881c8e4a32c98131b0e30efb4d86ec0aaa17cf6819f783a8cc1b0",
+        "d690ef83bd967f3f9e2d94ee0e33438da34cd2fd339527be3e8a7de92392348d",
+        "27f620e3589c633b1f19cf7f7ae198a749ee45caa715c7453d9c53fbd82e2ead",
+        "28939daea2121259dec18fb7361a711ec4ca0927071ea644a6090688fb60c6ed",
+        "37119f421d1eba555e10ee9fe0eae8c1ac2edc40d57a74fbc481b1fb636bc3f1",
+        "3635cf891c66c3f8c14fcfb17a09f13f89a3ad1c5e526cbe8b94393643a9b2d9",
+        "4756322f02133e38515df84892ed7e3b41a07d006e8d1ee3007ef12884f68206",
+        "d4ca17eae428ca72b7feca974a55c71efcf2c8a9ccc283892d3841a3ee99d635",
+        "dd3f18430c255a50b27a6632d08d052e4e4470e17bb6f3c8b877630a762a0f38",
+        "731047e98960b819e25237aa0a40a4e00172c18fb620fa663a1371fb344b9b95",
+        "a2e383961b3163b47c678ee94450d2456b859a3aa24e6cae477c3fa4f27bd067",
+        "bcb966b0ce8e28b559c626b06bef95f290d821a040a339bd5f6f6e5501e60237",
+        "ae0cc433f21b714bd09ef6b026e7d591970bb5a77410777ba0e21c79c1e69eee",
+        "1db2e084cff65cd2be16adfe215f8dadd299f208cac2115c6af0d4919a4a73fc",
+        "30f3a412393b64755ddb9d1d471bc1fe36a7278058bd56c839c2289e50f006f9",
+        "488420d5e7ed469e4e964c121047c89eef7fbf80cc1dd7eb79c7d5c16739a300",
+        "0403f26eb59ac1a2c1d6ba80cabbaf5161eb31e88a9f6b158dd82872c8a0ac51",
+        "a57f0273647153de96a272b9945359d5aab42a2abbfe4adeff3309d5d4e35ce3",
+        "4e4a0f3400fe169690f4ad2ab28b2b9474dc1adc807bcaac8ab16ed08063028e",
+        "459bf43eac48ed257f05b2cac823aee78877ee78d81767a1ba807d4d2d258fb0",
+        "57761450b1a5b45445a34b672cdf88c66998bb7606276f179353684fe100ec35",
+        "f8777fd20664e966d2cfe26fac773aa603ae994fd85b757516aa73a9f54dc8f5",
+        "3ab8fb7343d8a5e4f1b452610b7729b07bbf4977d616d18672d31359726dbcf0",
+        "e5da07bd55de818c743f93d6be87fcab2fae1d4506f7264782714b53aef8f43d",
+        "20eed673125afc4718ca1d40f65a0e483a2d75bb94354ad7095143d1cefb38b4",
+        "677e9c09e387b78844ecec01ad930189ec1762775ad8019369ecc96b91e11139",
+        "e5485ec51b3939b9f4cc5ef4dff9db01ed8af748ff42b57278cfd7a222623140",
+        "6eb0786a3cc5e6a3b708bf7aa95820e63ced45b31f21a5e45fe2e9e6ff125835",
+        "b68ba4cca73568657620e44f710029684e0f1aa928a84d8f116bb5c80eaea935",
+        "48c58423cb75fea23b00b3eecf0f75ad7ec4bbf60179cb2d3fc3fe6bf2f3a36c",
+        "e7b6a0f7b9c4719f3f378fc40f2f4a86fdbc2999089a5a03e74a21b49bd72b7a",
+        "94b7eaa543cfbebeb71ca0d013aad1a3eedd415af4394b7f09c872886edf8f18",
+        "0fa78d00dc8a82adbf2b7213960da2251cd815e32996fc4b6abdc76c82350c28",
+        "244889b40b31e41792ee777260e56471571251c1f7d7673225443b2847355198",
+        "b45610c78c69f9bbd52915cec4612cf80b02bcd9941b60d430ec607ae78da9c1",
+        "bfdf1cd182a5b372ceff12f7a6218010d8b3600623d283536c879447c9f80689",
+        "699e9d2da63f82cd9f0137034de10224e57fbf1b7ee33b6189b0c220aaf674e8",
+        "2631c387327c2e067dec0e6d82c7aa955e1514290a8b08b015a93674f55a4947",
+        "7b5c780a2b7c9219203b34578a8aa435839745224d3eae29a987e049f76961a9",
+        "f5e7ebb4a7398ca279a3ace8e50b5c9d23917952146e178b16c1fe1ffa581ba1",
+        "72884ab03f2a6ab5029fc79310969f220699fa2eab685bd16dd359cbd7a064fb",
+        "d7cd287b5b0a97f105fae3d6a8b6c1b466df8788e4b50f55089c6462b84ddaa9",
+        "6fbdfd3457ed145656dad5ca41ebf91752ec2ea8b6c14665ee2886ccd6569ee7",
+        "3a03bf59d1b15aa61ed1831309bf9d1caf2449a6078a55f23cc293234d784f13",
+        "d6c3da9fdbf04aaabd3083d1f0f8ace75e841518b589426a6704f0a609a3ee4e",
+        "eb8cf0228bcfc450cb95ba93288bf1fa4d91852a63ed28342c41a28b22f1a604",
+        "ab95f95a018c35442f960c411d4b5ee1911a45d00e1c08660f1847edde63ce37",
+        "fbe597c3c7b616b98fb3bc609164fb8b6e5fdefbae84828d870377065fe48d7f",
+        "f3b5c8bad144aee87e9f918fbbb2ef2ec902a3b3b34ef6939bd1730308a5b1bb",
+        "8943753bdb0b53067e7305906eeeb75d96303e414155aea284560d122f08de9f",
+        "187ba128046dbfcdc20cd6bd5a7d1c0306a88ae1e45ac9318bb2ecbc6149b455",
+        "22a1f0f9d5078e46bfc5b68a7c5ca45b62f0c8e5f159ba37352a700e561b1303",
+        "14b50efd7b571f9e93465b57d3a9365f246775e6b5ad20096c3bddf0f04362fd",
+        "6b81df4c9aba03fd6dc9525bda17ab62485c3e134fe4d761ad5a209e113f93fd",
+        "e0977aba57af61f32639c093678a245436cd92668e252af24ecae756f4f14779",
+        "b065dc618af8e83ff04712de03398eb5dbe229907930191f9199fe60cd12073d",
+        "6e544bf83fb11c7bc231032309f7da6bd7b195dfe8360104863bb0cdcce6c600",
+        "54420d3d137e1f2dfa8fe255692bce3341c28d2324a15f6b344c8f762192df4d",
+        "3af449a438c2b1a7ecb6466cc80b8ec32d8baf1fdbb66f39034fd2f5128c3a86",
+        "060bfaef029a78483012d22d1bd1261197035b04929bc8ab694d8d38751163c8",
+        "88bfcaac5def9801509e0f279b47380fd66e7ba971da7ce409fd6b0e85891b47",
+        "8ea41b51ea2c31c553d1aa7aab7292c25ef2ec7b8ee0dbfa678c208da04c2b60",
+        "f3834bbf7543e4a124626f6c2e81b4d48e1f02500bcb8cba5fe1a2fee6ac7c8f",
+        "d293579f661d634f02824287eb65155c87242274c736fe25a094df3036054fea"
+      ],
+      "available": 100,
+      "selected": 100
+    }
+  },
+  "status": "blocked"
+}
