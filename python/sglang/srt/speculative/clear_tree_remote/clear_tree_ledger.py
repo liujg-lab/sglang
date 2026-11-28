@@ -274,6 +274,20 @@ class ForgettingRegressor:
         self._coef = None
         self._coef_n = -1
 
+    def scale_weight(self, factor: float) -> None:
+        """Scale the accumulated evidence by ``factor``.
+
+        ``n``, the span and a frozen slope prior stay. Apart from the ridge,
+        the solution stays too; later samples simply weigh more against it.
+        """
+        factor = float(factor)
+        for i in range(self.n_features):
+            for j in range(self.n_features):
+                self.xtx[i][j] *= factor
+            self.xty[i] *= factor
+        self._coef = None
+        self._coef_n = -1
+
     def update(self, features: Sequence[float], target: float) -> None:
         forget = FORGET
         width = self.n_features

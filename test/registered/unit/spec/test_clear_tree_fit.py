@@ -1017,10 +1017,12 @@ class ClearTreeFitFileTest(CustomTestCase):
                 "SGLANG_CLEAR_AUTO_PREFIT",
                 "SGLANG_CLEAR_NPU_KV_BUCKETS",
                 "SGLANG_CLEAR_LAYER_SLOPE_PRIOR",
+                "SGLANG_CLEAR_PREFIT_LAYER_WEIGHT",
             )
         }
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
         os.environ.pop("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", None)
+        os.environ.pop("SGLANG_CLEAR_PREFIT_LAYER_WEIGHT", None)
         self._dir = tempfile.TemporaryDirectory()
         self._path = str(Path(self._dir.name) / "clear_tree_fit.json")
         os.environ["SGLANG_CLEAR_FIT_PATH"] = self._path
@@ -1382,6 +1384,107 @@ class ClearTreeFitFileTest(CustomTestCase):
             if (item["w"], item["path"], item["g"]) == key
         )
         self.assertEqual((row["n"], row["dropped"]), (fit._LAYER_CELL_SAMPLES, 6))
+
+    def _commit_heavy_cell(self, count=400):
+        """Commit a run whose flat layer cell holds ``count`` prefit samples."""
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        state, _stale = fit._adopt_run(scheduler, run)
+        for cell in state.required_h:
+            for _ in range(4):
+                fit.prefit_record_h(scheduler, *cell, 12.5)
+        key = (8, "graph", 1)
+        for length, target in _layer_points(count):
+            fit.prefit_record_layer(scheduler, *key, [1.0, length], target)
+        prefit_model = state.layers[key]
+        beta = list(prefit_model.coefficients())
+        xtx = [list(row) for row in prefit_model.xtx]
+        precision = xtx[1][1] - xtx[0][1] ** 2 / xtx[0][0]
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        return scheduler, key, beta, xtx, precision
+
+    @staticmethod
+    def _line(beta, length):
+        return beta[0] + beta[1] * length
+
+    def test_prefit_layer_weight_is_capped_at_install(self):
+        scheduler, key, beta, xtx, precision = self._commit_heavy_cell()
+        self.assertGreater(xtx[0][0], fit.PREFIT_LAYER_WEIGHT)
+        model = scheduler._clear_ledger.layer_models[key]
+        self.assertEqual(model.n, 400)
+        self.assertAlmostEqual(model.xtx[0][0], fit.PREFIT_LAYER_WEIGHT, places=6)
+        # Same line at install, up to the ridge (this test line is far steeper
+        # than a real cell, so the ridge shows at about 0.01 ms).
+        for length in (100.0, 1500.0):
+            expected = self._line(beta, length)
+            self.assertLess(abs(model.predict([1.0, length]) - expected), 0.02)
+        # The prior keeps the prefit slope and gains the slope information the
+        # scaled data gave up: S_p + (1 - c) * S_p.
+        self.assertIsNotNone(model.slope_prior)
+        self.assertAlmostEqual(model.slope_prior[1], beta[1])
+        scale = fit.PREFIT_LAYER_WEIGHT / xtx[0][0]
+        self.assertAlmostEqual(model.slope_prior[2] / precision, 2.0 - scale, places=9)
+        info = model.xtx[1][1] - model.xtx[0][1] ** 2 / model.xtx[0][0]
+        self.assertAlmostEqual((info + model.slope_prior[2]) / (2.0 * precision), 1.0, places=9)
+
+    def _level_moved(self, model, beta):
+        """Share of an 8% level gap closed by 150 online samples, and the slope."""
+        mid = 600.0
+        start = model.predict([1.0, mid])
+        for step in range(150):
+            length = 400.0 + 400.0 * (step % 50) / 49.0
+            model.update([1.0, length], 1.08 * self._line(beta, length))
+        moved = (model.predict([1.0, mid]) - start) / (0.08 * self._line(beta, mid))
+        return moved, model.coefficients()[1]
+
+    def test_online_samples_move_a_capped_cell_faster(self):
+        scheduler, key, beta, _xtx, _precision = self._commit_heavy_cell()
+        moved, slope = self._level_moved(scheduler._clear_ledger.layer_models[key], beta)
+        self.assertGreater(moved, 0.6)
+
+        os.environ["SGLANG_CLEAR_PREFIT_LAYER_WEIGHT"] = "0"
+        reset_policy()
+        Path(self._path).unlink()
+        scheduler, key, beta, xtx, _precision = self._commit_heavy_cell()
+        model = scheduler._clear_ledger.layer_models[key]
+        self.assertAlmostEqual(model.xtx[0][0], xtx[0][0])
+        plain_moved, plain_slope = self._level_moved(model, beta)
+        self.assertLess(plain_moved, 0.4)
+        # The cap frees the level only: the slope drifts no more than before.
+        self.assertLessEqual(abs(slope / beta[1] - 1.0), abs(plain_slope / beta[1] - 1.0))
+
+    def test_cap_leaves_cells_without_a_slope_prior_alone(self):
+        # With the prior switched off the control must match the old fits.
+        os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = "0"
+        scheduler, key, _beta, xtx, _precision = self._commit_heavy_cell()
+        model = scheduler._clear_ledger.layer_models[key]
+        self.assertIsNone(model.slope_prior)
+        self.assertEqual(model.n, 400)
+        self.assertAlmostEqual(model.xtx[0][0], xtx[0][0])
+        self.assertAlmostEqual(model.xtx[1][1], xtx[1][1])
+
+    def test_file_install_caps_the_prefit_weight(self):
+        scheduler, key, _beta, xtx, _precision = self._commit_heavy_cell()
+        payload = json.loads(Path(self._path).read_text())
+        row = next(
+            item
+            for item in payload["layers"]
+            if (item["w"], item["path"], item["g"]) == key
+        )
+        # The file keeps the full prefit evidence; only the install is capped.
+        self.assertEqual(row["n"], 400)
+        self.assertAlmostEqual(row["xtx"][0][0], xtx[0][0])
+        reset_policy()
+        scheduler._clear_ledger.layer_models = {}
+        scheduler._clear_fit_installed = False
+        scheduler._clear_fit_ready = False
+        scheduler._clear_fit_pending = None
+        fit.load_draft_part(scheduler)
+        fit.on_target_info(scheduler, scheduler._clear_target_header)
+        self.assertTrue(scheduler._clear_fit_ready)
+        loaded = scheduler._clear_ledger.layer_models[key]
+        self.assertEqual(loaded.n, 400)
+        self.assertAlmostEqual(loaded.xtx[0][0], fit.PREFIT_LAYER_WEIGHT, places=6)
 
     def test_spike_filter_keeps_long_prefixes_on_the_line(self):
         rows = [([1.0, length], target) for length, target in _layer_points()]

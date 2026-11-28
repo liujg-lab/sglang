@@ -53,6 +53,9 @@ _LAYER_CELL_SAMPLES = PREFIT_LAYER_SAMPLES
 # not the last forward.
 _LAYER_FIT_MIN_DEPTH = 3
 _QUERY_BACKOFF = (5.0, 10.0, 30.0)
+# Installed prefit layer evidence counts as at most this many samples, so a
+# cell that sees few online samples is not locked to the prefit level.
+PREFIT_LAYER_WEIGHT = 64
 
 
 class PrefitState:
@@ -446,6 +449,63 @@ def _attach_slope_priors(models) -> int:
     return attached
 
 
+def prefit_layer_weight() -> int:
+    """Cap on installed prefit layer weight; ``0`` or less turns the cap off.
+
+    ``SGLANG_CLEAR_PREFIT_LAYER_WEIGHT`` overrides the default for a
+    same-build comparison. A value that does not parse keeps the default and
+    logs a warning.
+    """
+    raw = os.environ.get("SGLANG_CLEAR_PREFIT_LAYER_WEIGHT", "").strip()
+    if not raw:
+        return PREFIT_LAYER_WEIGHT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "[CLEAR] SGLANG_CLEAR_PREFIT_LAYER_WEIGHT=%r is not an integer; using %d",
+            raw,
+            PREFIT_LAYER_WEIGHT,
+        )
+        return PREFIT_LAYER_WEIGHT
+
+
+def _cap_prefit_weight(models) -> int:
+    """Let online samples move the level of an installed prefit fit faster.
+
+    Run after ``_attach_slope_priors``. Only cells with a frozen slope prior
+    are touched: their matrices are scaled down to ``prefit_layer_weight``
+    samples, and the prior gains the slope information the scaled data gave
+    up, so the total slope information (data plus prior) and the install-time
+    solution stay as before. Cells without a prior (prior switched off, or a
+    prefix range too narrow for one) keep their matrices. ``n`` stays, so
+    readiness and coverage checks do not change.
+    """
+    cap = prefit_layer_weight()
+    if cap <= 0:
+        logger.info("[CLEAR] prefit layer weight capped cap=0 (off) cells=0")
+        return 0
+    scaled = 0
+    for model in list((models or {}).values()):
+        prior = getattr(model, "slope_prior", None)
+        if prior is None:
+            continue
+        xtx = model.xtx
+        weight = float(xtx[0][0])
+        if not math.isfinite(weight) or weight <= cap:
+            continue
+        index = int(prior[0])
+        factor = cap / weight
+        lost = (1.0 - factor) * (
+            float(xtx[index][index]) - float(xtx[0][index]) ** 2 / weight
+        )
+        model.scale_weight(factor)
+        model.set_slope_prior(index, float(prior[1]), float(prior[2]) + max(lost, 0.0))
+        scaled += 1
+    logger.info("[CLEAR] prefit layer weight capped cap=%d cells=%d", cap, scaled)
+    return scaled
+
+
 def _install_layers(scheduler, rows) -> int:
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         _new_layer_model,
@@ -467,6 +527,7 @@ def _install_layers(scheduler, rows) -> int:
         installed += 1
     ledger.layer_models = fresh
     _attach_slope_priors(fresh)
+    _cap_prefit_weight(fresh)
     return installed
 
 
@@ -689,6 +750,7 @@ def _install_prepared(scheduler, prepared) -> bool:
     replace_hold_cells(prepared.get("h") or [])
     ledger.layer_models = dict(prepared.get("layers") or {})
     _attach_slope_priors(ledger.layer_models)
+    _cap_prefit_weight(ledger.layer_models)
     scheduler._clear_fit_installed = True
     scheduler._clear_fit_ready = True
     scheduler._clear_prefit = None
