@@ -45,7 +45,8 @@ _TARGET_KEYS = (
 
 
 # Schema 4: layer cells hold forwards from layer index 2 on only.
-_FIT_SCHEMA = 4
+# Schema 5: prefit layer cells drop spikes above 1.5 times the cell's own fit.
+_FIT_SCHEMA = 5
 _CELL_SAMPLES = PREFIT_CELL_SAMPLES
 _LAYER_CELL_SAMPLES = PREFIT_LAYER_SAMPLES
 # A layer cell is produced only by a tree this deep: layer 2 is fitted and is
@@ -63,7 +64,11 @@ class PrefitState:
         self.counts = {}
         self.h = {}
         self.h_ell = {}
-        self.layers = {}
+        # Raw prefit layer samples per cell, in arrival order. ``layers`` fits
+        # them after dropping spikes and caches the models until a new sample.
+        self.layer_rows = {}
+        self._layer_models = None
+        self.layer_dropped = {}
         self.online_h = []
         self.online_layers = []
         self.required_h = [] if plan is None else list(plan.required_h)
@@ -73,6 +78,61 @@ class PrefitState:
         self.last_status = None
         self.session_id = None
         self.fingerprint = None
+
+    @property
+    def layers(self) -> dict:
+        """Layer fits per cell, built from ``layer_rows`` without spikes."""
+        if self._layer_models is None:
+            models = {}
+            dropped = {}
+            for key, rows in self.layer_rows.items():
+                models[key], dropped[key] = _steady_layer_model(rows)
+            self._layer_models = models
+            self.layer_dropped = dropped
+        return self._layer_models
+
+
+def _steady_layer_model(rows, rounds: int = 3):
+    """One prefit layer fit without spikes.
+
+    A cell mixes every bucket, and the prefix is the regression input, so a
+    sample is judged against the cell's own fit, not its median: fit all
+    samples, drop those above 1.5 times the prediction, refit, and repeat
+    until the kept set stops changing (at most ``rounds`` passes). A long
+    prefix that sits on the line stays. If no fit is possible yet, or every
+    sample would go, the current set stays. The kept samples update the usual
+    layer model in arrival order. Returns the model and the number dropped.
+    Online layer fits do not filter.
+    """
+    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        _new_layer_model,
+    )
+
+    rows = list(rows or [])
+
+    def _fit(indices):
+        model = _new_layer_model()
+        for index in indices:
+            features, measured = rows[index]
+            model.update(features, measured)
+        return model
+
+    kept = list(range(len(rows)))
+    model = _fit(kept)
+    for _ in range(max(int(rounds), 0)):
+        coef = model.coefficients()
+        if coef is None:
+            break
+        nxt = [
+            index
+            for index, (features, measured) in enumerate(rows)
+            if measured <= 1.5 * sum(float(c) * float(x) for c, x in zip(coef, features))
+        ]
+        if not nxt or nxt == kept:
+            break
+        kept = nxt
+        model = _fit(kept)
+    return model, len(rows) - len(kept)
 
 
 FIT_MODES = ("greedy", "rpd")
@@ -1113,11 +1173,10 @@ def prefit_record_h(scheduler, batch, k, bucket, hold_ms, owner=None, ell=None) 
 
 
 def prefit_record_layer(scheduler, width, path, graph, features, measured, owner=None) -> None:
-    """Keep one pre-reply layer sample on the run that opened this round."""
-    from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
-        _new_layer_model,
-    )
+    """Keep one pre-reply layer sample on the run that opened this round.
 
+    The sample is stored raw; ``PrefitState.layers`` fits the cell later.
+    """
     state = getattr(scheduler, "_clear_prefit", None)
     if (
         state is None
@@ -1127,11 +1186,10 @@ def prefit_record_layer(scheduler, width, path, graph, features, measured, owner
     ):
         return
     key = (int(width), str(path), int(graph))
-    model = state.layers.get(key)
-    if model is None:
-        model = _new_layer_model()
-        state.layers[key] = model
-    model.update(features, float(measured))
+    state.layer_rows.setdefault(key, []).append(
+        ([float(value) for value in features], float(measured))
+    )
+    state._layer_models = None
 
 
 def _state_rows(state: PrefitState):
@@ -1154,9 +1212,13 @@ def _state_rows(state: PrefitState):
             }
         )
     layers = []
-    for key in sorted(state.layers, key=lambda item: (item[0], item[1], item[2])):
+    models = state.layers
+    dropped = getattr(state, "layer_dropped", {}) or {}
+    for key in sorted(models, key=lambda item: (item[0], item[1], item[2])):
         row = {"w": int(key[0]), "path": str(key[1]), "g": int(key[2])}
-        row.update(state.layers[key].to_dict())
+        row.update(models[key].to_dict())
+        # Diagnostic only: spikes left out of this cell's fit.
+        row["dropped"] = int(dropped.get(key, 0))
         layers.append(row)
     return rows, layers
 
@@ -1191,6 +1253,13 @@ def _materialize_state(scheduler, state: PrefitState) -> dict:
     header = draft_header(scheduler)
     header["target"] = _target_identity(target)
     rows, layers = _state_rows(state)
+    spikes = {
+        "%s/%s/%s" % (row["w"], row["path"], row["g"]): row["dropped"]
+        for row in layers
+        if row.get("dropped")
+    }
+    if spikes:
+        logger.info("[CLEAR] prefit layer spikes dropped %s", json.dumps(spikes))
     payload = {
         "schema": _FIT_SCHEMA,
         "header": header,

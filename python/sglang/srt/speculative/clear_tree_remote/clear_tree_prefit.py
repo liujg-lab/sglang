@@ -40,7 +40,8 @@ PREFIT_WIDTH_SAMPLE_TARGET = PREFIT_LAYER_SAMPLES + PREFIT_LAYER_SAMPLES // 5
 # Verify rounds after warmup; each keeps ``depth - 2`` layer samples.
 PREFIT_VERIFY_KEEP_ROUNDS = _VERIFY_ROUNDS - PREFIT_VERIFY_WARMUP_ROUNDS
 _DEFAULT_WIDTH_ROUNDS = 20
-_LAYER_SAMPLE_VERSION = 1
+# 2: prefit layer cells drop spikes; w-group max_new follows the width rotation.
+_LAYER_SAMPLE_VERSION = 2
 
 
 @dataclass
@@ -157,9 +158,22 @@ def width_keep_rounds(rounds: int, n_widths: int) -> int:
     return int(cycles * (per_width - 1))
 
 
-def max_new_for_width(d_max: int, rounds: int = _DEFAULT_WIDTH_ROUNDS) -> int:
-    """Token budget that lasts ``rounds`` rounds even if every round commits ``d_max + 1``."""
-    return int(rounds) * (int(d_max) + 1)
+def max_new_for_width(depths: Sequence[int], rounds: int = _DEFAULT_WIDTH_ROUNDS) -> int:
+    """Token budget that lasts ``rounds`` rounds of the width rotation.
+
+    Round ``r`` uses width ``(r // PREFIT_WIDTH_ROUNDS_PER_WIDTH) % len(depths)``,
+    the rotation of the Draft's ``prefit_plan``, and commits at most that
+    width's depth plus one. Two more tokens cover the prefill token and one
+    spare. With full acceptance the request runs ``rounds`` rounds and at most
+    one more (the next width's warmup round); lower acceptance only adds
+    rounds.
+    """
+    widths = [max(int(depth), 0) for depth in depths]
+    if not widths:
+        return 0
+    per = PREFIT_WIDTH_ROUNDS_PER_WIDTH
+    total = sum(widths[(r // per) % len(widths)] + 1 for r in range(int(rounds)))
+    return int(total) + 2
 
 
 def _ordered(values, center: int, *, include_center: bool) -> list:
@@ -346,7 +360,7 @@ def build_plan(inputs: PlanInputs) -> PrefitPlan:
                     "b": batch,
                     "prefix": int(prefix),
                     "bucket": int(bucket),
-                    "max_new": int(max_new_for_width(max(d_max, 0), rounds)),
+                    "max_new": int(max_new_for_width(depths, rounds)),
                     "depth": int(d_max),
                     "rounds": int(rounds),
                     "produces_h": [],

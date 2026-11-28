@@ -60,7 +60,11 @@ register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 
 def _layer_points(count=None):
-    """Prefit layer samples on one line, enough to fill a layer cell."""
+    """Prefit layer samples on one line, enough to fill a layer cell.
+
+    The line rises 20x across the prefixes: the long-prefix end is far above
+    1.5x the median but on the fit, so the spike filter keeps every point.
+    """
     total = fit._LAYER_CELL_SAMPLES if count is None else int(count)
     return [(4.0 * step, 0.6 + 0.4 * step) for step in range(1, total + 1)]
 
@@ -726,10 +730,12 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         # least 2 x 3 rounds x 2 fitted layers in each of the five buckets.
         self.assertEqual(width_groups[0]["rounds"], 40)
         self.assertEqual(width_groups[0]["depth"], 7)
-        self.assertEqual(width_groups[0]["max_new"], 320)
+        # Widths 4, 16, 2, 32, 64 at depths 4, 4, 7, 4, 4: two cycles of
+        # 4 x (5 + 5 + 8 + 5 + 5) tokens plus the prefill token and a spare.
+        self.assertEqual(width_groups[0]["max_new"], 226)
         wide = [item for item in groups if item["kind"] == "w" and item["b"] == 4]
         self.assertEqual(wide[0]["rounds"], 40)
-        self.assertEqual(wide[0]["max_new"], 200)
+        self.assertEqual(wide[0]["max_new"], 202)
         self.assertGreaterEqual(
             2 * 3 * (prefit.PREFIT_WIDTH_MIN_DEPTH - 2) * len(cfg.buckets),
             prefit.PREFIT_WIDTH_SAMPLE_TARGET,
@@ -772,7 +778,8 @@ class ClearTreePrefitPlanTest(CustomTestCase):
         # (50 plus 20%) needs ceil(60 / (3 x 2)) = 10 cycles of four rounds.
         self.assertEqual(prefit.PREFIT_WIDTH_SAMPLE_TARGET, 60)
         self.assertEqual(group["rounds"], 40)
-        self.assertEqual(group["max_new"], 40 * (group["depth"] + 1))
+        self.assertEqual(group["max_new"], prefit.max_new_for_width([4], 40))
+        self.assertEqual(group["max_new"], 2 + 40 * (group["depth"] + 1))
         responses = [
             [{"meta_info": {"spec_verify_ct": 39}}],
             [{"meta_info": {"spec_verify_ct": 40}}],
@@ -781,6 +788,21 @@ class ClearTreePrefitPlanTest(CustomTestCase):
             result = prefit._run_group(cfg, group, random.Random(0), "run", 0)
         self.assertEqual((result["steps"], result["retries"]), (40, 2))
         self.assertTrue(result["step_target_met"])
+
+    def test_width_budget_lasts_exactly_the_planned_rounds(self):
+        depths = [4, 4, 7, 4, 4]
+        budget = prefit.max_new_for_width(depths, 40)
+        self.assertEqual(budget, 226)
+        per = prefit.PREFIT_WIDTH_ROUNDS_PER_WIDTH
+        # Full acceptance: round r commits its width's depth + 1 tokens after
+        # the prefill token. Forty rounds fit; the request then stops.
+        used = 1
+        for r in range(40):
+            self.assertLess(used, budget)
+            used += depths[(r // per) % len(depths)] + 1
+        self.assertLessEqual(used, budget)
+        self.assertEqual(budget - used, 1)
+        self.assertEqual(prefit.max_new_for_width([], 40), 0)
 
     def test_verify_group_retries_until_every_request_has_eight_verifies(self):
         cfg = prefit.PrefitConfig(
@@ -1074,7 +1096,7 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertTrue(status["written"])
         payload = json.loads(Path(self._path).read_text())
         self.assertEqual(payload["schema"], fit._FIT_SCHEMA)
-        self.assertEqual(fit._FIT_SCHEMA, 4)
+        self.assertEqual(fit._FIT_SCHEMA, 5)
         self.assertNotIn("q", payload)
         for row in payload["h"]:
             self.assertEqual(len(row["ells"]), len(row["samples_ms"]))
@@ -1258,15 +1280,15 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertIsNone(fresh._clear_fit_pending)
         self.assertEqual(fit.fit_handshake_status(fresh)["state"], "need_prefit")
 
-    def test_schema_three_file_is_a_cache_miss(self):
-        # Schema 3 layer cells still hold first forwards.
+    def test_schema_four_file_is_a_cache_miss(self):
+        # Schema 4 layer cells were fitted without dropping spikes.
         scheduler = self._scheduler()
         run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
         self._fill(scheduler, run)
         self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
         payload = json.loads(Path(self._path).read_text())
-        payload["schema"] = 3
-        payload["header"]["schema"] = 3
+        payload["schema"] = 4
+        payload["header"]["schema"] = 4
         Path(self._path).write_text(json.dumps(payload))
         reset_policy()
         scheduler._clear_ledger.layer_models = {}
@@ -1337,6 +1359,63 @@ class ClearTreeFitFileTest(CustomTestCase):
         self.assertLess(row["n"], fit._LAYER_CELL_SAMPLES)
         with self.assertRaises(ValueError):
             fit._parse_layer_row(row)
+
+    def test_prefit_layer_spikes_are_dropped_before_the_fit(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        state = self._fill(scheduler, run)
+        key = (8, "graph", 1)
+        self.assertIn(key, state.required_layers)
+        clean_slope = state.layers[key].coefficients()[1]
+        for _ in range(6):
+            fit.prefit_record_layer(scheduler, 8, "graph", 1, [1.0, 100.0], 35.0)
+        model = state.layers[key]
+        self.assertEqual(model.n, fit._LAYER_CELL_SAMPLES)
+        self.assertEqual(state.layer_dropped[key], 6)
+        self.assertGreater(model.coefficients()[1], 0.0)
+        self.assertAlmostEqual(model.coefficients()[1], clean_slope)
+        self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        payload = json.loads(Path(self._path).read_text())
+        row = next(
+            item
+            for item in payload["layers"]
+            if (item["w"], item["path"], item["g"]) == key
+        )
+        self.assertEqual((row["n"], row["dropped"]), (fit._LAYER_CELL_SAMPLES, 6))
+
+    def test_spike_filter_keeps_long_prefixes_on_the_line(self):
+        rows = [([1.0, length], target) for length, target in _layer_points()]
+        targets = [target for _features, target in rows]
+        median = sorted(targets)[len(targets) // 2]
+        # The long-prefix end is a real trend, not a spike.
+        self.assertGreater(max(targets), 1.5 * median)
+        model, dropped = fit._steady_layer_model(rows)
+        self.assertEqual((model.n, dropped), (len(rows), 0))
+        self.assertEqual(model.span_max, max(row[0][1] for row in rows))
+        # One spike at a short prefix goes; the long prefixes still stay.
+        model, dropped = fit._steady_layer_model(rows + [([1.0, 8.0], 6.0)])
+        self.assertEqual((model.n, dropped), (len(rows), 1))
+        self.assertEqual(model.span_max, max(row[0][1] for row in rows))
+        # Too few samples to fit: nothing is judged.
+        model, dropped = fit._steady_layer_model([([1.0, 8.0], 1.0), ([1.0, 8.0], 9.0)])
+        self.assertEqual((model.n, dropped), (2, 0))
+
+    def test_dropped_spikes_do_not_count_toward_the_cell(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        state, _stale = fit._adopt_run(scheduler, run)
+        for cell in state.required_h:
+            for _ in range(4):
+                fit.prefit_record_h(scheduler, *cell, 12.5)
+        key = (8, "graph", 1)
+        for length, target in _layer_points(fit._LAYER_CELL_SAMPLES - 1):
+            fit.prefit_record_layer(scheduler, *key, [1.0, length], target)
+        for _ in range(3):
+            fit.prefit_record_layer(scheduler, *key, [1.0, 100.0], 35.0)
+        self.assertEqual(state.layers[key].n, fit._LAYER_CELL_SAMPLES - 1)
+        status = fit.commit_prefit(scheduler, run, 1)
+        self.assertEqual(status["reason"], "missing")
+        self.assertIn([8, "graph", 1], status["missing_layers"])
 
     def test_fit_file_needs_matching_ells(self):
         scheduler = self._scheduler()
