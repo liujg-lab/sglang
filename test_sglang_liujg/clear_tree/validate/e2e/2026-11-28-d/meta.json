@@ -1,0 +1,32 @@
+{
+  "run_id": "2026-11-28-d",
+  "commit": "1a15ad1ca5331e15712fca337bf5fb7232ba3922",
+  "reference": "2026-11-28-c",
+  "watercaption_reference": "2026-11-27-b",
+  "fit_schema": 5,
+  "fit_fingerprint": "babb423d",
+  "fit_sha256": {
+    "greedy": "71a5cb3acb12b38ff8a769fc4c2cd2a04c6e84e48ce00b42e0d875e9865e8b38",
+    "rpd": "8d55e05bf292dc6137531d867ecb1f21a4ec638f7c98ece55aa1f925081f97e7"
+  },
+  "prefit_layer_weight": 64,
+  "layer_spike_ratio": 1.5,
+  "auto_prefit": false,
+  "rpd_tau": 0.4,
+  "capture_batches": [1, 2, 4],
+  "max_items": 100,
+  "max_new_tokens": 1024,
+  "temperature": 0,
+  "request_rate": "inf",
+  "timeout_s": 600,
+  "trials": [
+    {"trial": "01", "mode": "greedy", "dataset": "rsteller", "concurrency": 1},
+    {"trial": "02", "mode": "greedy", "dataset": "rsteller", "concurrency": 4},
+    {"trial": "03", "mode": "greedy", "dataset": "watercaption", "concurrency": 1},
+    {"trial": "04", "mode": "greedy", "dataset": "watercaption", "concurrency": 4},
+    {"trial": "05", "mode": "rpd", "dataset": "rsteller", "concurrency": 1},
+    {"trial": "06", "mode": "rpd", "dataset": "rsteller", "concurrency": 4},
+    {"trial": "07", "mode": "rpd", "dataset": "watercaption", "concurrency": 1},
+    {"trial": "08", "mode": "rpd", "dataset": "watercaption", "concurrency": 4}
+  ]
+}
