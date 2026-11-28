@@ -31,8 +31,10 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     plan_target_tree_fia_lengths,
     prime_target_tree_fia_capture_,
     SR_TARGET_BAKED_KV_ENV,
+    SR_TARGET_GRAPH_WARMUP_ENV,
     SR_TARGET_UPDATE_OVERLAP_ENV,
     read_sr_target_baked_kv_env,
+    read_sr_target_graph_warmup_env,
     read_sr_target_tree_fia_env,
     read_sr_target_update_overlap_env,
     target_tree_fia_blocked_extra_combos,
@@ -146,6 +148,17 @@ class TestTargetTreeFiaEnv(CustomTestCase):
         self.assertFalse(read_sr_target_baked_kv_env({SR_TARGET_BAKED_KV_ENV: "false"}))
         for raw in ("1", "true", "YES", "on"):
             self.assertTrue(read_sr_target_baked_kv_env({SR_TARGET_BAKED_KV_ENV: raw}))
+
+    def test_graph_warmup_env_default_on(self):
+        self.assertTrue(read_sr_target_graph_warmup_env({}))
+        for raw in ("0", "false", "off"):
+            self.assertFalse(
+                read_sr_target_graph_warmup_env({SR_TARGET_GRAPH_WARMUP_ENV: raw})
+            )
+        for raw in ("1", "true", "YES", "on"):
+            self.assertTrue(
+                read_sr_target_graph_warmup_env({SR_TARGET_GRAPH_WARMUP_ENV: raw})
+            )
 
 
 class TestTargetTreeFiaSelection(CustomTestCase):
@@ -706,14 +719,22 @@ class TestTargetTreeFiaWiring(CustomTestCase):
         capture_entry = _fn_source(_RUNNER, "NPUGraphRunner", "capture")
         self.assertLess(
             capture_entry.find("super().capture()"),
-            capture_entry.find("_warmup_baked_static_graphs"),
+            capture_entry.find("_warmup_target_verify_graphs"),
         )
-        warm = _fn_source(_RUNNER, "NPUGraphRunner", "_warmup_baked_static_graphs")
+        warm = _fn_source(_RUNNER, "NPUGraphRunner", "_warmup_target_verify_graphs")
         self.assertIn("_baked_static_keys", warm)
+        self.assertIn("_target_fia_maps", warm)
+        self.assertIn("capture_kv", warm)
         self.assertIn("graph.replay", warm)
-        self.assertLess(warm.find("graph.replay"), warm.find("torch.npu.synchronize"))
+        # Ranks agree on the list before any collective-bearing replay.
+        self.assertLess(warm.find("all_gather_object"), warm.find("graph.replay"))
+        self.assertLess(warm.find("graph.update"), warm.rfind("graph.replay"))
+        self.assertLess(warm.rfind("graph.replay"), warm.find("torch.npu.synchronize"))
         self.assertLess(warm.find("torch.npu.synchronize"), warm.find("barrier"))
-        self.assertNotIn("graph.update", warm)
+        self.assertIn("capture_kv", bind)
+        self.assertLess(
+            init.find("_npu_sr_target_graph_warmup"), init.find("super().__init__")
+        )
 
     def test_replay_error_does_not_rerun_forward(self):
         spec = _REPO / "python/sglang/srt/speculative/spec_utils.py"
@@ -1051,6 +1072,153 @@ class TestPrimeCapture(CustomTestCase):
         )
         self.assertEqual(md.kv_lens_cpu, [real])
         self.assertEqual(md.q_lens_cpu, [queries])
+
+
+class TestTargetVerifyGraphWarmup(CustomTestCase):
+    """Every captured Target verify graph is replayed once after capture."""
+
+    class _Graph:
+        def __init__(self, name, calls):
+            self.name = name
+            self.calls = calls
+
+        def update(self, cpu_update_input):
+            self.calls.append(
+                (self.name, "update", [list(rec["kv"]) for rec in cpu_update_input])
+            )
+
+        def replay(self):
+            self.calls.append((self.name, "replay"))
+
+    def _warm(self, runner):
+        from sglang.srt.speculative.spec_utils import (
+            NpuGraphPreparationError,
+            fill_fia_cpu_update_payload,
+        )
+
+        syncs = []
+        logs = []
+        self.warnings = []
+        ns = {
+            "torch": SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: syncs.append(1))),
+            "time": __import__("time"),
+            "logger": SimpleNamespace(
+                warning=lambda msg, *args: self.warnings.append(msg % args)
+            ),
+            "log_info_on_rank0": lambda _logger, msg: logs.append(msg),
+            "NpuGraphPreparationError": NpuGraphPreparationError,
+            "fill_fia_cpu_update_payload": fill_fia_cpu_update_payload,
+        }
+        fn = _load_runner_methods(["_warmup_target_verify_graphs"], ns)[
+            "_warmup_target_verify_graphs"
+        ]
+        fn(runner)
+        return syncs, logs
+
+    def _runner(self, calls, *, warm=True, tree_keys=("t",), graphs=True):
+        barriers = []
+        maps = {"cold": None}
+        graph_map = {"b": self._Graph("b", calls)}
+        for key in tree_keys:
+            kv = [999, 999]
+            maps[key] = {
+                "payload": [{"kv": kv}, {"kv": kv}],
+                "step_ids": [0, 0],
+                "attr_name": "kv",
+                "capture_kv": [1, 1],
+            }
+            if graphs:
+                graph_map[key] = self._Graph(key, calls)
+        graph_map["cold"] = self._Graph("cold", calls)
+        runner = SimpleNamespace(
+            _baked_static_keys={"b"},
+            _target_fia_maps=maps,
+            graphs=graph_map,
+            _npu_sr_target_graph_warmup=warm,
+            model_runner=SimpleNamespace(
+                tp_group=SimpleNamespace(barrier=lambda: barriers.append(1))
+            ),
+        )
+        return runner, barriers
+
+    def test_tree_graphs_refill_update_then_replay(self):
+        calls = []
+        runner, barriers = self._runner(calls)
+        syncs, logs = self._warm(runner)
+        self.assertEqual(
+            calls,
+            [("b", "replay"), ("t", "update", [[1, 1], [1, 1]]), ("t", "replay")],
+        )
+        self.assertEqual(syncs, [1])
+        self.assertEqual(barriers, [1])
+        self.assertIn("baked=1 tree=1", logs[0])
+
+    def test_switch_off_leaves_tree_graphs_cold(self):
+        calls = []
+        runner, _barriers = self._runner(calls, warm=False)
+        self._warm(runner)
+        self.assertEqual(calls, [("b", "replay")])
+
+    def test_nothing_to_warm_skips_sync(self):
+        calls = []
+        runner, barriers = self._runner(calls, tree_keys=())
+        runner._baked_static_keys = set()
+        syncs, logs = self._warm(runner)
+        self.assertEqual((calls, syncs, barriers, logs), ([], [], [], []))
+
+    def test_missing_graph_raises(self):
+        from sglang.srt.speculative.spec_utils import NpuGraphPreparationError
+
+        calls = []
+        runner, _barriers = self._runner(calls, graphs=False)
+        with self.assertRaises(NpuGraphPreparationError):
+            self._warm(runner)
+
+    def _tp2(self, runner, other=None):
+        """Two TP ranks; ``other`` is the peer's (baked, tree) list or a copy of ours."""
+        gathers = []
+
+        def all_gather_object(mine):
+            gathers.append(mine)
+            return [mine, mine if other is None else other]
+
+        runner.model_runner.tp_group.world_size = 2
+        runner.model_runner.tp_group.all_gather_object = all_gather_object
+        return gathers
+
+    def test_ranks_that_agree_warm(self):
+        calls = []
+        runner, barriers = self._runner(calls)
+        gathers = self._tp2(runner)
+        syncs, _logs = self._warm(runner)
+        self.assertEqual(gathers, [(["b"], ["t"])])
+        self.assertEqual([kind for _name, kind, *_ in calls], ["replay", "update", "replay"])
+        self.assertEqual((syncs, barriers), ([1], [1]))
+
+    def test_ranks_that_disagree_skip_warmup(self):
+        # The peer's tree FIA map failed to bind, so it would not replay ``t``.
+        calls = []
+        runner, barriers = self._runner(calls)
+        self._tp2(runner, other=(["b"], []))
+        syncs, logs = self._warm(runner)
+        self.assertEqual((calls, syncs, barriers, logs), ([], [], [], []))
+        self.assertIn("disagree", self.warnings[0])
+
+    def test_runner_without_target_graphs_skips_the_rank_check(self):
+        calls = []
+        runner, _barriers = self._runner(calls, tree_keys=())
+        runner._baked_static_keys = set()
+        runner._target_fia_maps = {}
+        gathers = self._tp2(runner)
+        self._warm(runner)
+        self.assertEqual((gathers, calls), ([], []))
+
+    def test_keys_go_in_sorted_order(self):
+        calls = []
+        runner, _barriers = self._runner(calls, tree_keys=("z", "a", "m"))
+        self._warm(runner)
+        order = [name for name, kind, *_ in calls if kind == "replay"]
+        self.assertEqual(order, ["b", "a", "m", "z"])
 
 
 if __name__ == "__main__":

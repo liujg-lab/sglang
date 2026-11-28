@@ -26,6 +26,7 @@ SeqLens = Union[torch.Tensor, Sequence[int]]
 SR_TARGET_TREE_FIA_ENV = "SGLANG_NPU_SR_TARGET_TREE_FIA"
 SR_TARGET_UPDATE_OVERLAP_ENV = "SGLANG_NPU_SR_TARGET_UPDATE_OVERLAP"
 SR_TARGET_BAKED_KV_ENV = "SGLANG_NPU_SR_TARGET_BAKED_KV"
+SR_TARGET_GRAPH_WARMUP_ENV = "SGLANG_NPU_SR_TARGET_GRAPH_WARMUP"
 IMPL_TREE_PAGED_FIA = "tree_paged_fia"
 TARGET_TREE_FIA_PAGE_SIZE = 128
 TARGET_TREE_FIA_HEAD_DIMS = (64, 128)
@@ -62,6 +63,20 @@ def read_sr_target_baked_kv_env(env=None) -> bool:
     """
     environ = os.environ if env is None else env
     raw = environ.get(SR_TARGET_BAKED_KV_ENV, "0")
+    return str(raw).strip().lower() in _TRUTHY
+
+
+def read_sr_target_graph_warmup_env(env=None) -> bool:
+    """Read once during NPU graph runner init; default on.
+
+    When on, every captured Target ``tree_paged_fia`` verify graph is updated
+    with its capture lengths and replayed once right after capture, so the
+    first request does not pay the CANN executable load. Set 0 to leave the
+    non-baked graphs cold for a same-build comparison. Baked graphs are
+    warmed either way. Not a runtime toggle.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SR_TARGET_GRAPH_WARMUP_ENV, "1")
     return str(raw).strip().lower() in _TRUTHY
 
 

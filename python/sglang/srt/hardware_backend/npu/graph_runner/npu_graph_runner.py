@@ -57,6 +57,7 @@ from sglang.srt.speculative.standalone_remote.verifier.sr_target_tree_fia import
     TARGET_TREE_FIA_KV_ATTR,
     TARGET_TREE_FIA_Q_ATTR,
     read_sr_target_baked_kv_env,
+    read_sr_target_graph_warmup_env,
     read_sr_target_update_overlap_env,
     validate_target_tree_fia_records,
 )
@@ -135,6 +136,7 @@ class NPUGraphRunner(CudaGraphRunner):
         # Capture runs inside super().__init__, so the flag must exist first.
         self._npu_sr_target_baked_kv = read_sr_target_baked_kv_env()
         model_runner._npu_sr_target_baked_kv = self._npu_sr_target_baked_kv
+        self._npu_sr_target_graph_warmup = read_sr_target_graph_warmup_env()
         self._baked_static_keys = set()
         self._capture_static_fia = False
         super().__init__(model_runner)
@@ -158,19 +160,56 @@ class NPUGraphRunner(CudaGraphRunner):
     def capture(self):
         self._ensure_capture_attrs()
         super().capture()
-        self._warmup_baked_static_graphs()
+        self._warmup_target_verify_graphs()
 
-    def _warmup_baked_static_graphs(self):
-        """Replay each baked bucket graph once on the inference stream.
+    def _warmup_target_verify_graphs(self):
+        """Replay each captured Target verify graph once on the inference stream.
 
-        The first ``replay`` instantiates the CANN executable. Doing it here
-        moves that cost to startup. Later requests in this process only enqueue.
+        The first ``replay`` instantiates the CANN executable (220-290 ms per
+        graph on 910c in 2026-11-28-d). Doing it here moves that cost to
+        startup; later requests in this process only enqueue. Only bucketed
+        Target verify graphs are warmed: baked ones replay, tree FIA ones
+        refill their payload with the lengths captured for them, then update
+        and replay, the order a real round uses. ntpb=1 decode graphs and
+        graphs whose FIA map failed to bind stay cold.
+
+        The graphs hold TP collectives, so every rank must replay the same
+        list in the same order. Keys are sorted, and with tp > 1 the ranks
+        first compare their lists over the CPU group; if they differ, every
+        rank skips the warmup and startup behaves as before. A failure inside
+        the loop raises on that rank only; the other ranks may wait in the
+        next collective until the HCCL timeout or the launcher stops them.
+        ``SGLANG_NPU_SR_TARGET_GRAPH_WARMUP=0`` leaves the tree FIA graphs
+        cold.
         """
-        keys = sorted(getattr(self, "_baked_static_keys", ()))
-        if not keys:
+        maps = getattr(self, "_target_fia_maps", None) or {}
+        baked = sorted(getattr(self, "_baked_static_keys", ()), key=str)
+        # Captured keys stay in ``maps`` even when their map is None, so this
+        # early return is the same on every rank.
+        if not maps and not baked:
+            return
+        tree = []
+        if getattr(self, "_npu_sr_target_graph_warmup", True):
+            skip = set(baked)
+            tree = sorted(
+                (k for k, info in maps.items() if info is not None and k not in skip),
+                key=str,
+            )
+        tp_group = getattr(self.model_runner, "tp_group", None)
+        if tp_group is not None and int(getattr(tp_group, "world_size", 1) or 1) > 1:
+            mine = ([str(k) for k in baked], [str(k) for k in tree])
+            seen = tp_group.all_gather_object(mine)
+            if any(tuple(item) != mine for item in seen):
+                logger.warning(
+                    "[SR CudaGraph] Target verify graph warmup skipped: TP ranks "
+                    "disagree on the graphs to warm (baked, tree) counts=%s",
+                    [(len(item[0]), len(item[1])) for item in seen],
+                )
+                return
+        if not baked and not tree:
             return
         started = time.perf_counter()
-        for key in keys:
+        for key in baked:
             graph = self.graphs.get(key)
             if graph is None:
                 raise NpuGraphPreparationError(
@@ -178,15 +217,28 @@ class NPUGraphRunner(CudaGraphRunner):
                     scope="graph",
                 )
             graph.replay()
+        for key in tree:
+            graph = self.graphs.get(key)
+            info = self._target_fia_maps[key]
+            capture_kv = info.get("capture_kv")
+            if graph is None or capture_kv is None:
+                raise NpuGraphPreparationError(
+                    f"target verify graph missing for warmup: {key}",
+                    scope="graph",
+                )
+            fill_fia_cpu_update_payload(
+                info["payload"], [capture_kv], info["step_ids"], info["attr_name"]
+            )
+            graph.update(cpu_update_input=info["payload"])
+            graph.replay()
         torch.npu.synchronize()
-        tp_group = getattr(self.model_runner, "tp_group", None)
         if tp_group is not None:
             tp_group.barrier()
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         log_info_on_rank0(
             logger,
-            "[SR CudaGraph] Baked bucket graph warmup complete. "
-            f"graphs={len(keys)} elapsed_ms={elapsed_ms:.1f}",
+            "[SR CudaGraph] Target verify graph warmup complete. "
+            f"baked={len(baked)} tree={len(tree)} elapsed_ms={elapsed_ms:.1f}",
         )
 
     def _capture_extra_keys(self, ntpb=None):
@@ -529,6 +581,9 @@ class NPUGraphRunner(CudaGraphRunner):
                 "bs": int(bs),
                 "payload": payload,
                 "attr_name": self.update_attr_name,
+                # The payload lists are refilled every round; warmup restores
+                # these capture lengths before its update.
+                "capture_kv": [int(value) for value in kv],
             }
         except NpuGraphPreparationError:
             self._target_fia_maps[key] = None
