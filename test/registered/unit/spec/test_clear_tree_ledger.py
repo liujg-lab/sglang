@@ -92,11 +92,14 @@ from sglang.srt.speculative.standalone_remote.sr_protocol import (
 from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
     LAYER_MIN_SAMPLES,
     LAYER_RIDGE,
+    LAYER_SPIKE_RATIO,
     VERIFY_MIN_SAMPLES,
     VERIFY_TIMING_FIELDS,
     ClearLedger,
     VerifyWallTimer,
+    _new_layer_model,
     attach_layer_slope_priors,
+    clip_layer_sample,
     predict_layer_ms,
     note_packet,
     push_verify_sample,
@@ -4887,6 +4890,132 @@ class TestAcceptPathDiagnostics(unittest.TestCase):
         [[row]] = rounds["1"]
         mass = late["e_rid"]["a"]["mass_k"]
         self.assertEqual(row, {2: (2.0, mass["2"]), 4: (2.0, mass["4"])})
+
+
+class TestOnlineLayerSpikeClip(CustomTestCase):
+    """A ready layer cell takes at most LAYER_SPIKE_RATIO times its own fit."""
+
+    _KEY = (8, "graph", 1)
+
+    def setUp(self):
+        reset_policy()
+        self._saved = os.environ.pop("SGLANG_CLEAR_LAYER_SPIKE_CLIP", None)
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_CLEAR_LAYER_SPIKE_CLIP", None)
+        if self._saved is not None:
+            os.environ["SGLANG_CLEAR_LAYER_SPIKE_CLIP"] = self._saved
+
+    @staticmethod
+    def _ready_cell(level=4.0, n=20):
+        model = _new_layer_model()
+        for _ in range(n):
+            model.update([1.0, 16.0], level)
+        return model
+
+    def _close_one_layer(self, ledger, measured_ms, sum_ell=16):
+        """One online round with one fittable layer; returns its ``d_layer``."""
+        half = int(round(measured_ms * 500))
+        with patch.object(ledger_module, "_emit") as emit:
+            _step(ledger, ["a"], [16], 1, 0.0)
+            ledger.queue_layer(
+                {
+                    "layer": 2,
+                    "active": 1,
+                    "graph_bucket": 1,
+                    "w": 8,
+                    "sum_ell": sum_ell,
+                    "host_us": half,
+                    "gpu_us": half,
+                    "path": "graph",
+                    "post_reply": False,
+                }
+            )
+            ledger.mark_stop(0.1)
+            ledger.mark_send(0.2)
+            ledger.mark_post(0.3)
+            ledger.note_idle()
+            _step(ledger, ["a"], [16], 2, 0.5)
+            ledger.flush_logs()
+        layers = [c.args[1] for c in emit.call_args_list if c.args[0] == "d_layer"]
+        self.assertEqual(len(layers), 1)
+        return layers[0]
+
+    def test_online_layer_spike_is_cut_to_the_cell_fit(self):
+        ledger = ClearLedger(active_rids=["a"])
+        model = self._ready_cell()
+        ledger.layer_models[self._KEY] = model
+        before = list(model.xty)
+        n = model.n
+        record = self._close_one_layer(ledger, 20.0)
+        self.assertEqual(model.n, n + 1)
+        self.assertAlmostEqual(model.xty[0], before[0] * FORGET + LAYER_SPIKE_RATIO * 4.0)
+        self.assertAlmostEqual(
+            model.xty[1], before[1] * FORGET + 16.0 * LAYER_SPIKE_RATIO * 4.0
+        )
+        self.assertTrue(record["fit"])
+        self.assertTrue(record["clipped"])
+        # The log keeps the raw measurement.
+        self.assertAlmostEqual(record["pred_ms"], 4.0)
+        self.assertAlmostEqual(record["residual"], 4.0)
+
+    def test_online_layer_below_the_ceiling_is_kept(self):
+        ledger = ClearLedger(active_rids=["a"])
+        model = self._ready_cell()
+        ledger.layer_models[self._KEY] = model
+        before = model.xty[0]
+        record = self._close_one_layer(ledger, 5.5)
+        self.assertAlmostEqual(model.xty[0], before * FORGET + 5.5)
+        self.assertTrue(record["fit"])
+        self.assertFalse(record["clipped"])
+
+    def test_layer_spike_cut_waits_for_a_ready_cell(self):
+        ledger = ClearLedger(active_rids=["a"])
+        record = self._close_one_layer(ledger, 20.0)
+        model = ledger.layer_models[self._KEY]
+        self.assertEqual(model.n, 1)
+        self.assertAlmostEqual(model.xty[0], 20.0)
+        self.assertTrue(record["fit"])
+        self.assertFalse(record["clipped"])
+
+    def test_prefix_outside_the_seen_span_is_not_cut(self):
+        ledger = ClearLedger(active_rids=["a"])
+        model = self._ready_cell()
+        ledger.layer_models[self._KEY] = model
+        self.assertFalse(model.span_allows([1.0, 4000.0]))
+        before = model.xty[0]
+        record = self._close_one_layer(ledger, 20.0, sum_ell=4000)
+        # Pricing refuses this extrapolation, so it is no ceiling either.
+        self.assertAlmostEqual(model.xty[0], before * FORGET + 20.0)
+        self.assertTrue(record["fit"])
+        self.assertFalse(record["clipped"])
+        self.assertEqual(model.span_max, 4000.0)
+        target, clipped = clip_layer_sample(self._ready_cell(), [1.0, 4000.0], 20.0)
+        self.assertEqual((target, clipped), (20.0, False))
+
+    def test_layer_spike_cut_can_be_turned_off(self):
+        os.environ["SGLANG_CLEAR_LAYER_SPIKE_CLIP"] = "0"
+        ledger = ClearLedger(active_rids=["a"])
+        model = self._ready_cell()
+        ledger.layer_models[self._KEY] = model
+        before = model.xty[0]
+        record = self._close_one_layer(ledger, 20.0)
+        self.assertAlmostEqual(model.xty[0], before * FORGET + 20.0)
+        self.assertFalse(record["clipped"])
+
+    def test_cut_samples_still_follow_a_level_rise(self):
+        def follow():
+            model = self._ready_cell()
+            for _ in range(200):
+                target, _clipped = clip_layer_sample(model, [1.0, 16.0], 8.0)
+                model.update([1.0, 16.0], target)
+            return model.predict([1.0, 16.0])
+
+        cut = follow()
+        os.environ["SGLANG_CLEAR_LAYER_SPIKE_CLIP"] = "0"
+        raw = follow()
+        self.assertGreater(cut, 7.4)
+        self.assertLess(raw - cut, 0.5)
 
 
 if __name__ == "__main__":

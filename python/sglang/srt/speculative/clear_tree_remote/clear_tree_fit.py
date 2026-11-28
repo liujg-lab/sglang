@@ -105,9 +105,11 @@ def _steady_layer_model(rows, rounds: int = 3):
     prefix that sits on the line stays. If no fit is possible yet, or every
     sample would go, the current set stays. The kept samples update the usual
     layer model in arrival order. Returns the model and the number dropped.
-    Online layer fits do not filter.
+    Online layer fits cut, rather than drop, samples above the same ratio
+    (``clip_layer_sample``).
     """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
+        LAYER_SPIKE_RATIO,
         _new_layer_model,
     )
 
@@ -129,7 +131,8 @@ def _steady_layer_model(rows, rounds: int = 3):
         nxt = [
             index
             for index, (features, measured) in enumerate(rows)
-            if measured <= 1.5 * sum(float(c) * float(x) for c, x in zip(coef, features))
+            if measured
+            <= LAYER_SPIKE_RATIO * sum(float(c) * float(x) for c, x in zip(coef, features))
         ]
         if not nxt or nxt == kept:
             break
@@ -1195,10 +1198,15 @@ def note_online_layer(scheduler, width, path, graph, features, measured) -> None
 
 
 def replay_online_updates(scheduler) -> None:
-    """Apply ordinary samples taken during the run on top of the installed snapshot."""
+    """Apply ordinary samples taken during the run on top of the installed snapshot.
+
+    Layer samples are kept raw and cut here against the installed fit, the
+    same way the online path cuts them (``clip_layer_sample``).
+    """
     from sglang.srt.speculative.clear_tree_remote.clear_tree_ledger import (
         _new_layer_model,
         bind_ledger,
+        clip_layer_sample,
     )
     from sglang.srt.speculative.clear_tree_remote.clear_tree_policy import (
         observe_verify,
@@ -1219,7 +1227,8 @@ def replay_online_updates(scheduler) -> None:
             if model is None:
                 model = _new_layer_model()
                 ledger.layer_models[key] = model
-            model.update(features, float(measured))
+            target, _ = clip_layer_sample(model, features, float(measured))
+            model.update(features, target)
     state.online_h = []
     state.online_layers = []
 

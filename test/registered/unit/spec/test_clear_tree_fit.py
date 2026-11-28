@@ -18,6 +18,7 @@ import torch
 import zmq
 
 from sglang.srt.speculative.clear_tree_remote import clear_tree_fit as fit
+from sglang.srt.speculative.clear_tree_remote import clear_tree_ledger as ledger_module
 from sglang.srt.speculative.clear_tree_remote import clear_tree_policy as policy
 from sglang.srt.speculative.clear_tree_remote import clear_tree_prefit as prefit
 from sglang.srt.speculative.clear_tree_remote import clear_tree_transport as transport
@@ -1018,11 +1019,13 @@ class ClearTreeFitFileTest(CustomTestCase):
                 "SGLANG_CLEAR_NPU_KV_BUCKETS",
                 "SGLANG_CLEAR_LAYER_SLOPE_PRIOR",
                 "SGLANG_CLEAR_PREFIT_LAYER_WEIGHT",
+                "SGLANG_CLEAR_LAYER_SPIKE_CLIP",
             )
         }
         os.environ["SGLANG_CLEAR_LEDGER"] = "1"
         os.environ.pop("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", None)
         os.environ.pop("SGLANG_CLEAR_PREFIT_LAYER_WEIGHT", None)
+        os.environ.pop("SGLANG_CLEAR_LAYER_SPIKE_CLIP", None)
         self._dir = tempfile.TemporaryDirectory()
         self._path = str(Path(self._dir.name) / "clear_tree_fit.json")
         os.environ["SGLANG_CLEAR_FIT_PATH"] = self._path
@@ -1573,6 +1576,36 @@ class ClearTreeFitFileTest(CustomTestCase):
         loaded = scheduler._clear_ledger.layer_models[key]
         self.assertIsNotNone(loaded.slope_prior)
         self.assertAlmostEqual(loaded.slope_prior[1], prefit_slope)
+
+    def test_replay_cuts_online_spikes_against_the_installed_fit(self):
+        scheduler = self._scheduler()
+        run = self._tiny(scheduler, ks=[16, 32], capture=(1,))
+        self._fill(scheduler, run)
+        key = (8, "graph", 1)
+        features = [1.0, 20.0]
+        base = scheduler._clear_prefit.layers[key].predict(features)
+        self.assertGreater(base, 0.0)
+        fit.note_online_layer(scheduler, 8, "graph", 1, features, 10.0 * base)
+        real = ledger_module.clip_layer_sample
+        calls = []
+
+        def spy(model, feats, measured):
+            before = model.predict(feats)
+            out = real(model, feats, measured)
+            calls.append((before, out))
+            return out
+
+        with patch.object(ledger_module, "clip_layer_sample", side_effect=spy):
+            self.assertTrue(fit.commit_prefit(scheduler, run, 1)["ready"])
+        self.assertEqual(len(calls), 1)
+        installed_pred, (target, clipped) = calls[0]
+        self.assertTrue(clipped)
+        self.assertAlmostEqual(target, ledger_module.LAYER_SPIKE_RATIO * installed_pred)
+        committed = scheduler._clear_ledger.layer_models[key]
+        self.assertEqual(committed.n, fit._LAYER_CELL_SAMPLES + 1)
+        # Uncut, the 10x sample would lift this point by about 0.18x on the
+        # cell's ~49 equivalent samples; cut, by about 0.01x.
+        self.assertLess(committed.predict(features), 1.1 * base)
 
     def test_slope_prior_switch_off_installs_plain_fits(self):
         os.environ["SGLANG_CLEAR_LAYER_SLOPE_PRIOR"] = "0"

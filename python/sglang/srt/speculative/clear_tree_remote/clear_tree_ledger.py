@@ -406,6 +406,40 @@ def layer_slope_prior_enabled() -> bool:
     return os.environ.get("SGLANG_CLEAR_LAYER_SLOPE_PRIOR", "").strip() != "0"
 
 
+# An online layer sample above this many times its cell's prediction is cut
+# down to it before the update. The prefit spike filter uses the same ratio.
+LAYER_SPIKE_RATIO = 1.5
+
+
+def layer_spike_clip_enabled() -> bool:
+    """Online layer spike clipping. ``SGLANG_CLEAR_LAYER_SPIKE_CLIP=0`` turns it off."""
+    return os.environ.get("SGLANG_CLEAR_LAYER_SPIKE_CLIP", "").strip() != "0"
+
+
+def clip_layer_sample(model, features, measured):
+    """``(target, clipped)`` for one online layer update.
+
+    A ready cell (``n >= LAYER_MIN_SAMPLES``) takes at most
+    ``LAYER_SPIKE_RATIO`` times its own prediction from before this sample.
+    A cell that is not ready, a prefix outside the cell's seen span (pricing
+    refuses that extrapolation too, see ``span_allows``), a missing or
+    non-positive prediction, or the switch being off leaves the sample as
+    measured. Cutting rather than dropping keeps a real level rise moving
+    the fit.
+    """
+    if measured is None or model is None or not layer_spike_clip_enabled():
+        return measured, False
+    if model.n < LAYER_MIN_SAMPLES or not model.span_allows(features):
+        return measured, False
+    pred = model.predict(features)
+    if pred is None or not math.isfinite(pred) or pred <= 0.0:
+        return measured, False
+    ceiling = LAYER_SPIKE_RATIO * float(pred)
+    if float(measured) > ceiling:
+        return ceiling, True
+    return float(measured), False
+
+
 def _prefit_slope_prior(model) -> Optional[tuple]:
     """``(slope, precision)`` from a fit's own matrices, or None.
 
@@ -1857,6 +1891,7 @@ class ClearLedger:
         pred = None
         residual = None
         fitted = False
+        clipped = False
         features = None
         measured = None
         if wall is not None:
@@ -1914,7 +1949,10 @@ class ClearLedger:
                         note_online_layer,
                     )
 
-                    model.update(features, measured)
+                    # The replay buffer keeps the raw value; a commit cuts it
+                    # again against the installed fit.
+                    target, clipped = clip_layer_sample(model, features, measured)
+                    model.update(features, target)
                     note_online_layer(
                         scheduler,
                         sample["w"],
@@ -1940,6 +1978,7 @@ class ClearLedger:
             "pred_ms": pred,
             "residual": residual,
             "fit": fitted,
+            "clipped": clipped,
             "last": bool(sample.get("last")),
             "lookahead": lookahead,
             "lookahead_mode": lookahead_mode,
