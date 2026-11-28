@@ -1,0 +1,124 @@
+{
+  "passed": true,
+  "cross": {
+    "packages_match": true,
+    "data_match_before_greedy": true,
+    "data_match_before_rpd": true,
+    "same_ordered_items": true,
+    "distinct_response_ids": true
+  },
+  "trials": {
+    "01": {
+      "artifacts": true,
+      "exit": true,
+      "complete": true,
+      "ordered_items": true,
+      "traffic": true,
+      "active_target": true,
+      "timing": true,
+      "speculation": true,
+      "flush_client": true,
+      "flush_target": true
+    },
+    "02": {
+      "artifacts": true,
+      "exit": true,
+      "complete": true,
+      "ordered_items": true,
+      "traffic": true,
+      "active_target": true,
+      "timing": true,
+      "speculation": true,
+      "flush_client": true,
+      "flush_target": true
+    },
+    "03": {
+      "artifacts": true,
+      "exit": true,
+      "complete": true,
+      "ordered_items": true,
+      "traffic": true,
+      "active_target": true,
+      "timing": true,
+      "speculation": true,
+      "flush_client": true,
+      "flush_target": true
+    },
+    "04": {
+      "artifacts": true,
+      "exit": true,
+      "complete": true,
+      "ordered_items": true,
+      "traffic": true,
+      "active_target": true,
+      "timing": true,
+      "speculation": true,
+      "flush_client": true,
+      "flush_target": true
+    }
+  },
+  "modes": {
+    "greedy": {
+      "block_complete": true,
+      "clean": true,
+      "refit": true,
+      "mode_handshake": true,
+      "captures": true,
+      "target_verify": true,
+      "ledger": true,
+      "trials": {
+        "01": {
+          "rounds_observed": true,
+          "layer_one_excluded": true,
+          "layer_two_plus_fit": true,
+          "layer_valid": true,
+          "missing_or_invalid_hold": 0,
+          "rpd_mask_valid": true,
+          "rpd_masks_observed": null
+        },
+        "02": {
+          "rounds_observed": true,
+          "layer_one_excluded": true,
+          "layer_two_plus_fit": true,
+          "layer_valid": true,
+          "missing_or_invalid_hold": 0,
+          "rpd_mask_valid": true,
+          "rpd_masks_observed": null
+        }
+      },
+      "accept_logs_exit": 0
+    },
+    "rpd": {
+      "block_complete": true,
+      "clean": true,
+      "refit": true,
+      "mode_handshake": true,
+      "captures": true,
+      "target_verify": true,
+      "ledger": true,
+      "greedy_preserved": true,
+      "trials": {
+        "03": {
+          "rounds_observed": true,
+          "layer_one_excluded": true,
+          "layer_two_plus_fit": true,
+          "layer_valid": true,
+          "missing_or_invalid_hold": 0,
+          "rpd_mask_valid": true,
+          "rpd_masks_observed": true
+        },
+        "04": {
+          "rounds_observed": true,
+          "layer_one_excluded": true,
+          "layer_two_plus_fit": true,
+          "layer_valid": true,
+          "missing_or_invalid_hold": 0,
+          "rpd_mask_valid": true,
+          "rpd_masks_observed": true
+        }
+      },
+      "accept_logs_exit": 0
+    }
+  },
+  "errors": []
+}
